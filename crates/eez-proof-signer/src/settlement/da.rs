@@ -2,8 +2,10 @@
 
 use alloy_consensus::Transaction as _;
 use alloy_primitives::Bytes;
-use alloy_rlp::{Decodable, Header};
 use alloy_sol_types::SolValue as _;
+use eez_payload_codec::{Action, DecodedSpan};
+use eez_protocol::RollupId;
+use eez_protocol::entries::manifest::entry_from_action;
 use reth_primitives_traits::BlockBody as _;
 use thiserror::Error;
 
@@ -45,18 +47,31 @@ pub(crate) enum DaPayloadError {
         transaction_index: usize,
     },
     #[error(
-        "batch callData is missing L2 entry {entry_index} for effect transaction {transaction_index}"
+        "batch callData is missing action {entry_index} for effect transaction {transaction_index}"
     )]
-    MissingL2Entry {
+    MissingAction {
         entry_index: usize,
         transaction_index: usize,
     },
     #[error(
-        "batch callData L2 entry {entry_index} does not match effect transaction {transaction_index}"
+        "batch callData action {entry_index} does not rebuild the entry for effect transaction {transaction_index}"
     )]
-    L2EntryMismatch {
+    ActionMismatch {
         entry_index: usize,
         transaction_index: usize,
+    },
+    #[error("batch callData action {entry_index} does not describe rollup {rollup_id}: {reason}")]
+    UnrebuildableAction {
+        entry_index: usize,
+        rollup_id: u64,
+        reason: String,
+    },
+    #[error(
+        "batch callData claims {field} for block {block_number} that the validated header does not carry"
+    )]
+    HeaderInputMismatch {
+        field: &'static str,
+        block_number: u64,
     },
     #[error("canonical Sync-block reconstruction failed: {reason}")]
     SystemTransactionReconstruction { reason: String },
@@ -72,53 +87,85 @@ pub(crate) enum DaPayloadError {
     InvalidEffectTransactionLayout,
 }
 
-const CALL_DATA_TAG: u8 = 0;
-
-/// Borrowed RLP-list bodies that advance as their items are verified.
+/// The decoded payload plus a cursor into its flat transaction column.
 ///
-/// Keeping slices into the original calldata avoids copying transactions and
-/// effect sidecars supplied by an untrusted composer.
-struct DaPayloadCursor<'a> {
-    block_tx_counts: &'a [u8],
-    transactions: &'a [u8],
-    l2_entries: &'a [u8],
+/// Parsing is `eez-payload-codec`, the same decoder the composer encodes with
+/// and the deriver reads with. A second implementation here is what let the
+/// wire format drift from the gate that is supposed to police it; the
+/// independence that matters is the VERIFICATION below, which binds the
+/// payload to the validated blocks and never trusts what it decoded.
+struct DaPayload {
+    span: DecodedSpan,
+    actions: Vec<Action>,
+    next_transaction: usize,
 }
 
-impl<'a> DaPayloadCursor<'a> {
-    fn decode(encoded_payload: &'a [u8]) -> Result<Self, DaPayloadError> {
-        let Some((&tag, encoded_body)) = encoded_payload.split_first() else {
-            return Err(invalid_da_payload("payload is empty"));
-        };
-        if tag != CALL_DATA_TAG {
-            return Err(invalid_da_payload(format!(
-                "unsupported tag byte 0x{tag:02x}; expected 0x{CALL_DATA_TAG:02x}"
-            )));
-        }
-
-        let mut remainder = encoded_body;
-        let mut body = decode_list(&mut remainder)?;
-        if !remainder.is_empty() {
-            return Err(DaPayloadError::TrailingBytes {
-                trailing: remainder.len(),
-            });
-        }
-
-        let block_tx_counts = decode_list(&mut body)?;
-        let transactions = decode_list(&mut body)?;
-        let l2_entries = decode_list(&mut body)?;
-        if !body.is_empty() {
-            return Err(invalid_da_payload("payload body has unexpected fields"));
-        }
+impl DaPayload {
+    fn decode(encoded_payload: &[u8]) -> Result<Self, DaPayloadError> {
+        let container =
+            eez_payload_codec::decode_container(encoded_payload).map_err(|error| match error {
+                eez_payload_codec::CodecError::TrailingBytes(trailing) => {
+                    DaPayloadError::TrailingBytes { trailing }
+                }
+                other => invalid_da_payload(other.to_string()),
+            })?;
         Ok(Self {
-            block_tx_counts,
-            transactions,
-            l2_entries,
+            span: container.span,
+            actions: container.actions,
+            next_transaction: 0,
         })
     }
-}
 
-fn decode_list<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], DaPayloadError> {
-    Header::decode_bytes(input, true).map_err(|error| invalid_da_payload(error.to_string()))
+    /// The submitted transaction count for the `index`-th block of the span.
+    fn block_count(&self, expected_blocks: usize, index: usize) -> Result<usize, DaPayloadError> {
+        let actual = self.span.block_count();
+        if actual != expected_blocks {
+            return Err(DaPayloadError::BlockCount {
+                expected: expected_blocks,
+                actual,
+            });
+        }
+        // Bounds-checked rather than indexed: the count equality above already
+        // implies `index` is in range, but this gate runs on composer-supplied
+        // input and must fail closed rather than panic if that ever changes.
+        self.span
+            .block_tx_counts
+            .get(index)
+            .map(|count| *count as usize)
+            .ok_or(DaPayloadError::BlockCount {
+                expected: expected_blocks,
+                actual,
+            })
+    }
+
+    /// The next transaction in block-major order, or a mismatch if exhausted.
+    fn expect_transaction(
+        &mut self,
+        block_number: u64,
+        transaction_index: usize,
+        expected: &[u8],
+    ) -> Result<(), DaPayloadError> {
+        let submitted = self.span.transactions.get(self.next_transaction);
+        self.next_transaction += 1;
+        if submitted.is_none_or(|tx| tx.as_slice() != expected) {
+            return Err(DaPayloadError::TransactionMismatch {
+                block_number,
+                transaction_index,
+            });
+        }
+        Ok(())
+    }
+
+    /// Every transaction the span carries must have been claimed by a block.
+    fn transactions_exhausted(&self, retained: usize) -> Result<(), DaPayloadError> {
+        if self.next_transaction == self.span.transactions.len() {
+            return Ok(());
+        }
+        Err(DaPayloadError::UnexpectedItems {
+            field: "transactions",
+            expected: retained,
+        })
+    }
 }
 
 fn invalid_da_payload(reason: impl Into<String>) -> DaPayloadError {
@@ -141,6 +188,7 @@ pub(crate) fn verify_da_payload(
     outbound_effects: &AuthorizedOutboundEffects,
     inbound_effects: &AuthorizedInboundEffects<'_>,
     system_transaction_reconstructor: &SystemTransactionReconstructor,
+    expected_rollup_id: u64,
 ) -> Result<(), DaPayloadError> {
     let settling = validated_window.settling_block().block();
     verify_encoded_da_payload(
@@ -153,6 +201,7 @@ pub(crate) fn verify_da_payload(
         outbound_effects,
         inbound_effects,
         system_transaction_reconstructor,
+        expected_rollup_id,
     )
 }
 
@@ -165,6 +214,7 @@ pub(crate) fn verify_da_payload_for_test<'a, I>(
     outbound_effects: &AuthorizedOutboundEffects,
     inbound_effects: &AuthorizedInboundEffects<'_>,
     system_transaction_reconstructor: &SystemTransactionReconstructor,
+    expected_rollup_id: u64,
 ) -> Result<(), DaPayloadError>
 where
     I: ExactSizeIterator<Item = (u64, &'a [u8])>,
@@ -176,6 +226,7 @@ where
         outbound_effects,
         inbound_effects,
         system_transaction_reconstructor,
+        expected_rollup_id,
     )
 }
 
@@ -186,11 +237,12 @@ fn verify_encoded_da_payload<'a, I>(
     outbound_effects: &AuthorizedOutboundEffects,
     inbound_effects: &AuthorizedInboundEffects<'_>,
     system_transaction_reconstructor: &SystemTransactionReconstructor,
+    expected_rollup_id: u64,
 ) -> Result<(), DaPayloadError>
 where
     I: ExactSizeIterator<Item = (u64, &'a [u8])>,
 {
-    let mut payload_cursor = DaPayloadCursor::decode(encoded_payload)?;
+    let mut payload_cursor = DaPayload::decode(encoded_payload)?;
     let expected_blocks = intermediate_blocks.len() + 1;
     let omitted_terminal_count = outbound_effects
         .len()
@@ -214,24 +266,14 @@ where
     let retained_transactions =
         preceding_transaction_count.saturating_add(settling.retained_transaction_count);
 
-    if !payload_cursor.block_tx_counts.is_empty() {
-        return Err(DaPayloadError::UnexpectedItems {
-            field: "blockTxCounts",
-            expected: expected_blocks,
-        });
-    }
-    if !payload_cursor.transactions.is_empty() {
-        return Err(DaPayloadError::UnexpectedItems {
-            field: "transactions",
-            expected: retained_transactions,
-        });
-    }
+    payload_cursor.transactions_exhausted(retained_transactions)?;
 
     verify_effect_sidecars(
-        &mut payload_cursor,
+        &payload_cursor,
         outbound_effects,
         inbound_effects,
         omitted_terminal_count,
+        expected_rollup_id,
     )?;
     if settling.requires_sync_reconstruction {
         verify_reconstructed_sync_block(
@@ -247,7 +289,7 @@ where
 
 /// Verify that every preceding block is reproduced transaction-for-transaction.
 fn verify_preceding_block_transactions<'a, I>(
-    payload_cursor: &mut DaPayloadCursor<'_>,
+    payload_cursor: &mut DaPayload,
     preceding_blocks: I,
     expected_blocks: usize,
 ) -> Result<usize, DaPayloadError>
@@ -257,7 +299,8 @@ where
     let mut retained_transaction_count = 0usize;
     for (block_index, (block_number, block_rlp)) in preceding_blocks.enumerate() {
         let block = decode_validated_block(block_number, block_rlp)?;
-        let submitted_count = next_block_count(payload_cursor, expected_blocks, block_index)?;
+        let submitted_count = payload_cursor.block_count(expected_blocks, block_index)?;
+        verify_header_inputs(payload_cursor, block_index, block_number, &block)?;
         let validated_count = block.body.transactions.len();
         if submitted_count != validated_count {
             return Err(DaPayloadError::ProjectedTransactionCount {
@@ -270,12 +313,7 @@ where
         for (transaction_index, transaction) in
             block.body.encoded_2718_transactions_iter().enumerate()
         {
-            expect_transaction(
-                &mut payload_cursor.transactions,
-                block_number,
-                transaction_index,
-                &transaction,
-            )?;
+            payload_cursor.expect_transaction(block_number, transaction_index, &transaction)?;
         }
     }
     Ok(retained_transaction_count)
@@ -291,7 +329,7 @@ struct SettlingBlockDaVerification {
 /// Verify the settling-block transaction projection and retain exact bytes only
 /// when the canonical Sync sequence must be reconstructed.
 fn verify_settling_block_transactions(
-    payload_cursor: &mut DaPayloadCursor<'_>,
+    payload_cursor: &mut DaPayload,
     (block_number, block_rlp): (u64, &[u8]),
     expected_blocks: usize,
     outbound_effects: &AuthorizedOutboundEffects,
@@ -299,7 +337,8 @@ fn verify_settling_block_transactions(
     omitted_transaction_count: usize,
 ) -> Result<SettlingBlockDaVerification, DaPayloadError> {
     let block = decode_validated_block(block_number, block_rlp)?;
-    let submitted_count = next_block_count(payload_cursor, expected_blocks, expected_blocks - 1)?;
+    let submitted_count = payload_cursor.block_count(expected_blocks, expected_blocks - 1)?;
+    verify_header_inputs(payload_cursor, expected_blocks - 1, block_number, &block)?;
     let validated_count = block.body.transactions.len();
     let retained_transaction_count = validated_count
         .checked_sub(omitted_transaction_count)
@@ -347,12 +386,7 @@ fn verify_settling_block_transactions(
             omitted_positions.next();
             continue;
         }
-        expect_transaction(
-            &mut payload_cursor.transactions,
-            block_number,
-            transaction_index,
-            transaction.as_ref(),
-        )?;
+        payload_cursor.expect_transaction(block_number, transaction_index, transaction.as_ref())?;
     }
     if omitted_positions.next().is_some() {
         return Err(DaPayloadError::InvalidEffectTransactionLayout);
@@ -367,11 +401,18 @@ fn verify_settling_block_transactions(
 }
 
 /// Verify one ordered canonical sidecar for every authorized effect.
+///
+/// The DA publishes ACTIONS, not entries, so each one is rebuilt through the
+/// same projection derivation uses and the result must equal the entry the
+/// authorized effect derives. That binds the action's own fields — target,
+/// value, calldata, outcome — because the rebuilt entry's `proxyEntryHash` and
+/// `rollingHash` are computed from them, not carried.
 fn verify_effect_sidecars(
-    payload_cursor: &mut DaPayloadCursor<'_>,
+    payload: &DaPayload,
     outbound_effects: &AuthorizedOutboundEffects,
     inbound_effects: &AuthorizedInboundEffects<'_>,
     expected_sidecar_count: usize,
+    expected_rollup_id: u64,
 ) -> Result<(), DaPayloadError> {
     let expected_sidecars = outbound_effects
         .iter()
@@ -388,17 +429,76 @@ fn verify_effect_sidecars(
             )
         }));
     for (entry_index, (transaction_index, expected_encoding)) in expected_sidecars.enumerate() {
-        verify_l2_entry(
-            &mut payload_cursor.l2_entries,
-            entry_index,
-            transaction_index,
-            &expected_encoding,
-        )?;
+        let action = payload
+            .actions
+            .get(entry_index)
+            .ok_or(DaPayloadError::MissingAction {
+                entry_index,
+                transaction_index,
+            })?;
+        let rebuilt = entry_from_action(action, RollupId(expected_rollup_id)).map_err(|error| {
+            DaPayloadError::UnrebuildableAction {
+                entry_index,
+                rollup_id: expected_rollup_id,
+                reason: error.to_string(),
+            }
+        })?;
+        if rebuilt.abi_encode() != expected_encoding {
+            return Err(DaPayloadError::ActionMismatch {
+                entry_index,
+                transaction_index,
+            });
+        }
     }
-    if !payload_cursor.l2_entries.is_empty() {
+    if payload.actions.len() != expected_sidecar_count {
         return Err(DaPayloadError::UnexpectedItems {
-            field: "l2Entries",
+            field: "actions",
             expected: expected_sidecar_count,
+        });
+    }
+    Ok(())
+}
+
+/// Bind the span's claimed per-block header inputs to the validated header.
+///
+/// The composer selects beneficiary and extraData per block and derivation
+/// rebuilds headers from these values, so an unchecked claim here would let a
+/// composer publish inputs that disagree with the blocks it actually built and
+/// send followers to a different chain.
+fn verify_header_inputs(
+    payload: &DaPayload,
+    block_index: usize,
+    block_number: u64,
+    block: &EthereumBlock,
+) -> Result<(), DaPayloadError> {
+    let submitted_beneficiary =
+        payload
+            .span
+            .beneficiaries
+            .get(block_index)
+            .ok_or(DaPayloadError::HeaderInputMismatch {
+                field: "beneficiary",
+                block_number,
+            })?;
+    if submitted_beneficiary != &block.header.beneficiary.0.0 {
+        return Err(DaPayloadError::HeaderInputMismatch {
+            field: "beneficiary",
+            block_number,
+        });
+    }
+    let submitted_extra_data =
+        payload
+            .span
+            .extra_data
+            .get(block_index)
+            .ok_or(DaPayloadError::HeaderInputMismatch {
+                field: "extraData",
+                block_number,
+            })?;
+    if submitted_extra_data.as_slice() != block.header.extra_data.as_ref() {
+        return Err(DaPayloadError::HeaderInputMismatch {
+            field: "extraData",
+            block_number,
         });
     }
     Ok(())
@@ -412,66 +512,6 @@ fn decode_validated_block(
         block_number,
         reason: error.to_string(),
     })
-}
-
-fn next_block_count(
-    payload_cursor: &mut DaPayloadCursor<'_>,
-    expected_blocks: usize,
-    block_index: usize,
-) -> Result<usize, DaPayloadError> {
-    if payload_cursor.block_tx_counts.is_empty() {
-        return Err(DaPayloadError::BlockCount {
-            expected: expected_blocks,
-            actual: block_index,
-        });
-    }
-    u16::decode(&mut payload_cursor.block_tx_counts)
-        .map(usize::from)
-        .map_err(|error| invalid_da_payload(error.to_string()))
-}
-
-fn expect_transaction(
-    transactions: &mut &[u8],
-    block_number: u64,
-    transaction_index: usize,
-    expected: &[u8],
-) -> Result<(), DaPayloadError> {
-    if transactions.is_empty() {
-        return Err(DaPayloadError::TransactionMismatch {
-            block_number,
-            transaction_index,
-        });
-    }
-    let encoded_transaction = decode_list(transactions)?;
-    if !encoded_bytes_match(encoded_transaction, expected)? {
-        return Err(DaPayloadError::TransactionMismatch {
-            block_number,
-            transaction_index,
-        });
-    }
-    Ok(())
-}
-
-fn verify_l2_entry(
-    encoded_entries: &mut &[u8],
-    entry_index: usize,
-    transaction_index: usize,
-    expected: &[u8],
-) -> Result<(), DaPayloadError> {
-    if encoded_entries.is_empty() {
-        return Err(DaPayloadError::MissingL2Entry {
-            entry_index,
-            transaction_index,
-        });
-    }
-    let encoded_entry = decode_list(encoded_entries)?;
-    if !encoded_bytes_match(encoded_entry, expected)? {
-        return Err(DaPayloadError::L2EntryMismatch {
-            entry_index,
-            transaction_index,
-        });
-    }
-    Ok(())
 }
 
 fn verify_reconstructed_sync_block(
@@ -539,46 +579,36 @@ fn verify_reconstructed_sync_block(
     Ok(())
 }
 
-pub(super) fn encoded_bytes_match(
-    mut encoded: &[u8],
-    expected: &[u8],
-) -> Result<bool, DaPayloadError> {
-    // `Vec<u8>` is represented here as an RLP list of byte items. Decode it
-    // incrementally so a malformed or non-canonical byte fails closed.
-    for expected_byte in expected {
-        if encoded.is_empty() {
-            return Ok(false);
-        }
-        let actual =
-            u8::decode(&mut encoded).map_err(|error| invalid_da_payload(error.to_string()))?;
-        if actual != *expected_byte {
-            return Ok(false);
-        }
-    }
-    Ok(encoded.is_empty())
-}
-
+/// The chain id these settlement fixtures build streams for. The signer binds
+/// the batch's rollup id, not the stream's chain id, so any stable value works.
 #[cfg(test)]
-pub(crate) fn encode_da_payload(blocks: &[Vec<Vec<u8>>], l2_entries: &[Vec<u8>]) -> Vec<u8> {
-    use alloy_rlp::Encodable as _;
+const TEST_CHAIN_ID: u64 = 7331;
 
-    #[derive(alloy_rlp::RlpEncodable)]
-    struct Body {
-        block_tx_counts: Vec<u16>,
-        transactions: Vec<Vec<u8>>,
-        l2_entries: Vec<Vec<u8>>,
-    }
-
-    let body = Body {
-        block_tx_counts: blocks
-            .iter()
-            .map(|block| u16::try_from(block.len()).expect("test block exceeds u16::MAX txs"))
-            .collect(),
-        transactions: blocks.iter().flatten().cloned().collect(),
-        l2_entries: l2_entries.to_vec(),
-    };
-    let mut encoded = Vec::with_capacity(1 + body.length());
-    encoded.push(CALL_DATA_TAG);
-    body.encode(&mut encoded);
-    encoded
+/// Encode a DA payload for focused tests, through the shared codec so a test
+/// fixture can never encode a shape the composer cannot produce.
+///
+/// `entries` are projected to actions exactly as the composer projects them,
+/// at the rollup id every settlement test uses.
+#[cfg(test)]
+pub(crate) fn encode_da_payload(
+    blocks: &[Vec<Vec<u8>>],
+    entries: &[eez_protocol::abi::ExecutionEntrySol],
+) -> Vec<u8> {
+    let rollup_id = 1;
+    let span: Vec<eez_payload_codec::SpanBlock> = blocks
+        .iter()
+        .map(|transactions| eez_payload_codec::SpanBlock {
+            transactions: transactions.clone(),
+            ..Default::default()
+        })
+        .collect();
+    let actions: Vec<Action> = entries
+        .iter()
+        .map(|entry| {
+            eez_protocol::entries::manifest::action_from_entry(entry, RollupId(rollup_id))
+                .expect("test entry projects to an action")
+        })
+        .collect();
+    eez_payload_codec::encode_container(TEST_CHAIN_ID, &span, &actions)
+        .expect("test payload encodes")
 }
