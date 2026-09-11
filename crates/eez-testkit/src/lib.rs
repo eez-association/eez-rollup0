@@ -235,6 +235,24 @@ struct BundleStub {
     _log_dir: Option<tempfile::TempDir>,
 }
 
+/// Fault modes exposed by the local relay stub for process-level tests.
+#[derive(Clone, Copy, Debug)]
+pub enum BuilderStubMode {
+    Forward,
+    Drop,
+    MethodNotFound,
+}
+
+impl BuilderStubMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Drop => "drop",
+            Self::MethodNotFound => "method_not_found",
+        }
+    }
+}
+
 impl BundleStub {
     async fn spawn(port_lease: PortLease, upstream: &str) -> Result<Self> {
         let port = port_lease.port();
@@ -275,6 +293,19 @@ impl BundleStub {
             "builder-stub did not bind within 3s on {listen}; log:\n{}",
             std::fs::read_to_string(&log_path).unwrap_or_default(),
         );
+    }
+
+    async fn set_mode(&self, mode: BuilderStubMode) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.url.parse()?);
+        let result: String = provider
+            .client()
+            .request("eez_setBuilderMode", (mode.as_str(),))
+            .await
+            .context("set builder stub mode")?;
+        if result != mode.as_str() {
+            bail!("builder stub returned unexpected mode {result}");
+        }
+        Ok(())
     }
 }
 
@@ -750,6 +781,11 @@ impl Harness {
 
     pub fn chain(&self) -> Chain<'_> {
         Chain::new(&self.anvil, &self.dep)
+    }
+
+    /// Select deterministic relay behavior for the next submissions.
+    pub async fn set_builder_mode(&self, mode: BuilderStubMode) -> Result<()> {
+        self.stub.set_mode(mode).await
     }
 
     /// Counts signer successes so negative tests cannot pass because proving stalled.
@@ -1742,15 +1778,26 @@ async fn wait_for_tag_prefix_convergence(
             return Ok(None);
         }
 
-        let mut blocks = Vec::with_capacity(nodes.len());
-        for node in nodes {
-            let Some(block) = l2_block_by_number(&node.l2_rpc_url(), target).await? else {
+        // Comparing only `target` can miss a divergent intermediate block if
+        // a later reorg happens to converge again. Walk the complete common
+        // prefix. Block hashes commit to every header field, including state,
+        // transactions, receipts/logs bloom, timestamp, and extra data.
+        let mut common_tip = None;
+        for height in 0..=target {
+            let mut blocks = Vec::with_capacity(nodes.len());
+            for node in nodes {
+                let Some(block) = l2_block_by_number(&node.l2_rpc_url(), height).await? else {
+                    return Ok(None);
+                };
+                blocks.push(block);
+            }
+            let first = blocks[0];
+            if blocks.iter().any(|block| block.hash != first.hash) {
                 return Ok(None);
-            };
-            blocks.push(block);
+            }
+            common_tip = Some(first);
         }
-        let first = blocks[0];
-        Ok(blocks.iter().all(|b| b.hash == first.hash).then_some(first))
+        Ok(common_tip)
     })
     .await;
     let err = match result {
@@ -1765,6 +1812,28 @@ async fn wait_for_tag_prefix_convergence(
             diagnostic_height = Some(
                 diagnostic_height.map_or(block.number, |height: u64| height.min(block.number)),
             );
+        }
+    }
+    if let Some(target) = diagnostic_height {
+        for height in 0..=target {
+            let mut at_height = Vec::with_capacity(nodes.len());
+            for node in nodes {
+                at_height.push((
+                    node.name.as_str(),
+                    l2_block_by_number(&node.l2_rpc_url(), height)
+                        .await
+                        .ok()
+                        .flatten(),
+                ));
+            }
+            let reference = at_height.first().and_then(|(_, block)| *block);
+            if at_height.iter().any(|(_, block)| *block != reference) {
+                let _ = writeln!(
+                    diagnostics,
+                    "first divergent or missing safe-prefix block: height={height} nodes={at_height:?}"
+                );
+                break;
+            }
         }
     }
     for node in nodes {
