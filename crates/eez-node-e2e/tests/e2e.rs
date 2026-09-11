@@ -132,9 +132,9 @@ async fn multi_composer_intra_batch_suffix_replay_converges() {
 }
 
 // Two composers build incompatible candidates for one settlement window. The
-// loser must observe its stale state claim and converge on the winning chain.
+// loser must converge on the winning chain whether the relay drops its bundle
+// or L1 includes it and rejects its stale state claim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known defect: losing optimistic ownership is resolved by height instead of postBatch identity"]
 async fn two_composers_one_winner_loser_resyncs() {
     let harness = Harness::fresh().await.unwrap();
     let chain = harness.chain();
@@ -154,7 +154,7 @@ async fn two_composers_one_winner_loser_resyncs() {
     // open settlement window instead of allowing two identical candidates.
     let composer_a_rpc = composer_a.l2_rpc_url();
     let composer_b_rpc = composer_b.l2_rpc_url();
-    tokio::try_join!(
+    let (tx_a, tx_b) = tokio::try_join!(
         send_l2_value_transfer_confirmed(
             &composer_a_rpc,
             ANVIL_KEY_1,
@@ -171,36 +171,33 @@ async fn two_composers_one_winner_loser_resyncs() {
         ),
     )
     .expect("failed to stage distinct Composer candidates");
+    assert_ne!(tx_a, tx_b, "the competing candidates must carry distinct txs");
+
+    // Convergence must advance through the divergent transactions, rather than
+    // passing vacuously because both nodes still agree on an older safe prefix.
+    let provider_a = ProviderBuilder::new().connect_http(composer_a_rpc.parse().unwrap());
+    let provider_b = ProviderBuilder::new().connect_http(composer_b_rpc.parse().unwrap());
+    let (receipt_a, receipt_b) = tokio::try_join!(
+        provider_a.get_transaction_receipt(tx_a),
+        provider_b.get_transaction_receipt(tx_b),
+    )
+    .expect("failed to read staged transaction receipts");
+    let convergence_height = receipt_a
+        .and_then(|receipt| receipt.block_number)
+        .expect("Composer A staged transaction has no block number")
+        .max(
+            receipt_b
+                .and_then(|receipt| receipt.block_number)
+                .expect("Composer B staged transaction has no block number"),
+        );
 
     chain
         .wait_for_batches_or_node_failure(2, &[&composer_a, &composer_b], DEFAULT_TIMEOUT)
         .await
         .expect("neither Composer established a canonical winner");
-    wait_for(DEFAULT_TIMEOUT, || {
-        std::future::ready(
-            composer_a
-                .log_count_matching(&["StateRootMismatch"])
-                .and_then(|a| {
-                    composer_b
-                        .log_count_matching(&["StateRootMismatch"])
-                        .map(|b| ((a + b) > 0).then_some(()))
-                }),
-        )
-    })
-    .await
-    .expect("the losing Composer never surfaced its stale state-root claim");
-
-    let safe_a = block_number_and_hash_at(&composer_a.l2_rpc_url(), BlockNumberOrTag::Safe)
-        .await
-        .unwrap()
-        .expect("Composer A has no safe head");
-    let safe_b = block_number_and_hash_at(&composer_b.l2_rpc_url(), BlockNumberOrTag::Safe)
-        .await
-        .unwrap()
-        .expect("Composer B has no safe head");
     wait_for_safe_prefix_convergence(
         &[&composer_a, &composer_b],
-        safe_a.0.min(safe_b.0),
+        convergence_height,
         DEFAULT_TIMEOUT,
     )
     .await

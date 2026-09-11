@@ -566,7 +566,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known defect: cursor confirmation has no postBatch identity"]
     fn rival_post_batch_at_same_height_does_not_resolve_local_entry() {
         use eez_l1::{BatchRecord, L1CanonicalHead};
 
@@ -598,7 +597,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known defect: peer cursor advancement overrides the local Failed verdict"]
     fn rival_cursor_does_not_override_failure_when_observer_finishes_first() {
         let ledger = OptimisticallyIncluded::new();
         ledger.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
@@ -614,7 +612,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known defect: a failure arriving after peer cursor advancement is ignored"]
     fn late_failure_remains_recoverable_after_rival_cursor_advances() {
         let ledger = OptimisticallyIncluded::new();
         ledger.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
