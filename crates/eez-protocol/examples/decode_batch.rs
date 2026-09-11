@@ -1,6 +1,6 @@
 //! Temporary decoder for the block-1251 postBatch divergence probe.
 use alloy_primitives::{B256, hex};
-use alloy_sol_types::{SolCall, SolValue};
+use alloy_sol_types::SolCall;
 use eez_protocol::abi::{ExecutionEntrySol, postAndVerifyBatchCall};
 
 fn dump_entry(label: &str, e: &ExecutionEntrySol) {
@@ -74,12 +74,13 @@ fn main() {
     }
 
     // ── DA payload ──
-    let d = eez_payload_codec::decode(&b.callData).unwrap();
+    let eez_payload_codec::DecodedContainer { span: d, actions } =
+        eez_payload_codec::decode_container(&b.callData).unwrap();
     println!("######## DA PAYLOAD ########");
+    let from_block = 1u64;
     println!("block_count = {}", d.block_count());
     println!("transactions.len() = {}", d.transactions.len());
-    println!("l2_entries.len() = {}", d.l2_entries.len());
-    let from_block = 501u64;
+    println!("actions.len() = {}", actions.len());
     for (idx, c) in d
         .block_tx_counts
         .iter()
@@ -93,23 +94,33 @@ fn main() {
     }
     println!();
 
-    // ── DA l2_entries[] (what the DERIVER actually consumes) ──
-    println!("######## DA l2_entries[] (DERIVER input) ########");
-    for (i, raw) in d.l2_entries.iter().enumerate() {
-        match ExecutionEntrySol::abi_decode(raw) {
-            Ok(e) => dump_entry(&format!("DA l2_entries[{i}]"), &e),
-            Err(err) => println!("DA l2_entries[{i}] DECODE FAILED: {err}"),
-        }
-    }
-
-    // ── Deriver-style partition over the DA entries ──
-    println!("######## DERIVER PARTITION (over DA l2_entries) ########");
-    let entries: Vec<ExecutionEntrySol> = d
-        .l2_entries
+    // ── DA actions (what the DERIVER rebuilds entries from) ──
+    println!("######## DA actions (DERIVER input) ########");
+    let rollup_id = eez_protocol::RollupId(1);
+    let entries: Vec<ExecutionEntrySol> = actions
         .iter()
-        .map(|r| ExecutionEntrySol::abi_decode(r).unwrap())
+        .enumerate()
+        .map(|(i, a)| {
+            println!(
+                "action[{i}]: {} -> {} | {} -> {} | value 0x{} | data {}B | success {}",
+                a.source_rollup_id,
+                a.target_rollup_id,
+                alloy_primitives::Address::from(a.source_address),
+                alloy_primitives::Address::from(a.target_address),
+                hex::encode(a.value),
+                a.data.len(),
+                a.success,
+            );
+            let e = eez_protocol::entries::manifest::entry_from_action(a, rollup_id).unwrap();
+            dump_entry(&format!("DA action[{i}] -> entry"), &e);
+            e
+        })
         .collect();
+
+    // ── Deriver-style partition over the rebuilt entries ──
+    println!("######## DERIVER PARTITION (over rebuilt entries) ########");
     let (outbound, inbound): (Vec<_>, Vec<_>) = entries
+        .clone()
         .into_iter()
         .filter(|e| !e.l2ToL1Calls.is_empty())
         .partition(|e| e.proxyEntryHash == B256::ZERO);
@@ -121,7 +132,7 @@ fn main() {
         "inbound (proxyEntryHash!=0, non-empty l2ToL1Calls) = {}",
         inbound.len()
     );
-    let sync_user_count = d.block_tx_counts.last().map_or(0, |c| usize::from(*c));
+    let sync_user_count = d.block_tx_counts.last().map_or(0, |c| *c as usize);
     let user_start = d.transactions.len().saturating_sub(sync_user_count);
     println!("sync_user_count (last block tx count) = {sync_user_count}");
     println!("user_start index = {user_start}");
@@ -141,10 +152,11 @@ fn main() {
     }
 
     println!();
-    println!("######## DA l2_entries[] (what the deriver feeds the shared builder) ########");
-    for (i, raw) in d.l2_entries.iter().enumerate() {
-        let e = ExecutionEntrySol::abi_decode(raw).unwrap();
-        dump_entry(&format!("DA l2_entries[{i}] (len {})", raw.len()), &e);
+    println!(
+        "######## DA actions rebuilt into entries (what the deriver feeds the builder) ########"
+    );
+    for (i, e) in entries.iter().enumerate() {
+        dump_entry(&format!("DA action[{i}] -> entry"), e);
     }
 
     println!();
@@ -154,19 +166,14 @@ fn main() {
         use eez_protocol::system_tx::{
             SystemTxContext, build_cross_chain_sync_pairs, interleave_sync_block_txs,
         };
-        // Partition DA entries exactly like the deriver.
-        let da_entries: Vec<ExecutionEntrySol> = d
-            .l2_entries
-            .iter()
-            .map(|r| ExecutionEntrySol::abi_decode(r).unwrap())
-            .collect();
-        let (da_outbound, da_inbound): (Vec<_>, Vec<_>) = da_entries
+        // Partition the rebuilt entries exactly like the deriver.
+        let (da_outbound, da_inbound): (Vec<_>, Vec<_>) = entries
             .clone()
             .into_iter()
             .filter(|e| !e.l2ToL1Calls.is_empty())
             .partition(|e| e.proxyEntryHash == B256::ZERO);
         // Pair outbound positionally with last-block user txs.
-        let suc = d.block_tx_counts.last().map_or(0, |c| usize::from(*c));
+        let suc = d.block_tx_counts.last().map_or(0, |c| *c as usize);
         let us = d.transactions.len().saturating_sub(suc);
         let outbound_paired: Vec<(ExecutionEntrySol, alloy_primitives::Bytes)> = da_outbound
             .iter()
