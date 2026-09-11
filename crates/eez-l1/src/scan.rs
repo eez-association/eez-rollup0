@@ -44,7 +44,6 @@ struct DecodedBatchLog {
     /// This batch lists our rollup, so it wiped our queue — a window boundary.
     verifies_our_rollup: bool,
     call_data: Bytes,
-    post_batch_input: Bytes,
     claimed_current_state: Option<B256>,
     claimed_chain: Vec<B256>,
 }
@@ -92,13 +91,6 @@ pub struct ScannedBatch {
     pub tx_hash: B256,
     pub submitter: Address,
     pub call_data: Bytes,
-    /// The `postAndVerifyBatch` calldata this batch decoded from — the tx's own
-    /// input, or the call unwrapped from the router that forwarded it. Carried
-    /// so the Deriver's reconcile fallback decodes `batch.entries`
-    /// from these bytes instead of re-fetching the tx by hash — that lookup
-    /// fails on a pruned or still-resyncing embedded L1 and crashed boot
-    /// catch_up on restart-after-post.
-    pub post_batch_input: Bytes,
     pub state_applied: bool,
     /// Which of this batch's claimed steps L1 actually ran. See [`Settlement`].
     pub settlement: Settlement,
@@ -365,8 +357,8 @@ pub(crate) async fn scan_batch_logs_range(
         // `BatchPosted` carries rollupCount, not rollupId, so every rollup's
         // batch lands here. Skip what we cannot bind to a call — unless it
         // settled OUR rollup (invariant 8), which must derive.
-        let (batch, post_batch_input) = match direct {
-            Ok(call) => (call.batch, input.clone()),
+        let batch = match direct {
+            Ok(call) => call.batch,
             Err(e) if !winner_tx_hashes.contains(&(l1_block_hash, tx_hash)) => {
                 event!(
                     name: "eez.l1_scan.foreign_batch_undecodable",
@@ -381,7 +373,7 @@ pub(crate) async fn scan_batch_logs_range(
             Err(direct) => {
                 // Settled us, so it must derive (invariant 1) — but only
                 // from a call we can identify beyond doubt.
-                let PostBatchCandidate { calldata, batch } =
+                let PostBatchCandidate { batch, .. } =
                     select_wrapped_post_batch(input, rollup_id, posted.rollupCount).map_err(
                         |e| {
                             L1Error::Decode(format!(
@@ -396,7 +388,7 @@ pub(crate) async fn scan_batch_logs_range(
                     tx_hash = %tx_hash,
                     "postBatch posted through a router; derived from the forwarded call",
                 );
-                (batch, Bytes::copy_from_slice(calldata))
+                batch
             }
         };
         let (claimed_current_state, claimed_chain) = our_state_chain(&batch, rollup_id);
@@ -413,7 +405,6 @@ pub(crate) async fn scan_batch_logs_range(
                 .iter()
                 .any(|r| r.rollupId == rollup_id),
             call_data: batch.callData,
-            post_batch_input,
             claimed_current_state,
             claimed_chain,
         });
@@ -463,7 +454,6 @@ pub(crate) async fn scan_batch_logs_range(
             tx_hash: b.tx_hash,
             submitter: b.submitter,
             call_data: b.call_data,
-            post_batch_input: b.post_batch_input,
             state_applied: winner_tx_hashes.contains(&(b.l1_block_hash, b.tx_hash)),
             settlement,
             claimed_current_state: b.claimed_current_state,
