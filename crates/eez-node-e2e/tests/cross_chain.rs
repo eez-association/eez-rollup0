@@ -39,10 +39,13 @@ async fn assert_all_transactions_succeeded(
     for &hash in hashes {
         let hash_string = hash.to_string();
         let landed = wait_for(SETTLE_TIMEOUT, || async {
+            if let Some(failure) = w.node.progress_failure()? {
+                anyhow::bail!("{failure}");
+            }
             if let Some(status) = receipt_ok(rpc_url, hash).await? {
                 return Ok(Some(status));
             }
-            let evictions = w.node.log_lines_matching(&["evict"], 20);
+            let evictions = w.node.log_lines_matching(&["evict"], usize::MAX);
             if let Some(line) = evictions.lines().find(|line| line.contains(&hash_string)) {
                 anyhow::bail!("transaction was permanently evicted before landing: {line}");
             }
