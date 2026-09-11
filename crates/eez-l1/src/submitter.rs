@@ -362,6 +362,27 @@ impl Inner {
         pin_timestamp: Option<u64>,
         expected_final_state: Option<alloy_primitives::B256>,
     ) -> L1Result<SendOutcome> {
+        let target_provider = self.build_target_provider();
+        self.observe_with_provider(
+            &target_provider,
+            tx_hash,
+            target_block,
+            pin_timestamp,
+            expected_final_state,
+        )
+        .await
+    }
+
+    // Provider-injected core used by deterministic observer tests. Production
+    // always calls it with the target-tip provider built above.
+    async fn observe_with_provider<P: Provider>(
+        &self,
+        target_provider: &P,
+        tx_hash: TxHash,
+        target_block: u64,
+        pin_timestamp: Option<u64>,
+        expected_final_state: Option<alloy_primitives::B256>,
+    ) -> L1Result<SendOutcome> {
         // Failure must mean PROVABLY DEAD, not merely slow. A bundle is
         // pinned to `target_block` — included in order there or never —
         // so death = the chain passed the target (head > target) without
@@ -378,7 +399,6 @@ impl Inner {
         // `pinned` buys a slot without weakening that: min == max timestamp
         // leaves one satisfiable height, so the block there decides it.
         let start = tokio::time::Instant::now();
-        let target_provider = self.build_target_provider();
         let mut slow_logged = false;
         loop {
             // Transient RPC failures are retried, never escalated to a
@@ -390,7 +410,7 @@ impl Inner {
                         L1Error::Provider("receipt present but block_number missing".into())
                     })?;
                     let state_applied = self
-                        .settlement_in_block(&target_provider, l1_block, expected_final_state)
+                        .settlement_in_block(target_provider, l1_block, expected_final_state)
                         .await?;
                     return Ok(SendOutcome::Included {
                         tx_hash,
@@ -401,7 +421,7 @@ impl Inner {
                 Ok(None) => {
                     let verdict = match pin_timestamp {
                         Some(pin_ts) => {
-                            pinned_slot_check(&target_provider, target_block, tx_hash, pin_ts).await
+                            pinned_slot_check(target_provider, target_block, tx_hash, pin_ts).await
                         }
                         None => PinnedVerdict::Pending,
                     };
@@ -656,9 +676,76 @@ fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutc
 
 #[cfg(test)]
 mod tests {
-    use super::{PinnedVerdict, pinned_verdict};
+    use super::{PinnedVerdict, Submitter, pinned_verdict};
+    use crate::config::{L1ReaderConfig, SubmitterConfig};
+    use alloy_primitives::{Address, B256};
+    use alloy_provider::ProviderBuilder;
+    use alloy_signer_local::PrivateKeySigner;
+    use alloy_sol_types::SolEvent;
+    use alloy_transport::mock::Asserter;
+    use eez_protocol::abi::L2ExecutionPerformed;
+    use url::Url;
 
     const PIN: u64 = 1_700_000_012;
+
+    fn test_submitter() -> Submitter {
+        let rpc_url = Url::parse("http://127.0.0.1:1").unwrap();
+        Submitter::new(SubmitterConfig {
+            reader: L1ReaderConfig {
+                rpc_url: rpc_url.clone(),
+                eez: Address::ZERO,
+                rollup_id: 1,
+                deploy_block: 0,
+            },
+            builder_rpc_url: rpc_url,
+            target_rpc_url: None,
+            poster: PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap(),
+        })
+    }
+
+    fn settled_root_log(
+        root: B256,
+        block_hash: B256,
+        tx_hash: B256,
+        tx_index: u64,
+    ) -> alloy_rpc_types_eth::Log {
+        alloy_rpc_types_eth::Log {
+            inner: alloy_primitives::Log {
+                address: Address::ZERO,
+                data: L2ExecutionPerformed {
+                    rollupId: 1,
+                    newState: root,
+                }
+                .encode_log_data(),
+            },
+            block_hash: Some(block_hash),
+            block_number: Some(100),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: Some(tx_index),
+            log_index: Some(0),
+            removed: false,
+        }
+    }
+
+    fn receipt_json(tx_hash: B256, block_hash: B256, status: bool) -> serde_json::Value {
+        serde_json::json!({
+            "transactionHash": format!("{tx_hash:#x}"),
+            "transactionIndex": "0x2",
+            "blockHash": format!("{block_hash:#x}"),
+            "blockNumber": "0x64",
+            "from": format!("{:#x}", Address::repeat_byte(0x11)),
+            "to": format!("{:#x}", Address::ZERO),
+            "cumulativeGasUsed": "0x5208",
+            "gasUsed": "0x5208",
+            "contractAddress": null,
+            "logs": [],
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "status": if status { "0x1" } else { "0x0" },
+            "effectiveGasPrice": "0x1",
+            "type": "0x2"
+        })
+    }
 
     #[test]
     fn pinned_verdict_covers_every_arm() {
@@ -689,5 +776,152 @@ mod tests {
         ] {
             assert_eq!(pinned_verdict(block, PIN), want, "{case}");
         }
+    }
+
+    #[tokio::test]
+    async fn settlement_scan_does_not_match_a_different_root() {
+        let submitter = test_submitter();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&vec![settled_root_log(
+            B256::repeat_byte(0x11),
+            B256::repeat_byte(0xaa),
+            B256::repeat_byte(0xbb),
+            3,
+        )]);
+
+        let applied = submitter
+            .inner
+            .settlement_in_block(&provider, 100, Some(B256::repeat_byte(0x22)))
+            .await
+            .unwrap();
+        assert!(!applied, "a different state root must not settle the batch");
+    }
+
+    #[tokio::test]
+    #[ignore = "known defect: live settlement attribution scans the whole L1 block"]
+    async fn rival_transaction_root_does_not_settle_our_post_batch() {
+        let submitter = test_submitter();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let expected = B256::repeat_byte(0x22);
+        let our_post_batch = B256::repeat_byte(0xa1);
+        let rival_post_batch = B256::repeat_byte(0xb2);
+        assert_ne!(our_post_batch, rival_post_batch);
+
+        // Our receipt is at tx index 2, but the only matching settlement event
+        // belongs to the rival at index 7. Block-wide set membership incorrectly
+        // credits this root to our submission.
+        asserter.push_success(&vec![settled_root_log(
+            expected,
+            B256::repeat_byte(0xcc),
+            rival_post_batch,
+            7,
+        )]);
+        let applied = submitter
+            .inner
+            .settlement_in_block(&provider, 100, Some(expected))
+            .await
+            .unwrap();
+        assert!(
+            !applied,
+            "a settlement event emitted by a rival transaction must not settle {our_post_batch}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "known defect: unpinned mempool submissions inherit the bundle target-height deadline"]
+    async fn unpinned_mempool_transaction_remains_pending_after_target_passes() {
+        let submitter = test_submitter();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::json!("0x65"));
+
+        // A public-mempool transaction accepted for target 100 is still live at
+        // head 101. The observer should continue polling instead of returning a
+        // negative verdict merely because the original bundle target passed.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            submitter.inner.observe_with_provider(
+                &provider,
+                B256::repeat_byte(0xa1),
+                100,
+                None,
+                Some(B256::repeat_byte(0x22)),
+            ),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "an unpinned mempool transaction must remain under observation"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "known defect: receipt status is ignored when attributing settlement"]
+    async fn reverted_post_batch_cannot_borrow_a_rival_settlement_event() {
+        let submitter = test_submitter();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let expected = B256::repeat_byte(0x22);
+        let block_hash = B256::repeat_byte(0xcc);
+        let our_post_batch = B256::repeat_byte(0xa1);
+
+        asserter.push_success(&receipt_json(our_post_batch, block_hash, false));
+        asserter.push_success(&vec![settled_root_log(
+            expected,
+            block_hash,
+            B256::repeat_byte(0xb2),
+            7,
+        )]);
+        let outcome = submitter
+            .inner
+            .observe_with_provider(&provider, our_post_batch, 100, None, Some(expected))
+            .await
+            .unwrap();
+        assert!(
+            !matches!(
+                outcome,
+                super::SendOutcome::Included {
+                    state_applied: true,
+                    ..
+                }
+            ),
+            "a reverted postBatch must not be credited with a rival's event"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "known defect: a transient settlement-log error escapes as a negative verdict"]
+    async fn transient_settlement_log_failure_is_inconclusive_and_retried() {
+        let submitter = test_submitter();
+        let expected = B256::repeat_byte(0x22);
+        let block_hash = B256::repeat_byte(0xcc);
+        let post_batch_hash = B256::repeat_byte(0xa1);
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&receipt_json(post_batch_hash, block_hash, true));
+        asserter.push_failure_msg("injected transient eth_getLogs failure");
+        asserter.push_success(&receipt_json(post_batch_hash, block_hash, true));
+        asserter.push_success(&vec![settled_root_log(
+            expected,
+            block_hash,
+            post_batch_hash,
+            2,
+        )]);
+
+        let outcome = submitter
+            .inner
+            .observe_with_provider(&provider, post_batch_hash, 100, None, Some(expected))
+            .await
+            .expect("a transient log-read failure must be retried, not returned as a verdict");
+        assert!(matches!(
+            outcome,
+            super::SendOutcome::Included {
+                state_applied: true,
+                ..
+            }
+        ));
     }
 }
