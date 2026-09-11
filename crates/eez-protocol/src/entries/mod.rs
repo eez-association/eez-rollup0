@@ -7,6 +7,8 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::SolCall;
 use tracing::{debug, trace};
 
+pub mod manifest;
+
 use crate::abi::{
     CrossChainCallSol, EvmBatch, ExecutionEntrySol, L2ExecutionEntrySol, L2ToL1CallSol,
     postAndVerifyBatchCall,

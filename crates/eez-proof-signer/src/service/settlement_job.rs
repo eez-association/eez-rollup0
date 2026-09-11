@@ -257,8 +257,14 @@ impl SettlementPipelineError {
                 | settlement::DaPayloadError::UnexpectedItems { .. }
                 | settlement::DaPayloadError::ProjectedTransactionCount { .. }
                 | settlement::DaPayloadError::TransactionMismatch { .. }
-                | settlement::DaPayloadError::MissingL2Entry { .. }
-                | settlement::DaPayloadError::L2EntryMismatch { .. }
+                | settlement::DaPayloadError::MissingAction { .. }
+                | settlement::DaPayloadError::ActionMismatch { .. }
+                // The composer published a payload that contradicts the blocks
+                // it built: an action for another rollup, or header inputs the
+                // validated header does not carry. Both are the composer's
+                // claim losing to reality.
+                | settlement::DaPayloadError::UnrebuildableAction { .. }
+                | settlement::DaPayloadError::HeaderInputMismatch { .. }
                 | settlement::DaPayloadError::SyncBlockTransactionCount { .. }
                 | settlement::DaPayloadError::SyncBlockTransactionMismatch { .. } => (
                     tonic::Code::FailedPrecondition,
@@ -365,6 +371,7 @@ pub(super) fn run_settlement(
         &authorized_outbound_effects,
         &authorized_inbound_effects,
         system_transaction_reconstructor,
+        expected_rollup_id.get(),
     )?;
 
     let recomputed_public_inputs_hash =

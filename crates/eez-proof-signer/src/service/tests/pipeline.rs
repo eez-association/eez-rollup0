@@ -312,7 +312,8 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         returnData: return_data,
     });
     eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
-    batch.callData = settlement::encode_da_payload(&[Vec::new()], &[sidecar.abi_encode()]).into();
+    batch.callData =
+        settlement::encode_da_payload(&[Vec::new()], std::slice::from_ref(&sidecar)).into();
     let expected_hash = recompute_test_public_inputs_hash(&batch);
     let calldata = eez_protocol::entries::encode_postbatch(&batch);
     let statuses = [true];
@@ -525,10 +526,14 @@ fn a_fully_bound_outbound_effect_is_authorized() {
 
     assert_eq!(run.unwrap().into_inner(), expected_hash);
 
+    // The DA describes the CALL, so an entry differing only by its attached
+    // state update projects to the same action — EEZ binds state updates
+    // through the entry hashes in the public input, not through the DA. A
+    // mismatch therefore has to be a different call.
     let mut mismatched_da = batch;
-    mismatched_da.callData =
-        settlement::encode_da_payload(&[vec![user]], &[mismatched_da.entries[1].abi_encode()])
-            .into();
+    let mut wrong_call = mismatched_da.entries[1].clone();
+    wrong_call.l2ToL1Calls[0].value += alloy_primitives::U256::from(1);
+    mismatched_da.callData = settlement::encode_da_payload(&[vec![user]], &[wrong_call]).into();
     let mismatched_calldata = eez_protocol::entries::encode_postbatch(&mismatched_da);
     let run = run_settlement(SettlementInput {
         submitted_post_batch_calldata: mismatched_calldata,
@@ -543,7 +548,7 @@ fn a_fully_bound_outbound_effect_is_authorized() {
     assert!(matches!(
         run,
         Err(SettlementPipelineError::DaPayload(
-            settlement::DaPayloadError::L2EntryMismatch { .. }
+            settlement::DaPayloadError::ActionMismatch { .. }
         ))
     ));
 }

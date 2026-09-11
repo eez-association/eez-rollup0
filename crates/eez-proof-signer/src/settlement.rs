@@ -21,7 +21,6 @@ use blocks::EthereumBlock;
 #[cfg(test)]
 use blocks::RESERVED_SYSTEM_TRANSACTION_TYPE;
 #[cfg(test)]
-use da::encoded_bytes_match;
 #[cfg(test)]
 use inbound::inspect_inbound_candidate;
 

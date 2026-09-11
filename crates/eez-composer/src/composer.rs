@@ -3970,7 +3970,8 @@ where
             .into());
         }
         let span_len = usize::try_from(span).map_err(|e| format!("batch span overflow: {e}"))?;
-        let mut blocks_rev: Vec<Vec<Vec<u8>>> = Vec::with_capacity(span_len.saturating_sub(1));
+        let mut blocks_rev: Vec<eez_payload_codec::SpanBlock> =
+            Vec::with_capacity(span_len.saturating_sub(1));
         let mut cursor_hash = parent_header.hash();
         let mut cursor_number = parent_header.number();
         while cursor_number >= from {
@@ -4029,7 +4030,13 @@ where
                     .into());
                 }
             }
-            blocks_rev.push(tx_bytes);
+            // Beneficiary and extraData are per-block choices, so the DA
+            // carries them rather than derivation assuming a constant.
+            blocks_rev.push(eez_payload_codec::SpanBlock {
+                beneficiary: block.header().beneficiary().into(),
+                extra_data: block.header().extra_data().to_vec(),
+                transactions: tx_bytes,
+            });
             if cursor_number == 0 {
                 break;
             }
@@ -4041,28 +4048,49 @@ where
         // Outbound user txs aren't reconstructible from the entries (only the load
         // is), so they travel in the Sync-block DA here; the deriver interleaves
         // them with the rebuilt loads. Inbound-only → empty.
-        blocks.push(outbound_user_txs.iter().map(|b| b.to_vec()).collect());
-        // Encoded `ExecutionEntrySol` values let followers reconstruct system
-        // transactions. Outbound entries describe L1 settlement and L2 loads;
-        // inbound target batches carry the L2 delivery inputs. Encode both into
-        // `batch.callData`, which enters the public-input preimage as opaque data.
-        use alloy_sol_types::SolValue as _;
-        // The DA sidecar stores the full derivation entry set in canonical
-        // order: outbound settlement entries first, then inbound deferred
-        // entries. This matches the deriver's prefix split.
-        let l2_entries_bytes: Vec<Vec<u8>> = outbound_entries
+        blocks.push(eez_payload_codec::SpanBlock {
+            // The Sync block does not exist yet; these are the header inputs
+            // `build_sync_block` gives it.
+            beneficiary: Address::ZERO.into(),
+            extra_data: eez_driver::BUILDER_EXTRA_DATA.to_vec(),
+            transactions: outbound_user_txs.iter().map(|b| b.to_vec()).collect(),
+        });
+        // Outbound entries describe L1 settlement and L2 loads; inbound target
+        // batches carry the delivery inputs. Published as actions in that order
+        // — a lean inbound entry binds its call only via `proxyEntryHash`, so
+        // this is its only published copy.
+        let actions: Vec<eez_payload_codec::Action> = outbound_entries
             .iter()
-            .map(eez_protocol::abi::ExecutionEntrySol::abi_encode)
             .chain(
                 compositions
                     .iter()
                     .flat_map(|c| c.targets.iter())
-                    .flat_map(|t| t.batch.entries.iter())
-                    .map(eez_protocol::abi::ExecutionEntrySol::abi_encode),
+                    .flat_map(|t| t.batch.entries.iter()),
             )
-            .collect();
-        let payload = eez_payload_codec::encode(&blocks, &l2_entries_bytes)
-            .map_err(|e| format!("eez_payload_codec::encode: {e}"))?;
+            .map(|entry| {
+                eez_protocol::entries::manifest::action_from_entry(
+                    entry,
+                    eez_protocol::RollupId(rollup_id),
+                )
+                .map_err(|e| format!("DA action for entry: {e}"))
+            })
+            .collect::<Result<_, String>>()?;
+        // Chained state deltas mean a skipped entry strands every later one
+        // (`EEZ.sol:_entryMatches`), so a manifest WE emit can only fail
+        // terminally. The contract allows a success after a failure, so this
+        // gates emission only — decoding must still accept a peer's.
+        if let Some(at) = actions.iter().position(|a| !a.success)
+            && at + 1 != actions.len()
+        {
+            return Err(format!(
+                "action {at} of {} failed but is not last; our chained entries cannot settle \
+                 past a failure",
+                actions.len(),
+            )
+            .into());
+        }
+        let payload = eez_payload_codec::encode_container(ctx.l2_chain_id, &blocks, &actions)
+            .map_err(|e| format!("eez_payload_codec::encode_container: {e}"))?;
         batch.callData = alloy_primitives::Bytes::from(payload);
 
         // Priced on the encoded candidate before witnesses and proving; `Ok(None)`

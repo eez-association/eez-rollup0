@@ -7,7 +7,6 @@ rust-version.workspace = true
 description            = "Batch payload encode/decode shared by the Submitter and the Deriver."
 
 [dependencies]
-alloy-rlp.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

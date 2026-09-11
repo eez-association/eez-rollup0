@@ -7,6 +7,8 @@ rust-version.workspace = true
 description            = "The eez cross-chain protocol: Solidity ABI + entry building, composition engine, composer, checkpoint format, proof signing."
 
 [dependencies]
+# the DA wire format: entries project to codec actions and back
+eez-payload-codec.workspace = true
 thiserror.workspace   = true
 serde.workspace       = true
 tracing.workspace     = true
@@ -29,7 +31,6 @@ reth-primitives-traits.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 hex.workspace = true
-eez-payload-codec.workspace = true
 
 [lints]
 workspace = true
