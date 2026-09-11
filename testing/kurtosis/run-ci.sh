@@ -23,8 +23,8 @@ signed_window_count=0
 remote_attestation_count=0
 export KURTOSIS_ARGS_FILE="$RESULT_DIR/ci-args.yaml"
 
-SIGNED_WINDOW_EVENT='event_name="eez.proof_signer.window_signed"'
-REMOTE_ATTESTATION_EVENT='event_name="eez.prover_client.attested"'
+SIGNED_WINDOW_EVENT='eez.proof_signer.window_signed'
+REMOTE_ATTESTATION_EVENT='eez.prover_client.attested'
 
 capture_service_log() {
     local service="$1"
@@ -80,6 +80,7 @@ write_result() {
         } + if $result == "pass" then {
             modes: ["inbound", "outbound", "mixed", "mixed-pure"],
             cross_chain_convergence: "pass",
+            state_chaining: "pass",
             l1_l2_root_divergence: 0,
             safe_head_convergence: "pass"
         } else {} end' >"$RESULT_DIR/result.json"
@@ -149,18 +150,13 @@ sed \
 bash "$HERE/start.sh" "$KURTOSIS_ARGS_FILE"
 
 # Wait until the canonical L1 and candidate L2 RPCs answer.
-http_url() {
-    case "$1" in
-        "") printf '\n' ;;
-        http://* | https://*) printf '%s\n' "$1" ;;
-        *) printf 'http://%s\n' "$1" ;;
-    esac
-}
+# shellcheck disable=SC1091
+source "$HERE/ports.sh" >/dev/null
+l1="$EEZ_DEVNET_L1_RPC"
+l2="$EEZ_DEVNET_L2_RPC"
 
 deadline=$((SECONDS + ${EEZ_CI_READY_TIMEOUT_SECS:-900}))
 while (( SECONDS < deadline )); do
-    l1="$(http_url "$(kurtosis port print "$KURTOSIS_ENCLAVE" el-1-reth-lighthouse rpc 2>/dev/null || true)")"
-    l2="$(http_url "$(kurtosis port print "$KURTOSIS_ENCLAVE" eez-node l2-rpc 2>/dev/null || true)")"
     if [[ -n "$l1" && -n "$l2" ]] \
         && cast block-number --rpc-url "$l1" >/dev/null 2>&1 \
         && cast block-number --rpc-url "$l2" >/dev/null 2>&1; then
@@ -177,7 +173,7 @@ L2="$l2" bash "$HERE/scripts/verify-eezl2-deployment.sh"
 
 while (( SECONDS < deadline )); do
     node_logs="$(timeout 10s kurtosis service logs "$KURTOSIS_ENCLAVE" eez-node 2>/dev/null || true)"
-    if grep -qE 'bundle outcome observed.*Included' <<<"$node_logs"; then
+    if grep -qE '"event_name":"eez.composer.bundle.observed".*"outcome":"Included' <<<"$node_logs"; then
         break
     fi
     sleep 5
@@ -209,6 +205,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         echo "- Proof-signer image: \`$EEZ_PROOF_SIGNER_IMAGE\`"
         echo "- Deploy image: \`$EEZ_DEPLOY_IMAGE\`"
         echo "- Inbound, outbound, mixed, and mixed-pure waves: pass"
+        echo "- Inbound, outbound, and mixed-direction state chaining: pass"
         echo "- Supported protocol network scenarios: pass"
         echo "- Signed windows observed: $signed_window_count"
         echo "- Remote attestations observed: $remote_attestation_count"

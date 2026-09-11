@@ -296,6 +296,7 @@ impl Inner {
                     event!(
                         name: "eez.submitter.bundle.mempool_fallback",
                         Level::WARN,
+                        event_name = "eez.submitter.bundle.mempool_fallback",
                         target_block,
                         tx_count = raw_txs.len(),
                         "relay has no eth_sendBundle; the mempool does NOT guarantee bundle order, so bundled user txs may revert",
@@ -304,6 +305,7 @@ impl Inner {
                     event!(
                         name: "eez.submitter.bundle.mempool_fallback",
                         Level::INFO,
+                        event_name = "eez.submitter.bundle.mempool_fallback",
                         target_block,
                         tx_count = raw_txs.len(),
                         "relay has no eth_sendBundle; submitting the lone postBatch via mempool",

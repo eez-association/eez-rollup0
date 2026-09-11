@@ -10,6 +10,9 @@ pragma solidity ^0.8.28;
 /// `entry.returnData`).
 contract SetterWrapper {
     address public immutable proxy;
+    uint256 public completedProxyCalls;
+    bool public lastChanged;
+    uint256 public lastNewValue;
 
     /// Carries the L2 `Value.setValue` return tuple back into an L1 log:
     /// `input` is what we sent, `changed`/`newValue` is what L2 returned.
@@ -24,10 +27,30 @@ contract SetterWrapper {
     /// into this frame, and emits it — "doing something with the L2
     /// result" entirely within the L1 tx.
     function setViaProxy(uint256 v) external {
-        (bool ok, bytes memory ret) =
-            proxy.call(abi.encodeWithSignature("setValue(uint256)", v));
+        _setViaProxy(v);
+    }
+
+    /// Derives the proxy-call calldata from source-chain state. Separate calls
+    /// composed together must therefore observe the preceding call count.
+    function setNextValueViaProxy() external {
+        _setViaProxy(completedProxyCalls + 1);
+    }
+
+    /// Calls the same proxy twice with identical calldata. Both invocations
+    /// deliberately share their semantic cross-chain hash; their ordered entry
+    /// positions, rather than the hash, distinguish them.
+    function setSameValueTwice(uint256 v) external {
+        _setViaProxy(v);
+        _setViaProxy(v);
+    }
+
+    function _setViaProxy(uint256 v) private {
+        (bool ok, bytes memory ret) = proxy.call(abi.encodeWithSignature("setValue(uint256)", v));
         require(ok, "cross-chain setValue reverted");
         (bool changed, uint256 newValue) = abi.decode(ret, (bool, uint256));
+        completedProxyCalls++;
+        lastChanged = changed;
+        lastNewValue = newValue;
         emit Wrapped(v, ok, changed, newValue);
     }
 }

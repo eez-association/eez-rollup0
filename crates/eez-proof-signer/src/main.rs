@@ -138,6 +138,7 @@ fn init_tracing() -> eyre::Result<()> {
     };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .json()
         .try_init()
         .map_err(|error| eyre::eyre!(error))
         .wrap_err("install tracing subscriber")

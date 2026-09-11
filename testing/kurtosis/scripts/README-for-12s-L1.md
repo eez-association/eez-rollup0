@@ -175,8 +175,9 @@ docker compose --env-file .env.kurtosis -f docker-compose.kurtosis-node.yml up -
 
 `.env.kurtosis.example` documents the rest: host paths (`L1_GENESIS_DIR`,
 `L2_DATA_DIR`, `JWT_FILE`, `FRESH_GENESIS`), the funded poster key, and
-`EEZ_PROOF_SIGNER_KEY` — which must be the same key used for
-`make deploy-protocol`, since its address is the on-chain `authorizedSigner`.
+`EEZ_PROOF_SIGNER_KEY` — whose address must be configured as the on-chain
+`authorizedSigner`. The poster/deployer pays for L1 transactions; the proof
+signer does not need to be a funded transaction-sending account.
 
 Timing is 12s L1 / 2s L2 → K=6, with `proof + slack = 3000ms < 12000ms`
 (`docker-compose.kurtosis-node.yml`).

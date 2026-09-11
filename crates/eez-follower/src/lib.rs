@@ -180,6 +180,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
                 event!(
                     name: "eez.node.deriver.boot_catch_up.failed",
                     Level::ERROR,
+                    event_name = "eez.node.deriver.boot_catch_up.failed",
                     mode = "follower",
                     error = %err,
                     "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",
