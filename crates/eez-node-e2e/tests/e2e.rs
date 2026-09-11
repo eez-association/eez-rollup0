@@ -152,16 +152,18 @@ async fn two_composers_one_winner_loser_resyncs() {
 
     // Different transactions force different local state roots for the same
     // open settlement window instead of allowing two identical candidates.
+    let composer_a_rpc = composer_a.l2_rpc_url();
+    let composer_b_rpc = composer_b.l2_rpc_url();
     tokio::try_join!(
         send_l2_value_transfer_confirmed(
-            &composer_a.l2_rpc_url(),
+            &composer_a_rpc,
             ANVIL_KEY_1,
             ANVIL_ADDR,
             U256::from(1u64),
             DEFAULT_TIMEOUT,
         ),
         send_l2_value_transfer_confirmed(
-            &composer_b.l2_rpc_url(),
+            &composer_b_rpc,
             ANVIL_KEY_2,
             ANVIL_ADDR_3,
             U256::from(2u64),
