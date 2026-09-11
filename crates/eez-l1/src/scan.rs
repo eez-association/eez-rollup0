@@ -11,6 +11,7 @@ use eez_protocol::abi::{
     BatchPosted, L2ExecutionPerformed, ProofSystemBatchPerVerificationEntriesSol,
     postAndVerifyBatchCall,
 };
+use eez_protocol::entries::{PostBatchCandidate, postbatch_candidates};
 use tracing::{Level, event};
 
 use crate::error::{L1Error, L1Result};
@@ -91,8 +92,8 @@ pub struct ScannedBatch {
     pub tx_hash: B256,
     pub submitter: Address,
     pub call_data: Bytes,
-    /// The originating postBatch tx's full input (the `postAndVerifyBatch`
-    /// calldata), captured from the tx fetched by (block, index). Carried
+    /// The `postAndVerifyBatch` calldata this batch decoded from — the tx's own
+    /// input, or the call unwrapped from the router that forwarded it. Carried
     /// so the Deriver's reconcile fallback decodes `batch.entries`
     /// from these bytes instead of re-fetching the tx by hash — that lookup
     /// fails on a pruned or still-resyncing embedded L1 and crashed boot
@@ -347,11 +348,25 @@ pub(crate) async fn scan_batch_logs_range(
             .await?;
         let submitter = tx.inner.signer();
         let input = tx.inner.input();
-        // `BatchPosted` carries rollupCount, not rollupId, so we decode every
-        // rollup's batch — and a peer posting via a router yields undecodable
-        // input. Skip unless it settled OUR rollup (invariant 8).
-        let decoded = match postAndVerifyBatchCall::abi_decode(input) {
-            Ok(decoded) => decoded,
+        // `rollupCount` is the log's only payload; selection below needs it.
+        let posted = BatchPosted::decode_log(&alloy_primitives::Log {
+            address: log.address(),
+            data: log.data().clone(),
+        })
+        .map_err(|e| L1Error::Decode(format!("decode BatchPosted({tx_hash}): {e}")))?;
+        // Only a direct call to EEZ has an input that IS the call that ran.
+        // Anything else forwards it, so those bytes go through selection below.
+        let direct = match tx.inner.to() {
+            Some(to) if to == eez => {
+                postAndVerifyBatchCall::abi_decode(input).map_err(|e| e.to_string())
+            }
+            _ => Err("tx did not call EEZ directly".to_string()),
+        };
+        // `BatchPosted` carries rollupCount, not rollupId, so every rollup's
+        // batch lands here. Skip what we cannot bind to a call — unless it
+        // settled OUR rollup (invariant 8), which must derive.
+        let (batch, post_batch_input) = match direct {
+            Ok(call) => (call.batch, input.clone()),
             Err(e) if !winner_tx_hashes.contains(&(l1_block_hash, tx_hash)) => {
                 event!(
                     name: "eez.l1_scan.foreign_batch_undecodable",
@@ -359,20 +374,32 @@ pub(crate) async fn scan_batch_logs_range(
                     l1_block_number,
                     tx_hash = %tx_hash,
                     error = %e,
-                    "skipping an undecodable postBatch that did not settle our rollup",
+                    "skipping a postBatch we cannot bind to a call that ran; it did not settle our rollup",
                 );
                 continue;
             }
-            Err(e) => {
-                return Err(L1Error::Decode(format!("decode postBatch({tx_hash}): {e}")));
+            Err(direct) => {
+                // Settled us, so it must derive (invariant 1) — but only
+                // from a call we can identify beyond doubt.
+                let PostBatchCandidate { calldata, batch } =
+                    select_wrapped_post_batch(input, rollup_id, posted.rollupCount).map_err(
+                        |e| {
+                            L1Error::Decode(format!(
+                                "decode postBatch({tx_hash}): {direct}; router unwrap: {e}"
+                            ))
+                        },
+                    )?;
+                event!(
+                    name: "eez.l1_scan.router_wrapped_batch",
+                    Level::INFO,
+                    l1_block_number,
+                    tx_hash = %tx_hash,
+                    "postBatch posted through a router; derived from the forwarded call",
+                );
+                (batch, Bytes::copy_from_slice(calldata))
             }
         };
-        let _decoded_event = BatchPosted::decode_log(&alloy_primitives::Log {
-            address: log.address(),
-            data: log.data().clone(),
-        })
-        .map_err(|e| L1Error::Decode(format!("decode BatchPosted({tx_hash}): {e}")))?;
-        let (claimed_current_state, claimed_chain) = our_state_chain(&decoded.batch, rollup_id);
+        let (claimed_current_state, claimed_chain) = our_state_chain(&batch, rollup_id);
         decoded_batches.push(DecodedBatchLog {
             l1_block_number,
             l1_block_hash,
@@ -381,13 +408,12 @@ pub(crate) async fn scan_batch_logs_range(
             submitter,
             // A batch verifies (and therefore wipes) our rollup iff it lists it
             // — the same array `postAndVerifyBatch` loops over to mark verified.
-            verifies_our_rollup: decoded
-                .batch
+            verifies_our_rollup: batch
                 .rollupIdsWithProofSystems
                 .iter()
                 .any(|r| r.rollupId == rollup_id),
-            call_data: decoded.batch.callData,
-            post_batch_input: input.clone(),
+            call_data: batch.callData,
+            post_batch_input,
             claimed_current_state,
             claimed_chain,
         });
@@ -445,6 +471,42 @@ pub(crate) async fn scan_batch_logs_range(
         });
     }
     Ok(out)
+}
+
+/// Pick the `postAndVerifyBatch` call a router-posted transaction ran: the one
+/// listing our rollup over the log's rollup count.
+///
+/// Anything short of a unique match is an error. Unlike a top-level input these
+/// bytes are not bound to execution, so guessing would let calldata that never
+/// ran dictate what we derive (invariant 7).
+fn select_wrapped_post_batch(
+    input: &[u8],
+    rollup_id: u64,
+    log_rollup_count: U256,
+) -> Result<PostBatchCandidate<'_>, String> {
+    let candidates = postbatch_candidates(input);
+    let total = candidates.len();
+    let mut ours: Vec<PostBatchCandidate<'_>> = candidates
+        .into_iter()
+        .filter(|c| {
+            U256::from(c.batch.rollupIdsWithProofSystems.len()) == log_rollup_count
+                && c.batch
+                    .rollupIdsWithProofSystems
+                    .iter()
+                    .any(|r| r.rollupId == rollup_id)
+        })
+        .collect();
+    match ours.len() {
+        1 => Ok(ours.remove(0)),
+        0 => Err(format!(
+            "none of {total} embedded call(s) verify rollup {rollup_id} over the log's \
+             {log_rollup_count} rollup(s)"
+        )),
+        n => Err(format!(
+            "{n} of {total} embedded call(s) verify rollup {rollup_id}; refusing to guess \
+             which one ran"
+        )),
+    }
 }
 
 /// Our rollup's state-update chain in a batch: the first update's
@@ -572,7 +634,7 @@ mod tests {
     use super::{
         BatchLogChunks, LOG_SCAN_CHUNK_BLOCKS, SettledRoot, Settlement, attribute_settlement,
         fetch_log_transaction, initial_log_scan_ranges, scan_batch_logs_range,
-        scan_next_batch_log_chunk, window_roots,
+        scan_next_batch_log_chunk, select_wrapped_post_batch, window_roots,
     };
     use crate::error::L1Error;
     use alloy_consensus::transaction::TxHashRef;
@@ -968,13 +1030,19 @@ mod tests {
     }
 
     fn mock_post_batch_tx(input: Vec<u8>) -> alloy_rpc_types_eth::Transaction {
+        mock_post_batch_tx_to(input, Address::ZERO)
+    }
+
+    /// A postBatch tx sent to `to` — `Address::ZERO` is the EEZ address every
+    /// test scans with, anything else is a wrapper contract.
+    fn mock_post_batch_tx_to(input: Vec<u8>, to: Address) -> alloy_rpc_types_eth::Transaction {
         use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy, transaction::Recovered};
         let tx = TxLegacy {
             chain_id: Some(1),
             nonce: 0,
             gas_price: 1,
             gas_limit: 21_000,
-            to: alloy_primitives::TxKind::Call(Address::ZERO),
+            to: alloy_primitives::TxKind::Call(to),
             value: U256::ZERO,
             input: Bytes::from(input),
         };
@@ -996,11 +1064,22 @@ mod tests {
         tx_hash: B256,
         tx_index: u64,
     ) -> alloy_rpc_types_eth::Log {
+        batch_posted_log_with_count(block_number, block_hash, tx_hash, tx_index, 1)
+    }
+
+    /// A `BatchPosted` log carrying an explicit `rollupCount`.
+    fn batch_posted_log_with_count(
+        block_number: u64,
+        block_hash: B256,
+        tx_hash: B256,
+        tx_index: u64,
+        rollup_count: u64,
+    ) -> alloy_rpc_types_eth::Log {
         alloy_rpc_types_eth::Log {
             inner: alloy_primitives::Log {
                 address: Address::ZERO,
                 data: BatchPosted {
-                    rollupCount: U256::from(1),
+                    rollupCount: U256::from(rollup_count),
                 }
                 .encode_log_data(),
             },
@@ -1320,8 +1399,9 @@ mod tests {
     }
 
     /// `BatchPosted` carries rollupCount, not rollupId, so a peer posting via a
-    /// router yields an input we cannot decode. That must not halt us — unless
-    /// the same tx settled OUR rollup, which we then genuinely cannot derive.
+    /// router yields an input we cannot decode top-level. That must not halt
+    /// us — unless the tx settled OUR rollup and carries no identifiable call,
+    /// which must fail loudly.
     #[tokio::test]
     async fn undecodable_foreign_batch_is_skipped_but_one_that_settled_us_is_fatal() {
         let block_hash = B256::with_last_byte(0xA1);
@@ -1357,5 +1437,197 @@ mod tests {
             .await
             .expect_err("an undecodable batch that moved our root must not be skipped");
         assert!(err.is_terminal(), "unexpected error: {err}");
+    }
+
+    /// Wrap calls the way a router does: own selector, a head word per
+    /// forwarded `bytes` arg, then each length-prefixed and padded to 32.
+    fn router_input(calls: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = vec![0x6f, 0xad, 0xcf, 0x72];
+        let mut offset = 32 * calls.len();
+        for call in calls {
+            out.extend_from_slice(&U256::from(offset).to_be_bytes::<32>());
+            offset += 32 + call.len().next_multiple_of(32);
+        }
+        for call in calls {
+            out.extend_from_slice(&U256::from(call.len()).to_be_bytes::<32>());
+            out.extend_from_slice(call);
+            out.resize(
+                out.len() + (call.len().next_multiple_of(32) - call.len()),
+                0,
+            );
+        }
+        out
+    }
+
+    /// `postAndVerifyBatch` calldata verifying `rollup_ids`, tagged with `salt`
+    /// so candidates from one input stay distinguishable.
+    fn post_batch_calldata_for(rollup_ids: &[u64], salt: u64) -> Vec<u8> {
+        let batch = ProofSystemBatchPerVerificationEntriesSol {
+            rollupIdsWithProofSystems: rollup_ids
+                .iter()
+                .map(|&id| RollupIdWithProofSystemsSol {
+                    rollupId: id,
+                    proofSystemIndexes: vec![],
+                })
+                .collect(),
+            immediateEntryCount: U256::from(salt),
+            // Marker payload: asserting on it proves which call was selected.
+            callData: Bytes::from(vec![salt as u8; 4]),
+            ..Default::default()
+        };
+        postAndVerifyBatchCall { batch }.abi_encode()
+    }
+
+    /// The honest multicall shape. First-match would take whichever call sits
+    /// first in the byte stream; selection takes the one verifying us.
+    #[test]
+    fn the_call_that_verifies_us_is_selected_not_the_first_one() {
+        let theirs = post_batch_calldata_for(&[2], 11);
+        let ours = post_batch_calldata_for(&[1], 22);
+        let input = router_input(&[theirs, ours.clone()]);
+
+        let picked = select_wrapped_post_batch(&input, 1, U256::from(1))
+            .expect("the call verifying our rollup is unambiguous");
+        assert_eq!(picked.calldata, &ours[..]);
+        assert_eq!(picked.batch.immediateEntryCount, U256::from(22));
+    }
+
+    /// Two calls both verify us: the bytes cannot say which ran, so refuse.
+    #[test]
+    fn ambiguous_wrapped_calls_are_rejected() {
+        let input = router_input(&[
+            post_batch_calldata_for(&[1], 11),
+            post_batch_calldata_for(&[1], 22),
+        ]);
+
+        let err = select_wrapped_post_batch(&input, 1, U256::from(1))
+            .expect_err("two calls verifying us must not resolve");
+        assert!(err.contains("refusing to guess"), "unexpected error: {err}");
+    }
+
+    /// A decoy is planted calldata that never ran. The log's `rollupCount` is
+    /// the one execution-bound fact we have, so a disagreeing candidate drops.
+    #[test]
+    fn a_candidate_disagreeing_with_the_logs_rollup_count_is_rejected() {
+        let decoy = post_batch_calldata_for(&[1, 2], 99);
+        let real = post_batch_calldata_for(&[1], 22);
+        let input = router_input(&[decoy, real.clone()]);
+
+        let picked = select_wrapped_post_batch(&input, 1, U256::from(1))
+            .expect("the count filter leaves exactly the real call");
+        assert_eq!(picked.calldata, &real[..]);
+
+        // With no call matching the log's count, nothing is selected.
+        let err = select_wrapped_post_batch(
+            &router_input(&[post_batch_calldata_for(&[1], 1)]),
+            1,
+            U256::from(2),
+        )
+        .expect_err("a count disagreement must not resolve");
+        assert!(err.contains("none of"), "unexpected error: {err}");
+    }
+
+    /// A router-posted batch that settled us derives from the forwarded call.
+    #[tokio::test]
+    async fn a_router_posted_batch_that_settled_us_is_unwrapped_and_derived() {
+        let block_hash = B256::with_last_byte(0xA1);
+        let inner = post_batch_calldata_for(&[1], 7);
+        let tx = mock_post_batch_tx(router_input(std::slice::from_ref(&inner)));
+        let tx_hash = *tx.inner.tx_hash();
+
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&vec![batch_posted_log(700, block_hash, tx_hash, 0)]);
+        asserter.push_success(&vec![settled_root_log(
+            1,
+            B256::repeat_byte(0x77),
+            700,
+            block_hash,
+            tx_hash,
+            0,
+            0,
+        )]);
+        asserter.push_success(&tx);
+
+        let scanned = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
+            .await
+            .expect("a router-posted batch that settled us must derive");
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].call_data, Bytes::from(vec![7u8; 4]));
+        assert!(scanned[0].state_applied);
+    }
+
+    /// The unwrap is reached only for a tx that settled us, so a decoy in any
+    /// other tx never becomes a batch — and never plants a window boundary.
+    #[tokio::test]
+    async fn a_decoy_in_a_tx_that_did_not_settle_us_is_skipped() {
+        let block_hash = B256::with_last_byte(0xA1);
+        let tx = mock_post_batch_tx(router_input(&[post_batch_calldata_for(&[1], 9)]));
+        let tx_hash = *tx.inner.tx_hash();
+
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&vec![batch_posted_log(700, block_hash, tx_hash, 0)]);
+        asserter.push_success(&Vec::<alloy_rpc_types_eth::Log>::new());
+        asserter.push_success(&tx);
+
+        let scanned = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
+            .await
+            .expect("a decoy that settled nothing of ours must not fail the scan");
+        assert!(scanned.is_empty(), "a decoy must never become a batch");
+    }
+
+    /// A 4-byte selector is not a signature, so a wrapper can carry ours. Only
+    /// a direct call to EEZ is trusted as-is; this one goes through selection.
+    #[tokio::test]
+    async fn a_selector_colliding_wrapper_is_not_taken_as_a_direct_call() {
+        let block_hash = B256::with_last_byte(0xA1);
+        let wrapper = Address::with_last_byte(0xEE);
+        let tx = mock_post_batch_tx_to(post_batch_calldata_for(&[1], 9), wrapper);
+        let tx_hash = *tx.inner.tx_hash();
+
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&vec![batch_posted_log(700, block_hash, tx_hash, 0)]);
+        asserter.push_success(&Vec::<alloy_rpc_types_eth::Log>::new());
+        asserter.push_success(&tx);
+
+        let scanned = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
+            .await
+            .expect("a wrapper that settled nothing of ours must not fail the scan");
+        assert!(
+            scanned.is_empty(),
+            "only a direct call to EEZ carries an input we can trust",
+        );
+    }
+
+    /// The same wrapper, but it DID settle us: selection resolves the call it
+    /// forwarded (here the whole input), so the batch derives.
+    #[tokio::test]
+    async fn a_wrapper_that_settled_us_still_resolves_its_call() {
+        let block_hash = B256::with_last_byte(0xA1);
+        let calldata = post_batch_calldata_for(&[1], 9);
+        let tx = mock_post_batch_tx_to(calldata.clone(), Address::with_last_byte(0xEE));
+        let tx_hash = *tx.inner.tx_hash();
+
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        asserter.push_success(&vec![batch_posted_log(700, block_hash, tx_hash, 0)]);
+        asserter.push_success(&vec![settled_root_log(
+            1,
+            B256::repeat_byte(0x77),
+            700,
+            block_hash,
+            tx_hash,
+            0,
+            0,
+        )]);
+        asserter.push_success(&tx);
+
+        let scanned = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
+            .await
+            .expect("a wrapped batch that settled us must derive");
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].call_data, Bytes::from(vec![9u8; 4]));
     }
 }
