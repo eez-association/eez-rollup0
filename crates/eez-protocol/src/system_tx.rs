@@ -22,13 +22,6 @@ pub struct SystemTxContext {
     pub eezl2_address: Address,
     /// EIP-155 chain id of this L2.
     pub l2_chain_id: u64,
-    /// `gasPrice` for the native system tx. Dev/devnet uses
-    /// 1 gwei (above the dev-mode 0 basefee).
-    pub l2_gas_price: u128,
-    /// Per-tx gas budget. Matches
-    /// `crosschain-evm-composer::EXECUTE_INCOMING_GAS_LIMIT` (~2M)
-    /// from the reference impl.
-    pub l2_gas_limit: u64,
     /// This rollup's id — entries whose `destinationRollupId` doesn't
     /// match are skipped (they belong to a different L2).
     pub this_rollup_id: u64,
@@ -96,8 +89,6 @@ pub fn build_inbound_system_txs(
             calldata,
             outer.value,
             cfg.l2_chain_id,
-            cfg.l2_gas_price,
-            cfg.l2_gas_limit,
         )?;
         nonce = nonce.checked_add(1).ok_or_else(|| {
             "SYSTEM_ADDRESS nonce overflow in build_inbound_system_txs".to_string()
@@ -150,8 +141,6 @@ pub fn build_outbound_load_table_txs(
             calldata,
             U256::ZERO, // loadExecutionTable carries no value
             cfg.l2_chain_id,
-            cfg.l2_gas_price,
-            cfg.l2_gas_limit,
         )?;
         nonce = nonce.checked_add(1).ok_or_else(|| {
             "SYSTEM_ADDRESS nonce overflow in build_outbound_load_table_txs".to_string()
@@ -378,8 +367,6 @@ fn encode_system_tx(
     calldata: Vec<u8>,
     value: U256,
     chain_id: u64,
-    gas_price: u128,
-    gas_limit: u64,
 ) -> Result<Bytes, String> {
     if to != EEZL2_ADDRESS {
         return Err("native system transactions must target the EEZL2 predeploy".to_string());
@@ -387,8 +374,6 @@ fn encode_system_tx(
     Ok(SystemTransaction {
         chain_id,
         nonce,
-        gas_price,
-        gas_limit,
         to,
         value,
         input: calldata.into(),
@@ -410,8 +395,6 @@ mod tests {
         SystemTxContext {
             eezl2_address: address!("4200000000000000000000000000000000000007"),
             l2_chain_id: 1,
-            l2_gas_price: 1_000_000_000,
-            l2_gas_limit: 2_000_000,
             this_rollup_id: 1,
         }
     }

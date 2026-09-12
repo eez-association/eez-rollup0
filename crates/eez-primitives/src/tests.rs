@@ -6,8 +6,6 @@ fn system() -> EezTxEnvelope {
     SystemTransaction {
         chain_id: 1,
         nonce: 0,
-        gas_price: 7,
-        gas_limit: 21_000,
         to: EEZL2_ADDRESS,
         value: U256::ZERO,
         input: Bytes::from_static(&[1, 2, 3, 4]),
@@ -18,9 +16,8 @@ fn system() -> EezTxEnvelope {
 fn native_wire_sender_hash_and_storage_round_trip() {
     let tx = system();
     let bytes = tx.encoded_2718();
-    let expected = alloy_primitives::hex!(
-        "76e1018007825208944200000000000000000000000000000000000007808401020304"
-    );
+    let expected =
+        alloy_primitives::hex!("76dd0180944200000000000000000000000000000000000007808401020304");
     assert_eq!(bytes, expected);
     assert_eq!(tx.tx_hash(), &alloy_primitives::keccak256(expected));
     assert_eq!(tx.recover_signer().unwrap(), SYSTEM_ADDRESS);
@@ -89,7 +86,10 @@ fn rpc_serialization_has_type_and_quantities_without_signature() {
     assert_eq!(json["hash"], serde_json::to_value(tx.tx_hash()).unwrap());
     assert_eq!(json["chainId"], "0x1");
     assert_eq!(json["nonce"], "0x0");
-    assert_eq!(json["gas"], "0x5208");
+    assert!(json.get("gas").is_none());
+    assert!(json.get("gasPrice").is_none());
+    assert_eq!(tx.gas_limit(), SYSTEM_TX_GAS_LIMIT);
+    assert_eq!(tx.effective_gas_price(Some(100)), 0);
     for field in ["v", "r", "s", "yParity"] {
         assert!(json.get(field).is_none());
     }

@@ -22,6 +22,13 @@ async fn rpc(url: &str, method: &str, params: Value) -> Result<Value> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn two_composers_two_keyless_followers() -> Result<()> {
+    let genesis: Value = serde_json::from_str(include_str!("fixtures/genesis.json"))?;
+    ensure!(
+        genesis["alloc"]
+            .get(format!("{:#x}", eez_primitives::SYSTEM_ADDRESS))
+            .is_none(),
+        "genesis must omit the system account entirely"
+    );
     let builder = common::native::SelectedBuilder::start().await?;
     let world = setup_cross_chain_with_env(&[
         ("EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES", "true".to_owned()),
@@ -35,16 +42,31 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
     let mirror_rpc = composer.node.l2_rpc_url();
     let follower_rpc = follower.l2_rpc_url();
     let l1_rpc = world.l1_rpc();
+    let system = eez_primitives::SYSTEM_ADDRESS;
+    let deposit = U256::from(1_000_000_000_000_000_000u128);
+    let withdrawal = deposit / U256::from(4);
+    let recipient_before = l2_balance(&primary_rpc, world.recipient).await?;
+    let withdrawal_before = l2_balance(&l1_rpc, world.withdrawal_recipient).await?;
+    for url in [&primary_rpc, &mirror_rpc, &follower_rpc] {
+        ensure!(
+            rpc(url, "eth_getBalance", json!([system, "0x0"])).await? == "0x0",
+            "system prefunding at {url}"
+        );
+        ensure!(
+            rpc(url, "eth_getTransactionCount", json!([system, "0x0"])).await? == "0x0",
+            "system genesis nonce at {url}"
+        );
+    }
 
-    // Composer 1 creates an inbound native delivery and proves its effects.
+    // Composer 1 mints a real deposit from an initially absent system account.
     let inbound = sign_and_send(
         &world.l1_xchain(),
         INBOUND_USER,
         DEV_CHAIN_ID,
         pending_nonce(&l1_rpc, INBOUND_USER).await?,
-        Some(world.setter_proxy),
-        U256::ZERO,
-        IValue::setValueCall { v: U256::from(41) }.abi_encode(),
+        Some(world.deposit_proxy),
+        deposit,
+        Vec::new(),
         600_000,
     )
     .await?;
@@ -63,12 +85,22 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
             }
         }
         Ok(
-            (l2_value(&mirror_rpc, world.value_l2).await? == U256::from(41)
-                && l2_value(&follower_rpc, world.value_l2).await? == U256::from(41))
-            .then_some(()),
+            (l2_balance(&mirror_rpc, world.recipient).await? == recipient_before + deposit
+                && l2_balance(&follower_rpc, world.recipient).await? == recipient_before + deposit)
+                .then_some(()),
         )
     })
     .await?;
+    for url in [&primary_rpc, &mirror_rpc, &follower_rpc] {
+        ensure!(
+            l2_balance(url, system).await? == U256::ZERO,
+            "deposit consumed or retained system funds at {url}"
+        );
+        ensure!(
+            rpc(url, "eth_getTransactionCount", json!([system, "latest"])).await? == "0x1",
+            "deposit nonce at {url}"
+        );
+    }
 
     // Drain any already accepted Composer 1 bundle before switching producers.
     builder.select(l1_rpc.clone(), ANVIL_ADDR_3);
@@ -85,9 +117,9 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
         OUTBOUND_USER,
         world.l2_chain_id,
         pending_nonce(&mirror_rpc, OUTBOUND_USER).await?,
-        Some(world.outbound_proxy),
-        U256::ZERO,
-        IValue::setValueCall { v: U256::from(43) }.abi_encode(),
+        Some(world.withdrawal_proxy),
+        withdrawal,
+        Vec::new(),
         900_000,
     )
     .await?;
@@ -102,12 +134,11 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
     wait_for(SETTLE_TIMEOUT, || async {
         composer.assert_healthy();
         let root = state_root(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
-        Ok(
-            (l2_value(&l1_rpc, world.outbound_value).await? == U256::from(43)
-                && safe_block_state_root(&primary_rpc).await? == Some(root)
-                && safe_block_state_root(&mirror_rpc).await? == Some(root))
-            .then_some(()),
-        )
+        Ok((l2_balance(&l1_rpc, world.withdrawal_recipient).await?
+            == withdrawal_before + withdrawal
+            && safe_block_state_root(&primary_rpc).await? == Some(root)
+            && safe_block_state_root(&mirror_rpc).await? == Some(root))
+        .then_some(()))
     })
     .await?;
 
@@ -145,6 +176,29 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
         Ok(Some(()))
     })
     .await?;
+
+    for url in urls {
+        ensure!(
+            l2_balance(url, system).await? == withdrawal,
+            "outbound ETH must remain at the system address on {url}"
+        );
+        ensure!(
+            rpc(url, "eth_getTransactionCount", json!([system, "latest"])).await? == "0x2",
+            "native nonces differ at {url}"
+        );
+        ensure!(
+            l2_balance(url, world.recipient).await? == recipient_before + deposit,
+            "deposit balance differs at {url}"
+        );
+    }
+    println!(
+        "native accounting evidence: {}",
+        json!({
+            "systemGenesisBalance": "0x0", "systemGenesisNonce": "0x0",
+            "deposit": deposit, "withdrawal": withdrawal,
+            "finalSystemBalance": withdrawal, "finalSystemNonce": 2,
+        })
+    );
 
     let mut native_count = 0;
     let mut incoming_count = 0;
@@ -200,6 +254,14 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
                 native_receipt["type"] == "0x76" && native_receipt["status"] == "0x1",
                 "native receipt: {native_receipt}"
             );
+            ensure!(
+                native_receipt["effectiveGasPrice"] == "0x0",
+                "native fee: {native_receipt}"
+            );
+            ensure!(
+                native_receipt["gasUsed"] != "0x0",
+                "native execution must still be metered"
+            );
             println!(
                 "native transaction evidence: {}",
                 json!({
@@ -233,12 +295,6 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
         incoming_count > 0 && load_count > 0,
         "did not exercise both native directions: incoming={incoming_count}, load={load_count}"
     );
-    for url in urls {
-        ensure!(
-            l2_value(url, world.value_l2).await? == U256::from(41),
-            "inbound state at {url}"
-        );
-    }
     world.node.assert_no_divergence_failure_logs();
     composer.node.assert_no_divergence_failure_logs();
     follower.assert_no_divergence_failure_logs();

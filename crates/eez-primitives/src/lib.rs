@@ -11,12 +11,14 @@ use reth_primitives_traits::InMemorySize;
 
 /// Reserved EEZ type. This is not the OP deposit wire format.
 pub const SYSTEM_TX_TYPE: u8 = 0x76;
+/// Protocol execution budget. Native transactions carry no configurable gas fields.
+pub const SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
 /// Codeless EEZ privilege domain, distinct from Ethereum's block-level system caller.
 pub const SYSTEM_ADDRESS: Address = address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076");
 /// The L2 execution manager is a protocol predeploy.
 pub const EEZL2_ADDRESS: Address = address!("4200000000000000000000000000000000000007");
 
-/// Canonical wire body: chain ID, nonce, gas price, gas limit, destination, value, calldata.
+/// Canonical wire body: chain ID, nonce, destination, value, calldata.
 /// Signatures and an arbitrary sender are deliberately absent. Authorization is
 /// established by derivation; this type must never enter a public transaction pool.
 #[derive(
@@ -35,10 +37,6 @@ pub struct SystemTransaction {
     pub chain_id: u64,
     #[serde(with = "alloy_serde::quantity")]
     pub nonce: u64,
-    #[serde(with = "alloy_serde::quantity")]
-    pub gas_price: u128,
-    #[serde(rename = "gas", with = "alloy_serde::quantity")]
-    pub gas_limit: u64,
     pub to: Address,
     pub value: U256,
     pub input: Bytes,
@@ -94,13 +92,13 @@ impl Transaction for SystemTransaction {
         self.nonce
     }
     fn gas_limit(&self) -> u64 {
-        self.gas_limit
+        SYSTEM_TX_GAS_LIMIT
     }
     fn gas_price(&self) -> Option<u128> {
-        Some(self.gas_price)
+        Some(0)
     }
     fn max_fee_per_gas(&self) -> u128 {
-        self.gas_price
+        0
     }
     fn max_priority_fee_per_gas(&self) -> Option<u128> {
         None
@@ -109,10 +107,10 @@ impl Transaction for SystemTransaction {
         None
     }
     fn priority_fee_or_price(&self) -> u128 {
-        self.gas_price
+        0
     }
     fn effective_gas_price(&self, _: Option<u64>) -> u128 {
-        self.gas_price
+        0
     }
     fn is_dynamic_fee(&self) -> bool {
         false
@@ -233,25 +231,24 @@ impl reth_codecs::Compact for EezTxType {
     }
 }
 impl alloy_evm::FromRecoveredTx<EezTxEnvelope> for revm::context::TxEnv {
-    /// Native envelopes have no signature: use the protocol's fixed caller and
-    /// Ethereum's legacy execution type to retain normal nonce, fee, balance,
-    /// and revert rules. The envelope and receipt still carry `0x76`. Ordinary
-    /// Ethereum transactions use the upstream conversion unchanged.
+    /// Preserve the native type so revm uses its Custom transaction path, which
+    /// omits Ethereum-specific fee validation. A zero price then makes ordinary
+    /// fee accounting charge nothing, even with a positive block base fee.
+    /// Nonce, chain ID and gas validation remain enabled. The protocol gas
+    /// budget is implicit; ordinary Ethereum conversions are unchanged.
     fn from_recovered_tx(tx: &EezTxEnvelope, sender: Address) -> Self {
         match tx {
             EezTxEnvelope::Ethereum(tx) => Self::from_recovered_tx(tx, sender),
             EezTxEnvelope::System(tx) => Self {
                 caller: SYSTEM_ADDRESS,
-                gas_limit: tx.gas_limit,
-                gas_price: tx.gas_price,
+                gas_limit: SYSTEM_TX_GAS_LIMIT,
+                gas_price: 0,
                 kind: TxKind::Call(tx.to),
                 value: tx.value,
                 data: tx.input.clone(),
                 nonce: tx.nonce,
                 chain_id: Some(tx.chain_id),
-                // Execution uses ordinary fee, nonce and balance rules. The
-                // envelope and receipt retain the reserved EEZ type.
-                tx_type: 0,
+                tx_type: SYSTEM_TX_TYPE,
                 ..Default::default()
             },
         }

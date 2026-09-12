@@ -1,19 +1,36 @@
 # Native system transactions
 
 EEZ L2 reserves EIP-2718 type `0x76`, encoded as
-`0x76 || rlp([chainId, nonce, gasPrice, gasLimit, to, value, input])`.
+`0x76 || rlp([chainId, nonce, to, value, input])`.
 There is no signature or caller field. The sender is always
 `0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076`; the target must be EEZL2 at
 `0x4200000000000000000000000000000000000007`. The transaction hash is the
 Keccak-256 hash of these bytes. Trie entries and receipts retain type `0x76`.
 Ethereum transaction bytes and signature recovery are unchanged.
 
-Native execution retains ordinary nonce, chain ID, gas, fee, balance,
-value-transfer, and revert rules. The system account remains funded: this change
-does not introduce minting or fee exemptions. The EVM uses Ethereum's legacy fee
-model; the consensus envelope and receipt carry the native type. Reverts consume
-gas and advance the nonce. RPC returns `type: 0x76`, the fixed sender, ordinary
-quantity fields, and no signature fields.
+Native transactions have no fee or gas-limit fields. Their execution environment
+preserves type `0x76`, which revm recognizes as Custom, and supplies a zero gas
+price. This skips Ethereum-specific fee validation while ordinary fee accounting
+charges zero even with a positive block base fee. Nonce and chain-ID validation
+remain enabled. The implicit protocol budget is `SYSTEM_TX_GAS_LIMIT` (2,000,000);
+execution is metered and actual gas usage counts toward receipts and the block
+limit. The full budget must fit the remaining block gas before execution.
+
+An inbound transaction mints exactly its `value` before the ordinary EVM call,
+independently of any existing system balance. The shared `eez-evm` wrapper journals
+this credit, delegates execution to Ethereum's EVM, and removes the credit if the
+outer call reverts or halts. Such failures still advance the nonce and consume
+gas; invalid transactions commit nothing. Nested call failures retain the normal
+contract/EVM semantics. Unlike OP deposits, an outer failure does not retain the
+mint. No separate `mint` field is needed because this protocol mints the attached
+inbound value. Canonical reconstruction and proof validation bind that value to
+the authorized cross-chain entry.
+
+The system account has no genesis allocation, code, or initial nonce. Its first
+transaction starts at nonce zero and creates it naturally. Outbound ETH continues
+to accumulate at this address; subsequent deposits mint fresh value and do not
+spend that existing balance. RPC retains native receipt types, gas usage and a
+zero effective gas price; native envelopes have no signature or gas/fee fields.
 
 The type identifies a privilege domain; derivation establishes authority.
 Public pooling/gossip use Ethereum's pooled envelope, which has no conversion
@@ -35,7 +52,8 @@ independently reconstructed sequence byte for byte.
 
 This implementation targets a **fresh genesis**. Regenerate genesis with
 `scripts/update-eezl2-genesis.sh` and redeploy the L1 commitment. EEZL2's immutable
-system address must match the funded, codeless reserved account. Existing L2
+system address must match the codeless reserved address; the generator removes
+its allocation from the base genesis. Existing L2
 databases must be rebuilt because transaction storage encoding also changes.
 There is no in-place activation/migration of a signed-system deployment here.
 `EEZ_L2_SYSTEM_KEY` is no longer used. The proof signer's attestation key and the
@@ -56,7 +74,8 @@ Composer processes with separate L1/L2 databases, a stateless proof signer, and
 two followers with public configuration only. One follower joins after both
 native transaction directions have settled. The test compares every block up to
 the outbound transaction's safe height, including transaction and receipt roots,
-checks native receipt equality, and rejects raw native submissions at the public
+checks a real ETH deposit and withdrawal, native nonces, zero fees, receipt
+equality, and rejects raw native submissions at the public
 RPC decoder. Successful output includes the exact native transactions, receipts,
 and containing block roots.
 

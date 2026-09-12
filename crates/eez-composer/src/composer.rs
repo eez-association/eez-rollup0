@@ -53,29 +53,16 @@ use crate::prover_retry::{
 };
 use crate::rollup::RollupState;
 
-/// Runtime config for the cross-chain execution path on Sync slots.
-/// Carried inside [`CrossChainWiring`] next to the wired
-/// cross-chain simulation: the keys and addresses needed to construct and sign
-/// canonical L2 system transactions from composition batch entries.
-///
-/// Owned by `eez-node` at startup and shared via `Arc` because the
-/// `PrivateKeySigner` is bigger than two-line clone-cheap.
+/// Shared contract identities, public L2 parameters, and L1 submission resources
+/// for cross-chain composition on Sync slots. Owned by `eez-node` at startup
+/// and carried inside [`CrossChainWiring`].
 #[derive(Clone)]
 pub struct CrossChainExecCtx {
-    /// Signing key for SYSTEM_ADDRESS — must match `EEZL2`'s
-    /// `SYSTEM_ADDRESS` immutable. Used for `loadExecutionTable` and
-    /// `executeIncomingCrossChainCall` system transactions.
     /// `EEZL2` address, where SYSTEM_ADDRESS calls both
     /// `loadExecutionTable` and `executeIncomingCrossChainCall`.
     pub eezl2_address: Address,
-    /// L2 chain id for EIP-155 signing.
+    /// L2 chain id for native transaction replay protection.
     pub l2_chain_id: u64,
-    /// L2 system tx gas_price (legacy). 1 gwei is plenty above
-    /// devnet basefee.
-    pub l2_gas_price: u128,
-    /// Per-tx gas limit for the load + execute system txs. Matches
-    /// the reference `EXECUTE_INCOMING_GAS_LIMIT` (~2M).
-    pub l2_gas_limit: u64,
     /// Alloy provider for the embedded L1 RPC. Used to sign the
     /// `postAndVerifyBatch` transaction (nonce + fee reads). Submission goes
     /// through `submitter`.
@@ -116,8 +103,6 @@ impl std::fmt::Debug for CrossChainExecCtx {
             .field("system_address", &eez_primitives::SYSTEM_ADDRESS)
             .field("eezl2_address", &self.eezl2_address)
             .field("l2_chain_id", &self.l2_chain_id)
-            .field("l2_gas_price", &self.l2_gas_price)
-            .field("l2_gas_limit", &self.l2_gas_limit)
             .finish_non_exhaustive()
     }
 }
@@ -1795,8 +1780,6 @@ where
         let stf_cfg = eez_protocol::system_tx::SystemTxContext {
             eezl2_address: ctx.eezl2_address,
             l2_chain_id: ctx.l2_chain_id,
-            l2_gas_price: ctx.l2_gas_price,
-            l2_gas_limit: ctx.l2_gas_limit,
             this_rollup_id: rollup_id,
         };
 
@@ -2106,8 +2089,7 @@ where
                     }
                     // `[load, user]` must fit the Sync block or `build_sync_block`
                     // hard-errors. Before the L1 budget, so a refusal costs nothing.
-                    let declared = stf_cfg
-                        .l2_gas_limit
+                    let declared = eez_primitives::SYSTEM_TX_GAS_LIMIT
                         .saturating_add(declared_gas_limit(&held.raw_tx));
                     match block_gas_fit(draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
                         BlockGasFit::Accept => {}
@@ -2436,10 +2418,9 @@ where
                         continue;
                     }
 
-                    // Same gate: one delivery tx per entry, each at `l2_gas_limit`.
+                    // Same gate: one delivery tx per entry, each at the protocol gas budget.
                     // Foreign entries never ship, so this over-counts at worst.
-                    let declared = stf_cfg
-                        .l2_gas_limit
+                    let declared = eez_primitives::SYSTEM_TX_GAS_LIMIT
                         .saturating_mul(target_entries.len() as u64);
                     match block_gas_fit(draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
                         BlockGasFit::Accept => {}

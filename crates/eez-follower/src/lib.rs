@@ -23,8 +23,6 @@ const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// ~15 min at the capped backoff: outlasts a restarting L1, but a permanently
 /// refused RPC call still surfaces as an exit.
 const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
-const L2_SYSTEM_TX_GAS_PRICE: u128 = 1_000_000_000;
-const L2_SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
 
 struct FollowerSystemConfig {
     eezl2_address: Address,
@@ -36,8 +34,6 @@ impl FollowerSystemConfig {
         eez_protocol::system_tx::SystemTxContext {
             eezl2_address: self.eezl2_address,
             l2_chain_id,
-            l2_gas_price: L2_SYSTEM_TX_GAS_PRICE,
-            l2_gas_limit: L2_SYSTEM_TX_GAS_LIMIT,
             this_rollup_id: self.this_rollup_id,
         }
     }
