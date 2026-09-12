@@ -160,6 +160,17 @@ async fn captured_current_protocol_window_is_validated_and_signed() {
     );
 }
 
+/// A batch captured from the public Chiado deployment must remain the canonical
+/// byte encoding of the logical batch it decodes to. This catches ABI
+/// field-order, integer-width, selector, and dynamic-offset drift.
+#[test]
+fn captured_postbatch_decodes_and_reencodes_byte_for_byte() {
+    let captured = fixture_hex(&fixture("captured-anchor-40155", "postbatch.hex"));
+    let decoded = settlement::decode_canonical_post_batch(captured.clone()).unwrap();
+
+    assert_eq!(eez_protocol::entries::encode_postbatch(&decoded), captured);
+}
+
 #[test]
 fn captured_legacy_inbound_calldata_is_rejected_by_target_abi() {
     let post_batch = fixture_json("fresh-chain-inbound-2175", "postbatch.json");
