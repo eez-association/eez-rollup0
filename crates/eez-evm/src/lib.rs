@@ -4,18 +4,15 @@
 //! represent native type `0x76`. This wrapper selects `EezPrimitives`, preserves
 //! the native receipt type, and decodes native transactions in Engine payloads.
 //! Ethereum's executor, gas accounting, system calls, block assembly, and header
-//! environment are reused. The fixed native caller and transaction-to-`TxEnv`
-//! conversion live in `eez-primitives`; this module adds no opcode or fee rules.
+//! environment are reused. `eez-primitives` defines the zero-fee native TxEnv;
+//! `evm` adds deposit minting and rollback around the upstream Ethereum EVM.
 
 use alloy_consensus::Header;
 use alloy_eips::Decodable2718;
-use alloy_evm::{
-    EthEvmFactory,
-    eth::{
-        EthBlockExecutionCtx, EthBlockExecutorFactory,
-        receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx},
-        spec::EthExecutorSpec,
-    },
+use alloy_evm::eth::{
+    EthBlockExecutionCtx, EthBlockExecutorFactory,
+    receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx},
+    spec::EthExecutorSpec,
 };
 use alloy_primitives::Bytes;
 use alloy_rpc_types_engine::ExecutionData;
@@ -28,6 +25,9 @@ use reth_evm::{
 use reth_evm_ethereum::{EthBlockAssembler, EthEvmConfig};
 use reth_primitives_traits::{SealedBlock, SealedHeader, SignedTransaction};
 use std::{borrow::Cow, convert::Infallible, sync::Arc};
+
+mod evm;
+pub use evm::EezEvmFactory;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EezReceiptBuilder;
@@ -56,21 +56,17 @@ impl ReceiptBuilder for EezReceiptBuilder {
 #[derive(Debug, Clone)]
 pub struct EezEvmConfig<C = ChainSpec> {
     ethereum: EthEvmConfig<C>,
-    executor: EthBlockExecutorFactory<EezReceiptBuilder, Arc<C>, EthEvmFactory>,
+    executor: EthBlockExecutorFactory<EezReceiptBuilder, Arc<C>, EezEvmFactory>,
 }
 
 impl<C> EezEvmConfig<C> {
-    /// Uses Ethereum's executor and EVM factory with the EEZ receipt builder so
+    /// Uses Ethereum's executor with the EEZ minting wrapper and receipt builder so
     /// it accepts native transactions. The upstream config supplies the shared
     /// header environment and block assembler unchanged.
     pub fn new(chain_spec: Arc<C>) -> Self {
         Self {
             ethereum: EthEvmConfig::new(chain_spec.clone()),
-            executor: EthBlockExecutorFactory::new(
-                EezReceiptBuilder,
-                chain_spec,
-                EthEvmFactory::default(),
-            ),
+            executor: EthBlockExecutorFactory::new(EezReceiptBuilder, chain_spec, EezEvmFactory),
         }
     }
 
@@ -85,7 +81,7 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
     type Primitives = EezPrimitives;
     type Error = Infallible;
     type NextBlockEnvCtx = NextBlockEnvAttributes;
-    type BlockExecutorFactory = EthBlockExecutorFactory<EezReceiptBuilder, Arc<C>, EthEvmFactory>;
+    type BlockExecutorFactory = EthBlockExecutorFactory<EezReceiptBuilder, Arc<C>, EezEvmFactory>;
     type BlockAssembler = EthBlockAssembler<C>;
 
     /// Selects the executor with EEZ transaction/receipt types; returning the

@@ -180,8 +180,6 @@ fn main() {
         let cfg = SystemTxContext {
             eezl2_address: alloy_primitives::address!("4200000000000000000000000000000000000007"),
             l2_chain_id: 1,
-            l2_gas_price: 1_000_000_000,
-            l2_gas_limit: 1_500_000,
             this_rollup_id: 1,
         };
         for start_nonce in [0u64, 1u64] {

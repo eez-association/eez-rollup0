@@ -91,8 +91,8 @@ This deploys EEZ + ECDSAProofSystem + the rollup manager, registers the
 rollup, deploys the L1 bridge contracts, and writes **`deployments.env`**
 (registry, proof system, rollup id, deploy block, bridge, and EEZL2 addresses).
 The deploy uses reserved native system address `0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076`,
-generates and funds its canonical EEZL2 genesis, and registers that exact state
-root; the private key is never written to `deployments.env`. It also writes the
+generates its canonical EEZL2 genesis without allocating the system account, and
+registers that exact state root. System transactions require no private key. It also writes the
 L2 **`datadir/genesis.json`** whose timestamp is pinned to the deploy block. The
 container loads `deployments.env` automatically; `.env.chiado`'s
 `FRESH_GENESIS` points at that genesis (default `./datadir/genesis.json`), so

@@ -41,8 +41,6 @@ const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// refused RPC call still surfaces as an exit.
 const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
 const L1_CHAIN_ID_READ_TIMEOUT: Duration = Duration::from_secs(30);
-const L2_SYSTEM_TX_GAS_PRICE: u128 = 1_000_000_000;
-const L2_SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
 
 /// Witness-capture resources selected by the mandatory composer prover.
 enum WitnessCapture {
@@ -483,8 +481,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         let exec_ctx = Arc::new(eez_composer::CrossChainExecCtx {
             eezl2_address,
             l2_chain_id: chain_spec.chain().id(),
-            l2_gas_price: L2_SYSTEM_TX_GAS_PRICE,
-            l2_gas_limit: L2_SYSTEM_TX_GAS_LIMIT,
             l1_provider,
             submitter: submitter.clone(),
             l1_poster_signer,
@@ -520,8 +516,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             eez_protocol::system_tx::SystemTxContext {
                 eezl2_address: ctx.eezl2_address,
                 l2_chain_id: ctx.l2_chain_id,
-                l2_gas_price: ctx.l2_gas_price,
-                l2_gas_limit: ctx.l2_gas_limit,
                 this_rollup_id: rollup_id,
             }
         };

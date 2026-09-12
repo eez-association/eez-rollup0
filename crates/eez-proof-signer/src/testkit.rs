@@ -20,7 +20,7 @@ pub(crate) const LEGACY_PRIVATE_KEY: B256 =
     b256!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
 
 /// Native system envelope with empty calldata, for framing tests.
-pub(crate) const SYSTEM_TX: &str = "76dd0180018252089442000000000000000000000000000000000000078080";
+pub(crate) const SYSTEM_TX: &str = "76d901809442000000000000000000000000000000000000078080";
 
 /// Canonical context for reconstructing system transactions in tests; tests
 /// that need a noncanonical variant mutate one field of a fresh copy.
@@ -28,8 +28,6 @@ pub(crate) fn system_transaction_context() -> eez_protocol::system_tx::SystemTxC
     eez_protocol::system_tx::SystemTxContext {
         eezl2_address: crate::EEZL2_ADDRESS,
         l2_chain_id: 1,
-        l2_gas_price: 1_000_000_000,
-        l2_gas_limit: 2_000_000,
         this_rollup_id: 1,
     }
 }

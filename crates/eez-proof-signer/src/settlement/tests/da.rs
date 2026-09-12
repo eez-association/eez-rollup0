@@ -387,7 +387,7 @@ fn da_payload_binds_inbound_sidecars_and_complete_reconstructed_transactions() {
     );
 
     let mut noncanonical_context = system_transaction_context();
-    noncanonical_context.l2_gas_limit += 1;
+    noncanonical_context.l2_chain_id += 1;
     let noncanonical_transactions = build_inbound_transactions(&entries, &noncanonical_context, 11);
     let mut mutated_second_transaction = transactions;
     mutated_second_transaction[1] = noncanonical_transactions[1].clone();
@@ -524,7 +524,7 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     );
 
     let mut noncanonical_context = system_transaction_context();
-    noncanonical_context.l2_gas_limit += 1;
+    noncanonical_context.l2_chain_id += 1;
     let wrong_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &[(sidecar.clone(), Bytes::from(user))],
         &[],
@@ -644,7 +644,7 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
     );
 
     let mut noncanonical_context = system_transaction_context();
-    noncanonical_context.l2_gas_limit += 1;
+    noncanonical_context.l2_chain_id += 1;
     let wrong_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &outbound_inputs,
         &[],
