@@ -36,10 +36,10 @@ pub struct HeldTx {
     pub raw_tx: Bytes,
     /// Cached hash of the signed envelope, used for queued/in-flight dedupe.
     pub hash: TxHash,
-    /// Failed settlement attempts so far. A proof rejection or bundle drop
-    /// may be caused by a poison transaction even when compose-time simulation
-    /// accepted it. Recovery increments this once per failed episode and
-    /// EVICTS the tx (loud ERROR, user resubmits) at
+    /// Failed inclusion attempts so far. A funding deferral, proof rejection,
+    /// or bundle drop may otherwise retain a transaction indefinitely. Retry
+    /// handling increments this once per failed episode and EVICTS the tx (loud
+    /// ERROR, user resubmits) at
     /// [`MAX_BUNDLE_ATTEMPTS`](crate::composer::MAX_BUNDLE_ATTEMPTS),
     /// so one candidate set cannot fail every postBatch forever.
     pub attempts: u32,

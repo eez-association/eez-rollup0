@@ -131,6 +131,15 @@ pub enum ExecutorErrorKind {
     /// returned.
     #[error("evm: {0}")]
     Evm(#[source] BoxedError),
+    /// The target-side caller cannot yet fund the transaction. Unlike other
+    /// transaction-validation failures, later chain state can make it valid.
+    #[error("insufficient target funds: available {available}, required {required}")]
+    InsufficientFunds {
+        /// Balance visible to the target-side simulation.
+        available: alloy_primitives::U256,
+        /// Value plus maximum fee required by the simulated transaction.
+        required: alloy_primitives::U256,
+    },
     /// Executor data has an invalid representation or concrete type.
     #[error("encoding: {0}")]
     Encoding(String),

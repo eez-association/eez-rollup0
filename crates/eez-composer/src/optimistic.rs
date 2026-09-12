@@ -45,7 +45,8 @@ use crate::held_pool::HeldTx;
 /// recovery is treated as bad luck and re-queued, with
 /// [`MAX_BUNDLE_ATTEMPTS`](crate::composer::MAX_BUNDLE_ATTEMPTS) as a
 /// backstop for poison the compose-time sim view missed. The same bound covers
-/// proof failures, so one counter follows a transaction across both paths.
+/// proof failures and compose-time funding deferrals, so one counter follows a
+/// transaction across every bounded retry path.
 #[derive(Debug)]
 pub struct FailedBatch {
     /// L2 height of the optimistically-committed Sync block.
