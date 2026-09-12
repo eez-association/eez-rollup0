@@ -3,8 +3,6 @@ use crate::EEZL2_ADDRESS;
 use alloy_primitives::Bytes;
 use eez_protocol::abi::ExecutionEntrySol;
 use std::{fmt, num::NonZeroU64};
-const SYSTEM_TRANSACTION_GAS_PRICE: u128 = 1_000_000_000;
-const SYSTEM_TRANSACTION_GAS_LIMIT: u64 = 2_000_000;
 
 /// Configuration for reconstructing and byte-checking omitted Sync-block
 /// system transactions.
@@ -22,8 +20,6 @@ impl SystemTransactionReconstructor {
             context: eez_protocol::system_tx::SystemTxContext {
                 eezl2_address: EEZL2_ADDRESS,
                 l2_chain_id,
-                l2_gas_price: SYSTEM_TRANSACTION_GAS_PRICE,
-                l2_gas_limit: SYSTEM_TRANSACTION_GAS_LIMIT,
                 this_rollup_id: expected_rollup_id.get(),
             },
         }
@@ -52,8 +48,6 @@ impl fmt::Debug for SystemTransactionReconstructor {
             .field("system_address", &eez_primitives::SYSTEM_ADDRESS)
             .field("eezl2_address", &self.context.eezl2_address)
             .field("l2_chain_id", &self.context.l2_chain_id)
-            .field("l2_gas_price", &self.context.l2_gas_price)
-            .field("l2_gas_limit", &self.context.l2_gas_limit)
             .field("rollup_id", &self.context.this_rollup_id)
             .finish()
     }

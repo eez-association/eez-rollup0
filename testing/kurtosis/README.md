@@ -146,7 +146,7 @@ The local topology contains:
 - A canonical private PoS L1 with one reth/Lighthouse participant.
 - An rbuilder, relay, MEV-Boost, and proposer path for atomic bundle inclusion.
 - A deployment task that deploys the L1 contracts, derives the configured L2
-  system address, renders the EEZL2 runtime and funded L2 genesis, and registers
+  system address, renders the EEZL2 runtime and L2 genesis, and registers
   the resulting genesis state root.
 - An `eez-node` running the L2, composer, cross-chain RPC fronts, and an
   embedded L1 execution client.
