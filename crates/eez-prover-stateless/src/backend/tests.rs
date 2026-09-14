@@ -1,14 +1,15 @@
-use std::num::NonZeroU64;
-
-use alloy_consensus::{Header, SignableTransaction as _, TxLegacy};
+use alloy_consensus::{EthereumReceipt, Header, SignableTransaction as _, TxLegacy};
 use alloy_primitives::{B256, Bytes, Log, Signature, TxKind, U256, b256};
+use alloy_sol_types::SolEvent as _;
+use eez_proof_signer::EEZL2_ADDRESS;
+use eez_proof_signer::validate::{DecodedOutboundEvent, OutboundEventObservation};
+use eez_proof_signer::window::testing::admitted_block_with_witness;
+use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable as _;
 
 use super::*;
-use crate::settlement::inspect_validated_settling_block;
 use crate::testkit::{SYSTEM_TX, TEST_SYSTEM_ADDRESS};
-use crate::validate::ValidatedBlock;
 
 fn fixture_chain_config() -> ChainConfig {
     serde_json::from_str(include_str!(concat!(
@@ -30,13 +31,13 @@ fn fixture_input() -> AdmittedBlock {
         "/tests/fixtures/stateless-block-13/witness-13.json"
     )))
     .unwrap();
-    AdmittedBlock {
-        declared_number: block.header.number,
-        claimed_hash: block.header.hash_slow(),
-        claimed_parent_hash: block.header.parent_hash,
+    admitted_block_with_witness(
+        block.header.number,
+        block.header.hash_slow(),
+        block.header.parent_hash,
         rlp,
         witness,
-    }
+    )
 }
 
 fn checkpoint_fixture() -> (AdmittedBlock, ChainConfig, Vec<TransactionStateCheckpoint>) {
@@ -80,16 +81,45 @@ fn checkpoint_fixture() -> (AdmittedBlock, ChainConfig, Vec<TransactionStateChec
         .collect();
 
     (
-        AdmittedBlock {
-            declared_number: block.header.number,
-            claimed_hash: block.header.hash_slow(),
-            claimed_parent_hash: block.header.parent_hash,
+        admitted_block_with_witness(
+            block.header.number,
+            block.header.hash_slow(),
+            block.header.parent_hash,
             rlp,
             witness,
-        },
+        ),
         chain_config,
         checkpoints,
     )
+}
+
+fn captured_fixture(dir: &str, name: &str) -> String {
+    let path = format!("{}/tests/fixtures/{dir}/{name}", env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read fixture {path}: {error}"))
+}
+
+fn captured_hex(value: &str) -> Vec<u8> {
+    let value = value.trim();
+    hex::decode(value.strip_prefix("0x").unwrap_or(value)).unwrap()
+}
+
+fn captured_witness(encoded: &str) -> alloy_rpc_types_debug::ExecutionWitness {
+    let witness: serde_json::Value = serde_json::from_str(encoded).unwrap();
+    let items = |field: &str| {
+        witness[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| captured_hex(item.as_str().unwrap()).into())
+            .collect()
+    };
+    alloy_rpc_types_debug::ExecutionWitness {
+        state: items("state"),
+        codes: items("codes"),
+        keys: items("keys"),
+        headers: items("headers"),
+    }
 }
 
 fn high_s_system_transaction() -> TransactionSigned {
@@ -155,9 +185,11 @@ fn outbound_observations_require_the_eezl2_emitter_and_event_signature() {
 
     assert_eq!(
         observe_outbound_events(&[receipt_with_logs(logs)]),
-        [OutboundEventObservation::decoded_for_test(
-            0, 2, call_hash, 0,
-        )]
+        [OutboundEventObservation {
+            transaction_index: 0,
+            receipt_log_index: 2,
+            decoded_event: Some(DecodedOutboundEvent::new(call_hash, 0)),
+        }]
     );
 }
 
@@ -186,10 +218,26 @@ fn malformed_named_outbound_events_are_retained_without_decoded_fields() {
             trailing_body,
         ])]),
         [
-            OutboundEventObservation::malformed_for_test(0, 0),
-            OutboundEventObservation::malformed_for_test(0, 1),
-            OutboundEventObservation::malformed_for_test(0, 2),
-            OutboundEventObservation::malformed_for_test(0, 3),
+            OutboundEventObservation {
+                transaction_index: 0,
+                receipt_log_index: 0,
+                decoded_event: None
+            },
+            OutboundEventObservation {
+                transaction_index: 0,
+                receipt_log_index: 1,
+                decoded_event: None
+            },
+            OutboundEventObservation {
+                transaction_index: 0,
+                receipt_log_index: 2,
+                decoded_event: None
+            },
+            OutboundEventObservation {
+                transaction_index: 0,
+                receipt_log_index: 3,
+                decoded_event: None
+            },
         ]
     );
 }
@@ -214,19 +262,33 @@ fn outbound_observations_preserve_receipt_log_order_and_duplicates() {
     assert_eq!(
         observations,
         [
-            OutboundEventObservation::decoded_for_test(0, 0, a, 0),
-            OutboundEventObservation::decoded_for_test(0, 1, a, 0),
-            OutboundEventObservation::decoded_for_test(1, 1, b, u64::MAX),
-            OutboundEventObservation::decoded_for_test(1, 2, a, 0),
+            OutboundEventObservation {
+                transaction_index: 0,
+                receipt_log_index: 0,
+                decoded_event: Some(DecodedOutboundEvent::new(a, 0))
+            },
+            OutboundEventObservation {
+                transaction_index: 0,
+                receipt_log_index: 1,
+                decoded_event: Some(DecodedOutboundEvent::new(a, 0))
+            },
+            OutboundEventObservation {
+                transaction_index: 1,
+                receipt_log_index: 1,
+                decoded_event: Some(DecodedOutboundEvent::new(b, u64::MAX))
+            },
+            OutboundEventObservation {
+                transaction_index: 1,
+                receipt_log_index: 2,
+                decoded_event: Some(DecodedOutboundEvent::new(a, 0))
+            },
         ]
     );
 }
 
 #[test]
 fn checkpoint_response_must_match_the_plan_exactly() {
-    let plan = CheckpointPlan {
-        transaction_indices: vec![0, 2],
-    };
+    let plan = CheckpointPlan::new(vec![0, 2]);
     assert!(
         plan.verify_returned(&[checkpoint(0), checkpoint(2)])
             .is_ok()
@@ -270,7 +332,7 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
         CheckpointPlan::from_recovered_block(&recovered, TEST_SYSTEM_ADDRESS);
 
     assert_eq!(system_sender_flags, [true, false, true]);
-    assert_eq!(plan.transaction_indices, [1, 2]);
+    assert_eq!(plan.transaction_indices(), [1, 2]);
 }
 
 #[test]
@@ -302,7 +364,7 @@ fn checkpoint_plan_includes_every_inbound_boundary() {
 
         assert_eq!(system_sender_flags, vec![true; transaction_count]);
         assert_eq!(
-            plan.transaction_indices,
+            plan.transaction_indices(),
             (0..transaction_count).collect::<Vec<_>>()
         );
     }
@@ -356,7 +418,14 @@ fn recovered_sender_facts_follow_the_homestead_signature_rule() {
         },
         ..Default::default()
     });
-    let recovered = recover_block(block.clone(), &pre_homestead).unwrap();
+    let admitted = admitted_block_with_witness(
+        block.header.number,
+        block.header.hash_slow(),
+        block.header.parent_hash,
+        alloy_rlp::encode(block.clone()),
+        Default::default(),
+    );
+    let recovered = decode_match_and_recover_signers(&admitted, &pre_homestead).unwrap();
     assert_eq!(system_sender_flags(&recovered, TEST_SYSTEM_ADDRESS), [true]);
 
     let post_homestead = ChainSpec::from_genesis(Genesis {
@@ -366,13 +435,13 @@ fn recovered_sender_facts_follow_the_homestead_signature_rule() {
         },
         ..Default::default()
     });
-    assert!(recover_block(block, &post_homestead).is_err());
+    assert!(decode_match_and_recover_signers(&admitted, &post_homestead).is_err());
 }
 
 #[test]
 fn validates_the_golden_block_through_stateless() {
     let output = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
-        .validate(&[fixture_input()])
+        .validate(vec![fixture_input()])
         .unwrap();
     let root = b256!("f09d8f7da5bc5036f8dd9536c953e2212390a46fb3e553ece2b7d419131537b1");
 
@@ -398,10 +467,10 @@ fn validates_the_golden_block_through_stateless() {
 #[test]
 fn selected_checkpoints_flow_through_the_stateless_adapter() {
     let (mut input, chain_config, expected) = checkpoint_fixture();
-    let expected_hash = input.claimed_hash;
+    let expected_hash = input.claimed_hash();
 
     let output = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
-        .validate_blocks(
+        .validate_admitted(
             std::slice::from_mut(&mut input),
             &CancellationToken::default(),
         )
@@ -423,31 +492,63 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
 }
 
 #[test]
-fn real_checkpoints_do_not_classify_the_legacy_inbound_selector() {
-    let (mut input, chain_config, _) = checkpoint_fixture();
-    let block_number = input.declared_number;
-    let block_rlp = input.rlp.clone();
-    let mut output = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
-        .validate_blocks(
-            std::slice::from_mut(&mut input),
-            &CancellationToken::default(),
-        )
-        .unwrap();
-    let block_output = output.blocks.remove(0);
-    assert_eq!(block_output.receipt_successes, [true, true, true]);
+fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
+    const FIXTURE: &str = "nonzero-outbound-630";
+    let oracle: serde_json::Value =
+        serde_json::from_str(&captured_fixture(FIXTURE, "oracle.json")).unwrap();
+    let chain_config =
+        serde_json::from_str(&captured_fixture(FIXTURE, "chain-config.json")).unwrap();
+    let from = oracle["from_block"].as_u64().unwrap();
+    let to = oracle["to_block"].as_u64().unwrap();
+    let mut blocks = (from..=to)
+        .map(|number| {
+            let rlp = captured_hex(&captured_fixture(
+                FIXTURE,
+                &format!("block-{number}.rlp.hex"),
+            ));
+            let block = alloy_rlp::decode_exact::<Block>(&rlp).unwrap();
+            admitted_block_with_witness(
+                number,
+                block.header.hash_slow(),
+                block.header.parent_hash,
+                rlp,
+                captured_witness(&captured_fixture(
+                    FIXTURE,
+                    &format!("witness-{number}.json"),
+                )),
+            )
+        })
+        .collect::<Vec<_>>();
 
-    let validated_block =
-        ValidatedBlock::for_test(block_number, block_rlp, block_output.settlement_evidence);
-    let settling = inspect_validated_settling_block(
-        &validated_block,
-        block_output.receipt_successes.as_slice(),
-        NonZeroU64::new(1).unwrap(),
-    )
-    .unwrap();
-    // The transactions are still genuine system calls and checkpoint inputs,
-    // but their obsolete selector cannot enter the target inbound decoder.
-    assert_eq!(settling.system_sender_flags(), [true, true, true]);
-    assert!(settling.inbound_candidates().is_empty());
+    let output = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
+        .validate_admitted(&mut blocks, &CancellationToken::default())
+        .unwrap();
+
+    assert_eq!(
+        output.pre_state_root,
+        oracle["batch_anchor_root"]
+            .as_str()
+            .unwrap()
+            .parse::<B256>()
+            .unwrap()
+    );
+    assert_eq!(
+        output.blocks.last().unwrap().post_state_root,
+        oracle["final_state_root"]
+            .as_str()
+            .unwrap()
+            .parse::<B256>()
+            .unwrap()
+    );
+    assert!(
+        output
+            .blocks
+            .last()
+            .unwrap()
+            .settlement_evidence
+            .observed_outbound_events
+            .is_empty()
+    );
 }
 
 #[test]
@@ -455,21 +556,24 @@ fn pre_cancelled_validation_does_not_consume_the_witness() {
     let cancellation = CancellationToken::default();
     cancellation.cancel();
     let mut input = fixture_input();
-    let state_items = input.witness.state.len();
+    let state_items = admitted_block_parts_mut(&mut input).witness.state.len();
 
     let result = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
-        .validate_blocks(std::slice::from_mut(&mut input), &cancellation);
+        .validate_admitted(std::slice::from_mut(&mut input), &cancellation);
 
     assert!(matches!(result, Err(ValidationError::Cancelled)));
-    assert_eq!(input.witness.state.len(), state_items);
+    assert_eq!(
+        admitted_block_parts_mut(&mut input).witness.state.len(),
+        state_items
+    );
 }
 
 #[test]
 fn consensus_rlp_must_decode_exactly() {
     let mut input = fixture_input();
-    input.rlp.push(0x80);
+    admitted_block_parts_mut(&mut input).rlp.push(0x80);
     assert!(matches!(
-        Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(&[input]),
+        Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(vec![input]),
         Err(ValidationError::Rejected(_))
     ));
 }
@@ -477,14 +581,16 @@ fn consensus_rlp_must_decode_exactly() {
 #[test]
 fn decoded_header_must_match_the_streamed_number_and_parent() {
     let mutations: [fn(&mut AdmittedBlock); 2] = [
-        |input| input.declared_number += 1,
-        |input| input.claimed_parent_hash = B256::repeat_byte(0xee),
+        |input| *admitted_block_parts_mut(input).declared_number += 1,
+        |input| {
+            *admitted_block_parts_mut(input).claimed_parent_hash = B256::repeat_byte(0xee);
+        },
     ];
     for mutate in mutations {
         let mut input = fixture_input();
         mutate(&mut input);
         assert!(matches!(
-            Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(&[input]),
+            Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(vec![input]),
             Err(ValidationError::Rejected(_))
         ));
     }
@@ -493,12 +599,13 @@ fn decoded_header_must_match_the_streamed_number_and_parent() {
 #[test]
 fn decoded_header_hash_must_match_the_streamed_hash_before_reexecution() {
     let mut input = fixture_input();
-    input.claimed_hash = B256::repeat_byte(0xee);
-    let mut node = input.witness.state[0].to_vec();
+    let parts = admitted_block_parts_mut(&mut input);
+    *parts.claimed_hash = B256::repeat_byte(0xee);
+    let mut node = parts.witness.state[0].to_vec();
     node[0] ^= 0x01;
-    input.witness.state[0] = node.into();
+    parts.witness.state[0] = node.into();
     let error = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
-        .validate(&[input])
+        .validate(vec![input])
         .unwrap_err();
     assert!(matches!(error, ValidationError::Rejected(_)));
     assert!(
@@ -511,13 +618,14 @@ fn decoded_header_hash_must_match_the_streamed_hash_before_reexecution() {
 #[test]
 fn execution_must_produce_the_state_root_committed_by_the_header() {
     let mut input = fixture_input();
-    let mut block = alloy_rlp::decode_exact::<Block>(&input.rlp).unwrap();
+    let mut block = alloy_rlp::decode_exact::<Block>(input.rlp()).unwrap();
     block.header.state_root = B256::repeat_byte(0xee);
-    input.claimed_hash = block.header.hash_slow();
-    input.rlp = alloy_rlp::encode(block);
+    let parts = admitted_block_parts_mut(&mut input);
+    *parts.claimed_hash = block.header.hash_slow();
+    *parts.rlp = alloy_rlp::encode(block);
 
     let error = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
-        .validate(&[input])
+        .validate(vec![input])
         .unwrap_err();
 
     assert!(matches!(
@@ -529,11 +637,12 @@ fn execution_must_produce_the_state_root_committed_by_the_header() {
 #[test]
 fn corrupt_witness_data_is_rejected_by_stateless() {
     let mut input = fixture_input();
-    let mut node = input.witness.state[0].to_vec();
+    let parts = admitted_block_parts_mut(&mut input);
+    let mut node = parts.witness.state[0].to_vec();
     node[0] ^= 0x01;
-    input.witness.state[0] = node.into();
+    parts.witness.state[0] = node.into();
     assert!(matches!(
-        Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(&[input]),
+        Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(vec![input]),
         Err(ValidationError::Rejected(_))
     ));
 }

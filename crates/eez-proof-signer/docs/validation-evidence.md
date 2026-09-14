@@ -9,6 +9,8 @@ quotas. Validation proves that the exact admitted block sequence executes under
 the operator-configured chain rules and produces the commitments later used by
 settlement.
 
+This guide follows the witness-backed `eez-prover-stateless` implementation.
+
 ```mermaid
 flowchart TB
     subgraph composer["Composer-controlled"]
@@ -34,7 +36,7 @@ flowchart TB
 
 ## Startup initialization
 
-At startup, [`validate/stateless.rs`](../src/validate/stateless.rs) loads the
+At startup, [`eez-prover-stateless/src/backend.rs`](../../eez-prover-stateless/src/backend.rs) loads the
 operator-configured Alloy `ChainConfig` or complete `Genesis` document once,
 then builds the Reth `ChainSpec` and EVM configuration shared by every request.
 

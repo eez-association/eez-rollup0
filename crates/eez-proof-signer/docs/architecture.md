@@ -3,10 +3,11 @@
 > This is an implementation guide. [`SPEC.md`](../SPEC.md) is authoritative for
 > protocol behavior and compatibility requirements.
 
-`eez-proof-signer` is a stateless, single-flight attestation service. A Composer
-streams one complete block window. The daemon re-executes every block, binds a
-supported settlement batch to the resulting evidence, recomputes the public
-input, and signs it. Any failed stage returns no signature.
+`eez-proof-signer` is the shared single-flight attestation service. A Composer
+streams one complete block window. A configured backend re-executes every
+block, then the service binds a supported settlement batch to the resulting
+evidence, recomputes the public input, and signs it. Any failed stage returns
+no signature.
 
 ```mermaid
 flowchart LR
@@ -20,7 +21,7 @@ flowchart LR
     SVC --> RPC
     STATE --> JOB
 
-    JOB --> ST[Stateless and Reth]
+    JOB --> ST[ValidationBackend]
     ST -->|BackendWindowOutput| VAL[shared output checks]
     VAL -->|ValidatedWindow| SET[settlement binding and authorization]
     SET --> HASH[RecomputedPublicInputsHash]
@@ -36,27 +37,21 @@ flowchart LR
 
 | Module | Owns |
 | --- | --- |
-| [`main.rs`](../src/main.rs) | Startup wiring, tracing, server lifetime, graceful shutdown |
-| [`config.rs`](../src/config.rs) | CLI/environment parsing, secret redaction, startup validation |
+| [`lib.rs`](../src/lib.rs) | Backend-neutral server construction and graceful draining |
 | [`service.rs`](../src/service.rs) | Shared immutable dependencies, limits, and the one active-request slot |
 | [`service/stream.rs`](../src/service/stream.rs) | Stream draining and transport-timeout normalization |
 | [`service/rpc.rs`](../src/service/rpc.rs) | Async orchestration, absolute deadline, worker lifetime, signing, response |
 | [`service/settlement_job.rs`](../src/service/settlement_job.rs) | The synchronous validation-to-settlement handoff and error provenance |
 | [`window.rs`](../src/window.rs) | Incremental structural admission and aggregate resource accounting |
 | [`validate.rs`](../src/validate.rs) | Associated backend-output contract, shared cross-checks, `ValidatedWindow` normalization |
-| [`validate/stateless.rs`](../src/validate/stateless.rs) | Chain-aware decode/recovery, checkpoint planning, Stateless execution |
+| [`validate/support.rs`](../src/validate/support.rs) | Decode/recovery, checkpoint planning, and evidence helpers shared by backends |
+| [`eez-prover-stateless`](../../eez-prover-stateless/src/backend.rs) | Witness-backed Stateless/Reth execution |
 | [`settlement/`](../src/settlement.rs) | Focused batch, block, state, inbound, outbound, and DA gates |
 | [`attest.rs`](../src/attest.rs) | Attestation identity and typed attestable-hash signing |
 | [`cancel.rs`](../src/cancel.rs) | Cooperative cancellation shared with synchronous work |
 
-This is a binary crate, so `main.rs` is the crate root and the implementation
-has no public library API. Rust allows a parent module such as `service.rs` to
-declare children in `service/rpc.rs`, and a child such as
-`validate/stateless.rs` can in turn declare `validate/stateless/chain_config.rs`.
-That file-plus-directory layout is intentional: the parent file exposes the
-module boundary while the directory holds focused implementation pieces. It
-does not change runtime behavior or import semantics because every module is
-declared explicitly.
+This is a library crate. `eez-prover-stateless` owns the standalone binary,
+CLI, and witness-backed validation backend.
 
 The split follows trust boundaries, not just file size. `window` may reject
 malformed structure but cannot claim a block is valid. `validate` may prove
@@ -68,7 +63,7 @@ already validated facts but cannot manufacture missing execution evidence.
 1. `WindowAssembler` produces an `AdmittedWindow`. Its `AdmittedBlock` values
    retain Composer-declared metadata, exact RLP, and execution witnesses after
    stream-shape, identity, adjacency, and quota checks.
-2. The Stateless adapter consumes those witnesses and returns one
+2. The configured backend returns one
    `BackendWindowOutput`. Each `BackendBlockOutput` keeps its computed identity,
    post-state root, receipt outcomes, selected checkpoints, and settlement
    evidence together.

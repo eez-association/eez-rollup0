@@ -13,6 +13,7 @@ members = [
     "crates/eez-node-e2e",
     "crates/eez-payload-codec",
     "crates/eez-proof-signer",
+    "crates/eez-prover-stateless",
     "crates/eez-protocol",
     "crates/eez-prover",
     "crates/eez-prover-client",
@@ -149,8 +150,10 @@ eez-l1             = { path = "crates/eez-l1" }
 eez-node           = { path = "crates/eez-node" }
 eez-node-common    = { path = "crates/eez-node-common" }
 eez-payload-codec  = { path = "crates/eez-payload-codec" }
+eez-proof-signer   = { path = "crates/eez-proof-signer" }
 eez-protocol       = { path = "crates/eez-protocol" }
 eez-prover         = { path = "crates/eez-prover" }
+eez-prover-stateless = { path = "crates/eez-prover-stateless" }
 eez-testkit        = { path = "crates/eez-testkit" }
 
 # Profiles copied from reth (paradigmxyz/reth Cargo.toml), minus its

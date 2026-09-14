@@ -26,7 +26,7 @@ const SYSTEM_TRANSACTION_GAS_LIMIT: u64 = 2_000_000;
 /// transactions present in Composer-supplied block RLP but omitted from batch
 /// DA are accepted only when they byte-match the sequence independently
 /// reconstructed with this key.
-pub(crate) struct SystemTransactionKey(PrivateKeySigner);
+pub struct SystemTransactionKey(PrivateKeySigner);
 
 impl fmt::Debug for SystemTransactionKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -38,7 +38,7 @@ impl fmt::Debug for SystemTransactionKey {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub(crate) enum SystemTransactionConfigError {
+pub enum SystemTransactionConfigError {
     #[error("L2 system key is not a valid secp256k1 private key")]
     InvalidPrivateKey,
     #[error("L2 system key derives address {actual}; expected {expected}")]
@@ -48,7 +48,7 @@ pub(crate) enum SystemTransactionConfigError {
 impl SystemTransactionKey {
     /// Parse once and bind the key to the address selected by deployment; no
     /// secret representation other than the signer is kept.
-    pub(crate) fn new(
+    pub fn new(
         private_key: B256,
         expected_address: Address,
     ) -> Result<Self, SystemTransactionConfigError> {
@@ -65,7 +65,7 @@ impl SystemTransactionKey {
     }
 
     /// Return the deployment address already verified by [`Self::new`].
-    pub(crate) fn address(&self) -> Address {
+    pub fn address(&self) -> Address {
         self.0.address()
     }
 

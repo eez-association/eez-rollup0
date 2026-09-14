@@ -1051,11 +1051,12 @@ one byte (`0x00` or `0x01`).
 
 The principal sources for this specification are:
 
-- `src/config.rs`, `src/service.rs`, and `src/service/` for configuration,
-  request lifetime, deadlines, and error mapping;
+- `../eez-prover-stateless/src/config.rs`, `src/service.rs`, and `src/service/`
+  for configuration, request lifetime, deadlines, and error mapping;
 - `src/window.rs` and `../eez-control-rpc/proto/prove.proto` for wire admission;
-- `src/validate.rs`, `src/validate/stateless.rs`, and
-  `src/validate/stateless/chain_config.rs` for replay evidence;
+- `src/validate.rs`, `src/validate/support.rs`,
+  `../eez-prover-stateless/src/backend.rs`, and
+  `../eez-prover-stateless/src/backend/chain_config.rs` for replay evidence;
 - `src/settlement/` for canonical decoding, profile, state, effect, inbound,
   outbound, DA, and system-transaction gates;
 - `src/attest.rs` and `../eez-protocol/src/signer.rs` for attestation;
