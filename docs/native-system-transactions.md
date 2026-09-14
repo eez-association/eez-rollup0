@@ -68,9 +68,11 @@ L1 consensus stays upstream Ethereum/Gnosis. Local cross-chain simulation shares
 Ethereum execution rules through the EEZ adapter without enabling native L1
 transactions. Reth's assembler, consensus and Engine validation are reused; its
 payload-selection loop is adapted because the pinned entry point fixes Ethereum
-primitives. `vendor/stateless` adds generic recovered-block/receipt entry points
-to the pinned library while retaining witness, consensus, trie, and checkpoint
-algorithms. See its provenance note for replacing it with an upstream revision.
+primitives. Stateless provides generic recovered-block/receipt entry points while
+retaining witness, consensus, trie, and checkpoint algorithms. Until the change
+lands via [EEZ Stateless PR #2](https://github.com/eez-association/stateless/pull/2),
+the dependency uses `AdityaSripal/stateless` branch
+`aditya/generic-recovered-validation`, pinned to an exact commit in `Cargo.lock`.
 
 ## Live regression
 

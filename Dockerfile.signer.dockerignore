@@ -3,8 +3,6 @@
 !Cargo.lock
 !crates/
 !crates/**
-!vendor/
-!vendor/**
 **/target/
 **/.env
 **/.env.*

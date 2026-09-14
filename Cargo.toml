@@ -18,7 +18,6 @@ members = [
     "crates/eez-protocol",
     "crates/eez-primitives",
     "crates/eez-evm",
-    "vendor/stateless",
     "crates/eez-prover",
     "crates/eez-prover-client",
     "crates/eez-testkit",
@@ -105,6 +104,7 @@ reth-trie-common                = { git = "https://github.com/paradigmxyz/reth",
 # DEDICATED env (never reth's node DB). Same rev so we don't link a 2nd mdbx build.
 reth-libmdbx                    = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-consensus-common = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-errors = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-execution-cache = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
@@ -114,18 +114,8 @@ reth-rpc = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b5123
 reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
 
-tries = { git = "https://github.com/eez-association/stateless", rev = "4fc3806bdd0e6b296c761ef4d4b260938365cf45" }
-
-reth-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb", default-features = false }
-
-revm-bytecode = { version = "=10.0.0", default-features = false }
-revm-database-interface = { version = "=11.0.1", default-features = false }
-revm-state = { version = "=11.0.1", default-features = false }
-
-serde_with = { version = "3.16", default-features = false, features = ["alloc", "macros"] }
-
 # Stateless execution, aligned with the same Reth revision used by the node.
-stateless-reth = { package = "stateless", path = "vendor/stateless" }
+stateless-reth = { package = "stateless", git = "https://github.com/AdityaSripal/stateless", branch = "aditya/generic-recovered-validation" }
 
 # reth_gnosis — Gnosis chain (chiado / gnosis mainnet) NodeBuilder.
 # Pinned to the rollup0-fd59fd22 branch which is the reth_gnosis

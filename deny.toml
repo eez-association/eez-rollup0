@@ -28,8 +28,8 @@ ignore = [
 # A reth dependency tree legitimately carries many duplicate versions; failing
 # on that would make this job noise rather than signal.
 multiple-versions = "allow"
-# Every git dependency is pinned by rev/tag in the workspace Cargo.toml and so
-# carries no version requirement, which cargo-deny reports as a wildcard.
+# Git dependencies carry no version requirement, which cargo-deny reports
+# as a wildcard; their exact commits are pinned in Cargo.lock.
 # Report it, do not fail on it — `sources` below is the real gate for those.
 wildcards = "warn"
 
@@ -37,11 +37,10 @@ wildcards = "warn"
 unknown-registry = "deny"
 unknown-git = "deny"
 # Every git source in Cargo.lock must be listed here, so adding a new fork is a
-# deliberate, reviewed change rather than a silent one. Revisions and tags are
-# pinned in the workspace Cargo.toml.
+# deliberate, reviewed change rather than a silent one.
 allow-git = [
     "https://github.com/paradigmxyz/reth",
-    "https://github.com/eez-association/stateless",
+    "https://github.com/AdityaSripal/stateless",
     "https://github.com/gnosischain/reth_gnosis",
     "https://github.com/gnosischain/rust-primitives.git",
     "https://github.com/sigp/discv5",
