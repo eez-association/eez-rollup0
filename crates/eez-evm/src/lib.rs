@@ -48,10 +48,8 @@ impl ReceiptBuilder for EezReceiptBuilder {
     type Transaction = EezTxEnvelope;
     type Receipt = Receipt;
 
-    /// Uses the same status, cumulative gas, and logs as `RethReceiptBuilder`,
-    /// but accepts `EezTxType` and returns `EthereumReceipt<EezTxType>`. The
-    /// upstream builder fixes both to Ethereum's type enum, which cannot carry
-    /// `0x76`; preserving that type is required for the consensus receipt root.
+    /// Preserve native type `0x76` in the receipt root; Ethereum's receipt builder
+    /// only accepts its own type enum. Status, gas, and logs are unchanged.
     fn build_receipt<E: Evm>(&self, ctx: ReceiptBuilderCtx<'_, EezTxType, E>) -> Receipt {
         Receipt {
             tx_type: ctx.tx_type,
@@ -62,9 +60,6 @@ impl ReceiptBuilder for EezReceiptBuilder {
     }
 }
 
-/// Selects EEZ primitives while delegating Ethereum execution rules to the
-/// upstream config. Its primitive and receipt types are fixed upstream, so they
-/// cannot be changed by configuring `EthEvmConfig` alone.
 #[derive(Debug, Clone)]
 pub struct EezEvmConfig<C = ChainSpec> {
     ethereum: EthEvmConfig<C>,
@@ -72,9 +67,6 @@ pub struct EezEvmConfig<C = ChainSpec> {
 }
 
 impl<C> EezEvmConfig<C> {
-    /// Uses Ethereum's executor with the EEZ minting wrapper and receipt builder so
-    /// it accepts native transactions. The upstream config supplies the shared
-    /// header environment and block assembler unchanged.
     pub fn new(chain_spec: Arc<C>) -> Self {
         Self {
             ethereum: EthEvmConfig::new(chain_spec.clone()),
@@ -96,8 +88,6 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
     type BlockExecutorFactory = EthBlockExecutorFactory<EezReceiptBuilder, Arc<C>, EezEvmFactory>;
     type BlockAssembler = EthBlockAssembler<C>;
 
-    /// Selects the executor with EEZ transaction/receipt types; returning the
-    /// inner Ethereum config's factory would restore its Ethereum-only types.
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
         &self.executor
     }
@@ -120,9 +110,8 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
             .map_err(AnyError::new)
     }
 
-    /// Rejects L2 blob transactions, then copies the upstream context fields. This
-    /// cannot delegate to `EthEvmConfig::context_for_block` because that method
-    /// accepts an Ethereum block, whereas this block contains `EezTxEnvelope`s.
+    /// Reject blobs on block import and stateless proof replay, then reuse
+    /// Ethereum's context fields with EEZ transaction types.
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<Block>,
@@ -176,12 +165,9 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static>
             .map_err(AnyError::new)
     }
 
-    /// Decodes Engine transactions as EEZ envelopes so imports can include
-    /// `0x76`, which the upstream Ethereum decoder rejects, and excludes L2 blob
-    /// transactions. EEZ signer recovery returns the fixed system sender for
-    /// native transactions and performs
-    /// ordinary signature recovery for Ethereum transactions. This identifies
-    /// the sender; canonical derivation and proof checks establish authorization.
+    /// Decode native envelopes and reject blobs before Engine replay. Native
+    /// recovery assigns the protocol sender; derivation and proof checks
+    /// establish the call's authority.
     fn tx_iterator_for_payload(
         &self,
         payload: &ExecutionData,

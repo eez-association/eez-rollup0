@@ -1,4 +1,5 @@
 //! Ethereum RPC methods with EEZ transaction and receipt response types.
+
 use crate::node::{EezEngineValidatorBuilder, EezNode};
 use alloy_consensus::{Receipt as RpcReceipt, TxReceipt};
 use alloy_consensus_any::AnyReceiptEnvelope;
@@ -18,21 +19,26 @@ use reth_rpc_eth_types::receipt::EthReceiptConverter;
 
 #[derive(Debug, Clone)]
 pub struct EezRpcTypes;
+
 impl RpcTypes for EezRpcTypes {
     type Header = Header;
     type Receipt = TransactionReceipt<AnyReceiptEnvelope<Log>>;
     type TransactionResponse = Transaction<EezTxEnvelope>;
     type TransactionRequest = TransactionRequest;
 }
+
 type ReceiptBuilder = fn(Receipt, usize, TransactionMeta) -> AnyReceiptEnvelope<Log>;
 type Converter =
     RpcConverter<EezRpcTypes, EezEvmConfig, EthReceiptConverter<ChainSpec, ReceiptBuilder>>;
+
 #[derive(Debug, Default)]
 pub struct EezEthApiBuilder;
+
 impl<N: FullNodeComponents<Types = EezNode, Evm = EezEvmConfig>> EthApiBuilder<N>
     for EezEthApiBuilder
 {
     type EthApi = EthApi<N, Converter>;
+
     async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
         let receipts = EthReceiptConverter::new(ctx.components.provider().chain_spec())
             .with_builder(build_receipt as ReceiptBuilder);
@@ -42,6 +48,7 @@ impl<N: FullNodeComponents<Types = EezNode, Evm = EezEvmConfig>> EthApiBuilder<N
             .build())
     }
 }
+
 fn build_receipt(
     receipt: Receipt,
     next_log_index: usize,
@@ -76,6 +83,7 @@ fn build_receipt(
         },
     }
 }
+
 pub fn eez_add_ons<N: FullNodeComponents<Types = EezNode, Evm = EezEvmConfig>>()
 -> RpcAddOns<N, EezEthApiBuilder, EezEngineValidatorBuilder> {
     RpcAddOns::new(

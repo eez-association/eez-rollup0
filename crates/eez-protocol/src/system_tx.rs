@@ -14,13 +14,12 @@ use crate::entries::{
     encode_execute_incoming,
 };
 
-/// Per-follower configuration the system-tx builder needs. The
-/// composer and deriver each build one from their own startup config.
+/// Public reconstruction inputs shared by Composer, Deriver, and proof validation.
 #[derive(Clone, Debug)]
 pub struct SystemTxContext {
-    /// Address of the `EEZL2` contract on this L2.
+    /// Must equal the reserved EEZL2 predeploy; encoding rejects other targets.
     pub eezl2_address: Address,
-    /// EIP-155 chain id of this L2.
+    /// Binds the reconstructed transaction to its L2 chain for replay protection.
     pub l2_chain_id: u64,
     /// This rollup's id — entries whose `destinationRollupId` doesn't
     /// match are skipped (they belong to a different L2).
@@ -59,11 +58,6 @@ pub fn build_inbound_system_txs(
         check_entry_shape(entry, "inbound")?;
         let outer = &entry.l2ToL1Calls[0];
         let source_rollup = outer.sourceRollupId;
-        // Build the lean L2 mirror, then encode
-        // `executeIncomingCrossChainCall(...)`. NOTE: inbound runtime semantics
-        // (success / return_data byte-identity vs the composer's emit) are
-        // validated in the prover phase — outbound-first does not exercise
-        // this delivery path at runtime.
         let l2_entry = build_l2_incoming_entry(IncomingEntry {
             target: outer.targetAddress,
             source: outer.sourceAddress,
@@ -321,16 +315,12 @@ pub fn build_cross_chain_sync_pairs(
     let mut nonce = starting_nonce;
     let mut pairs: Vec<SyncPair> = Vec::with_capacity(outbound.len() + inbound.len());
 
-    // Gate the inbound half before emitting anything: a bad shape must fail the
-    // call, not half-build it. Inbound needs its own gate because
-    // `build_inbound_system_txs` skips foreign entries before checking them.
-    // Outbound is gated by `build_outbound_pair`, which checks its entry first.
+    // Validate even foreign inbound entries, which the delivery builder skips.
     for entry in inbound {
         check_entry_shape(entry, "inbound")?;
     }
 
-    // ── PHASE 1 — outbound: each loadExecutionTable immediately paired with
-    // its consuming user tx (the self-clean requires consume-before-next-load).
+    // Each user must consume its load before the next load resets the execution table.
     for (entry, user_tx) in outbound {
         let built = build_outbound_pair(entry, user_tx, cfg, nonce)?;
         nonce = nonce
@@ -339,8 +329,7 @@ pub fn build_cross_chain_sync_pairs(
         pairs.extend(built);
     }
 
-    // ── PHASE 2 — inbound deliveries, continuing the SYSTEM_ADDRESS nonce
-    // after ALL outbound loads (build_inbound_system_txs advances internally).
+    // Inbound deliveries continue the nonce sequence after all outbound loads.
     let deliveries = build_inbound_system_txs(inbound, cfg, nonce)?;
     for d in deliveries {
         pairs.push(SyncPair {
@@ -352,15 +341,9 @@ pub fn build_cross_chain_sync_pairs(
     Ok(pairs)
 }
 
-/// Encode a native L2 transaction with an explicit `value`.
-///
-/// `EEZL2.executeIncomingCrossChainCall` enforces strict
-/// `msg.value == value` equality in `executeIncomingCrossChainCall` — pass the same
-/// value here as is embedded in the calldata.
-///
-/// # Errors
-///
-/// Returns an error if the target is not the reserved EEZL2 predeploy.
+/// Use the unsigned native envelope so every role reconstructs identical bytes.
+/// Restrict calls to EEZL2; its incoming-call check requires `value` to match
+/// the value encoded in the calldata.
 fn encode_system_tx(
     nonce: u64,
     to: Address,
@@ -739,17 +722,8 @@ mod tests {
         }
     }
 
-    /// Phase-C invariant (the migration plan's ★ HIGHEST-RISK item): the composer
-    /// EMITS the inbound system tx from its in-memory entries; the standalone deriver
-    /// REBUILDS it from the L1 `postBatch` (encode → on-chain → decode). The shared
-    /// `build_inbound_system_txs` MUST produce BYTE-IDENTICAL native txs across that
-    /// encode/decode round-trip — otherwise the derived L2 block forks from the
-    /// composer's and the next postBatch root mismatches: a SILENT soundness failure
-    /// (based has no deriver, so this equality was never exercised upstream).
-    ///
-    /// (eez0 keeps `TxLegacy` — fixed `gasPrice`, no `base_fee` — so the plan's
-    /// `max_fee = base_fee*2` asymmetry trap does not apply; the surface is the
-    /// entry encode/decode preservation + nonce agreement, which this pins.)
+    /// Reconstructing inbound transactions from posted entries must preserve the
+    /// composer's native bytes, or the follower derives a different block root.
     #[test]
     fn composer_emit_equals_deriver_rebuild_byte_identical() {
         let cfg = ctx();

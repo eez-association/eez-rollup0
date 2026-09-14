@@ -1,6 +1,7 @@
 //! Native-type devnet support. The second Composer's L1 is a real independent
 //! Reth database driven through Engine API by the first development L1's blocks.
 //! This is a development consensus feed, not a PoS/MEV builder simulation.
+
 use super::{
     ANVIL_ADDR, ANVIL_KEY_3, CrossChainWorld, DEV_CHAIN_ID, NodeBinary, NodeConfig, NodeHandle,
     PortLease, SETUP_TIMEOUT, signer_address, wait_for,
@@ -25,6 +26,7 @@ pub struct MirrorComposer {
     _witness: tempfile::TempDir,
     _jwt_dir: tempfile::TempDir,
 }
+
 impl MirrorComposer {
     pub fn assert_healthy(&self) {
         self.node.assert_no_process_death();
@@ -32,6 +34,7 @@ impl MirrorComposer {
         assert!(error.is_none(), "L1 mirror failed: {error:?}");
     }
 }
+
 impl Drop for MirrorComposer {
     fn drop(&mut self) {
         self.feed.abort();
@@ -195,6 +198,7 @@ async fn mirror_l1(source: &str, destination: &str, jwt: JwtSecret) -> Result<()
         number += 1;
     }
 }
+
 async fn engine_call(
     client: &reqwest::Client,
     url: &str,
@@ -253,6 +257,7 @@ pub struct SelectedBuilder {
     state: Arc<Mutex<(Option<String>, Address)>>,
     server: jsonrpsee::server::ServerHandle,
 }
+
 impl SelectedBuilder {
     pub async fn start() -> Result<Self> {
         use alloy_consensus::transaction::SignerRecoverable;
@@ -287,10 +292,12 @@ impl SelectedBuilder {
             server: server.start(module),
         })
     }
+
     pub fn select(&self, upstream: String, poster: Address) {
         *self.state.lock().unwrap() = (Some(upstream), poster);
     }
 }
+
 impl Drop for SelectedBuilder {
     fn drop(&mut self) {
         let _ = self.server.stop();

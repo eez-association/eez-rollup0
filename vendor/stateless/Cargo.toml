@@ -1,7 +1,5 @@
 [package]
 name = "stateless"
-# Make the workspace inherited by this package explicit.
-
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

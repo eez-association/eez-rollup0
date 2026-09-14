@@ -1,28 +1,9 @@
-//! Provides types and functions for stateless execution and validation of Ethereum blocks.
+//! Validate blocks against execution witnesses without a persistent state database.
 //!
-//! This crate enables the verification of block execution without requiring access to a
-//! full node's persistent database. Instead, it relies on pre-generated "witness" data
-//! that proves the specific state accessed during the block's execution.
-//!
-//! # Key Components
-//!
-//! * `WitnessDatabase`: An implementation of [`revm_database_interface::Database`] that uses a
-//!   [`tries::StatelessTrie`] implementation populated from witness data, along with provided
-//!   bytecode and ancestor block hashes, to serve state reads during execution.
-//! * `stateless_validation`: The core function that orchestrates the stateless validation process.
-//!   It takes a block, its execution witness, ancestor headers, and chain specification, then
-//!   performs:
-//!     1. Witness verification against the parent block's state root.
-//!     2. Block execution using the `WitnessDatabase`.
-//!     3. Post-execution consensus checks.
-//!     4. Post-state root calculation and comparison against the block header.
-//!
-//! # Usage
-//!
-//! The primary entry point is typically the `validation::stateless_validation` function. Callers
-//! need to provide the block to be validated along with accurately generated `ExecutionWitness`
-//! data corresponding to that block's execution trace and the necessary Headers of ancestor
-//! blocks.
+//! Witnesses are checked against the parent state root; execution results are
+//! checked against the block's consensus commitments. The local extension accepts
+//! generic recovered transaction and receipt types so EEZ native blocks use the
+//! same validation algorithms. See `README.eez.md` for upstream provenance.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
@@ -65,7 +46,6 @@ pub use validation::stateless_validation_recovered_with_trie_and_state_checkpoin
 #[doc(inline)]
 pub use validation::stateless_validation_with_trie;
 
-/// Implementation of stateless validation
 pub mod validation;
 pub(crate) mod witness_db;
 
@@ -76,16 +56,11 @@ pub use alloy_genesis::Genesis;
 
 use reth_ethereum_primitives::Block;
 
-/// `StatelessInput` is a convenience structure for serializing the input needed
-/// for the stateless validation function.
 #[serde_with::serde_as]
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct StatelessInput {
-    /// The block being executed in the stateless validation function
     pub block: Block,
-    /// `ExecutionWitness` for the stateless validation function
     pub witness: ExecutionWitness,
-    /// Chain configuration for the stateless validation function
     #[serde_as(as = "alloy_genesis::serde_bincode_compat::ChainConfig<'_>")]
     pub chain_config: ChainConfig,
 }

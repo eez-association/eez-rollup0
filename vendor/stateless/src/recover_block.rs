@@ -23,8 +23,6 @@ impl Deref for UncompressedPublicKey {
 }
 
 /// Verifies all transactions in a block against a list of public keys and signatures.
-///
-/// Returns a `RecoveredBlock`
 pub fn recover_block_with_public_keys<ChainSpec>(
     block: Block,
     public_keys: Vec<UncompressedPublicKey>,
@@ -39,27 +37,18 @@ where
         ));
     }
 
-    // Determine if we're in the Homestead fork for signature validation
     let is_homestead = chain_spec.is_homestead_active_at_block(block.header().number());
 
-    // Verify each transaction signature against its corresponding public key
     let senders = public_keys
         .iter()
         .zip(block.body().transactions())
         .map(|(vk, tx)| verify_and_compute_sender(vk, tx, is_homestead))
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Create RecoveredBlock with verified senders
     let block_hash = block.hash_slow();
     Ok(RecoveredBlock::new(block, senders, block_hash))
 }
 
-/// Verifies a transaction using its signature and the given public key.
-///
-/// Note: If the signature or the public key is incorrect, then this method
-/// will return an error.
-///
-/// Returns the address derived from the public key.
 fn verify_and_compute_sender(
     vk: &UncompressedPublicKey,
     tx: &TransactionSigned,
