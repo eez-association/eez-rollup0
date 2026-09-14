@@ -12,8 +12,6 @@ const TEST_ATTESTER_KEY: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8
 const PREFIXED_TEST_ATTESTER_KEY: &str =
     "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 const TEST_ATTESTER_ADDRESS: &str = "70997970c51812dc3A010C7d01b50e0d17dc79C8";
-// Deterministic deployment identity used only by configuration tests.
-const TEST_SYSTEM_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const TEST_PROOF_SYSTEM: &str = "00000000000000000000000000000000000000aa";
 
 /// Parse a normal valid baseline while keeping each test focused on the option
@@ -483,8 +481,8 @@ fn signer_key_must_match_the_expected_attester() {
         "chain-config.json",
         "--rollup-id",
         "1",
-        "--signer-key",
-        TEST_SYSTEM_KEY,
+        "--attester-address",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     ])
     .unwrap();
 
@@ -494,7 +492,7 @@ fn signer_key_must_match_the_expected_attester() {
         error,
         "attestation key does not match the expected attester address"
     );
-    assert!(!error.contains(TEST_SYSTEM_KEY));
+    assert!(!error.contains(TEST_ATTESTER_KEY));
 }
 
 #[test]

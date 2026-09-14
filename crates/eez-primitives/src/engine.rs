@@ -1,5 +1,6 @@
 //! Engine API adapters for EEZ blocks. Payload formats and fork rules are Ethereum's;
 //! transaction bytes inside those payloads are decoded using the EEZ envelope.
+//! L2 has no blob transactions, so the required Engine blob bundles are empty.
 use crate::{Block, EezPrimitives};
 use alloy_eips::eip7685::Requests;
 use alloy_primitives::{Bytes, U256};
@@ -11,7 +12,7 @@ use alloy_rpc_types_engine::{
     PayloadAttributes, PraguePayloadFields,
 };
 use reth_engine_primitives::EngineTypes;
-use reth_ethereum_engine_primitives::{BlobSidecars, BuiltPayloadConversionError, EthBuiltPayload};
+use reth_ethereum_engine_primitives::{BuiltPayloadConversionError, EthBuiltPayload};
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
 use reth_primitives_traits::SealedBlock;
 use std::sync::Arc;
@@ -27,11 +28,6 @@ impl EezBuiltPayload {
     ) -> Self {
         Self(EthBuiltPayload::new(block, fees, requests, bal))
     }
-    #[must_use]
-    pub fn with_sidecars(mut self, sidecars: impl Into<BlobSidecars>) -> Self {
-        self.0 = self.0.with_sidecars(sidecars);
-        self
-    }
     pub fn block(&self) -> &SealedBlock<Block> {
         self.0.block()
     }
@@ -40,13 +36,6 @@ impl EezBuiltPayload {
     }
     pub fn fees(&self) -> U256 {
         self.0.fees()
-    }
-    fn blobs_v2(&self) -> Result<BlobsBundleV2, BuiltPayloadConversionError> {
-        match self.0.sidecars().clone() {
-            BlobSidecars::Empty => Ok(BlobsBundleV2::empty()),
-            BlobSidecars::Eip7594(sidecars) => Ok(sidecars.into()),
-            BlobSidecars::Eip4844(_) => Err(BuiltPayloadConversionError::UnexpectedEip4844Sidecars),
-        }
     }
 }
 impl BuiltPayload for EezBuiltPayload {
@@ -83,13 +72,6 @@ impl From<EezBuiltPayload> for ExecutionPayloadEnvelopeV2 {
 impl TryFrom<EezBuiltPayload> for ExecutionPayloadEnvelopeV3 {
     type Error = BuiltPayloadConversionError;
     fn try_from(value: EezBuiltPayload) -> Result<Self, Self::Error> {
-        let blobs_bundle = match value.0.sidecars().clone() {
-            BlobSidecars::Empty => BlobsBundleV1::empty(),
-            BlobSidecars::Eip4844(sidecars) => sidecars.into(),
-            BlobSidecars::Eip7594(_) => {
-                return Err(BuiltPayloadConversionError::UnexpectedEip7594Sidecars);
-            }
-        };
         Ok(Self {
             execution_payload: ExecutionPayloadV3::from_block_unchecked(
                 value.block().hash(),
@@ -97,7 +79,7 @@ impl TryFrom<EezBuiltPayload> for ExecutionPayloadEnvelopeV3 {
             ),
             block_value: value.fees(),
             should_override_builder: false,
-            blobs_bundle,
+            blobs_bundle: BlobsBundleV1::empty(),
         })
     }
 }
@@ -120,7 +102,7 @@ impl TryFrom<EezBuiltPayload> for ExecutionPayloadEnvelopeV5 {
             ),
             block_value: value.fees(),
             should_override_builder: false,
-            blobs_bundle: value.blobs_v2()?,
+            blobs_bundle: BlobsBundleV2::empty(),
             execution_requests: value.requests().unwrap_or_default(),
         })
     }
@@ -140,7 +122,7 @@ impl TryFrom<EezBuiltPayload> for ExecutionPayloadEnvelopeV6 {
             ),
             block_value: value.fees(),
             should_override_builder: false,
-            blobs_bundle: value.blobs_v2()?,
+            blobs_bundle: BlobsBundleV2::empty(),
             execution_requests: value.requests().unwrap_or_default(),
         })
     }

@@ -1,12 +1,12 @@
 use super::*;
-use alloy_consensus::Typed2718;
+use alloy_consensus::{SignableTransaction, TxEip1559, TxEip4844};
 use alloy_evm::{EvmFactory, FromRecoveredTx};
-use alloy_primitives::{B256, TxKind, U256, address, bytes};
+use alloy_primitives::{B256, Signature, TxKind, U256, address, bytes};
 use eez_primitives::{
     EEZL2_ADDRESS, SYSTEM_ADDRESS, SYSTEM_TX_GAS_LIMIT, SYSTEM_TX_TYPE, SystemTransaction,
 };
 use reth_chainspec::ChainSpecBuilder;
-use reth_evm::execute::Executor;
+use reth_evm::{ConvertTx, ExecutableTxTuple, execute::Executor};
 use revm::{
     DatabaseCommit,
     context::TxEnv,
@@ -276,4 +276,82 @@ fn ordinary_transactions_still_pay_fees_and_outbound_eth_stays_at_the_system_add
     let next = evm.transact_raw(TxEnv { nonce: 1, ..native }).unwrap();
     assert_eq!(next.state[&SYSTEM_ADDRESS].info.balance, U256::from(17));
     assert_eq!(next.state[&EEZL2_ADDRESS].info.balance, U256::from(26));
+}
+
+#[test]
+fn l2_block_and_engine_replay_reject_blobs_but_l1_simulation_still_executes_them() {
+    let signature = Signature::new(U256::ONE, U256::ONE, false);
+    let ordinary = EezTxEnvelope::Ethereum(
+        TxEip1559 {
+            chain_id: 1,
+            gas_limit: 21_000,
+            max_fee_per_gas: 7,
+            to: TxKind::Call(EEZL2_ADDRESS),
+            ..Default::default()
+        }
+        .into_signed(signature)
+        .into(),
+    );
+    let blob = EezTxEnvelope::Ethereum(
+        TxEip4844 {
+            chain_id: 1,
+            gas_limit: 21_000,
+            max_fee_per_gas: 7,
+            max_fee_per_blob_gas: 1,
+            blob_versioned_hashes: vec![B256::repeat_byte(1)],
+            to: EEZL2_ADDRESS,
+            ..Default::default()
+        }
+        .into_signed(signature)
+        .into(),
+    );
+    let config = config();
+    for tx in [block(0, 1).body().transactions[0].clone(), ordinary, blob] {
+        let is_blob = tx.is_eip4844();
+        let signer = tx.try_recover().unwrap();
+        let mut block = block(0, 1).into_block();
+        block.body.transactions = vec![tx.clone()];
+        let block = SealedBlock::seal_slow(block).try_recover().unwrap();
+        let mut db = database(U256::ZERO, bytes!("00"));
+        db.insert_account_info(
+            signer,
+            AccountInfo {
+                balance: U256::from(1_000_000),
+                ..Default::default()
+            },
+        );
+
+        // The same raw-EVM path is used for cross-chain L1 simulation.
+        let mut evm = config.evm_with_env(db.clone(), config.evm_env(block.header()).unwrap());
+        let result = evm.transact(tx.with_signer(signer)).unwrap();
+        assert!(result.result.is_success());
+
+        let result = config.executor(db).execute_one(&block);
+        if is_blob {
+            assert!(format!("{:?}", result.unwrap_err()).contains("Eip4844Disabled"));
+        } else {
+            assert!(result.unwrap().receipts[0].success);
+        }
+
+        let payload: ExecutionData = eez_primitives::engine::EezBuiltPayload::new(
+            Arc::new(block.into_sealed_block()),
+            U256::ZERO,
+            None,
+            None,
+        )
+        .into();
+        let (raw, convert) = config
+            .tx_iterator_for_payload(&payload)
+            .unwrap()
+            .into_parts();
+        let result = convert.convert(raw.into_iter().next().unwrap());
+        if is_blob {
+            let error = result
+                .err()
+                .expect("Engine replay must reject blob transactions");
+            assert!(format!("{error:?}").contains("Eip4844Disabled"));
+        } else {
+            assert!(result.is_ok());
+        }
+    }
 }

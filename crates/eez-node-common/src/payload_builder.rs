@@ -1,6 +1,6 @@
 //! Payload construction adapted from reth-ethereum-payload-builder at fd59fd22
 //! (MIT/Apache-2.0). The pinned upstream builder fixes Ethereum primitives; this
-//! adapter changes only transaction, receipt, and built-payload types.
+//! adapter uses EEZ types and excludes blob transactions from L2 payloads.
 
 use alloy_consensus::{Transaction, transaction::TxHashRef};
 use alloy_primitives::{Bytes, U256};
@@ -13,10 +13,9 @@ use reth_basic_payload_builder::{
     BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder, PayloadConfig,
     is_better_payload,
 };
-use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
+use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
 use reth_errors::{BlockExecutionError, BlockValidationError, ConsensusError};
-use reth_ethereum_engine_primitives::BlobSidecars;
 use reth_evm::{
     ConfigureEvm, Evm, NextBlockEnvAttributes,
     block::TxResult,
@@ -30,8 +29,7 @@ use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::StateProviderFactory;
 use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
-    ValidPoolTransaction,
-    error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
+    ValidPoolTransaction, error::InvalidPoolTransactionError,
 };
 use revm::context_interface::{Block as _, Cfg as _};
 use std::sync::Arc;
@@ -39,25 +37,18 @@ use tracing::{debug, trace, warn};
 
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 
-type BestTransactionsIter<Pool> = Box<
-    dyn BestTransactions<Item = Arc<ValidPoolTransaction<<Pool as TransactionPool>::Transaction>>>,
->;
+type BestTransactionsIter<Tx> = Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<Tx>>>>;
 
-/// Ethereum payload builder
+/// Live L2 payload builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativePayloadBuilder<Pool, Client, EvmConfig = EezEvmConfig> {
-    /// Client providing access to node state.
     client: Client,
-    /// Transaction pool.
     pool: Pool,
-    /// The type responsible for creating the evm.
     evm_config: EvmConfig,
-    /// Payload builder configuration.
     builder_config: EthereumBuilderConfig,
 }
 
 impl<Pool, Client, EvmConfig> NativePayloadBuilder<Pool, Client, EvmConfig> {
-    /// `NativePayloadBuilder` constructor.
     pub const fn new(
         client: Client,
         pool: Pool,
@@ -73,7 +64,6 @@ impl<Pool, Client, EvmConfig> NativePayloadBuilder<Pool, Client, EvmConfig> {
     }
 }
 
-// Default implementation of [PayloadBuilder] for unit type
 impl<Pool, Client, EvmConfig> PayloadBuilder for NativePayloadBuilder<Pool, Client, EvmConfig>
 where
     EvmConfig: ConfigureEvm<Primitives = EezPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
@@ -90,7 +80,6 @@ where
         build_payload(
             self.evm_config.clone(),
             self.client.clone(),
-            self.pool.clone(),
             self.builder_config.clone(),
             args,
             |attributes| self.pool.best_transactions_with_attributes(attributes),
@@ -124,26 +113,22 @@ where
         build_payload(
             self.evm_config.clone(),
             self.client.clone(),
-            self.pool.clone(),
             self.builder_config.clone(),
             args,
-            |_| -> BestTransactionsIter<Pool> { Box::new(std::iter::empty()) },
+            |_| -> BestTransactionsIter<Pool::Transaction> { Box::new(std::iter::empty()) },
         )?
         .into_payload()
         .ok_or_else(|| PayloadBuilderError::MissingPayload)
     }
 }
 
-/// Constructs an Ethereum transaction payload using the best transactions from the pool.
-///
-/// Given build arguments including an Ethereum client, transaction pool,
-/// and configuration, this function creates a transaction payload. Returns
-/// a result indicating success with the payload or an error in case of failure.
+/// Builds a Live L2 payload from the best non-blob transactions in the pool.
+/// Copied from upstream `reth-ethereum-payload-builder` at `fd59fd22`, with
+/// EEZ types substituted and blob transaction handling removed.
 #[inline]
-pub fn build_payload<EvmConfig, Client, Pool, F>(
+pub fn build_payload<EvmConfig, Client, Tx, F>(
     evm_config: EvmConfig,
     client: Client,
-    pool: Pool,
     builder_config: EthereumBuilderConfig,
     args: BuildArguments<EthPayloadAttributes, EezBuiltPayload>,
     best_txs: F,
@@ -151,8 +136,8 @@ pub fn build_payload<EvmConfig, Client, Pool, F>(
 where
     EvmConfig: ConfigureEvm<Primitives = EezPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks>,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = EezTxEnvelope>>,
-    F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
+    Tx: PoolTransaction<Consensus = EezTxEnvelope>,
+    F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Tx>,
 {
     let BuildArguments {
         mut cached_reads,
@@ -212,14 +197,8 @@ where
     let tx_gas_limit_cap = builder.evm_mut().cfg_env().tx_gas_limit_cap();
     let base_fee = builder.evm_mut().block().basefee();
 
-    let mut best_txs = best_txs(BestTransactionsAttributes::new(
-        base_fee,
-        builder
-            .evm_mut()
-            .block()
-            .blob_gasprice()
-            .map(|gasprice| gasprice as u64),
-    ));
+    let mut best_txs = best_txs(BestTransactionsAttributes::new(base_fee, None));
+    best_txs.skip_blobs();
     let mut total_fees = U256::ZERO;
 
     // If we have a sparse trie handle, wire a state hook that streams per-tx state diffs
@@ -235,25 +214,7 @@ where
         PayloadBuilderError::Internal(err.into())
     })?;
 
-    // initialize empty blob sidecars at first. If cancun is active then this will be populated by
-    // blob sidecars if any.
-    let mut blob_sidecars = BlobSidecars::Empty;
-
-    let mut block_blob_count = 0;
     let mut block_transactions_rlp_length = 0;
-
-    let blob_params = chain_spec.blob_params_at_timestamp(attributes.timestamp);
-    let protocol_max_blob_count = blob_params
-        .as_ref()
-        .map(|params| params.max_blob_count)
-        .unwrap_or_else(Default::default);
-
-    // Apply user-configured blob limit (EIP-7872)
-    // Per EIP-7872: if the minimum is zero, set it to one
-    let max_blob_count = builder_config
-        .max_blobs_per_block
-        .map(|user_limit| std::cmp::min(user_limit, protocol_max_blob_count).max(1))
-        .unwrap_or(protocol_max_blob_count);
 
     let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp);
 
@@ -321,60 +282,6 @@ where
             continue;
         }
 
-        // There's only limited amount of blob space available per block, so we need to check if
-        // the EIP-4844 can still fit in the block
-        let mut blob_tx_sidecar = None;
-        let tx_blob_count = tx.blob_count();
-
-        if let Some(tx_blob_count) = tx_blob_count {
-            if block_blob_count + tx_blob_count > max_blob_count {
-                // we can't fit this _blob_ transaction into the block, so we mark it as
-                // invalid, which removes its dependent transactions from
-                // the iterator. This is similar to the gas limit condition
-                // for regular transactions above.
-                trace!(target: "payload_builder", tx=?tx.tx_hash(), ?block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
-                best_txs.mark_invalid(
-                    &pool_tx,
-                    InvalidPoolTransactionError::Eip4844(
-                        Eip4844PoolTransactionError::TooManyEip4844Blobs {
-                            have: block_blob_count + tx_blob_count,
-                            permitted: max_blob_count,
-                        },
-                    ),
-                );
-                continue;
-            }
-
-            let blob_sidecar_result = 'sidecar: {
-                let Some(sidecar) = pool
-                    .get_blob(*tx.tx_hash())
-                    .map_err(PayloadBuilderError::other)?
-                else {
-                    break 'sidecar Err(Eip4844PoolTransactionError::MissingEip4844BlobSidecar);
-                };
-
-                if is_osaka {
-                    if sidecar.is_eip7594() {
-                        Ok(sidecar)
-                    } else {
-                        Err(Eip4844PoolTransactionError::UnexpectedEip4844SidecarAfterOsaka)
-                    }
-                } else if sidecar.is_eip4844() {
-                    Ok(sidecar)
-                } else {
-                    Err(Eip4844PoolTransactionError::UnexpectedEip7594SidecarBeforeOsaka)
-                }
-            };
-
-            blob_tx_sidecar = match blob_sidecar_result {
-                Ok(sidecar) => Some(sidecar),
-                Err(error) => {
-                    best_txs.mark_invalid(&pool_tx, InvalidPoolTransactionError::Eip4844(error));
-                    continue;
-                }
-            };
-        }
-
         let miner_fee = tx.effective_tip_per_gas(base_fee);
         let tx_hash = *tx.tx_hash();
 
@@ -424,16 +331,6 @@ where
             Err(err) => return Err(PayloadBuilderError::evm(err)),
         };
 
-        // add to the total blob gas used if the transaction successfully executed
-        if let Some(blob_count) = tx_blob_count {
-            block_blob_count += blob_count;
-
-            // if we've reached the max blob count, we can skip blob txs entirely
-            if block_blob_count == max_blob_count {
-                best_txs.skip_blobs();
-            }
-        }
-
         block_transactions_rlp_length += tx_rlp_len;
 
         // update and add to total fees
@@ -443,11 +340,6 @@ where
         cumulative_tx_gas_used += gas_used;
         block_regular_gas_used += tx_regular_gas_used;
         block_state_gas_used += gas_output.state_gas_used();
-
-        // Add blob tx sidecar to the payload.
-        if let Some(sidecar) = blob_tx_sidecar {
-            blob_sidecars.push_sidecar_variant(sidecar.as_ref().clone());
-        }
     }
 
     // check if we have a better block
@@ -510,9 +402,7 @@ where
 
     let block_access_list: Option<Bytes> =
         block_access_list.map(|block_access_list| alloy_rlp::encode(&block_access_list).into());
-    let payload = EezBuiltPayload::new(sealed_block, total_fees, requests, block_access_list)
-        // add blob sidecars from the executed txs
-        .with_sidecars(blob_sidecars);
+    let payload = EezBuiltPayload::new(sealed_block, total_fees, requests, block_access_list);
 
     Ok(BuildOutcome::Better {
         payload,

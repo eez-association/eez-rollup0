@@ -7,7 +7,7 @@
 //! environment are reused. `eez-primitives` defines the zero-fee native TxEnv;
 //! `evm` adds deposit minting and rollback around the upstream Ethereum EVM.
 
-use alloy_consensus::Header;
+use alloy_consensus::{Header, Typed2718};
 use alloy_eips::Decodable2718;
 use alloy_evm::eth::{
     EthBlockExecutionCtx, EthBlockExecutorFactory,
@@ -23,11 +23,23 @@ use reth_evm::{
     ExecutionCtxFor, NextBlockEnvAttributes,
 };
 use reth_evm_ethereum::{EthBlockAssembler, EthEvmConfig};
-use reth_primitives_traits::{SealedBlock, SealedHeader, SignedTransaction};
-use std::{borrow::Cow, convert::Infallible, sync::Arc};
+use reth_primitives_traits::{
+    SealedBlock, SealedHeader, SignedTransaction, transaction::error::InvalidTransactionError,
+};
+use reth_storage_errors::any::AnyError;
+use std::{borrow::Cow, sync::Arc};
 
 mod evm;
 pub use evm::EezEvmFactory;
+
+// Enforce L2 transaction support at block replay boundaries. The underlying EVM
+// is also used for L1 simulation, where blob transactions remain valid.
+fn ensure_supported_transaction(tx: &EezTxEnvelope) -> Result<(), AnyError> {
+    if tx.is_eip4844() {
+        return Err(AnyError::new(InvalidTransactionError::Eip4844Disabled));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EezReceiptBuilder;
@@ -79,7 +91,7 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
     for EezEvmConfig<C>
 {
     type Primitives = EezPrimitives;
-    type Error = Infallible;
+    type Error = AnyError;
     type NextBlockEnvCtx = NextBlockEnvAttributes;
     type BlockExecutorFactory = EthBlockExecutorFactory<EezReceiptBuilder, Arc<C>, EezEvmFactory>;
     type BlockAssembler = EthBlockAssembler<C>;
@@ -95,7 +107,7 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
     }
 
     fn evm_env(&self, header: &Header) -> Result<EvmEnv, Self::Error> {
-        self.ethereum.evm_env(header)
+        self.ethereum.evm_env(header).map_err(AnyError::new)
     }
 
     fn next_evm_env(
@@ -103,16 +115,23 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
         parent: &Header,
         attributes: &NextBlockEnvAttributes,
     ) -> Result<EvmEnv, Self::Error> {
-        self.ethereum.next_evm_env(parent, attributes)
+        self.ethereum
+            .next_evm_env(parent, attributes)
+            .map_err(AnyError::new)
     }
 
-    /// Copies the upstream context fields without changing their meaning. This
+    /// Rejects L2 blob transactions, then copies the upstream context fields. This
     /// cannot delegate to `EthEvmConfig::context_for_block` because that method
     /// accepts an Ethereum block, whereas this block contains `EezTxEnvelope`s.
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<Block>,
     ) -> Result<EthBlockExecutionCtx<'a>, Self::Error> {
+        block
+            .body()
+            .transactions
+            .iter()
+            .try_for_each(ensure_supported_transaction)?;
         Ok(EthBlockExecutionCtx {
             tx_count_hint: Some(block.transaction_count()),
             parent_hash: block.header().parent_hash,
@@ -133,7 +152,9 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
         parent: &SealedHeader,
         attributes: NextBlockEnvAttributes,
     ) -> Result<EthBlockExecutionCtx<'_>, Self::Error> {
-        self.ethereum.context_for_next_block(parent, attributes)
+        self.ethereum
+            .context_for_next_block(parent, attributes)
+            .map_err(AnyError::new)
     }
 }
 
@@ -141,31 +162,34 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static>
     ConfigureEngineEvm<ExecutionData> for EezEvmConfig<C>
 {
     fn evm_env_for_payload(&self, payload: &ExecutionData) -> Result<EvmEnvFor<Self>, Self::Error> {
-        self.ethereum.evm_env_for_payload(payload)
+        self.ethereum
+            .evm_env_for_payload(payload)
+            .map_err(AnyError::new)
     }
 
     fn context_for_payload<'a>(
         &self,
         payload: &'a ExecutionData,
     ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
-        self.ethereum.context_for_payload(payload)
+        self.ethereum
+            .context_for_payload(payload)
+            .map_err(AnyError::new)
     }
 
     /// Decodes Engine transactions as EEZ envelopes so imports can include
-    /// `0x76`, which the upstream Ethereum decoder rejects. EEZ signer recovery
-    /// returns the fixed system sender for native transactions and performs
+    /// `0x76`, which the upstream Ethereum decoder rejects, and excludes L2 blob
+    /// transactions. EEZ signer recovery returns the fixed system sender for
+    /// native transactions and performs
     /// ordinary signature recovery for Ethereum transactions. This identifies
     /// the sender; canonical derivation and proof checks establish authorization.
     fn tx_iterator_for_payload(
         &self,
         payload: &ExecutionData,
     ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
-        let convert = |raw: Bytes| -> Result<_, reth_storage_errors::any::AnyError> {
-            let tx = EezTxEnvelope::decode_2718_exact(&raw)
-                .map_err(reth_storage_errors::any::AnyError::new)?;
-            let signer = tx
-                .try_recover()
-                .map_err(reth_storage_errors::any::AnyError::new)?;
+        let convert = |raw: Bytes| -> Result<_, AnyError> {
+            let tx = EezTxEnvelope::decode_2718_exact(&raw).map_err(AnyError::new)?;
+            ensure_supported_transaction(&tx)?;
+            let signer = tx.try_recover().map_err(AnyError::new)?;
             Ok(tx.with_signer(signer))
         };
         Ok((payload.payload.transactions().clone(), convert))
