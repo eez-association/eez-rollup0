@@ -9,8 +9,8 @@ EEZ protocol.
 The protocol source used by this profile is the `eez-core-protocol`
 submodule at commit
 `6fcc90b65063831cb7797e9fa361004064d28f9f`. Stateless execution uses
-`eez-association/stateless` at commit
-`4fc3806bdd0e6b296c761ef4d4b260938365cf45`.
+`AdityaSripal/stateless` branch `aditya/generic-recovered-validation`,
+with the exact commit pinned in `Cargo.lock`.
 
 The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative. Solidity
 defines on-chain behavior. This document defines the additional conditions the
