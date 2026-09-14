@@ -37,84 +37,56 @@ const BLOCKHASH_ANCESTOR_LIMIT: usize = 256;
 /// Errors that can occur during stateless validation.
 #[derive(Debug, thiserror::Error)]
 pub enum StatelessValidationError {
-    /// Error when the number of ancestor headers exceeds the limit.
     #[error("ancestor header count ({count}) exceeds limit ({limit})")]
-    AncestorHeaderLimitExceeded {
-        /// The number of headers provided.
-        count: usize,
-        /// The limit.
-        limit: usize,
-    },
+    AncestorHeaderLimitExceeded { count: usize, limit: usize },
 
-    /// Error when an ancestor header hash does not match its child's parent hash.
     #[error(
         "invalid ancestor chain: child block {child_number} expects parent hash {expected_parent_hash}, but ancestor block {parent_number} has hash {actual_parent_hash}"
     )]
     InvalidAncestorParentHash {
-        /// The child block number whose parent hash was checked.
         child_number: u64,
-        /// The ancestor block number provided as the parent.
         parent_number: u64,
-        /// The parent hash committed to by the child header.
         expected_parent_hash: B256,
-        /// The hash of the provided ancestor header.
         actual_parent_hash: B256,
     },
 
-    /// Error when ancestor header numbers are not contiguous.
     #[error(
         "invalid ancestor chain: ancestor block {parent_number} is not the parent of child block {child_number}; expected parent block {expected_parent_number}"
     )]
     InvalidAncestorNumber {
-        /// The child block number whose parent number was checked.
         child_number: u64,
-        /// The expected parent block number.
         expected_parent_number: u64,
-        /// The ancestor block number provided as the parent.
         parent_number: u64,
     },
 
-    /// Error when revealing the witness data failed.
     #[error("failed to reveal witness data for pre-state root {pre_state_root}")]
-    WitnessRevealFailed {
-        /// The pre-state root used for verification.
-        pre_state_root: B256,
-    },
+    WitnessRevealFailed { pre_state_root: B256 },
 
-    /// Error during stateless block execution.
     #[error("stateless block execution failed: {0}")]
     StatelessExecutionFailed(String),
 
-    /// Error during consensus validation of the block.
     #[error("consensus validation failed: {0}")]
     ConsensusValidationFailed(#[from] ConsensusError),
 
-    /// Error when the block access list exceeds the per-block item gas limit (EIP-7928).
     #[error("block access list exceeds gas limit, {items} items exceeds limit of {limit}")]
     BlockAccessListGasLimitExceeded {
-        /// The number of block access list items produced during execution.
         items: u64,
         /// The maximum number of items allowed, the block gas limit divided by the per item cost.
         limit: u64,
     },
 
-    /// Error during stateless state root calculation.
     #[error("stateless state root calculation failed")]
     StatelessStateRootCalculationFailed,
 
-    /// Error calculating the pre-state root from the witness data.
     #[error("stateless pre-state root calculation failed")]
     StatelessPreStateRootCalculationFailed,
 
-    /// Error when required ancestor headers are missing (e.g., parent header for pre-state root).
     #[error("missing required ancestor headers")]
     MissingAncestorHeader,
 
-    /// Error when deserializing ancestor headers
     #[error("could not deserialize ancestor headers")]
     HeaderDeserializationFailed,
 
-    /// Error when the computed state root does not match the one in the block header.
     #[error("mismatched post-state root: {got}\n {expected}")]
     PostStateRootMismatch {
         /// The computed post-state root
@@ -123,7 +95,6 @@ pub enum StatelessValidationError {
         expected: B256,
     },
 
-    /// Error when the computed pre-state root does not match the expected one.
     #[error("mismatched pre-state root: {got} \n {expected}")]
     PreStateRootMismatch {
         /// The computed pre-state root
@@ -132,37 +103,22 @@ pub enum StatelessValidationError {
         expected: B256,
     },
 
-    /// Error during signer recovery.
     #[error("signer recovery failed")]
     SignerRecovery,
 
-    /// Error when requested transaction checkpoints are not strictly ordered.
     #[error(
         "transaction checkpoint indices must be strictly increasing, got {previous} before {current}"
     )]
-    UnorderedTransactionCheckpoints {
-        /// The preceding requested transaction index.
-        previous: usize,
-        /// The next requested transaction index.
-        current: usize,
-    },
+    UnorderedTransactionCheckpoints { previous: usize, current: usize },
 
-    /// Error when a requested checkpoint is outside the block's transactions.
     #[error(
         "transaction checkpoint index {index} is outside a block with {transactions} transactions"
     )]
-    TransactionCheckpointOutOfBounds {
-        /// The requested transaction index.
-        index: usize,
-        /// The number of transactions in the block.
-        transactions: usize,
-    },
+    TransactionCheckpointOutOfBounds { index: usize, transactions: usize },
 
-    /// Error when signature has non-normalized s value in homestead block.
     #[error("signature s value not normalized for homestead block")]
     HomesteadSignatureNotNormalized,
 
-    /// Custom error.
     #[error("{0}")]
     Custom(&'static str),
 }
@@ -189,15 +145,12 @@ impl From<StatelessTrieError> for StatelessValidationError {
 /// Output of successful stateless block validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatelessValidationOutput<R = EthereumReceipt> {
-    /// Hash of the validated block.
     pub block_hash: B256,
     /// State root from which the validated block was executed.
     pub pre_state_root: B256,
     /// State root recomputed after executing and finalizing the validated block.
     pub post_state_root: B256,
-    /// Execution output produced while validating the block.
     pub execution_output: BlockExecutionOutput<R>,
-    /// Block access list produced during execution, if available.
     pub block_access_list: Option<BlockAccessList>,
 }
 
@@ -220,7 +173,6 @@ pub struct TransactionStateCheckpoint {
 /// Successful stateless validation with opt-in execution checkpoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatelessValidationWithStateCheckpointsOutput<R = EthereumReceipt> {
-    /// The ordinary block validation output.
     pub validation: StatelessValidationOutput<R>,
     /// State roots derived at the block's execution boundaries.
     pub checkpoints: BlockStateCheckpoints,

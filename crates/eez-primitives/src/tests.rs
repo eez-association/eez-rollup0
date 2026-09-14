@@ -79,6 +79,7 @@ fn native_wire_sender_hash_and_storage_round_trip() {
     );
     assert!(reth_ethereum_primitives::TransactionSigned::decode_2718_exact(&bytes).is_err());
 }
+
 #[test]
 fn rejects_malformed_and_trailing_native_bytes() {
     let bytes = system().encoded_2718();
@@ -93,6 +94,7 @@ fn rejects_malformed_and_trailing_native_bytes() {
     assert!(EezTxEnvelope::decode_2718_exact(&wrong_target).is_err());
     assert!(<EezTxEnvelope as reth_codecs::Decompress>::decompress(&wrong_target).is_err());
 }
+
 #[test]
 fn ethereum_bytes_and_sender_are_unchanged() {
     let eth: reth_ethereum_primitives::TransactionSigned = TxLegacy {
@@ -116,11 +118,13 @@ fn ethereum_bytes_and_sender_are_unchanged() {
         tx
     );
 }
+
 #[test]
 fn native_is_not_a_public_pooled_transaction() {
     type Pooled = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844WithSidecar>;
     assert!(Pooled::try_from(system()).is_err());
 }
+
 #[test]
 fn rpc_serialization_has_type_and_quantities_without_signature() {
     let tx = system();

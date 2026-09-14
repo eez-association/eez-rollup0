@@ -1,6 +1,7 @@
 //! Engine API adapters for EEZ blocks. Payload formats and fork rules are Ethereum's;
 //! transaction bytes inside those payloads are decoded using the EEZ envelope.
 //! L2 has no blob transactions, so the required Engine blob bundles are empty.
+
 use crate::{Block, EezPrimitives};
 use alloy_eips::eip7685::Requests;
 use alloy_primitives::{Bytes, U256};
@@ -19,6 +20,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct EezBuiltPayload(EthBuiltPayload<EezPrimitives>);
+
 impl EezBuiltPayload {
     pub fn new(
         block: Arc<SealedBlock<Block>>,
@@ -28,36 +30,46 @@ impl EezBuiltPayload {
     ) -> Self {
         Self(EthBuiltPayload::new(block, fees, requests, bal))
     }
+
     pub fn block(&self) -> &SealedBlock<Block> {
         self.0.block()
     }
+
     pub fn block_arc(&self) -> &Arc<SealedBlock<Block>> {
         self.0.block_arc()
     }
+
     pub fn fees(&self) -> U256 {
         self.0.fees()
     }
 }
+
 impl BuiltPayload for EezBuiltPayload {
     type Primitives = EezPrimitives;
+
     fn block(&self) -> &SealedBlock<Block> {
         self.0.block()
     }
+
     fn fees(&self) -> U256 {
         self.0.fees()
     }
+
     fn block_access_list(&self) -> Option<&Bytes> {
         self.0.block_access_list()
     }
+
     fn requests(&self) -> Option<Requests> {
         self.0.requests()
     }
 }
+
 impl From<EezBuiltPayload> for ExecutionPayloadV1 {
     fn from(value: EezBuiltPayload) -> Self {
         Self::from_block_unchecked(value.block().hash(), &value.block().clone_block())
     }
 }
+
 impl From<EezBuiltPayload> for ExecutionPayloadEnvelopeV2 {
     fn from(value: EezBuiltPayload) -> Self {
         Self {
@@ -69,8 +81,10 @@ impl From<EezBuiltPayload> for ExecutionPayloadEnvelopeV2 {
         }
     }
 }
+
 impl TryFrom<EezBuiltPayload> for ExecutionPayloadEnvelopeV3 {
     type Error = BuiltPayloadConversionError;
+
     fn try_from(value: EezBuiltPayload) -> Result<Self, Self::Error> {
         Ok(Self {
             execution_payload: ExecutionPayloadV3::from_block_unchecked(
@@ -83,8 +97,10 @@ impl TryFrom<EezBuiltPayload> for ExecutionPayloadEnvelopeV3 {
         })
     }
 }
+
 impl TryFrom<EezBuiltPayload> for ExecutionPayloadEnvelopeV4 {
     type Error = BuiltPayloadConversionError;
+
     fn try_from(value: EezBuiltPayload) -> Result<Self, Self::Error> {
         Ok(Self {
             execution_requests: value.requests().unwrap_or_default(),
@@ -92,8 +108,10 @@ impl TryFrom<EezBuiltPayload> for ExecutionPayloadEnvelopeV4 {
         })
     }
 }
+
 impl TryFrom<EezBuiltPayload> for ExecutionPayloadEnvelopeV5 {
     type Error = BuiltPayloadConversionError;
+
     fn try_from(value: EezBuiltPayload) -> Result<Self, Self::Error> {
         Ok(Self {
             execution_payload: ExecutionPayloadV3::from_block_unchecked(
@@ -107,8 +125,10 @@ impl TryFrom<EezBuiltPayload> for ExecutionPayloadEnvelopeV5 {
         })
     }
 }
+
 impl TryFrom<EezBuiltPayload> for ExecutionPayloadEnvelopeV6 {
     type Error = BuiltPayloadConversionError;
+
     fn try_from(value: EezBuiltPayload) -> Result<Self, Self::Error> {
         let bal = value
             .block_access_list()
@@ -127,6 +147,7 @@ impl TryFrom<EezBuiltPayload> for ExecutionPayloadEnvelopeV6 {
         })
     }
 }
+
 impl From<EezBuiltPayload> for ExecutionData {
     fn from(value: EezBuiltPayload) -> Self {
         let block = value.block();
@@ -151,12 +172,15 @@ impl From<EezBuiltPayload> for ExecutionData {
         Self { payload, sidecar }
     }
 }
+
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EezEngineTypes;
+
 impl PayloadTypes for EezEngineTypes {
     type BuiltPayload = EezBuiltPayload;
     type PayloadAttributes = PayloadAttributes;
     type ExecutionData = ExecutionData;
+
     fn block_to_payload(block: SealedBlock<Block>, bal: Option<Bytes>) -> ExecutionData {
         let (payload, sidecar) = ExecutionPayload::from_block_unchecked_with_extras(
             block.hash(),
@@ -166,6 +190,7 @@ impl PayloadTypes for EezEngineTypes {
         ExecutionData { payload, sidecar }
     }
 }
+
 impl EngineTypes for EezEngineTypes {
     type ExecutionPayloadEnvelopeV1 = ExecutionPayloadV1;
     type ExecutionPayloadEnvelopeV2 = ExecutionPayloadEnvelopeV2;

@@ -1,5 +1,6 @@
 //! Ethereum pooled transactions adapted to EEZ block primitives. Native system
 //! envelopes have no conversion into the public pooled wire format.
+
 use alloy_consensus::{
     Typed2718,
     transaction::{Recovered, TxHashRef},
@@ -20,29 +21,36 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct EezPooledTransaction(EthPooledTransaction<EezTxEnvelope>);
+
 impl Typed2718 for EezPooledTransaction {
     fn ty(&self) -> u8 {
         self.0.ty()
     }
 }
+
 impl InMemorySize for EezPooledTransaction {
     fn size(&self) -> usize {
         self.0.size()
     }
 }
+
 impl PoolTransaction for EezPooledTransaction {
     type TryFromConsensusError = alloy_consensus::error::ValueError<EezTxEnvelope>;
     type Consensus = EezTxEnvelope;
     type Pooled = <EthPooledTransaction as PoolTransaction>::Pooled;
+
     fn clone_into_consensus(&self) -> Recovered<Self::Consensus> {
         self.0.transaction.clone()
     }
+
     fn consensus_ref(&self) -> Recovered<&Self::Consensus> {
         Recovered::new_unchecked(&self.0.transaction, self.sender())
     }
+
     fn into_consensus(self) -> Recovered<Self::Consensus> {
         self.0.transaction
     }
+
     fn from_pooled(tx: Recovered<Self::Pooled>) -> Self {
         let tx = EthPooledTransaction::from_pooled(tx);
         Self(EthPooledTransaction {
@@ -52,22 +60,28 @@ impl PoolTransaction for EezPooledTransaction {
             blob_sidecar: tx.blob_sidecar,
         })
     }
+
     fn hash(&self) -> &TxHash {
         self.0.transaction.tx_hash()
     }
+
     fn sender(&self) -> Address {
         self.0.transaction.signer()
     }
+
     fn sender_ref(&self) -> &Address {
         self.0.transaction.signer_ref()
     }
+
     fn cost(&self) -> &U256 {
         &self.0.cost
     }
+
     fn encoded_length(&self) -> usize {
         self.0.encoded_length
     }
 }
+
 impl EthPoolTransaction for EezPooledTransaction {
     fn take_blob(&mut self) -> EthBlobTransactionSidecar {
         if self.is_eip4844() {
@@ -76,6 +90,7 @@ impl EthPoolTransaction for EezPooledTransaction {
             EthBlobTransactionSidecar::None
         }
     }
+
     fn try_into_pooled_eip4844(
         self,
         sidecar: Arc<BlobTransactionSidecarVariant>,
@@ -88,6 +103,7 @@ impl EthPoolTransaction for EezPooledTransaction {
             .ok()
             .map(|tx| tx.with_signer(signer))
     }
+
     fn try_from_eip4844(
         tx: Recovered<Self::Consensus>,
         sidecar: BlobTransactionSidecarVariant,
@@ -100,6 +116,7 @@ impl EthPoolTransaction for EezPooledTransaction {
             .ok()
             .map(|tx| Self::from_pooled(tx.with_signer(signer)))
     }
+
     fn validate_blob(
         &self,
         sidecar: &BlobTransactionSidecarVariant,
@@ -115,6 +132,7 @@ impl EthPoolTransaction for EezPooledTransaction {
         ))
     }
 }
+
 impl alloy_consensus::Transaction for EezPooledTransaction {
     fn chain_id(&self) -> Option<alloy_primitives::ChainId> {
         self.0.chain_id()

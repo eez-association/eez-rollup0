@@ -49,8 +49,7 @@ impl PoolTransactionError for SystemAddressRejected {
     }
 }
 
-/// Rejects L2 SYSTEM_ADDRESS txs; a reorg re-injects them and a Live block
-/// carrying one fail-closes emission.
+/// Prevents RPC, gossip, and reorg reinjection from admitting the reserved sender.
 #[derive(Debug)]
 pub struct SystemAddressGate<V> {
     inner: V,
@@ -70,8 +69,6 @@ impl<V> SystemAddressGate<V>
 where
     V: TransactionValidator,
 {
-    /// The pool tx carries its recovered sender, so this is a compare, not an
-    /// ECDSA recovery.
     fn is_system_sender(&self, tx: &V::Transaction) -> bool {
         self.system_address == tx.sender()
     }
@@ -109,13 +106,13 @@ where
         self.inner.validate_transaction(origin, transaction).await
     }
 
+    /// Preserve input order after filtering: callers associate each outcome
+    /// with the transaction at the same position in the request.
     async fn validate_transactions(
         &self,
         transactions: impl IntoIterator<Item = (TransactionOrigin, Self::Transaction), IntoIter: Send>
         + Send,
     ) -> Vec<TransactionValidationOutcome<Self::Transaction>> {
-        // One batch keeps the inner validator on a single state provider;
-        // `slots` puts the results back in input order.
         let mut slots = Vec::new();
         let mut forwarded = Vec::new();
         for (origin, tx) in transactions {
@@ -131,8 +128,7 @@ where
             .validate_transactions(forwarded)
             .await
             .into_iter();
-        // One outcome per input, in input order. A short inner result would
-        // silently drop txs, so panic instead (invariant 7).
+        // A short inner result would silently drop a transaction's outcome.
         slots
             .into_iter()
             .map(|slot| {
@@ -150,8 +146,7 @@ where
     }
 }
 
-/// Copy of [`reth_node_ethereum::node::EthereumPoolBuilder`] that wraps the
-/// Ethereum validator in [`SystemAddressGate`].
+/// Upstream Ethereum pool with the reserved-sender gate and blob support disabled.
 #[derive(Debug, Clone, Copy)]
 pub struct EezPoolBuilder {
     system_address: Address,
@@ -174,14 +169,12 @@ where
 {
     type Pool = EezTransactionPool<Node::Provider, NoopBlobStore, Evm>;
 
-    // Nothing here awaits, so `async fn` would build a state machine for no
-    // reason; an `async move` body instead would just trip `manual_async_fn`.
+    /// Disable L2 blob admission and storage, and gate reserved senders for every origin.
     fn build_pool(
         self,
         ctx: &BuilderContext<Node>,
         evm_config: Evm,
     ) -> impl Future<Output = eyre::Result<Self::Pool>> + Send {
-        // Closure only so the body keeps using `?`.
         let build = move || -> eyre::Result<Self::Pool> {
             let pool_config = ctx.pool_config();
 

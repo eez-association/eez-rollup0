@@ -158,8 +158,6 @@ where
         state_provider = Box::new(CachedStateProvider::new(
             state_provider,
             execution_cache.cache().clone(),
-            // It's ok to recreate the cache every time, because it's cheap to do so for a vanilla
-            // Ethereum builder every 12s.
             CachedStateMetrics::zeroed(CachedStateMetricsSource::Builder),
         ));
     }
@@ -201,8 +199,7 @@ where
     best_txs.skip_blobs();
     let mut total_fees = U256::ZERO;
 
-    // If we have a sparse trie handle, wire a state hook that streams per-tx state diffs
-    // to the background trie pipeline for incremental state root computation.
+    // Stream state diffs so the trie task can compute the root alongside execution.
     if let Some(ref handle) = trie_handle {
         builder
             .executor_mut()
@@ -225,7 +222,6 @@ where
         .unwrap_or(0);
 
     while let Some(pool_tx) = best_txs.next() {
-        // ensure we still have capacity for this transaction
         let exceeds_gas_limit = if is_amsterdam {
             let regular_available_gas = block_gas_limit.saturating_sub(block_regular_gas_used);
             let state_available_gas = block_gas_limit.saturating_sub(block_state_gas_used);
@@ -245,9 +241,7 @@ where
         };
 
         if let Some((transaction_gas_limit, block_available_gas)) = exceeds_gas_limit {
-            // we can't fit this transaction into the block, so we need to mark it as invalid
-            // which also removes all dependent transaction from the iterator before we can
-            // continue
+            // Skipping this nonce also excludes dependent transactions from the candidate.
             best_txs.mark_invalid(
                 &pool_tx,
                 InvalidPoolTransactionError::ExceedsGasLimit(
@@ -258,12 +252,10 @@ where
             continue;
         }
 
-        // check if the job was cancelled, if so we can exit early
         if cancel.is_cancelled() {
             return Ok(BuildOutcome::Cancelled);
         }
 
-        // convert tx to a signed transaction
         let tx = pool_tx.to_consensus();
 
         let tx_rlp_len = tx.inner().length();
@@ -294,11 +286,8 @@ where
                 error, ..
             })) => {
                 if error.is_nonce_too_low() {
-                    // if the nonce is too low, we can skip this transaction
                     trace!(target: "payload_builder", %error, ?tx_hash, "skipping nonce too low transaction");
                 } else {
-                    // if the transaction is invalid, we can skip it and all of its
-                    // descendants
                     trace!(target: "payload_builder", %error, ?tx_hash, "skipping invalid transaction and its descendants");
                     best_txs.mark_invalid(
                         &pool_tx,
@@ -327,13 +316,11 @@ where
                 );
                 continue;
             }
-            // this is an error that we should treat as fatal for this attempt
             Err(err) => return Err(PayloadBuilderError::evm(err)),
         };
 
         block_transactions_rlp_length += tx_rlp_len;
 
-        // update and add to total fees
         let gas_used = gas_output.tx_gas_used();
         let miner_fee = miner_fee.expect("fee is always valid; execution succeeded");
         total_fees += U256::from(miner_fee) * U256::from(gas_used);
@@ -342,11 +329,8 @@ where
         block_state_gas_used += gas_output.state_gas_used();
     }
 
-    // check if we have a better block
     if !is_better_payload(best_payload.as_ref(), total_fees) {
-        // Release db
         drop(builder);
-        // can skip building the block
         return Ok(BuildOutcome::Aborted {
             fees: total_fees,
             cached_reads,
@@ -359,13 +343,9 @@ where
         block_access_list,
         ..
     } = if let Some(mut handle) = trie_handle {
-        // Drop the state hook, which drops the StateHookSender and triggers
-        // FinishedStateUpdates via its Drop impl, signaling the trie task to finalize.
+        // Dropping the hook signals the trie task to finalize before we wait for its root.
         builder.executor_mut().set_state_hook(None);
 
-        // The sparse trie has been computing incrementally alongside tx execution.
-        // This recv() waits for the final root hash — most work is already done.
-        // Fall back to sync state root if the trie pipeline fails.
         match handle.state_root() {
             Ok(outcome) => {
                 debug!(target: "payload_builder", id=%payload_id, state_root=?outcome.state_root, "received state root from sparse trie");

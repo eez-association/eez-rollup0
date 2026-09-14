@@ -50,16 +50,14 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> Evm for EezEvm<DB, I> {
         self.ethereum.chain_id()
     }
 
-    /// Native value is minted for this call, independently of the system
-    /// account's existing balance (which may contain outbound ETH). The mint
-    /// enters revm's journal before its ordinary nonce/funding validation and
-    /// value transfer. Invalid transactions discard it through revm's error
-    /// cleanup; an outer EVM revert/halt needs the explicit rollback below.
-    /// Fee exemption comes from the native zero-price TxEnv, not a cfg flag.
+    /// Mint native value before Ethereum's validation and transfer, preserving
+    /// existing system funds. Revm errors discard the mint; reverted or halted
+    /// calls need the explicit rollback below. The native TxEnv supplies zero fees.
     fn transact_raw(&mut self, tx: TxEnv) -> Result<ResultAndState, Self::Error> {
         if tx.tx_type != SYSTEM_TX_TYPE {
             return self.ethereum.transact_raw(tx);
         }
+        // Direct TxEnv callers can bypass envelope decoding; enforce its restrictions here too.
         if tx.caller != SYSTEM_ADDRESS || tx.kind != TxKind::Call(EEZL2_ADDRESS) {
             return Err(EVMError::Custom(
                 "invalid native system caller or target".into(),
@@ -131,8 +129,7 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> Evm for EezEvm<DB, I> {
     }
 }
 
-/// Reuses Ethereum's factory, including its inspector and precompile setup.
-/// The wrapper adds only native minting at the transaction execution boundary.
+/// Installs the minting wrapper for both ordinary and inspected execution.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EezEvmFactory;
 
