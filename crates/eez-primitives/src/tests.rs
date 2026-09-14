@@ -12,6 +12,49 @@ fn system() -> EezTxEnvelope {
     }
     .into()
 }
+
+#[test]
+fn engine_payloads_keep_native_transactions_and_empty_blob_bundles() {
+    use alloy_rpc_types_engine::{
+        BlobsBundleV1, BlobsBundleV2, ExecutionPayloadEnvelopeV3, ExecutionPayloadEnvelopeV4,
+        ExecutionPayloadEnvelopeV5, ExecutionPayloadEnvelopeV6,
+    };
+    use reth_primitives_traits::SealedBlock;
+    use std::sync::Arc;
+
+    let block = Block::new(
+        Default::default(),
+        alloy_consensus::BlockBody {
+            transactions: vec![system()],
+            ..Default::default()
+        },
+    );
+    let built = engine::EezBuiltPayload::new(
+        Arc::new(SealedBlock::seal_slow(block)),
+        U256::ZERO,
+        None,
+        Some(Bytes::from_static(&[0xc0])),
+    );
+    let v3 = ExecutionPayloadEnvelopeV3::try_from(built.clone()).unwrap();
+    let v4 = ExecutionPayloadEnvelopeV4::try_from(built.clone()).unwrap();
+    let v5 = ExecutionPayloadEnvelopeV5::try_from(built.clone()).unwrap();
+    let v6 = ExecutionPayloadEnvelopeV6::try_from(built).unwrap();
+    assert_eq!(v3.blobs_bundle, BlobsBundleV1::empty());
+    assert_eq!(v4.envelope_inner.blobs_bundle, BlobsBundleV1::empty());
+    assert_eq!(v5.blobs_bundle, BlobsBundleV2::empty());
+    assert_eq!(v6.blobs_bundle, BlobsBundleV2::empty());
+    assert_eq!(
+        v3.execution_payload
+            .payload_inner
+            .payload_inner
+            .transactions,
+        vec![Bytes::from(system().encoded_2718())]
+    );
+    assert_eq!(v4.envelope_inner.execution_payload, v3.execution_payload);
+    assert_eq!(v5.execution_payload, v3.execution_payload);
+    assert_eq!(v6.execution_payload.payload_inner, v3.execution_payload);
+}
+
 #[test]
 fn native_wire_sender_hash_and_storage_round_trip() {
     let tx = system();

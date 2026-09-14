@@ -46,9 +46,8 @@ impl fmt::Display for NonZeroProofSystemVkey {
 /// attestation configuration. The proof-system vkey is deliberately
 /// independent from the signing address: deployments may register a
 /// proof-system-specific vkey.
-/// The signing address must also differ from the deployment-configured L2
-/// system address, whose key has separate authority to create system
-/// transactions.
+/// The signing address must also differ from the configured reserved L2
+/// system address.
 pub struct Attester {
     signer: EcdsaProofSigner,
     proof_system_vkey: NonZeroProofSystemVkey,
@@ -96,8 +95,7 @@ impl Attester {
         }
         let signer = EcdsaProofSigner::from_private_key(attestation_private_key)
             .map_err(|_| AttesterConfigError::InvalidPrivateKey)?;
-        // System-transaction signing and public-input attestation are separate
-        // authorities; one key must never confer both capabilities.
+        // Keep proof attestation identity separate from the native system sender.
         if signer.address() == expected_l2_system_address {
             return Err(AttesterConfigError::ReservedSystemAddress);
         }
@@ -144,7 +142,7 @@ mod tests {
     use alloy_primitives::{address, b256};
 
     use super::*;
-    use crate::testkit::{LEGACY_PRIVATE_KEY, LEGACY_SIGNER_ADDRESS, TEST_SYSTEM_ADDRESS};
+    use crate::testkit::TEST_SYSTEM_ADDRESS;
 
     fn test_proof_system_vkey() -> NonZeroProofSystemVkey {
         NonZeroProofSystemVkey::new(B256::repeat_byte(0x42)).unwrap()
@@ -155,54 +153,37 @@ mod tests {
     }
 
     #[test]
-    fn accepts_an_attestation_key_distinct_from_the_system_identity() {
+    fn attestation_identity_must_differ_from_the_configured_system_address() {
         // Anvil account #1. Test-only and intentionally public.
         let attestation_key =
             b256!("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
 
-        let attester = Attester::new(
-            attestation_key,
-            test_proof_system_vkey(),
-            test_proof_system(),
+        let attestation_address = address!("70997970c51812dc3a010c7d01b50e0d17dc79c8");
+
+        for system_address in [
             TEST_SYSTEM_ADDRESS,
-        )
-        .unwrap();
-
-        assert_eq!(
-            attester.address(),
-            address!("70997970c51812dc3a010c7d01b50e0d17dc79c8")
-        );
-    }
-
-    #[test]
-    fn system_identity_is_selected_by_deployment() {
-        let attester = Attester::new(
-            LEGACY_PRIVATE_KEY,
-            test_proof_system_vkey(),
-            test_proof_system(),
             Address::repeat_byte(0xbb),
-        )
-        .unwrap();
+            attestation_address,
+        ] {
+            let result = Attester::new(
+                attestation_key,
+                test_proof_system_vkey(),
+                test_proof_system(),
+                system_address,
+            );
 
-        assert_eq!(attester.address(), LEGACY_SIGNER_ADDRESS);
-    }
-
-    #[test]
-    fn rejects_the_reserved_system_identity_without_exposing_its_key() {
-        let error = Attester::new(
-            LEGACY_PRIVATE_KEY,
-            test_proof_system_vkey(),
-            test_proof_system(),
-            LEGACY_SIGNER_ADDRESS,
-        )
-        .unwrap_err();
-        let displayed = error.to_string();
-
-        assert_eq!(error, AttesterConfigError::ReservedSystemAddress);
-        assert_eq!(
-            displayed,
-            "attestation key must not derive the reserved L2 system address"
-        );
-        assert!(!displayed.contains(&LEGACY_PRIVATE_KEY.to_string()));
+            if system_address == attestation_address {
+                let error = result.unwrap_err();
+                let displayed = error.to_string();
+                assert_eq!(error, AttesterConfigError::ReservedSystemAddress);
+                assert_eq!(
+                    displayed,
+                    "attestation key must not derive the reserved L2 system address"
+                );
+                assert!(!displayed.contains(&attestation_key.to_string()));
+            } else {
+                assert_eq!(result.unwrap().address(), attestation_address);
+            }
+        }
     }
 }

@@ -6,15 +6,11 @@
 //! `validate::testing`, and behavior-specific builders stay beside the test
 //! suite that owns them.
 
-use alloy_primitives::{Address, B256, address, b256};
+use alloy_primitives::{Address, B256, address};
 
 /// Deterministic system-transaction identity used only by tests.
 pub(crate) const TEST_SYSTEM_ADDRESS: Address =
     address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076");
-
-/// Legacy user key retained for Ethereum signature regression tests.
-pub(crate) const LEGACY_PRIVATE_KEY: B256 =
-    b256!("ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80");
 
 /// Native system envelope with empty calldata, for framing tests.
 pub(crate) const SYSTEM_TX: &str = "76d901809442000000000000000000000000000000000000078080";

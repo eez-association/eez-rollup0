@@ -8,6 +8,11 @@ There is no signature or caller field. The sender is always
 Keccak-256 hash of these bytes. Trie entries and receipts retain type `0x76`.
 Ethereum transaction bytes and signature recovery are unchanged.
 
+L2 does not support blob transactions. The pool rejects EIP-4844, the Live
+payload builder skips blobs without storing or fetching sidecars, and block/Engine
+replay rejects them before execution, including stateless proof validation.
+Engine API blob bundles remain present but empty. L1 still supports blobs.
+
 Native transactions have no fee or gas-limit fields. Their execution environment
 preserves type `0x76`, which revm recognizes as Custom, and supplies a zero gas
 price. This skips Ethereum-specific fee validation while ordinary fee accounting
