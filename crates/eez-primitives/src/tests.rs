@@ -164,20 +164,36 @@ fn native_is_not_a_public_pooled_transaction() {
 }
 
 #[test]
-fn rpc_serialization_has_type_and_quantities_without_signature() {
+fn rpc_serialization_has_native_execution_fields_and_zero_signature_placeholders() {
     let tx = system();
     let json = serde_json::to_value(&tx).unwrap();
     assert_eq!(json["type"], "0x76");
     assert_eq!(json["hash"], serde_json::to_value(tx.tx_hash()).unwrap());
     assert_eq!(json["chainId"], "0x1");
     assert_eq!(json["nonce"], "0x0");
-    assert!(json.get("gas").is_none());
-    assert!(json.get("gasPrice").is_none());
+    assert_eq!(json["gas"], "0x1e8480");
+    assert_eq!(json["gasPrice"], "0x0");
     assert_eq!(tx.gas_limit(), SYSTEM_TX_GAS_LIMIT);
     assert_eq!(tx.effective_gas_price(Some(100)), 0);
-    for field in ["v", "r", "s", "yParity"] {
-        assert!(json.get(field).is_none());
+    let rpc = alloy_rpc_types_eth::Transaction::from_transaction(
+        alloy_consensus::transaction::Recovered::new_unchecked(tx.clone(), SYSTEM_ADDRESS),
+        alloy_consensus::transaction::TransactionInfo {
+            base_fee: Some(100),
+            ..Default::default()
+        },
+    );
+    let rpc_json = serde_json::to_value(&rpc).unwrap();
+    assert_eq!(rpc_json["gas"], "0x1e8480");
+    assert_eq!(rpc_json["gasPrice"], "0x0");
+    assert_eq!(
+        rpc_json["from"],
+        serde_json::to_value(SYSTEM_ADDRESS).unwrap()
+    );
+    for field in ["v", "r", "s"] {
+        assert_eq!(json[field], "0x0");
+        assert_eq!(rpc_json[field], "0x0");
     }
+    assert!(json.get("yParity").is_none());
     assert_eq!(serde_json::from_value::<EezTxEnvelope>(json).unwrap(), tx);
 }
 

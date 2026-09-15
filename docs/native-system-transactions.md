@@ -13,7 +13,7 @@ payload builder skips blobs without storing or fetching sidecars, and block/Engi
 replay rejects them before execution, including stateless proof validation.
 Engine API blob bundles remain present but empty. L1 still supports blobs.
 
-Native transactions have no fee or gas-limit fields. Their execution environment
+Native wire transactions have no fee or gas-limit fields. Their execution environment
 preserves type `0x76`, which revm recognizes as Custom, and supplies a zero gas
 price. This skips Ethereum-specific fee validation while ordinary fee accounting
 charges zero even with a positive block base fee. Nonce and chain-ID validation
@@ -35,7 +35,10 @@ The system account has no genesis allocation, code, or initial nonce. Its first
 transaction starts at nonce zero and creates it naturally. Outbound ETH continues
 to accumulate at this address; subsequent deposits mint fresh value and do not
 spend that existing balance. RPC retains native receipt types, gas usage and a
-zero effective gas price; native envelopes have no signature or gas/fee fields.
+zero effective gas price. Transaction JSON exposes the fixed `gas` budget,
+`gasPrice: "0x0"`, and zero `v/r/s` placeholders for Ethereum tooling such as
+Blockscout. These compatibility fields are absent from the wire transaction and
+do not affect its hash or provide signature authorization.
 
 The type identifies a privilege domain; derivation establishes authority.
 Public pooling/gossip use Ethereum's pooled envelope, which has no conversion
