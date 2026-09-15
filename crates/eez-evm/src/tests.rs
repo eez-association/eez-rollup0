@@ -10,6 +10,7 @@ use reth_evm::{ConvertTx, ExecutableTxTuple, execute::Executor};
 use revm::{
     DatabaseCommit,
     context::TxEnv,
+    context_interface::result::EVMError,
     database::InMemoryDB,
     inspector::NoOpInspector,
     state::{AccountInfo, Bytecode},
@@ -156,6 +157,43 @@ fn native_execution_retains_nonce_chain_and_block_gas_validation() {
         .execute_one(&block)
         .unwrap_err();
     assert!(format!("{error:?}").contains("TransactionGasLimitMoreThanAvailableBlockGas"));
+}
+
+#[test]
+fn native_execution_rejects_noncanonical_gas_fields_without_mutating_state() {
+    let block = block(0, 1);
+    let balance = U256::from(20_000_000);
+    let mut evm = EezEvmFactory.create_evm(
+        database(balance, bytes!("00")),
+        config().evm_env(block.header()).unwrap(),
+    );
+    let tx = TxEnv::from_recovered_tx(&block.body().transactions[0], SYSTEM_ADDRESS);
+    for value in [U256::ZERO, U256::from(13)] {
+        for (gas_limit, gas_price) in [
+            (SYSTEM_TX_GAS_LIMIT - 1, 0),
+            (SYSTEM_TX_GAS_LIMIT + 1, 0),
+            (SYSTEM_TX_GAS_LIMIT, 7),
+        ] {
+            let invalid = TxEnv {
+                gas_limit,
+                gas_price,
+                value,
+                ..tx.clone()
+            };
+            assert!(
+                matches!(evm.transact_raw(invalid), Err(EVMError::Custom(_))),
+                "accepted noncanonical native gas fields: limit={gas_limit}, price={gas_price}, value={value}"
+            );
+            let account = &evm.db().cache.accounts[&SYSTEM_ADDRESS].info;
+            assert_eq!(account.balance, balance);
+            assert_eq!(account.nonce, 0);
+        }
+    }
+    let output = evm.transact_raw(tx).unwrap();
+    assert!(output.result.is_success());
+    assert_eq!(output.state[&SYSTEM_ADDRESS].info.balance, balance);
+    assert_eq!(output.state[&SYSTEM_ADDRESS].info.nonce, 1);
+    assert_eq!(output.state[&EEZL2_ADDRESS].info.balance, U256::from(13));
 }
 
 #[test]

@@ -32,9 +32,9 @@ use std::{borrow::Cow, sync::Arc};
 mod evm;
 pub use evm::EezEvmFactory;
 
-// Enforce L2 transaction support at block replay boundaries. The underlying EVM
-// is also used for L1 simulation, where blob transactions remain valid.
-fn ensure_supported_transaction(tx: &EezTxEnvelope) -> Result<(), AnyError> {
+/// Enforce L2 transaction support during construction and replay. The underlying
+/// EVM is also used for L1 simulation, where blob transactions remain valid.
+pub fn ensure_supported_transaction(tx: &EezTxEnvelope) -> Result<(), AnyError> {
     if tx.is_eip4844() {
         return Err(AnyError::new(InvalidTransactionError::Eip4844Disabled));
     }

@@ -5,7 +5,7 @@ use alloy_evm::{
     precompiles::PrecompilesMap,
 };
 use alloy_primitives::{Address, Bytes, TxKind};
-use eez_primitives::{EEZL2_ADDRESS, SYSTEM_ADDRESS, SYSTEM_TX_TYPE};
+use eez_primitives::{EEZL2_ADDRESS, SYSTEM_ADDRESS, SYSTEM_TX_GAS_LIMIT, SYSTEM_TX_TYPE};
 use revm::{
     Inspector,
     context::{BlockEnv, CfgEnv, TxEnv},
@@ -57,10 +57,15 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> Evm for EezEvm<DB, I> {
         if tx.tx_type != SYSTEM_TX_TYPE {
             return self.ethereum.transact_raw(tx);
         }
-        // Direct TxEnv callers can bypass envelope decoding; enforce its restrictions here too.
-        if tx.caller != SYSTEM_ADDRESS || tx.kind != TxKind::Call(EEZL2_ADDRESS) {
+        // Direct TxEnv callers bypass envelope conversion; enforce native sender,
+        // target, and gas rules here before executing or minting value.
+        if tx.caller != SYSTEM_ADDRESS
+            || tx.kind != TxKind::Call(EEZL2_ADDRESS)
+            || tx.gas_limit != SYSTEM_TX_GAS_LIMIT
+            || tx.gas_price != 0
+        {
             return Err(EVMError::Custom(
-                "invalid native system caller or target".into(),
+                "invalid native system caller, target, or gas fields".into(),
             ));
         }
         if tx.value.is_zero() {

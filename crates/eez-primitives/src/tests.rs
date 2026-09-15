@@ -56,6 +56,44 @@ fn engine_payloads_keep_native_transactions_and_empty_blob_bundles() {
 }
 
 #[test]
+fn engine_block_conversion_preserves_prague_requests_hash() {
+    use alloy_eips::eip7685::Requests;
+    use reth_payload_primitives::PayloadTypes;
+    use reth_primitives_traits::SealedBlock;
+
+    for requests in [
+        Requests::default(),
+        Requests::new(vec![Bytes::from_static(&[0, 1])]),
+    ] {
+        let requests_hash = requests.requests_hash();
+        let block = SealedBlock::seal_slow(Block::new(
+            alloy_consensus::Header {
+                base_fee_per_gas: Some(1),
+                withdrawals_root: Some(alloy_consensus::proofs::calculate_withdrawals_root(&[])),
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                parent_beacon_block_root: Some(B256::ZERO),
+                requests_hash: Some(requests_hash),
+                ..Default::default()
+            },
+            alloy_consensus::BlockBody {
+                withdrawals: Some(Default::default()),
+                ..Default::default()
+            },
+        ));
+        let expected_hash = block.hash();
+        let data = engine::EezEngineTypes::block_to_payload(block, None);
+        assert_eq!(data.sidecar.requests_hash(), Some(requests_hash));
+        let restored = data
+            .payload
+            .try_into_block_with_sidecar::<EezTxEnvelope>(&data.sidecar)
+            .unwrap();
+        assert_eq!(restored.header.requests_hash, Some(requests_hash));
+        assert_eq!(SealedBlock::seal_slow(restored).hash(), expected_hash);
+    }
+}
+
+#[test]
 fn native_wire_sender_hash_and_storage_round_trip() {
     let tx = system();
     let bytes = tx.encoded_2718();

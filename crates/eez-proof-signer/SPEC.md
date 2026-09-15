@@ -656,11 +656,12 @@ type         = 0x76 (unsigned native)
 sender       = reserved EEZ_L2_SYSTEM_ADDRESS
 target       = EEZL2_ADDRESS
 chain id     = operator-configured L2 chain ID
-gas price    = 1_000_000_000
-gas limit    = 2_000_000
 rollup id    = expected_rollup_id
 first nonce  = nonce of the first validated omitted system transaction
 ```
+
+Gas fields are not encoded: execution uses a fixed gas limit of `2_000_000`
+and a gas price of `0`.
 
 The canonical order is:
 
