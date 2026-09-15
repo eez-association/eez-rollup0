@@ -1,7 +1,8 @@
 use super::*;
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEip4844};
+use alloy_eips::eip4895::Withdrawal;
 use alloy_evm::{EvmFactory, FromRecoveredTx};
-use alloy_primitives::{B256, Signature, TxKind, U256, address, bytes};
+use alloy_primitives::{Address, B256, Signature, TxKind, U256, address, bytes};
 use eez_primitives::{
     EEZL2_ADDRESS, SYSTEM_ADDRESS, SYSTEM_TX_GAS_LIMIT, SYSTEM_TX_TYPE, SystemTransaction,
 };
@@ -157,6 +158,59 @@ fn native_execution_retains_nonce_chain_and_block_gas_validation() {
         .execute_one(&block)
         .unwrap_err();
     assert!(format!("{error:?}").contains("TransactionGasLimitMoreThanAvailableBlockGas"));
+}
+
+#[test]
+fn l2_rejects_beacon_withdrawals_during_construction_import_and_engine_replay() {
+    let withdrawals = vec![Withdrawal {
+        index: 0,
+        validator_index: 0,
+        address: Address::repeat_byte(0xab),
+        amount: 7_000_000_000,
+    }];
+    let config = config();
+    let parent = SealedHeader::seal_slow(Header::default());
+    let error = config
+        .context_for_next_block(
+            &parent,
+            NextBlockEnvAttributes {
+                timestamp: 1,
+                suggested_fee_recipient: Address::ZERO,
+                prev_randao: B256::ZERO,
+                gas_limit: 30_000_000,
+                parent_beacon_block_root: Some(B256::ZERO),
+                withdrawals: Some(withdrawals.clone().into()),
+                extra_data: Bytes::new(),
+                slot_number: None,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("L2 blocks cannot contain beacon withdrawals")
+    );
+
+    let mut block = block(0, 1).into_block();
+    block.body.transactions.clear();
+    block.body.withdrawals = Some(withdrawals.into());
+    let sealed = SealedBlock::seal_slow(block);
+    let error = config.context_for_block(&sealed).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("L2 blocks cannot contain beacon withdrawals")
+    );
+
+    let payload: ExecutionData =
+        eez_primitives::engine::EezBuiltPayload::new(Arc::new(sealed), U256::ZERO, None, None)
+            .into();
+    let error = config.context_for_payload(&payload).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("L2 blocks cannot contain beacon withdrawals")
+    );
 }
 
 #[test]

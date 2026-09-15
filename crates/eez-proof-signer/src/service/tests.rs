@@ -3,6 +3,7 @@
 
 mod attestation;
 mod golden;
+mod native_security;
 mod pipeline;
 mod runtime;
 
