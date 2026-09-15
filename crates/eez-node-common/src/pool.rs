@@ -1,24 +1,25 @@
-//! L2 pool that refuses SYSTEM_ADDRESS txs. Real ones ride in Sync blocks over
-//! the engine API, so this covers RPC and reth's reorg re-injection alike.
+//! L2 pool that disables blobs and refuses SYSTEM_ADDRESS txs. Native system
+//! txs ride in Sync blocks over the Engine API; the pool gate also covers reorg
+//! reinjection.
 
-use std::{any::Any, time::SystemTime};
+use std::any::Any;
 
-use alloy_eips::{eip7840::BlobParams, merge::EPOCH_SLOTS};
+use crate::pool_transaction::EezPooledTransaction;
 use alloy_primitives::Address;
-use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_ethereum_primitives::TransactionSigned;
+use eez_primitives::EezTxEnvelope;
+use reth_chainspec::EthereumHardforks;
 use reth_evm::ConfigureEvm;
 use reth_node_api::{NodePrimitives, PrimitivesTy};
 use reth_node_builder::{
     BuilderContext,
-    components::{PoolBuilder, TxPoolBuilder, create_blob_store_with_cache},
+    components::{PoolBuilder, TxPoolBuilder},
     node::{FullNodeTypes, NodeTypes},
 };
 use reth_primitives_traits::SealedBlock;
 use reth_transaction_pool::{
-    CoinbaseTipOrdering, EthPooledTransaction, Pool, PoolTransaction, TransactionOrigin,
-    TransactionValidationOutcome, TransactionValidationTaskExecutor, TransactionValidator,
-    blobstore::DiskFileBlobStore,
+    CoinbaseTipOrdering, Pool, PoolTransaction, TransactionOrigin, TransactionValidationOutcome,
+    TransactionValidationTaskExecutor, TransactionValidator,
+    blobstore::NoopBlobStore,
     error::{InvalidPoolTransactionError, PoolTransactionError},
     validate::EthTransactionValidator,
 };
@@ -27,9 +28,9 @@ use tracing::{Level, event};
 /// reth's Ethereum pool with [`SystemAddressGate`] around its validator.
 pub type EezTransactionPool<Client, S, Evm> = Pool<
     TransactionValidationTaskExecutor<
-        SystemAddressGate<EthTransactionValidator<Client, EthPooledTransaction, Evm>>,
+        SystemAddressGate<EthTransactionValidator<Client, EezPooledTransaction, Evm>>,
     >,
-    CoinbaseTipOrdering<EthPooledTransaction>,
+    CoinbaseTipOrdering<EezPooledTransaction>,
     S,
 >;
 
@@ -48,8 +49,7 @@ impl PoolTransactionError for SystemAddressRejected {
     }
 }
 
-/// Rejects L2 SYSTEM_ADDRESS txs; a reorg re-injects them and a Live block
-/// carrying one fail-closes emission.
+/// Prevents RPC, gossip, and reorg reinjection from admitting the reserved sender.
 #[derive(Debug)]
 pub struct SystemAddressGate<V> {
     inner: V,
@@ -69,8 +69,6 @@ impl<V> SystemAddressGate<V>
 where
     V: TransactionValidator,
 {
-    /// The pool tx carries its recovered sender, so this is a compare, not an
-    /// ECDSA recovery.
     fn is_system_sender(&self, tx: &V::Transaction) -> bool {
         self.system_address == tx.sender()
     }
@@ -108,13 +106,13 @@ where
         self.inner.validate_transaction(origin, transaction).await
     }
 
+    /// Preserve input order after filtering: callers associate each outcome
+    /// with the transaction at the same position in the request.
     async fn validate_transactions(
         &self,
         transactions: impl IntoIterator<Item = (TransactionOrigin, Self::Transaction), IntoIter: Send>
         + Send,
     ) -> Vec<TransactionValidationOutcome<Self::Transaction>> {
-        // One batch keeps the inner validator on a single state provider;
-        // `slots` puts the results back in input order.
         let mut slots = Vec::new();
         let mut forwarded = Vec::new();
         for (origin, tx) in transactions {
@@ -130,8 +128,7 @@ where
             .validate_transactions(forwarded)
             .await
             .into_iter();
-        // One outcome per input, in input order. A short inner result would
-        // silently drop txs, so panic instead (invariant 7).
+        // A short inner result would silently drop a transaction's outcome.
         slots
             .into_iter()
             .map(|slot| {
@@ -149,8 +146,7 @@ where
     }
 }
 
-/// Copy of [`reth_node_ethereum::node::EthereumPoolBuilder`] that wraps the
-/// Ethereum validator in [`SystemAddressGate`].
+/// Upstream Ethereum pool with the reserved-sender gate and blob support disabled.
 #[derive(Debug, Clone, Copy)]
 pub struct EezPoolBuilder {
     system_address: Address,
@@ -166,61 +162,34 @@ impl<Types, Node, Evm> PoolBuilder<Node, Evm> for EezPoolBuilder
 where
     Types: NodeTypes<
             ChainSpec: EthereumHardforks,
-            Primitives: NodePrimitives<SignedTx = TransactionSigned>,
+            Primitives: NodePrimitives<SignedTx = EezTxEnvelope>,
         >,
     Node: FullNodeTypes<Types = Types>,
     Evm: ConfigureEvm<Primitives = PrimitivesTy<Types>> + Clone + 'static,
 {
-    type Pool = EezTransactionPool<Node::Provider, DiskFileBlobStore, Evm>;
+    type Pool = EezTransactionPool<Node::Provider, NoopBlobStore, Evm>;
 
-    // Nothing here awaits, so `async fn` would build a state machine for no
-    // reason; an `async move` body instead would just trip `manual_async_fn`.
+    /// Disable L2 blob admission and storage, and gate reserved senders for every origin.
     fn build_pool(
         self,
         ctx: &BuilderContext<Node>,
         evm_config: Evm,
     ) -> impl Future<Output = eyre::Result<Self::Pool>> + Send {
-        // Closure only so the body keeps using `?`.
         let build = move || -> eyre::Result<Self::Pool> {
             let pool_config = ctx.pool_config();
 
-            let blobs_disabled = ctx.config().txpool.disable_blobs_support
-                || ctx.config().txpool.blobpool_max_count == 0;
-
-            let blob_cache_size = if let Some(blob_cache_size) = pool_config.blob_cache_size {
-                Some(blob_cache_size)
-            } else {
-                let current_timestamp = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)?
-                    .as_secs();
-                let blob_params = ctx
-                    .chain_spec()
-                    .blob_params_at_timestamp(current_timestamp)
-                    .unwrap_or_else(BlobParams::cancun);
-                Some((blob_params.target_blob_count * EPOCH_SLOTS * 2) as u32)
-            };
-
-            let blob_store = create_blob_store_with_cache(ctx, blob_cache_size)?;
+            let blob_store = NoopBlobStore::default();
 
             let eth_validator =
                 TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
-                    .set_eip4844(!blobs_disabled)
-                    .kzg_settings(ctx.kzg_settings()?)
+                    .no_eip4844()
                     .with_max_tx_input_bytes(ctx.config().txpool.max_tx_input_bytes)
                     .with_local_transactions_config(pool_config.local_transactions_config.clone())
                     .set_tx_fee_cap(ctx.config().rpc.rpc_tx_fee_cap)
                     .with_max_tx_gas_limit(ctx.config().txpool.max_tx_gas_limit)
                     .with_minimum_priority_fee(ctx.config().txpool.minimum_priority_fee)
                     .with_additional_tasks(ctx.config().txpool.additional_validation_tasks)
-                    .build_with_tasks(ctx.task_executor().clone(), blob_store.clone());
-
-            if eth_validator.validator().eip4844() {
-                // KZG setup is slow, so warm it off the first-block path.
-                let kzg_settings = eth_validator.validator().kzg_settings().clone();
-                ctx.task_executor().spawn_blocking_task(async move {
-                    let _ = kzg_settings.get();
-                });
-            }
+                    .build_with_tasks(ctx.task_executor().clone(), blob_store);
 
             let system_address = self.system_address;
             let validator =
@@ -247,7 +216,8 @@ where
 mod tests {
     use alloy_consensus::{TxLegacy, transaction::Recovered};
     use alloy_primitives::{Signature, TxKind, U256, address};
-    use reth_ethereum_primitives::Transaction;
+    use reth_ethereum_primitives::{Transaction, TransactionSigned};
+    use reth_transaction_pool::EthPooledTransaction;
     use reth_transaction_pool::validate::ValidTransaction;
 
     use super::*;
