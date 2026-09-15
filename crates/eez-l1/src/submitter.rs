@@ -663,6 +663,7 @@ fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutc
     event!(
         name: "eez.submitter.bundle.dropped",
         Level::WARN,
+        event_name = "eez.submitter.bundle.dropped",
         target_block,
         tx_hash = %tx_hash,
         reason,

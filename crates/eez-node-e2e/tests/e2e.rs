@@ -440,6 +440,77 @@ async fn builder_method_not_found_uses_mempool_fallback() {
     node.assert_no_process_death();
 }
 
+// A relay may acknowledge bundles while silently omitting them from its target
+// blocks. The composer must preserve the local candidate, retry after the relay
+// recovers, and continue settling fresh L2 traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn builder_silent_drop_preserves_safety_and_recovers_progress() {
+    let harness = Harness::fresh().await.unwrap();
+    harness
+        .set_builder_mode(BuilderStubMode::Drop)
+        .await
+        .expect("configure silent builder drops");
+    let chain = harness.chain();
+    let node = NodeHandle::start(
+        "builder-silent-drop",
+        &NodeConfig::default(),
+        &harness.env().await.unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Wait for observed misses rather than sleeping. This proves the composer
+    // reached the relay and the relay accepted but omitted multiple bundles.
+    wait_for(DEFAULT_TIMEOUT, || async {
+        Ok((node.count_signal(signals::BUNDLE_DROPPED)? >= 2).then_some(()))
+    })
+    .await
+    .expect("composer did not observe two silently dropped bundles");
+    assert_eq!(
+        chain.batches_posted().await.unwrap(),
+        0,
+        "an acknowledged but omitted bundle must not advance settlement",
+    );
+    node.assert_no_process_death();
+
+    harness
+        .set_builder_mode(BuilderStubMode::Forward)
+        .await
+        .expect("restore builder forwarding");
+    chain
+        .wait_for_batches_or_node_failure(1, &[&node], DEFAULT_TIMEOUT)
+        .await
+        .expect("composer did not recover after silent bundle drops");
+
+    // Recovery is incomplete if only the old candidate settles and the
+    // composer remains wedged. Require a fresh transaction and its exact block
+    // to enter the safe chain after forwarding resumes.
+    let l2_rpc = node.l2_rpc_url();
+    let fresh = send_l2_value_transfer_confirmed(
+        &l2_rpc,
+        ANVIL_KEY_1,
+        ANVIL_ADDR,
+        U256::from(7u64),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("fresh post-recovery L2 transaction did not execute");
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+    let receipt = provider
+        .get_transaction_receipt(fresh)
+        .await
+        .unwrap()
+        .expect("fresh transaction receipt disappeared");
+    let block_number = receipt
+        .block_number
+        .expect("fresh receipt has no block number");
+    let block_hash = receipt.block_hash.expect("fresh receipt has no block hash");
+    wait_for_safe_chain_contains(&node, block_number, block_hash, DEFAULT_TIMEOUT)
+        .await
+        .expect("fresh post-recovery transaction never entered the safe chain");
+    node.assert_no_divergence_failure_logs();
+}
+
 // Proofs for an unregistered rollup ID are signed but never posted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failure_wrong_rollup_id() {
