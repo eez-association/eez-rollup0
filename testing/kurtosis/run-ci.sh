@@ -82,7 +82,12 @@ write_result() {
             cross_chain_convergence: "pass",
             state_chaining: "pass",
             l1_l2_root_divergence: 0,
-            safe_head_convergence: "pass"
+            safe_head_convergence: "pass",
+            signer_outage_recovery: "pass",
+            relay_outage_recovery: "pass",
+            builder_outage_recovery: "pass",
+            node_restart_replay: "pass",
+            ingress_nonce_gap_rejection: "pass"
         } else {} end' >"$RESULT_DIR/result.json"
 }
 
@@ -190,6 +195,12 @@ bash "$HERE/scripts/verify-cross-chain-waves.sh"
 echo "==> running eez-core-protocol network scenario suite"
 bash "$HERE/scripts/run-protocol-e2e.sh"
 
+echo "==> running ingress nonce-gap admission suite"
+bash "$HERE/scripts/verify-ingress-admission.sh"
+
+echo "==> running service fault-recovery suite"
+bash "$HERE/scripts/verify-fault-recovery.sh"
+
 capture_service_log eez-proof-signer
 capture_service_log eez-node
 verify_real_proof_path
@@ -207,6 +218,9 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         echo "- Inbound, outbound, mixed, and mixed-pure waves: pass"
         echo "- Inbound, outbound, and mixed-direction state chaining: pass"
         echo "- Supported protocol network scenarios: pass"
+        echo "- L1 front nonce-gap rejection and contiguous recovery: pass"
+        echo "- Proof-signer, MEV relay, and builder outage recovery: pass"
+        echo "- Node restart, exact safe-prefix replay, and fresh progress: pass"
         echo "- Signed windows observed: $signed_window_count"
         echo "- Remote attestations observed: $remote_attestation_count"
         echo "- L1/L2 root divergence: 0"

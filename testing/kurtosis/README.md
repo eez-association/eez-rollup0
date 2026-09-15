@@ -423,6 +423,33 @@ inbound delivery share the canonical L2 Sync block. Every scenario also
 verifies bundle settlement, proof-signer acceptance, and L1/L2 state-root
 convergence.
 
+### Run service fault recovery
+
+```bash
+export EEZ_CI_RESULT_DIR="$PWD/artifacts/kurtosis-dev"
+bash testing/kurtosis/scripts/verify-fault-recovery.sh
+```
+
+This stops the real proof signer with an inbound transaction pending and
+proves that the transaction neither settles nor changes destination state
+without an attestation. After restarting the signer, it requires that pending
+transaction to settle. It then restarts `eez-node`, verifies that the exact
+pre-restart safe block hash remains canonical, and requires a fresh
+cross-chain transaction and L1/L2 root convergence. Cleanup restarts either
+service if the scenario exits while a fault is active.
+
+### Run ingress nonce-gap admission
+
+```bash
+export EEZ_CI_RESULT_DIR="$PWD/artifacts/kurtosis-dev"
+bash testing/kurtosis/scripts/verify-ingress-admission.sh
+```
+
+This submits nonce `N+1` to the live L1 cross-chain front before `N`, requires
+an `invalid nonce` rejection with no destination mutation and no source-nonce
+consumption, then settles the contiguous pair and checks L1/L2 root
+convergence.
+
 ### Run all included workloads
 
 The suite requires an output directory:
@@ -552,3 +579,5 @@ Kurtosis assigns different host ports automatically. Remember that
 - `scripts/cross-chain-wave.sh`: individual cross-chain workload modes.
 - `scripts/verify-cross-chain-waves.sh`: complete workload suite.
 - `scripts/verify-state-chaining.sh`: ordered same-Sync-block state-chaining regression.
+- `scripts/verify-fault-recovery.sh`: proof-signer outage, node restart, and exact safe-prefix replay.
+- `scripts/verify-ingress-admission.sh`: live L1 front nonce-gap rejection and contiguous recovery.
