@@ -15,7 +15,7 @@ use alloy_eips::Decodable2718;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT};
-use eez_evm::EezEvmConfig;
+use eez_evm::{EezEvmConfig, ensure_supported_transaction};
 use eez_primitives::engine::EezEngineTypes;
 use eez_primitives::{Block, EezTxEnvelope as TransactionSigned};
 use reth_chainspec::EthereumHardforks;
@@ -120,13 +120,18 @@ fn next_block_attributes(
 }
 
 /// Decode a raw EIP-2718 tx and recover its signer. `idx` is the tx's position
-/// in the block, for error reporting.
+/// in the block, for error reporting. Reject L2 blobs before either the block
+/// builder or incremental simulation executes them.
 fn recover_tx(raw: &Bytes, idx: usize) -> Result<Recovered<TransactionSigned>, BuildError> {
     let tx =
         TransactionSigned::decode_2718(&mut raw.as_ref()).map_err(|e| BuildError::DecodeTx {
             idx,
             msg: e.to_string(),
         })?;
+    ensure_supported_transaction(&tx).map_err(|e| BuildError::ExecuteTx {
+        idx,
+        msg: e.to_string(),
+    })?;
     SignedTransaction::try_into_recovered(tx).map_err(|_| BuildError::RecoverSigner { idx })
 }
 
@@ -580,7 +585,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::TxLegacy;
+    use alloy_consensus::{SignableTransaction, TxEip4844, TxLegacy};
     use alloy_eips::eip2718::Encodable2718;
     use alloy_network::TxSignerSync;
     use alloy_primitives::{TxKind, U256, address, bytes};
@@ -711,6 +716,54 @@ mod tests {
                 .collect();
             cumulative.windows(2).map(|w| w[1] - w[0]).collect()
         }
+    }
+
+    #[test]
+    fn sync_build_and_incremental_execution_reject_blobs_before_spending_nonce() {
+        let f = fixture();
+        let mut tx = TxEip4844 {
+            chain_id: 1,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_fee_per_blob_gas: 1,
+            blob_versioned_hashes: vec![B256::repeat_byte(1)],
+            to: BOB,
+            ..Default::default()
+        };
+        let signature = test_signer().sign_transaction_sync(&mut tx).unwrap();
+        let tx: reth_ethereum_primitives::TransactionSigned = tx.into_signed(signature).into();
+        let raw = Bytes::from(tx.encoded_2718());
+        let mut prefix = f.open(&[]);
+        let mut fork = prefix.fork().unwrap();
+        for result in [
+            build_sync_block(
+                &f.provider,
+                &f.evm_config,
+                &f.parent,
+                TIMESTAMP,
+                FEE_RECIPIENT,
+                std::slice::from_ref(&raw),
+            )
+            .map(|_| ()),
+            SyncBlockState::open(
+                Arc::new(f.provider.clone()),
+                &f.evm_config,
+                &f.parent,
+                TIMESTAMP,
+                FEE_RECIPIENT,
+                std::slice::from_ref(&raw),
+            )
+            .map(|_| ()),
+            prefix.execute_tx(&raw).map(|_| ()),
+            fork.execute_tx(&raw).map(|_| ()),
+        ] {
+            assert!(
+                matches!(&result, Err(BuildError::ExecuteTx { idx: 0, msg }) if msg == "EIP-4844 transactions are disabled"),
+                "expected L2 blob rejection, got {result:?}"
+            );
+        }
+        assert!(prefix.execute_tx(&f.txs[0]).unwrap().success);
+        assert!(fork.execute_tx(&f.txs[0]).unwrap().success);
     }
 
     /// THE equivalence guard: appending txs to a live [`SyncBlockState`]
