@@ -27,7 +27,7 @@ use reth_primitives_traits::{
     SealedBlock, SealedHeader, SignedTransaction, transaction::error::InvalidTransactionError,
 };
 use reth_storage_errors::any::AnyError;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, fmt, sync::Arc};
 
 mod evm;
 pub use evm::EezEvmFactory;
@@ -37,6 +37,33 @@ pub use evm::EezEvmFactory;
 pub fn ensure_supported_transaction(tx: &EezTxEnvelope) -> Result<(), AnyError> {
     if tx.is_eip4844() {
         return Err(AnyError::new(InvalidTransactionError::Eip4844Disabled));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct L2WithdrawalsUnsupported {
+    count: usize,
+}
+
+impl fmt::Display for L2WithdrawalsUnsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "L2 blocks cannot contain beacon withdrawals (got {})",
+            self.count
+        )
+    }
+}
+
+impl std::error::Error for L2WithdrawalsUnsupported {}
+
+/// L2 ETH issuance is authorized only by validated native deposit transactions.
+/// Reject Ethereum's beacon-withdrawal mint path everywhere this configuration
+/// constructs or replays an L2 block.
+fn ensure_no_withdrawals(count: usize) -> Result<(), AnyError> {
+    if count != 0 {
+        return Err(AnyError::new(L2WithdrawalsUnsupported { count }));
     }
     Ok(())
 }
@@ -116,6 +143,13 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
         &self,
         block: &'a SealedBlock<Block>,
     ) -> Result<EthBlockExecutionCtx<'a>, Self::Error> {
+        ensure_no_withdrawals(
+            block
+                .body()
+                .withdrawals
+                .as_ref()
+                .map_or(0, |withdrawals| withdrawals.len()),
+        )?;
         block
             .body()
             .transactions
@@ -141,6 +175,12 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
         parent: &SealedHeader,
         attributes: NextBlockEnvAttributes,
     ) -> Result<EthBlockExecutionCtx<'_>, Self::Error> {
+        ensure_no_withdrawals(
+            attributes
+                .withdrawals
+                .as_ref()
+                .map_or(0, |withdrawals| withdrawals.len()),
+        )?;
         self.ethereum
             .context_for_next_block(parent, attributes)
             .map_err(AnyError::new)
@@ -160,6 +200,7 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static>
         &self,
         payload: &'a ExecutionData,
     ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
+        ensure_no_withdrawals(payload.payload.withdrawals().map_or(0, Vec::len))?;
         self.ethereum
             .context_for_payload(payload)
             .map_err(AnyError::new)
