@@ -171,7 +171,10 @@ async fn two_composers_one_winner_loser_resyncs() {
         ),
     )
     .expect("failed to stage distinct Composer candidates");
-    assert_ne!(tx_a, tx_b, "the competing candidates must carry distinct txs");
+    assert_ne!(
+        tx_a, tx_b,
+        "the competing candidates must carry distinct txs"
+    );
 
     // Convergence must advance through the divergent transactions, rather than
     // passing vacuously because both nodes still agree on an older safe prefix.
@@ -182,14 +185,17 @@ async fn two_composers_one_winner_loser_resyncs() {
         provider_b.get_transaction_receipt(tx_b),
     )
     .expect("failed to read staged transaction receipts");
-    let convergence_height = receipt_a
+    let candidate_a_height = receipt_a
         .and_then(|receipt| receipt.block_number)
-        .expect("Composer A staged transaction has no block number")
-        .max(
-            receipt_b
-                .and_then(|receipt| receipt.block_number)
-                .expect("Composer B staged transaction has no block number"),
-        );
+        .expect("Composer A staged transaction has no block number");
+    let candidate_b_height = receipt_b
+        .and_then(|receipt| receipt.block_number)
+        .expect("Composer B staged transaction has no block number");
+    assert_eq!(
+        candidate_a_height, candidate_b_height,
+        "the test must stage incompatible candidates at the same L2 height"
+    );
+    let convergence_height = candidate_a_height;
 
     chain
         .wait_for_batches_or_node_failure(2, &[&composer_a, &composer_b], DEFAULT_TIMEOUT)
