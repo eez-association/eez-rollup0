@@ -84,6 +84,8 @@ write_result() {
             l1_l2_root_divergence: 0,
             safe_head_convergence: "pass",
             signer_outage_recovery: "pass",
+            relay_outage_recovery: "pass",
+            builder_outage_recovery: "pass",
             node_restart_replay: "pass",
             ingress_nonce_gap_rejection: "pass"
         } else {} end' >"$RESULT_DIR/result.json"
@@ -217,7 +219,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         echo "- Inbound, outbound, and mixed-direction state chaining: pass"
         echo "- Supported protocol network scenarios: pass"
         echo "- L1 front nonce-gap rejection and contiguous recovery: pass"
-        echo "- Proof-signer outage and pending-transaction recovery: pass"
+        echo "- Proof-signer, MEV relay, and builder outage recovery: pass"
         echo "- Node restart, exact safe-prefix replay, and fresh progress: pass"
         echo "- Signed windows observed: $signed_window_count"
         echo "- Remote attestations observed: $remote_attestation_count"
