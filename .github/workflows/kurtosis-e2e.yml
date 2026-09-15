@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: kurtosis-e2e-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   kurtosis-e2e:
@@ -19,10 +19,11 @@ jobs:
     timeout-minutes: 150
     env:
       KURTOSIS_ENCLAVE: eez-ci
-      EEZ_NODE_IMAGE: eez-node:ci-${{ github.sha }}
-      EEZ_PROOF_SIGNER_IMAGE: eez-proof-signer:ci-${{ github.sha }}
-      EEZ_DEPLOY_IMAGE: eez-deploy:ci-${{ github.sha }}
+      EEZ_NODE_IMAGE: eez-node:ci
+      EEZ_PROOF_SIGNER_IMAGE: eez-proof-signer:ci
+      EEZ_DEPLOY_IMAGE: eez-deploy:ci
       EEZ_CI_RESULT_DIR: ${{ github.workspace }}/artifacts/kurtosis-e2e
+      EEZ_DOCKER_CACHE: gha
       EEZ_PRUNE_BUILD_CACHE: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -34,6 +35,10 @@ jobs:
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           docker system prune --all --force
+      - name: Create BuildKit builder
+        run: docker buildx create --use --driver docker-container
+      - name: Expose GitHub runtime for BuildKit cache
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1
         with:
@@ -50,7 +55,7 @@ jobs:
         if: always()
         run: bash testing/kurtosis/stop.sh
       - name: Upload kurtosis e2e diagnostics
-        if: always()
+        if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: kurtosis-e2e-${{ github.run_id }}-${{ github.run_attempt }}

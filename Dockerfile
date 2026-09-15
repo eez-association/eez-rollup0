@@ -49,7 +49,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=eez-node-target,target=/build/target,sharing=locked \
     cargo chef cook --profile "$BUILD_PROFILE" --recipe-path recipe.json \
-        --package eez-node --package eez-follower
+        --package eez-node --package eez-follower --package eez-proof-signer
 # Workspace sources; only this layer rebuilds on first-party code changes.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -58,9 +58,22 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     --mount=type=cache,id=eez-node-target,target=/build/target,sharing=locked \
     cargo build --profile "$BUILD_PROFILE" -p eez-node --bin eez-composer --example genesis_state_root \
     && cargo build --profile "$BUILD_PROFILE" -p eez-follower --bin eez-follower \
+    && cargo build --locked --profile "$BUILD_PROFILE" -p eez-proof-signer --bin eez-proof-signer \
+    && cp "target/$BUILD_PROFILE/eez-proof-signer" /build/eez-proof-signer \
     && cp "target/$BUILD_PROFILE/eez-composer" /build/eez-composer \
     && cp "target/$BUILD_PROFILE/eez-follower" /build/eez-follower \
     && cp "target/$BUILD_PROFILE/examples/genesis_state_root" /build/genesis_state_root
+
+# CI builds this target after the node image, reusing the same builder layers.
+FROM debian:bookworm-slim AS proof-signer
+RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder --chmod=0555 /build/eez-proof-signer /usr/local/bin/eez-proof-signer
+WORKDIR /app
+USER 65532:65532
+EXPOSE 50061/tcp
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/eez-proof-signer"]
 
 # ── runtime: slim image with just the binaries ──────────────────
 FROM debian:bookworm-slim AS runtime
