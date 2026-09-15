@@ -16,6 +16,7 @@ use reth_primitives_traits::TransactionMeta;
 use reth_rpc::EthApi;
 use reth_rpc_convert::{RpcConverter, RpcTypes};
 use reth_rpc_eth_types::receipt::EthReceiptConverter;
+use std::future::ready;
 
 #[derive(Debug, Clone)]
 pub struct EezRpcTypes;
@@ -39,13 +40,16 @@ impl<N: FullNodeComponents<Types = EezNode, Evm = EezEvmConfig>> EthApiBuilder<N
 {
     type EthApi = EthApi<N, Converter>;
 
-    async fn build_eth_api(self, ctx: EthApiCtx<'_, N>) -> eyre::Result<Self::EthApi> {
+    fn build_eth_api(
+        self,
+        ctx: EthApiCtx<'_, N>,
+    ) -> impl Future<Output = eyre::Result<Self::EthApi>> {
         let receipts = EthReceiptConverter::new(ctx.components.provider().chain_spec())
             .with_builder(build_receipt as ReceiptBuilder);
-        Ok(ctx
+        ready(Ok(ctx
             .eth_api_builder()
             .map_converter(|_| Converter::new(receipts))
-            .build())
+            .build()))
     }
 }
 
