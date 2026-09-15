@@ -26,7 +26,6 @@ pub const EEZL2_ADDRESS: Address = address!("42000000000000000000000000000000000
     Debug,
     PartialEq,
     Eq,
-    serde::Serialize,
     serde::Deserialize,
     alloy_rlp::RlpEncodable,
     alloy_rlp::RlpDecodable,
@@ -40,6 +39,29 @@ pub struct SystemTransaction {
     pub to: Address,
     pub value: U256,
     pub input: Bytes,
+}
+
+impl serde::Serialize for SystemTransaction {
+    /// Ethereum RPC consumers require gas fields and signature placeholders.
+    /// These fixed JSON values do not add gas settings or a signature to the
+    /// native wire body; derivation still supplies its authorization.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use alloy_primitives::U64;
+        use serde::ser::SerializeStruct;
+
+        let mut tx = serializer.serialize_struct("SystemTransaction", 10)?;
+        tx.serialize_field("chainId", &U64::from(self.chain_id))?;
+        tx.serialize_field("nonce", &U64::from(self.nonce))?;
+        tx.serialize_field("to", &self.to)?;
+        tx.serialize_field("value", &self.value)?;
+        tx.serialize_field("input", &self.input)?;
+        tx.serialize_field("gas", &U64::from(SYSTEM_TX_GAS_LIMIT))?;
+        tx.serialize_field("gasPrice", &U256::ZERO)?;
+        tx.serialize_field("v", &U256::ZERO)?;
+        tx.serialize_field("r", &U256::ZERO)?;
+        tx.serialize_field("s", &U256::ZERO)?;
+        tx.end()
+    }
 }
 
 impl Typed2718 for SystemTransaction {
