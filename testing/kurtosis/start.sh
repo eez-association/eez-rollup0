@@ -43,6 +43,28 @@ DEPLOY_IMAGE="$(yv deploy_image)";                DEPLOY_IMAGE="${DEPLOY_IMAGE:-
 
 export DOCKER_BUILDKIT=1
 
+# GitHub-hosted runners start with an empty Docker cache. CI opts into the
+# GitHub Actions cache backend so dependency layers survive across commits.
+# Local runs keep using the ordinary Docker builder and its local cache.
+docker_build() {
+    local cache_scope="$1"
+    shift
+    if [[ "${EEZ_DOCKER_CACHE:-}" == "gha" ]]; then
+        local cache_args=(
+            --cache-from "type=gha,scope=eez-$cache_scope"
+            --cache-to "type=gha,mode=max,scope=eez-$cache_scope"
+        )
+        if [[ "$cache_scope" != "node" ]]; then
+            cache_args+=(--cache-from "type=gha,scope=eez-node")
+        fi
+        docker buildx build --load \
+            "${cache_args[@]}" \
+            "$@"
+    else
+        docker build "$@"
+    fi
+}
+
 # The default `release` profile is already the fast build; set
 # EEZ_OPTIMIZED_BUILD=1 for production (maxperf) binaries.
 release_build_args=()
@@ -52,13 +74,13 @@ fi
 
 if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
     echo "==> building $NODE_IMAGE (fast development profile)"
-    docker build "${release_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
+    docker_build node "${release_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
 fi
 
 if [[ "${EEZ_SKIP_PROOF_SIGNER_BUILD:-0}" != "1" ]]; then
     echo "==> building $PROOF_SIGNER_IMAGE (fast development profile)"
-    docker build "${release_build_args[@]}" \
-        -f "$REPO/Dockerfile.signer" \
+    docker_build signer "${release_build_args[@]}" \
+        -f "$REPO/Dockerfile" --target proof-signer \
         -t "$PROOF_SIGNER_IMAGE" "$REPO"
 else
     echo "==> reusing $PROOF_SIGNER_IMAGE (EEZ_SKIP_PROOF_SIGNER_BUILD=1)"
@@ -66,7 +88,7 @@ fi
 
 if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then
     echo "==> building $DEPLOY_IMAGE (foundry + contracts)"
-    docker build \
+    docker_build deploy \
         --build-arg "EEZ_NODE_IMAGE=$NODE_IMAGE" \
         -f "$HERE/Dockerfile.deploy" \
         -t "$DEPLOY_IMAGE" \

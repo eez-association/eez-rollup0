@@ -25,7 +25,8 @@ services:
   eez-proof-signer:
     build:
       context: .
-      dockerfile: Dockerfile.signer
+      dockerfile: Dockerfile
+      target: proof-signer
     image: eez-proof-signer:local
     container_name: eez-proof-signer-chiado
     network_mode: host
