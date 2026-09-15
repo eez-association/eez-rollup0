@@ -24,7 +24,7 @@ use reth_payload_primitives::{
 };
 use reth_primitives_traits::SealedBlock;
 use reth_provider::EthStorage;
-use std::sync::Arc;
+use std::{future::ready, sync::Arc};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EezNode;
@@ -77,8 +77,8 @@ pub struct EezExecutorBuilder;
 impl<N: FullNodeTypes<Types = EezNode>> ExecutorBuilder<N> for EezExecutorBuilder {
     type EVM = EezEvmConfig;
 
-    async fn build_evm(self, ctx: &BuilderContext<N>) -> eyre::Result<Self::EVM> {
-        Ok(EezEvmConfig::new(ctx.chain_spec()))
+    fn build_evm(self, ctx: &BuilderContext<N>) -> impl Future<Output = eyre::Result<Self::EVM>> {
+        ready(Ok(EezEvmConfig::new(ctx.chain_spec())))
     }
 }
 
@@ -88,8 +88,11 @@ pub struct EezConsensusBuilder;
 impl<N: FullNodeTypes<Types = EezNode>> ConsensusBuilder<N> for EezConsensusBuilder {
     type Consensus = Arc<EthBeaconConsensus<ChainSpec>>;
 
-    async fn build_consensus(self, ctx: &BuilderContext<N>) -> eyre::Result<Self::Consensus> {
-        Ok(Arc::new(EthBeaconConsensus::new(ctx.chain_spec())))
+    fn build_consensus(
+        self,
+        ctx: &BuilderContext<N>,
+    ) -> impl Future<Output = eyre::Result<Self::Consensus>> {
+        ready(Ok(Arc::new(EthBeaconConsensus::new(ctx.chain_spec()))))
     }
 }
 
@@ -147,8 +150,11 @@ impl<N: FullNodeComponents<Types = EezNode>> PayloadValidatorBuilder<N>
 {
     type Validator = EezEngineValidator;
 
-    async fn build(self, ctx: &AddOnsContext<'_, N>) -> eyre::Result<Self::Validator> {
-        Ok(EezEngineValidator::new(ctx.config.chain.clone()))
+    fn build(
+        self,
+        ctx: &AddOnsContext<'_, N>,
+    ) -> impl Future<Output = eyre::Result<Self::Validator>> {
+        ready(Ok(EezEngineValidator::new(ctx.config.chain.clone())))
     }
 }
 
