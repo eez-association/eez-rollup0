@@ -512,6 +512,38 @@ impl ProofSignerHandle {
             );
         }
     }
+
+    #[cfg(unix)]
+    fn send_signal(&self, signal: &str) -> Result<()> {
+        let pid = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("proof signer child mutex poisoned"))?
+            .id()
+            .to_string();
+        let status = Command::new("kill")
+            .args([signal, &pid])
+            .status()
+            .with_context(|| format!("send {signal} to proof signer pid {pid}"))?;
+        if !status.success() {
+            bail!("sending {signal} to proof signer pid {pid} failed with {status}");
+        }
+        Ok(())
+    }
+
+    /// Suspend the real signer without closing its listening socket. This
+    /// exercises an in-flight prover outage rather than an immediate
+    /// connection-refused error.
+    #[cfg(unix)]
+    pub fn pause(&self) -> Result<()> {
+        self.send_signal("-STOP")
+    }
+
+    /// Resume a signer previously suspended by [`Self::pause`].
+    #[cfg(unix)]
+    pub fn resume(&self) -> Result<()> {
+        self.send_signal("-CONT")
+    }
 }
 
 impl Drop for ProofSignerHandle {
@@ -3588,6 +3620,33 @@ impl CrossChainWorld {
     }
     pub fn l2_rpc(&self) -> String {
         self.node.l2_rpc_url()
+    }
+
+    /// Environment for an L1-derived follower of this world's composer.
+    ///
+    /// The follower talks to the composer's embedded L1 over RPC and must not
+    /// reuse that process's bound HTTP, P2P, or cross-chain ports.
+    pub fn follower_env(&self) -> Vec<(&'static str, String)> {
+        self.cfg
+            .env()
+            .into_iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    *key,
+                    "EEZ_L1_HTTP_PORT"
+                        | "EEZ_L1_AUTH_PORT"
+                        | "EEZ_L1_P2P_PORT"
+                        | "EEZ_L1_XCHAIN_PORT"
+                        | "EEZ_L2_XCHAIN_PORT"
+                )
+            })
+            .map(|(key, mut value)| {
+                if key == "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES" {
+                    value = "true".to_string();
+                }
+                (key, value)
+            })
+            .collect()
     }
 }
 
