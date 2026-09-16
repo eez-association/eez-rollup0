@@ -75,6 +75,13 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         "launching eez follower",
     );
     warn_on_deprecated_env();
+
+    let stateful_proof_signer = eez_prover_stateful::Config::from_env()?;
+    if stateful_proof_signer.is_some() && ext.sequencer_rpc.is_some() {
+        return Err(eyre::eyre!(
+            "stateful proof signing requires an L1-derived-only follower; remove EEZ_SEQUENCER_RPC",
+        ));
+    }
     // A production follower must reconstruct the Composer's Sync-block system
     // transactions byte-for-byte. Read every required value before launching
     // reth so a misconfigured follower never appears healthy.
@@ -201,6 +208,32 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     task_executor.spawn_critical_task("eez-deriver", async move {
         deriver.run(deriver_events).await;
     });
+
+    if let Some(config) = stateful_proof_signer {
+        let signer_provider = provider.clone();
+        let signer_chain_spec = handle.node.chain_spec();
+        event!(
+            name: "eez.node.stateful_proof_signer.spawned",
+            Level::INFO,
+            "spawning stateful proof signer over the L1-derived follower",
+        );
+        task_executor.spawn_critical_with_graceful_shutdown_signal(
+            "eez-stateful-proof-signer",
+            move |shutdown| async move {
+                // Signal tonic while retaining Reth's shutdown guard during drain.
+                let shutdown_signal = shutdown.clone().ignore_guard();
+                let result = eez_prover_stateful::serve(
+                    config,
+                    signer_provider,
+                    signer_chain_spec,
+                    shutdown_signal,
+                )
+                .await;
+                drop(shutdown);
+                result.unwrap_or_else(|error| panic!("stateful proof signer exited: {error:#}"));
+            },
+        );
+    }
 
     if let Some(sequencer_rpc) = ext.sequencer_rpc {
         let follower = UnsafeHeadFollower::new(

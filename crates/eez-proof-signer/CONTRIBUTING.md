@@ -24,8 +24,8 @@ the spec are appropriate in repository documentation.
 
 ## Current implementation
 
-- The production witness-backed backend lives in `eez-prover-stateless` and
-  inherits this crate's service pipeline.
+- Production backends live in `eez-prover-stateless` and
+  `eez-prover-stateful`; both inherit this crate's service pipeline.
 - Exactly one request may be active across all connections. An overlap is
   rejected, not queued. The request permit covers ingestion through response
   construction and remains with a running detached worker until it exits.
@@ -130,7 +130,7 @@ cargo check --package eez-proof-signer --all-targets --locked
 cargo clippy --package eez-proof-signer --all-targets --all-features --locked -- -D warnings
 cargo test --package eez-proof-signer --locked
 RUSTDOCFLAGS='-D warnings' cargo doc --package eez-proof-signer --no-deps --locked
-cargo test --package eez-prover-stateless --locked
+cargo test --package eez-prover-stateless --package eez-prover-stateful --locked
 ```
 
 Before updating the dependency pin, verify the fork change from a checkout of
