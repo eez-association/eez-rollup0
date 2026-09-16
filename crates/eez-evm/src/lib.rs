@@ -6,6 +6,11 @@
 //! Ethereum's executor, gas accounting, system calls, block assembly, and header
 //! environment are reused. `eez-primitives` defines the zero-fee native TxEnv;
 //! `evm` adds deposit minting and rollback around the upstream Ethereum EVM.
+//!
+//! Configuration adapted from reth's `EthEvmConfig` at the pinned revision:
+//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/evm/src/lib.rs>.
+//! Receipt construction follows Alloy 0.34.0's Ethereum receipt builder:
+//! <https://github.com/alloy-rs/alloy-evm/blob/6022e02ee1ab669f7c1ee59b58fc7a6b3f5f15d5/crates/evm/src/eth/receipt_builder.rs>.
 
 use alloy_consensus::{Header, Typed2718};
 use alloy_eips::Decodable2718;

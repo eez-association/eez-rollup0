@@ -1,6 +1,9 @@
 //! L2 pool that disables blobs and refuses SYSTEM_ADDRESS txs. Native system
 //! txs ride in Sync blocks over the Engine API; the pool gate also covers reorg
 //! reinjection.
+//!
+//! Pool setup adapted from reth's `EthereumPoolBuilder` at the pinned revision:
+//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/node/src/node.rs>.
 
 use std::any::Any;
 

@@ -13,7 +13,7 @@ use revm::{
     context::TxEnv,
     context_interface::result::EVMError,
     database::InMemoryDB,
-    inspector::NoOpInspector,
+    inspector::CountInspector,
     state::{AccountInfo, Bytecode},
 };
 
@@ -310,17 +310,55 @@ fn mint_overflow_does_not_poison_the_next_execution() {
 
 #[test]
 fn inspection_and_normal_execution_apply_identical_mint_and_rollback_rules() {
-    for code in [bytes!("3360005500"), bytes!("3360005560006000fd")] {
-        let block = block(0, 1);
-        let env = config().evm_env(block.header()).unwrap();
-        let db = database(U256::ZERO, code);
-        let mut plain = EezEvmFactory.create_evm(db.clone(), env.clone());
-        let mut inspected = EezEvmFactory.create_evm_with_inspector(db, env, NoOpInspector);
-        let tx = TxEnv::from_recovered_tx(&block.body().transactions[0], SYSTEM_ADDRESS);
-        assert_eq!(
-            plain.transact_raw(tx.clone()).unwrap(),
-            inspected.transact_raw(tx).unwrap()
-        );
+    let user = Address::repeat_byte(0x11);
+    // Exercise each delegation path: minting, zero-value native, and ordinary.
+    for (tx_type, caller, value, gas_price) in [
+        (SYSTEM_TX_TYPE, SYSTEM_ADDRESS, 13, 0),
+        (SYSTEM_TX_TYPE, SYSTEM_ADDRESS, 0, 0),
+        (0, user, 13, 1),
+    ] {
+        // Successful storage write, revert, and invalid-opcode halt.
+        for code in [
+            bytes!("3360005500"),
+            bytes!("3360005560006000fd"),
+            bytes!("fe"),
+        ] {
+            let block = block(0, 1);
+            let env = config().evm_env(block.header()).unwrap();
+            let mut db = database(U256::from(5), code);
+            db.insert_account_info(
+                user,
+                AccountInfo {
+                    balance: U256::from(3_000_000),
+                    ..Default::default()
+                },
+            );
+            let mut plain = EezEvmFactory.create_evm(db.clone(), env.clone());
+            let mut inspected =
+                EezEvmFactory.create_evm_with_inspector(db, env, CountInspector::default());
+            let tx = TxEnv {
+                tx_type,
+                caller,
+                value: U256::from(value),
+                gas_price,
+                ..TxEnv::from_recovered_tx(&block.body().transactions[0], SYSTEM_ADDRESS)
+            };
+            let expected = plain.transact_raw(tx.clone()).unwrap();
+            // First verify that the factory enables the inspector itself, then
+            // check that runtime toggles preserve execution while gating callbacks.
+            for enabled in [None, Some(false), Some(true)] {
+                if let Some(enabled) = enabled {
+                    inspected.set_inspector_enabled(enabled);
+                }
+                inspected.components_mut().1.clear();
+                assert_eq!(expected, inspected.transact_raw(tx.clone()).unwrap());
+                let inspector = inspected.components().1;
+                let enabled = enabled.unwrap_or(true);
+                assert_eq!(inspector.call_count(), u64::from(enabled));
+                assert_eq!(inspector.call_end_count(), u64::from(enabled));
+                assert_eq!(inspector.step_count() > 0, enabled);
+            }
+        }
     }
 }
 

@@ -1,6 +1,10 @@
 //! Engine API adapters for EEZ blocks. Payload formats and fork rules are Ethereum's;
 //! transaction bytes inside those payloads are decoded using the EEZ envelope.
 //! L2 has no blob transactions, so the required Engine blob bundles are empty.
+//!
+//! Adapted from reth's Engine types and payload conversions at the pinned revision:
+//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/engine-primitives/src/lib.rs>
+//! and <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/engine-primitives/src/payload.rs>.
 
 use crate::{Block, EezPrimitives};
 use alloy_eips::eip7685::Requests;

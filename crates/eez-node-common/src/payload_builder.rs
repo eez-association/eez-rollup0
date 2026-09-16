@@ -1,6 +1,9 @@
 //! Payload construction adapted from reth-ethereum-payload-builder at fd59fd22
 //! (MIT/Apache-2.0). The pinned upstream builder fixes Ethereum primitives; this
 //! adapter uses EEZ types and excludes blob transactions from L2 payloads.
+//!
+//! Upstream source at the pinned revision:
+//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/payload/src/lib.rs>.
 
 use alloy_consensus::{Transaction, transaction::TxHashRef};
 use alloy_primitives::{Bytes, U256};

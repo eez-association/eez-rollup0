@@ -6,6 +6,9 @@
 //! `--builder.extradata` CLI flags. The Deriver's `execute_block`
 //! reads the same constants, so the two block-construction paths can't
 //! drift via operator misconfiguration.
+//!
+//! Adapted from reth's `EthereumPayloadBuilder` at the pinned revision:
+//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/node/src/payload.rs>.
 
 use alloy_primitives::Bytes;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT};

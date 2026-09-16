@@ -1,4 +1,7 @@
 //! Native deposit minting around the unmodified Ethereum EVM.
+//!
+//! Delegates execution and inspector dispatch to Alloy 0.34.0's [`EthEvm`]:
+//! <https://github.com/alloy-rs/alloy-evm/blob/6022e02ee1ab669f7c1ee59b58fc7a6b3f5f15d5/crates/evm/src/eth/mod.rs>.
 
 use alloy_evm::{
     Database, EthEvm, EthEvmFactory, Evm, EvmEnv, EvmFactory, eth::EthEvmContext,
@@ -53,6 +56,8 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> Evm for EezEvm<DB, I> {
     /// Mint native value before Ethereum's validation and transfer, preserving
     /// existing system funds. Revm errors discard the mint; reverted or halted
     /// calls need the explicit rollback below. The native TxEnv supplies zero fees.
+    /// `EthEvm::transact_raw` dispatches to `inspect_tx` when its inspector is enabled,
+    /// so all paths below preserve the inspector installed by our factory.
     fn transact_raw(&mut self, tx: TxEnv) -> Result<ResultAndState, Self::Error> {
         if tx.tx_type != SYSTEM_TX_TYPE {
             return self.ethereum.transact_raw(tx);

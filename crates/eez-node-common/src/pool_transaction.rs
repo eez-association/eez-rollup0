@@ -1,5 +1,8 @@
 //! Ethereum pooled transactions adapted to EEZ block primitives. Native system
 //! envelopes have no conversion into the public pooled wire format.
+//!
+//! Adapted from reth's `EthPooledTransaction` implementations at the pinned revision:
+//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/transaction-pool/src/traits.rs>.
 
 use alloy_consensus::{
     Typed2718,
@@ -82,6 +85,10 @@ impl PoolTransaction for EezPooledTransaction {
     }
 }
 
+// These helpers preserve upstream conversion and sidecar-validation semantics.
+// L2 admission policy lives in EezPoolBuilder's `.no_eip4844()` validator, which
+// rejects blobs from every pool origin with Eip4844Disabled before sidecar checks.
+// Successfully converting a blob envelope here does not admit it to the pool.
 impl EthPoolTransaction for EezPooledTransaction {
     fn take_blob(&mut self) -> EthBlobTransactionSidecar {
         if self.is_eip4844() {
