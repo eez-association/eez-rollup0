@@ -127,14 +127,19 @@ jobs:
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
       - name: Build helper binaries
         run: |
+          cargo build --locked -p eez-node --bin eez-composer
+          cargo build --locked -p eez-follower --bin eez-follower
           cargo build --locked -p eez-proof-signer --bin eez-proof-signer
           cargo build --locked -p eez-node --example genesis_state_root
       - name: Archive integration test executables
         run: |
           mkdir -p artifacts/e2e-build
           cargo nextest archive --locked -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test resumption --archive-file artifacts/e2e-build/tests.tar.zst
+          cp target/debug/eez-composer artifacts/e2e-build/
+          cp target/debug/eez-follower artifacts/e2e-build/
           cp target/debug/eez-proof-signer artifacts/e2e-build/
           cp target/debug/examples/genesis_state_root artifacts/e2e-build/eez-genesis-state-root
+          strip artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e-build
@@ -252,3 +257,58 @@ jobs:
             artifacts/cross-chain-e2e/logs
           if-no-files-found: warn
           retention-days: 7
+
+  kurtosis-e2e:
+    name: Kurtosis E2E
+    needs: [build-e2e, contract-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      KURTOSIS_ENCLAVE: eez-ci
+      EEZ_NODE_IMAGE: eez-node:ci
+      EEZ_PROOF_SIGNER_IMAGE: eez-proof-signer:ci
+      EEZ_DEPLOY_IMAGE: eez-deploy:ci
+      EEZ_CI_RESULT_DIR: ${{ github.workspace }}/artifacts/kurtosis-e2e
+      EEZ_PREBUILT_BIN_DIR: ${{ github.workspace }}/artifacts/e2e-build
+      EEZ_PRUNE_BUILD_CACHE: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: e2e-build
+          path: artifacts/e2e-build
+      - name: Restore runtime binary permissions
+        run: chmod +x artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root
+      - name: Reclaim runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          docker system prune --all --force
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1
+        with:
+          version: v1.7.1
+      - name: Install Kurtosis
+        run: |
+          echo "deb [trusted=yes] https://sdk.kurtosis.com/kurtosis-cli-release-artifacts/ /" | sudo tee /etc/apt/sources.list.d/kurtosis.list
+          sudo apt-get update
+          sudo apt-get install -y bc kurtosis-cli jq openssl
+          kurtosis engine start
+      - name: Run Enclave
+        run: bash testing/kurtosis/run-ci.sh
+      - name: Stop kurtosis enclave
+        if: always()
+        run: bash testing/kurtosis/stop.sh
+      - name: Upload kurtosis e2e diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kurtosis-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/kurtosis-e2e
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove candidate images
+        if: always()
+        run: docker image rm "$EEZ_NODE_IMAGE" "$EEZ_PROOF_SIGNER_IMAGE" "$EEZ_DEPLOY_IMAGE" || true

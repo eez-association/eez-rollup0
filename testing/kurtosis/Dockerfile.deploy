@@ -4,7 +4,7 @@
 ARG EEZ_NODE_IMAGE=eez-node:dev
 FROM ${EEZ_NODE_IMAGE} AS node-tools
 
-FROM debian:bookworm-slim
+FROM ubuntu:24.04
 
 ARG FOUNDRY_VERSION=v1.7.1
 

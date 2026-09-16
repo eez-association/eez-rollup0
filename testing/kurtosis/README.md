@@ -65,6 +65,11 @@ the Ethereum client images. It can take several minutes. The command returns
 after Kurtosis has deployed the contracts and started the network services. It
 leaves the enclave running.
 
+CI may set `EEZ_PREBUILT_BIN_DIR` to a directory containing prebuilt
+`eez-composer`, `eez-follower`, `eez-proof-signer`, and
+`eez-genesis-state-root` binaries. In that mode `start.sh` builds thin runtime
+images from those binaries instead of compiling Rust inside Docker.
+
 ### 3. Check the deployment
 
 ```bash
@@ -544,6 +549,8 @@ Kurtosis assigns different host ports automatically. Remember that
   committed test genesis; it contains no private key.
 - `Dockerfile.deploy`: deployment image containing Foundry, contracts, scripts,
   and the genesis state-root utility copied from the selected node image.
+- `Dockerfile.prebuilt`: CI runtime images that copy prebuilt node and
+  proof-signer binaries from the shared `e2e-build` artifact.
 - `start.sh` and `stop.sh`: local network lifecycle.
 - `ports.sh`: endpoint discovery, summary, and shell exports.
 - `scripts/verify-eezl2-deployment.sh`: live EEZL2 deployment verification.
