@@ -49,6 +49,10 @@ export DOCKER_BUILDKIT=1
 docker_build() {
     local cache_scope="$1"
     shift
+    if [[ "$cache_scope" == "deploy" ]]; then
+        docker build "$@"
+        return
+    fi
     if [[ "${EEZ_DOCKER_CACHE:-}" == "gha" ]]; then
         local cache_args=(
             --cache-from "type=gha,scope=eez-$cache_scope"

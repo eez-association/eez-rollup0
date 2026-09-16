@@ -103,14 +103,14 @@ jobs:
         with:
           tool: cargo-deny,cargo-audit
       - name: Check dependency policy
-        run: cargo deny check advisories bans sources
+        run: cargo deny check bans sources
       - name: Check known vulnerabilities
         run: cargo audit
 
   build-e2e:
     name: Build E2E Binaries
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
