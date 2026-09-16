@@ -30,15 +30,13 @@ COPY crates ./crates
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ── builder: cook deps (cached), then build eez-node ─────────────────
-# target/ + cargo caches live in BuildKit cache mounts so incremental
-# artifacts survive across builds: a code change recompiles only the
-# edited crates + dependents instead of every first-party crate. The
-# SAME mounts must be on both RUNs — cook populates them; without the
-# mount on cook, the cache would shadow the cooked deps and the first
-# cold build would recompile the whole dep tree in the source layer.
-# Mount registry/git subdirs only (never all of $CARGO_HOME — that
-# would hide cargo-chef in $CARGO_HOME/bin). Binaries are cp'd out
-# inside the RUN because mount contents never land in image layers.
+# Keep target/ in Docker layers, not a BuildKit cache mount. The cooked
+# dependency artifacts then survive into the source build layer and can be
+# exported/restored by the GitHub Actions cache. A target/ cache mount is
+# useful on a persistent local builder, but GitHub-hosted runners start cold
+# often enough that it makes the hot source layer recompile too much.
+# Mount registry/git subdirs only (never all of $CARGO_HOME — that would hide
+# cargo-chef in $CARGO_HOME/bin).
 FROM chef AS builder
 # `release` (workspace profile: cgu=16, stripped, thin LTO) is the
 # fast-to-build default; BUILD_PROFILE=maxperf for production binaries.
@@ -47,7 +45,6 @@ COPY --from=planner /build/recipe.json recipe.json
 # Slow, cache-friendly layer: only re-runs when the dep graph changes.
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=eez-node-target,target=/build/target,sharing=locked \
     cargo chef cook --profile "$BUILD_PROFILE" --recipe-path recipe.json \
         --package eez-node --package eez-follower --package eez-proof-signer
 # Workspace sources; only this layer rebuilds on first-party code changes.
@@ -55,7 +52,6 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=eez-node-target,target=/build/target,sharing=locked \
     cargo build --profile "$BUILD_PROFILE" -p eez-node --bin eez-composer --example genesis_state_root \
     && cargo build --profile "$BUILD_PROFILE" -p eez-follower --bin eez-follower \
     && cargo build --locked --profile "$BUILD_PROFILE" -p eez-proof-signer --bin eez-proof-signer \
