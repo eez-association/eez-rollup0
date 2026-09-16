@@ -228,10 +228,12 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
                 tx["from"] == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076",
                 "native caller: {tx}"
             );
-            ensure!(
-                tx.get("r").is_none() && tx.get("s").is_none() && tx.get("v").is_none(),
-                "native signature: {tx}"
-            );
+            for field in ["r", "s", "v"] {
+                ensure!(
+                    tx[field] == "0x0",
+                    "native signature placeholder {field}: {tx}"
+                );
+            }
             let input = tx["input"].as_str().unwrap();
             if input.starts_with(&format!(
                 "0x{}",
