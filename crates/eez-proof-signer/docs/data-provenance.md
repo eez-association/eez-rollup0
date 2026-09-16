@@ -10,7 +10,7 @@ itself never turns a Composer claim into validated evidence.
 ```mermaid
 flowchart TB
     W[Composer ProveChunk stream] --> A[AdmittedWindow]
-    A -->|RLP and witnesses| V[Stateless validation]
+    A -->|RLP and witnesses| V[Validation backend]
     V --> VW[ValidatedWindow]
 
     A -->|submitted PostBatch calldata| C[CanonicalPostBatch]
@@ -61,7 +61,7 @@ consensus or execution correctness.
 
 ### Backend results
 
-Stateless exact-decodes the block, recovers signers under the configured fork
+The backend exact-decodes the block, recovers signers under the configured fork
 rules, checks consensus, verifies the witness pre-state, re-executes the block,
 and compares the locally computed post-state root with the header commitment.
 The backend returns each block's computed identity, validated roots, receipt

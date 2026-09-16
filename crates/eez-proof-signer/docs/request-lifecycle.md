@@ -66,7 +66,7 @@ queued; an already-running EVM execution cannot be forcefully aborted safely.
 
 The current worker polls:
 
-- before preparing the settling block and before each Stateless block
+- before preparing the settling block and before each backend block
   execution;
 - between completed validation and settlement through the absolute deadline;
   and

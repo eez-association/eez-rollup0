@@ -46,7 +46,7 @@ COPY --from=planner /build/recipe.json recipe.json
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     cargo chef cook --profile "$BUILD_PROFILE" --recipe-path recipe.json \
-        --package eez-node --package eez-follower --package eez-proof-signer
+        --package eez-node --package eez-follower --package eez-prover-stateless
 # Workspace sources; only this layer rebuilds on first-party code changes.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -54,7 +54,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     cargo build --profile "$BUILD_PROFILE" -p eez-node --bin eez-composer --example genesis_state_root \
     && cargo build --profile "$BUILD_PROFILE" -p eez-follower --bin eez-follower \
-    && cargo build --locked --profile "$BUILD_PROFILE" -p eez-proof-signer --bin eez-proof-signer \
+    && cargo build --locked --profile "$BUILD_PROFILE" -p eez-prover-stateless --bin eez-proof-signer \
     && cp "target/$BUILD_PROFILE/eez-proof-signer" /build/eez-proof-signer \
     && cp "target/$BUILD_PROFILE/eez-composer" /build/eez-composer \
     && cp "target/$BUILD_PROFILE/eez-follower" /build/eez-follower \

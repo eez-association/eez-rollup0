@@ -13,6 +13,7 @@ eez-driver.workspace  = true
 eez-l1.workspace      = true
 eez-node-common = { workspace = true, features = ["l1-startup"] }
 eez-protocol.workspace = true
+eez-prover-stateful.workspace = true
 
 alloy-consensus.workspace    = true
 alloy-eips.workspace         = true

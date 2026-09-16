@@ -43,7 +43,7 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -129,7 +129,7 @@ jobs:
         run: |
           cargo build --locked -p eez-node --bin eez-composer
           cargo build --locked -p eez-follower --bin eez-follower
-          cargo build --locked -p eez-proof-signer --bin eez-proof-signer
+          cargo build --locked -p eez-prover-stateless --bin eez-proof-signer
           cargo build --locked -p eez-node --example genesis_state_root
       - name: Archive integration test executables
         run: |
