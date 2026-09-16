@@ -125,13 +125,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
-      - name: Build proof signer (launched by harness)
-        run: cargo build -p eez-proof-signer --locked
+      - name: Build helper binaries
+        run: |
+          cargo build --locked -p eez-proof-signer --bin eez-proof-signer
+          cargo build --locked -p eez-node --example genesis_state_root
       - name: Archive integration test executables
         run: |
           mkdir -p artifacts/e2e-build
           cargo nextest archive --locked -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test resumption --archive-file artifacts/e2e-build/tests.tar.zst
           cp target/debug/eez-proof-signer artifacts/e2e-build/
+          cp target/debug/examples/genesis_state_root artifacts/e2e-build/eez-genesis-state-root
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e-build
@@ -170,8 +173,10 @@ jobs:
         with:
           name: e2e-build
           path: artifacts/e2e-build
-      - name: Restore signer executable permission
-        run: chmod +x artifacts/e2e-build/eez-proof-signer
+      - name: Restore helper executable permissions
+        run: |
+          chmod +x artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root
+          echo "$GITHUB_WORKSPACE/artifacts/e2e-build" >> "$GITHUB_PATH"
       - name: Verify generated EEZL2 genesis artifacts
         run: scripts/update-eezl2-genesis.sh --check
       - name: Integration tests (e2e, serial)
