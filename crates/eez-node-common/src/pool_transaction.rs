@@ -85,7 +85,7 @@ impl PoolTransaction for EezPooledTransaction {
     }
 }
 
-// These helpers preserve upstream conversion and sidecar-validation semantics.
+// The conversion helpers preserve upstream semantics.
 // L2 admission policy lives in EezPoolBuilder's `.no_eip4844()` validator, which
 // rejects blobs from every pool origin with Eip4844Disabled before sidecar checks.
 // Successfully converting a blob envelope here does not admit it to the pool.
@@ -126,14 +126,16 @@ impl EthPoolTransaction for EezPooledTransaction {
 
     fn validate_blob(
         &self,
-        sidecar: &BlobTransactionSidecarVariant,
-        settings: &KzgSettings,
+        _sidecar: &BlobTransactionSidecarVariant,
+        _settings: &KzgSettings,
     ) -> Result<(), BlobTransactionValidationError> {
-        if let EezTxEnvelope::Ethereum(tx) = self.0.transaction.inner()
-            && let Some(tx) = tx.as_eip4844()
-        {
-            return tx.tx().validate_blob(sidecar, settings);
-        }
+        // `.no_eip4844()` should reject blobs before reaching this required trait method.
+        // The upstream error type cannot carry a custom message, so log the context here.
+        tracing::error!(
+            name: "eez.node.pool.unexpected_blob_validation",
+            tx_type = self.ty(),
+            "Unexpected blob validation: L2 blob transactions are disabled and should have been rejected before sidecar validation"
+        );
         Err(BlobTransactionValidationError::NotBlobTransaction(
             self.ty(),
         ))
