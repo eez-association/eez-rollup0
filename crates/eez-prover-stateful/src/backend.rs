@@ -351,7 +351,9 @@ fn execute_block(
     state.bal_state.bal_builder = None;
     let executor = evm_config
         .executor_for_block(state, block)
-        .map_err(|never| match never {})?;
+        .map_err(|error| {
+            ValidationError::Rejected(format!("stateful block context rejected: {error}"))
+        })?;
     let result = executor
         .execute_block(block.transactions_recovered())
         .map_err(execution_error)?;
@@ -377,7 +379,9 @@ fn execute_block_with_state_checkpoints(
     let (result, checkpoints) = {
         let mut executor = evm_config
             .executor_for_block(state, block)
-            .map_err(|never| match never {})?;
+            .map_err(|error| {
+                ValidationError::Rejected(format!("stateful block context rejected: {error}"))
+            })?;
         if has_bal {
             executor.evm_mut().db_mut().bal_state.bal_builder = Some(Bal::new());
         } else {

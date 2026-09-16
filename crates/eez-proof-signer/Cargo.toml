@@ -24,7 +24,6 @@ alloy-rpc-types-debug.workspace = true
 alloy-sol-types.workspace = true
 
 reth-chainspec.workspace = true
-reth-ethereum-primitives.workspace = true
 reth-primitives-traits.workspace = true
 
 eyre.workspace = true

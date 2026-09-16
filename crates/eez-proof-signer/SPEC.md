@@ -174,7 +174,7 @@ variables from section 3.1 except that:
 
 The remaining shared resource-limit and identity defaults are unchanged. The
 stateful service MUST apply the same secret-redaction, attester-address,
-system-key, and fixed EEZL2-address checks as the stateless service.
+reserved system-address, and fixed EEZL2-address checks as the stateless service.
 
 The active deployment bindings are:
 

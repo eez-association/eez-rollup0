@@ -37,8 +37,8 @@ implementation deliberately uses an L1-derived-only view.
 
 The service uses the deployment settings shared with the stateless signer:
 `EEZ_ROLLUP_ID`, `EEZ_VKEY`, `EEZ_PROOF_SYSTEM`, `EEZ_ATTESTER_ADDRESS`,
-and `EEZ_L2_SYSTEM_ADDRESS` (the reserved native system address). Its attestation secret uses a
-distinct name, `EEZ_STATEFUL_PROOF_SIGNER_KEY`, so enabling it does not put the
+and `EEZ_L2_SYSTEM_ADDRESS` (the reserved native system address). Its attestation
+secret uses a distinct name, `EEZ_STATEFUL_PROOF_SIGNER_KEY`, so enabling it does not put the
 node into Composer mode.
 
 The current `prove.v1` stream still requires execution witnesses for wire

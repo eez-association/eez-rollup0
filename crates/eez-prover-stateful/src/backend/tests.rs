@@ -543,3 +543,129 @@ fn replayed_state_root_must_match_the_block_header() {
     assert!(matches!(error, ValidationError::Rejected(_)));
     assert!(error.to_string().contains("produced root"));
 }
+
+#[test]
+fn native_deposits_execute_in_both_stateful_replay_paths() {
+    use eez_primitives::{EEZL2_ADDRESS, SYSTEM_ADDRESS, SystemTransaction};
+
+    let chain_spec = Arc::new(
+        reth_chainspec::ChainSpecBuilder::mainnet()
+            .cancun_activated()
+            .build(),
+    );
+    let evm_config = EezEvmConfig::new(chain_spec);
+    let block = RecoveredBlock::try_recover(Block {
+        header: Header {
+            number: 1,
+            timestamp: 1,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(1),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::ZERO),
+            ..Default::default()
+        },
+        body: BlockBody {
+            transactions: vec![
+                SystemTransaction {
+                    chain_id: 1,
+                    nonce: 0,
+                    to: EEZL2_ADDRESS,
+                    value: U256::from(13),
+                    input: Bytes::new(),
+                }
+                .into(),
+            ],
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    for with_checkpoints in [false, true] {
+        // The mock supplies an empty anchor state and a checkpoint root; the
+        // actual EEZ EVM must mint the deposit without a prefunded system account.
+        let provider: MockEthProvider = MockEthProvider::new();
+        provider.add_state_root(B256::repeat_byte(0x11));
+        let mut state = State::builder()
+            .with_database(StateProviderDatabase::new(
+                Box::new(provider) as Box<dyn StateProvider + Send>
+            ))
+            .with_bundle_update()
+            .build();
+        let result = if with_checkpoints {
+            let (result, checkpoints, _) =
+                execute_block_with_state_checkpoints(&evm_config, &mut state, &block, &[0])
+                    .unwrap();
+            assert_eq!(checkpoints.len(), 1);
+            assert_eq!(checkpoints[0].transaction_index, 0);
+            result
+        } else {
+            execute_block(&evm_config, &mut state, &block).unwrap()
+        };
+        assert_eq!(result.receipts.len(), 1);
+        assert!(result.receipts[0].success);
+        assert_eq!(
+            result.receipts[0].tx_type,
+            eez_primitives::EezTxType::System
+        );
+        let system = state
+            .bundle_state
+            .account(&SYSTEM_ADDRESS)
+            .unwrap()
+            .info
+            .as_ref()
+            .unwrap();
+        assert_eq!(system.nonce, 1);
+        assert_eq!(system.balance, U256::ZERO);
+        let recipient = state
+            .bundle_state
+            .account(&EEZL2_ADDRESS)
+            .unwrap()
+            .info
+            .as_ref()
+            .unwrap();
+        assert_eq!(recipient.balance, U256::from(13));
+    }
+}
+
+#[test]
+fn beacon_withdrawals_are_rejected_in_both_stateful_replay_paths() {
+    let evm_config = EezEvmConfig::new(Arc::new(ChainSpec::default()));
+    let block = RecoveredBlock::new_unhashed(
+        Block {
+            header: Header::default(),
+            body: BlockBody {
+                withdrawals: Some(
+                    vec![alloy_eips::eip4895::Withdrawal {
+                        index: 0,
+                        validator_index: 0,
+                        address: Address::repeat_byte(0xab),
+                        amount: 7_000_000_000,
+                    }]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+        },
+        vec![],
+    );
+    for with_checkpoints in [false, true] {
+        let provider: MockEthProvider = MockEthProvider::new();
+        let mut state = State::builder()
+            .with_database(StateProviderDatabase::new(
+                Box::new(provider) as Box<dyn StateProvider + Send>
+            ))
+            .with_bundle_update()
+            .build();
+        let error = if with_checkpoints {
+            execute_block_with_state_checkpoints(&evm_config, &mut state, &block, &[]).unwrap_err()
+        } else {
+            execute_block(&evm_config, &mut state, &block).unwrap_err()
+        };
+        assert!(matches!(error, ValidationError::Rejected(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("L2 blocks cannot contain beacon withdrawals")
+        );
+        assert!(state.bundle_state.state.is_empty());
+    }
+}

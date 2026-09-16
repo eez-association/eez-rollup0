@@ -1,3 +1,5 @@
+mod native_security;
+
 use alloy_consensus::{Header, SignableTransaction as _, TxLegacy};
 use alloy_primitives::{B256, Bytes, Log, Signature, U256, b256};
 use alloy_sol_types::SolEvent as _;

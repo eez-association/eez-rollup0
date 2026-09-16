@@ -38,6 +38,3 @@ pub(crate) fn checkpoint(
         state_root,
     }
 }
-
-pub(crate) const LEGACY_SIGNER_ADDRESS: Address =
-    address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");

@@ -62,15 +62,15 @@ fn prover_rejects_beacon_withdrawal_mints() {
         format!("{error:?}").contains("L2 blocks cannot contain beacon withdrawals"),
         "unexpected stateless rejection: {error:?}"
     );
-    let admitted = AdmittedBlock {
-        declared_number: 1,
-        claimed_hash: block.header.hash_slow(),
-        claimed_parent_hash: block.header.parent_hash,
-        rlp: alloy_rlp::encode(&block),
+    let admitted = admitted_block_with_witness(
+        1,
+        block.header.hash_slow(),
+        block.header.parent_hash,
+        alloy_rlp::encode(&block),
         witness,
-    };
-    let error = Validator::stateless_for_test(chain_config, TEST_SYSTEM_ADDRESS)
-        .validate(&[admitted])
+    );
+    let error = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
+        .validate(vec![admitted])
         .unwrap_err();
     assert!(
         format!("{error:?}").contains("L2 blocks cannot contain beacon withdrawals"),
