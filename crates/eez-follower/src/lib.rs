@@ -5,7 +5,6 @@ mod unsafe_head;
 use std::{env, str::FromStr, sync::Arc, time::Duration};
 
 use alloy_primitives::{Address, B256};
-use alloy_provider::RootProvider;
 use alloy_signer_local::PrivateKeySigner;
 use eez_deriver::Deriver;
 use eez_driver::{BlockCommitterHandle, RollupTiming};
@@ -14,6 +13,7 @@ use eez_node_common::{
     EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, node_cli, read_checkpoint_dir,
     wait_for_l1_ready, warn_on_deprecated_env,
 };
+use eez_p2p::{NetworkConfig, NetworkService};
 use reth_chainspec::EthChainSpec as _;
 use reth_node_builder::components::BasicPayloadServiceBuilder;
 use reth_node_ethereum::EthereumNode;
@@ -51,10 +51,33 @@ impl FollowerSystemConfig {
 /// Follower-specific CLI arguments layered on top of reth's CLI.
 #[derive(clap::Args, Debug, Clone)]
 struct FollowerArgs {
-    /// Sequencer JSON-RPC URL. When set, this enables the optional unsafe-head
-    /// overlay; safe and finalized remain L1-derived.
-    #[arg(long, env = "EEZ_SEQUENCER_RPC")]
-    sequencer_rpc: Option<url::Url>,
+    /// libp2p TCP listen multiaddr.
+    #[arg(
+        long,
+        env = "EEZ_P2P_LISTEN_ADDR",
+        default_value = "/ip4/0.0.0.0/tcp/9300"
+    )]
+    p2p_listen_addr: String,
+
+    /// Comma-separated static libp2p peer multiaddrs.
+    #[arg(long, env = "EEZ_P2P_PEERS", value_delimiter = ',')]
+    p2p_peers: Vec<String>,
+
+    /// Address authorized to sign this rollup's unsafe blocks. When omitted,
+    /// the follower remains L1-derived-only.
+    #[arg(long, env = "EEZ_UNSAFE_BLOCK_SIGNER_ADDRESS")]
+    unsafe_block_signer_address: Option<Address>,
+}
+
+impl FollowerArgs {
+    fn network_config(&self, chain_id: u64) -> eyre::Result<NetworkConfig> {
+        NetworkConfig::parse(
+            chain_id,
+            &self.p2p_listen_addr,
+            self.p2p_peers.iter().map(String::as_str),
+        )
+        .map_err(Into::into)
+    }
 }
 
 /// Launch an L1-derived follower node.
@@ -77,9 +100,9 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     warn_on_deprecated_env();
 
     let stateful_proof_signer = eez_prover_stateful::Config::from_env()?;
-    if stateful_proof_signer.is_some() && ext.sequencer_rpc.is_some() {
+    if stateful_proof_signer.is_some() && ext.unsafe_block_signer_address.is_some() {
         return Err(eyre::eyre!(
-            "stateful proof signing requires an L1-derived-only follower; remove EEZ_SEQUENCER_RPC",
+            "stateful proof signing requires an L1-derived-only follower; remove EEZ_UNSAFE_BLOCK_SIGNER_ADDRESS",
         ));
     }
     // A production follower must reconstruct the Composer's Sync-block system
@@ -102,6 +125,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         .await?;
 
     let chain_spec: Arc<_> = handle.node.chain_spec();
+    let l2_chain_id = chain_spec.chain().id();
     let provider = handle.node.provider.clone();
     let task_executor = handle.node.task_executor.clone();
     let timing = RollupTiming::from_env()?;
@@ -235,17 +259,23 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         );
     }
 
-    if let Some(sequencer_rpc) = ext.sequencer_rpc {
+    if let Some(unsafe_block_signer_address) = ext.unsafe_block_signer_address {
+        let (p2p_service, p2p_handle, p2p_events) =
+            NetworkService::new(ext.network_config(l2_chain_id)?)?;
+        task_executor.spawn_critical_task("eez-unsafe-block-p2p", p2p_service.run());
         let follower = UnsafeHeadFollower::new(
             block_committer,
-            RootProvider::new_http(sequencer_rpc),
             provider,
-            timing.l2_block_time(),
+            l2_chain_id,
+            unsafe_block_signer_address,
+            p2p_events,
+            p2p_handle,
         );
         event!(
-            name: "eez.node.follower.sequencer_rpc.spawned",
+            name: "eez.node.follower.p2p.spawned",
             Level::INFO,
-            "spawning sequencer-RPC unsafe-head follower",
+            signer = %unsafe_block_signer_address,
+            "spawning signed P2P unsafe-block follower",
         );
         task_executor.spawn_critical_task("eez-node-follower-unsafe-head", async move {
             follower.run().await;
@@ -254,7 +284,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         event!(
             name: "eez.node.follower.l1_derived_only",
             Level::INFO,
-            "EEZ_SEQUENCER_RPC not set; running L1-derived-only follower",
+            "EEZ_UNSAFE_BLOCK_SIGNER_ADDRESS not set; running L1-derived-only follower",
         );
     }
 
