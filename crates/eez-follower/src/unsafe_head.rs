@@ -222,6 +222,7 @@ where
         event!(
             name: "eez.node.follower.head.advanced",
             Level::INFO,
+            event_name = "eez.node.follower.head.advanced",
             block.number = number,
             block.hash = %hash,
             "follower imported verified sequencer payload and advanced unsafe head",
