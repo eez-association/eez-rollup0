@@ -36,7 +36,6 @@ where
         expected_rollup_id,
         expected_l2_system_address,
         attester,
-        system_transaction_key,
         limits,
     } = config;
     let backend = Backend::new(provider, chain_spec, expected_l2_system_address);
@@ -46,7 +45,6 @@ where
             limits,
             expected_rollup_id,
             attester,
-            system_transaction_key,
         },
         backend,
         shutdown,

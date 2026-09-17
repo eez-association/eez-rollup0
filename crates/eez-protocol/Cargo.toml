@@ -9,6 +9,7 @@ description            = "The eez cross-chain protocol: Solidity ABI + entry bui
 [dependencies]
 # the DA wire format: entries project to codec actions and back
 eez-payload-codec.workspace = true
+eez-primitives.workspace = true
 thiserror.workspace   = true
 serde.workspace       = true
 tracing.workspace     = true

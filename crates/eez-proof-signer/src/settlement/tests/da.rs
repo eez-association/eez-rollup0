@@ -419,7 +419,7 @@ fn da_payload_binds_inbound_sidecars_and_complete_reconstructed_transactions() {
     );
 
     let mut noncanonical_context = system_transaction_context();
-    noncanonical_context.l2_gas_limit += 1;
+    noncanonical_context.l2_chain_id += 1;
     let noncanonical_transactions = build_inbound_transactions(&entries, &noncanonical_context, 11);
     let mut mutated_second_transaction = transactions;
     mutated_second_transaction[1] = noncanonical_transactions[1].clone();
@@ -471,7 +471,12 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
     let transactions = raw_transactions
         .iter()
-        .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
         .collect::<Vec<_>>();
     let settling_rlp = block_rlp(transactions);
     let verifier = system_transactions();
@@ -508,7 +513,12 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     let extra_block = block_rlp(
         extra_transactions
             .into_iter()
-            .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+            .map(|raw| {
+                <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                    raw.as_ref(),
+                )
+                .unwrap()
+            })
             .collect(),
     );
     let extra_transaction = encode_da_payload(&[vec![user.clone(), extra]], &[sidecar.clone()]);
@@ -551,7 +561,7 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     );
 
     let mut noncanonical_context = system_transaction_context();
-    noncanonical_context.l2_gas_limit += 1;
+    noncanonical_context.l2_chain_id += 1;
     let wrong_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &[(sidecar.clone(), Bytes::from(user))],
         &[],
@@ -561,7 +571,12 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     .unwrap();
     let wrong_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&wrong_pairs)
         .into_iter()
-        .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
         .collect::<Vec<_>>();
     let wrong_block = block_rlp(wrong_transactions);
     assert_eq!(
@@ -625,7 +640,12 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
     let settling_rlp = block_rlp(
         raw_transactions
             .iter()
-            .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+            .map(|raw| {
+                <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                    raw.as_ref(),
+                )
+                .unwrap()
+            })
             .collect(),
     );
     let payload = encode_da_payload(std::slice::from_ref(&users), &sidecars);
@@ -658,7 +678,7 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
     );
 
     let mut noncanonical_context = system_transaction_context();
-    noncanonical_context.l2_gas_limit += 1;
+    noncanonical_context.l2_chain_id += 1;
     let wrong_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &outbound_inputs,
         &[],
@@ -672,7 +692,12 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
     let wrong_block = block_rlp(
         mutated_second_load
             .into_iter()
-            .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+            .map(|raw| {
+                <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                    raw.as_ref(),
+                )
+                .unwrap()
+            })
             .collect(),
     );
     assert_eq!(
@@ -736,7 +761,12 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
     let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
     let transactions = raw_transactions
         .iter()
-        .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
         .collect::<Vec<_>>();
     let settling_rlp = block_rlp(transactions);
     let sidecars = vec![outbound_sidecar.clone(), inbound_sidecar.clone()];
@@ -774,7 +804,12 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
     let reordered_block = block_rlp(
         reordered
             .into_iter()
-            .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+            .map(|raw| {
+                <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                    raw.as_ref(),
+                )
+                .unwrap()
+            })
             .collect(),
     );
     assert_eq!(

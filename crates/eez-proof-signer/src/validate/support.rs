@@ -1,12 +1,12 @@
 //! Replay helpers shared by validation backends.
 
-use alloy_consensus::{EthereumReceipt, Transaction as _};
 use alloy_primitives::Address;
 use alloy_sol_types::SolEvent as _;
+use eez_primitives::Block;
+use eez_primitives::Receipt as EthereumReceipt;
 use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
 use eez_protocol::settlement::{is_system_tx, pair_end_positions};
 use reth_chainspec::{ChainSpec, EthereumHardforks as _};
-use reth_ethereum_primitives::Block;
 use reth_primitives_traits::RecoveredBlock;
 use tracing::debug;
 
@@ -43,12 +43,7 @@ impl CheckpointPlan {
         for transaction in block.transactions_recovered() {
             let is_system_sender = transaction.signer() == expected_l2_system_address;
             system_sender_flags.push(is_system_sender);
-            sync_system_transaction_flags.push(is_system_tx(
-                transaction.signer(),
-                transaction.to(),
-                expected_l2_system_address,
-                EEZL2_ADDRESS,
-            ));
+            sync_system_transaction_flags.push(is_system_tx(&transaction));
         }
         let plan = Self {
             transaction_indices: pair_end_positions(&sync_system_transaction_flags),

@@ -10,22 +10,20 @@
 //! extended state: the Sync block under construction is itself the composition
 //! session, so a claim read off it is the value the committed block produces.
 
-use alloy_consensus::{BlockHeader, Header, Transaction};
+use alloy_consensus::{BlockHeader, Header};
 use alloy_eips::Decodable2718;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT};
+use eez_evm::{EezEvmConfig, ensure_supported_transaction};
+use eez_primitives::engine::EezEngineTypes;
+use eez_primitives::{Block, EezTxEnvelope as TransactionSigned};
 use reth_chainspec::EthereumHardforks;
-use reth_ethereum_engine_primitives::EthEngineTypes;
-use reth_ethereum_primitives::{Block, TransactionSigned};
 use reth_evm::{
     ConfigureEvm, Evm as _, EvmEnvFor, InspectorFor, NextBlockEnvAttributes, execute::BlockBuilder,
 };
-use reth_evm_ethereum::EthEvmConfig;
 use reth_payload_primitives::PayloadTypes;
-use reth_primitives_traits::{
-    Recovered, RecoveredBlock, SealedHeader, SignedTransaction, SignerRecoverable,
-};
+use reth_primitives_traits::{Recovered, RecoveredBlock, SealedHeader, SignedTransaction};
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::{StateProviderBox, StateProviderFactory};
 use revm::database::{CacheState, State};
@@ -100,7 +98,7 @@ pub struct BuiltSyncBlock {
 /// `check_claimed_state` diverges where Cancun/Shanghai isn't active at
 /// genesis.
 fn next_block_attributes(
-    evm_config: &EthEvmConfig,
+    evm_config: &EezEvmConfig,
     timestamp: u64,
     suggested_fee_recipient: Address,
 ) -> NextBlockEnvAttributes {
@@ -122,13 +120,18 @@ fn next_block_attributes(
 }
 
 /// Decode a raw EIP-2718 tx and recover its signer. `idx` is the tx's position
-/// in the block, for error reporting.
+/// in the block, for error reporting. Reject L2 blobs before either the block
+/// builder or incremental simulation executes them.
 fn recover_tx(raw: &Bytes, idx: usize) -> Result<Recovered<TransactionSigned>, BuildError> {
     let tx =
         TransactionSigned::decode_2718(&mut raw.as_ref()).map_err(|e| BuildError::DecodeTx {
             idx,
             msg: e.to_string(),
         })?;
+    ensure_supported_transaction(&tx).map_err(|e| BuildError::ExecuteTx {
+        idx,
+        msg: e.to_string(),
+    })?;
     SignedTransaction::try_into_recovered(tx).map_err(|_| BuildError::RecoverSigner { idx })
 }
 
@@ -166,7 +169,7 @@ fn open_draft_db(
 /// [`BlockCommitterHandle::commit_derived`]: eez_driver::BlockCommitterHandle::commit_derived
 pub fn build_sync_block<P>(
     l2_provider: &P,
-    evm_config: &EthEvmConfig,
+    evm_config: &EezEvmConfig,
     parent: &SealedHeader<Header>,
     timestamp: u64,
     suggested_fee_recipient: Address,
@@ -216,7 +219,7 @@ where
     let block = outcome.block;
     let sealed_block = block.sealed_block().clone();
     let header = sealed_block.sealed_header().clone();
-    let payload = <EthEngineTypes as PayloadTypes>::block_to_payload(sealed_block, None);
+    let payload = <EezEngineTypes as PayloadTypes>::block_to_payload(sealed_block, None);
     Ok(BuiltSyncBlock {
         payload,
         header,
@@ -263,15 +266,15 @@ fn exec_outcome<H>(result: &ExecutionResult<H>) -> TxOutcome {
 /// The uninspected path passes [`NoOpInspector`], the same inspector reth uses
 /// when a caller supplies none.
 fn execute_and_commit_inspected<I>(
-    evm_config: &EthEvmConfig,
+    evm_config: &EezEvmConfig,
     state: &mut DraftDb,
-    evm_env: &EvmEnvFor<EthEvmConfig>,
+    evm_env: &EvmEnvFor<EezEvmConfig>,
     raw: &Bytes,
     idx: usize,
     inspector: I,
 ) -> Result<TxOutcome, BuildError>
 where
-    I: for<'db> InspectorFor<EthEvmConfig, &'db mut DraftDb>,
+    I: for<'db> InspectorFor<EezEvmConfig, &'db mut DraftDb>,
 {
     let recovered = recover_tx(raw, idx)?;
     let mut evm = evm_config.evm_with_env_and_inspector(state, evm_env.clone(), inspector);
@@ -300,9 +303,9 @@ where
 /// close, not to mid-block state.
 pub struct SyncBlockState {
     provider: Arc<dyn StateProviderFactory>,
-    evm_config: EthEvmConfig,
+    evm_config: EezEvmConfig,
     parent_hash: B256,
-    evm_env: EvmEnvFor<EthEvmConfig>,
+    evm_env: EvmEnvFor<EezEvmConfig>,
     state: DraftDb,
     /// Number of txs applied — the next tx's block position.
     applied: usize,
@@ -330,7 +333,7 @@ impl SyncBlockState {
     /// See [`BuildError`].
     pub fn open(
         provider: Arc<dyn StateProviderFactory>,
-        evm_config: &EthEvmConfig,
+        evm_config: &EezEvmConfig,
         parent: &SealedHeader<Header>,
         timestamp: u64,
         suggested_fee_recipient: Address,
@@ -441,8 +444,8 @@ pub struct ForkSnapshot {
 /// sims run here, and only their accepted effects are appended to the real
 /// block.
 pub struct SyncBlockFork {
-    evm_config: EthEvmConfig,
-    evm_env: EvmEnvFor<EthEvmConfig>,
+    evm_config: EezEvmConfig,
+    evm_env: EvmEnvFor<EezEvmConfig>,
     state: DraftDb,
     applied: usize,
     gas_used: u64,
@@ -489,7 +492,7 @@ impl SyncBlockFork {
         inspector: I,
     ) -> Result<TxOutcome, BuildError>
     where
-        I: for<'db> InspectorFor<EthEvmConfig, &'db mut DraftDb>,
+        I: for<'db> InspectorFor<EezEvmConfig, &'db mut DraftDb>,
     {
         let outcome = execute_and_commit_inspected(
             &self.evm_config,
@@ -522,7 +525,7 @@ impl SyncBlockFork {
 
     /// Raw state + env, for callers that drive their own EVM (a source
     /// simulation threading its inspector through this fork).
-    pub fn state_and_env(&mut self) -> (&mut DraftDb, &EvmEnvFor<EthEvmConfig>) {
+    pub fn state_and_env(&mut self) -> (&mut DraftDb, &EvmEnvFor<EezEvmConfig>) {
         (&mut self.state, &self.evm_env)
     }
 }
@@ -542,13 +545,11 @@ impl SyncBlockFork {
 /// tx (pair-end), matching the prover's fail-safe flagging.
 pub fn sync_block_pair_roots<P>(
     l2_provider: &P,
-    evm_config: &EthEvmConfig,
+    evm_config: &EezEvmConfig,
     parent: &SealedHeader<Header>,
     timestamp: u64,
     suggested_fee_recipient: Address,
     sync_txs: &[Bytes],
-    system_address: Address,
-    eezl2_address: Address,
 ) -> Result<Vec<B256>, BuildError>
 where
     P: StateProviderFactory,
@@ -561,10 +562,7 @@ where
             let Ok(tx) = TransactionSigned::decode_2718(&mut raw.as_ref()) else {
                 return false;
             };
-            let to = tx.to();
-            tx.recover_signer().is_ok_and(|signer| {
-                eez_protocol::settlement::is_system_tx(signer, to, system_address, eezl2_address)
-            })
+            eez_protocol::settlement::is_system_tx(&tx)
         })
         .collect();
 
@@ -587,7 +585,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::TxLegacy;
+    use alloy_consensus::{SignableTransaction, TxEip4844, TxLegacy};
     use alloy_eips::eip2718::Encodable2718;
     use alloy_network::TxSignerSync;
     use alloy_primitives::{TxKind, U256, address, bytes};
@@ -605,7 +603,7 @@ mod tests {
     /// tx list.
     struct Fixture {
         provider: MockEthProvider,
-        evm_config: EthEvmConfig,
+        evm_config: EezEvmConfig,
         parent: SealedHeader<Header>,
         txs: Vec<Bytes>,
     }
@@ -627,15 +625,17 @@ mod tests {
         let sig = test_signer()
             .sign_transaction_sync(&mut tx)
             .expect("sign test tx");
-        let signed =
-            TransactionSigned::new_unhashed(reth_ethereum_primitives::Transaction::Legacy(tx), sig);
+        let signed = reth_ethereum_primitives::TransactionSigned::new_unhashed(
+            reth_ethereum_primitives::Transaction::Legacy(tx),
+            sig,
+        );
         let mut buf = Vec::new();
         signed.encode_2718(&mut buf);
         Bytes::from(buf)
     }
 
     fn fixture() -> Fixture {
-        let evm_config = EthEvmConfig::new(Arc::new(
+        let evm_config = EezEvmConfig::new(Arc::new(
             ChainSpecBuilder::mainnet().cancun_activated().build(),
         ));
 
@@ -716,6 +716,54 @@ mod tests {
                 .collect();
             cumulative.windows(2).map(|w| w[1] - w[0]).collect()
         }
+    }
+
+    #[test]
+    fn sync_build_and_incremental_execution_reject_blobs_before_spending_nonce() {
+        let f = fixture();
+        let mut tx = TxEip4844 {
+            chain_id: 1,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_fee_per_blob_gas: 1,
+            blob_versioned_hashes: vec![B256::repeat_byte(1)],
+            to: BOB,
+            ..Default::default()
+        };
+        let signature = test_signer().sign_transaction_sync(&mut tx).unwrap();
+        let tx: reth_ethereum_primitives::TransactionSigned = tx.into_signed(signature).into();
+        let raw = Bytes::from(tx.encoded_2718());
+        let mut prefix = f.open(&[]);
+        let mut fork = prefix.fork().unwrap();
+        for result in [
+            build_sync_block(
+                &f.provider,
+                &f.evm_config,
+                &f.parent,
+                TIMESTAMP,
+                FEE_RECIPIENT,
+                std::slice::from_ref(&raw),
+            )
+            .map(|_| ()),
+            SyncBlockState::open(
+                Arc::new(f.provider.clone()),
+                &f.evm_config,
+                &f.parent,
+                TIMESTAMP,
+                FEE_RECIPIENT,
+                std::slice::from_ref(&raw),
+            )
+            .map(|_| ()),
+            prefix.execute_tx(&raw).map(|_| ()),
+            fork.execute_tx(&raw).map(|_| ()),
+        ] {
+            assert!(
+                matches!(&result, Err(BuildError::ExecuteTx { idx: 0, msg }) if msg == "EIP-4844 transactions are disabled"),
+                "expected L2 blob rejection, got {result:?}"
+            );
+        }
+        assert!(prefix.execute_tx(&f.txs[0]).unwrap().success);
+        assert!(fork.execute_tx(&f.txs[0]).unwrap().success);
     }
 
     /// THE equivalence guard: appending txs to a live [`SyncBlockState`]

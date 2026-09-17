@@ -8,6 +8,8 @@ description            = "eez Rollup-0 node — vanilla reth driven by an eez se
 default-run            = "eez-composer"
 
 [dependencies]
+eez-primitives.workspace = true
+eez-evm.workspace = true
 eez-composer.workspace      = true
 eez-deriver.workspace       = true
 eez-driver = { workspace = true, features = ["witness"] }
