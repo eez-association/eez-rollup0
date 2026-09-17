@@ -9,17 +9,17 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 use eez_testkit::signals;
 use eez_testkit::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
-    ANVIL_KEY_6, Harness, INVALID_PROOF_SELECTOR, INVALID_PROOF_SYSTEM_CONFIG_SELECTOR,
-    L2_SYSTEM_KEY, NodeBinary, NodeConfig, NodeHandle, block_number_and_hash_at,
-    l2_genesis_state_root, override_env, safe_block_state_root, send_l2_value_transfer,
-    send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
+    ANVIL_KEY_6, BuilderStubMode, Harness, INVALID_PROOF_SELECTOR,
+    INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, L2_SYSTEM_KEY, NodeBinary, NodeConfig, NodeHandle,
+    block_number_and_hash_at, l2_genesis_state_root, override_env, safe_block_state_root,
+    send_l2_value_transfer, send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
     wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(5);
 
-/// A follower replaces the full divergent suffix of an intra-batch fork.
+// A follower replaces the full divergent suffix of an intra-batch fork.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_composer_intra_batch_suffix_replay_converges() {
     let harness = Harness::fresh().await.unwrap();
@@ -129,6 +129,159 @@ async fn multi_composer_intra_batch_suffix_replay_converges() {
 
     primary.assert_no_divergence_failure_logs();
     mirror.assert_no_divergence_failure_logs();
+}
+
+// Two composers build incompatible candidates for one settlement window. The
+// loser must converge on the winning chain whether the relay drops its bundle
+// or L1 includes it and rejects its stale state claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_composers_one_winner_loser_resyncs() {
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
+    let cfg = NodeConfig {
+        genesis_path: Some(harness.l2_genesis_path()),
+        ..Default::default()
+    };
+    let env_a = harness.env_for(ANVIL_KEY, true).await.unwrap();
+    let env_b = harness.env_for(ANVIL_KEY_4, true).await.unwrap();
+    let (composer_a, composer_b) = tokio::try_join!(
+        NodeHandle::start("race-a", &cfg, &env_a),
+        NodeHandle::start("race-b", &cfg, &env_b),
+    )
+    .unwrap();
+
+    // Different transactions force different local state roots for the same
+    // open settlement window instead of allowing two identical candidates.
+    let composer_a_rpc = composer_a.l2_rpc_url();
+    let composer_b_rpc = composer_b.l2_rpc_url();
+    let (tx_a, tx_b) = tokio::try_join!(
+        send_l2_value_transfer_confirmed(
+            &composer_a_rpc,
+            ANVIL_KEY_1,
+            ANVIL_ADDR,
+            U256::from(1u64),
+            DEFAULT_TIMEOUT,
+        ),
+        send_l2_value_transfer_confirmed(
+            &composer_b_rpc,
+            ANVIL_KEY_2,
+            ANVIL_ADDR_3,
+            U256::from(2u64),
+            DEFAULT_TIMEOUT,
+        ),
+    )
+    .expect("failed to stage distinct Composer candidates");
+    assert_ne!(
+        tx_a, tx_b,
+        "the competing candidates must carry distinct txs"
+    );
+
+    // Convergence must advance through the divergent transactions, rather than
+    // passing vacuously because both nodes still agree on an older safe prefix.
+    let provider_a = ProviderBuilder::new().connect_http(composer_a_rpc.parse().unwrap());
+    let provider_b = ProviderBuilder::new().connect_http(composer_b_rpc.parse().unwrap());
+    let (receipt_a, receipt_b) = tokio::try_join!(
+        provider_a.get_transaction_receipt(tx_a),
+        provider_b.get_transaction_receipt(tx_b),
+    )
+    .expect("failed to read staged transaction receipts");
+    let candidate_a_height = receipt_a
+        .and_then(|receipt| receipt.block_number)
+        .expect("Composer A staged transaction has no block number");
+    let candidate_b_height = receipt_b
+        .and_then(|receipt| receipt.block_number)
+        .expect("Composer B staged transaction has no block number");
+    assert_eq!(
+        candidate_a_height, candidate_b_height,
+        "the test must stage incompatible candidates at the same L2 height"
+    );
+    let convergence_height = candidate_a_height;
+
+    chain
+        .wait_for_batches_or_node_failure(2, &[&composer_a, &composer_b], DEFAULT_TIMEOUT)
+        .await
+        .expect("neither Composer established a canonical winner");
+    wait_for_safe_prefix_convergence(
+        &[&composer_a, &composer_b],
+        convergence_height,
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("the losing Composer did not replace its fork with the L1 winner");
+    composer_a.assert_no_process_death();
+    composer_b.assert_no_process_death();
+}
+
+// Two independent composer databases alternate as the active poster. Each
+// takeover must resume from L1 and extend one continuous L2 history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_composers_alternate_without_safe_chain_gaps() {
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
+    let genesis = harness.l2_genesis_path();
+    let cfg = NodeConfig {
+        genesis_path: Some(genesis),
+        ..Default::default()
+    };
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let env_a = harness.env_for(ANVIL_KEY, true).await.unwrap();
+    let env_b = harness.env_for(ANVIL_KEY_4, true).await.unwrap();
+
+    let composer_a = NodeHandle::start_with_datadir("alternate-a1", dir_a.path(), &cfg, &env_a)
+        .await
+        .unwrap();
+    chain
+        .wait_for_batches_or_node_failure(2, &[&composer_a], DEFAULT_TIMEOUT)
+        .await
+        .expect("Composer A did not establish the first canonical segment");
+    composer_a.assert_no_process_death();
+    drop(composer_a);
+
+    let after_a = chain.batches_posted().await.unwrap();
+    let composer_b = NodeHandle::start_with_datadir("alternate-b", dir_b.path(), &cfg, &env_b)
+        .await
+        .unwrap();
+    chain
+        .wait_for_batches_or_node_failure(after_a + 2, &[&composer_b], DEFAULT_TIMEOUT)
+        .await
+        .expect("Composer B did not extend Composer A's canonical segment");
+    composer_b.assert_no_process_death();
+    drop(composer_b);
+
+    let after_b = chain.batches_posted().await.unwrap();
+    let composer_a = NodeHandle::start_with_datadir("alternate-a2", dir_a.path(), &cfg, &env_a)
+        .await
+        .unwrap();
+    chain
+        .wait_for_batches_or_node_failure(after_b + 2, &[&composer_a], DEFAULT_TIMEOUT)
+        .await
+        .expect("Composer A did not resume after Composer B's segment");
+    wait_for_safe_state(
+        &composer_a,
+        &chain,
+        l2_genesis_state_root(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("the returning Composer did not catch up to the L1-derived state");
+
+    let safe = block_number_and_hash_at(&composer_a.l2_rpc_url(), BlockNumberOrTag::Safe)
+        .await
+        .unwrap()
+        .expect("returning Composer has no safe head");
+    let provider = ProviderBuilder::new().connect_http(composer_a.l2_rpc_url().parse().unwrap());
+    for height in 0..=safe.0 {
+        assert!(
+            provider
+                .get_block_by_number(BlockNumberOrTag::Number(height))
+                .await
+                .unwrap()
+                .is_some(),
+            "safe chain has a missing block at height {height}"
+        );
+    }
+    composer_a.assert_no_process_death();
 }
 
 /// Builder mode, sustained operation through a restart. Asserts every
@@ -251,7 +404,114 @@ async fn happy_case_composer_sustained() {
     node.assert_no_process_death();
 }
 
-/// Proofs for an unregistered rollup ID are signed but never posted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn builder_method_not_found_uses_mempool_fallback() {
+    // Exercise the -32601 fallback, not just the eventual settlement.
+    let harness = Harness::fresh().await.unwrap();
+    harness
+        .set_builder_mode(BuilderStubMode::MethodNotFound)
+        .await
+        .expect("configure relay method-not-found fault");
+    let chain = harness.chain();
+    let node = NodeHandle::start(
+        "builder-32601",
+        &NodeConfig::default(),
+        &harness.env().await.unwrap(),
+    )
+    .await
+    .unwrap();
+
+    chain
+        .wait_for_batches(1, DEFAULT_TIMEOUT)
+        .await
+        .expect("mempool fallback never settled postBatch");
+    assert!(
+        node.count_signal(signals::BUNDLE_MEMPOOL_FALLBACK)
+            .expect("read structured fallback signal")
+            > 0,
+        "settlement alone is insufficient: the structured signal must prove the -32601 fallback ran"
+    );
+    assert_eq!(
+        node.count_signal(signals::BUNDLE_ACCEPTED)
+            .expect("read builder acceptance signal"),
+        0,
+        "the method-not-found relay must not be mistaken for a successful bundle submission"
+    );
+    node.assert_no_process_death();
+}
+
+// A relay may acknowledge bundles while silently omitting them from its target
+// blocks. The composer must preserve the local candidate, retry after the relay
+// recovers, and continue settling fresh L2 traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn builder_silent_drop_preserves_safety_and_recovers_progress() {
+    let harness = Harness::fresh().await.unwrap();
+    harness
+        .set_builder_mode(BuilderStubMode::Drop)
+        .await
+        .expect("configure silent builder drops");
+    let chain = harness.chain();
+    let node = NodeHandle::start(
+        "builder-silent-drop",
+        &NodeConfig::default(),
+        &harness.env().await.unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Wait for observed misses rather than sleeping. This proves the composer
+    // reached the relay and the relay accepted but omitted multiple bundles.
+    wait_for(DEFAULT_TIMEOUT, || async {
+        Ok((node.count_signal(signals::BUNDLE_DROPPED)? >= 2).then_some(()))
+    })
+    .await
+    .expect("composer did not observe two silently dropped bundles");
+    assert_eq!(
+        chain.batches_posted().await.unwrap(),
+        0,
+        "an acknowledged but omitted bundle must not advance settlement",
+    );
+    node.assert_no_process_death();
+
+    harness
+        .set_builder_mode(BuilderStubMode::Forward)
+        .await
+        .expect("restore builder forwarding");
+    chain
+        .wait_for_batches_or_node_failure(1, &[&node], DEFAULT_TIMEOUT)
+        .await
+        .expect("composer did not recover after silent bundle drops");
+
+    // Recovery is incomplete if only the old candidate settles and the
+    // composer remains wedged. Require a fresh transaction and its exact block
+    // to enter the safe chain after forwarding resumes.
+    let l2_rpc = node.l2_rpc_url();
+    let fresh = send_l2_value_transfer_confirmed(
+        &l2_rpc,
+        ANVIL_KEY_1,
+        ANVIL_ADDR,
+        U256::from(7u64),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("fresh post-recovery L2 transaction did not execute");
+    let provider = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+    let receipt = provider
+        .get_transaction_receipt(fresh)
+        .await
+        .unwrap()
+        .expect("fresh transaction receipt disappeared");
+    let block_number = receipt
+        .block_number
+        .expect("fresh receipt has no block number");
+    let block_hash = receipt.block_hash.expect("fresh receipt has no block hash");
+    wait_for_safe_chain_contains(&node, block_number, block_hash, DEFAULT_TIMEOUT)
+        .await
+        .expect("fresh post-recovery transaction never entered the safe chain");
+    node.assert_no_divergence_failure_logs();
+}
+
+// Proofs for an unregistered rollup ID are signed but never posted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failure_wrong_rollup_id() {
     let harness = Harness::fresh().await.unwrap();
@@ -494,13 +754,12 @@ async fn happy_case_two_composers_l1_reorg_recovers() {
     c2.assert_no_process_death();
 }
 
-/// Three composers racing on one L1, no reorg and no injected fault, so the
-/// loser's batch is redundant every slot. Checks each composer stays converged
-/// with what L1 recorded rather than wedging on a divergence it cannot resync.
+// Three composers race on one L1 without a reorg or injected fault. Each
+// composer must remain converged with L1 instead of wedging on redundant work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_composer_steady_state_stays_converged_with_l1() {
     const COMPOSERS: usize = 3;
-    /// Enough to catch a composer that converges once then drifts.
+    // Enough to catch a composer that converges once and then drifts.
     const SETTLEMENTS: usize = 24;
 
     let harness = Harness::fresh().await.unwrap();
@@ -597,6 +856,49 @@ async fn multi_composer_steady_state_stays_converged_with_l1() {
         "only {compared} root comparisons (floor {floor}) across {SETTLEMENTS} settlements × \
          {COMPOSERS} composers — the soundness check was mostly skipped, so this proves little",
     );
+}
+
+// A composer in based mode classifies a peer's batch as expected external work.
+// The observer is unfunded so only the peer can land a batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn based_mode_logs_peer_batch_as_expected_external() {
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
+    let cfg = NodeConfig {
+        genesis_path: Some(harness.l2_genesis_path()),
+        ..Default::default()
+    };
+    let observer_env = harness.env_for(L2_SYSTEM_KEY, true).await.unwrap();
+    let peer_env = harness.env_for(ANVIL_KEY, true).await.unwrap();
+    let (observer, peer) = tokio::try_join!(
+        NodeHandle::start("based-observer", &cfg, &observer_env),
+        NodeHandle::start("based-peer", &cfg, &peer_env),
+    )
+    .unwrap();
+
+    chain
+        .wait_for_batches_or_node_failure(2, &[&observer, &peer], DEFAULT_TIMEOUT)
+        .await
+        .expect("the funded peer did not land a batch");
+    wait_for(DEFAULT_TIMEOUT, || {
+        std::future::ready(
+            observer
+                .log_count_matching(&["external batch landed (based mode)"])
+                .map(|count| (count > 0).then_some(())),
+        )
+    })
+    .await
+    .expect("based-mode observer never classified the peer batch as expected external traffic");
+
+    assert_eq!(
+        observer
+            .log_count_matching(&["external batch landed in sequenced-mode rollup"])
+            .unwrap(),
+        0,
+        "based-mode peer traffic must not be logged as a sequenced-mode violation",
+    );
+    observer.assert_no_process_death();
+    peer.assert_no_process_death();
 }
 
 async fn spawn_follower(

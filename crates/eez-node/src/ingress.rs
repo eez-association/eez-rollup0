@@ -578,6 +578,9 @@ mod tests {
 
     use super::*;
 
+    // Osaka is active from genesis on the Rollup0 L2 test chain.
+    const EIP_7825_TX_GAS_LIMIT: u64 = 1 << 24;
+
     fn test_signer() -> PrivateKeySigner {
         PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).expect("valid signer")
     }
@@ -675,6 +678,56 @@ mod tests {
 
         assert!(matches!(admission, Admission::Held(_)));
         assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn outbound_eip_7825_exact_cap_is_accepted() {
+        // The EIP-7825 ceiling is inclusive.
+        let (_, envelope, raw) = signed_eip1559(31337, U256::ZERO, EIP_7825_TX_GAS_LIMIT, 1);
+        let pool = HeldPool::new();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+        push_admission_lookups(&asserter, EIP_7825_TX_GAS_LIMIT, 0);
+
+        let admission = gate_and_hold(
+            &envelope,
+            &raw,
+            Direction::Outbound,
+            &pool,
+            31337,
+            &provider,
+        )
+        .await;
+
+        assert!(matches!(admission, Admission::Held(_)));
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "known defect #148: cross-chain ingress does not enforce EIP-7825"]
+    async fn outbound_eip_7825_one_over_cap_is_rejected_at_envelope_gate() {
+        // No RPC responses: the envelope gate must reject before source lookups.
+        let (_, envelope, raw) = signed_eip1559(31337, U256::ZERO, EIP_7825_TX_GAS_LIMIT + 1, 1);
+        let pool = HeldPool::new();
+        let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
+
+        let msg = rejection(
+            gate_and_hold(
+                &envelope,
+                &raw,
+                Direction::Outbound,
+                &pool,
+                31337,
+                &provider,
+            )
+            .await,
+        );
+
+        assert!(
+            msg.contains("16777217") && msg.contains("16777216"),
+            "rejection must name the declared gas limit and EIP-7825 cap: {msg}"
+        );
+        assert_eq!(pool.len(), 0, "invalid transaction mutated HeldPool");
     }
 
     /// Retrying the exact same signed submission is idempotent at the ingress

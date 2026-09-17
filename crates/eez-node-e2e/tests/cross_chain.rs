@@ -1,6 +1,7 @@
 //! Cross-chain integration and nonce-gap regression tests.
 
 use alloy_primitives::{Address, Bytes, TxHash, U256, keccak256};
+use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue};
 
 use eez_protocol::EEZL2_ADDRESS;
@@ -8,16 +9,17 @@ use eez_testkit::signals;
 use eez_testkit::{
     ANVIL_ATTESTER_KEY, DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER, INestedSetterInner,
     INestedSetterOuter, IReturnData, IReturnDataWrapper, IRevertBubbleWrapper, IRevertingTarget,
-    ISetterWrapper, IValue, IValueNoRet, L1_ROLLUP_ID, OUTBOUND_USER, ProverMutation,
-    SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead, TARGET_DEPLOYER, account_code,
-    assert_latest_batch_signature, batches_posted, call_read, call_revert_data,
-    completed_proxy_calls, count_events, cross_chain_source_proxy, deploy_nested_setter_inner,
-    deploy_nested_setter_outer, events_since, l2_balance, l2_value, last_proxy_result,
-    onchain_nonce, read_state_word, receipt_ok, run_scenarios, safe_block_state_root, setter_call,
-    setup_cross_chain, setup_cross_chain_codeless, setup_cross_chain_empty_call,
-    setup_cross_chain_nested_setter, setup_cross_chain_outbound_return_data,
-    setup_cross_chain_proxied, setup_cross_chain_return_data, setup_cross_chain_reverting,
-    sign_and_send, signer_address, state_root, value_no_ret, value_read, wait_for,
+    ISetterWrapper, IValue, IValueNoRet, L1_ROLLUP_ID, NodeBinary, NodeConfig, NodeHandle,
+    OUTBOUND_USER, ProverMutation, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead,
+    TARGET_DEPLOYER, account_code, assert_latest_batch_signature, batches_posted,
+    block_number_and_hash_at, call_read, call_revert_data, completed_proxy_calls, count_events,
+    cross_chain_source_proxy, deploy_nested_setter_inner, deploy_nested_setter_outer, events_since,
+    l2_balance, l2_value, last_proxy_result, onchain_nonce, read_state_word, receipt_ok,
+    run_scenarios, safe_block_state_root, setter_call, setup_cross_chain,
+    setup_cross_chain_codeless, setup_cross_chain_empty_call, setup_cross_chain_nested_setter,
+    setup_cross_chain_outbound_return_data, setup_cross_chain_proxied,
+    setup_cross_chain_return_data, setup_cross_chain_reverting, sign_and_send, signer_address,
+    state_root, value_no_ret, value_read, wait_for, wait_for_safe_chain_contains,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -27,8 +29,9 @@ const WAVE_DEPOSITS: &[u128] = &[
     3_000_000_000_000_000,
 ];
 
-// The embedded bundle path preserves ordering but not all-or-nothing inclusion,
-// so a wave must check every source receipt independently.
+// Source-chain receipts only: a mined user tx is not proof of cross-chain
+// settlement. Callers that need delivery must wait on destination state / L1
+// vs L2 safe roots after this helper returns.
 async fn assert_all_transactions_succeeded(
     w: &eez_testkit::CrossChainWorld,
     rpc_url: &str,
@@ -164,6 +167,9 @@ async fn minimal_bidirectional_cross_chain_smoke() {
     let w = setup_cross_chain().await.unwrap();
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
+    let batches_before = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+        .await
+        .unwrap();
 
     let inbound = sign_and_send(
         &w.l1_xchain(),
@@ -226,8 +232,8 @@ async fn minimal_bidirectional_cross_chain_smoke() {
         batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
             .await
             .unwrap()
-            >= 1,
-        "minimal smoke must post at least one batch",
+            > batches_before,
+        "minimal smoke must post a batch for the submitted transactions",
     );
     assert_latest_batch_signature(&l1_rpc, &w.dep, attester)
         .await
@@ -306,6 +312,125 @@ async fn real_signer_rejects_tampered_post_batch_calldata() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_signer_rejects_tampered_witness() {
     assert_real_signer_rejects(ProverMutation::Witness, "witness").await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signer_outage_blocks_settlement_then_recovers_pending_and_fresh_transactions() {
+    let attester = signer_address(ANVIL_ATTESTER_KEY).unwrap();
+    let w = setup_cross_chain_proxied(ProverMutation::None, attester)
+        .await
+        .unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let proxy = w.prover_proxy.as_ref().expect("observability proxy");
+    let attempts_before = proxy.attempts();
+    let source_nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+    let destination_before = l2_value(&l2_rpc, w.value_l2).await.unwrap();
+
+    w.proof_signer.pause().expect("pause real proof signer");
+    let batches_before = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+        .await
+        .unwrap();
+    let successes_before = proxy.successes();
+    let submitted = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        source_nonce,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall { v: U256::from(81) }.abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("transaction must be admitted while the signer is unavailable");
+
+    wait_for(SETTLE_TIMEOUT, || async {
+        Ok((proxy.attempts() > attempts_before).then_some(()))
+    })
+    .await
+    .expect("composer never attempted to prove the pending transaction");
+
+    // Observe two L1 blocks after the proof attempt. This distinguishes a real
+    // outage from an assertion made before the builder had an inclusion chance.
+    let outage_start = block_number_and_hash_at(&l1_rpc, BlockNumberOrTag::Latest)
+        .await
+        .unwrap()
+        .expect("L1 latest block")
+        .0;
+    wait_for(SETTLE_TIMEOUT, || {
+        let l1_rpc = l1_rpc.clone();
+        async move {
+            let height = block_number_and_hash_at(&l1_rpc, BlockNumberOrTag::Latest)
+                .await?
+                .map(|head| head.0)
+                .unwrap_or_default();
+            Ok((height >= outage_start + 2).then_some(()))
+        }
+    })
+    .await
+    .expect("L1 did not advance during the signer outage");
+    assert_eq!(
+        receipt_ok(&l1_rpc, submitted).await.unwrap(),
+        None,
+        "a transaction whose window was not attested must not appear settled",
+    );
+    assert_eq!(
+        batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
+            .await
+            .unwrap(),
+        batches_before,
+        "signer outage must not produce a new L1 batch",
+    );
+    assert_eq!(
+        proxy.successes(),
+        successes_before,
+        "a paused signer must not complete an attestation",
+    );
+    assert_eq!(
+        l2_value(&l2_rpc, w.value_l2).await.unwrap(),
+        destination_before,
+        "an unattested cross-chain call must not mutate destination state",
+    );
+
+    w.proof_signer.resume().expect("resume real proof signer");
+    assert_all_transactions_succeeded(&w, &l1_rpc, &[submitted], "outage-pending").await;
+    wait_for(SETTLE_TIMEOUT, || {
+        let l2_rpc = l2_rpc.clone();
+        async move { Ok((l2_value(&l2_rpc, w.value_l2).await? == U256::from(81)).then_some(())) }
+    })
+    .await
+    .expect("pending transaction did not reach its destination after signer recovery");
+
+    // A fresh nonce after recovery catches a prover client left wedged behind
+    // the request that was suspended in flight.
+    let fresh = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        source_nonce + 1,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall { v: U256::from(83) }.abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("fresh post-recovery transaction must be admitted");
+    assert_all_transactions_succeeded(&w, &l1_rpc, &[fresh], "post-outage fresh").await;
+    wait_for(SETTLE_TIMEOUT, || {
+        let (l1_rpc, l2_rpc) = (l1_rpc.clone(), l2_rpc.clone());
+        async move {
+            let applied = l2_value(&l2_rpc, w.value_l2).await? == U256::from(83);
+            let committed = state_root(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id).await?;
+            let safe = safe_block_state_root(&l2_rpc).await?;
+            Ok((applied && safe == Some(committed)).then_some(()))
+        }
+    })
+    .await
+    .expect("fresh transaction did not settle to a reconciled safe root");
+    w.proof_signer.assert_alive();
+    w.node.assert_no_process_death();
 }
 
 /// Whether the response is intrinsically opaque (`ResourceExhausted`) or becomes
@@ -407,15 +532,30 @@ async fn real_signer_attester_mismatch_never_submits_a_batch() {
     let w = setup_cross_chain_proxied(ProverMutation::None, wrong_attester)
         .await
         .unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
     let proxy = w.prover_proxy.as_ref().expect("real signer proxy");
+    let destination_before = l2_value(&l2_rpc, w.value_l2).await.unwrap();
+    let submitted = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall { v: U256::from(77) }.abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("mismatch test transaction must be admitted");
 
     let attested = wait_for(SETTLE_TIMEOUT, || async {
-        Ok((proxy.successes() >= 2).then_some(()))
+        Ok((proxy.successes() >= 1).then_some(()))
     })
     .await;
     if let Err(err) = attested {
         w.proof_signer.assert_alive();
-        panic!("signer never returned the mismatched attestations: {err:#}");
+        panic!("signer never returned a mismatched attestation: {err:#}");
     }
     assert_eq!(
         proxy.rejections(),
@@ -423,18 +563,28 @@ async fn real_signer_attester_mismatch_never_submits_a_batch() {
         "the signer must have attested; only the composer may refuse here",
     );
     assert_eq!(
-        batches_posted(&w.l1_rpc(), w.cfg.eez_address, w.dep.deploy_block)
+        receipt_ok(&l1_rpc, submitted).await.unwrap(),
+        None,
+        "a mismatched attester must not settle the user transaction",
+    );
+    assert_eq!(
+        batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
             .await
             .unwrap(),
         0,
         "an attestation from an unexpected signer must never reach L1",
     );
     assert_eq!(
-        state_root(&w.l1_rpc(), w.cfg.eez_address, w.cfg.rollup_id)
+        state_root(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id)
             .await
             .unwrap(),
         w.cfg.initial_state,
         "signer mismatch must leave the registered state root unchanged",
+    );
+    assert_eq!(
+        l2_value(&l2_rpc, w.value_l2).await.unwrap(),
+        destination_before,
+        "signer mismatch must not mutate destination state",
     );
     w.node.assert_no_process_death();
 }
@@ -814,6 +964,145 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
         0,
         "composer must not fall back to eth_sendRawTransaction",
     );
+    w.node.assert_no_divergence_failure_logs();
+}
+
+/// Ingress must reject a gap nonce immediately. The held pool only admits the
+/// next contiguous nonce, so N+1 cannot sit in the queue ahead of N.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_nonce_gap_is_rejected_then_contiguous_nonces_settle() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+    let destination_before = l2_value(&l2_rpc, w.value_l2).await.unwrap();
+
+    let gap_err = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce + 1,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(91u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .expect_err("gap nonce N+1 must be refused at the L1 front");
+    let gap_msg = gap_err.to_string();
+    assert!(
+        gap_msg.contains("invalid nonce"),
+        "ingress must name the nonce gap, got: {gap_msg}",
+    );
+    assert_eq!(
+        l2_value(&l2_rpc, w.value_l2).await.unwrap(),
+        destination_before,
+        "a rejected gap nonce must not mutate destination state",
+    );
+    assert_eq!(
+        onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap(),
+        nonce,
+        "a rejected gap nonce must not consume the source-chain nonce",
+    );
+
+    let first = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(91u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("contiguous nonce N must be admitted");
+    let second = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce + 1,
+        Some(w.setter_proxy),
+        U256::ZERO,
+        IValue::setValueCall {
+            v: U256::from(92u64),
+        }
+        .abi_encode(),
+        600_000,
+    )
+    .await
+    .expect("contiguous nonce N+1 must be admitted after N is held");
+    assert_all_transactions_succeeded(&w, &l1_rpc, &[first, second], "nonce-gap recovery").await;
+
+    let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
+    wait_for(SETTLE_TIMEOUT, || {
+        let (l1_rpc, l2_rpc) = (l1_rpc.clone(), l2_rpc.clone());
+        async move {
+            let applied = l2_value(&l2_rpc, w.value_l2).await? == U256::from(92u64);
+            let committed = state_root(&l1_rpc, eez, rollup_id).await?;
+            let safe = safe_block_state_root(&l2_rpc).await?;
+            Ok((applied && safe == Some(committed)).then_some(()))
+        }
+    })
+    .await
+    .expect("contiguous nonces did not settle to a reconciled safe root");
+    w.node.assert_no_process_death();
+}
+
+/// A late-joining L1-derived follower must replay the exact safe block that
+/// delivered a settled inbound call, not merely converge on a later head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_replays_settled_inbound_safe_block() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    Scenario::new("follower-replay inbound")
+        .inbound(setter_call(w.setter_proxy, 71u64).with_gas_limit(600_000))
+        .expect_l2_state(value_read(w.value_l2), 71u64)
+        .expect_settled_fully()
+        .run(&w)
+        .await
+        .unwrap();
+
+    let settled = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe)
+        .await
+        .unwrap()
+        .expect("composer has a safe head after inbound settlement");
+    let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        genesis_path: Some(w.cfg.l2_genesis.0.as_path()),
+    };
+    let follower = NodeHandle::start("xchain-inbound-follower", &follower_cfg, &w.follower_env())
+        .await
+        .unwrap();
+    wait_for_safe_chain_contains(&follower, settled.0, settled.1, SETTLE_TIMEOUT)
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "follower did not replay exact safe block {} {}: {err:#}",
+                settled.0, settled.1
+            )
+        });
+    assert_eq!(
+        l2_value(&follower.l2_rpc_url(), w.value_l2).await.unwrap(),
+        U256::from(71u64),
+        "follower execution must reproduce the inbound destination write",
+    );
+    let committed = state_root(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        safe_block_state_root(&follower.l2_rpc_url()).await.unwrap(),
+        Some(committed),
+        "follower safe root must match the L1 committed root",
+    );
+    follower.assert_no_process_death();
     w.node.assert_no_divergence_failure_logs();
 }
 
@@ -1338,7 +1627,7 @@ async fn wait_for_poison_eviction(
     w: &eez_testkit::CrossChainWorld,
     cursor: usize,
     hash: TxHash,
-    direction: &str,
+    _direction: &str,
     label: &str,
 ) {
     let tx_hash = hash.to_string();
@@ -1346,7 +1635,6 @@ async fn wait_for_poison_eviction(
         let evicted = w.node.signals_since(cursor)?.into_iter().any(|record| {
             record.name == signals::COMPOSER_POISON_EVICTION_COMPLETED
                 && record.fields.get("tx_hash").and_then(|v| v.as_str()) == Some(tx_hash.as_str())
-                && record.fields.get("direction").and_then(|v| v.as_str()) == Some(direction)
         });
         Ok(evicted.then_some(()))
     })
