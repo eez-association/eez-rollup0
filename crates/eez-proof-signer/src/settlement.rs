@@ -52,7 +52,8 @@ pub(crate) use post_batch::{
     RecomputedPublicInputsHash, decode_canonical_post_batch,
 };
 pub(crate) use state_chain::{StateUpdateChainError, verify_state_update_chain};
-pub(crate) use system_transactions::{SystemTransactionKey, SystemTransactionReconstructor};
+pub use system_transactions::SystemTransactionKey;
+pub(crate) use system_transactions::SystemTransactionReconstructor;
 
 #[cfg(test)]
 mod tests;

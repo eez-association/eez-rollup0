@@ -24,7 +24,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     cargo build \
         --profile "$BUILD_PROFILE" \
         --locked \
-        --package eez-proof-signer \
+        --package eez-prover-stateless \
         --bin eez-proof-signer \
     && install -D -m 0555 "/build/target/$BUILD_PROFILE/eez-proof-signer" /out/eez-proof-signer
 
