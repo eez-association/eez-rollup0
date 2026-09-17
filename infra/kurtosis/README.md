@@ -89,7 +89,7 @@ follower → the follower feeds it to the embedded reth via `engine_newPayload`
 
 For bring-up: `kurtosis`, `docker`, and `cast` (from
 [Foundry](https://getfoundry.sh)), plus an initialized and current
-`sync-rollups-protocol` submodule. `up.sh` checks the submodule before building
+`eez-core-protocol` submodule. `up.sh` checks the submodule before building
 and prints the update command if it is missing or incompatible.
 
 The end-to-end harnesses additionally require `forge`, `jq`, `curl`, and

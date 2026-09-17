@@ -26,7 +26,7 @@
 # PREREQS: just `bash infra/kurtosis/up.sh` (settled) — this script discovers
 # everything else itself (endpoints via `kurtosis port print`, protocol
 # deployment via `kurtosis files download`). cast, forge, jq, curl, kurtosis on
-# PATH; sync-rollups-protocol submodule initialised.
+# PATH; eez-core-protocol submodule initialised.
 
 set -euo pipefail
 export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
@@ -206,13 +206,13 @@ create_l1_proxy() { # <target_on_L2> → proxy addr
 # createCrossChainProxy on the L2 CCM (a PURE L2 tx → normal L2 RPC).
 create_l2_proxy() { # <target_on_L1> → proxy addr
     local tgt="$1" p code nonce raw
-    p=$(cast call "$EEZ_CCM_L2_PREDEPLOY" 'computeCrossChainProxyAddress(address,uint256)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2" | tr -d '[:space:]')
+    p=$(cast call "$EEZ_CCM_L2_PREDEPLOY" 'computeCrossChainProxyAddress(address,uint64)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2" | tr -d '[:space:]')
     code=$(cast code "$p" --rpc-url "$L2" 2>/dev/null || echo 0x)
     if [[ "$code" == "0x" || -z "$code" ]]; then
         nonce=$(cast nonce "$HH_KEY_2_ADDR" --rpc-url "$L2")
         raw=$(cast mktx --rpc-url "$L2" --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_2" --nonce "$nonce" \
             --gas-limit 1500000 --gas-price "$(gas_price_for "$L2")" \
-            "$EEZ_CCM_L2_PREDEPLOY" 'createCrossChainProxy(address,uint256)' "$tgt" "$MAINNET_RID")
+            "$EEZ_CCM_L2_PREDEPLOY" 'createCrossChainProxy(address,uint64)' "$tgt" "$MAINNET_RID")
         curl -s -X POST "$L2" -H 'Content-Type: application/json' \
             -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}" >/dev/null
         for _ in $(seq 1 30); do
@@ -515,7 +515,7 @@ run_waves() {
     LAST_SETTLED=$(strip_ansi <"$NODE_LOG" | grep "bundle outcome observed" | grep "settled=true" \
         | grep -oE "sync_height=[0-9]+" | grep -oE "[0-9]+" | sort -n | tail -1 || true)
     if [[ -n "$LAST_SETTLED" ]]; then
-        L1_TRACKED=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' \
+        L1_TRACKED=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' \
             "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
         L2_ROOT=$(cast block "$LAST_SETTLED" --rpc-url "$L2" --json | jq -r '.stateRoot')
         if [[ "${L1_TRACKED,,}" == "${L2_ROOT,,}" ]]; then

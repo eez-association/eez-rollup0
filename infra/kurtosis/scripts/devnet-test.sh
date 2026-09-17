@@ -24,7 +24,7 @@
 # PREREQS: just `bash infra/kurtosis/up.sh` (settled) — this script discovers
 # everything else itself (endpoints via `kurtosis port print`, protocol
 # deployment via `kurtosis files download`). cast, forge, jq, curl, kurtosis on
-# PATH; sync-rollups-protocol submodule initialised.
+# PATH; eez-core-protocol submodule initialised.
 
 set -euo pipefail
 K="$(cd "$(dirname "$0")/.." && pwd)"
@@ -297,7 +297,7 @@ fi
 # ── L1↔L2 stateRoot reconciliation ───────────────────────────────────
 echo
 echo "==> L1 vs L2 stateRoot reconciliation"
-L1_TRACKED=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint256)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" \
+L1_TRACKED=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" \
     --rpc-url "$L1_RPC" 2>/dev/null | sed -n '2p' | tr -d '[:space:]')
 LAST_SETTLED=$(sed 's/\x1b\[[0-9;]*m//g' "$NODE_LOG" 2>/dev/null \
     | grep "bundle outcome observed" | grep "settled=true" \

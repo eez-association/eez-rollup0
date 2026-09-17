@@ -6,8 +6,8 @@
 # is consumed by the eez-node service (see main.star).
 #
 # Built with the REPO ROOT as context (needs contracts/ AND its sibling
-# sync-rollups-protocol/ submodule, per contracts/foundry.toml libs+remappings).
-# The root .dockerignore excludes sync-rollups-protocol/, so this Dockerfile
+# eez-core-protocol/ submodule, per contracts/foundry.toml libs+remappings).
+# The root .dockerignore excludes eez-core-protocol/, so this Dockerfile
 # ships its own ignore file (deploy.Dockerfile.dockerignore, used by BuildKit).
 #
 #   DOCKER_BUILDKIT=1 docker build -f infra/kurtosis/deploy.Dockerfile -t eez-deploy:dev .
@@ -35,11 +35,11 @@ COPY --from=node-tools /usr/local/bin/eez-genesis-state-root /usr/local/bin/eez-
 
 WORKDIR /repo
 # deploy.sh resolves REPO from its own location and expects these siblings:
-#   /repo/scripts/deploy.sh, /repo/contracts, /repo/sync-rollups-protocol,
+#   /repo/scripts/deploy.sh, /repo/contracts, /repo/eez-core-protocol,
 #   /repo/genesis.json (base L2 genesis it timestamps per-deploy).
 COPY scripts ./scripts
 COPY contracts ./contracts
-COPY sync-rollups-protocol ./sync-rollups-protocol
+COPY eez-core-protocol ./eez-core-protocol
 COPY genesis.json ./genesis.json
 # deploy.sh requires EEZ_ENV_FILE (default /repo/.env) to exist; real values
 # arrive via env vars from the Kurtosis run_sh task, so an empty file suffices.

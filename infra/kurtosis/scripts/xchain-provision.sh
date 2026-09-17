@@ -105,12 +105,12 @@ has_code() { local c; c=$(cast code "$1" --rpc-url "$2" 2>/dev/null || echo 0x);
 create_l1_proxy() { forge_deploy "$L1" "$HH_KEY_0" CreateValueProxy.s.sol:CreateValueProxy \
         'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$1" "$EEZ_ROLLUP_ID" | grab EEZ_VALUE_PROXY; }
 create_l2_proxy() { local tgt="$1" p nonce raw
-    p=$(cast call "$EEZ_CCM_L2_PREDEPLOY" 'computeCrossChainProxyAddress(address,uint256)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2" | tr -d '[:space:]')
+    p=$(cast call "$EEZ_CCM_L2_PREDEPLOY" 'computeCrossChainProxyAddress(address,uint64)(address)' "$tgt" "$MAINNET_RID" --rpc-url "$L2" | tr -d '[:space:]')
     if ! has_code "$p" "$L2"; then
         nonce=$(cast nonce "$HH_KEY_2_ADDR" --rpc-url "$L2")
         raw=$(cast mktx --rpc-url "$L2" --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_2" --nonce "$nonce" \
             --gas-limit 1500000 --gas-price "$(gas_price_for "$L2")" \
-            "$EEZ_CCM_L2_PREDEPLOY" 'createCrossChainProxy(address,uint256)' "$tgt" "$MAINNET_RID")
+            "$EEZ_CCM_L2_PREDEPLOY" 'createCrossChainProxy(address,uint64)' "$tgt" "$MAINNET_RID")
         curl -s -X POST "$L2" -H 'Content-Type: application/json' \
             -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}" >/dev/null
         for _ in $(seq 1 30); do has_code "$p" "$L2" && break; sleep 1; done
