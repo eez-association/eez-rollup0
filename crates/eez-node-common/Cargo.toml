@@ -36,6 +36,32 @@ thiserror.workspace = true
 tokio.workspace    = true
 tracing.workspace  = true
 
+reth-basic-payload-builder.workspace = true
+reth-consensus-common.workspace = true
+reth-errors.workspace = true
+reth-execution-cache.workspace = true
+reth-payload-builder-primitives.workspace = true
+reth-ethereum-consensus.workspace = true
+reth-engine-local.workspace = true
+reth-rpc.workspace = true
+reth-rpc-convert.workspace = true
+reth-rpc-eth-types.workspace = true
+eez-evm.workspace = true
+eez-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-rlp.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-rpc-types-engine.workspace = true
+alloy-consensus-any.workspace = true
+reth-node-ethereum.workspace = true
+reth-engine-primitives.workspace = true
+reth-payload-primitives.workspace = true
+reth-evm-ethereum.workspace = true
+reth-provider.workspace = true
+reth-revm.workspace = true
+reth-storage-api.workspace = true
+revm.workspace = true
+
 [dev-dependencies]
 alloy-consensus.workspace = true
 

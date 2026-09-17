@@ -4,19 +4,16 @@ mod unsafe_head;
 
 use std::{env, str::FromStr, sync::Arc, time::Duration};
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::Address;
 use alloy_provider::RootProvider;
-use alloy_signer_local::PrivateKeySigner;
 use eez_deriver::Deriver;
 use eez_driver::{BlockCommitterHandle, RollupTiming};
 use eez_l1::{L1CanonicalHead, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
+use eez_node_common::EezNode;
 use eez_node_common::{
-    EezPayloadBuilder, EezPoolBuilder, L2NodeBuilder, node_cli, read_checkpoint_dir,
-    wait_for_l1_ready, warn_on_deprecated_env,
+    L2NodeBuilder, node_cli, read_checkpoint_dir, wait_for_l1_ready, warn_on_deprecated_env,
 };
 use reth_chainspec::EthChainSpec as _;
-use reth_node_builder::components::BasicPayloadServiceBuilder;
-use reth_node_ethereum::EthereumNode;
 use tracing::{Level, event};
 
 use unsafe_head::UnsafeHeadFollower;
@@ -26,11 +23,8 @@ const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// ~15 min at the capped backoff: outlasts a restarting L1, but a permanently
 /// refused RPC call still surfaces as an exit.
 const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
-const L2_SYSTEM_TX_GAS_PRICE: u128 = 1_000_000_000;
-const L2_SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
 
 struct FollowerSystemConfig {
-    system_signer: PrivateKeySigner,
     eezl2_address: Address,
     this_rollup_id: u64,
 }
@@ -38,11 +32,8 @@ struct FollowerSystemConfig {
 impl FollowerSystemConfig {
     fn into_context(self, l2_chain_id: u64) -> eez_protocol::system_tx::SystemTxContext {
         eez_protocol::system_tx::SystemTxContext {
-            system_signer: self.system_signer,
             eezl2_address: self.eezl2_address,
             l2_chain_id,
-            l2_gas_price: L2_SYSTEM_TX_GAS_PRICE,
-            l2_gas_limit: L2_SYSTEM_TX_GAS_LIMIT,
             this_rollup_id: self.this_rollup_id,
         }
     }
@@ -86,18 +77,10 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     // transactions byte-for-byte. Read every required value before launching
     // reth so a misconfigured follower never appears healthy.
     let system_config = read_system_config()?;
-    let system_address = system_config.system_signer.address();
+    let system_address = eez_primitives::SYSTEM_ADDRESS;
 
     let handle = builder
-        .with_types::<EthereumNode>()
-        .with_components(
-            EthereumNode::components()
-                // Reorged-out system transactions must not leak from reth's
-                // reinjection path into an ordinary Live block.
-                .pool(EezPoolBuilder::new(system_address))
-                .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder::default())),
-        )
-        .with_add_ons(reth_node_ethereum::node::EthereumAddOns::default())
+        .node(EezNode)
         .launch_with_debug_capabilities()
         .await?;
 
@@ -268,12 +251,9 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
 
 /// Read the mandatory system-transaction identity before follower startup.
 fn read_system_config() -> eyre::Result<FollowerSystemConfig> {
-    let system_key = required_env("EEZ_L2_SYSTEM_KEY")?;
     let eezl2_address = required_env("EEZL2_ADDRESS")?;
     let rollup_id = required_env("EEZ_ROLLUP_ID")?;
 
-    let system_signer =
-        PrivateKeySigner::from_bytes(&B256::from_str(system_key.trim_start_matches("0x"))?)?;
     let eezl2_address = Address::from_str(&eezl2_address)
         .map_err(|err| eyre::eyre!("EEZL2_ADDRESS malformed: {err}"))?;
     let this_rollup_id = rollup_id
@@ -281,7 +261,6 @@ fn read_system_config() -> eyre::Result<FollowerSystemConfig> {
         .map_err(|e| eyre::eyre!("EEZ_ROLLUP_ID malformed: {e}"))?;
 
     Ok(FollowerSystemConfig {
-        system_signer,
         eezl2_address,
         this_rollup_id,
     })

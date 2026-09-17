@@ -6,21 +6,18 @@
 ## Startup trust roots
 
 The operator supplies the chain document, expected rollup ID, proof-system
-address, proof-system vkey, attestation key, and L2 system-transaction key.
+address, proof-system vkey, attestation key, and reserved L2 system address.
 Startup validates syntax and local relationships, including key/address
 constraints, but cannot query L1 to prove that the configured proof system
 registers that vkey and authorizes the derived attester. Deployment automation
 must verify those external relationships.
 
-The two private keys have different authority:
+The daemon uses the attestation key only after the complete pipeline produces
+an `AttestablePublicInputsHash`, signing it with raw/prehash ECDSA and no
+EIP-191 prefix. Omitted native L2 system transactions are reconstructed from
+public chain and rollup identity without a private key.
 
-- the daemon uses the attestation key only after the complete pipeline produces
-  an `AttestablePublicInputsHash`, signing it with raw/prehash ECDSA and no
-  EIP-191 prefix; and
-- the L2 system-transaction key reconstructs omitted legacy EIP-155 L2 system
-  transactions and must derive the reserved system address.
-
-Do not reuse them. Prefer environment injection from a secret manager over
+Prefer environment injection of the attestation key from a secret manager over
 command-line flags, which may be visible in shell history or process listings.
 The checked-in [`.env.example`](../.env.example) contains placeholders only.
 

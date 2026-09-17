@@ -4,7 +4,7 @@
 # dependency-layer caching — reth is a large, rarely-changing tree, so
 # the cooked-deps layer is reused across code changes.
 #
-# The build is self-contained in `crates/` + `Cargo.{toml,lock}`; the
+# The build is self-contained in `crates/` and `Cargo.{toml,lock}`; the
 # Solidity protocol submodule and `contracts/` are NOT needed (ABI is
 # inline `sol!`). Contract deploys are a separate `forge` step (see
 # scripts/deploy.sh + README).
