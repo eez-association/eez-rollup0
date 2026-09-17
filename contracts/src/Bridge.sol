@@ -3,7 +3,7 @@ pragma solidity ^0.8.28;
 
 /// @notice Minimal L1-side user contract: receives a value-bearing call
 /// and forwards it to the L2 proxy. Lifted byte-identical from the
-/// `bridge` E2E fixture in `sync-rollups-protocol/script/e2e/bridge/E2E.s.sol`
+/// `bridge` E2E fixture in `eez-core-protocol/script/e2e/bridge/E2E.s.sol`
 /// so the composer-produced ExecutionEntry shapes match the existing
 /// fixture's `_l1Entries` / `_l2Entries`. The fixture is the canonical
 /// reference for the L1→L2 deposit flow.

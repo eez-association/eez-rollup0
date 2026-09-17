@@ -41,5 +41,9 @@ alloy-rpc-types-engine.workspace = true
 tokio.workspace   = true
 tracing.workspace = true
 
+[dev-dependencies]
+# Checkpoint tests write real files; atomicity is the point of the code.
+tempfile = "3"
+
 [lints]
 workspace = true

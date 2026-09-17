@@ -62,3 +62,34 @@ message ProveResponse {
   bytes public_inputs_hash = 1;  // 32B — the hash the prover signed
   bytes signature          = 2;  // 65B — ECDSA over public_inputs_hash
 }
+
+// Machine-readable detail attached to a failed Prove RPC. The gRPC status
+// code remains authoritative for retry classification; this payload only
+// identifies one cross-chain candidate that the Composer can safely remove
+// before rebuilding the request.
+message ProveFailure {
+  oneof actionable_failure {
+    OutboundFailure outbound = 1;
+    InboundFailure inbound   = 2;
+  }
+}
+
+// An outbound candidate is identified by its original signed L2 user
+// transaction. `transaction_index` is its zero-based position in the terminal
+// Sync block, not the position of its preceding synthetic load transaction.
+// If that load failed, the prover still reports the paired user transaction so
+// discarding and rebuilding the candidate removes both halves together.
+message OutboundFailure {
+  uint32 transaction_index = 1;
+  bytes transaction_hash   = 2;  // 32B — canonical signed tx hash (HeldTx.hash)
+}
+
+// An inbound candidate's original signed L1 transaction is not present in the
+// Prove request. The prover therefore identifies the effect entry and the
+// Composer resolves it through the request-local entry-to-HeldTx mapping it
+// retained while composing the batch.
+message InboundFailure {
+  uint32 entry_index = 1;  // zero-based position in PostBatch.entries
+  // 32B — keccak256 of the canonical ExecutionEntrySol ABI encoding.
+  bytes entry_hash = 2;
+}

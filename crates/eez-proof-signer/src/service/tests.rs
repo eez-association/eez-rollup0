@@ -7,11 +7,12 @@ mod pipeline;
 mod runtime;
 
 use alloy_consensus::{SignableTransaction as _, Transaction as _};
-use alloy_primitives::{B256, Bytes, I256, Signature, U256, address, b256};
+use alloy_primitives::{B256, Bytes, I256, Signature, U256, address, b256, keccak256};
 use alloy_sol_types::SolValue as _;
 use eez_control_rpc::v1::prover_client::ProverClient;
 use eez_control_rpc::v1::{
     BlockWitness, ExecutionWitness, PostBatch, ProveChunk, ProveHeader, ProveResponse, prove_chunk,
+    prove_failure,
 };
 use eez_protocol::abi::{ExecutionEntrySol, L2ToL1CallSol, StateUpdateSol};
 use reth_primitives_traits::BlockBody as _;
@@ -461,47 +462,6 @@ fn happy_window() -> Vec<ProveChunk> {
     ]
 }
 
-fn stateless_window() -> Vec<ProveChunk> {
-    let consensus_header = alloy_consensus::Header {
-        number: 5,
-        parent_hash: alloy_primitives::B256::repeat_byte(0x04),
-        ..Default::default()
-    };
-    let hash = consensus_header.hash_slow();
-    let consensus_block = alloy_consensus::Block::<
-        alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>,
-    >::new(consensus_header, Default::default());
-    let mut chunk = block_chunk(5, 0x04, 0x05);
-    let block = block_mut(&mut chunk);
-    block.hash = hash.to_vec();
-    block.rlp = alloy_rlp::encode(consensus_block);
-    vec![header_chunk(5, 5), chunk]
-}
-
-fn stateless_transaction_window() -> Vec<ProveChunk> {
-    let header = alloy_consensus::Header {
-        number: 5,
-        parent_hash: B256::repeat_byte(0x04),
-        ..Default::default()
-    };
-    let hash = header.hash_slow();
-    let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
-        transactions: vec![non_system_transaction()],
-        ..Default::default()
-    };
-    let block = reth_ethereum_primitives::Block::new(header, body);
-    let chunk = ProveChunk {
-        kind: Some(prove_chunk::Kind::Block(BlockWitness {
-            number: 5,
-            hash: hash.to_vec(),
-            parent_hash: vec![0x04; 32],
-            rlp: alloy_rlp::encode(block),
-            witness: Some(ExecutionWitness::default()),
-        })),
-    };
-    vec![header_chunk(5, 5), chunk]
-}
-
 type TestTransaction = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>;
 
 fn single_non_system_transaction_window() -> Vec<ProveChunk> {
@@ -640,18 +600,6 @@ fn limits() -> ServiceLimits {
     )
 }
 
-fn limits_with_checkpoint_limit(max_transaction_state_checkpoints: usize) -> ServiceLimits {
-    ServiceLimits::new(ServiceLimitsParams {
-        max_window_blocks: nz(16),
-        max_window_bytes: nz(1024 * 1024),
-        max_window_witness_items: nz(1024),
-        max_transaction_state_checkpoints,
-        stream_idle_timeout: Duration::from_secs(5),
-        request_timeout: Duration::from_secs(30),
-    })
-    .unwrap()
-}
-
 fn limits_with(
     max_blocks: usize,
     max_bytes: usize,
@@ -662,7 +610,6 @@ fn limits_with(
         max_window_blocks: nz(max_blocks),
         max_window_bytes: nz(max_bytes),
         max_window_witness_items: nz(1024),
-        max_transaction_state_checkpoints: 8,
         stream_idle_timeout: idle_timeout,
         request_timeout,
     })

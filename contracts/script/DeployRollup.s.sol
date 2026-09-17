@@ -3,7 +3,7 @@ pragma solidity ^0.8.28;
 
 import {Script, console} from "forge-std/Script.sol";
 
-import {Rollup} from "sync-rollups-protocol/src/rollupContract/Rollup.sol";
+import {Rollup} from "eez-core-protocol/src/rollupContract/Rollup.sol";
 
 /// @title DeployRollup
 /// @notice Deploys the per-rollup `IRollupContract` manager (reference

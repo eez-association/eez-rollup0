@@ -36,7 +36,7 @@ services:
     env_file:
       - ./deployments.env
     environment:
-      EEZ_PROOF_SIGNER_ADDR: 127.0.0.1:50061
+      EEZ_PROOF_SIGNER_ADDR: 127.0.0.1:${EEZ_SIGNER_PORT:-50061}
       EEZ_CHAIN_CONFIG: /app/genesis.json
       EEZ_PROOF_SIGNER_KEY: "${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY}"
       EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
@@ -44,7 +44,7 @@ services:
     volumes:
       - ${FRESH_GENESIS:?set FRESH_GENESIS}:/app/genesis.json:ro
     healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "50061"]
+      test: ["CMD", "nc", "-z", "127.0.0.1", "${EEZ_SIGNER_PORT:-50061}"]
       interval: 5s
       timeout: 2s
       retries: 12
@@ -72,10 +72,9 @@ services:
       EEZ_L1_POSTER_KEY: "${EEZ_L1_POSTER_KEY:?set EEZ_L1_POSTER_KEY}"
       EEZ_L1_BUILDER_RPC_URL: "${EEZ_L1_BUILDER_RPC_URL:?set EEZ_L1_BUILDER_RPC_URL}"
       EEZ_L2_SYSTEM_KEY: "${EEZ_L2_SYSTEM_KEY:?set EEZ_L2_SYSTEM_KEY}"
-      EEZ_PROVER_URL: http://127.0.0.1:50061
+      EEZ_PROVER_URL: http://127.0.0.1:${EEZ_SIGNER_PORT:-50061}
       EEZ_WITNESS_DB_PATH: /l2/witnesses
       # Embedded chiado L1 (reth_gnosis) — single L1 for the whole node.
-      EEZ_L1_EMBEDDED: "1"
       EEZ_L1_CHAIN: chiado
       EEZ_L1_CHAIN_ID: "10200"
       EEZ_L1_HTTP_PORT: "18645"
@@ -86,8 +85,14 @@ services:
       EEZ_L1_DATADIR: /l1
       EEZ_L1_JWT_SECRET: /jwt/jwt.hex
       EEZ_L1_RPC_URL: http://127.0.0.1:18645
-      # EEZ_L1_TARGET_RPC_URL intentionally unset → bundle target-block
-      # oracle falls back to the embedded L1 (config.rs build_target_provider).
+      # Forwarded but empty by default - the bundle
+      # target-block oracle falls back to the embedded L1. Set it in
+      # .env.chiado
+      EEZ_L1_TARGET_RPC_URL: "${EEZ_L1_TARGET_RPC_URL:-}"
+      # Without this the embedded L1 falls back to the persisted
+      # known-peers.json, which fills with cross-network noise and
+      # leaves it on 0 peers, unable to backfill.
+      EEZ_L1_TRUSTED_PEERS: "${EEZ_L1_TRUSTED_PEERS:-}"
       EEZ_L1_ROLLUP_ID: "0"
       # Cross-chain wiring.
       EEZL2_ADDRESS: "0x4200000000000000000000000000000000000007"
@@ -99,17 +104,25 @@ services:
       # other eth_* is transparently forwarded to the matching source-chain RPC.
       EEZ_L1_XCHAIN_PORT: "18999"
       EEZ_L2_XCHAIN_PORT: "18998"
-      # Max user_txs bundled per postBatch. rbuilder-chiado partial-includes
-      # beyond ~3 (→ silent user_tx loss); raise only against a builder proven to
-      # include larger bundles atomically. Host-env overridable (default 3).
-      EEZ_MAX_USER_TXS_PER_BUNDLE: "${EEZ_MAX_USER_TXS_PER_BUNDLE:-3}"
+      # Lower than the in-code default (50) because the whole bundle
+      # [postBatch, user_tx...] has to fit a 17M chiado block, not the 60M a
+      # devnet L1 gives: 9M cap + 12 * 400k = 13.8M.
+      EEZ_MAX_USER_TXS_PER_BUNDLE: "${EEZ_MAX_USER_TXS_PER_BUNDLE:-12}"
+      # Emission + reorg bounds documented in .env.example. eez-node reads these
+      # from the process env, and this service takes no env_file beyond
+      # deployments.env, so they have to be forwarded explicitly. Defaults track
+      # the in-code ones (composer.rs, timing.rs, l1_watcher.rs).
+      EEZ_MAX_BLOCKS_PER_BATCH: "${EEZ_MAX_BLOCKS_PER_BATCH:-300}"
+      EEZ_MAX_POSTBATCH_GAS: "${EEZ_MAX_POSTBATCH_GAS:-16777216}"
+      EEZ_L1_REORG_MAX_DEPTH_BLOCKS: "${EEZ_L1_REORG_MAX_DEPTH_BLOCKS:-62}"
       # Deterministic L1-anchored timings (must match any follower).
       EEZ_L1_BLOCK_TIME_MS: "5000"
       EEZ_L2_BLOCK_TIME_MS: "1000"
       # Reserve time for remote stateless validation. The 2500ms proof budget
-      # plus 1300ms slack stays within the 4000ms schedulable L2 window.
+      # plus 1300ms slack stays within the 4000ms schedulable L2 window — if
+      # either is raised, keep their sum at or below 4000ms.
       EEZ_PROOF_TIME_MS: "${EEZ_PROOF_TIME_MS:-2500}"
-      EEZ_SUBMISSION_SLACK_MS: "1300"
+      EEZ_SUBMISSION_SLACK_MS: "${EEZ_SUBMISSION_SLACK_MS:-1300}"
       # Don't freeze the sequencer when chiado bundles are slow to land.
       EEZ_MAX_SPECULATIVE_DEPTH: "0"
       # Multi-composer: tolerate + adopt batches posted by the competing

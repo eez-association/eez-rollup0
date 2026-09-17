@@ -150,6 +150,20 @@ fn reverted_system_transactions_are_rejected_but_user_reverts_are_allowed() {
 }
 
 #[test]
+fn reverted_inbound_system_transactions_remain_positioned_candidates() {
+    let rlp = block_rlp(vec![target_system_inbound_transaction()]);
+
+    let facts = inspect_settling_block(&rlp, &[false], expected_rollup_id()).unwrap();
+
+    assert_eq!(facts.inbound_candidates().len(), 1);
+    assert_eq!(facts.inbound_candidates()[0].transaction_index, 0);
+    assert_eq!(
+        facts.inbound_candidates()[0].inspection,
+        Err(InboundObservationError::RevertedTransaction)
+    );
+}
+
+#[test]
 fn settling_inbound_candidates_are_retained_independently_of_effect_candidates() {
     let rlp = block_rlp(vec![
         target_system_inbound_transaction(),

@@ -5,9 +5,10 @@
 # Walks Foundry's broadcast/ for CREATE/CREATE2 entries on the L1 chain-id
 # and submits each to Blockscout via `forge verify-contract`. NEVER fails the
 # caller — Blockscout is an inspector tool, not part of the protocol surface,
-# so a verification miss must not abort a deploy or a smoke run. Dedup is
-# delegated to Blockscout (re-submitting an already-verified address is a fast
-# no-op). No-op when EEZ_BLOCKSCOUT_URL is unset, or jq/cast/forge are missing.
+# so a verification miss must not abort a deploy or a smoke run. Constructor
+# calldata is recovered from the exact creation input rather than guessed via
+# an explorer API. No-op when EEZ_BLOCKSCOUT_URL is unset, or a required tool is
+# missing.
 #
 # Usage: verify-blockscout.sh [since_marker]
 #   since_marker  optional file; only run-latest.json newer than it are scanned,
@@ -16,24 +17,31 @@
 #
 # Env:
 #   EEZ_BLOCKSCOUT_URL   Blockscout base URL (e.g. https://gnosis-chiado.blockscout.com)
-#   EEZ_L1_RPC_URL       L1 RPC — chain-id filter + creation-tx source for --guess-constructor-args
+#   EEZ_L1_RPC_URL       L1 RPC used for the chain-id filter and verification
 #   EEZ_CONTRACTS_DIR    Foundry project dir (default: <repo>/contracts)
+#   EEZ_BROADCAST_DIR    Foundry broadcast dir (default: <contracts>/broadcast)
+#   EEZ_BLOCKSCOUT_CONNECT_TIMEOUT_SECS  Connection timeout (default: 5)
+#   EEZ_BLOCKSCOUT_REQUEST_TIMEOUT_SECS  Whole-request timeout (default: 30)
 
 set -uo pipefail
 
 [[ -n "${EEZ_BLOCKSCOUT_URL:-}" ]] || { echo "blockscout: EEZ_BLOCKSCOUT_URL unset; skipping verification"; exit 0; }
-for t in jq cast forge; do command -v "$t" >/dev/null 2>&1 || { echo "blockscout: $t not found; skipping verification"; exit 0; }; done
+for t in jq cast curl forge; do command -v "$t" >/dev/null 2>&1 || { echo "blockscout: $t not found; skipping verification"; exit 0; }; done
 : "${EEZ_L1_RPC_URL:?verify-blockscout: EEZ_L1_RPC_URL not set}"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 CONTRACTS="${EEZ_CONTRACTS_DIR:-$REPO/contracts}"
-BROADCAST="$CONTRACTS/broadcast"
+BROADCAST="${EEZ_BROADCAST_DIR:-$CONTRACTS/broadcast}"
 SINCE="${1:-}"
 
 [[ -d "$BROADCAST" ]] || { echo "blockscout: no broadcast dir ($BROADCAST); nothing to verify"; exit 0; }
 
 chain="$(cast chain-id --rpc-url "$EEZ_L1_RPC_URL" 2>/dev/null)" || { echo "blockscout: chain-id lookup failed; skipping"; exit 0; }
 URL="${EEZ_BLOCKSCOUT_URL%/}/api/"
+BLOCKSCOUT_CURL_ARGS=(
+    --connect-timeout "${EEZ_BLOCKSCOUT_CONNECT_TIMEOUT_SECS:-5}"
+    --max-time "${EEZ_BLOCKSCOUT_REQUEST_TIMEOUT_SECS:-30}"
+)
 
 echo "blockscout: verifying via $EEZ_BLOCKSCOUT_URL (chain $chain)"
 
@@ -50,25 +58,66 @@ find_broadcasts() {
         [[ "$(basename "$(dirname "$f")")" == "$chain" ]] || continue
         jq -r '.transactions[]
                | select(.transactionType=="CREATE" or .transactionType=="CREATE2")
-               | select(.contractName != null and .contractAddress != null)
-               | "\(.contractAddress)\t\(.contractName)"' "$f" 2>/dev/null
+               | select(.contractName != null and .contractAddress != null and .transaction.input != null)
+               | "\(.contractAddress)\t\(.contractName)\t\(.transaction.input)"' "$f" 2>/dev/null
     done
 }
 
+is_verified() {
+    curl "${BLOCKSCOUT_CURL_ARGS[@]}" -fsS \
+        "${EEZ_BLOCKSCOUT_URL%/}/api/v2/addresses/$1" 2>/dev/null \
+        | jq -e '.is_verified == true' >/dev/null 2>&1
+}
+
+constructor_args() {
+    local name="$1" creation_input="${2#0x}" bytecode
+    bytecode="$(cd "$CONTRACTS" && forge inspect "$name" bytecode 2>/dev/null)" || return 1
+    bytecode="${bytecode#0x}"
+
+    # Creation input is creation bytecode followed by the ABI-encoded
+    # constructor arguments. Refuse to guess if the local build is not the
+    # artifact that was actually deployed.
+    [[ -n "$bytecode" && "$creation_input" == "$bytecode"* ]] || return 1
+    printf '%s\n' "${creation_input:${#bytecode}}"
+}
+
 count=0; fail=0
-while IFS=$'\t' read -r addr name; do
+while IFS=$'\t' read -r addr name creation_input; do
     [[ -z "$addr" || -z "$name" ]] && continue
     count=$((count + 1))
-    if ( cd "$CONTRACTS" && "${TO[@]}" forge verify-contract \
-            --watch --guess-constructor-args \
-            --rpc-url "$EEZ_L1_RPC_URL" \
-            --verifier blockscout --verifier-url "$URL" \
-            "$addr" "$name" ) >/dev/null 2>&1
-    then
+
+    if is_verified "$addr"; then
+        echo "  verified $name @ $addr"
+        continue
+    fi
+
+    args="$(constructor_args "$name" "$creation_input")" || {
+        fail=$((fail + 1))
+        echo "  failed   $name @ $addr (local creation bytecode differs from the deployment)"
+        continue
+    }
+
+    verify_args=(
+        --watch
+        --rpc-url "$EEZ_L1_RPC_URL"
+        --verifier blockscout
+        --verifier-url "$URL"
+    )
+    [[ -n "$args" ]] && verify_args+=(--constructor-args "$args")
+
+    output="$(cd "$CONTRACTS" && "${TO[@]}" forge verify-contract \
+        "${verify_args[@]}" "$addr" "$name" 2>&1)" || true
+
+    if is_verified "$addr"; then
         echo "  verified $name @ $addr"
     else
         fail=$((fail + 1))
-        echo "  failed   $name @ $addr"
+        detail="$(grep -E '^(Error:|Details:)' <<< "$output" | tail -1)"
+        if [[ -n "$detail" ]]; then
+            echo "  failed   $name @ $addr ($detail)"
+        else
+            echo "  failed   $name @ $addr"
+        fi
     fi
 done < <(find_broadcasts)
 

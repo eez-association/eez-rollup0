@@ -23,7 +23,7 @@
 //! # Spec anchors
 //!
 //! Mirrors `ECDSAProofSystem.verify` (in-tree:
-//! `sync-rollups-protocol/src/proofSystems/ECDSAProofSystem.sol`).
+//! `eez-core-protocol/src/proofSystems/ECDSAProofSystem.sol`).
 //! 65-byte `abi.encodePacked(r, s, v)` signature, `s` in the canonical
 //! (low) half of `secp256k1_n`, `v` normalized to `{27, 28}`.
 

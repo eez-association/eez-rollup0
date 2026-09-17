@@ -6,9 +6,9 @@ This document specifies the behavior of `eez-proof-signer` for the currently
 supported single-rollup profile. It is intentionally narrower than the complete
 EEZ protocol.
 
-The protocol source used by this profile is the `sync-rollups-protocol`
+The protocol source used by this profile is the `eez-core-protocol`
 submodule at commit
-`6fcc90b65063831cb7797e9fa361004064d28f9f`. Stateless execution uses
+`6fcc90b65063831cb7797e9fa361004064d28f9f`. The stateless backend uses
 `eez-association/stateless` at commit
 `4fc3806bdd0e6b296c761ef4d4b260938365cf45`.
 
@@ -21,9 +21,11 @@ document MUST be updated atomically.
 ## 1. Purpose and supported profile
 
 The signer accepts one Composer-supplied L2 block window, validates every block
-with witness-backed Stateless/Reth execution, binds one canonical
+with one operator-selected production backend, binds one canonical
 `postAndVerifyBatch` payload to the validated execution, recomputes the one
-supported public-input hash, and signs that hash.
+supported public-input hash, and signs that hash. The supported backends are
+witness-backed Stateless/Reth execution and node-backed execution over an
+L1-derived follower's canonical L2 database.
 
 The only supported execution-entry sequence is:
 
@@ -52,7 +54,8 @@ locally recomputed public-input hash only under all rules in this document.
 The signature does **not** establish:
 
 - canonical L2 ancestry, fork choice, finality, or sequencer authorization;
-- that the witness-backed pre-state is an operator-trusted chain checkpoint;
+- that the witness-backed pre-state is an operator-trusted chain checkpoint, or
+  which execution backend produced the validation evidence;
 - current L1 registry state or future on-chain applicability of a state update;
 - successful future execution of an L1 target call;
 - proof-system registration, threshold configuration, or verification-key
@@ -106,10 +109,10 @@ Values are classified as follows:
 | --- | --- |
 | Operator configuration | Authoritative for execution-chain rules, expected rollup ID, proof-system address and vkey, attester identity, system-transaction key, and resource limits. The deployment MUST use the fixed EEZL2 address and MUST bind its configured system address to the configured system-transaction key. |
 | Composer stream | Untrusted, including range, hashes, RLP, witness, settlement calldata, and claimed public-input hash. |
-| Stateless/Reth output | Security-critical derived evidence. It MUST be consumed and checked against the corresponding admitted blocks before settlement uses it. |
+| Validation-backend output | Security-critical derived evidence. It MUST be consumed and checked against the corresponding admitted blocks before settlement uses it. The backend is trusted to derive that evidence by the replay rules in section 6. |
 | Pinned EEZ contracts | Authoritative for on-chain ABI layouts, selectors, hashes, and execution behavior. |
 | `eez-protocol` mirrors | Shared local implementations used by the signer; they MUST match the pinned contracts and independent vectors. |
-| Live L1/L2 network state | Not queried by the signer. |
+| Live L1/L2 network state | The stateless backend does not query it. The stateful backend treats its L1-derived follower's canonical L2 database and chain specification as operator-trusted input, subject to the snapshot checks in section 6.4. |
 
 Names in code and diagnostics SHOULD preserve this distinction. Composer values
 SHOULD be described as `claimed`, `declared`, or `submitted`; replay results as
@@ -117,6 +120,8 @@ SHOULD be described as `claimed`, `declared`, or `submitted`; replay results as
 direction-specific gate as `authorized`.
 
 ## 3. Startup configuration
+
+### 3.1 Standalone stateless service
 
 Every option is available as a CLI flag with the listed environment fallback.
 The CLI value takes precedence.
@@ -135,7 +140,6 @@ The CLI value takes precedence.
 | `--max-request-blocks` | `EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS` | `512` | Nonzero. |
 | `--max-request-bytes` | `EEZ_PROOF_SIGNER_MAX_REQUEST_BYTES` | `536870912` | Nonzero. |
 | `--max-request-witness-items` | `EEZ_PROOF_SIGNER_MAX_REQUEST_WITNESS_ITEMS` | `1000000` | Nonzero. |
-| `--max-transaction-state-checkpoints` | `EEZ_PROOF_SIGNER_MAX_TRANSACTION_STATE_CHECKPOINTS` | `8` | May be zero. |
 | `--stream-idle-timeout-secs` | `EEZ_PROOF_SIGNER_STREAM_IDLE_TIMEOUT_SECS` | `120` | Nonzero and representable as an `Instant` deadline. |
 | `--request-timeout-secs` | `EEZ_PROOF_SIGNER_REQUEST_TIMEOUT_SECS` | `600` | Nonzero and representable as an `Instant` deadline. |
 
@@ -150,6 +154,28 @@ The chain document MUST contain an explicit `chainId`. Unknown supported-level
 and extension fields MUST be rejected rather than silently ignored. A complete
 Genesis document supplies its timestamp and genesis fields; a bare
 `ChainConfig` uses the implementation's default Genesis values.
+
+### 3.2 Follower-hosted stateful service
+
+The stateful backend runs inside `eez-follower` and is configured only through the
+environment. It is enabled when `EEZ_STATEFUL_PROOF_SIGNER_ADDR` is present;
+otherwise the node MUST NOT expose the stateful `Prove` service. It MUST run
+only in follower mode without `EEZ_SEQUENCER_RPC`, so its database view is
+derived from L1 rather than a sequencer's unsafe head.
+
+The stateful service uses the running follower's chain specification and L2
+EIP-155 chain ID instead of `EEZ_CHAIN_CONFIG`. It uses the common deployment
+variables from section 3.1 except that:
+
+- `EEZ_STATEFUL_PROOF_SIGNER_ADDR` supplies the listen address and has no
+  default;
+- `EEZ_STATEFUL_PROOF_SIGNER_KEY` supplies the attestation private key; and
+- `EEZ_PROOF_SIGNER_REQUEST_TIMEOUT_SECS` defaults to `240`, leaving margin
+  below Reth's default 300-second MDBX read-transaction limit.
+
+The remaining shared resource-limit and identity defaults are unchanged. The
+stateful service MUST apply the same secret-redaction, attester-address,
+system-key, and fixed EEZL2-address checks as the stateless service.
 
 The active deployment bindings are:
 
@@ -177,7 +203,7 @@ declared block.
 ### 4.1 Single-flight execution
 
 Exactly one request may be admitted at a time. A second request MUST be
-rejected immediately with `ResourceExhausted`; it MUST NOT wait while holding an
+rejected immediately with `Unavailable`; it MUST NOT wait while holding an
 open stream.
 
 The active-request slot remains held through validation, settlement, signing,
@@ -255,6 +281,10 @@ For block index `i`, admission MUST require:
 - the aggregate quotas remain within limits; and
 - for `i > 0`, the claimed parent hash equals the preceding claimed block hash.
 
+The wire profile requires a witness for every backend. The stateless backend
+MUST use it for replay. The stateful backend MAY ignore its contents, but the
+service MUST still enforce all witness presence and quota rules above.
+
 EOF is accepted only after exactly the declared number of blocks. Extra,
 missing, duplicated, or reordered blocks MUST be rejected.
 
@@ -263,9 +293,17 @@ admission.
 
 ## 6. Execution validation
 
-The production backend is always the pinned in-process Stateless/Reth backend.
-The operator-configured chain document determines fork rules and the EIP-155
-chain ID; the Composer cannot override either.
+The operator selects exactly one production backend when the service starts:
+
+- the standalone service uses the pinned in-process Stateless/Reth backend;
+  or
+- an L1-derived-only follower may host the stateful Reth backend over its local
+  canonical database.
+
+For the stateless backend, the operator-configured chain document determines
+fork rules and the EIP-155 chain ID. For the stateful backend, the running
+follower's chain specification determines them. The Composer cannot override
+either backend's execution rules or chain identity.
 
 ### 6.1 Decode and identity binding
 
@@ -300,9 +338,9 @@ An absent `system[i + 1]` at block end is treated as `true`. Thus an outbound
 inbound system transaction ends at itself.
 
 The Composer MUST NOT nominate checkpoint positions. The complete plan MUST be
-derived and checked against `max_transaction_state_checkpoints` before earlier
-blocks are replayed. The backend MUST return exactly the requested positions in
-strict order. Preceding blocks MUST return no checkpoints.
+derived before earlier blocks are replayed. The backend MUST return exactly the
+requested positions in strict order. Preceding blocks MUST return no
+checkpoints.
 
 ### 6.3 Stateless replay guarantees
 
@@ -327,7 +365,31 @@ block's computed post-state root. The resulting window therefore exposes:
 This telescope is self-consistency, not proof that the first pre-state belongs
 to the canonical chain.
 
-### 6.4 Settlement evidence
+### 6.4 Stateful replay guarantees
+
+For a request covering `m..=n`, the stateful backend MUST:
+
+1. require `m > 0` and identify block `m - 1` as the anchor;
+2. return `Unavailable` if the follower has not reached the anchor or cannot
+   currently read required canonical state;
+3. reject the request if the claimed anchor, or any requested block already in
+   the follower's canonical view, conflicts with the local canonical hash;
+4. open historical state at the canonical anchor and replay every proposed
+   block through `n` in one disposable state overlay;
+5. apply sections 6.1 and 6.2 and validate each block's consensus/header rules,
+   transactions, receipts, block hash, post-state root, and selected
+   post-transaction state roots against the continuously updated overlay; and
+6. after replay, re-read the anchor and every requested height known canonical
+   at completion, returning `Aborted` if that snapshot changed.
+
+The stateful backend MUST NOT commit the replay overlay to the follower
+database. Success and failure therefore require no database rollback. The
+follower database and chain specification are within this backend's operator
+trust boundary; the snapshot check prevents signing across an observed local
+reorganization but does not prove global canonicality or finality to a verifier
+of the signature.
+
+### 6.5 Settlement evidence
 
 From the validated block and receipts, the backend MUST retain:
 
@@ -722,14 +784,65 @@ messages SHOULD remain stable and must not expose secrets.
 | gRPC code | Principal cases |
 | --- | --- |
 | `InvalidArgument` | Malformed stream structure; invalid widths or bounds; noncanonical/invalid PostBatch calldata; malformed or trailing DA payload. |
-| `FailedPrecondition` | Rollup identity mismatch; Stateless input rejection; unsupported batch profile; state/effect/inbound/outbound/DA semantic rejection. |
-| `ResourceExhausted` | Another request is active; a decoding, block, byte, witness-item, or checkpoint limit was exceeded; or block-vector storage could not be reserved. |
+| `FailedPrecondition` | Rollup identity mismatch; backend input rejection, including a stateful canonical conflict; unsupported batch profile; state/effect/inbound/outbound/DA semantic rejection. |
+| `Unavailable` | Another request is active; the stateful follower is behind the required anchor; or required local canonical data is temporarily unavailable. The same complete request may succeed after the transient condition clears. |
+| `Aborted` | The stateful follower's relevant canonical snapshot changed during validation. |
+| `ResourceExhausted` | A decoding, block, byte, or witness-item limit was exceeded; or block-vector storage could not be reserved. |
 | `DeadlineExceeded` | Stream idle timeout or absolute request deadline. |
 | `Cancelled` | Cooperative stop after request cancellation. |
 | `Internal` | Backend-success output violates its contract; local invariant failure; impossible public-input computation/cardinality; reconstruction failures attributable to already validated internal evidence; signing failure. |
 
 A malformed candidate that could otherwise disappear from consideration MUST
 be retained and rejected at its authorization gate.
+
+### 14.1 Actionable failed preconditions
+
+A `FailedPrecondition` response MAY carry one protobuf-encoded `ProveFailure`
+in the gRPC status-details field when the validated execution identifies one
+cross-chain candidate that the Composer can safely remove. The status code,
+not the details payload, remains authoritative for retry classification.
+
+`ProveFailure.actionable_failure` has exactly two supported variants:
+
+- `OutboundFailure` identifies the original signed L2 user transaction by its
+  zero-based index in the terminal Sync block and its canonical 32-byte
+  transaction hash. When the preceding synthetic load transaction reverted,
+  the failure still identifies the paired user transaction; rebuilding the
+  Sync block regenerates or removes both halves together.
+- `InboundFailure` identifies the claimed effect by its zero-based index in
+  `PostBatch.entries` and the 32-byte keccak hash of that entry's canonical ABI
+  encoding. The original signed L1 transaction is not present in the proof
+  request, so the Composer MUST resolve it through the request-local
+  entry-to-held-transaction mapping retained during composition.
+
+The signer MUST attach an outbound detail only when validated terminal-block
+execution safely identifies the original user transaction: a reverted
+canonical synthetic load/user pair, or a positioned outbound observation
+failure attributable to the user transaction. It MUST attach an inbound detail
+only for a positioned inbound delivery transaction that reverted. Structural,
+ordering, envelope, claim-only, missing-candidate, extra-observation, DA, and
+state-chain failures MUST remain non-actionable even when their diagnostic
+contains an index. A mismatch between a claimed entry's call hash and an
+execution observation is claim-only in both directions and MUST remain
+non-actionable.
+
+Before changing pool state, the Composer MUST verify both fields against the
+exact rejected request: index and transaction hash for outbound, or index and
+canonical entry hash for inbound. Empty, malformed, unknown, wrong-width, or
+mismatched details MUST be handled as an ordinary non-actionable rejection.
+The Composer MUST NOT retry an unchanged request after an actionable failure.
+It MAY remove the resolved held transaction and its same-sender,
+same-direction nonce suffix, then rebuild and submit a smaller batch within the
+remaining slot budget. This recovery does not authorize bisection or eviction
+for failures that carry no valid typed detail.
+
+The index-and-hash checks bind an actionable detail to the rejected request;
+they do not independently prove that the reported execution failure occurred.
+The Composer therefore trusts its configured prover not to falsely attribute a
+failure. A buggy or compromised prover can cause valid held transactions and
+their nonce suffixes to be evicted, requiring users to resubmit. Authenticating
+the Composer-prover transport prevents response injection but does not remove
+this configured-prover trust.
 
 ## 15. Conformance and change control
 
@@ -740,9 +853,9 @@ supported profile are security-sensitive.
 A compatible implementation MUST test at least:
 
 - every stream ordering, identity, and quota boundary;
-- strict chain-document parsing and secret redaction;
+- strict backend-configuration parsing and secret redaction;
 - exact RLP identity/hash binding and backend-output association;
-- checkpoint selection, quota, returned positions, and roots;
+- checkpoint selection, returned positions, and roots;
 - canonical PostBatch decoding and every profile pin;
 - state-chain endpoints, continuity, effect count/order/kind, and checkpoints;
 - inbound outer/inner equality, call hash, rolling hash, value, and canonical
@@ -750,8 +863,16 @@ A compatible implementation MUST test at least:
 - outbound event provenance, canonical encoding, zero-`callGas` hash, L1
   rolling hash, ordering, source, and value;
 - exact DA projection, sidecars, and mixed Sync-block reconstruction;
+- actionable outbound/inbound failure attribution, reference validation, and
+  non-actionable fallback;
 - public-input vectors against the pinned Solidity formula; and
 - raw-digest ECDSA recovery, low-`s`, and `v` encoding.
+
+Each enabled execution backend MUST also test its trust boundary. The stateless
+backend MUST cover strict chain-document and witness-backed replay behavior. The
+stateful backend MUST cover follower lag, canonical conflicts, historical-state
+replay, disposable multi-block overlays, and canonical snapshot changes during
+validation.
 
 The root Kurtosis gate MUST also observe at least one successful signer
 attestation and one node-side acceptance of a remote attestation while running
@@ -1000,17 +1121,21 @@ one byte (`0x00` or `0x01`).
 
 The principal sources for this specification are:
 
-- `src/config.rs`, `src/service.rs`, and `src/service/` for configuration,
-  request lifetime, deadlines, and error mapping;
+- `../eez-prover-stateless/src/config.rs`, `src/service.rs`, and `src/service/`
+  for configuration, request lifetime, deadlines, and error mapping;
 - `src/window.rs` and `../eez-control-rpc/proto/prove.proto` for wire admission;
-- `src/validate.rs`, `src/validate/stateless.rs`, and
-  `src/validate/stateless/chain_config.rs` for replay evidence;
+- `src/validate.rs`, `src/validate/support.rs`,
+  `../eez-prover-stateless/src/backend.rs`, and
+  `../eez-prover-stateless/src/backend/chain_config.rs` for replay evidence;
+- `../eez-prover-stateful/src/config.rs`,
+  `../eez-prover-stateful/src/backend.rs`, and `../eez-follower/src/lib.rs` for the
+  follower-hosted stateful profile;
 - `src/settlement/` for canonical decoding, profile, state, effect, inbound,
   outbound, DA, and system-transaction gates;
 - `src/attest.rs` and `../eez-protocol/src/signer.rs` for attestation;
 - `../eez-protocol/src/abi.rs`, `action.rs`, `rolling_hash.rs`,
   `public_inputs.rs`, and `system_tx.rs` for shared protocol mirrors; and
-- `../../sync-rollups-protocol/src/interfaces/IEEZ.sol`, `EEZ.sol`,
+- `../../eez-core-protocol/src/interfaces/IEEZ.sol`, `EEZ.sol`,
   `src/interfaces/IEEZL2.sol`, `src/L2/EEZL2.sol`, and
   `src/rollupContract/Rollup.sol` for pinned protocol behavior; and
 - `../../contracts/src/ECDSAProofSystem.sol` for the deployed ECDSA verifier.

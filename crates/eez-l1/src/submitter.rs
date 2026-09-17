@@ -1,7 +1,6 @@
-//! Thin L1-interaction primitive: sends `postAndVerifyBatch` via
-//! `eth_sendBundle` and reads past `BatchPosted` events. Stateless —
-//! the runtime composer owns cursors, batch construction, and prover
-//! orchestration.
+//! Thin signed L1-submission primitive: sends `postAndVerifyBatch` via
+//! `eth_sendBundle`. Read-only canonical-chain scans live in
+//! [`L1Reader`].
 //!
 //! `eth_sendBundle` pins inclusion to one L1 block. If the bundle
 //! isn't in that block we report [`SendOutcome::Dropped`] and the
@@ -24,7 +23,7 @@ use tracing::{Level, event};
 
 use crate::config::SubmitterConfig;
 use crate::error::{L1Error, L1Result};
-use crate::scan::{BatchLogChunks, ScannedBatch, scan_next_batch_log_chunk};
+use crate::l1_reader::L1Reader;
 
 /// Wall-clock cap on the target-block + inclusion check.
 const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
@@ -74,6 +73,7 @@ pub struct Submitter {
 
 struct Inner {
     config: SubmitterConfig,
+    reader: L1Reader,
     http: reqwest::Client,
 }
 
@@ -89,9 +89,11 @@ impl Submitter {
     /// Build a Submitter from its config.
     #[must_use]
     pub fn new(config: SubmitterConfig) -> Self {
+        let reader = L1Reader::new(config.reader.clone());
         Self {
             inner: Arc::new(Inner {
                 config,
+                reader,
                 // Bounded timeout so a hanging/unreachable builder relay cannot
                 // stall the one-in-flight gate forever: a timed-out `eth_sendBundle`
                 // returns Err, which `observe_bundle_outcome` treats as a drop →
@@ -104,6 +106,14 @@ impl Submitter {
                     .unwrap_or_else(|_| reqwest::Client::new()),
             }),
         }
+    }
+
+    /// Clone the read-only canonical L1 client contained by this Submitter.
+    /// The Deriver uses it without gaining access to submission credentials or
+    /// builder routing.
+    #[must_use]
+    pub fn reader(&self) -> L1Reader {
+        self.inner.reader.clone()
     }
 
     /// L1 EOA address this Submitter sends from. Used by the Composer
@@ -213,58 +223,6 @@ impl Submitter {
             .is_some())
     }
 
-    /// Creates bounded `BatchPosted` log chunks from `from_block` to the
-    /// current L1 head. Call [`Self::next_batch_log_chunk`] to consume it.
-    ///
-    /// # Errors
-    ///
-    /// [`L1Error::Provider`] on RPC failure.
-    pub async fn batch_log_chunks(&self, from_block: u64) -> L1Result<BatchLogChunks> {
-        let provider = self.inner.build_provider();
-        let latest = provider
-            .get_block_number()
-            .await
-            .map_err(|e| L1Error::Provider(format!("get_block_number: {e}")))?;
-        Ok(BatchLogChunks::new(from_block, latest))
-    }
-
-    /// Scans and returns the next `BatchPosted` log chunk, or `None` when
-    /// the chunks are exhausted.
-    ///
-    /// # Errors
-    ///
-    /// - [`L1Error::Provider`] on RPC failure (log fetch, tx fetch).
-    /// - [`L1Error::SourceIncomplete`] when a canonical batch tx is not
-    ///   served by the L1 source yet — retryable once the source syncs.
-    pub async fn next_batch_log_chunk(
-        &self,
-        chunks: &mut BatchLogChunks,
-    ) -> L1Result<Option<Vec<ScannedBatch>>> {
-        let provider = self.inner.build_provider();
-        scan_next_batch_log_chunk(
-            &provider,
-            self.inner.config.eez,
-            self.inner.config.rollup_id,
-            chunks,
-        )
-        .await
-    }
-
-    /// Hash of the canonical L1 block at `number`, or `None` if none. Used by
-    /// the Deriver's resync to check whether an indexed batch is still canonical.
-    ///
-    /// # Errors
-    ///
-    /// [`L1Error::Provider`] on RPC failure.
-    pub async fn canonical_l1_hash(&self, number: u64) -> L1Result<Option<alloy_primitives::B256>> {
-        let provider = self.inner.build_provider();
-        Ok(provider
-            .get_block_by_number(BlockNumberOrTag::Number(number))
-            .await
-            .map_err(|e| L1Error::Provider(format!("get_block_by_number({number}): {e}")))?
-            .map(|b| b.header.hash))
-    }
-
     /// Timestamp of an L1 block on the target chain, or `None` if absent.
     /// Distinguishes a skipped-slot drop from a genuine exclusion.
     pub async fn block_timestamp(&self, number: u64) -> L1Result<Option<u64>> {
@@ -278,14 +236,6 @@ impl Submitter {
 }
 
 impl Inner {
-    fn build_provider(&self) -> impl Provider + use<> {
-        // No wallet: writes go through the builder relay, reads
-        // don't need signing. Pre-sim sets `from` explicitly.
-        ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(self.config.rpc_url.clone())
-    }
-
     /// Provider used ONLY for target-block discovery on
     /// `BundleTarget::NextBlock`. Falls back to the main RPC when no
     /// override URL is set. See `SubmitterConfig::target_rpc_url`.
@@ -294,7 +244,7 @@ impl Inner {
             .config
             .target_rpc_url
             .clone()
-            .unwrap_or_else(|| self.config.rpc_url.clone());
+            .unwrap_or_else(|| self.reader.rpc_url());
         ProviderBuilder::new()
             .disable_recommended_fillers()
             .connect_http(url)
@@ -338,17 +288,38 @@ impl Inner {
         .await
         {
             Ok(()) => {
-                self.observe(post_batch_hash, target_block, expected_final_state)
-                    .await
+                // Relay path: the builder honors the min/max timestamp pin, so
+                // an Exact target's `pin_timestamp` unlocks the early verdict.
+                self.observe(
+                    post_batch_hash,
+                    target_block,
+                    pin_timestamp,
+                    expected_final_state,
+                )
+                .await
             }
             Err(L1Error::BundleRpcUnsupported) => {
-                event!(
-                    name: "eez.submitter.bundle.mempool_fallback",
-                    Level::INFO,
-                    target_block,
-                    tx_count = raw_txs.len(),
-                    "relay has no eth_sendBundle; submitting txs via mempool in order",
-                );
+                // A multi-tx bundle needs its order kept: the deferred entries
+                // chain, so a reordered user tx finds no entry and reverts.
+                if raw_txs.len() > 1 {
+                    event!(
+                        name: "eez.submitter.bundle.mempool_fallback",
+                        Level::WARN,
+                        event_name = "eez.submitter.bundle.mempool_fallback",
+                        target_block,
+                        tx_count = raw_txs.len(),
+                        "relay has no eth_sendBundle; the mempool does NOT guarantee bundle order, so bundled user txs may revert",
+                    );
+                } else {
+                    event!(
+                        name: "eez.submitter.bundle.mempool_fallback",
+                        Level::INFO,
+                        event_name = "eez.submitter.bundle.mempool_fallback",
+                        target_block,
+                        tx_count = raw_txs.len(),
+                        "relay has no eth_sendBundle; submitting the lone postBatch via mempool",
+                    );
+                }
                 let target_provider = self.build_target_provider();
                 for (idx, raw) in raw_txs.iter().enumerate() {
                     if let Err(err) = alloy_provider::Provider::send_raw_transaction(
@@ -375,7 +346,9 @@ impl Inner {
                         );
                     }
                 }
-                self.observe(post_batch_hash, target_block, expected_final_state)
+                // No bundle API, no timestamp pin: these txs can genuinely land
+                // in a later block, so the conservative rule is the only one.
+                self.observe(post_batch_hash, target_block, None, expected_final_state)
                     .await
             }
             Err(other) => Err(other),
@@ -388,10 +361,14 @@ impl Inner {
     /// target produced false `Dropped` verdicts), then derive
     /// `state_applied` from the inclusion block's `L2ExecutionPerformed`
     /// events via [`Self::settlement_in_block`].
+    ///
+    /// `pinned` is the timestamp pin, set only for an [`BundleTarget::Exact`]
+    /// bundle the relay accepted — those get the early verdict below.
     async fn observe(
         &self,
         tx_hash: TxHash,
         target_block: u64,
+        pin_timestamp: Option<u64>,
         expected_final_state: Option<alloy_primitives::B256>,
     ) -> L1Result<SendOutcome> {
         // Failure must mean PROVABLY DEAD, not merely slow. A bundle is
@@ -406,6 +383,9 @@ impl Inner {
         // would re-open the false-death window. If the tip later reorgs
         // the bundle in, downstream converges it (Watcher → Deriver →
         // recovery cursor re-check drops the stale verdict).
+        //
+        // `pinned` buys a slot without weakening that: min == max timestamp
+        // leaves one satisfiable height, so the block there decides it.
         let start = tokio::time::Instant::now();
         let target_provider = self.build_target_provider();
         let mut slow_logged = false;
@@ -427,23 +407,46 @@ impl Inner {
                         state_applied,
                     });
                 }
-                Ok(None) => match target_provider.get_block_number().await {
-                    Ok(head) if head > target_block => {
-                        return Ok(dropped(
-                            tx_hash,
-                            target_block,
-                            "target block passed without inclusion",
-                        ));
+                Ok(None) => {
+                    let verdict = match pin_timestamp {
+                        Some(pin_ts) => {
+                            pinned_slot_check(&target_provider, target_block, tx_hash, pin_ts).await
+                        }
+                        None => PinnedVerdict::Pending,
+                    };
+                    match verdict {
+                        PinnedVerdict::Excluded => {
+                            return Ok(dropped(
+                                tx_hash,
+                                target_block,
+                                "pinned slot built without inclusion",
+                            ));
+                        }
+                        PinnedVerdict::SlotSkipped => {
+                            return Ok(dropped(tx_hash, target_block, "pinned slot skipped"));
+                        }
+                        // Our tx IS in the pinned block; only the receipt read
+                        // trails it. Poll on, skipping the head rule.
+                        PinnedVerdict::Included => {}
+                        PinnedVerdict::Pending => match target_provider.get_block_number().await {
+                            Ok(head) if head > target_block => {
+                                return Ok(dropped(
+                                    tx_hash,
+                                    target_block,
+                                    "target block passed without inclusion",
+                                ));
+                            }
+                            Ok(_) => {}
+                            Err(err) => event!(
+                                name: "eez.submitter.observe.head_read_failed",
+                                Level::WARN,
+                                tx_hash = %tx_hash,
+                                error = %err,
+                                "head read failed during bundle observation; retrying",
+                            ),
+                        },
                     }
-                    Ok(_) => {}
-                    Err(err) => event!(
-                        name: "eez.submitter.observe.head_read_failed",
-                        Level::WARN,
-                        tx_hash = %tx_hash,
-                        error = %err,
-                        "head read failed during bundle observation; retrying",
-                    ),
-                },
+                }
                 Err(err) => event!(
                     name: "eez.submitter.observe.receipt_read_failed",
                     Level::WARN,
@@ -487,9 +490,9 @@ impl Inner {
         expected_final_state: Option<alloy_primitives::B256>,
     ) -> L1Result<bool> {
         let winners = Filter::new()
-            .address(self.config.eez)
+            .address(self.reader.eez())
             .event_signature(L2ExecutionPerformed::SIGNATURE_HASH)
-            .topic1(U256::from(self.config.rollup_id))
+            .topic1(U256::from(self.reader.rollup_id()))
             .from_block(l1_block)
             .to_block(l1_block);
         let logs = provider
@@ -583,6 +586,68 @@ async fn post_bundle(
     Ok(())
 }
 
+/// Verdict for a relay-submitted, timestamp-pinned bundle, read off the
+/// canonical block at the pinned height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinnedVerdict {
+    /// Height not built (or not visible) yet — no verdict.
+    Pending,
+    /// Our postBatch is in it; the receipt follows.
+    Included,
+    /// Built without us; atomic bundles land in that block or nowhere.
+    Excluded,
+    /// Another timestamp filled the height. Timestamps strictly increase, so
+    /// no later block can satisfy `minTimestamp == maxTimestamp == pin_ts`.
+    SlotSkipped,
+}
+
+/// `block` is `(timestamp, contains our tx)` at the pinned height, `None` while
+/// unobservable. Inclusion outranks a timestamp mismatch — in is in.
+fn pinned_verdict(block: Option<(u64, bool)>, pin_ts: u64) -> PinnedVerdict {
+    match block {
+        None => PinnedVerdict::Pending,
+        Some((_, true)) => PinnedVerdict::Included,
+        Some((ts, false)) if ts == pin_ts => PinnedVerdict::Excluded,
+        Some(_) => PinnedVerdict::SlotSkipped,
+    }
+}
+
+/// Read the canonical block at the pinned height (hashes only) and apply
+/// [`pinned_verdict`]. RPC failures yield `Pending`, never a verdict.
+async fn pinned_slot_check<P: Provider>(
+    provider: &P,
+    target_block: u64,
+    tx_hash: TxHash,
+    pin_ts: u64,
+) -> PinnedVerdict {
+    match provider
+        .get_block_by_number(BlockNumberOrTag::Number(target_block))
+        .hashes()
+        .await
+    {
+        Ok(block) => pinned_verdict(
+            block.map(|b| {
+                (
+                    b.header.timestamp,
+                    b.transactions.hashes().any(|h| h == tx_hash),
+                )
+            }),
+            pin_ts,
+        ),
+        Err(err) => {
+            event!(
+                name: "eez.submitter.observe.pinned_block_read_failed",
+                Level::WARN,
+                tx_hash = %tx_hash,
+                target_block,
+                error = %err,
+                "pinned block read failed during bundle observation; retrying",
+            );
+            PinnedVerdict::Pending
+        }
+    }
+}
+
 fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutcome {
     event!(
         name: "eez.submitter.bundle.dropped",
@@ -595,5 +660,43 @@ fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutc
     SendOutcome::Dropped {
         tx_hash,
         target_block,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PinnedVerdict, pinned_verdict};
+
+    const PIN: u64 = 1_700_000_012;
+
+    #[test]
+    fn pinned_verdict_covers_every_arm() {
+        for (case, block, want) in [
+            ("height unbuilt", None, PinnedVerdict::Pending),
+            (
+                "block carries our tx",
+                Some((PIN, true)),
+                PinnedVerdict::Included,
+            ),
+            (
+                "pinned slot built without us",
+                Some((PIN, false)),
+                PinnedVerdict::Excluded,
+            ),
+            (
+                "timestamp mismatch",
+                Some((PIN + 5, false)),
+                PinnedVerdict::SlotSkipped,
+            ),
+            // Inclusion is the stronger fact: a builder that ignored the pin
+            // still settled us, so never call that height a skip.
+            (
+                "included despite mismatch",
+                Some((PIN + 5, true)),
+                PinnedVerdict::Included,
+            ),
+        ] {
+            assert_eq!(pinned_verdict(block, PIN), want, "{case}");
+        }
     }
 }

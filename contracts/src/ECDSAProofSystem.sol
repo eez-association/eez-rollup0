@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
-import {IProofSystem} from "sync-rollups-protocol/src/interfaces/IProofSystem.sol";
+import {IProofSystem} from "eez-core-protocol/src/interfaces/IProofSystem.sol";
 
 /// @title ECDSAProofSystem
 /// @notice `IProofSystem` that binds to the per-batch `publicInputsHash`: a
 ///         valid proof is a 65-byte ECDSA signature over the `publicInputsHash`
 ///         the EEZ dispatcher recomputes on-chain, by the authorized attester.
 ///
-/// @dev    This is the real counterpart of `MockECDSAProofSystem` (which ignores
-///         the hash and recovers a fixed digest). Here the off-chain attester —
-///         `eez-proof-signer`, after stateless re-execution and settlement gates —
-///         signs the recomputed `publicInputsHash`; `verify` recovers against
-///         that same hash, so the proof is BOUND to the batch. Sound only when
-///         the attester signs a hash it actually re-executed (the signer enforces
-///         this: validator mandatory, sign only if every gate passes).
+/// @dev    The off-chain attester (`eez-proof-signer`) signs the recomputed
+///         `publicInputsHash` after stateless re-execution and settlement gates.
+///         `verify` recovers against that same hash, so the proof is bound to
+///         the batch. Sound only when the attester signs a hash it actually
+///         re-executed (validator mandatory; sign only if every gate passes).
 ///
 ///         Proof shape: `abi.encodePacked(r, s, v)` — 32 + 32 + 1 = 65 bytes.
 ///

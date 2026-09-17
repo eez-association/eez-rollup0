@@ -1,14 +1,4 @@
 //! Strongly-typed rollup identifier.
-//!
-//! Treats `rollupId` as a first-class parameter of every component
-//! (upstream's "Invariant 8"). [`RollupId`] makes that constraint
-//! compiler-enforced: it cannot be confused with `chain_id`, `gas_used`,
-//! block numbers, or any of the dozens of other `u64`s that flow through
-//! the codebase.
-//!
-//! Serializes transparently as a bare number — JSON / TOML / proto
-//! representations are byte-identical to plain `u64`, so existing
-//! configs and RPC responses round-trip unchanged.
 
 use serde::{Deserialize, Serialize};
 

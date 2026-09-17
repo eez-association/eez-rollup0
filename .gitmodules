@@ -1,5 +1,5 @@
-[submodule "sync-rollups-protocol"]
-	path = sync-rollups-protocol
+[submodule "eez-core-protocol"]
+	path = eez-core-protocol
 	url = https://github.com/eez-association/eez-core-protocol.git
 	# The gitlink pins the protocol revision. Upgrade it deliberately by
 	# checking out the desired revision in the submodule and committing the

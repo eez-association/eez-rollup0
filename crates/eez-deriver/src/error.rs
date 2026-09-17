@@ -87,6 +87,13 @@ impl DeriverError {
         matches!(&self.kind, ErrorKind::L1Scan(err) if err.is_source_incomplete())
     }
 
+    /// Returns true if the L1 RPC never answered (DNS, TCP, HTTP). Decode
+    /// failures are excluded: they are deterministic and never clear.
+    #[must_use]
+    pub fn is_l1_transport(&self) -> bool {
+        matches!(&self.kind, ErrorKind::L1Scan(err) if err.is_transport())
+    }
+
     /// Returns true if the `BlockCommitter` actor task has exited.
     #[must_use]
     pub fn is_committer_closed(&self) -> bool {

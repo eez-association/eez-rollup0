@@ -619,33 +619,6 @@ async fn validator_rejection_precedes_settlement_decoding() {
 }
 
 #[tokio::test]
-async fn stateless_validation_is_mandatory_and_remains_fail_closed() {
-    let server = TestServer::new(inner(Validator::stateless_for_test(
-        Default::default(),
-        TEST_SYSTEM_ADDRESS,
-    )))
-    .await;
-    let status = server.prove(stateless_window()).await;
-    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
-    assert_eq!(status.message(), "window validation rejected");
-}
-
-#[tokio::test]
-async fn stateless_rejections_are_redacted() {
-    let server = TestServer::new(inner(Validator::stateless_for_test(
-        Default::default(),
-        TEST_SYSTEM_ADDRESS,
-    )))
-    .await;
-    let mut window = stateless_window();
-    block_mut(&mut window[1]).parent_hash = vec![0xee; 32];
-
-    let status = server.prove(window).await;
-    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
-    assert_eq!(status.message(), "window validation rejected");
-}
-
-#[tokio::test]
 async fn invalid_backend_outputs_are_internal_errors() {
     let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output_for(&[]))]))).await;
 

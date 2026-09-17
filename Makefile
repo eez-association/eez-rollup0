@@ -26,7 +26,7 @@ help:
 	@echo "  make test             - cargo test + forge test"
 	@echo "  make fmt              - cargo fmt + forge fmt"
 	@echo "  make deploy-protocol  - deploy EEZ + ECDSA PS + Rollup manager + register; writes deployments.env"
-	@echo "  make run-node         - run eez-node against the configured L2 datadir"
+	@echo "  make run-node         - run the composer against the configured L2 datadir"
 	@echo "  make clean-l2         - rm EEZ_L2_DATADIR (fresh L2 chain)"
 	@echo "  make clean-deploy     - rm deployments.env (fresh contract addresses on next deploy)"
 

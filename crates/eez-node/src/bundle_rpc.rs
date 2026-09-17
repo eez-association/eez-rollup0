@@ -10,7 +10,7 @@
 //!
 //! This module closes the gap: [`install_dev_bundle_rpc`] registers an
 //! `eth_sendBundle` method directly on the dev L1's own RPC server (via
-//! the node builder's `extend_rpc_modules` hook in [`crate::main`]). The
+//! the node builder's `extend_rpc_modules` hook in [`crate::run_composer`]). The
 //! handler forwards each signed, 2718-encoded tx through the node's own
 //! [`EthApiServer::send_raw_transaction`] — full validation + correct
 //! pool insertion — in submitted order, so the dev auto-miner lands them
@@ -108,6 +108,7 @@ where
         event!(
             name: "eez.node.l1_embedded.bundle.accepted",
             Level::INFO,
+            event_name = "eez.node.l1_embedded.bundle.accepted",
             tx_count = bundle.txs.len(),
             target_block = bundle.block_number.as_deref().unwrap_or("next"),
             "embedded dev L1 eth_sendBundle: forwarded txs to pool in order",
