@@ -19,10 +19,14 @@
 //! with a protobuf varint.
 //!
 //! `operations` is opaque to EEZ — "everything about how `operations` is
-//! structured is up to the chain" — so Rollup0's published
-//! `0x00 ‖ native_block_span_v0` rides inside it verbatim, byte-exact against
-//! the Appendix D.4.2 vectors. Nothing here extends it: the span's start comes
+//! structured is up to the chain" — so Rollup0's `0x00 ‖ native_block_span_v0`
+//! rides inside it verbatim. Nothing here extends it: the span's start comes
 //! from the settled parent EEZ names, not from a field of our own.
+//!
+//! INTERIM CALLDATA PROFILE, not full blob-format compliance: §2.1 and §5
+//! cond. 2 want `CloseBlobStream` in the blob portion, cond. 3 forbids it in
+//! the tail, and a zero-blob stream has nowhere legal to put it. Open with the
+//! spec owner.
 
 use crate::{CodecError, CodecResult, Cursor, DecodedSpan, SpanBlock};
 
@@ -216,8 +220,8 @@ fn put_bytes(out: &mut Vec<u8>, value: &[u8]) -> CodecResult<()> {
 }
 
 fn take_bytes<'a>(cur: &mut Cursor<'a>, what: &'static str) -> CodecResult<&'a [u8]> {
-    let len = varint(cur, what)?;
-    let len = usize::try_from(len).map_err(|_| CodecError::NonCanonicalVarint(what))?;
+    let len =
+        usize::try_from(varint(cur, what)?).map_err(|_| CodecError::NonCanonicalVarint(what))?;
     cur.take(what, len)
 }
 
@@ -229,22 +233,19 @@ fn put_varint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
-/// Read a protobuf varint, rejecting non-shortest and over-long encodings so
-/// every value has exactly one representation.
-/// A protobuf varint. Non-minimal encodings stay valid here (§5 cond. 8),
-/// unlike the span's `uvarint32`; the errors below are range guards, not
-/// minimality.
-fn varint(cur: &mut Cursor<'_>, what: &'static str) -> CodecResult<u64> {
+/// A `bytes` length prefix: a `u32` in one to five bytes (§1.1). Non-minimal
+/// encodings stay valid (§5 cond. 8); anything outside that domain does not.
+fn varint(cur: &mut Cursor<'_>, what: &'static str) -> CodecResult<u32> {
     let mut value: u64 = 0;
-    for i in 0..10 {
+    for i in 0..crate::MAX_UVARINT32_BYTES {
         let byte = cur.byte(what)?;
         let group = u64::from(byte & 0x7f);
-        if i == 9 && group > 0x01 {
+        if i == crate::MAX_UVARINT32_BYTES - 1 && group > 0x0f {
             return Err(CodecError::NonCanonicalVarint(what));
         }
         value |= group << (7 * i);
         if byte & 0x80 == 0 {
-            return Ok(value);
+            return u32::try_from(value).map_err(|_| CodecError::NonCanonicalVarint(what));
         }
     }
     Err(CodecError::NonCanonicalVarint(what))
@@ -338,8 +339,28 @@ mod tests {
         );
     }
 
-    /// A stream whose first byte is not a known protocol version is rejected
-    /// whole, never parsed under this format.
+    /// Outside the `u32` / five-byte domain (§1.1) no conforming decoder
+    /// accepts it, unlike a merely non-minimal prefix.
+    #[test]
+    fn a_length_prefix_outside_the_u32_domain_is_rejected() {
+        let encoded = encode_container(ROLLUP, &span(), &[]).unwrap();
+        let at = 1 + 1 + 8;
+
+        let mut over_long = encoded.clone();
+        over_long.splice(at..=at, [0x80, 0x80, 0x80, 0x80, 0x80, 0x00]);
+        assert_eq!(
+            decode_container(&over_long).unwrap_err(),
+            CodecError::NonCanonicalVarint("operations"),
+        );
+
+        let mut overflow = encoded.clone();
+        overflow.splice(at..=at, [0x80, 0x80, 0x80, 0x80, 0x10]);
+        assert_eq!(
+            decode_container(&overflow).unwrap_err(),
+            CodecError::NonCanonicalVarint("operations"),
+        );
+    }
+
     /// §5 cond. 8: a padded length prefix is valid EEZ, so a peer emitting
     /// one must not be rejected.
     #[test]
@@ -357,6 +378,8 @@ mod tests {
         );
     }
 
+    /// A stream whose first byte is not a known protocol version is rejected
+    /// whole, never parsed under this format.
     #[test]
     fn an_unknown_stream_version_is_rejected() {
         let mut forged = encode_container(ROLLUP, &span(), &[]).unwrap();

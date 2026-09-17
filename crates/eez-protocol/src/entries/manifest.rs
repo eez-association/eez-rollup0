@@ -34,13 +34,36 @@ pub fn action_from_entry(entry: &ExecutionEntrySol, local: RollupId) -> Protocol
         )
         .into());
     };
+    // Reject what an `Action` cannot carry: the deriver rebuilds the entry
+    // from it, so anything dropped here rebuilds a different entry.
+    if !entry.expectedL1ToL2Calls.is_empty() {
+        return Err(crate::ProtocolErrorKind::InvalidEncoding(
+            "a DA action cannot carry nested expected calls".to_string(),
+        )
+        .into());
+    }
+    if call.isStatic || call.revertNextNCalls != 0 {
+        return Err(crate::ProtocolErrorKind::InvalidEncoding(
+            "a DA action needs a flat, mutable call: no static call, no revert span".to_string(),
+        )
+        .into());
+    }
     // An entry whose call originates here is our outbound settlement, so its
     // target is the settlement L1; anything else is an inbound delivery to us.
     let source_rollup_id = RollupId(call.sourceRollupId);
     let target_rollup_id = if source_rollup_id == local {
         RollupId::MAINNET
     } else {
-        RollupId(entry.destinationRollupId)
+        // Another rollup's delivery is not ours to project; retargeting it
+        // silently would rebuild a different entry.
+        if entry.destinationRollupId != local.0 {
+            return Err(crate::ProtocolErrorKind::InvalidEncoding(format!(
+                "a DA action's inbound entry targets rollup {}, not {}",
+                entry.destinationRollupId, local.0,
+            ))
+            .into());
+        }
+        local
     };
     Ok(Action {
         source_rollup_id: source_rollup_id.0,

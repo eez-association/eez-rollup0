@@ -1,4 +1,5 @@
-//! Rollup0 DA payload — `native_block_span_v0` (spec Appendix G).
+//! Rollup0 DA payload — `native_block_span_v0`, this chain's contents of
+//! `ChainOperation.operations`, which EEZ treats as opaque (§2.2).
 //!
 //! ```text
 //!   operations := 0x00 ‖ NativeBlockSpan
@@ -696,7 +697,7 @@ mod tests {
         assert_eq!(decoded.transactions[0], raw);
     }
 
-    /// Normative codec vectors from spec Appendix D.4.2. The encoding is
+    /// Rollup0 golden vectors for this chain-defined encoding. The encoding is
     /// canonical, so each valid vector must both decode to its stated fields
     /// and re-encode to the exact published bytes.
     mod spec_vectors {

@@ -116,9 +116,31 @@ fn da_payload_rejects_noncanonical_outer_and_integer_encodings() {
     wrong_span_version[11] = 0x01; // the span's own payload version
     assert!(verify_rejects(&wrong_span_version), "span version");
 
-    // A padded two-byte varint is a second encoding of the same length.
-    let non_shortest_len = [&canonical[..10], &[0x81, 0x00][..], &canonical[11..]].concat();
-    assert!(verify_rejects(&non_shortest_len), "non-shortest varint");
+    let over_long_len = [
+        &canonical[..10],
+        &[0x80, 0x80, 0x80, 0x80, 0x80, 0x00][..],
+        &canonical[11..],
+    ]
+    .concat();
+    assert!(verify_rejects(&over_long_len), "over-long varint");
+}
+
+/// A non-minimal prefix stays valid (§5 cond. 8). Padding the REAL length is
+/// what keeps this about minimality rather than a shifted offset.
+#[test]
+fn da_payload_accepts_a_non_minimal_outer_length() {
+    let block_rlp = block_rlp(Vec::new());
+    let canonical = encode_da_payload(&[Vec::new()], &[]);
+    let padded = [
+        &canonical[..10],
+        &[canonical[10] | 0x80, 0x00][..],
+        &canonical[11..],
+    ]
+    .concat();
+
+    assert!(canonical[10] < 0x80, "fixture length must fit one byte");
+    verify_anchor_only_da_payload(&padded, [(41, block_rlp.as_slice())])
+        .expect("a padded length prefix is valid EEZ");
 }
 
 #[test]

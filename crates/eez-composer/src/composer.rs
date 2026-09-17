@@ -4054,16 +4054,11 @@ where
                 .map_err(|e| format!("DA action for entry: {e}"))
             })
             .collect::<Result<_, String>>()?;
-        // Chained state deltas mean a skipped entry strands every later one
-        // (`EEZ.sol:_entryMatches`), so a manifest WE emit can only fail
-        // terminally. The contract allows a success after a failure, so this
-        // gates emission only — decoding must still accept a peer's.
-        if let Some(at) = actions.iter().position(|a| !a.success)
-            && at + 1 != actions.len()
-        {
+        // A failed action is never emitted: an unsuccessful call is rejected
+        // as unsupported long before it becomes an entry.
+        if let Some(at) = actions.iter().position(|a| !a.success) {
             return Err(format!(
-                "action {at} of {} failed but is not last; our chained entries cannot settle \
-                 past a failure",
+                "action {at} of {} failed; we do not emit failed actions",
                 actions.len(),
             )
             .into());
