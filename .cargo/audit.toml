@@ -1,0 +1,30 @@
+# cargo-audit policy for the `Dependency Audit` CI job.
+#
+# cargo-audit does not read deny.toml, so the accepted-advisory list is
+# duplicated here. Keep the two in sync: an ID added to one usually belongs in
+# the other. cargo-audit sees a slightly wider graph than cargo-deny, so a few
+# IDs below have no deny.toml counterpart.
+
+[advisories]
+ignore = [
+    # ── also ignored in deny.toml ──────────────────────────────────────────
+    # anyhow `Error::downcast_mut()` unsoundness. Transitive; we never
+    # downcast_mut an anyhow error.
+    "RUSTSEC-2026-0190",
+    # hickory-proto NSEC3 unbounded loop (no patched release) and O(n^2) name
+    # compression DoS. Reached via reth's p2p DNS discovery, not enabled here.
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
+
+    # ── seen only by cargo-audit's graph ───────────────────────────────────
+    # tracing-subscriber 0.2.x ANSI escape injection through log fields.
+    # Requires a transitive dependency to move to 0.3.x; we log via 0.3
+    # ourselves.
+    "RUSTSEC-2025-0055",
+]
+
+[output]
+quiet = false
+# Unmaintained/unsound advisories stay visible in the job log without failing
+# it; deny.toml's `unmaintained = "workspace"` is the gate for the ones we own.
+deny = []

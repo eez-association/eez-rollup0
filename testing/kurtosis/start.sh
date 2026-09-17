@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the candidate images and start the CI test network.
+# Build the selected images and start the local Kurtosis devnet.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -10,22 +10,22 @@ ARGS_FILE="${1:-$HERE/ci-args.yaml}"
 command -v kurtosis >/dev/null || { echo "kurtosis not found in PATH" >&2; exit 1; }
 command -v docker   >/dev/null || { echo "docker not found in PATH" >&2; exit 1; }
 
-PROTOCOL_DIR="$REPO/sync-rollups-protocol"
+PROTOCOL_DIR="$REPO/eez-core-protocol"
 
 # Fail before building images if the protocol submodule is missing or stale.
 if [[ ! -d "$PROTOCOL_DIR/.git" && ! -f "$PROTOCOL_DIR/.git" ]]; then
-    echo "sync-rollups-protocol submodule is not initialized." >&2
-    echo "Run: git submodule update --init --recursive sync-rollups-protocol" >&2
+    echo "eez-core-protocol submodule is not initialized." >&2
+    echo "Run: git submodule update --init --recursive eez-core-protocol" >&2
     exit 1
 fi
 
-EXPECTED_PROTOCOL_COMMIT="$(git -C "$REPO" ls-files -s sync-rollups-protocol | awk '{print $2}')"
+EXPECTED_PROTOCOL_COMMIT="$(git -C "$REPO" ls-files -s eez-core-protocol | awk '{print $2}')"
 ACTUAL_PROTOCOL_COMMIT="$(git -C "$PROTOCOL_DIR" rev-parse HEAD)"
 if [[ -z "$EXPECTED_PROTOCOL_COMMIT" || "$ACTUAL_PROTOCOL_COMMIT" != "$EXPECTED_PROTOCOL_COMMIT" ]]; then
-    echo "sync-rollups-protocol is not at the commit pinned by this checkout." >&2
-    echo "Run: git submodule update --init --recursive sync-rollups-protocol" >&2
+    echo "eez-core-protocol is not at the commit pinned by this checkout." >&2
+    echo "Run: git submodule update --init --recursive eez-core-protocol" >&2
     echo "Current submodule status:" >&2
-    git -C "$REPO" submodule status sync-rollups-protocol >&2 || true
+    git -C "$REPO" submodule status eez-core-protocol >&2 || true
     exit 1
 fi
 
@@ -43,23 +43,20 @@ DEPLOY_IMAGE="$(yv deploy_image)";                DEPLOY_IMAGE="${DEPLOY_IMAGE:-
 
 export DOCKER_BUILDKIT=1
 
-# Fast local build; set EEZ_OPTIMIZED_BUILD=1 for the full release profile.
+# The default `release` profile is already the fast build; set
+# EEZ_OPTIMIZED_BUILD=1 for production (maxperf) binaries.
 release_build_args=()
-if [[ "${EEZ_OPTIMIZED_BUILD:-0}" != "1" ]]; then
-    release_build_args=(
-        --build-arg CARGO_PROFILE_RELEASE_LTO=false
-        --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
-        --build-arg CARGO_PROFILE_RELEASE_DEBUG=0
-    )
+if [[ "${EEZ_OPTIMIZED_BUILD:-0}" == "1" ]]; then
+    release_build_args=(--build-arg BUILD_PROFILE=maxperf)
 fi
 
 if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
-    echo "==> building $NODE_IMAGE (fast CI profile)"
+    echo "==> building $NODE_IMAGE (fast development profile)"
     docker build "${release_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
 fi
 
 if [[ "${EEZ_SKIP_PROOF_SIGNER_BUILD:-0}" != "1" ]]; then
-    echo "==> building $PROOF_SIGNER_IMAGE (fast CI profile)"
+    echo "==> building $PROOF_SIGNER_IMAGE (fast development profile)"
     docker build "${release_build_args[@]}" \
         -f "$REPO/Dockerfile.signer" \
         -t "$PROOF_SIGNER_IMAGE" "$REPO"
@@ -85,7 +82,9 @@ fi
 
 echo "==> kurtosis run (enclave: $ENCLAVE)"
 kurtosis_flags=()
-if [[ "${KURTOSIS_PRIVILEGED:-1}" == "1" ]]; then
+# The included topology runs without privileged package execution. Keep this
+# opt-in for custom argument files or future package changes that require it.
+if [[ "${KURTOSIS_PRIVILEGED:-0}" == "1" ]]; then
     kurtosis_flags+=(--privileged)
 fi
 kurtosis run "${kurtosis_flags[@]}" --enclave "$ENCLAVE" "$HERE" --args-file "$ARGS_FILE"
@@ -93,10 +92,14 @@ kurtosis run "${kurtosis_flags[@]}" --enclave "$ENCLAVE" "$HERE" --args-file "$A
 cat <<EOF
 
 ════════════════════════════════════════
-  EEZ CI test network is up.
+  EEZ Kurtosis devnet is up.
 ════════════════════════════════════════
 Inspect  : kurtosis enclave inspect $ENCLAVE
 Node log : kurtosis service logs -f $ENCLAVE eez-node
 Signer log: kurtosis service logs -f $ENCLAVE eez-proof-signer
 Tear down: bash testing/kurtosis/stop.sh
 EOF
+
+if ! KURTOSIS_ENCLAVE="$ENCLAVE" bash "$HERE/ports.sh"; then
+    echo "warning: devnet started, but its endpoint summary could not be resolved" >&2
+fi

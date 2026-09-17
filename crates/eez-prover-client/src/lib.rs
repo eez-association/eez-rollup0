@@ -16,9 +16,13 @@ use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use eez_control_rpc::v1::{
     BlockWitness as WireBlockWitness, ExecutionWitness as WireWitness, PostBatch, ProveChunk,
-    ProveHeader, prove_chunk, prover_client::ProverClient,
+    ProveHeader, prove_chunk, prove_failure, prover_client::ProverClient,
 };
-use eez_prover::{Prover, ProverError, ProverResult, ProvingContext};
+use eez_prover::{
+    ActionableProverFailure, Prover, ProverError, ProverResult, ProvingContext,
+    RetryableProverError,
+};
+use tonic::{Code, Status};
 use tracing::{Level, event};
 
 /// A [`Prover`] that proves a window on a remote `eez-proof-signer` over the
@@ -112,15 +116,16 @@ impl Prover for RemoteProver {
         // can exceed tonic's 4 MiB default → `ResourceExhausted`. Server matches.
         let mut client = ProverClient::connect(self.inner.url.clone())
             .await
-            .map_err(|e| ProverError::Backend(format!("connect {}: {e}", self.inner.url)))?
+            .map_err(|error| ProverError::Retryable {
+                kind: RetryableProverError::Unavailable,
+                message: format!("connect {}: {error}", self.inner.url),
+            })?
             .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
             .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES);
         let resp = client
             .prove(tokio_stream::iter(chunks))
             .await
-            .map_err(|e| {
-                ProverError::Backend(format!("Prove {}-{}: {e}", ctx.from_block, ctx.to_block))
-            })?
+            .map_err(|status| map_rpc_status(ctx.from_block, ctx.to_block, status))?
             .into_inner();
 
         // Fail-closed: the attestation must recover to the REGISTERED attester
@@ -147,6 +152,58 @@ impl Prover for RemoteProver {
         // Left-zero-pad the 20-byte attester into a B256 (the registry vkey).
         self.inner.attester.into_word()
     }
+}
+
+/// Preserve the Composer profile's closed retryable-status allowlist across
+/// the transport-neutral [`Prover`] boundary. Every other non-OK status is a
+/// non-retryable backend rejection for the unchanged request.
+fn map_rpc_status(from_block: u64, to_block: u64, status: Status) -> ProverError {
+    let kind = match status.code() {
+        Code::Unavailable => Some(RetryableProverError::Unavailable),
+        Code::DeadlineExceeded => Some(RetryableProverError::DeadlineExceeded),
+        Code::Aborted => Some(RetryableProverError::Aborted),
+        _ => None,
+    };
+    let message = format!("Prove {from_block}-{to_block}: {status}");
+    match kind {
+        Some(kind) => ProverError::Retryable { kind, message },
+        None if status.code() == Code::FailedPrecondition => {
+            match decode_actionable_failure(status.details()) {
+                Some(failure) => ProverError::Actionable { failure, message },
+                None => ProverError::Backend(message),
+            }
+        }
+        None => ProverError::Backend(message),
+    }
+}
+
+/// Decode only the exact candidate identities the Composer can act on.
+/// Empty, malformed, or wrong-length details remain non-actionable.
+fn decode_actionable_failure(details: &[u8]) -> Option<ActionableProverFailure> {
+    if details.is_empty() {
+        return None;
+    }
+    let failure = eez_control_rpc::decode_prove_failure(details)
+        .ok()?
+        .actionable_failure?;
+    match failure {
+        prove_failure::ActionableFailure::Outbound(outbound) => {
+            Some(ActionableProverFailure::Outbound {
+                transaction_index: outbound.transaction_index.try_into().ok()?,
+                transaction_hash: exact_hash(&outbound.transaction_hash)?,
+            })
+        }
+        prove_failure::ActionableFailure::Inbound(inbound) => {
+            Some(ActionableProverFailure::Inbound {
+                entry_index: inbound.entry_index.try_into().ok()?,
+                entry_hash: exact_hash(&inbound.entry_hash)?,
+            })
+        }
+    }
+}
+
+fn exact_hash(bytes: &[u8]) -> Option<B256> {
+    (bytes.len() == B256::len_bytes()).then(|| B256::from_slice(bytes))
 }
 
 /// Verify a prover attestation: the 65-byte signature must recover to `attester`
@@ -194,11 +251,11 @@ mod tests {
     use alloy_signer::SignerSync;
     use alloy_signer_local::PrivateKeySigner;
     use eez_control_rpc::v1::{
-        ProveResponse,
+        InboundFailure, OutboundFailure, ProveFailure, ProveResponse,
         prover_server::{Prover as ProverService, ProverServer},
     };
     use std::str::FromStr;
-    use tonic::{Request, Response, Status, Streaming, transport::Server};
+    use tonic::{Request, Response, Streaming, transport::Server};
 
     /// Stub `Prove` server: drains the window stream and returns a fixed
     /// `publicInputsHash` signed by `signer` (the r||s||v packing L1 expects).
@@ -228,6 +285,19 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct UnavailableProver;
+
+    #[tonic::async_trait]
+    impl ProverService for UnavailableProver {
+        async fn prove(
+            &self,
+            _request: Request<Streaming<ProveChunk>>,
+        ) -> Result<Response<ProveResponse>, Status> {
+            Err(Status::unavailable("test prover is busy"))
+        }
+    }
+
     async fn spawn_stub(signer: PrivateKeySigner, hash: B256) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -239,6 +309,19 @@ mod tests {
                 .unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        format!("http://{addr}")
+    }
+
+    async fn spawn_unavailable_stub() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(ProverServer::new(UnavailableProver))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
         format!("http://{addr}")
     }
 
@@ -283,6 +366,39 @@ mod tests {
         assert!(
             matches!(err, ProverError::Backend(_)),
             "wrong-signer attestation must fail closed, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_failure_is_retryable_unavailable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let prover = RemoteProver::new(format!("http://{addr}"), Address::ZERO);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            prover.prove(ProvingContext::default()),
+        )
+        .await
+        .expect("connection failure should be prompt")
+        .unwrap_err();
+
+        assert_eq!(
+            error.retryable_kind(),
+            Some(RetryableProverError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_rpc_status_surfaces_as_retryable() {
+        let prover = RemoteProver::new(spawn_unavailable_stub().await, Address::ZERO);
+
+        let error = prover.prove(ProvingContext::default()).await.unwrap_err();
+
+        assert_eq!(
+            error.retryable_kind(),
+            Some(RetryableProverError::Unavailable)
         );
     }
 
@@ -336,5 +452,131 @@ mod tests {
         // 65 bytes but not a valid signature over `hash` → recover fails or the
         // recovered address won't be the attester.
         assert!(verify_attestation(&[0u8; 65], hash.as_slice(), test_key().address()).is_err());
+    }
+
+    #[test]
+    fn rpc_status_retryability_is_a_closed_allowlist() {
+        let retryable = [
+            (Code::Unavailable, RetryableProverError::Unavailable),
+            (
+                Code::DeadlineExceeded,
+                RetryableProverError::DeadlineExceeded,
+            ),
+            (Code::Aborted, RetryableProverError::Aborted),
+        ];
+        for (code, expected) in retryable {
+            let error = map_rpc_status(5, 9, Status::new(code, "test"));
+            assert_eq!(error.retryable_kind(), Some(expected), "{code:?}");
+        }
+
+        for code in [
+            Code::Cancelled,
+            Code::Unknown,
+            Code::InvalidArgument,
+            Code::NotFound,
+            Code::AlreadyExists,
+            Code::PermissionDenied,
+            Code::ResourceExhausted,
+            Code::FailedPrecondition,
+            Code::OutOfRange,
+            Code::Unimplemented,
+            Code::Internal,
+            Code::DataLoss,
+            Code::Unauthenticated,
+        ] {
+            let error = map_rpc_status(5, 9, Status::new(code, "test"));
+            assert_eq!(error.retryable_kind(), None, "{code:?}");
+            assert!(matches!(error, ProverError::Backend(_)), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn failed_precondition_decodes_exact_actionable_candidate_identities() {
+        let outbound = ProveFailure {
+            actionable_failure: Some(prove_failure::ActionableFailure::Outbound(
+                OutboundFailure {
+                    transaction_index: 3,
+                    transaction_hash: vec![0x44; 32],
+                },
+            )),
+        };
+        let error = map_rpc_status(
+            5,
+            9,
+            Status::with_details(
+                Code::FailedPrecondition,
+                "rejected",
+                eez_control_rpc::encode_prove_failure(&outbound).into(),
+            ),
+        );
+        assert_eq!(
+            error.actionable_failure(),
+            Some(ActionableProverFailure::Outbound {
+                transaction_index: 3,
+                transaction_hash: B256::repeat_byte(0x44),
+            })
+        );
+
+        let inbound = ProveFailure {
+            actionable_failure: Some(prove_failure::ActionableFailure::Inbound(InboundFailure {
+                entry_index: 4,
+                entry_hash: vec![0x55; 32],
+            })),
+        };
+        let error = map_rpc_status(
+            5,
+            9,
+            Status::with_details(
+                Code::FailedPrecondition,
+                "rejected",
+                eez_control_rpc::encode_prove_failure(&inbound).into(),
+            ),
+        );
+        assert_eq!(
+            error.actionable_failure(),
+            Some(ActionableProverFailure::Inbound {
+                entry_index: 4,
+                entry_hash: B256::repeat_byte(0x55),
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_or_misclassified_details_never_become_actionable() {
+        let wrong_hash_length = ProveFailure {
+            actionable_failure: Some(prove_failure::ActionableFailure::Outbound(
+                OutboundFailure {
+                    transaction_index: 3,
+                    transaction_hash: vec![0x44; 31],
+                },
+            )),
+        };
+        let statuses = [
+            Status::with_details(
+                Code::FailedPrecondition,
+                "rejected",
+                eez_control_rpc::encode_prove_failure(&wrong_hash_length).into(),
+            ),
+            Status::with_details(Code::FailedPrecondition, "rejected", vec![0xff].into()),
+            Status::with_details(
+                Code::Internal,
+                "internal",
+                eez_control_rpc::encode_prove_failure(&ProveFailure {
+                    actionable_failure: Some(prove_failure::ActionableFailure::Inbound(
+                        InboundFailure {
+                            entry_index: 4,
+                            entry_hash: vec![0x55; 32],
+                        },
+                    )),
+                })
+                .into(),
+            ),
+        ];
+
+        for status in statuses {
+            let error = map_rpc_status(5, 9, status);
+            assert!(matches!(error, ProverError::Backend(_)));
+            assert_eq!(error.actionable_failure(), None);
+        }
     }
 }

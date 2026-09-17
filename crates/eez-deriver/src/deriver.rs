@@ -6,14 +6,16 @@
 //! STF-replay pattern adapted from `based-rollup`'s `build_derived_block`
 //! at `/root/sync-rollups-composer/crates/based-rollup/src/driver/protocol_txs.rs:453`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
-use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Watcher, ScannedBatch, Submitter};
+use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Reader, ScannedBatch};
 use eez_protocol::outbound_gate::OutboundCallObservation;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::EthEngineTypes;
@@ -31,6 +33,15 @@ use tracing::{Level, event};
 
 use crate::error::{DeriverError, DeriverResult};
 
+/// Watcher seed: the finalized block, kept inside the range this scan read.
+/// Both bounds have wedged boot in the field. Separate fn so they stay
+/// unit-testable without a provider.
+fn choose_seed(floor: u64, end: u64, finalized: Option<u64>) -> u64 {
+    // `floor.min(end)` is load-bearing: `clamp` PANICS when min > max, which a
+    // rewound L1 can produce.
+    finalized.unwrap_or(floor).clamp(floor.min(end), end)
+}
+
 /// L1-derived L2 consensus engine. Cheaply [`Clone`]able.
 #[derive(Clone)]
 pub struct Deriver<L2>
@@ -44,10 +55,9 @@ struct Inner<L2>
 where
     L2: BlockReader,
 {
-    l1_watcher: L1Watcher,
     committer: BlockCommitterHandle<EthEngineTypes>,
     l2_provider: Arc<L2>,
-    submitter: Submitter,
+    l1_reader: L1Reader,
     evm_config: EthEvmConfig,
     /// Chainspec-aware deriver
     chain_spec: Arc<ChainSpec>,
@@ -71,6 +81,9 @@ where
     /// L1-entries → L2 system-tx prepending in `reconcile_batch_blocks`;
     /// `None` falls back to pure-user-tx STF. See [`Deriver::new`] docs.
     system_tx_cfg: Option<eez_protocol::system_tx::SystemTxContext>,
+    /// L2 datadir holding the boot checkpoint. `None` disables it, which is
+    /// the old behaviour: boot rescans from the deploy block.
+    checkpoint_dir: Option<PathBuf>,
 }
 
 impl<L2> std::fmt::Debug for Deriver<L2>
@@ -86,7 +99,6 @@ where
             )
             .field("finalized_l2_block", &self.inner.l1_head.finalized_l2())
             .field("committer", &self.inner.committer)
-            .field("l1_watcher", &self.inner.l1_watcher)
             .finish_non_exhaustive()
     }
 }
@@ -113,23 +125,22 @@ where
     /// `l2_entries[]`) and prepends them to the batch's Sync block, so
     /// local replay is byte-identical. `None` is the pure-user-tx STF.
     pub fn new(
-        l1_watcher: L1Watcher,
         committer: BlockCommitterHandle<EthEngineTypes>,
         l2_provider: Arc<L2>,
-        submitter: Submitter,
+        l1_reader: L1Reader,
         chain_spec: Arc<ChainSpec>,
         l2_block_time_secs: u64,
         deploy_block: u64,
         l1_head: Arc<L1CanonicalHead>,
         system_tx_cfg: Option<eez_protocol::system_tx::SystemTxContext>,
+        checkpoint_dir: Option<PathBuf>,
     ) -> Self {
         let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             inner: Arc::new(Inner {
-                l1_watcher,
                 committer,
                 l2_provider,
-                submitter,
+                l1_reader,
                 evm_config,
                 chain_spec,
                 l2_block_time_secs,
@@ -137,8 +148,121 @@ where
                 l1_head,
                 safe_l2_block: AtomicU64::new(0),
                 system_tx_cfg,
+                checkpoint_dir,
             }),
         }
+    }
+
+    /// Record the last indexed batch so the next boot resumes there. Best
+    /// effort: a write failure costs a slow boot, never correctness.
+    fn save_checkpoint(&self) {
+        let Some(dir) = self.inner.checkpoint_dir.as_deref() else {
+            return;
+        };
+        let Some(tail) = self.inner.l1_head.last_indexed() else {
+            return;
+        };
+        // A resume seeds only this batch's hash, so an earlier batch in the same
+        // block would replay with the cursor past it; a slow boot beats a wrong one.
+        if self.inner.l1_head.count_at_l1_block(tail.l1_block) > 1 {
+            event!(
+                name: "eez.deriver.checkpoint.multi_batch_block",
+                Level::DEBUG,
+                l1_block = tail.l1_block,
+                "L1 block holds more than one indexed batch; skipping the boot checkpoint",
+            );
+            return;
+        }
+        let l2_state_root = match self.l2_state_root_at(tail.last_l2_block) {
+            Ok(root) => root,
+            Err(err) => {
+                event!(
+                    name: "eez.deriver.checkpoint.no_local_root",
+                    Level::WARN,
+                    l2_block = tail.last_l2_block,
+                    error = %err,
+                    "no local root at the indexed tip; skipping the boot checkpoint",
+                );
+                return;
+            }
+        };
+        let checkpoint = crate::checkpoint::ReconcileCheckpoint {
+            l1_block: tail.l1_block,
+            l1_block_hash: tail.l1_block_hash,
+            tx_hash: tail.tx_hash,
+            l2_cursor: tail.last_l2_block,
+            l2_state_root,
+        };
+        if let Err(err) = checkpoint.save(dir) {
+            event!(
+                name: "eez.deriver.checkpoint.write_failed",
+                Level::WARN,
+                dir = %dir.display(),
+                error = %err,
+                "boot checkpoint not written; the next boot rescans from the deploy block",
+            );
+        }
+    }
+
+    /// Bounded wait for the L1 head to reach `block`. Best effort: on timeout
+    /// the caller reads whatever L1 serves and the usual validation decides.
+    async fn await_l1_head(&self, block: u64) {
+        const POLL: Duration = Duration::from_secs(2);
+        const POLLS: u32 = 30;
+        for _ in 0..POLLS {
+            match self.inner.l1_reader.readiness().await {
+                Ok(state) if state.head_block_number >= block => return,
+                _ => tokio::time::sleep(POLL).await,
+            }
+        }
+        event!(
+            name: "eez.deriver.checkpoint.l1_behind",
+            Level::WARN,
+            l1_block = block,
+            "L1 head still below the checkpoint block; validating anyway",
+        );
+    }
+
+    /// Checkpoint to seed the boot scan from, or `None` to rescan from the
+    /// deploy block. [`ReconcileCheckpoint::usable_with`] decides.
+    async fn checkpoint_seed(&self) -> Option<crate::checkpoint::ReconcileCheckpoint> {
+        let checkpoint =
+            crate::checkpoint::ReconcileCheckpoint::load(self.inner.checkpoint_dir.as_deref()?)?;
+        // The checkpoint names the tip we last indexed. A restart brings the L1
+        // back with us, so for a few seconds its head sits below that block and
+        // every hash read is `None` — discarding the checkpoint then is a
+        // verdict about timing, not canonicality. Once the head is level, a
+        // missing or different hash is real reorg evidence and still rejects.
+        self.await_l1_head(checkpoint.l1_block).await;
+        let canonical = self
+            .inner
+            .l1_reader
+            .canonical_l1_hash(checkpoint.l1_block)
+            .await
+            .ok()
+            .flatten();
+        let local_root = self.l2_state_root_at(checkpoint.l2_cursor).ok();
+        if let Err(reason) = checkpoint.usable_with(canonical, local_root) {
+            event!(
+                name: "eez.deriver.checkpoint.rejected",
+                Level::WARN,
+                l1_block = checkpoint.l1_block,
+                l2_cursor = checkpoint.l2_cursor,
+                canonical = ?canonical,
+                local_root = ?local_root,
+                reason,
+                "boot checkpoint rejected; rescanning from the deploy block",
+            );
+            return None;
+        }
+        event!(
+            name: "eez.deriver.checkpoint.seeded",
+            Level::INFO,
+            l1_block = checkpoint.l1_block,
+            l2_cursor = checkpoint.l2_cursor,
+            "boot seeded from checkpoint; scanning forward instead of from the deploy block",
+        );
+        Some(checkpoint)
     }
 
     /// Current cursor — highest L2 block confirmed by any L1-landed
@@ -155,13 +279,82 @@ where
     ///
     /// # Errors
     ///
-    /// `l2_provider` (lookup / scan failure), `local_diverged` (replay
-    /// failure), `committer_closed`.
+    /// `l1_scan` (scan failure), `l2_provider` (lookup failure),
+    /// `local_diverged` (replay failure), `committer_closed`.
     ///
     /// # Panics
     ///
     /// If the `batches` mutex is poisoned.
     pub async fn catch_up(&self) -> DeriverResult<()> {
+        self.catch_up_inner().await.map(|_| ())
+    }
+
+    /// [`Self::catch_up`], additionally returning the `L1Watcher::polling`
+    /// seed: the finalized block, kept inside the range this scan read so
+    /// the seed is immutable and always servable. Boot-only.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::catch_up`]; additionally `SourceIncomplete` while the
+    /// L1 source cannot yet serve the seed block's hash.
+    pub async fn catch_up_with_seed(&self) -> DeriverResult<(u64, B256)> {
+        let end = self.catch_up_inner().await?;
+        // NOT canonicality-probed: at boot this tail is a batch THIS scan just
+        // found, with a hash straight from `get_logs`. Cross-checked below.
+        let indexed_tail = self.inner.l1_head.last_indexed();
+        let floor = indexed_tail
+            .as_ref()
+            .map_or_else(|| self.inner.deploy_block.saturating_sub(1), |t| t.l1_block);
+        let finalized = self
+            .inner
+            .l1_reader
+            .finalized_block()
+            .await
+            .map_err(DeriverError::l1_scan)?;
+        // No finality yet (a chain younger than two epochs) → the floor, which
+        // this scan read and the watcher's ancestor backfill makes reorg-safe.
+        let seed = choose_seed(floor, end, finalized.map(|(n, _)| n));
+        let canonical = self
+            .inner
+            .l1_reader
+            .canonical_l1_hash(seed)
+            .await
+            .map_err(DeriverError::l1_scan)?
+            .ok_or_else(|| {
+                // Not served yet, or rewound mid-scan — retryable, not fatal.
+                DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                    block: seed,
+                    tx_hash: B256::ZERO,
+                    detail: "catch-up seed block not served by the L1 source yet".into(),
+                })
+            })?;
+        // A batch this scan indexed at the seed height sitting on another fork
+        // means the chain moved under us: retry so `revalidate_index_tail` drops
+        // it. (A finalized seed needs no such check — it cannot reorg.)
+        if indexed_tail.is_some_and(|t| t.l1_block == seed && t.l1_block_hash != canonical) {
+            return Err(DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                block: seed,
+                tx_hash: B256::ZERO,
+                detail: "catch-up seed block reorged during the scan; retry".into(),
+            }));
+        }
+        event!(
+            name: "eez.deriver.catch_up.seed",
+            Level::INFO,
+            floor,
+            scan_end = end,
+            finalized = ?finalized.map(|(n, _)| n),
+            seed,
+            seed_hash = %canonical,
+            "watcher seed chosen",
+        );
+        Ok((seed, canonical))
+    }
+
+    /// Shared body of [`Self::catch_up`] / [`Self::catch_up_with_seed`].
+    /// Returns the inclusive L1 block covered: the scan's endpoint, or the
+    /// tip when the range was empty (nothing below it can hold our events).
+    async fn catch_up_inner(&self) -> DeriverResult<u64> {
         let _guard = self.inner.committer.begin_reconcile().await;
         let old_cursor = self.inner.l1_head.cursor();
         let anchor = self.revalidate_index_tail().await?;
@@ -171,7 +364,20 @@ where
         }
         match anchor {
             Some(anchor_l1_block) => self.sync_batches_inner(anchor_l1_block, cursor).await,
-            None => self.sync_batches_inner(self.inner.deploy_block, 0).await,
+            // Every boot has an empty index. The checkpoint keeps the scan
+            // short (`docs/issues/deep-reverify-cost.md`).
+            None => match self.checkpoint_seed().await {
+                Some(seed) => {
+                    self.inner.l1_head.append(BatchRecord {
+                        l1_block: seed.l1_block,
+                        l1_block_hash: seed.l1_block_hash,
+                        tx_hash: seed.tx_hash,
+                        last_l2_block: seed.l2_cursor,
+                    });
+                    self.sync_batches_inner(seed.l1_block, seed.l2_cursor).await
+                }
+                None => self.sync_batches_inner(self.inner.deploy_block, 0).await,
+            },
         }
     }
 
@@ -184,11 +390,32 @@ where
         while let Some(tail) = self.inner.l1_head.last_indexed() {
             let canonical = self
                 .inner
-                .submitter
+                .l1_reader
                 .canonical_l1_hash(tail.l1_block)
                 .await
-                .map_err(|e| DeriverError::l2_provider(format!("L1 canonicality probe: {e}")))?;
-            if canonical == Some(tail.l1_block_hash) {
+                .map_err(DeriverError::l1_scan)?;
+            // `None` is not proof of a reorg — retreating would unwind L2 to
+            // genesis, so retry. A head ABOVE this block means pruned/rewound,
+            // which retrying won't fix; report it so that is diagnosable.
+            let Some(canonical) = canonical else {
+                let head = self
+                    .inner
+                    .l1_reader
+                    .readiness()
+                    .await
+                    .map(|r| r.head_block_number)
+                    .ok();
+                return Err(DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                    block: tail.l1_block,
+                    tx_hash: tail.tx_hash,
+                    detail: format!(
+                        "indexed batch's L1 block not served; cannot judge canonicality \
+                         (source head: {head:?} — above this block means pruned or rewound, \
+                         not lagging)"
+                    ),
+                }));
+            };
+            if canonical == tail.l1_block_hash {
                 return Ok(Some(tail.l1_block));
             }
             let old_cursor = self.inner.l1_head.cursor();
@@ -199,9 +426,10 @@ where
             event!(
                 name: "eez.deriver.l1.reorg.retreated",
                 Level::WARN,
+                event_name = "eez.deriver.l1.reorg.retreated",
                 l1_block = tail.l1_block,
                 indexed_hash = %tail.l1_block_hash,
-                canonical_hash = ?canonical,
+                canonical_hash = %canonical,
                 old_cursor,
                 new_cursor,
                 dropped_batches = dropped,
@@ -215,11 +443,12 @@ where
     /// each successful L1 chunk before fetching the next. If a later chunk
     /// reports an incomplete source, the next catch-up retry can resume from
     /// the latest canonical batch already indexed in [`L1CanonicalHead`].
+    /// Returns the inclusive L1 block the scan covered through.
     async fn sync_batches_inner(
         &self,
         from_l1_block: u64,
         cumulative_start: u64,
-    ) -> DeriverResult<()> {
+    ) -> DeriverResult<u64> {
         let local_head = self
             .inner
             .l2_provider
@@ -227,7 +456,7 @@ where
             .map_err(DeriverError::l2_provider)?;
         let mut chunks = self
             .inner
-            .submitter
+            .l1_reader
             .batch_log_chunks(from_l1_block)
             .await
             .map_err(DeriverError::l1_scan)?;
@@ -249,14 +478,14 @@ where
                 cursor = cumulative_start,
                 "scan completed without replaying any blocks",
             );
-            return Ok(());
+            return Ok(to_l1_block);
         }
 
         let mut cumulative_l2 = cumulative_start;
         let mut total_replayed: u64 = 0;
         while let Some(scanned_batches) = self
             .inner
-            .submitter
+            .l1_reader
             .next_batch_log_chunk(&mut chunks)
             .await
             .map_err(DeriverError::l1_scan)?
@@ -283,7 +512,7 @@ where
                 "scan completed without replaying any blocks",
             );
         }
-        Ok(())
+        Ok(to_l1_block)
     }
 
     async fn reconcile_scanned_batches(
@@ -301,7 +530,7 @@ where
             // roots are phantoms). Skip the whole reconcile — no
             // cursor advance, no replay, no state check; the composer's
             // next slot re-attempts over the same range.
-            if batch.settled_count == 0 {
+            if batch.settlement.is_empty() {
                 event!(
                     name: "eez.deriver.catch_up.batch.unsettled",
                     Level::DEBUG,
@@ -318,62 +547,81 @@ where
                 continue;
             }
 
-            let batch_first_l2 = *cumulative_l2 + 1;
-            let batch_last_l2 = *cumulative_l2 + decoded.block_count() as u64;
+            let resumed = batch.settlement.start > 0;
+            // Anchor on the batch's own start, not our cursor: a competing
+            // composer's batch can cover a range that begins below it.
+            let anchor = match batch.settlement.entry_state {
+                Some(entry_state) => self
+                    .batch_anchor(*cumulative_l2, entry_state, decoded.block_count() as u64)?
+                    .unwrap_or(*cumulative_l2),
+                None => *cumulative_l2,
+            };
+            let (batch_first_l2, batch_last_l2) =
+                batch_l2_range(anchor, resumed, decoded.block_count() as u64);
 
-            // Cursor-alignment guard (as in on_batch_posted): the batch's
-            // claimed `currentState` must equal our state root here, else
-            // this scan is misaligned with L1 — bail before replaying onto
-            // blocks that exist on no other node.
-            if let Some(claimed_current) = batch.claimed_current_state {
-                let local_root = self.l2_state_root_at(*cumulative_l2)?;
-                if local_root != claimed_current {
+            // Cursor guard (as in on_batch_posted): a root this batch cannot leave at
+            // the cursor means the scan is off L1, and replaying would fork us alone.
+            if let Some(entry_state) = batch.settlement.entry_state {
+                let local_root = self.l2_state_root_at(anchor)?;
+                if !cursor_root_accepted(local_root, entry_state, batch.settlement.final_state) {
                     event!(
                         name: "eez.deriver.catch_up.cursor.misaligned",
                         Level::ERROR,
                         l1_block_number = batch.l1_block_number,
                         tx_hash = %batch.tx_hash,
                         cumulative_l2 = *cumulative_l2,
+                        anchor,
                         local_root = %local_root,
-                        claimed_current = %claimed_current,
-                        "batch currentState does not match local state root at the scan cursor; refusing to replay",
+                        entry_state = %entry_state,
+                        final_state = ?batch.settlement.final_state,
+                        applied_start = batch.settlement.start,
+                        "local state root at the scan cursor is neither the root the batch's applied run started from nor its settled endpoint; refusing to replay",
                     );
                     return Err(DeriverError::local_diverged(batch_first_l2));
                 }
             }
 
-            total_replayed += self
+            let (replayed_here, scan_sync_hash) = self
                 .reconcile_batch_blocks(
                     batch_first_l2,
                     &decoded,
                     batch.post_batch_input.clone(),
                     batch.l1_block_number,
                     batch.tx_hash,
-                    batch.settled_count,
+                    batch.settlement,
                 )
                 .await?;
+            total_replayed += replayed_here;
 
+            // Catch drift now, not at a live event. Both ends must be what L1
+            // ACTUALLY ran, not the claimed endpoints. Pre-check skipped when
+            // resumed: the cursor-alignment guard above already checked it, at
+            // `cumulative_l2` — `batch_first_l2 - 1` would check the wrong
+            // height now that a resumed batch doesn't advance past it.
+            let settled_end = self.check_claimed_state(
+                if resumed {
+                    None
+                } else {
+                    batch.settlement.entry_state.or(batch.claimed_current_state)
+                },
+                batch.settlement.final_state.or(batch.claimed_new_state),
+                anchor,
+                batch_first_l2,
+                batch_last_l2,
+                scan_sync_hash,
+                batch.l1_block_number,
+                batch.tx_hash,
+            )?;
+            // Follow L1's real endpoint. A partial settlement stops early, and
+            // the composer must not anchor past L1's stored root.
+            let end = settled_end.unwrap_or(batch_last_l2);
             new_batches.push(BatchRecord {
                 l1_block: batch.l1_block_number,
                 l1_block_hash: batch.l1_block_hash,
                 tx_hash: batch.tx_hash,
-                last_l2_block: batch_last_l2,
+                last_l2_block: end,
             });
-
-            // Catch claimed-vs-derived drift now, during the sync,
-            // rather than waiting for a live event.
-            // The endpoint is what L1 ACTUALLY stored
-            // (`settled_final_state`), which under partial consumption
-            // is a prefix root of the claimed chain, not its end.
-            self.check_claimed_state(
-                batch.claimed_current_state,
-                batch.settled_final_state.or(batch.claimed_new_state),
-                batch_first_l2,
-                batch_last_l2,
-                batch.l1_block_number,
-                batch.tx_hash,
-            )?;
-            *cumulative_l2 = batch_last_l2;
+            *cumulative_l2 = end;
         }
 
         // Index every batch we walked (de-duped against startup
@@ -381,11 +629,11 @@ where
         // of them are skipped as already-processed.
         if !new_batches.is_empty() {
             self.inner.l1_head.append_many(new_batches);
+            self.save_checkpoint();
         }
 
-        // Advance reth's safe head to whatever L1 has confirmed.
-        // Delivered reorgs and recovery tail audits retreat it before
-        // this forward scan runs.
+        // Advance safe once per chunk, not per batch: two batches in one L1 block
+        // rewrite the same L2 height, so a per-batch hash gets orphaned.
         let old_safe_l2 = self.inner.safe_l2_block.load(Ordering::Acquire);
         if *cumulative_l2 > old_safe_l2 {
             let safe_header = self.l2_sealed_header_at(*cumulative_l2)?;
@@ -573,27 +821,17 @@ where
             .await?)
     }
 
-    /// Runs the deriver loop. Subscribes to the `L1Watcher`'s event
-    /// broadcast and processes each event until the stream closes.
-    pub async fn run(self) {
-        // Subscribe FIRST. broadcast::channel only delivers events
-        // fired after the subscription; any event fired before is lost
-        // to this receiver. Subscribing here means events fired during
-        // the resync below are queued in the broadcast buffer and
-        // delivered to us once we enter the recv() loop.
-        let mut rx = self.inner.l1_watcher.subscribe();
-
-        // Resync: re-anchor against L1 to cover the window between
-        // main.rs's boot-time `catch_up` and the subscription above.
-        // Batches that landed in that window are visible neither in
-        // the boot scan nor in live events; a reorg in that window is
-        // worse — it invalidates batches the boot scan already
-        // indexed, and no Reorg event for it will ever arrive. Reorg-aware
-        // catch_up handles both.
+    /// Runs the deriver loop, processing each event on `rx` until the
+    /// stream closes. `rx` must be subscribed before the `L1Watcher`
+    /// starts so no event predates it.
+    pub async fn run(self, mut rx: broadcast::Receiver<L1Event>) {
+        // Defensive re-anchor: a cheap no-op in the normal boot order;
+        // load-bearing for any caller that subscribed rx late.
         if let Err(err) = self.catch_up().await {
             event!(
                 name: "eez.deriver.resync.failed",
                 Level::ERROR,
+                event_name = "eez.deriver.resync.failed",
                 error = %err,
                 "post-subscribe resync failed; deriver may have a gap",
             );
@@ -613,6 +851,7 @@ where
                             event!(
                                 name: "eez.deriver.committer.closed",
                                 Level::ERROR,
+                                event_name = "eez.deriver.committer.closed",
                                 error = %err,
                                 "block committer gone; deriver exiting",
                             );
@@ -673,6 +912,7 @@ where
                 event!(
                     name: "eez.deriver.committer.closed",
                     Level::ERROR,
+                    event_name = "eez.deriver.committer.closed",
                     error = %err,
                     "block committer gone; deriver exiting",
                 );
@@ -682,6 +922,7 @@ where
                 event!(
                     name: "eez.deriver.resync.failed",
                     Level::ERROR,
+                    event_name = "eez.deriver.resync.failed",
                     error = %err,
                     "resync failed; will retry after the next L1 event",
                 );
@@ -700,11 +941,10 @@ where
                 call_data,
                 post_batch_input,
                 state_applied,
-                settled_count,
-                settled_final_state,
+                settlement,
                 claimed_current_state,
                 claimed_new_state,
-                ..
+                last_in_l1_block,
             } => {
                 self.on_batch_posted(
                     l1_block_number,
@@ -714,10 +954,10 @@ where
                     call_data,
                     post_batch_input,
                     state_applied,
-                    settled_count,
-                    settled_final_state,
+                    settlement,
                     claimed_current_state,
                     claimed_new_state,
+                    last_in_l1_block,
                 )
                 .await
             }
@@ -751,15 +991,15 @@ where
         call_data: Bytes,
         post_batch_input: Bytes,
         state_applied: bool,
-        settled_count: usize,
-        settled_final_state: Option<B256>,
+        settlement: eez_l1::Settlement,
         claimed_current_state: Option<B256>,
         claimed_new_state: Option<B256>,
+        last_in_l1_block: bool,
     ) -> DeriverResult<()> {
         let decoded = eez_payload_codec::decode(call_data.as_ref())?;
         let block_count = decoded.block_count() as u64;
         if block_count == 0 {
-            return Ok(());
+            return self.flush_deferred_safe(last_in_l1_block).await;
         }
 
         // Dedup by tx_hash — already-indexed = already processed by
@@ -772,7 +1012,7 @@ where
                 tx_hash = %tx_hash,
                 "live event for an already-indexed batch; skipping",
             );
-            return Ok(());
+            return self.flush_deferred_safe(last_in_l1_block).await;
         }
 
         // L1-finality gate: no `L2ExecutionPerformed` for our rollupId
@@ -781,7 +1021,7 @@ where
         // composer's next slot re-attempts. Without this gate the
         // deriver would replay the unsettled range, reorg L2, then fail
         // `check_claimed_state` as a spurious divergence.
-        if settled_count == 0 {
+        if settlement.is_empty() {
             event!(
                 name: "eez.deriver.batch.unsettled",
                 Level::INFO,
@@ -790,7 +1030,7 @@ where
                 submitter = %submitter,
                 "postBatch's L1 block has no L2ExecutionPerformed for our rollup; bundle didn't settle, skipping (re-attempt expected)",
             );
-            return Ok(());
+            return self.flush_deferred_safe(last_in_l1_block).await;
         }
 
         event!(
@@ -833,25 +1073,34 @@ where
         // from_block is the next L2 block after the highest indexed
         // batch — the shared L1CanonicalHead is the source of truth.
         let last_indexed_l2 = self.inner.l1_head.last_indexed_l2();
-        let from_block = last_indexed_l2 + 1;
-        let to_block = last_indexed_l2 + block_count;
+        let resumed = settlement.start > 0;
+        // Anchor on the batch's own start, not our cursor: a competing
+        // composer's batch can cover a range that begins below it.
+        let anchor = match settlement.entry_state {
+            Some(entry_state) => self
+                .batch_anchor(last_indexed_l2, entry_state, block_count)?
+                .unwrap_or(last_indexed_l2),
+            None => last_indexed_l2,
+        };
+        let (from_block, to_block) = batch_l2_range(anchor, resumed, block_count);
 
-        // Cursor-alignment guard: the batch's claimed `currentState` must
-        // equal our state root at the cursor, else the local index is
-        // misaligned with L1 (e.g. a dropped event) — bail and let the
-        // run-loop resync re-anchor.
-        if let Some(claimed_current) = claimed_current_state {
-            let local_root = self.l2_state_root_at(last_indexed_l2)?;
-            if local_root != claimed_current {
+        // Cursor guard: a root this batch cannot leave at the cursor means the local
+        // index is off L1 (e.g. a dropped event); let the run-loop resync re-anchor.
+        if let Some(entry_state) = settlement.entry_state {
+            let local_root = self.l2_state_root_at(anchor)?;
+            if !cursor_root_accepted(local_root, entry_state, settlement.final_state) {
                 event!(
                     name: "eez.deriver.cursor.misaligned",
                     Level::ERROR,
                     l1_block_number,
                     tx_hash = %tx_hash,
                     last_indexed_l2,
+                    anchor,
                     local_root = %local_root,
-                    claimed_current = %claimed_current,
-                    "batch currentState does not match local state root at cursor; resync required",
+                    entry_state = %entry_state,
+                    final_state = ?settlement.final_state,
+                    applied_start = settlement.start,
+                    "local state root at cursor is neither the root the batch's applied run started from nor its settled endpoint; resync required",
                 );
                 return Err(DeriverError::local_diverged(from_block));
             }
@@ -860,14 +1109,14 @@ where
         // Per-block reconciliation: skip blocks whose tx lists already
         // match the batch, and STF-replay the rest (reth fork-switches
         // as needed).
-        let replayed = self
+        let (replayed, sync_block_hash) = self
             .reconcile_batch_blocks(
                 from_block,
                 &decoded,
                 post_batch_input,
                 l1_block_number,
                 tx_hash,
-                settled_count,
+                settlement,
             )
             .await?;
         event!(
@@ -881,49 +1130,101 @@ where
             "per-block reconciliation complete (pre-divergence check)",
         );
 
-        // Endpoint = what L1 ACTUALLY stored (`settled_final_state`),
-        // which under partial consumption is a prefix root of the
-        // claimed chain — never the claimed full-chain end.
-        self.check_claimed_state(
-            claimed_current_state,
-            settled_final_state.or(claimed_new_state),
+        // Both ends are what L1 ACTUALLY ran, never the claimed chain's endpoints.
+        // Pre-check skipped when resumed: the cursor-alignment guard above
+        // already checked it, at `last_indexed_l2` — `from_block - 1` would
+        // check the wrong height now that a resumed batch doesn't advance past it.
+        let settled_end = self.check_claimed_state(
+            if resumed {
+                None
+            } else {
+                settlement.entry_state.or(claimed_current_state)
+            },
+            settlement.final_state.or(claimed_new_state),
+            anchor,
             from_block,
             to_block,
+            sync_block_hash,
             l1_block_number,
             tx_hash,
         )?;
 
-        let new_safe_header = self.l2_sealed_header_at(to_block)?;
-        let new_safe_hash = new_safe_header.hash();
-
-        // Advance safe; keep finalized where it is (only L1 finality
-        // moves it).
-        let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
-        self.inner
-            .committer
-            .advance_safe_finalized(new_safe_header, finalized_hash)
-            .await?;
-
-        self.inner.safe_l2_block.store(to_block, Ordering::Release);
+        let l1_settled_state_root = settlement.final_state.unwrap_or_default();
+        // Index first: the safe advance reads this cursor, and a replayed batch
+        // must stay indexed even if the FCU fails. Use L1's real endpoint.
         self.inner.l1_head.append(BatchRecord {
             l1_block: l1_block_number,
             l1_block_hash,
             tx_hash,
-            last_l2_block: to_block,
+            last_l2_block: settled_end.unwrap_or(to_block),
         });
+        // After the index, so the checkpoint never names a batch the index does
+        // not hold; the blocks it points at are already committed locally.
+        self.save_checkpoint();
 
+        // Safe moves once per L1 block, at its last batch: a resumed batch rewrites
+        // the height its same-block predecessor settled, orphaning that safe hash.
+        if !last_in_l1_block {
+            event!(
+                name: "eez.deriver.safe.deferred",
+                Level::DEBUG,
+                from_block,
+                to_block,
+                l1_block_number,
+                tx_hash = %tx_hash,
+                "more batches in this L1 block; safe advance waits for its last one",
+            );
+            return Ok(());
+        }
+        let Some(new_safe_hash) = self.sync_safe_to_cursor().await? else {
+            return Ok(());
+        };
+        let l2_safe_state_root = self
+            .l2_sealed_header_at(self.inner.l1_head.last_indexed_l2())?
+            .state_root();
         event!(
             name: "eez.deriver.safe.advanced",
             Level::INFO,
+            event_name = "eez.deriver.safe.advanced",
             from_block,
             to_block,
+            applied_entries = settlement.len,
+            l1_settled_state_root = %l1_settled_state_root,
             l1_block_number,
             tx_hash = %tx_hash,
             submitter = %submitter,
             new_safe_hash = %new_safe_hash,
+            l2_safe_state_root = %l2_safe_state_root,
             "advanced L2 safe head from L1-confirmed batch",
         );
         Ok(())
+    }
+
+    /// Runs the safe advance a skipped last batch would have done, else safe
+    /// stalls until the next posted batch.
+    async fn flush_deferred_safe(&self, last_in_l1_block: bool) -> DeriverResult<()> {
+        if last_in_l1_block {
+            self.sync_safe_to_cursor().await?;
+        }
+        Ok(())
+    }
+
+    /// Moves `safe` to the L1-confirmed cursor, re-reading the header so a height
+    /// a resume rewrote gives its current hash. Only L1 finality moves finalized.
+    async fn sync_safe_to_cursor(&self) -> DeriverResult<Option<B256>> {
+        let cursor = self.inner.l1_head.last_indexed_l2();
+        if cursor <= self.inner.safe_l2_block.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let safe_header = self.l2_sealed_header_at(cursor)?;
+        let safe_hash = safe_header.hash();
+        let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
+        self.inner
+            .committer
+            .advance_safe_finalized(safe_header, finalized_hash)
+            .await?;
+        self.inner.safe_l2_block.store(cursor, Ordering::Release);
+        Ok(Some(safe_hash))
     }
 
     async fn on_l1_reorg(
@@ -946,6 +1247,7 @@ where
             event!(
                 name: "eez.deriver.l1.reorg.noop",
                 Level::WARN,
+                event_name = "eez.deriver.l1.reorg.noop",
                 common_ancestor_number,
                 old_head_hash = %old_head_hash,
                 new_head_number,
@@ -961,6 +1263,7 @@ where
         event!(
             name: "eez.deriver.l1.reorg.retreated",
             Level::WARN,
+            event_name = "eez.deriver.l1.reorg.retreated",
             common_ancestor_number,
             old_head_hash = %old_head_hash,
             new_head_number,
@@ -1022,6 +1325,7 @@ where
         event!(
             name: "eez.deriver.finalized.advanced",
             Level::INFO,
+            event_name = "eez.deriver.finalized.advanced",
             l1_finalized_block,
             l2_finalized = bounded,
             "advanced L2 finalized head from L1 finality",
@@ -1044,6 +1348,19 @@ where
 
     fn l2_hash_at(&self, l2_block: u64) -> DeriverResult<B256> {
         Ok(self.l2_sealed_header_at(l2_block)?.hash())
+    }
+
+    /// Block whose root is `entry_state`: where this batch's run starts. A
+    /// competing composer's batch can begin below our cursor, so search back.
+    fn batch_anchor(
+        &self,
+        cursor: u64,
+        entry_state: B256,
+        window: u64,
+    ) -> DeriverResult<Option<u64>> {
+        anchor_with_overlap_log(cursor, entry_state, window, |block| {
+            self.l2_state_root_at(block)
+        })
     }
 
     fn l2_state_root_at(&self, l2_block: u64) -> DeriverResult<B256> {
@@ -1070,8 +1387,8 @@ where
         post_batch_input: Bytes,
         l1_block_number: u64,
         tx_hash: B256,
-        settled_count: usize,
-    ) -> DeriverResult<u64> {
+        settlement: eez_l1::Settlement,
+    ) -> DeriverResult<(u64, Option<B256>)> {
         // Cross-chain path (skipped when `system_tx_cfg` is `None`):
         // reconstruct the system txs the composer produced, from either
         // codec branch:
@@ -1099,10 +1416,9 @@ where
         // Producing entries are ordered `[anchor, outbound…, inbound…]`:
         // `postAndVerifyBatch` drains the leading `proxyEntryHash==0` run (anchor +
         // outbound) inline, then consumes the deferred inbound ones (`EEZ.sol:387`).
-        // Applied entries are always a PREFIX (a skipped immediate cascades via
-        // `StateUpdate.currentState` mismatch), so `settled_count - 1`
-        // splits outbound-first, then inbound. One path: inbound-only / outbound-only
-        // / mixed.
+        // `Settlement::producing_slice` says WHICH of those L1 actually ran, read
+        // off the settled roots — the anchor cannot be assumed to have run, since
+        // a competing same-block batch can supply its hop.
         //
         // `gate_outbound`: outbound entries L1 paid, stashed for the post-replay
         // gate (empty in the pure-user-tx path → no-op).
@@ -1154,25 +1470,33 @@ where
                 let (mut outbound, mut inbound): (Vec<_>, Vec<_>) = entries
                     .into_iter()
                     .partition(|e| e.proxyEntryHash == alloy_primitives::B256::ZERO);
+                // Captured before drain/truncate: all originally-claimed entries,
+                // settled or not, were paired 1:1 with Sync-block user txs.
+                let original_outbound_len = outbound.len();
 
-                // Prefix split: applied non-anchor entries consume outbound first.
-                let applied = settled_count.saturating_sub(1);
-                let applied_outbound = applied.min(outbound.len());
-                let consumed_inbound = applied - applied_outbound;
-                if outbound.len() > applied_outbound || inbound.len() > consumed_inbound {
+                // Rebuild exactly the steps L1 ran; `skip > 0` = it resumed
+                // mid-chain (see `ProducingSlice`).
+                let slice = ProducingSlice::split(settlement, outbound.len(), inbound.len());
+                let outbound_skip = slice.outbound_skip;
+                if slice.leaves_entries_unconsumed(outbound.len(), inbound.len()) {
                     event!(
                         name: "eez.deriver.reconcile.partial_consumption",
                         Level::WARN,
                         tx_hash = %tx_hash,
                         outbound = outbound.len(),
                         inbound = inbound.len(),
-                        applied_outbound,
-                        consumed_inbound,
-                        "L1 settled only a prefix; truncating reconstruction to match",
+                        outbound_skip = slice.outbound_skip,
+                        outbound_take = slice.outbound_take,
+                        inbound_skip = slice.inbound_skip,
+                        inbound_take = slice.inbound_take,
+                        anchor_applied = settlement.start == 0,
+                        "L1 ran only part of this batch; reconstructing exactly that slice",
                     );
                 }
-                outbound.truncate(applied_outbound);
-                inbound.truncate(consumed_inbound);
+                let skipped_outbound: Vec<_> = outbound.drain(..slice.outbound_skip).collect();
+                outbound.truncate(slice.outbound_take);
+                let skipped_inbound: Vec<_> = inbound.drain(..slice.inbound_skip).collect();
+                inbound.truncate(slice.inbound_take);
 
                 // The Sync block is the LAST block of the range; its user txs are
                 // the tail of `decoded.transactions`. Pair the i-th outbound entry
@@ -1188,12 +1512,19 @@ where
                     .iter()
                     .map(|t| Bytes::from(t.clone()))
                     .collect();
-                if sync_user_txs.len() < outbound.len() {
+                // Outbound entries pair POSITIONALLY with the Sync block's user
+                // txs, so a skipped OR unconsumed outbound entry must drop its user
+                // tx too, else every pair shifts by one. Neither ever lands on this
+                // chain as a bare tx: a skipped entry's tx already landed under the
+                // competing batch that consumed it; an unconsumed one is rolled back
+                // by the composer's own recovery (rich Sync blocks reorg out on
+                // partial settlement) and retried later. Checked against the
+                // pre-truncation count so the unconsumed tail is covered too.
+                if sync_user_txs.len() < original_outbound_len {
                     return Err(DeriverError::local_diverged_with_msg(
                         from_block,
                         &format!(
-                            "outbound entries ({}) exceed Sync-block user txs ({})",
-                            outbound.len(),
+                            "outbound entries ({original_outbound_len}) exceed Sync-block user txs ({})",
                             sync_user_txs.len(),
                         ),
                     ));
@@ -1201,14 +1532,41 @@ where
                 let outbound_paired: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> = outbound
                     .iter()
                     .cloned()
-                    .zip(sync_user_txs.iter().cloned())
+                    .zip(sync_user_txs[outbound_skip..].iter().cloned())
                     .collect();
 
                 // Stash for the post-replay gate — it needs the
                 // `CrossChainCallExecuted` events, observable only after replay.
                 gate_outbound.clone_from(&outbound);
 
-                let starting_nonce = self.system_address_nonce_at(from_block - 1)?;
+                let mut starting_nonce = self.system_address_nonce_at(from_block - 1)?;
+                // The skipped prefix's system txs already sit in this block, so the
+                // parent nonce predates them; entry counts are not that offset.
+                if !skipped_outbound.is_empty() || !skipped_inbound.is_empty() {
+                    let skipped_paired: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> =
+                        skipped_outbound
+                            .into_iter()
+                            .zip(sync_user_txs[..outbound_skip].iter().cloned())
+                            .collect();
+                    let prefix_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
+                        &skipped_paired,
+                        &skipped_inbound,
+                        cfg,
+                        starting_nonce,
+                    )
+                    .map_err(|e| {
+                        DeriverError::l2_provider(format!(
+                            "build_cross_chain_sync_pairs(skipped prefix, tx={tx_hash}): {e}"
+                        ))
+                    })?;
+                    starting_nonce = starting_nonce
+                        .checked_add(prefix_pairs.len() as u64)
+                        .ok_or_else(|| {
+                            DeriverError::l2_provider(format!(
+                                "SYSTEM_ADDRESS nonce overflow over the skipped prefix (tx={tx_hash})"
+                            ))
+                        })?;
+                }
                 let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
                     &outbound_paired,
                     &inbound,
@@ -1227,13 +1585,15 @@ where
                         .into_iter()
                         .map(|b| b.to_vec())
                         .collect();
-                for t in &decoded.transactions[sync_user_start + outbound_paired.len()..] {
+                for t in &decoded.transactions[sync_user_start + original_outbound_len..] {
                     full.push(t.clone());
                 }
                 event!(
                     name: "eez.deriver.reconcile.sync_block_built",
                     Level::INFO,
+                    event_name = "eez.deriver.reconcile.sync_block_built",
                     tx_hash = %tx_hash,
+                    sync_height = from_block + decoded.block_tx_counts.len().saturating_sub(1) as u64,
                     outbound = outbound_paired.len(),
                     inbound = inbound.len(),
                     sync_block_txs = full.len(),
@@ -1245,49 +1605,152 @@ where
             None => None,
         };
 
-        let mut tx_offset = 0usize;
-        let mut replayed: u64 = 0;
+        // Hash of the Sync block replayed this pass; the gate must read by hash.
+        let mut sync_block_hash: Option<B256> = None;
         let stale_boundary = !local_batch_boundary_matches(&self.inner.l2_provider, from_block)?;
+        let mut suffix_replay = SuffixReplay::new(stale_boundary);
+        let mut replayed: u64 = 0;
         let last_index = decoded.block_tx_counts.len().saturating_sub(1);
-        for (i, count) in decoded.block_tx_counts.iter().enumerate() {
-            let l2_block = from_block + i as u64;
-            let count_usize = usize::from(*count);
-            let user_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
-            tx_offset += count_usize;
-            // Per Rollup-1 §1.3 + §13.4.23 the composer always sets
-            // `to_block = sync_slot_block`, so the Sync block is the
-            // LAST block of every batch's range. Prepend system txs
-            // there; earlier blocks stay user-tx-only.
-            let is_sync_block = i == last_index;
-            // The Sync block's full tx list (system + outbound-user, interleaved,
-            // plus trailing non-cc user txs) was pre-built above; every other
-            // block is its user txs verbatim.
-            let block_txs: Vec<Vec<u8>> = match (is_sync_block, sync_block_txs.as_ref()) {
-                (true, Some(full)) => full.clone(),
-                _ => user_txs.to_vec(),
-            };
-            let matched = if stale_boundary {
-                false
-            } else {
-                local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
-            };
-            let should_replay = stale_boundary || replayed > 0 || !matched;
+        let resumed = settlement.start > 0;
+        if resumed {
+            // The competing batch already committed this Sync block; only the
+            // entries this batch settled are new. Append them to its EXISTING
+            // content rather than a fresh block — see `batch_l2_range`.
+            if stale_boundary {
+                return Err(DeriverError::local_diverged_with_msg(
+                    from_block,
+                    "resumed batch's Sync block is missing or reorged; cannot append its \
+                     settled entries without the existing content",
+                ));
+            }
+            // Which Sync block these entries land in (issue #121).
+            event!(
+                name: "eez.deriver.resumed.placement",
+                Level::INFO,
+                l1_block_number,
+                tx_hash = %tx_hash,
+                from_block,
+                applied_start = settlement.start,
+                applied_len = settlement.len,
+                entry_state = ?settlement.entry_state,
+                claimed_block_count = decoded.block_count(),
+                "resumed batch placement: appending settled entries to Sync block {from_block}",
+            );
+            let mut block_txs: Vec<Vec<u8>> = self
+                .inner
+                .l2_provider
+                .block_by_number(from_block)
+                .map_err(DeriverError::l2_provider)?
+                .ok_or_else(|| {
+                    DeriverError::l2_provider(format!("local L2 block at {from_block} missing"))
+                })?
+                .body()
+                .transactions()
+                .iter()
+                .map(Encodable2718::encoded_2718)
+                .collect();
+            let new_content = sync_block_txs.clone().unwrap_or_default();
+            // `ends_with`, not equality: idempotent re-derivation (e.g. after a
+            // crash between this replay and recording it) must not re-append.
+            let already_applied = !new_content.is_empty() && block_txs.ends_with(&new_content);
             event!(
                 name: "eez.deriver.reconcile.block",
                 Level::DEBUG,
                 l1_block_number,
                 tx_hash = %tx_hash,
-                l2_block,
-                action = if should_replay { "replay" } else { "skip" },
-                tx_count = block_txs.len(),
-                replayed_so_far = replayed,
-                "reconciling batch block",
+                l2_block = from_block,
+                action = if already_applied { "skip" } else { "replay" },
+                tx_count = block_txs.len() + new_content.len(),
+                resumed_mid_chain = true,
+                "appending settled entries to the existing Sync block",
             );
-            if !should_replay {
-                continue;
+            if !already_applied {
+                // Rewriting a height at or below `safe` orphans the stored safe hash
+                // and the engine rejects the FCU, so retreat safe to the parent.
+                if self.inner.safe_l2_block.load(Ordering::Acquire) >= from_block {
+                    // Safe cannot retreat below finalized (finalized ahead of safe is
+                    // an invalid forkchoice), so refuse loudly here (invariant 7).
+                    let finalized_l2 = self.inner.l1_head.finalized_l2();
+                    if from_block <= finalized_l2 {
+                        return Err(DeriverError::local_diverged_with_msg(
+                            from_block,
+                            &format!(
+                                "resumed batch would rewrite Sync block {from_block} at or below \
+                                 the L1-finalized L2 head {finalized_l2}"
+                            ),
+                        ));
+                    }
+                    let parent = self.l2_sealed_header_at(from_block - 1)?;
+                    // Only safe retreats; finalized tracks L1 finality, which a
+                    // resume never reaches.
+                    let finalized_hash = self.l2_hash_at(finalized_l2)?;
+                    self.inner
+                        .committer
+                        .advance_safe_finalized(parent, finalized_hash)
+                        .await?;
+                    self.inner
+                        .safe_l2_block
+                        .store(from_block - 1, Ordering::Release);
+                    event!(
+                        name: "eez.deriver.safe.retreated_for_resume",
+                        Level::WARN,
+                        l2_block = from_block,
+                        "safe retreated to the parent for a same-height resumed replacement (finalized unchanged)",
+                    );
+                }
+                block_txs.extend(new_content);
+                let outcome = self.replay_block(from_block - 1, &block_txs).await?;
+                // No later block follows this one to make it canonical, so
+                // reading by number can still return the old block. Only an
+                // issue here; a forward replay is extended by the next commit.
+                sync_block_hash = Some(outcome.block_hash);
+                replayed = 1;
             }
-            self.replay_block(l2_block - 1, &block_txs).await?;
-            replayed += 1;
+        } else {
+            let mut tx_offset = 0usize;
+            for (i, count) in decoded.block_tx_counts.iter().enumerate() {
+                let l2_block = from_block + i as u64;
+                let count_usize = usize::from(*count);
+                let user_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
+                tx_offset += count_usize;
+                // Per Rollup-1 §1.3 + §13.4.23 the composer always sets
+                // `to_block = sync_slot_block`, so the Sync block is the
+                // LAST block of every batch's range. Prepend system txs
+                // there; earlier blocks stay user-tx-only.
+                let is_sync_block = i == last_index;
+                // The Sync block's full tx list (system + outbound-user, interleaved,
+                // plus trailing non-cc user txs) was pre-built above; every other
+                // block is its user txs verbatim.
+                let block_txs: Vec<Vec<u8>> = match (is_sync_block, sync_block_txs.as_ref()) {
+                    (true, Some(full)) => full.clone(),
+                    _ => user_txs.to_vec(),
+                };
+                let matched = if stale_boundary {
+                    false
+                } else {
+                    local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
+                };
+                let should_replay = suffix_replay.required(matched);
+                event!(
+                    name: "eez.deriver.reconcile.block",
+                    Level::DEBUG,
+                    l1_block_number,
+                    tx_hash = %tx_hash,
+                    l2_block,
+                    action = if should_replay { "replay" } else { "skip" },
+                    tx_count = block_txs.len(),
+                    replayed_so_far = replayed,
+                    "reconciling batch block",
+                );
+                if !should_replay {
+                    continue;
+                }
+                let outcome = self.replay_block(l2_block - 1, &block_txs).await?;
+                if is_sync_block {
+                    sync_block_hash = Some(outcome.block_hash);
+                }
+                replayed += 1;
+            }
         }
 
         // Outbound authorization gate (trace binding): every OUTBOUND settlement
@@ -1302,8 +1765,16 @@ where
                 .system_tx_cfg
                 .as_ref()
                 .expect("gate_outbound only populated under system_tx_cfg = Some");
-            let to_block = from_block + last_index as u64;
-            let observed = self.observed_outbound_calls(to_block, cfg.eezl2_address)?;
+            let to_block = if resumed {
+                from_block
+            } else {
+                from_block + last_index as u64
+            };
+            // By hash after a replay: the number still resolves to the superseded
+            // block until persistence catches up.
+            let source: alloy_eips::BlockHashOrNumber =
+                sync_block_hash.map_or_else(|| to_block.into(), Into::into);
+            let observed = self.observed_outbound_calls(source, cfg.eezl2_address)?;
             eez_protocol::outbound_gate::verify_outbound_authorized(
                 &gate_outbound,
                 &observed,
@@ -1316,7 +1787,7 @@ where
                 )
             })?;
         }
-        Ok(replayed)
+        Ok((replayed, sync_block_hash))
     }
 
     /// Outbound calls emitted by the L2 manager in `block`.
@@ -1325,13 +1796,13 @@ where
     /// [`DeriverError::l2_provider`] if the block's receipts are missing locally.
     fn observed_outbound_calls(
         &self,
-        block: u64,
+        block: alloy_eips::BlockHashOrNumber,
         eez_l2: Address,
     ) -> DeriverResult<Vec<OutboundCallObservation>> {
         let receipts = self
             .inner
             .l2_provider
-            .receipts_by_block(block.into())
+            .receipts_by_block(block)
             .map_err(DeriverError::l2_provider)?
             .ok_or_else(|| {
                 DeriverError::l2_provider(format!("local receipts for Sync block {block} missing"))
@@ -1377,21 +1848,29 @@ where
     /// - `claimed_new_state` (last state update's `newState`) vs the local
     ///   root at `to_block`.
     ///
-    /// Both ends are checked — the composer chains deltas across
-    /// entries, so checking one would let a crafted chain pass. Matters
-    /// under the mock prover, which can't enforce linearity; halting
-    /// here surfaces the mismatch at its origin rather than at our next
-    /// post's `StateRootMismatch`.
+    /// Both ends are checked — the composer chains deltas across entries, so
+    /// checking one would let a crafted chain pass. Halting here surfaces a
+    /// mismatch at its origin rather than at our next post's
+    /// `StateRootMismatch`.
+    ///
+    /// `entry_root` is [`eez_l1::Settlement::entry_state`], not the claimed chain
+    /// head — the claimed head would contradict the cursor guard on a mid-chain resume.
     fn check_claimed_state(
         &self,
-        claimed_current_state: Option<B256>,
+        entry_root: Option<B256>,
         claimed_new_state: Option<B256>,
+        // Block the applied run started from. The endpoint is in
+        // `[anchor, to_block]`, anchor included.
+        anchor: u64,
         from_block: u64,
         to_block: u64,
+        // Hash of the block replayed at `to_block`. Needed only when a
+        // resumed batch rewrote the tip; see `sync_block_hash`.
+        to_block_hash: Option<B256>,
         l1_block_number: u64,
         tx_hash: B256,
-    ) -> DeriverResult<()> {
-        if let Some(claimed_curr) = claimed_current_state {
+    ) -> DeriverResult<Option<u64>> {
+        if let Some(claimed_curr) = entry_root {
             let pre = from_block.saturating_sub(1);
             let local_pre = self
                 .inner
@@ -1406,30 +1885,80 @@ where
                 event!(
                     name: "eez.deriver.state.diverged_pre",
                     Level::ERROR,
+                    event_name = "eez.deriver.state.diverged_pre",
                     l1_block_number,
                     tx_hash = %tx_hash,
                     pre_block = pre,
                     local_root = %local_pre,
                     claimed = %claimed_curr,
-                    "local L2 state root at from_block-1 differs from batch's claimed currentState",
+                    "local L2 state root at from_block-1 differs from the root the batch's applied run started from",
                 );
                 return Err(DeriverError::local_diverged(pre));
             }
         }
+        // A partial settlement stops early, so find the block carrying the
+        // settled root rather than assuming `to_block`. It becomes the cursor.
         if let Some(claimed_new) = claimed_new_state {
-            let local_post = self
-                .inner
-                .l2_provider
-                .sealed_header(to_block)
-                .map_err(DeriverError::l2_provider)?
-                .ok_or_else(|| {
-                    DeriverError::l2_provider(format!("local L2 header at {to_block} missing"))
-                })?
-                .state_root();
+            // L1 can only apply a PREFIX of the claimed chain, so the settled
+            // endpoint is at or below the range end — never above our tip.
+            let tip = self.inner.committer.last_header().number();
+            if to_block > tip {
+                event!(
+                    name: "eez.deriver.state.endpoint_above_tip",
+                    Level::ERROR,
+                    l1_block_number,
+                    tx_hash = %tx_hash,
+                    to_block,
+                    tip,
+                    "batch claims a range ending above the local tip; replay did not reach it",
+                );
+                return Err(DeriverError::local_diverged(to_block));
+            }
+            // A depth, not a block count. `from_block` is `anchor + 1` when
+            // fresh and `anchor` when resumed, so measure from the anchor.
+            let window = to_block.saturating_sub(anchor);
+            if let Some(settled_end) = find_batch_anchor(to_block, claimed_new, window, |block| {
+                self.l2_state_root_at(block)
+            })? {
+                if settled_end != to_block {
+                    event!(
+                        name: "eez.deriver.state.settled_prefix",
+                        Level::INFO,
+                        l1_block_number,
+                        tx_hash = %tx_hash,
+                        to_block,
+                        settled_end,
+                        "L1 settled a prefix; the cursor follows its endpoint, not the claimed range end",
+                    );
+                }
+                return Ok(Some(settled_end));
+            }
+            let local_post = if let Some(hash) = to_block_hash {
+                self.inner
+                    .l2_provider
+                    .header(hash)
+                    .map_err(DeriverError::l2_provider)?
+                    .ok_or_else(|| {
+                        DeriverError::l2_provider(format!(
+                            "local L2 header for replayed block {hash} missing"
+                        ))
+                    })?
+                    .state_root
+            } else {
+                self.inner
+                    .l2_provider
+                    .sealed_header(to_block)
+                    .map_err(DeriverError::l2_provider)?
+                    .ok_or_else(|| {
+                        DeriverError::l2_provider(format!("local L2 header at {to_block} missing"))
+                    })?
+                    .state_root()
+            };
             if local_post != claimed_new {
                 event!(
                     name: "eez.deriver.state.diverged_post",
                     Level::ERROR,
+                    event_name = "eez.deriver.state.diverged_post",
                     l1_block_number,
                     tx_hash = %tx_hash,
                     to_block,
@@ -1439,9 +1968,74 @@ where
                 );
                 return Err(DeriverError::local_diverged(to_block));
             }
+            return Ok(Some(to_block));
         }
-        Ok(())
+        Ok(None)
     }
+}
+
+/// [`find_batch_anchor`] plus the overlap log. Free fn so a test can drive it
+/// with a closure and assert the event, with no live `Deriver`.
+///
+/// # Errors
+/// Propagates `root_at` failures.
+fn anchor_with_overlap_log(
+    cursor: u64,
+    entry_state: B256,
+    window: u64,
+    root_at: impl FnMut(u64) -> DeriverResult<B256>,
+) -> DeriverResult<Option<u64>> {
+    let anchor = find_batch_anchor(cursor, entry_state, window, root_at)?;
+    // Overlapping range: a competing composer's batch starts below our cursor.
+    if let Some(anchor) = anchor
+        && anchor != cursor
+    {
+        event!(
+            name: "eez.deriver.batch.anchored_below_cursor",
+            Level::INFO,
+            cursor,
+            anchor,
+            "batch anchored below the cursor; its range overlaps ours",
+        );
+    }
+    Ok(anchor)
+}
+
+/// Walks back from `cursor` for the block whose root is `entry_state`. `None`
+/// means the batch starts outside the window, which the caller treats as loud.
+fn find_batch_anchor(
+    cursor: u64,
+    entry_state: B256,
+    window: u64,
+    mut root_at: impl FnMut(u64) -> DeriverResult<B256>,
+) -> DeriverResult<Option<u64>> {
+    let floor = cursor.saturating_sub(window);
+    let mut block = cursor;
+    loop {
+        if root_at(block)? == entry_state {
+            return Ok(Some(block));
+        }
+        if block == floor {
+            return Ok(None);
+        }
+        block -= 1;
+    }
+}
+
+/// L2 heights a batch's settled part covers. A resumed batch reuses the Sync
+/// block at `cumulative_l2`; a fresh height would re-apply EIP-2935/4788.
+const fn batch_l2_range(cumulative_l2: u64, resumed: bool, claimed_block_count: u64) -> (u64, u64) {
+    if resumed {
+        (cumulative_l2, cumulative_l2)
+    } else {
+        (cumulative_l2 + 1, cumulative_l2 + claimed_block_count)
+    }
+}
+
+/// Takes `entry_state` (batch not applied yet) or `final_state` (already applied,
+/// as a re-scan sees). Re-derivation is idempotent; any other root is divergence.
+fn cursor_root_accepted(local_root: B256, entry_state: B256, final_state: Option<B256>) -> bool {
+    local_root == entry_state || final_state == Some(local_root)
 }
 
 /// `true` iff local reth has a block at `block_number` whose tx list
@@ -1503,6 +2097,92 @@ where
     Ok(local_block.header().parent_hash == expected_parent_hash)
 }
 
+/// Once one block in a batch must be replayed, every descendant in that batch
+/// must be rebuilt on the new parent even when its transaction list matches.
+#[derive(Debug, Clone, Copy)]
+struct SuffixReplay {
+    active: bool,
+}
+
+impl SuffixReplay {
+    const fn new(stale_boundary: bool) -> Self {
+        Self {
+            active: stale_boundary,
+        }
+    }
+
+    const fn required(&mut self, local_matches: bool) -> bool {
+        self.active |= !local_matches;
+        self.active
+    }
+}
+
+#[cfg(test)]
+mod suffix_replay_tests {
+    use super::SuffixReplay;
+
+    fn decisions(stale_boundary: bool, local_matches: &[bool]) -> Vec<bool> {
+        let mut suffix = SuffixReplay::new(stale_boundary);
+        local_matches
+            .iter()
+            .map(|matches| suffix.required(*matches))
+            .collect()
+    }
+
+    #[test]
+    fn mismatch_replays_every_later_descendant() {
+        assert_eq!(
+            decisions(false, &[true, false, true, true]),
+            [false, true, true, true],
+        );
+    }
+
+    #[test]
+    fn stale_boundary_replays_the_complete_batch() {
+        assert_eq!(decisions(true, &[true, true, true]), [true, true, true]);
+    }
+}
+
+/// Which producing entries L1 ran, projected onto the partitioned
+/// `[outbound…, inbound…]` list (that concatenation is the claimed chain minus
+/// the anchor). A `skip` per list, not just a length: L1 resumes MID-CHAIN when
+/// a competing same-block batch already made the leading hops, so those entries
+/// drop from the FRONT — which prefix truncation cannot express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProducingSlice {
+    outbound_skip: usize,
+    outbound_take: usize,
+    inbound_skip: usize,
+    inbound_take: usize,
+}
+
+impl ProducingSlice {
+    /// Project `settlement`'s producing run onto lists of the given lengths.
+    fn split(settlement: eez_l1::Settlement, outbound_len: usize, inbound_len: usize) -> Self {
+        let (skip, take) = settlement.producing_slice();
+        let outbound_skip = skip.min(outbound_len);
+        let outbound_take = take.min(outbound_len - outbound_skip);
+        // Any skip beyond the outbound list falls through into inbound.
+        let inbound_skip = skip.saturating_sub(outbound_skip).min(inbound_len);
+        let inbound_take = take
+            .saturating_sub(outbound_take)
+            .min(inbound_len - inbound_skip);
+        Self {
+            outbound_skip,
+            outbound_take,
+            inbound_skip,
+            inbound_take,
+        }
+    }
+
+    /// True when entries are left over at the TAIL (partial consumption). A pure
+    /// mid-chain resume does NOT trip this — front skips are counted in `*_skip`.
+    const fn leaves_entries_unconsumed(&self, outbound_len: usize, inbound_len: usize) -> bool {
+        self.outbound_skip + self.outbound_take < outbound_len
+            || self.inbound_skip + self.inbound_take < inbound_len
+    }
+}
+
 /// Decode outbound-call events emitted by the configured L2 manager.
 fn extract_outbound_call_observations<R>(
     receipts: &[R],
@@ -1511,18 +2191,177 @@ fn extract_outbound_call_observations<R>(
 where
     R: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
 {
-    use alloy_sol_types::SolEvent as _;
-    use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
-
-    receipts
+    let logs: Vec<alloy_primitives::Log> = receipts
         .iter()
         .flat_map(alloy_consensus::TxReceipt::logs)
-        .filter(|log| log.address == eez_l2)
-        .filter_map(|log| CrossChainCallExecuted::decode_log_validate(log).ok())
-        .map(|event| {
-            OutboundCallObservation::new(event.data.crossChainCallHash, event.data.callGas)
-        })
-        .collect()
+        .cloned()
+        .collect();
+    eez_protocol::outbound_gate::observations_from_logs(&logs, eez_l2)
+}
+
+#[cfg(test)]
+mod producing_slice_tests {
+    //! Two composers post into ONE L1 block: `pb1` claims `A→B` and lands, so
+    //! `pb2`'s leading step(s) are refused as redundant and L1 resumes MID-CHAIN
+    //! inside it. The deriver must rebuild exactly the steps that ran.
+
+    use super::ProducingSlice;
+    use alloy_primitives::B256;
+    use eez_l1::Settlement;
+
+    /// Cursor guard and `check_claimed_state` must agree on entry root, else a
+    /// mid-chain resume clears one and fails the other.
+    #[test]
+    fn state_check_entry_root_is_not_the_claimed_chain_head() {
+        let (a, b) = (B256::repeat_byte(0x0A), B256::repeat_byte(0x0B));
+        let claimed_head = Some(a);
+
+        // Mid-chain resume: B is what both guards check.
+        let resumed = Settlement {
+            start: 1,
+            len: 1,
+            final_state: None,
+            entry_state: Some(b),
+        };
+        assert_eq!(resumed.entry_state.or(claimed_head), Some(b));
+        assert_ne!(resumed.entry_state.or(claimed_head), claimed_head);
+
+        // Uncontested: unchanged.
+        let plain = Settlement {
+            start: 0,
+            len: 1,
+            final_state: None,
+            entry_state: claimed_head,
+        };
+        assert_eq!(plain.entry_state.or(claimed_head), claimed_head);
+    }
+
+    /// The superseded reconstruction: keep `settled_count - 1` entries from the
+    /// FRONT (outbound first, then inbound). Its skips are structurally 0 — the
+    /// defect. Shaped as `(outbound_skip, outbound_take, inbound_skip, inbound_take)` to compare.
+    fn old_prefix_split(
+        settled_count: usize,
+        outbound_len: usize,
+        inbound_len: usize,
+    ) -> (usize, usize, usize, usize) {
+        let applied = settled_count.saturating_sub(1);
+        let applied_outbound = applied.min(outbound_len);
+        let consumed_inbound = (applied - applied_outbound).min(inbound_len);
+        (0, applied_outbound, 0, consumed_inbound)
+    }
+
+    fn settlement(start: usize, len: usize) -> Settlement {
+        Settlement {
+            start,
+            len,
+            final_state: None,
+            entry_state: None,
+        }
+    }
+
+    /// Anchor skipped, one producing step ran → rebuild that one, not zero.
+    #[test]
+    fn second_batch_rebuilds_the_single_step_that_ran() {
+        let s = ProducingSlice::split(settlement(1, 1), 0, 1);
+        assert_eq!(
+            s,
+            ProducingSlice {
+                outbound_skip: 0,
+                outbound_take: 0,
+                inbound_skip: 0,
+                inbound_take: 1
+            },
+        );
+        assert!(!s.leaves_entries_unconsumed(0, 1));
+    }
+
+    /// Competitor made the anchor AND the first producing hop, so L1 resumed at
+    /// the second. The prefix formula keeps the already-settled entry and drops
+    /// the one that ran — rebuilding a different tx than L1 executed.
+    #[test]
+    fn deeper_resume_skips_the_front_where_prefix_truncation_cannot() {
+        // claimed [anchor, p0, p1]; competitor made anchor + p0; only p1 ran.
+        let s = ProducingSlice::split(settlement(2, 1), 0, 2);
+        assert_eq!(
+            s,
+            ProducingSlice {
+                outbound_skip: 0,
+                outbound_take: 0,
+                inbound_skip: 1,
+                inbound_take: 1,
+            },
+        );
+        // Front skips are counted, so nothing reads as left over.
+        assert!(!s.leaves_entries_unconsumed(0, 2));
+
+        let old = old_prefix_split(1, 0, 2);
+        assert_eq!(old, (0, 0, 0, 0), "prefix formula rebuilds nothing here");
+        assert_ne!((old.2, old.3), (s.inbound_skip, s.inbound_take));
+    }
+
+    /// A skip longer than the outbound list falls through into inbound.
+    #[test]
+    fn skip_and_take_span_outbound_into_inbound() {
+        let s = ProducingSlice::split(settlement(3, 2), 2, 3);
+        assert_eq!((s.outbound_skip, s.outbound_take), (2, 0));
+        assert_eq!((s.inbound_skip, s.inbound_take), (0, 2));
+    }
+
+    /// Anchor ran: producing entries are `len - 1`, nothing skipped. The ordinary
+    /// single-composer path must derive exactly as the prefix formula did.
+    #[test]
+    fn anchor_applied_matches_the_prefix_formula() {
+        let s = ProducingSlice::split(settlement(0, 3), 1, 1);
+        assert_eq!(s.outbound_skip, 0);
+        assert_eq!(s.inbound_skip, 0);
+        assert_eq!((s.outbound_take, s.inbound_take), (1, 1));
+        let old = old_prefix_split(3, 1, 1);
+        assert_eq!((old.1, old.3), (s.outbound_take, s.inbound_take));
+    }
+
+    /// L1 stopped SHORT (a reverting user tx left its entry and the rest
+    /// unconsumed) — truncate the tail, no skip.
+    #[test]
+    fn stopping_short_truncates_the_tail() {
+        let s = ProducingSlice::split(settlement(0, 2), 0, 3);
+        assert_eq!((s.inbound_skip, s.inbound_take), (0, 1));
+        assert!(s.leaves_entries_unconsumed(0, 3));
+    }
+
+    /// A run longer than the available entries clamps instead of panicking.
+    #[test]
+    fn oversized_run_clamps_to_available_entries() {
+        let s = ProducingSlice::split(settlement(0, 99), 1, 1);
+        assert_eq!((s.outbound_take, s.inbound_take), (1, 1));
+        let s = ProducingSlice::split(settlement(50, 99), 1, 1);
+        assert_eq!(s.outbound_skip + s.outbound_take, 1);
+        assert_eq!(s.inbound_skip + s.inbound_take, 1);
+    }
+
+    /// The trailing-append boundary must skip unconsumed tail entries too, not
+    /// just `outbound_skip + outbound_take`.
+    #[test]
+    fn tail_truncation_boundary_must_skip_the_unconsumed_entry_too() {
+        let original_outbound_len = 2; // [E0, E1]
+        let s = ProducingSlice::split(settlement(0, 2), original_outbound_len, 0);
+        assert_eq!((s.outbound_skip, s.outbound_take), (0, 1));
+        assert!(s.leaves_entries_unconsumed(original_outbound_len, 0));
+
+        let buggy_boundary = s.outbound_skip + s.outbound_take;
+        assert_ne!(buggy_boundary, original_outbound_len);
+    }
+
+    /// Two composers built from cursor 100, both claiming 101..=110: batch 1
+    /// (plain) spans that full range, advancing the cursor to 110; batch 2
+    /// (resumed) settles within that SAME Sync block, not a new one.
+    #[test]
+    fn resumed_batch_settles_within_the_existing_sync_block_not_a_new_one() {
+        let (first, last) = super::batch_l2_range(100, settlement(0, 2).start > 0, 10);
+        assert_eq!((first, last), (101, 110));
+
+        let (first, last) = super::batch_l2_range(110, settlement(2, 1).start > 0, 10);
+        assert_eq!((first, last), (110, 110));
+    }
 }
 
 #[cfg(test)]
@@ -1699,5 +2538,214 @@ mod outbound_wiring_tests {
             )
             .is_ok()
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_anchor_tests {
+    //! Two composers on one rollup post OVERLAPPING ranges: B's cursor sits a
+    //! block behind A's, so B's batch starts below A's cursor (live 2026-08-24).
+
+    use super::{batch_l2_range, find_batch_anchor};
+    use alloy_primitives::B256;
+
+    /// Roots of the live stall: B's batch covered 174192..174197, A's cursor was
+    /// 174192, and L1's stored root was block 174197's.
+    fn root_at(block: u64) -> B256 {
+        B256::with_last_byte(u8::try_from(block % 251).expect("fits"))
+    }
+
+    #[test]
+    fn overlapping_batch_anchors_below_the_cursor_and_lands_on_the_settled_block() {
+        let cursor = 174_192_u64;
+        let block_count = 6_u64;
+        // B's batch declares the root of 174191 as where its run starts.
+        let entry_state = root_at(174_191);
+
+        let anchor = find_batch_anchor(cursor, entry_state, block_count, |b| Ok(root_at(b)))
+            .expect("lookup")
+            .expect("anchor is inside the window");
+        assert_eq!(anchor, 174_191);
+
+        // Anchored: the range is B's real one and ends where L1 stored its root.
+        assert_eq!(
+            batch_l2_range(anchor, false, block_count),
+            (174_192, 174_197)
+        );
+        // Cursor-relative (the bug): one block too high, so the endpoint check
+        // compared L1's stored root against block 174198 and refused.
+        assert_eq!(
+            batch_l2_range(cursor, false, block_count),
+            (174_193, 174_198)
+        );
+    }
+
+    #[test]
+    fn a_partial_settlement_endpoint_is_found_below_the_claimed_range_end() {
+        // Live 2026-08-24: the batch claimed 174193..174198, but L1 stopped at
+        // the hop whose newState is block 174197's root.
+        let claimed_end = 174_198_u64;
+        let settled = find_batch_anchor(claimed_end, root_at(174_197), 6, |b| Ok(root_at(b)))
+            .expect("lookup")
+            .expect("endpoint inside the window");
+        assert_eq!(settled, 174_197);
+        assert_ne!(settled, claimed_end, "cursor must not run past L1's root");
+    }
+
+    #[test]
+    fn a_full_settlement_endpoint_is_the_range_end() {
+        let claimed_end = 174_198_u64;
+        let settled = find_batch_anchor(claimed_end, root_at(claimed_end), 6, |b| Ok(root_at(b)))
+            .expect("lookup")
+            .expect("endpoint");
+        assert_eq!(settled, claimed_end);
+    }
+
+    #[test]
+    fn disjoint_batch_still_anchors_at_the_cursor() {
+        let cursor = 1_000_u64;
+        let anchor = find_batch_anchor(cursor, root_at(cursor), 6, |b| Ok(root_at(b)))
+            .expect("lookup")
+            .expect("anchor");
+        assert_eq!(anchor, cursor);
+        assert_eq!(batch_l2_range(anchor, false, 6), (1_001, 1_006));
+    }
+
+    #[test]
+    fn a_root_outside_the_window_stays_loud() {
+        let cursor = 1_000_u64;
+        let anchor =
+            find_batch_anchor(cursor, B256::repeat_byte(0xEE), 6, |b| Ok(root_at(b))).expect("ok");
+        assert!(anchor.is_none(), "unknown root must not be anchored");
+    }
+
+    /// Endpoint depth is measured from the ANCHOR, not `from_block`, which is
+    /// `anchor + 1` when fresh and `anchor` when resumed. Both from-relative
+    /// forms are wrong in opposite directions.
+    ///
+    /// The anchor is a legitimate endpoint: a single-block batch's leading
+    /// immediate is a no-op (`newState == parent.stateRoot == root(anchor)`),
+    /// so L1 can accept it and leave the root there.
+    #[test]
+    fn endpoint_depth_is_measured_from_the_anchor() {
+        for count in [1_u64, 6] {
+            let anchor = 174_192_u64;
+            let (from, to) = batch_l2_range(anchor, false, count);
+            let probe = |b| Ok(root_at(b));
+
+            assert_eq!(
+                find_batch_anchor(to, root_at(anchor), to - anchor, probe).expect("lookup"),
+                Some(anchor),
+                "count={count}: the anchor must stay reachable",
+            );
+            // `to - from` misses it — one short for a fresh batch.
+            assert!(
+                find_batch_anchor(to, root_at(anchor), to - from, probe)
+                    .expect("lookup")
+                    .is_none(),
+                "count={count}: from-relative depth wrongly excludes the anchor",
+            );
+            for endpoint in from..=to {
+                assert_eq!(
+                    find_batch_anchor(to, root_at(endpoint), to - anchor, probe).expect("lookup"),
+                    Some(endpoint),
+                );
+            }
+            assert!(
+                find_batch_anchor(to, root_at(anchor - 1), to - anchor, probe)
+                    .expect("lookup")
+                    .is_none(),
+                "count={count}: a root predating the run must not be accepted",
+            );
+        }
+    }
+
+    /// A resumed batch collapses onto the anchor (`from == to == anchor`), so
+    /// its only valid endpoint is that block — depth 0. The inclusive count
+    /// would reach the anchor's parent and accept a root predating the batch.
+    #[test]
+    fn resumed_batch_endpoint_is_its_own_sync_block_only() {
+        let anchor = 174_197_u64;
+        let (from, to) = batch_l2_range(anchor, true, 10);
+        assert_eq!((from, to), (anchor, anchor));
+        assert_eq!(to - anchor, 0);
+
+        assert_eq!(
+            find_batch_anchor(to, root_at(anchor), 0, |b| Ok(root_at(b))).expect("lookup"),
+            Some(anchor),
+        );
+        assert!(
+            find_batch_anchor(to, root_at(anchor - 1), 0, |b| Ok(root_at(b)))
+                .expect("lookup")
+                .is_none(),
+            "must not settle at its predecessor's root",
+        );
+        // The old inclusive count accepted exactly that.
+        assert_eq!(
+            find_batch_anchor(to, root_at(anchor - 1), to - from + 1, |b| Ok(root_at(b)))
+                .expect("lookup"),
+            Some(anchor - 1),
+        );
+    }
+
+    #[test]
+    fn search_is_bounded_by_the_window() {
+        let cursor = 1_000_u64;
+        let mut reads = 0_u32;
+        let _ = find_batch_anchor(cursor, B256::repeat_byte(0xEE), 6, |b| {
+            reads += 1;
+            Ok(root_at(b))
+        });
+        assert_eq!(reads, 7, "cursor plus the window, nothing deeper");
+    }
+}
+
+#[cfg(test)]
+mod cursor_guard_tests {
+    //! A re-scanned resume hits the guard twice: cursor at `entry_state` first,
+    //! at `final_state` after. Calling the second divergence rolls back good state.
+
+    use super::cursor_root_accepted;
+    use alloy_primitives::B256;
+
+    const ENTRY: B256 = B256::repeat_byte(0x0B);
+    const FINAL: B256 = B256::repeat_byte(0x0C);
+    const OTHER: B256 = B256::repeat_byte(0xFF);
+
+    #[test]
+    fn entry_state_passes_before_the_append() {
+        assert!(cursor_root_accepted(ENTRY, ENTRY, Some(FINAL)));
+    }
+
+    #[test]
+    fn settled_endpoint_passes_after_the_append() {
+        assert!(cursor_root_accepted(FINAL, ENTRY, Some(FINAL)));
+    }
+
+    #[test]
+    fn a_third_root_stays_loud() {
+        assert!(!cursor_root_accepted(OTHER, ENTRY, Some(FINAL)));
+        // No settled endpoint reported: only `entry_state` can clear the guard.
+        assert!(!cursor_root_accepted(OTHER, ENTRY, None));
+        assert!(!cursor_root_accepted(FINAL, ENTRY, None));
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::choose_seed;
+
+    /// The seed must never leave `[floor, end]` — both bounds have been wrong
+    /// in the field, wedging boot each time.
+    #[test]
+    fn choose_seed_stays_within_the_scanned_range() {
+        assert_eq!(choose_seed(500, 1000, Some(968)), 968); // finality lags the tip
+        assert_eq!(choose_seed(990, 1000, Some(900)), 990); // finalized below floor
+        assert_eq!(choose_seed(500, 1000, Some(1010)), 1000); // finality past scan
+        // Chain too young to finalize: the floor is what the scan read.
+        assert_eq!(choose_seed(500, 1000, None), 500);
+        // Floor above the endpoint (L1 rewound under an indexed batch).
+        assert_eq!(choose_seed(999, 40, Some(20)), 40);
+        assert_eq!(choose_seed(0, 0, None), 0);
     }
 }

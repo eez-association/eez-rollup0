@@ -3,8 +3,8 @@ pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/Test.sol";
 
-import {EEZ, ProofSystemBatchPerVerificationEntries, RollupIdWithProofSystems} from "sync-rollups-protocol/src/EEZ.sol";
-import {Rollup} from "sync-rollups-protocol/src/rollupContract/Rollup.sol";
+import {EEZ, ProofSystemBatchPerVerificationEntries, RollupIdWithProofSystems} from "eez-core-protocol/src/EEZ.sol";
+import {Rollup} from "eez-core-protocol/src/rollupContract/Rollup.sol";
 import {
     ExecutionEntry,
     ExpectedStateRootPerRollup,
@@ -12,8 +12,8 @@ import {
     L2ToL1Call,
     StateUpdate,
     StaticExecutionEntry
-} from "sync-rollups-protocol/src/interfaces/IEEZ.sol";
-import {MockProofSystem} from "sync-rollups-protocol/test/mocks/MockProofSystem.sol";
+} from "eez-core-protocol/src/interfaces/IEEZ.sol";
+import {MockProofSystem} from "eez-core-protocol/test/mocks/MockProofSystem.sol";
 import {ECDSAProofSystem} from "../src/ECDSAProofSystem.sol";
 
 /// Solidity oracle for the two-stage public-input construction at the pinned

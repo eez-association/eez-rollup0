@@ -30,20 +30,24 @@ rebuild the whole L2 chain from L1 alone. The supported L1 is Gnosis **Chiado**
 its settlement effects before signing the recomputed public-input hash.
 `ECDSAProofSystem` verifies that hash-bound attestation on L1. This is not yet
 a succinct validity proof, but the deployed verifier no longer accepts an
-unbound mock signature.
+unbound mock signature. The
+[Composer-to-prover gRPC specification](crates/eez-control-rpc/SPEC.md) defines
+request construction, response validation, and the prove-to-L1 handoff.
 
 ## Run a chiado L2 (Docker)
 
-Runs three containers: `eez-node` (which embeds a Chiado L1 node alongside the
-L2 + composer), `eez-proof-signer`, and a **lighthouse** consensus client that drives the L1.
+Runs three containers: `eez-node` (whose entrypoint is the `eez-composer`
+binary, embedding a Chiado L1 node alongside the L2), `eez-proof-signer`, and a
+**lighthouse** consensus client that drives the L1.
 There's no separate L1 node to run. Cross-chain batches are submitted to
 Chiado's block builder; the L1 block to aim them at is read from the embedded
 L1 once it has caught up to the chain tip.
 
-> **One command** (after the one-time setup): `bash scripts/chiado-up.sh`
-> deploys the protocol, verifies the contracts on Blockscout, prepares the
-> datadirs, starts the stack, waits until it's healthy, and prints the RPC
-> URLs. The numbered steps below are that same flow done by hand.
+> **One command** (after the one-time setup + `.env`/`.env.chiado`): `bash
+> scripts/chiado-up.sh` deploys the protocol (skipped if already deployed),
+> prepares the datadirs, starts the stack, waits until it's healthy, and
+> prints the RPC URLs. The numbered steps below are that same flow done by
+> hand.
 
 ### One-time setup
 
@@ -82,8 +86,6 @@ cp .env.example .env
 #   EEZ_PROOF_SIGNER_KEY=<operator key>   (its address becomes the proof system's authorizedSigner)
 #   EEZ_L2_SYSTEM_KEY=<separate L2 system-transaction key>
 EEZ_DEPLOY_SKIP_SIMULATION=1 make deploy-protocol
-
-cp datadir/genesis.json ./data/genesis-fresh.json
 ```
 
 This deploys EEZ + ECDSAProofSystem + the rollup manager, registers the
@@ -127,7 +129,7 @@ The two **cross-chain ingress fronts** are transparent proxies:
 `eth_sendRawTransaction` sent to a front is held and composed into the next Sync
 block; every other `eth_*` is forwarded to that front's source-chain RPC. They
 use the compose env `EEZ_L1_XCHAIN_PORT` / `EEZ_L2_XCHAIN_PORT`; both ports are
-required in composer mode. Follower and standalone modes do not start cross-chain
+required by `eez-composer`. The `eez-follower` binary does not start cross-chain
 ingress fronts. Upstreams are `EEZ_L1_RPC_URL` / `EEZ_L2_RPC_URL` respectively.
 
 `EEZ_MAX_USER_TXS_PER_BUNDLE` (compose, default `3`) caps how many user
@@ -159,11 +161,36 @@ EEZ_RESTART=1 EEZ_MODE=load ... bash scripts/xchain-test.sh                    #
 (`scripts/devnet-test.sh` is the earlier, simpler driver — setter+deposit only,
 raw-RPC — kept for reference.)
 
+## Run node roles locally
+
+`eez-composer` is the package default. Run it directly, or use `make run-node`:
+
+```bash
+cargo run -p eez-node -- node \
+  --chain "$EEZ_L2_GENESIS_PATH" \
+  --datadir "$EEZ_L2_DATADIR"
+```
+
+Select the non-default follower role explicitly. `EEZ_L1_CHAIN_ID` must match
+the numeric chain ID served by `EEZ_L1_RPC_URL`. A follower also requires the
+system signer and L2 execution identity so it can reconstruct Sync blocks:
+
+```bash
+# L1-derived follower; optionally add `--sequencer-rpc <URL>` after `node`.
+EEZ_L1_CHAIN_ID="<numeric-l1-chain-id>" \
+EEZ_L2_SYSTEM_KEY="<system-private-key>" \
+EEZL2_ADDRESS="<eezl2-contract-address>" \
+EEZ_ROLLUP_ID="<numeric-rollup-id>" \
+cargo run -p eez-follower -- node \
+  --chain "$EEZ_L2_GENESIS_PATH" \
+  --datadir "$EEZ_L2_DATADIR"
+```
+
 ## Build, test, teardown
 
 ```bash
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                  # Rust; `cd contracts && forge test` for Solidity
-bash scripts/teardown-chiado.sh         # stop node + lighthouse, release the L1 datadir
+bash scripts/teardown-chiado.sh         # stop eez-node + eez-proof-signer + lighthouse (datadirs untouched)
 ```

@@ -16,5 +16,8 @@ prost       = { workspace = true }
 # Compiles `proto/prove.proto`. Needs `protoc` on PATH.
 tonic-prost-build = { workspace = true }
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true

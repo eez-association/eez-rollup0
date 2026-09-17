@@ -5,10 +5,8 @@
 //! at production time for logging + dashboards.
 //!
 //! [`SlotEvent`] is the trigger event sent into the Sequencer's
-//! `mpsc::Receiver<SlotEvent>`. Three variants:
+//! `mpsc::Receiver<SlotEvent>`. Two variants:
 //!
-//! - [`SlotEvent::Live`] — fixed-interval tick, standalone-mode only.
-//!   Produced by [`spawn_interval`].
 //! - [`SlotEvent::SyncSlot`] — L1-anchored sync-slot trigger. Produced
 //!   by [`spawn_l1_anchored`], which subscribes to an
 //!   [`eez_l1::L1HeadStream`]
@@ -88,13 +86,6 @@ pub enum SlotEvent {
         /// `l1_head + 1` in steady state.
         l1_head: u64,
     },
-    /// Interval-mode tick — produce one Live block at this target
-    /// wall-clock timestamp. Sequencer's greedy-backfill catches up
-    /// if behind.
-    Live {
-        /// Wall-clock unix timestamp the block should advertise.
-        target_timestamp: u64,
-    },
     /// L1-anchored wall-clock tick — commit exactly one Live block,
     /// but only while the head is below the live region of the next
     /// sync slot (`sync_slot_block_height - future_count - 1`). The
@@ -145,6 +136,10 @@ pub enum SyncSlotMode {
     /// Behind-the-wall-clock catchup — empty Sync block; cross-chain
     /// waits for the next [`Steady`](Self::Steady) slot.
     Catchup,
+    /// Deterministic EMPTY block, no emission (deferred-late slots). Unlike
+    /// the mempool-fed `commit_one` fallback it keeps grid heights
+    /// batch-boundary-eligible.
+    Empty,
 }
 
 /// Per-Sync-slot block producer for cross-chain content.
@@ -169,37 +164,16 @@ pub trait SyncSlotComposer: Send + Sync + 'static {
         target_l1_block: Option<u64>,
         mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock>;
+
+    /// Run pending failed-bundle recovery before this tick's commit. May move
+    /// the head (reorg + substitution), so callers re-read it. Default: no-op.
+    async fn recover_failed(&self, rollup_id: u64) {
+        let _ = rollup_id;
+    }
 }
 
 /// Cheap clone-able handle for a [`SyncSlotComposer`].
 pub type SyncSlotComposerHandle = Arc<dyn SyncSlotComposer>;
-
-/// Spawn an interval ticker that emits [`SlotEvent::Live`] every
-/// `block_time`. Returns the receiver side of the channel.
-///
-/// Used in standalone mode (no L1 stack). [`spawn_l1_anchored`] is
-/// the L1-anchored production counterpart.
-///
-/// First tick fires after `block_time` (not immediately) so startup
-/// has time to settle. [`MissedTickBehavior::Delay`] keeps cadence
-/// under load.
-#[must_use]
-pub fn spawn_interval(block_time: Duration) -> mpsc::Receiver<SlotEvent> {
-    let (tx, rx) = mpsc::channel(8);
-    tokio::spawn(async move {
-        let start = Instant::now() + block_time;
-        let mut interval = interval_at(start, block_time);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            let target_timestamp = now_unix();
-            if tx.send(SlotEvent::Live { target_timestamp }).await.is_err() {
-                break; // Sequencer dropped the receiver; exit cleanly.
-            }
-        }
-    });
-    rx
-}
 
 /// Sync-slot trigger armed by an L1 head, waiting for its
 /// proof-window-open instant.
@@ -367,15 +341,8 @@ pub fn spawn_l1_anchored(
     rx
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Wall-clock unix time in milliseconds — the defer-on-lateness check
-/// needs sub-second precision that [`now_unix`] lacks.
+/// needs sub-second precision.
 pub(crate) fn now_unix_millis() -> u64 {
     u64::try_from(
         SystemTime::now()

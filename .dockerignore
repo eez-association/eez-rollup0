@@ -6,7 +6,8 @@
 chiado-db/
 data/
 datadir/
-sync-rollups-protocol/
+eez-core-protocol/out/
+eez-core-protocol/cache/
 contracts/out/
 contracts/cache/
 contracts/broadcast/

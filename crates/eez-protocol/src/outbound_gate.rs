@@ -23,6 +23,28 @@ const MAINNET_ROLLUP_ID: RollupId = RollupId(0);
 /// The supported EEZL2 deployment disables `USE_GAS_LEFT`.
 const SUPPORTED_CALL_GAS: u64 = 0;
 
+/// Decode the outbound-call events `eez_l2` emitted in `logs`.
+///
+/// Shared so the composer (raw execution logs) and the deriver (receipt logs)
+/// decide from the same decoder.
+#[must_use]
+pub fn observations_from_logs(
+    logs: &[alloy_primitives::Log],
+    eez_l2: alloy_primitives::Address,
+) -> Vec<OutboundCallObservation> {
+    use alloy_sol_types::SolEvent as _;
+
+    logs.iter()
+        .filter(|log| log.address == eez_l2)
+        .filter_map(|log| {
+            crate::abi::eez_l2_events::CrossChainCallExecuted::decode_log_validate(log).ok()
+        })
+        .map(|event| {
+            OutboundCallObservation::new(event.data.crossChainCallHash, event.data.callGas)
+        })
+        .collect()
+}
+
 /// Canonically decoded evidence from an `EEZL2.CrossChainCallExecuted` log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutboundCallObservation {
@@ -156,6 +178,55 @@ mod tests {
     use super::*;
     use crate::abi::L2ToL1CallSol;
     use alloy_primitives::{Address, Bytes, U256, address};
+
+    /// A real `CrossChainCallExecuted` log as EEZL2 emits it.
+    fn cc_log(eez_l2: Address, call_hash: B256, call_gas: u64) -> alloy_primitives::Log {
+        use alloy_sol_types::SolEvent as _;
+        let event = crate::abi::eez_l2_events::CrossChainCallExecuted {
+            crossChainCallHash: call_hash,
+            proxy: Address::ZERO,
+            sourceAddress: Address::ZERO,
+            callData: Bytes::new(),
+            value: U256::ZERO,
+            callGas: call_gas,
+        };
+        alloy_primitives::Log {
+            address: eez_l2,
+            data: alloy_primitives::LogData::new_unchecked(
+                event.encode_topics().iter().map(|t| t.0).collect(),
+                event.encode_data().into(),
+            ),
+        }
+    }
+
+    /// Only the configured manager's logs count. A look-alike event from any
+    /// other address must not authorize an entry.
+    #[test]
+    fn observations_come_only_from_the_configured_manager() {
+        let eez_l2 = address!("0x4200000000000000000000000000000000000007");
+        let impostor = address!("0x00000000000000000000000000000000deadbeef");
+        let hash = B256::repeat_byte(0xab);
+
+        let mine = observations_from_logs(&[cc_log(eez_l2, hash, 0)], eez_l2);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0], OutboundCallObservation::new(hash, 0));
+
+        assert!(
+            observations_from_logs(&[cc_log(impostor, hash, 0)], eez_l2).is_empty(),
+            "an event from another address must not be observed",
+        );
+        assert!(observations_from_logs(&[], eez_l2).is_empty());
+    }
+
+    /// Duplicate calls are a multiset, so two identical events must both survive
+    /// decoding — one event may not authorize two entries.
+    #[test]
+    fn duplicate_events_are_both_observed() {
+        let eez_l2 = address!("0x4200000000000000000000000000000000000007");
+        let hash = B256::repeat_byte(0xcd);
+        let logs = [cc_log(eez_l2, hash, 0), cc_log(eez_l2, hash, 0)];
+        assert_eq!(observations_from_logs(&logs, eez_l2).len(), 2);
+    }
 
     fn entry(calls: Vec<L2ToL1CallSol>) -> ExecutionEntrySol {
         ExecutionEntrySol {

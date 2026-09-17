@@ -9,25 +9,18 @@
 //! The inspector's synchronous dispatch keeps
 //! source-sim's `evm.transact`, target-session execution, and
 //! nested-back-to-entry dispatch all on the same OS thread — no
-//! Send/Sync requirements, no cross-thread cloning. The overlay
-//! handle holds a fresh `State<DB>` constructed with
-//! `StateBuilder::with_cached_prestate(source_cache.clone())`, runs
-//! the nested call against it, and on commit walks the cache delta to
-//! emit journal entries onto source-sim's live state via the
-//! inspector's `&mut ctx`.
+//! Send/Sync requirements, no cross-thread cloning. The re-entered
+//! session opens a fresh `State<DB>` preloaded with the published
+//! snapshot via `StateBuilder::with_cached_prestate`, runs the nested
+//! call against it, and publishes its post-execute cache; the
+//! suspended inspector then applies the cache delta as journal
+//! entries onto source-sim's live state.
 //!
-//! # Why a manual clone of `State<DB>` is unnecessary
-//!
-//! revm's `State<DB>` lacks `Clone`, and reth's `StateProviderBox =
-//! Box<dyn StateProvider + Send>` is neither `Clone` nor `Sync`.
-//! Cloning `State<DB>` in full is impossible without `unsafe` fiat.
-//! But we don't need to: revm's
-//! [`StateBuilder::with_cached_prestate`](revm::database::states::StateBuilder::with_cached_prestate)
-//! preloads a fresh `State` with another state's `CacheState` (which
-//! IS `Clone`). The fresh `State` reads cold data from a fresh
-//! database instance (cheap to obtain via `provider.latest()`) and
-//! writes mutations to its own cache + journal. On commit, diff the
-//! caches and apply.
+//! Sharing works through `CacheState` because revm's `State<DB>`
+//! itself lacks `Clone`: `with_cached_prestate` preloads a fresh
+//! `State` with a cloned cache, reading cold data from a fresh
+//! database instance. (`clone_state` in this module's tests guards
+//! that assumption against revm field drift.)
 //!
 //! # Crate-layering invariants
 //!
@@ -37,10 +30,86 @@
 //! lives in this crate's `inspector.rs` (which has the necessary
 //! `&mut Context` access during the `Inspector::call` hook).
 
+use std::sync::{Arc, Mutex};
+
 use revm::context_interface::journaled_state::account::JournaledAccountTr;
 use revm::context_interface::{ContextTr, Host, JournalTr};
-use revm::database::{AccountStatus, CacheState, State, states::CacheAccount};
+use revm::database::{AccountStatus, CacheState, states::CacheAccount};
 use revm::primitives::Address;
+
+/// Cache exchange for nested dispatches that re-enter a suspended rollup.
+///
+/// # Why it exists
+///
+/// During nested dispatch, the caller's revm state remains mutably borrowed.
+/// A re-entered session therefore cannot borrow that state directly. This
+/// channel transfers cache snapshots across the dispatch boundary using two
+/// LIFO stacks:
+///
+/// - `source_cache` stores this rollup's live cache before dispatch. A session
+///   that re-enters the rollup peeks at the latest snapshot when it opens.
+///
+/// - `overlay_cache` stores the cache produced by a re-entered session. The
+///   suspended inspector pops it after dispatch and applies the diff through
+///   [`apply_overlay_diff`].
+///
+/// Stacks keep recursive re-entry snapshots paired with their call frames.
+/// All access is same-thread; a poisoned lock means a dispatch panicked
+/// mid-exchange, so methods panic rather than silently dropping state.
+#[derive(Debug, Default)]
+pub struct OverlayChannel {
+    /// Stack of pre-dispatch cache snapshots.
+    source_cache: Mutex<Vec<CacheState>>,
+    /// Stack of post-execute cache snapshots.
+    overlay_cache: Mutex<Vec<CacheState>>,
+}
+
+/// A poisoned lock means a panic escaped mid-exchange; continuing would
+/// silently drop state propagation.
+const POISONED: &str = "overlay channel mutex poisoned by a panicked dispatch";
+
+impl OverlayChannel {
+    /// Clear all snapshots at a transaction-composition boundary.
+    pub fn reset(&self) {
+        self.source_cache.lock().expect(POISONED).clear();
+        self.overlay_cache.lock().expect(POISONED).clear();
+    }
+
+    /// Push a pre-dispatch cache snapshot for this rollup.
+    pub fn push_pre_snapshot(&self, cache: CacheState) {
+        self.source_cache.lock().expect(POISONED).push(cache);
+    }
+
+    /// Pop the matching pre-dispatch snapshot at the end of the
+    /// inspector frame.
+    pub fn pop_pre_snapshot(&self) -> Option<CacheState> {
+        self.source_cache.lock().expect(POISONED).pop()
+    }
+
+    /// Clone the latest pre-dispatch snapshot for a re-entered session.
+    pub fn peek_pre_snapshot(&self) -> Option<CacheState> {
+        self.source_cache.lock().expect(POISONED).last().cloned()
+    }
+
+    /// Push the cache produced by a re-entered session.
+    pub fn push_post_cache(&self, cache: CacheState) {
+        self.overlay_cache.lock().expect(POISONED).push(cache);
+    }
+
+    /// Pop the cache produced by the latest re-entered session.
+    pub fn pop_post_cache(&self) -> Option<CacheState> {
+        self.overlay_cache.lock().expect(POISONED).pop()
+    }
+}
+
+/// Shared handle to an [`OverlayChannel`].
+pub type OverlayChannelHandle = Arc<OverlayChannel>;
+
+/// Build a fresh, empty [`OverlayChannelHandle`].
+#[must_use]
+pub fn new_overlay_channel() -> OverlayChannelHandle {
+    Arc::new(OverlayChannel::default())
+}
 
 // Note on trait choice:
 //
@@ -61,34 +130,6 @@ use revm::primitives::Address;
 //
 // Balance writes go through `JournaledAccountTr::set_balance` —
 // `Host` exposes `balance(addr)` for reads but no public setter.
-
-/// Field-by-field clone of revm [`State<DB>`].
-///
-/// Constructs the struct literally so any field addition in a future
-/// revm version causes a compile error here (and the matching
-/// `clone_state_field_parity` regression test catches drift in
-/// existing fields). All seven fields are `pub` and individually
-/// `Clone` when `DB: Clone`.
-///
-/// Retained as a primitive even though the live overlay path uses
-/// `with_cached_prestate` instead. The field-parity test is the
-/// canonical drift guard against revm version bumps.
-///
-/// # Errors
-///
-/// Infallible.
-#[must_use]
-pub fn clone_state<DB: Clone>(src: &State<DB>) -> State<DB> {
-    State {
-        cache: src.cache.clone(),
-        database: src.database.clone(),
-        transition_state: src.transition_state.clone(),
-        bundle_state: src.bundle_state.clone(),
-        use_preloaded_bundle: src.use_preloaded_bundle,
-        block_hashes: src.block_hashes.clone(),
-        bal_state: src.bal_state.clone(),
-    }
-}
 
 /// Errors surfaced by the overlay diff-apply path.
 ///
@@ -145,15 +186,12 @@ fn has_unsupported_destruction(
 ///
 /// # When this is called
 ///
-/// Source-sim's inspector hook fires for a cross-chain CALL,
-/// snapshots source's cache as `before`, populates the source-cache
-/// side-channel, and drives the dispatch. During
-/// that dispatch, an inner target session may dispatch back to the
-/// entry rollup; the entry rollup's session opens its `State` preloaded
-/// with `before` and accumulates per-overlay-call mutations. After the
-/// outer dispatch returns, the inspector reads the entry session's
-/// post-execute cache (`after`) from the second side-channel and calls
-/// this function on source-sim's `&mut ctx`.
+/// The inspector hook fires for a cross-chain CALL, snapshots the
+/// source cache as `before`, publishes it on the overlay channel, and
+/// drives the dispatch. A nested dispatch back into this rollup opens
+/// its session preloaded with `before` and publishes its post-execute
+/// cache; after the outer dispatch returns, the inspector pops that
+/// cache as `after` and calls this function on the source EVM context.
 ///
 /// # Mutation classes
 ///
@@ -189,10 +227,9 @@ fn has_unsupported_destruction(
 ///
 /// # Idempotency
 ///
-/// The inspector clears both side-channel slots after this function
-/// returns. Calling it twice on the same `(before, after)` is
-/// well-defined but emits redundant journal entries; callers should
-/// not do this.
+/// The inspector pops both channel stacks around this call. Calling it
+/// twice on the same `(before, after)` is well-defined but emits
+/// redundant journal entries; callers should not do this.
 ///
 /// # Errors
 ///
@@ -295,7 +332,57 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use revm::database::EmptyDB;
+    use revm::database::{EmptyDB, State};
+
+    #[test]
+    fn overlay_cache_snapshots_are_lifo() {
+        let marker = Address::with_last_byte(0x22);
+        let channel = OverlayChannel::default();
+        let first = CacheState::default();
+        let mut second = CacheState::default();
+        second.insert_not_existing(marker);
+
+        channel.push_pre_snapshot(first.clone());
+        channel.push_pre_snapshot(second.clone());
+        assert_eq!(channel.peek_pre_snapshot(), Some(second.clone()));
+        assert_eq!(channel.pop_pre_snapshot(), Some(second.clone()));
+        assert_eq!(channel.pop_pre_snapshot(), Some(first.clone()));
+        assert_eq!(channel.pop_pre_snapshot(), None);
+
+        channel.push_post_cache(first.clone());
+        channel.push_post_cache(second.clone());
+        assert_eq!(channel.pop_post_cache(), Some(second));
+        assert_eq!(channel.pop_post_cache(), Some(first));
+        assert_eq!(channel.pop_post_cache(), None);
+    }
+
+    #[test]
+    fn reset_clears_both_overlay_stacks() {
+        let channel = OverlayChannel::default();
+        channel.push_pre_snapshot(CacheState::default());
+        channel.push_post_cache(CacheState::default());
+
+        channel.reset();
+
+        assert_eq!(channel.pop_pre_snapshot(), None);
+        assert_eq!(channel.pop_post_cache(), None);
+    }
+
+    /// Field-by-field clone of revm [`State<DB>`], constructed literally so a
+    /// field addition in a future revm version breaks this test's compile —
+    /// the drift guard for the cache-sharing assumptions in the live overlay
+    /// path (`with_cached_prestate`).
+    fn clone_state<DB: Clone>(src: &State<DB>) -> State<DB> {
+        State {
+            cache: src.cache.clone(),
+            database: src.database.clone(),
+            transition_state: src.transition_state.clone(),
+            bundle_state: src.bundle_state.clone(),
+            use_preloaded_bundle: src.use_preloaded_bundle,
+            block_hashes: src.block_hashes.clone(),
+            bal_state: src.bal_state.clone(),
+        }
+    }
 
     /// Regression: `clone_state` must produce a struct literally
     /// equivalent to the source. Any divergence (a field accidentally

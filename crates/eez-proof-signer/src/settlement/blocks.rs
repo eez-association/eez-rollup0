@@ -3,8 +3,12 @@
 use std::num::NonZeroU64;
 
 use alloy_consensus::{Transaction as _, Typed2718 as _};
+use alloy_primitives::B256;
+use alloy_sol_types::SolCall as _;
+use eez_protocol::abi::loadExecutionTableCall;
 use eez_protocol::entries::EXECUTE_INCOMING_SELECTOR;
 use eez_protocol::settlement::pair_end_positions as framed_effect_candidate_positions;
+use reth_primitives_traits::SignedTransaction;
 use thiserror::Error;
 
 use super::inbound::{InboundCandidate, inspect_inbound_candidate};
@@ -124,7 +128,8 @@ pub(crate) enum BlockInspectionError {
 }
 
 /// Bind fork-aware execution facts to the exact settling-block transaction
-/// order, then require a successful receipt for every system transaction.
+/// order. Reverted inbound deliveries remain attributable candidates; every
+/// other system transaction requires a successful receipt.
 pub(crate) fn inspect_validated_settling_block(
     block: &ValidatedBlock,
     receipt_successes: &[bool],
@@ -150,6 +155,53 @@ fn decode_block(
             reason: error.to_string(),
         }
     })
+}
+
+/// Recompute the canonical hash of one transaction in a validated block.
+///
+/// Returning `None` keeps malformed or out-of-range attribution fail-closed
+/// instead of turning it into an eviction hint.
+pub(crate) fn transaction_hash_at(block: &ValidatedBlock, index: usize) -> Option<B256> {
+    decode_block(block.number(), block.rlp())
+        .ok()?
+        .body
+        .transactions
+        .get(index)
+        .map(SignedTransaction::recalculate_hash)
+}
+
+/// Resolve a reverted outbound load to the user transaction it frames.
+///
+/// The recovered sender layout must contain a system transaction immediately
+/// followed by a non-system transaction. Inbound deliveries are excluded by
+/// selector so malformed layouts do not become eviction hints.
+pub(crate) fn paired_outbound_transaction(
+    block: &ValidatedBlock,
+    load_index: usize,
+) -> Option<(usize, B256)> {
+    let user_index = load_index.checked_add(1)?;
+    let flags = block.settlement_evidence().system_sender_flags();
+    if flags.get(load_index).copied() != Some(true) || flags.get(user_index).copied() != Some(false)
+    {
+        return None;
+    }
+
+    let decoded = decode_block(block.number(), block.rlp()).ok()?;
+    let load = decoded.body.transactions.get(load_index)?;
+    let load_call = loadExecutionTableCall::abi_decode(load.input()).ok()?;
+    if load_call.abi_encode().as_slice() != load.input()
+        || load_call._entries.len() != 1
+        || !load_call._staticEntries.is_empty()
+        || !load.value().is_zero()
+    {
+        return None;
+    }
+    let user_hash = decoded
+        .body
+        .transactions
+        .get(user_index)?
+        .recalculate_hash();
+    Some((user_index, user_hash))
 }
 
 fn inspect_decoded_settling_block(
@@ -189,11 +241,11 @@ fn inspect_decoded_settling_block(
         }
         // The target is already pinned, so reserved signer plus the inbound
         // selector fully identifies an inbound candidate.
-        if is_system_sender
+        let is_inbound_candidate = is_system_sender
             && transaction
                 .input()
-                .starts_with(EXECUTE_INCOMING_SELECTOR.as_slice())
-        {
+                .starts_with(EXECUTE_INCOMING_SELECTOR.as_slice());
+        if is_inbound_candidate {
             inbound_candidates.push(InboundCandidate {
                 transaction_index,
                 inspection: inspect_inbound_candidate(
@@ -204,7 +256,10 @@ fn inspect_decoded_settling_block(
                 ),
             });
         }
-        if is_system_sender && !succeeded {
+        // Reverted inbound deliveries remain positioned candidates so the
+        // inbound gate can bind the failure to its PostBatch entry. Other
+        // reverted system transactions are outbound loads and fail here.
+        if is_system_sender && !succeeded && !is_inbound_candidate {
             return Err(BlockInspectionError::RevertedSystemTransaction {
                 index: transaction_index,
             });

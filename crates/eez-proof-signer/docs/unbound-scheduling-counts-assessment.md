@@ -67,12 +67,12 @@ No protocol source was modified as part of this assessment.
 The batch carries `immediateEntryCount` and `immediateStaticEntryCount` as
 separate fields. The interface itself labels them "UNPROVEN dispatch params"
 and says that the split can be re-tuned without re-proving
-([`IEEZ.sol:25-44`](../../../sync-rollups-protocol/src/interfaces/IEEZ.sol#L25)).
+([`IEEZ.sol:25-44`](../../../eez-core-protocol/src/interfaces/IEEZ.sol#L25)).
 
 ### 2. The proof hash binds entry contents, but not the counts
 
 `EEZ._verifyProofSystemBatch` hashes every complete execution entry and static
-entry ([`EEZ.sol:683-695`](../../../sync-rollups-protocol/src/EEZ.sol#L683)).
+entry ([`EEZ.sol:683-695`](../../../eez-core-protocol/src/EEZ.sol#L683)).
 Its shared preimage then contains:
 
 - the entry hashes;
@@ -83,12 +83,12 @@ Its shared preimage then contains:
 - the bound sender or `address(0)`.
 
 Neither scheduling count appears in that preimage
-([`EEZ.sol:709-718`](../../../sync-rollups-protocol/src/EEZ.sol#L709)). The final
+([`EEZ.sol:709-718`](../../../eez-core-protocol/src/EEZ.sol#L709)). The final
 per-proof-system hash only adds the rollup/vkey accumulator
-([`EEZ.sol:720-743`](../../../sync-rollups-protocol/src/EEZ.sol#L720)).
+([`EEZ.sol:720-743`](../../../eez-core-protocol/src/EEZ.sol#L720)).
 
 The verifier API receives only `(proof, publicInputsHash)`
-([`IProofSystem.sol:7-15`](../../../sync-rollups-protocol/src/interfaces/IProofSystem.sol#L7)).
+([`IProofSystem.sol:7-15`](../../../eez-core-protocol/src/interfaces/IProofSystem.sol#L7)).
 The deployed ECDSA verifier recovers the signer from that digest directly
 ([`ECDSAProofSystem.sol`](../../../contracts/src/ECDSAProofSystem.sol)).
 There is no later step that rebinds either count to the proof.
@@ -98,16 +98,16 @@ There is no later step that rebinds either count to the proof.
 After proof verification:
 
 1. `immediateEntryCount` bounds the leading inline L2Tx loop
-   ([`EEZ.sol:397-421`](../../../sync-rollups-protocol/src/EEZ.sol#L397)).
+   ([`EEZ.sol:397-421`](../../../eez-core-protocol/src/EEZ.sol#L397)).
 2. If a non-L2Tx entry remains inside that prefix and the poster has code, the
    remainder of the prefix and the selected static prefix are loaded into
    transient tables for the poster's meta hook
-   ([`EEZ.sol:423-434`](../../../sync-rollups-protocol/src/EEZ.sol#L423)).
+   ([`EEZ.sol:423-434`](../../../eez-core-protocol/src/EEZ.sol#L423)).
 3. Persistent queues start exactly at `immediateEntryCount` and
    `immediateStaticEntryCount`
-   ([`EEZ.sol:764-778`](../../../sync-rollups-protocol/src/EEZ.sol#L764)).
+   ([`EEZ.sol:764-778`](../../../eez-core-protocol/src/EEZ.sol#L764)).
 4. Any unconsumed transient values are deleted
-   ([`EEZ.sol:443-448`](../../../sync-rollups-protocol/src/EEZ.sol#L443)).
+   ([`EEZ.sol:443-448`](../../../eez-core-protocol/src/EEZ.sol#L443)).
 
 Consequently, these fields do more than select timing. Depending on the poster
 and batch shape, they can decide whether a proved entry remains available at
@@ -151,7 +151,7 @@ checks that:
 
 The mock is non-vacuous: `setExpectedPublicInputsHash` enables exact equality
 checking, rather than its default accept-all behavior
-([`MockProofSystem.sol:21-29`](../../../sync-rollups-protocol/test/mocks/MockProofSystem.sol#L21)).
+([`MockProofSystem.sol:21-29`](../../../eez-core-protocol/test/mocks/MockProofSystem.sol#L21)).
 
 The test passes with:
 
@@ -190,7 +190,7 @@ of intended cross-entry atomicity.
 
 `postAndVerifyBatch` is permissionless; proofs provide authorization, and
 sender binding is optional
-([`CORE_PROTOCOL_SPEC.md:1374-1384`](../../../sync-rollups-protocol/docs/CORE_PROTOCOL_SPEC.md#L1374)).
+([`CORE_PROTOCOL_SPEC.md:1374-1384`](../../../eez-core-protocol/docs/CORE_PROTOCOL_SPEC.md#L1374)).
 
 The current Composer sets `bindMsgSenderInPublicInput = false`
 ([`composer.rs:2227-2234`](../../eez-composer/src/composer.rs#L2227)), and the
@@ -230,22 +230,22 @@ profile.
 The omission is consistent across normative and explanatory sources:
 
 - The Solidity interface calls both values unproven and re-tunable
-  ([`IEEZ.sol:30-31`](../../../sync-rollups-protocol/src/interfaces/IEEZ.sol#L30)).
+  ([`IEEZ.sol:30-31`](../../../eez-core-protocol/src/interfaces/IEEZ.sol#L30)).
 - The core protocol specification repeats that definition and shows a hash
   formula without the counts
-  ([`CORE_PROTOCOL_SPEC.md:319-355`](../../../sync-rollups-protocol/docs/CORE_PROTOCOL_SPEC.md#L319)).
+  ([`CORE_PROTOCOL_SPEC.md:319-355`](../../../eez-core-protocol/docs/CORE_PROTOCOL_SPEC.md#L319)).
 - The multi-prover specification explicitly excludes both values
-  ([`MULTI_PROVER_SPEC.md:122-159`](../../../sync-rollups-protocol/docs/MULTI_PROVER_SPEC.md#L122)).
+  ([`MULTI_PROVER_SPEC.md:122-159`](../../../eez-core-protocol/docs/MULTI_PROVER_SPEC.md#L122)).
 - The execution-entry and lookup specifications describe the same unproven
   split
-  ([`EXECUTION_ENTRY_SPEC.md:273-289`](../../../sync-rollups-protocol/docs/EXECUTION_ENTRY_SPEC.md#L273),
-  [`STATIC_ENTRY.md:264-269`](../../../sync-rollups-protocol/docs/STATIC_ENTRY.md#L264)).
+  ([`EXECUTION_ENTRY_SPEC.md:273-289`](../../../eez-core-protocol/docs/EXECUTION_ENTRY_SPEC.md#L273),
+  [`STATIC_ENTRY.md:264-269`](../../../eez-core-protocol/docs/STATIC_ENTRY.md#L264)).
 - The security section calls the meta hook untrusted and allows it to consume
   partially or ignore the call
-  ([`CORE_PROTOCOL_SPEC.md:1366-1372`](../../../sync-rollups-protocol/docs/CORE_PROTOCOL_SPEC.md#L1366)).
+  ([`CORE_PROTOCOL_SPEC.md:1366-1372`](../../../eez-core-protocol/docs/CORE_PROTOCOL_SPEC.md#L1366)).
 - The same document classifies discarding unconsumed-but-proved entries as a
   liveness choice, not a safety violation
-  ([`CORE_PROTOCOL_SPEC.md:1334-1338`](../../../sync-rollups-protocol/docs/CORE_PROTOCOL_SPEC.md#L1334)).
+  ([`CORE_PROTOCOL_SPEC.md:1334-1338`](../../../eez-core-protocol/docs/CORE_PROTOCOL_SPEC.md#L1334)).
 
 Repository history reinforces that this was considered rather than merely
 overlooked. Commit `7c5db1b5` removed a comment that explicitly described an

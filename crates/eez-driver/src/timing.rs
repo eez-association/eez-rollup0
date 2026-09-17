@@ -43,10 +43,16 @@ use std::time::Duration;
 use crate::error::{DriverError, DriverResult};
 
 /// Cap on Live blocks produced per catchup trigger. Aligned with
-/// `MAX_BLOCKS_PER_BATCH` on the Composer side so one trigger's
+/// [`MAX_BLOCKS_PER_BATCH`] on the Composer side so one trigger's
 /// catchup output maps to exactly one postBatch submission. Drop to
 /// 100 if 300 turns out to produce calldata-gas pressure in practice.
 pub const MAX_BLOCKS_PER_CATCHUP: u64 = 300;
+
+/// Cap on one postBatch's SETTLEMENT range, where [`MAX_BLOCKS_PER_CATCHUP`] caps
+/// production. `EEZ_MAX_BLOCKS_PER_BATCH` overrides it, rounded down to a multiple
+/// of K. A chunk shrinks no further than K blocks, so calldata heavier than
+/// `EEZ_MAX_POSTBATCH_GAS` allows over K blocks cannot settle at any cap.
+pub const MAX_BLOCKS_PER_BATCH: u64 = MAX_BLOCKS_PER_CATCHUP;
 
 const ENV_L1_BLOCK_TIME_MS: &str = "EEZ_L1_BLOCK_TIME_MS";
 const ENV_L2_BLOCK_TIME_MS: &str = "EEZ_L2_BLOCK_TIME_MS";
@@ -110,16 +116,6 @@ impl RollupTiming {
         );
         t.validate()?;
         Ok(t)
-    }
-
-    /// Standalone-dev default: mainnet-shaped (L1=12s, L2=2s, proof=4s,
-    /// slack=100ms). Used when no L1 stack is configured — only the
-    /// `l2_block_time()` accessor is meaningful in that path; the
-    /// other fields exist for type completeness. Production deployments
-    /// MUST use [`Self::from_env`] so misconfig is loud.
-    #[must_use]
-    pub const fn standalone_default() -> Self {
-        Self::new(12_000, 2_000, 4_000, 100)
     }
 
     /// Verify the invariants from §5.4.4. Hard error on violation;
@@ -319,6 +315,17 @@ impl RollupTiming {
             }
         }
     }
+
+    /// Terminal for a bounded settlement chunk: the largest height
+    /// `<= cursor + cap` sharing `sync_height`'s K-residue (the deriver rebuilds
+    /// a terminal by position). `None` if none lies strictly between the two.
+    #[must_use]
+    pub fn historical_chunk_boundary(self, cursor: u64, sync_height: u64, cap: u64) -> Option<u64> {
+        let k = u64::from(self.k());
+        let over = sync_height.saturating_sub(cursor.saturating_add(cap));
+        let boundary = sync_height.checked_sub(over.div_ceil(k).saturating_mul(k))?;
+        (boundary > cursor && boundary < sync_height).then_some(boundary)
+    }
 }
 
 /// Output of [`RollupTiming::per_trigger_composition`].
@@ -376,6 +383,95 @@ mod tests {
     // trigger = +3s, so the postBatch targets the immediate next L1 block.
     fn chiado_fast() -> RollupTiming {
         RollupTiming::new(5_000, 1_000, 200, 1_700)
+    }
+
+    /// After an off-grid settlement the cursor sits one below the grid. The next
+    /// trigger must still end ON the grid — the range just gets longer.
+    #[test]
+    fn an_off_grid_cursor_realigns_on_the_next_slot() {
+        let t = mainnet();
+        let k = u64::from(t.k());
+        // Off-grid head/cursor: one below an on-grid sync height.
+        let head = 174_197_u64;
+        assert_ne!(head % k, 0, "fixture must be off-grid");
+
+        // Next grid height above it.
+        let sync = 174_198_u64;
+        let comp = t.per_trigger_composition(head, sync, 64);
+        let produced = match comp {
+            SlotComposition::Slot { live, future } => live + future + 1,
+            SlotComposition::Catchup { live } => live + 1,
+            SlotComposition::Idle => 0,
+        };
+        assert!(produced > 0, "must produce the realigning Sync block");
+        assert_eq!(head + produced, sync, "terminal must land on the grid");
+        assert_eq!((head + produced) % k, 0);
+
+        // The drift cannot persist: the next target is absolute, so the span
+        // stretches to reach it (K+1 here) instead of inheriting the offset.
+        let far = t.per_trigger_composition(head, sync + k, 300);
+        let produced_far = match far {
+            SlotComposition::Slot { live, future } => live + future + 1,
+            SlotComposition::Catchup { live } => live + 1,
+            SlotComposition::Idle => 0,
+        };
+        assert_eq!(
+            head + produced_far,
+            sync + k,
+            "must reach the absolute target"
+        );
+        assert_eq!(produced_far, k + 1, "one longer-than-K span realigns it");
+
+        // A whole slot later: still on-grid, normal K-block span.
+        let sync2 = sync + k;
+        let comp2 = t.per_trigger_composition(sync, sync2, 64);
+        let produced2 = match comp2 {
+            SlotComposition::Slot { live, future } => live + future + 1,
+            SlotComposition::Catchup { live } => live + 1,
+            SlotComposition::Idle => 0,
+        };
+        assert_eq!(sync + produced2, sync2);
+    }
+
+    #[test]
+    fn catchup_terminal_is_on_grid_and_a_moved_head_is_detectable() {
+        let t = mainnet();
+        let k = u64::from(t.k());
+        let sync = 174_198_u64; // on-grid: 174198 % 6 == 0
+        assert_eq!(sync % k, 0, "fixture must be on-grid");
+        let mut checked = 0_u32;
+
+        for head in (sync - 400)..(sync - 1) {
+            let SlotComposition::Catchup { live } = t.per_trigger_composition(head, sync, 64)
+            else {
+                continue;
+            };
+            // The terminal the burst intends is on-grid, always.
+            let terminal = head + live + 1;
+            assert_eq!(terminal % k, 0, "terminal off-grid for head {head}");
+            // Producing `live` blocks from a head one higher lands off-grid:
+            // why the burst must target `terminal`, not count blocks.
+            assert_ne!((head + 1 + live + 1) % k, 0, "a moved head must shift it");
+            checked += 1;
+        }
+        assert!(checked > 0, "fixture produced no Catchup compositions");
+    }
+
+    /// Both snap paths step by whole K, so the arithmetic cannot place a
+    /// terminal off-grid — the live drift came from production, not from here.
+    #[test]
+    fn historical_chunk_boundary_stays_on_the_sync_height_grid() {
+        let t = mainnet();
+        let k = u64::from(t.k());
+        let sync = 174_198_u64;
+        for cursor in (sync - 500)..(sync - 10) {
+            for cap in [6_u64, 12, 60, 300] {
+                if let Some(b) = t.historical_chunk_boundary(cursor, sync, cap) {
+                    assert_eq!((sync - b) % k, 0, "boundary off-grid: {b}");
+                    assert!(b > cursor && b < sync);
+                }
+            }
+        }
     }
 
     #[test]
@@ -675,6 +771,49 @@ mod tests {
             mainnet().per_trigger_composition(7, 6, MAX_BLOCKS_PER_CATCHUP),
             SlotComposition::Idle
         );
+    }
+
+    // --- historical_chunk_boundary (settlement dual of the grid snap) ---
+
+    #[test]
+    fn historical_boundary_is_past_on_grid_and_within_cap() {
+        // 6_005 is the genesis-offset case: sync heights carry a residue != 0
+        // mod K, and stepping back whole K's must keep that OFFSET grid.
+        let t = mainnet();
+        let k = u64::from(t.k());
+        for sync_height in [6_000u64, 6_005] {
+            for cursor in [0u64, 1, 7, 137, 5_000] {
+                let boundary = t
+                    .historical_chunk_boundary(cursor, sync_height, MAX_BLOCKS_PER_BATCH)
+                    .expect("backlog exceeds the cap for every cursor here");
+                assert_eq!(
+                    boundary % k,
+                    sync_height % k,
+                    "boundary {boundary} off-grid (cursor={cursor})"
+                );
+                assert!(boundary > cursor && boundary < sync_height);
+                assert!(boundary - cursor <= MAX_BLOCKS_PER_BATCH);
+            }
+        }
+    }
+
+    #[test]
+    fn historical_boundary_none_when_backlog_fits_cap() {
+        // Steady emission handles this — no historical chunk.
+        let t = mainnet();
+        assert_eq!(t.historical_chunk_boundary(100, 400, 300), None);
+        assert_eq!(t.historical_chunk_boundary(100, 100, 300), None);
+    }
+
+    #[test]
+    fn historical_boundary_none_when_no_grid_height_fits_the_cap() {
+        // K=6, grid ≡ 0 mod 6. From cursor 97 the next grid height is 102 —
+        // five blocks up, out of reach for a cap of 3, so nothing is emitted.
+        let t = mainnet();
+        assert_eq!(t.historical_chunk_boundary(97, 6_000, 3), None);
+        // A cap of at least K always reaches one: the step-back lands within
+        // K of `cursor + cap`. This is why the composer clamps the cap to K.
+        assert_eq!(t.historical_chunk_boundary(97, 6_000, 6), Some(102));
     }
 
     #[test]

@@ -41,13 +41,13 @@ independent:
 - aggregate known-field protobuf bytes;
 - declared block count;
 - aggregate witness item count;
-- locally selected transaction checkpoint count;
 - per-message idle timeout; and
 - end-to-end request deadline.
 
-An overlap returns `ResourceExhausted` immediately. The same status is used for
-local quotas, so diagnose it from the status message and available structured
-fields rather than assuming the window is semantically invalid.
+An overlap returns `Unavailable` immediately and may be retried later. Local
+quota violations return `ResourceExhausted` and require changing the request or
+the configured limit. Clients can therefore classify the failure from the
+canonical status code without parsing its message.
 
 ## Deadlines and shutdown
 

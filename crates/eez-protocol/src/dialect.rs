@@ -1,34 +1,31 @@
-//! Per-chain dialect for entry encoding and target-chain batch construction.
+//! Contract dialect used for per-rollup composition and proxy lookup.
 //!
-//! Two [`ChainDialect`] variants distinguish the two
-//! contract surfaces the protocol exposes:
+//! The variants distinguish the supported dispatch contracts:
 //!
-//! - [`EvmL2Style`](ChainDialect::EvmL2Style) — `EEZL2`,
-//!   system-address-loaded `loadExecutionTable`.
-//! - [`EvmL1Style`](ChainDialect::EvmL1Style) — `EEZ.sol`,
-//!   permissionless `executeCrossChainCall` / `executeL2TX`.
+//! - [`EvmL2Style`](ChainDialect::EvmL2Style) — `EEZL2`; execution tables
+//!   and inbound deliveries are installed by the configured system address.
+//! - [`EvmL1Style`](ChainDialect::EvmL1Style) — `EEZ`; batches are posted
+//!   and proof-verified through `postAndVerifyBatch`.
 //!
-//! Slot, ABI selection, and emission rules flow through
-//! `TargetConfig`; the runtime composer (Step 7) and
-//! inspectors never see `ChainDialect` directly.
-
-use crate::ExecutedAction;
+//! Composition uses the dialect to select the target-batch shape. Local
+//! clients use it to derive contract storage configuration; inspectors receive
+//! the resulting [`crate::ProxyLookupConfig`].
 
 use crate::authorized_proxies::{EEZ_AUTHORIZED_PROXIES_SLOT, EEZL2_AUTHORIZED_PROXIES_SLOT};
 
-/// Selects the contract ABI and entry-emission rules for one rollup.
+/// Selects the dispatch-contract layout and target-batch construction path for
+/// one rollup.
 ///
-/// Stored on [`crate::TargetConfig`] and read at composition
-/// time to select the correct calldata encoding.
+/// Stored on [`crate::TargetConfig`]; composition uses it to distinguish L1
+/// proof-posting targets from L2 execution-table targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ChainDialect {
-    /// L2 follower (`EEZL2`): system-address-loaded
-    /// `loadExecutionTable`. Default.
+    /// `EEZL2`: system-address-authorized `loadExecutionTable` and
+    /// `executeIncomingCrossChainCall`. Default.
     #[default]
     EvmL2Style,
-    /// L1 follower (`EEZ.sol`): permissionless
-    /// `executeCrossChainCall` / `executeL2TX`.
+    /// L1 `EEZ`: proof-verified `postAndVerifyBatch` submission.
     EvmL1Style,
 }
 
@@ -43,52 +40,13 @@ impl ChainDialect {
         }
     }
 
-    /// Whether the target-chain execution transaction must be sent from the
-    /// registered system address (L2-style) or is permissionless
-    /// through the registered proxy (L1-style).
+    /// Whether this is the L1 `EEZ` dialect whose batches are submitted
+    /// through `postAndVerifyBatch`.
     #[must_use]
-    pub const fn system_address_required(&self) -> bool {
-        matches!(self, Self::EvmL2Style)
-    }
-
-    /// Whether this dialect routes its table-loading payload through
-    /// the canonical proof-bundle poster (L1-style →
-    /// `EEZ.postAndVerifyBatch`). Drives
-    /// [`encode_table_payload`](crate::entries::encode_table_payload)'s
-    /// dispatch.
-    #[must_use]
-    pub const fn is_zk_poster(&self) -> bool {
+    pub const fn is_evm_l1_style(&self) -> bool {
         matches!(self, Self::EvmL1Style)
     }
-
-    /// Encode the follower-side trigger calldata for the
-    /// `outer_root` cross-chain call.
-    ///
-    /// In the multi-prover protocol, both L1 and L2 dispatch via
-    /// the same `executeCrossChainCall(sourceAddress, callData)`
-    /// entry point on the manager — invoked through the registered
-    /// proxy. The composer's target-chain simulation forges the
-    /// call from the proxy's address; this method returns the
-    /// calldata for the outer ROUTING call (the proxy's `fallback`
-    /// receives `outer_root.data` as-is and forwards to the
-    /// manager).
-    ///
-    #[must_use]
-    pub fn encode_follower_trigger(&self, call: &ExecutedAction) -> Vec<u8> {
-        let _ = self;
-        // Both dialects route through the proxy's fallback, which
-        // forwards the original calldata to the manager. The
-        // simulator's TargetTransaction sets `destination` to the
-        // proxy address externally; here we just pass through the
-        // outer call's calldata bytes.
-        call.data.to_vec()
-    }
 }
-
-// (Removed in the 5c51e02 bump: `encode_execute_cross_chain_call` /
-// `executeL1ToL2Call` — a stale direct-invocation helper whose selector never
-// matched the in-tree contracts; production always flows through the proxy
-// fallback. No in-tree consumers remained.)
 
 #[cfg(test)]
 mod tests {
@@ -108,15 +66,5 @@ mod tests {
             ChainDialect::EvmL1Style.proxy_lookup_slot(),
             EEZ_AUTHORIZED_PROXIES_SLOT
         );
-    }
-
-    #[test]
-    fn l2_style_requires_system_address() {
-        assert!(ChainDialect::EvmL2Style.system_address_required());
-    }
-
-    #[test]
-    fn l1_style_does_not_require_system_address() {
-        assert!(!ChainDialect::EvmL1Style.system_address_required());
     }
 }

@@ -9,9 +9,6 @@
 use alloy_primitives::{Address, B256, address, b256};
 
 /// Deterministic system-transaction identity used only by tests.
-pub(crate) const TEST_SYSTEM_ADDRESS_ARG: &str = "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
-
-/// Parsed form of [`TEST_SYSTEM_ADDRESS_ARG`] for transaction and policy tests.
 pub(crate) const TEST_SYSTEM_ADDRESS: Address =
     address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 
