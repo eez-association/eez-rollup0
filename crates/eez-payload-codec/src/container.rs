@@ -7,7 +7,7 @@
 //!
 //! ```text
 //!   stream := 00                                       # protocol version, never a message
-//!           ‖ ChainOperation(chain_id, operations)      # type 2
+//!           ‖ ChainOperation(rollup_id, operations)      # type 2
 //!           ‖ ( Initiate ‖ Call ‖ Return ‖ Finish ) *   # one bracket per action
 //! ```
 //!
@@ -70,6 +70,10 @@ pub struct Action {
 /// A decoded stream: the block span and the actions that settle with it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DecodedContainer {
+    /// Whose operations this stream carries. EEZ's `chain_id` IS the rollup
+    /// id (§1.2 folds it into the call hash as `sourceRollupId`). Anything
+    /// deriving from `span` must check it.
+    pub rollup_id: u64,
     /// The Rollup0 block span.
     pub span: DecodedSpan,
     /// The action manifest, in bracket order, aligned with `entries[]`.
@@ -83,7 +87,7 @@ pub struct DecodedContainer {
 /// - [`CodecError::EmptySpan`] if `blocks` is empty.
 /// - [`CodecError::ValueTooLarge`] if a `bytes` field exceeds `u32`.
 pub fn encode_container(
-    chain_id: u64,
+    rollup_id: u64,
     blocks: &[SpanBlock],
     actions: &[Action],
 ) -> CodecResult<Vec<u8>> {
@@ -91,7 +95,7 @@ pub fn encode_container(
 
     let mut out = vec![STREAM_VERSION];
     out.push(MSG_CHAIN_OPERATION);
-    out.extend_from_slice(&chain_id.to_le_bytes());
+    out.extend_from_slice(&rollup_id.to_le_bytes());
     put_bytes(&mut out, &operations)?;
 
     for action in actions {
@@ -143,22 +147,26 @@ pub fn decode_container(payload: &[u8]) -> CodecResult<DecodedContainer> {
     // Exactly one Rollup0 ChainOperation opens the stream; a second is invalid
     // rather than concatenated with the first.
     expect_message(&mut cur, MSG_CHAIN_OPERATION)?;
-    let _chain_id = u64::from_le_bytes(cur.take_array::<8>("chain_id")?);
+    let rollup_id = u64::from_le_bytes(cur.take_array::<8>("chain_id")?);
     let span = crate::decode(take_bytes(&mut cur, "operations")?)?;
 
     let mut actions = Vec::new();
     while cur.remaining() != 0 {
         actions.push(decode_action(&mut cur)?);
     }
-    Ok(DecodedContainer { span, actions })
+    Ok(DecodedContainer {
+        rollup_id,
+        span,
+        actions,
+    })
 }
 
 fn decode_action(cur: &mut Cursor<'_>) -> CodecResult<Action> {
     expect_message(cur, MSG_INITIATE)?;
     let source_rollup_id = u64::from_le_bytes(cur.take_array::<8>("initiate chain_id")?);
-    if !take_bytes(cur, "tx_data")?.is_empty() {
-        return Err(CodecError::NonEmptyTxData);
-    }
+    // Chain-defined and opaque to EEZ (§2.3): read past a peer's rather than
+    // rejecting the stream. We emit none.
+    take_bytes(cur, "tx_data")?;
 
     expect_message(cur, MSG_CALL)?;
     let target_rollup_id = u64::from_le_bytes(cur.take_array::<8>("to_chain")?);
@@ -223,6 +231,9 @@ fn put_varint(out: &mut Vec<u8>, mut value: u64) {
 
 /// Read a protobuf varint, rejecting non-shortest and over-long encodings so
 /// every value has exactly one representation.
+/// A protobuf varint. Non-minimal encodings stay valid here (§5 cond. 8),
+/// unlike the span's `uvarint32`; the errors below are range guards, not
+/// minimality.
 fn varint(cur: &mut Cursor<'_>, what: &'static str) -> CodecResult<u64> {
     let mut value: u64 = 0;
     for i in 0..10 {
@@ -233,9 +244,6 @@ fn varint(cur: &mut Cursor<'_>, what: &'static str) -> CodecResult<u64> {
         }
         value |= group << (7 * i);
         if byte & 0x80 == 0 {
-            if i > 0 && group == 0 {
-                return Err(CodecError::NonCanonicalVarint(what));
-            }
             return Ok(value);
         }
     }
@@ -253,7 +261,7 @@ fn reversed(value: &[u8; VALUE_BYTES]) -> [u8; VALUE_BYTES] {
 mod tests {
     use super::*;
 
-    const CHAIN: u64 = 7331;
+    const ROLLUP: u64 = 1;
 
     fn action(success: bool) -> Action {
         let mut value = [0u8; VALUE_BYTES];
@@ -285,15 +293,16 @@ mod tests {
     #[test]
     fn round_trips_span_and_actions() {
         let actions = vec![action(true), action(false)];
-        let encoded = encode_container(CHAIN, &span(), &actions).unwrap();
+        let encoded = encode_container(ROLLUP, &span(), &actions).unwrap();
         let decoded = decode_container(&encoded).unwrap();
         assert_eq!(decoded.span.block_tx_counts, vec![1, 0]);
         assert_eq!(decoded.actions, actions);
+        assert_eq!(decoded.rollup_id, ROLLUP);
     }
 
     #[test]
     fn round_trips_an_empty_manifest() {
-        let encoded = encode_container(CHAIN, &span(), &[]).unwrap();
+        let encoded = encode_container(ROLLUP, &span(), &[]).unwrap();
         assert!(decode_container(&encoded).unwrap().actions.is_empty());
     }
 
@@ -301,12 +310,12 @@ mod tests {
     /// then a ChainOperation whose chain_id is little-endian.
     #[test]
     fn the_stream_opens_as_the_spec_defines() {
-        let encoded = encode_container(CHAIN, &span(), &[]).unwrap();
+        let encoded = encode_container(ROLLUP, &span(), &[]).unwrap();
         assert_eq!(encoded[0], STREAM_VERSION, "protocol version");
         assert_eq!(encoded[1], MSG_CHAIN_OPERATION, "ChainOperation is type 2");
         assert_eq!(
             &encoded[2..10],
-            &CHAIN.to_le_bytes(),
+            &ROLLUP.to_le_bytes(),
             "chain_id little-endian"
         );
     }
@@ -316,7 +325,7 @@ mod tests {
     #[test]
     fn operations_carries_the_span_verbatim() {
         let blocks = span();
-        let encoded = encode_container(CHAIN, &blocks, &[]).unwrap();
+        let encoded = encode_container(ROLLUP, &blocks, &[]).unwrap();
         let raw_span = crate::encode(&blocks).unwrap();
         assert_eq!(
             raw_span[0],
@@ -331,9 +340,26 @@ mod tests {
 
     /// A stream whose first byte is not a known protocol version is rejected
     /// whole, never parsed under this format.
+    /// §5 cond. 8: a padded length prefix is valid EEZ, so a peer emitting
+    /// one must not be rejected.
+    #[test]
+    fn a_padded_length_prefix_is_accepted() {
+        let encoded = encode_container(ROLLUP, &span(), &[]).unwrap();
+        // 00 ‖ 02 ‖ chain_id(8) ‖ operations length
+        let at = 1 + 1 + 8;
+        assert!(encoded[at] < 0x80, "fixture's length must fit one byte");
+        let mut padded = encoded.clone();
+        padded.splice(at..=at, [encoded[at] | 0x80, 0x00]);
+
+        assert_eq!(
+            decode_container(&padded).unwrap().span,
+            decode_container(&encoded).unwrap().span,
+        );
+    }
+
     #[test]
     fn an_unknown_stream_version_is_rejected() {
-        let mut forged = encode_container(CHAIN, &span(), &[]).unwrap();
+        let mut forged = encode_container(ROLLUP, &span(), &[]).unwrap();
         forged[0] = 0x01;
         assert_eq!(
             decode_container(&forged).unwrap_err(),
@@ -360,13 +386,13 @@ mod tests {
     /// and without actions, so encoding an empty manifest measures it. Scanning
     /// for a type byte would collide with the same value inside the span.
     fn first_bracket_offset() -> usize {
-        encode_container(CHAIN, &span(), &[]).unwrap().len()
+        encode_container(ROLLUP, &span(), &[]).unwrap().len()
     }
 
     #[test]
     fn value_is_little_endian_on_the_wire() {
         let a = action(true);
-        let encoded = encode_container(CHAIN, &span(), std::slice::from_ref(&a)).unwrap();
+        let encoded = encode_container(ROLLUP, &span(), std::slice::from_ref(&a)).unwrap();
         // Initiate: type(1) | chain_id(8) | tx_data len(1) = 10 bytes.
         // Call: type(1) | to_chain(8) | from(20) | to(20) → value at +49.
         let call = first_bracket_offset() + 10;
@@ -379,25 +405,26 @@ mod tests {
         );
     }
 
-    /// Rollup0 requires an empty `tx_data`: a proposed trigger is delivery
-    /// data, never action identity.
+    /// `tx_data` is chain-defined (§2.3), so a peer's must still decode.
     #[test]
-    fn a_non_empty_tx_data_is_rejected() {
-        let mut forged = encode_container(CHAIN, &span(), &[action(true)]).unwrap();
+    fn a_non_empty_tx_data_is_accepted() {
+        let clean = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();
+        let mut forged = clean.clone();
         let at = first_bracket_offset();
         assert_eq!(forged[at], MSG_INITIATE);
         forged[at + 9] = 0x01; // tx_data length 0 -> 1
         forged.insert(at + 10, 0xff);
+
         assert_eq!(
-            decode_container(&forged).unwrap_err(),
-            CodecError::NonEmptyTxData,
+            decode_container(&forged).unwrap().actions,
+            decode_container(&clean).unwrap().actions,
         );
     }
 
     /// A bracket must be complete: truncating anywhere fails the whole stream.
     #[test]
     fn a_truncated_stream_is_rejected() {
-        let encoded = encode_container(CHAIN, &span(), &[action(true)]).unwrap();
+        let encoded = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();
         for cut in [encoded.len() - 1, encoded.len() - 6, encoded.len() / 2] {
             assert!(
                 decode_container(&encoded[..cut]).is_err(),

@@ -41,7 +41,7 @@ fn refresh_l1_rolling_hash(entry: &mut ExecutionEntrySol) {
 fn test_da_payload_encoder_matches_the_wire_format() {
     // 00            EEZ protocol version (never a message)
     // 02            ChainOperation
-    // <u64 LE>      chain_id
+    // <u64 LE>      chain_id — EEZ's chain id IS the rollup id (spec §1.2)
     // 1a <26 bytes> operations: the published 0x00 span, length-prefixed
     let span = [
         vec![0x00, 0x01, 0x00],
@@ -52,7 +52,7 @@ fn test_da_payload_encoder_matches_the_wire_format() {
     .concat();
     let expected = [
         vec![0x00, 0x02],
-        7331u64.to_le_bytes().to_vec(),
+        1u64.to_le_bytes().to_vec(),
         vec![u8::try_from(span.len()).unwrap()],
         span,
     ]

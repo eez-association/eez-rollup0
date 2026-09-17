@@ -101,7 +101,7 @@ struct DaPayload {
 }
 
 impl DaPayload {
-    fn decode(encoded_payload: &[u8]) -> Result<Self, DaPayloadError> {
+    fn decode(encoded_payload: &[u8], expected_rollup_id: u64) -> Result<Self, DaPayloadError> {
         let container =
             eez_payload_codec::decode_container(encoded_payload).map_err(|error| match error {
                 eez_payload_codec::CodecError::TrailingBytes(trailing) => {
@@ -109,6 +109,14 @@ impl DaPayload {
                 }
                 other => invalid_da_payload(other.to_string()),
             })?;
+        // Fatal here, unlike the deriver: we are asked to attest THIS batch,
+        // and a payload for another rollup is not it.
+        if container.rollup_id != expected_rollup_id {
+            return Err(invalid_da_payload(format!(
+                "DA payload carries rollup {} operations, expected {expected_rollup_id}",
+                container.rollup_id,
+            )));
+        }
         Ok(Self {
             span: container.span,
             actions: container.actions,
@@ -242,7 +250,7 @@ fn verify_encoded_da_payload<'a, I>(
 where
     I: ExactSizeIterator<Item = (u64, &'a [u8])>,
 {
-    let mut payload_cursor = DaPayload::decode(encoded_payload)?;
+    let mut payload_cursor = DaPayload::decode(encoded_payload, expected_rollup_id)?;
     let expected_blocks = intermediate_blocks.len() + 1;
     let omitted_terminal_count = outbound_effects
         .len()
@@ -579,11 +587,6 @@ fn verify_reconstructed_sync_block(
     Ok(())
 }
 
-/// The chain id these settlement fixtures build streams for. The signer binds
-/// the batch's rollup id, not the stream's chain id, so any stable value works.
-#[cfg(test)]
-const TEST_CHAIN_ID: u64 = 7331;
-
 /// Encode a DA payload for focused tests, through the shared codec so a test
 /// fixture can never encode a shape the composer cannot produce.
 ///
@@ -594,7 +597,16 @@ pub(crate) fn encode_da_payload(
     blocks: &[Vec<Vec<u8>>],
     entries: &[eez_protocol::abi::ExecutionEntrySol],
 ) -> Vec<u8> {
-    let rollup_id = 1;
+    encode_da_payload_for(1, blocks, entries)
+}
+
+/// As [`encode_da_payload`], for a fixture attesting a non-default rollup.
+#[cfg(test)]
+pub(crate) fn encode_da_payload_for(
+    rollup_id: u64,
+    blocks: &[Vec<Vec<u8>>],
+    entries: &[eez_protocol::abi::ExecutionEntrySol],
+) -> Vec<u8> {
     let span: Vec<eez_payload_codec::SpanBlock> = blocks
         .iter()
         .map(|transactions| eez_payload_codec::SpanBlock {
@@ -609,6 +621,5 @@ pub(crate) fn encode_da_payload(
                 .expect("test entry projects to an action")
         })
         .collect();
-    eez_payload_codec::encode_container(TEST_CHAIN_ID, &span, &actions)
-        .expect("test payload encodes")
+    eez_payload_codec::encode_container(rollup_id, &span, &actions).expect("test payload encodes")
 }

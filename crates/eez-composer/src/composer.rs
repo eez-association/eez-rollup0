@@ -3050,6 +3050,7 @@ where
                 &comp_refs,
                 parent_header,
                 built.header.state_root(),
+                &built.header,
                 Some(&built.block),
                 &pair_roots,
                 &outbound_entries,
@@ -3374,6 +3375,7 @@ where
                 &[], // no compositions → leading immediate only
                 parent_header,
                 empty_built.header.state_root(),
+                &empty_built.header,
                 Some(&empty_built.block),
                 &[], // no cross-chain effects → no per-effect roots
                 &[], // no outbound entries
@@ -3537,6 +3539,7 @@ where
                     &[], // no compositions → leading immediate only
                     &boundary_parent,
                     boundary_header.state_root(),
+                    &boundary_header,
                     None, // terminal is committed → witnesses come from the store
                     &[],
                     &[],
@@ -3682,7 +3685,8 @@ where
     /// proof system. Each effect entry's `newState` is its per-effect root from
     /// `pair_roots` (verified by the proof signer's effect-prefix checks); the
     /// last is the final Sync-block root. `sync_block_state_root` is the
-    /// required settlement-chain endpoint.
+    /// required settlement-chain endpoint; `terminal_header` carries it too,
+    /// and the two collapse into one once commitments become block hashes.
     ///
     /// `sync_block` is the terminal, `Some` only while freshly built; `None`
     /// (historical chunk) takes its witness from the store like the rest.
@@ -3701,6 +3705,7 @@ where
         compositions: &[&eez_protocol::Composition],
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         sync_block_state_root: B256,
+        terminal_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         sync_block: Option<
             &reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>,
         >,
@@ -4049,10 +4054,9 @@ where
         // is), so they travel in the Sync-block DA here; the deriver interleaves
         // them with the rebuilt loads. Inbound-only → empty.
         blocks.push(eez_payload_codec::SpanBlock {
-            // The Sync block does not exist yet; these are the header inputs
-            // `build_sync_block` gives it.
-            beneficiary: Address::ZERO.into(),
-            extra_data: eez_driver::BUILDER_EXTRA_DATA.to_vec(),
+            // Read off the terminal header.
+            beneficiary: terminal_header.beneficiary().into(),
+            extra_data: terminal_header.extra_data().to_vec(),
             transactions: outbound_user_txs.iter().map(|b| b.to_vec()).collect(),
         });
         // Outbound entries describe L1 settlement and L2 loads; inbound target
@@ -4089,7 +4093,7 @@ where
             )
             .into());
         }
-        let payload = eez_payload_codec::encode_container(ctx.l2_chain_id, &blocks, &actions)
+        let payload = eez_payload_codec::encode_container(rollup_id, &blocks, &actions)
             .map_err(|e| format!("eez_payload_codec::encode_container: {e}"))?;
         batch.callData = alloy_primitives::Bytes::from(payload);
 

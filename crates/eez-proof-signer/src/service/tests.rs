@@ -371,7 +371,11 @@ fn public_input_post_batch_for_empty_blocks(
     batch.callData = if block_count == 0 {
         alloy_primitives::Bytes::new()
     } else {
-        settlement::encode_da_payload(&vec![Vec::new(); block_count], &[]).into()
+        let rollup_id = batch
+            .rollupIdsWithProofSystems
+            .first()
+            .map_or(1, |r| r.rollupId);
+        settlement::encode_da_payload_for(rollup_id, &vec![Vec::new(); block_count], &[]).into()
     };
     public_input_post_batch_for(batch)
 }

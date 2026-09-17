@@ -551,7 +551,11 @@ where
         let mut new_batches: Vec<BatchRecord> = Vec::new();
         let mut total_replayed: u64 = 0;
         for batch in scanned_batches {
-            let container = eez_payload_codec::decode_container(batch.call_data.as_ref())?;
+            let Some(container) =
+                self.decode_our_payload(batch.call_data.as_ref(), batch.l1_block_number)?
+            else {
+                continue;
+            };
             let decoded = &container.span;
 
             // `settled_count == 0` = nothing applied on L1 (the claimed
@@ -851,6 +855,32 @@ where
             .await?)
     }
 
+    /// Decode a posted DA payload, or `None` when it is not ours.
+    ///
+    /// Skipped rather than fatal: we read one `ChainOperation`, so a legitimate
+    /// multi-rollup batch reads as foreign, and halting would hand a peer a
+    /// stop. Unchecked outside cross-chain mode, which configures no rollup id.
+    fn decode_our_payload(
+        &self,
+        call_data: &[u8],
+        l1_block_number: u64,
+    ) -> DeriverResult<Option<eez_payload_codec::DecodedContainer>> {
+        let container = eez_payload_codec::decode_container(call_data)?;
+        let ours = self.inner.system_tx_cfg.as_ref().map(|c| c.this_rollup_id);
+        if ours.is_some_and(|ours| container.rollup_id != ours) {
+            event!(
+                name: "eez.deriver.foreign_rollup_payload",
+                Level::WARN,
+                l1_block_number,
+                payload_rollup = container.rollup_id,
+                ours = ?ours,
+                "DA payload carries another rollup's operations; skipping",
+            );
+            return Ok(None);
+        }
+        Ok(Some(container))
+    }
+
     /// Runs the deriver loop, processing each event on `rx` until the
     /// stream closes. `rx` must be subscribed before the `L1Watcher`
     /// starts so no event predates it.
@@ -1023,7 +1053,9 @@ where
         claimed_new_state: Option<B256>,
         last_in_l1_block: bool,
     ) -> DeriverResult<()> {
-        let container = eez_payload_codec::decode_container(call_data.as_ref())?;
+        let Some(container) = self.decode_our_payload(call_data.as_ref(), l1_block_number)? else {
+            return self.flush_deferred_safe(last_in_l1_block).await;
+        };
         let decoded = &container.span;
         let block_count = decoded.block_count() as u64;
         if block_count == 0 {

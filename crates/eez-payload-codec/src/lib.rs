@@ -140,9 +140,6 @@ pub enum CodecError {
     /// A message type byte is not assigned by the format.
     #[error("unknown message type {0}")]
     UnknownMessage(u8),
-    /// Rollup0 requires every bracket's `tx_data` to be empty.
-    #[error("InitiateCrossChainTransaction.tx_data must be empty")]
-    NonEmptyTxData,
     /// A value did not fit the `uvarint32` domain on encode.
     #[error("{what} = {value} exceeds u32")]
     ValueTooLarge {
