@@ -134,7 +134,7 @@ jobs:
       - name: Archive integration test executables
         run: |
           mkdir -p artifacts/e2e-build
-          cargo nextest archive --locked -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test resumption --archive-file artifacts/e2e-build/tests.tar.zst
+          cargo nextest archive --locked -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test resumption --test native_system --archive-file artifacts/e2e-build/tests.tar.zst
           cp target/debug/eez-composer artifacts/e2e-build/
           cp target/debug/eez-follower artifacts/e2e-build/
           cp target/debug/eez-proof-signer artifacts/e2e-build/
@@ -223,6 +223,9 @@ jobs:
           - id: resumption
             name: resumption
             filter: binary(=resumption)
+          - id: native-system
+            name: native system
+            filter: binary(=native_system)
     env:
       EEZ_TEST_PROOF_SIGNER_BIN: ${{ github.workspace }}/artifacts/e2e-build/eez-proof-signer
       EEZ_TEST_LOG_DIR: ${{ github.workspace }}/artifacts/cross-chain-e2e/${{ matrix.suite.id }}/logs

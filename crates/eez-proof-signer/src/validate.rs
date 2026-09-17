@@ -14,7 +14,7 @@ use crate::window::{AdmittedBlock, AdmittedBlocks};
 
 pub mod support;
 
-type EthereumBlock = reth_ethereum_primitives::Block;
+type EthereumBlock = eez_primitives::Block;
 
 /// A cumulative state root locally recomputed during successful block replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

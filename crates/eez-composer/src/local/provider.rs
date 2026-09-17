@@ -8,14 +8,14 @@
 //! - type-erased [`HeaderReader`] (dyn-compatible wrapper around
 //!   `HeaderProvider`, which has generic methods that block direct
 //!   `dyn` use)
-//! - `EthEvmConfig` (for building EVM envs from headers)
+//! - `EezEvmConfig` (for building EVM envs from headers)
 //!
 //! Held once per rollup inside [`crate::composer::local::LocalChainClient`]
 //! and cloned cheaply per execution-session open.
 
 use std::sync::Arc;
 
-use reth_evm_ethereum::EthEvmConfig;
+use eez_evm::EezEvmConfig;
 use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderFactory};
 
 /// Dyn-compatible header reader (`HeaderProvider` has generic methods
@@ -55,7 +55,7 @@ pub struct ChainProvider {
     /// Header reader — dyn-compatible wrapper around `HeaderProvider`.
     pub headers: Arc<dyn HeaderReader>,
     /// EVM config for building envs from headers.
-    pub evm_config: EthEvmConfig,
+    pub evm_config: EezEvmConfig,
 }
 
 impl Clone for ChainProvider {

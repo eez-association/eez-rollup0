@@ -1,34 +1,11 @@
-//! Single source of truth for building signed L2 inbound system txs.
-//!
-//! Given the cross-chain entries that will land in a `postBatch` —
-//! whether observed locally by the composer's chained simulation
-//! or read from L1's `BatchPosted` event by the deriver — produce
-//! the **same** signed `executeIncomingCrossChainCall(...)` system
-//! txs that should appear at the head of the L2 Sync block.
-//!
-//! Composer and deriver agree mechanically: both call
-//! [`build_inbound_system_txs`] with the same `entries`, so the signed
-//! txs are byte-identical (`Rollup-1.md §5`: system txs precede user
-//! txs).
-//!
-//! Txs are signed legacy txs from the SYSTEM_ADDRESS key — works
-//! against vanilla reth without a custom tx type, and both processes
-//! sign with the same key so the sigs match. (Type-0x7E system txs,
-//! per `Rollup-1.md §5.3`, would drop the deriver's need for the key;
-//! a follow-up.)
-//!
-//! Nonce: both sides read the SYSTEM_ADDRESS nonce from local L2 state
-//! at the same parent block. Reth derives it deterministically from
-//! applied history, so equal histories give equal nonce → signature →
-//! tx hash.
+//! Canonical unsigned L2 system transactions, shared by Composer, Deriver, and
+//! proof verification. Equal entries and parent-state nonces produce identical
+//! EIP-2718 bytes without private material. Sync pairs preserve per-entry ordering.
 
-use alloy_consensus::TxLegacy;
 use alloy_eips::eip2718::Encodable2718;
-use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, Bytes, TxKind, U256};
-use alloy_signer_local::PrivateKeySigner;
+use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::SolCall;
-use reth_ethereum_primitives::{Transaction, TransactionSigned};
+use eez_primitives::{EEZL2_ADDRESS, SystemTransaction};
 
 use crate::RollupId;
 use crate::abi::{ExecutionEntrySol, L2ExecutionEntrySol, loadExecutionTableCall};
@@ -37,36 +14,23 @@ use crate::entries::{
     encode_execute_incoming,
 };
 
-/// Per-follower configuration the system-tx builder needs. The
-/// composer and deriver each build one from their own startup config.
+/// Public reconstruction inputs shared by Composer, Deriver, and proof validation.
 #[derive(Clone, Debug)]
 pub struct SystemTxContext {
-    /// SYSTEM_ADDRESS signer for this L2. Must match the L2's
-    /// `EEZL2.SYSTEM_ADDRESS` immutable, otherwise
-    /// `executeIncomingCrossChainCall`'s `onlySystemAddress` modifier
-    /// reverts.
-    pub system_signer: PrivateKeySigner,
-    /// Address of the `EEZL2` contract on this L2.
+    /// Must equal the reserved EEZL2 predeploy; encoding rejects other targets.
     pub eezl2_address: Address,
-    /// EIP-155 chain id of this L2.
+    /// Binds the reconstructed transaction to its L2 chain for replay protection.
     pub l2_chain_id: u64,
-    /// Legacy `gasPrice` for the signed system tx. Dev/devnet uses
-    /// 1 gwei (above the dev-mode 0 basefee).
-    pub l2_gas_price: u128,
-    /// Per-tx gas budget. Matches
-    /// `crosschain-evm-composer::EXECUTE_INCOMING_GAS_LIMIT` (~2M)
-    /// from the reference impl.
-    pub l2_gas_limit: u64,
     /// This rollup's id — entries whose `destinationRollupId` doesn't
     /// match are skipped (they belong to a different L2).
     pub this_rollup_id: u64,
 }
 
-/// Build signed L2 inbound system txs from a postBatch's entries.
+/// Build unsigned L2 inbound system txs from a postBatch's entries.
 ///
 /// For each entry whose `destinationRollupId == cfg.this_rollup_id`,
 /// reconstructs the outer cross-chain call from
-/// `entry.L2ToL1Calls[0]` and produces one signed legacy tx invoking
+/// `entry.L2ToL1Calls[0]` and produces one native system tx invoking
 /// `EEZL2.executeIncomingCrossChainCall(...)`. Entries for other
 /// rollups are skipped.
 ///
@@ -76,8 +40,7 @@ pub struct SystemTxContext {
 ///
 /// # Errors
 ///
-/// Returns a `String` error if a signature operation fails (signer
-/// chain-id disagreement, malformed key, etc.).
+/// Returns an error for an invalid predeploy address, entry shape, or nonce overflow.
 pub fn build_inbound_system_txs(
     entries: &[ExecutionEntrySol],
     cfg: &SystemTxContext,
@@ -95,11 +58,6 @@ pub fn build_inbound_system_txs(
         check_entry_shape(entry, "inbound")?;
         let outer = &entry.l2ToL1Calls[0];
         let source_rollup = outer.sourceRollupId;
-        // Build the lean L2 mirror, then encode
-        // `executeIncomingCrossChainCall(...)`. NOTE: inbound runtime semantics
-        // (success / return_data byte-identity vs the composer's emit) are
-        // validated in the prover phase — outbound-first does not exercise
-        // this delivery path at runtime.
         let l2_entry = build_l2_incoming_entry(IncomingEntry {
             target: outer.targetAddress,
             source: outer.sourceAddress,
@@ -119,15 +77,12 @@ pub fn build_inbound_system_txs(
             RollupId(source_rollup),
             l2_entry,
         );
-        let raw = sign_legacy_system_tx(
-            &cfg.system_signer,
+        let raw = encode_system_tx(
             nonce,
             cfg.eezl2_address,
             calldata,
             outer.value,
             cfg.l2_chain_id,
-            cfg.l2_gas_price,
-            cfg.l2_gas_limit,
         )?;
         nonce = nonce.checked_add(1).ok_or_else(|| {
             "SYSTEM_ADDRESS nonce overflow in build_inbound_system_txs".to_string()
@@ -155,8 +110,7 @@ pub fn build_inbound_system_txs(
 ///
 /// # Errors
 ///
-/// Returns a `String` error if a signature operation fails or the
-/// SYSTEM_ADDRESS nonce overflows.
+/// Returns an error for an invalid predeploy address or nonce overflow.
 pub fn build_outbound_load_table_txs(
     entries: &[L2ExecutionEntrySol],
     cfg: &SystemTxContext,
@@ -175,15 +129,12 @@ pub fn build_outbound_load_table_txs(
             _staticEntries: Vec::new(),
         }
         .abi_encode();
-        let raw = sign_legacy_system_tx(
-            &cfg.system_signer,
+        let raw = encode_system_tx(
             nonce,
             cfg.eezl2_address,
             calldata,
             U256::ZERO, // loadExecutionTable carries no value
             cfg.l2_chain_id,
-            cfg.l2_gas_price,
-            cfg.l2_gas_limit,
         )?;
         nonce = nonce.checked_add(1).ok_or_else(|| {
             "SYSTEM_ADDRESS nonce overflow in build_outbound_load_table_txs".to_string()
@@ -203,7 +154,7 @@ pub fn build_outbound_load_table_txs(
 ///   `executeCrossChainCall` (the SyncPair `[load_i | user_i]`).
 #[derive(Clone, Debug)]
 pub struct SyncPair {
-    /// The system tx (a signed SYSTEM_ADDRESS tx).
+    /// The system tx (an unsigned native transaction).
     pub system_tx: Bytes,
     /// The user tx that consumes `system_tx`'s effect in the SAME block,
     /// immediately after it. `None` for a self-contained system tx.
@@ -353,7 +304,7 @@ pub fn build_outbound_pair(
 /// the pre-refactor per-direction builds.
 ///
 /// # Errors
-/// Rejects unsupported entry shapes, signing failures, and SYSTEM_ADDRESS
+/// Rejects unsupported entry shapes, invalid targets, and SYSTEM_ADDRESS
 /// nonce overflow.
 pub fn build_cross_chain_sync_pairs(
     outbound: &[(ExecutionEntrySol, Bytes)],
@@ -364,16 +315,12 @@ pub fn build_cross_chain_sync_pairs(
     let mut nonce = starting_nonce;
     let mut pairs: Vec<SyncPair> = Vec::with_capacity(outbound.len() + inbound.len());
 
-    // Gate the inbound half before emitting anything: a bad shape must fail the
-    // call, not half-build it. Inbound needs its own gate because
-    // `build_inbound_system_txs` skips foreign entries before checking them.
-    // Outbound is gated by `build_outbound_pair`, which checks its entry first.
+    // Validate even foreign inbound entries, which the delivery builder skips.
     for entry in inbound {
         check_entry_shape(entry, "inbound")?;
     }
 
-    // ── PHASE 1 — outbound: each loadExecutionTable immediately paired with
-    // its consuming user tx (the self-clean requires consume-before-next-load).
+    // Each user must consume its load before the next load resets the execution table.
     for (entry, user_tx) in outbound {
         let built = build_outbound_pair(entry, user_tx, cfg, nonce)?;
         nonce = nonce
@@ -382,8 +329,7 @@ pub fn build_cross_chain_sync_pairs(
         pairs.extend(built);
     }
 
-    // ── PHASE 2 — inbound deliveries, continuing the SYSTEM_ADDRESS nonce
-    // after ALL outbound loads (build_inbound_system_txs advances internally).
+    // Inbound deliveries continue the nonce sequence after all outbound loads.
     let deliveries = build_inbound_system_txs(inbound, cfg, nonce)?;
     for d in deliveries {
         pairs.push(SyncPair {
@@ -395,47 +341,28 @@ pub fn build_cross_chain_sync_pairs(
     Ok(pairs)
 }
 
-/// Sign a single legacy L2 tx from SYSTEM_ADDRESS with an explicit
-/// `value`.
-///
-/// `EEZL2.executeIncomingCrossChainCall` enforces strict
-/// `msg.value == value` equality in `executeIncomingCrossChainCall` — pass the same
-/// value here as is embedded in the calldata.
-///
-/// # Errors
-///
-/// Returns a `String` error if `sign_transaction_sync` fails.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "wrapping in a struct would just move the arity to the constructor; \
-              every field is load-bearing and the function is private to this module"
-)]
-fn sign_legacy_system_tx(
-    signer: &PrivateKeySigner,
+/// Use the unsigned native envelope so every role reconstructs identical bytes.
+/// Restrict calls to EEZL2; its incoming-call check requires `value` to match
+/// the value encoded in the calldata.
+fn encode_system_tx(
     nonce: u64,
     to: Address,
     calldata: Vec<u8>,
     value: U256,
     chain_id: u64,
-    gas_price: u128,
-    gas_limit: u64,
 ) -> Result<Bytes, String> {
-    let mut tx = TxLegacy {
-        chain_id: Some(chain_id),
+    if to != EEZL2_ADDRESS {
+        return Err("native system transactions must target the EEZL2 predeploy".to_string());
+    }
+    Ok(SystemTransaction {
+        chain_id,
         nonce,
-        gas_price,
-        gas_limit,
-        to: TxKind::Call(to),
+        to,
         value,
         input: calldata.into(),
-    };
-    let sig = signer
-        .sign_transaction_sync(&mut tx)
-        .map_err(|e| format!("sign_transaction_sync: {e}"))?;
-    let signed = TransactionSigned::new_unhashed(Transaction::Legacy(tx), sig);
-    let mut buf = Vec::with_capacity(512);
-    signed.encode_2718(&mut buf);
-    Ok(Bytes::from(buf))
+    }
+    .encoded_2718()
+    .into())
 }
 
 #[cfg(test)]
@@ -445,14 +372,12 @@ mod tests {
     use crate::abi::{L2ToL1CallSol, RollupIdWithProofSystemsSol, StateUpdateSol};
     use crate::entries::{decode_postbatch, encode_postbatch};
     use alloy_primitives::{B256, I256, address};
+    use eez_primitives::EezTxEnvelope as TransactionSigned;
 
     fn ctx() -> SystemTxContext {
         SystemTxContext {
-            system_signer: PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap(),
             eezl2_address: address!("4200000000000000000000000000000000000007"),
             l2_chain_id: 1,
-            l2_gas_price: 1_000_000_000,
-            l2_gas_limit: 2_000_000,
             this_rollup_id: 1,
         }
     }
@@ -527,7 +452,7 @@ mod tests {
         }
     }
 
-    /// Decode a signed legacy system tx's nonce.
+    /// Decode a native system transaction's nonce.
     fn nonce_of(raw: &Bytes) -> u64 {
         use alloy_consensus::Transaction as _;
         use alloy_eips::eip2718::Decodable2718 as _;
@@ -797,17 +722,8 @@ mod tests {
         }
     }
 
-    /// Phase-C invariant (the migration plan's ★ HIGHEST-RISK item): the composer
-    /// EMITS the inbound system tx from its in-memory entries; the standalone deriver
-    /// REBUILDS it from the L1 `postBatch` (encode → on-chain → decode). The shared
-    /// `build_inbound_system_txs` MUST produce BYTE-IDENTICAL signed txs across that
-    /// encode/decode round-trip — otherwise the derived L2 block forks from the
-    /// composer's and the next postBatch root mismatches: a SILENT soundness failure
-    /// (based has no deriver, so this equality was never exercised upstream).
-    ///
-    /// (eez0 keeps `TxLegacy` — fixed `gasPrice`, no `base_fee` — so the plan's
-    /// `max_fee = base_fee*2` asymmetry trap does not apply; the surface is the
-    /// entry encode/decode preservation + nonce agreement, which this pins.)
+    /// Reconstructing inbound transactions from posted entries must preserve the
+    /// composer's native bytes, or the follower derives a different block root.
     #[test]
     fn composer_emit_equals_deriver_rebuild_byte_identical() {
         let cfg = ctx();
@@ -824,7 +740,7 @@ mod tests {
         );
     }
 
-    /// Guards against a vacuous pass: the signed bytes MUST vary with the nonce (so the
+    /// Guards against a vacuous pass: the native bytes MUST vary with the nonce (so the
     /// equality above is non-trivial), and emit==rebuild must still hold at that nonce.
     #[test]
     fn byte_identity_is_non_vacuous_and_holds_across_nonces() {
@@ -832,7 +748,7 @@ mod tests {
         let entries = vec![inbound_entry()];
         let at0 = build_inbound_system_txs(&entries, &cfg, 0).unwrap();
         let at99 = build_inbound_system_txs(&entries, &cfg, 99).unwrap();
-        assert_ne!(at0, at99, "different nonce must change the signed bytes");
+        assert_ne!(at0, at99, "different nonce must change the native bytes");
         assert_eq!(
             build_inbound_system_txs(&round_tripped(&entries), &cfg, 99).unwrap(),
             at99,
@@ -885,11 +801,11 @@ mod tests {
             "composer-emit must equal deriver-rebuild byte-for-byte"
         );
 
-        // Non-vacuous: the signed bytes vary with the nonce.
+        // Non-vacuous: the native bytes vary with the nonce.
         let at99 = build_outbound_load_table_txs(&[entry], &cfg, 99).unwrap();
         assert_ne!(
             emitted, at99,
-            "different nonce must change the signed bytes"
+            "different nonce must change the native bytes"
         );
     }
 

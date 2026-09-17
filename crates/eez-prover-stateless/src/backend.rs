@@ -14,6 +14,8 @@ use alloy_genesis::ChainConfig;
 use alloy_genesis::Genesis;
 use alloy_primitives::Address;
 use alloy_rpc_types_debug::ExecutionWitness;
+use eez_evm::EezEvmConfig;
+use eez_primitives::Block;
 use eez_proof_signer::cancel::CancellationToken;
 use eez_proof_signer::validate::support::{
     CheckpointPlan, check_cancellation, decode_match_and_recover_signers, observe_outbound_events,
@@ -27,8 +29,6 @@ use eez_proof_signer::window::AdmittedBlock;
 #[cfg(test)]
 use eez_proof_signer::window::testing::admitted_block_parts_mut;
 use reth_chainspec::ChainSpec;
-use reth_ethereum_primitives::Block;
-use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::RecoveredBlock;
 use stateless_reth::validation::StatelessValidationError;
 use stateless_reth::{
@@ -58,7 +58,7 @@ struct PreparedSettlingBlock {
 #[derive(Debug)]
 pub struct Backend {
     chain_spec: Arc<ChainSpec>,
-    evm_config: EthEvmConfig,
+    evm_config: EezEvmConfig,
     expected_l2_system_address: Address,
 }
 
@@ -104,7 +104,7 @@ impl Backend {
 
     fn from_genesis(genesis: Genesis, expected_l2_system_address: Address) -> Self {
         let chain_spec = Arc::new(ChainSpec::from_genesis(genesis));
-        let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
+        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             chain_spec,
             evm_config,

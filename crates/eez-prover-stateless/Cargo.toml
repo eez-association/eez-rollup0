@@ -12,10 +12,13 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
+eez-primitives.workspace = true
+eez-evm.workspace = true
 eez-proof-signer.workspace = true
 eez-protocol.workspace = true
 
 alloy-consensus.workspace = true
+alloy-eips.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
@@ -24,7 +27,6 @@ alloy-sol-types.workspace = true
 
 reth-chainspec.workspace = true
 reth-ethereum-primitives.workspace = true
-reth-evm-ethereum.workspace = true
 reth-primitives-traits.workspace = true
 stateless-reth.workspace = true
 

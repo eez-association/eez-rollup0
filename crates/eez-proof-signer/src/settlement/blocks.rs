@@ -15,8 +15,8 @@ use super::inbound::{InboundCandidate, inspect_inbound_candidate};
 use crate::EEZL2_ADDRESS;
 use crate::validate::{OutboundEventObservation, SettlementBlockEvidence, ValidatedBlock};
 
-pub(super) type EthereumBlock = reth_ethereum_primitives::Block;
-pub(super) const RESERVED_SYSTEM_TRANSACTION_TYPE: u8 = 0x7e;
+pub(super) type EthereumBlock = eez_primitives::Block;
+pub(super) const RESERVED_SYSTEM_TRANSACTION_TYPE: u8 = eez_primitives::SYSTEM_TX_TYPE;
 
 /// Settlement observations derived by combining backend-recovered evidence
 /// with the exact settling-block transaction order.
@@ -122,7 +122,7 @@ pub(crate) enum BlockInspectionError {
     #[error("settling system transaction {index} reverted")]
     RevertedSystemTransaction { index: usize },
     #[error(
-        "settling block transaction {index} is signed by the reserved system account but does not target EEZL2"
+        "settling block transaction {index} uses the reserved system sender without the native transaction type"
     )]
     ReservedSystemSender { index: usize },
 }
@@ -233,8 +233,11 @@ fn inspect_decoded_settling_block(
         .zip(receipt_successes)
         .enumerate()
     {
-        // The reserved system signer may authorize only top-level calls to EEZL2.
-        if is_system_sender && transaction.to() != Some(EEZL2_ADDRESS) {
+        // Only the native type may use the reserved system sender.
+        if is_system_sender
+            && (!eez_protocol::settlement::is_system_tx(transaction)
+                || transaction.to() != Some(EEZL2_ADDRESS))
+        {
             return Err(BlockInspectionError::ReservedSystemSender {
                 index: transaction_index,
             });

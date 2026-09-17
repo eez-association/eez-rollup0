@@ -1,11 +1,13 @@
-use alloy_consensus::{EthereumReceipt, Header, SignableTransaction as _, TxLegacy};
-use alloy_primitives::{B256, Bytes, Log, Signature, TxKind, U256, b256};
+mod native_security;
+
+use alloy_consensus::{Header, SignableTransaction as _, TxLegacy};
+use alloy_primitives::{B256, Bytes, Log, Signature, U256, b256};
 use alloy_sol_types::SolEvent as _;
+use eez_primitives::{EezTxEnvelope as TransactionSigned, Receipt as EthereumReceipt};
 use eez_proof_signer::EEZL2_ADDRESS;
 use eez_proof_signer::validate::{DecodedOutboundEvent, OutboundEventObservation};
 use eez_proof_signer::window::testing::admitted_block_with_witness;
 use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
-use reth_ethereum_primitives::TransactionSigned;
 use reth_primitives_traits::SignerRecoverable as _;
 
 use super::*;
@@ -122,9 +124,9 @@ fn captured_witness(encoded: &str) -> alloy_rpc_types_debug::ExecutionWitness {
     }
 }
 
-fn high_s_system_transaction() -> TransactionSigned {
-    let transaction: TransactionSigned =
-        alloy_rlp::decode_exact(hex::decode(SYSTEM_TX).unwrap()).unwrap();
+fn high_s_ethereum_transaction() -> TransactionSigned {
+    let transaction: reth_ethereum_primitives::TransactionSigned =
+        <reth_ethereum_primitives::TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(&hex::decode(crate::testkit::LEGACY_TX).unwrap()).unwrap();
     let signature = transaction.signature();
     let curve_order = U256::from_str_radix(
         "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
@@ -132,7 +134,11 @@ fn high_s_system_transaction() -> TransactionSigned {
     )
     .unwrap();
     let high_s = Signature::new(signature.r(), curve_order - signature.s(), !signature.v());
-    TransactionSigned::new_unhashed(transaction.into_typed_transaction(), high_s)
+    reth_ethereum_primitives::TransactionSigned::new_unhashed(
+        transaction.into_typed_transaction(),
+        high_s,
+    )
+    .into()
 }
 
 fn checkpoint(transaction_index: usize) -> TransactionStateCheckpoint {
@@ -309,17 +315,21 @@ fn checkpoint_response_must_match_the_plan_exactly() {
 #[test]
 fn checkpoint_plan_is_derived_from_recovered_transactions() {
     let transaction = || {
-        TxLegacy {
-            to: TxKind::Call(EEZL2_ADDRESS),
-            ..Default::default()
-        }
-        .into_signed(alloy_primitives::Signature::test_signature())
-        .into()
+        <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(
+            &hex::decode(SYSTEM_TX).unwrap(),
+        )
+        .unwrap()
     };
     let block = Block::new(
         Default::default(),
         alloy_consensus::BlockBody {
-            transactions: vec![transaction(), transaction(), transaction()],
+            transactions: vec![
+                transaction(),
+                TxLegacy::default()
+                    .into_signed(Signature::test_signature())
+                    .into(),
+                transaction(),
+            ],
             ..Default::default()
         },
     );
@@ -338,12 +348,10 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
 #[test]
 fn checkpoint_plan_includes_every_inbound_boundary() {
     let transaction = || {
-        TxLegacy {
-            to: TxKind::Call(EEZL2_ADDRESS),
-            ..Default::default()
-        }
-        .into_signed(alloy_primitives::Signature::test_signature())
-        .into()
+        <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(
+            &hex::decode(SYSTEM_TX).unwrap(),
+        )
+        .unwrap()
     };
 
     for transaction_count in [8, 9, 64, 65] {
@@ -393,11 +401,11 @@ fn sender_classification_uses_the_configured_system_address() {
 
 #[test]
 fn recovered_sender_facts_follow_the_homestead_signature_rule() {
-    let transaction = high_s_system_transaction();
+    let transaction = high_s_ethereum_transaction();
     assert!(transaction.recover_signer().is_err());
     assert_eq!(
         transaction.recover_signer_unchecked().unwrap(),
-        TEST_SYSTEM_ADDRESS
+        crate::testkit::LEGACY_SIGNER_ADDRESS
     );
     let header = Header {
         number: 7,
@@ -426,7 +434,10 @@ fn recovered_sender_facts_follow_the_homestead_signature_rule() {
         Default::default(),
     );
     let recovered = decode_match_and_recover_signers(&admitted, &pre_homestead).unwrap();
-    assert_eq!(system_sender_flags(&recovered, TEST_SYSTEM_ADDRESS), [true]);
+    assert_eq!(
+        system_sender_flags(&recovered, crate::testkit::LEGACY_SIGNER_ADDRESS),
+        [true]
+    );
 
     let post_homestead = ChainSpec::from_genesis(Genesis {
         config: ChainConfig {
@@ -479,7 +490,7 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
     let block = &output.blocks[0];
     assert_eq!(
         block.settlement_evidence.system_sender_flags,
-        [true, true, true]
+        [false, false, false]
     );
     assert!(
         block
@@ -549,6 +560,14 @@ fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
             .observed_outbound_events
             .is_empty()
     );
+    // Historical signed calls have no native system authority.
+    assert!(output.blocks.iter().all(|block| {
+        block
+            .settlement_evidence
+            .system_sender_flags
+            .iter()
+            .all(|is_system| !is_system)
+    }));
 }
 
 #[test]

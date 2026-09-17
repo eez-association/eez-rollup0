@@ -13,9 +13,11 @@ mod config;
 mod testkit {
     use alloy_primitives::{Address, address};
 
-    pub const TEST_SYSTEM_ADDRESS_ARG: &str = "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
-    pub const TEST_SYSTEM_ADDRESS: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-    pub const SYSTEM_TX: &str = "f85f8001825208944200000000000000000000000000000000000007808026a0ed95c78ea14cbb6af669c61f27c5fb7fb0192101d4d706d055ab9ff9895c9f66a027c2e67303de8fa1cad36d0e59298a98df684e54295eb5f61ab99609c1738f73";
+    pub const TEST_SYSTEM_ADDRESS_ARG: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076";
+    pub const TEST_SYSTEM_ADDRESS: Address = eez_primitives::SYSTEM_ADDRESS;
+    pub const LEGACY_SIGNER_ADDRESS: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+    pub const SYSTEM_TX: &str = "76d901809442000000000000000000000000000000000000078080";
+    pub const LEGACY_TX: &str = "f85f8001825208944200000000000000000000000000000000000007808026a0ed95c78ea14cbb6af669c61f27c5fb7fb0192101d4d706d055ab9ff9895c9f66a027c2e67303de8fa1cad36d0e59298a98df684e54295eb5f61ab99609c1738f73";
 }
 
 pub use backend::Backend;
@@ -39,7 +41,6 @@ pub async fn run() -> eyre::Result<()> {
             limits,
             expected_rollup_id: config.expected_rollup_id,
             attester: config.attester,
-            system_transaction_key: config.system_transaction_key,
         },
         backend,
         shutdown_signal(),

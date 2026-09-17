@@ -6,10 +6,13 @@
 
 use std::sync::Arc;
 
-use alloy_consensus::{BlockHeader as _, EthereumReceipt};
+use alloy_consensus::BlockHeader as _;
 use alloy_eips::eip7928::compute_block_access_list_hash;
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_debug::ExecutionWitness;
+use eez_evm::EezEvmConfig;
+use eez_primitives::Block;
+use eez_primitives::Receipt as EthereumReceipt;
 use eez_proof_signer::cancel::CancellationToken;
 use eez_proof_signer::validate::support::{
     CheckpointPlan, check_cancellation, decode_match_and_recover_signers, observe_outbound_events,
@@ -23,11 +26,9 @@ use eez_proof_signer::window::AdmittedBlock;
 use reth_chainspec::ChainSpec;
 use reth_consensus::{Consensus as _, HeaderValidator as _};
 use reth_ethereum_consensus::{EthBeaconConsensus, validate_block_post_execution};
-use reth_ethereum_primitives::Block;
 use reth_evm::block::BlockExecutionError;
 use reth_evm::execute::BlockExecutor as _;
 use reth_evm::{ConfigureEvm as _, Evm as _};
-use reth_evm_ethereum::EthEvmConfig;
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{RecoveredBlock, SealedHeader};
 use reth_revm::State;
@@ -45,7 +46,7 @@ use tracing::{debug, trace};
 pub struct Backend<P> {
     provider: P,
     chain_spec: Arc<ChainSpec>,
-    evm_config: EthEvmConfig,
+    evm_config: EezEvmConfig,
     expected_l2_system_address: Address,
 }
 
@@ -56,7 +57,7 @@ impl<P> Backend<P> {
         chain_spec: Arc<ChainSpec>,
         expected_l2_system_address: Address,
     ) -> Self {
-        let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
+        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             provider,
             chain_spec,
@@ -109,7 +110,7 @@ where
 fn validate_blocks<P>(
     provider: &P,
     chain_spec: &Arc<ChainSpec>,
-    evm_config: &EthEvmConfig,
+    evm_config: &EezEvmConfig,
     expected_l2_system_address: Address,
     blocks: &[AdmittedBlock],
     cancellation: &CancellationToken,
@@ -343,14 +344,16 @@ where
 
 /// Use Reth's normal block flow when no checkpoints or BAL output are needed.
 fn execute_block(
-    evm_config: &EthEvmConfig,
+    evm_config: &EezEvmConfig,
     state: &mut State<StateProviderDatabase<Box<dyn StateProvider + Send>>>,
     block: &RecoveredBlock<Block>,
 ) -> Result<BlockExecutionResult<EthereumReceipt>, ValidationError> {
     state.bal_state.bal_builder = None;
     let executor = evm_config
         .executor_for_block(state, block)
-        .map_err(|never| match never {})?;
+        .map_err(|error| {
+            ValidationError::Rejected(format!("stateful block context rejected: {error}"))
+        })?;
     let result = executor
         .execute_block(block.transactions_recovered())
         .map_err(execution_error)?;
@@ -360,7 +363,7 @@ fn execute_block(
 
 /// Execute transactions individually to capture checkpoints and BAL indices.
 fn execute_block_with_state_checkpoints(
-    evm_config: &EthEvmConfig,
+    evm_config: &EezEvmConfig,
     state: &mut State<StateProviderDatabase<Box<dyn StateProvider + Send>>>,
     block: &RecoveredBlock<Block>,
     checkpoint_indices: &[usize],
@@ -376,7 +379,9 @@ fn execute_block_with_state_checkpoints(
     let (result, checkpoints) = {
         let mut executor = evm_config
             .executor_for_block(state, block)
-            .map_err(|never| match never {})?;
+            .map_err(|error| {
+                ValidationError::Rejected(format!("stateful block context rejected: {error}"))
+            })?;
         if has_bal {
             executor.evm_mut().db_mut().bal_state.bal_builder = Some(Bal::new());
         } else {

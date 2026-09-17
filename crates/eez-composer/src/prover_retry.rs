@@ -70,7 +70,7 @@ pub(crate) fn partition_retryable(
 pub(crate) fn validate_actionable_prover_failure(
     failure: ActionableProverFailure,
     batch: &eez_protocol::EvmBatch,
-    sync_block: Option<&reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>>,
+    sync_block: Option<&reth_primitives_traits::RecoveredBlock<eez_primitives::Block>>,
 ) -> Result<(), String> {
     match failure {
         ActionableProverFailure::Outbound {
@@ -376,17 +376,16 @@ mod tests {
 
     #[test]
     fn actionable_references_must_match_the_exact_proving_request() {
-        let transaction: reth_ethereum_primitives::TransactionSigned =
-            alloy_consensus::TxLegacy::default()
-                .into_signed(alloy_primitives::Signature::test_signature())
-                .into();
+        let transaction: eez_primitives::EezTxEnvelope = alloy_consensus::TxLegacy::default()
+            .into_signed(alloy_primitives::Signature::test_signature())
+            .into();
         let transaction_hash = transaction.recalculate_hash();
-        let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
+        let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
             transactions: vec![transaction],
             ..Default::default()
         };
         let block = reth_primitives_traits::RecoveredBlock::new_unhashed(
-            reth_ethereum_primitives::Block::new(Default::default(), body),
+            eez_primitives::Block::new(Default::default(), body),
             vec![Address::ZERO],
         );
 
