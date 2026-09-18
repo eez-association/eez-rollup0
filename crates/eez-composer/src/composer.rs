@@ -3027,6 +3027,7 @@ where
                 &comp_refs,
                 parent_header,
                 built.header.state_root(),
+                &built.header,
                 Some(&built.block),
                 &pair_roots,
                 &outbound_entries,
@@ -3351,6 +3352,7 @@ where
                 &[], // no compositions → leading immediate only
                 parent_header,
                 empty_built.header.state_root(),
+                &empty_built.header,
                 Some(&empty_built.block),
                 &[], // no cross-chain effects → no per-effect roots
                 &[], // no outbound entries
@@ -3514,6 +3516,7 @@ where
                     &[], // no compositions → leading immediate only
                     &boundary_parent,
                     boundary_header.state_root(),
+                    &boundary_header,
                     None, // terminal is committed → witnesses come from the store
                     &[],
                     &[],
@@ -3659,7 +3662,8 @@ where
     /// proof system. Each effect entry's `newState` is its per-effect root from
     /// `pair_roots` (verified by the proof signer's effect-prefix checks); the
     /// last is the final Sync-block root. `sync_block_state_root` is the
-    /// required settlement-chain endpoint.
+    /// required settlement-chain endpoint; `terminal_header` carries it too,
+    /// and the two collapse into one once commitments become block hashes.
     ///
     /// `sync_block` is the terminal, `Some` only while freshly built; `None`
     /// (historical chunk) takes its witness from the store like the rest.
@@ -3678,6 +3682,7 @@ where
         compositions: &[&eez_protocol::Composition],
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         sync_block_state_root: B256,
+        terminal_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         sync_block: Option<&reth_primitives_traits::RecoveredBlock<eez_primitives::Block>>,
         pair_roots: &[B256],
         outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
@@ -3945,7 +3950,8 @@ where
             .into());
         }
         let span_len = usize::try_from(span).map_err(|e| format!("batch span overflow: {e}"))?;
-        let mut blocks_rev: Vec<Vec<Vec<u8>>> = Vec::with_capacity(span_len.saturating_sub(1));
+        let mut blocks_rev: Vec<eez_payload_codec::SpanBlock> =
+            Vec::with_capacity(span_len.saturating_sub(1));
         let mut cursor_hash = parent_header.hash();
         let mut cursor_number = parent_header.number();
         while cursor_number >= from {
@@ -4004,7 +4010,13 @@ where
                     .into());
                 }
             }
-            blocks_rev.push(tx_bytes);
+            // Beneficiary and extraData are per-block choices, so the DA
+            // carries them rather than derivation assuming a constant.
+            blocks_rev.push(eez_payload_codec::SpanBlock {
+                beneficiary: block.header().beneficiary().into(),
+                extra_data: block.header().extra_data().to_vec(),
+                transactions: tx_bytes,
+            });
             if cursor_number == 0 {
                 break;
             }
@@ -4016,28 +4028,43 @@ where
         // Outbound user txs aren't reconstructible from the entries (only the load
         // is), so they travel in the Sync-block DA here; the deriver interleaves
         // them with the rebuilt loads. Inbound-only → empty.
-        blocks.push(outbound_user_txs.iter().map(|b| b.to_vec()).collect());
-        // Encoded `ExecutionEntrySol` values let followers reconstruct system
-        // transactions. Outbound entries describe L1 settlement and L2 loads;
-        // inbound target batches carry the L2 delivery inputs. Encode both into
-        // `batch.callData`, which enters the public-input preimage as opaque data.
-        use alloy_sol_types::SolValue as _;
-        // The DA sidecar stores the full derivation entry set in canonical
-        // order: outbound settlement entries first, then inbound deferred
-        // entries. This matches the deriver's prefix split.
-        let l2_entries_bytes: Vec<Vec<u8>> = outbound_entries
+        blocks.push(eez_payload_codec::SpanBlock {
+            // Read off the terminal header.
+            beneficiary: terminal_header.beneficiary().into(),
+            extra_data: terminal_header.extra_data().to_vec(),
+            transactions: outbound_user_txs.iter().map(|b| b.to_vec()).collect(),
+        });
+        // Outbound entries describe L1 settlement and L2 loads; inbound target
+        // batches carry the delivery inputs. Published as actions in that order
+        // — a lean inbound entry binds its call only via `proxyEntryHash`, so
+        // this is its only published copy.
+        let actions: Vec<eez_payload_codec::Action> = outbound_entries
             .iter()
-            .map(eez_protocol::abi::ExecutionEntrySol::abi_encode)
             .chain(
                 compositions
                     .iter()
                     .flat_map(|c| c.targets.iter())
-                    .flat_map(|t| t.batch.entries.iter())
-                    .map(eez_protocol::abi::ExecutionEntrySol::abi_encode),
+                    .flat_map(|t| t.batch.entries.iter()),
             )
-            .collect();
-        let payload = eez_payload_codec::encode(&blocks, &l2_entries_bytes)
-            .map_err(|e| format!("eez_payload_codec::encode: {e}"))?;
+            .map(|entry| {
+                eez_protocol::entries::manifest::action_from_entry(
+                    entry,
+                    eez_protocol::RollupId(rollup_id),
+                )
+                .map_err(|e| format!("DA action for entry: {e}"))
+            })
+            .collect::<Result<_, String>>()?;
+        // A failed action is never emitted: an unsuccessful call is rejected
+        // as unsupported long before it becomes an entry.
+        if let Some(at) = actions.iter().position(|a| !a.success) {
+            return Err(format!(
+                "action {at} of {} failed; we do not emit failed actions",
+                actions.len(),
+            )
+            .into());
+        }
+        let payload = eez_payload_codec::encode_container(rollup_id, &blocks, &actions)
+            .map_err(|e| format!("eez_payload_codec::encode_container: {e}"))?;
         batch.callData = alloy_primitives::Bytes::from(payload);
 
         // Priced on the encoded candidate before witnesses and proving; `Ok(None)`

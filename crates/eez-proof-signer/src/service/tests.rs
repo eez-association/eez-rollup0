@@ -206,7 +206,7 @@ fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256
     };
     let block = eez_primitives::Block::new(Default::default(), body);
     batch.callData =
-        settlement::encode_da_payload(&[vec![user.clone()]], &[sidecar.abi_encode()]).into();
+        settlement::encode_da_payload(&[vec![user.clone()]], &[sidecar.clone()]).into();
     (batch, alloy_rlp::encode(block), user, call_hash)
 }
 
@@ -269,7 +269,7 @@ fn mixed_outbound_inbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, B256) {
     let block = eez_primitives::Block::new(Default::default(), body);
     batch.callData = settlement::encode_da_payload(
         &[vec![user]],
-        &[outbound_sidecar.abi_encode(), inbound_sidecar.abi_encode()],
+        &[outbound_sidecar.clone(), inbound_sidecar.clone()],
     )
     .into();
 
@@ -342,7 +342,18 @@ fn public_input_post_batch_for_empty_blocks(
     mut batch: eez_protocol::EvmBatch,
     block_count: usize,
 ) -> PostBatch {
-    batch.callData = settlement::encode_da_payload(&vec![Vec::new(); block_count], &[]).into();
+    // A span covers at least one block, so a zero-block window (an inverted
+    // range fixture) has no encodable payload — an empty one stands in, and is
+    // itself invalid, which is what such a fixture wants.
+    batch.callData = if block_count == 0 {
+        alloy_primitives::Bytes::new()
+    } else {
+        let rollup_id = batch
+            .rollupIdsWithProofSystems
+            .first()
+            .map_or(1, |r| r.rollupId);
+        settlement::encode_da_payload_for(rollup_id, &vec![Vec::new(); block_count], &[]).into()
+    };
     public_input_post_batch_for(batch)
 }
 

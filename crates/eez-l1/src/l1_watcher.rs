@@ -94,12 +94,6 @@ pub enum L1Event {
         /// Composer uses this to detect external batches (based mode).
         submitter: Address,
         call_data: Bytes,
-        /// The originating postBatch tx's full `postAndVerifyBatch` input,
-        /// captured from the tx fetched by (block, index) during the scan.
-        /// The Deriver's reconcile fallback decodes `batch.entries`
-        /// from these bytes instead of re-fetching the tx by hash (which
-        /// fails on a pruned or still-resyncing embedded L1).
-        post_batch_input: Bytes,
         /// `true` iff the same L1 tx emitted `L2ExecutionPerformed` —
         /// the contract's state delta applied. `false` = loser
         /// (`ImmediateEntrySkipped`). Deriver reads this directly.
@@ -722,7 +716,6 @@ impl L1Watcher {
                 tx_hash: b.tx_hash,
                 submitter: b.submitter,
                 call_data: b.call_data,
-                post_batch_input: b.post_batch_input,
                 state_applied: b.state_applied,
                 settlement: b.settlement,
                 claimed_current_state: b.claimed_current_state,
@@ -1480,7 +1473,6 @@ mod tests {
             tx_hash: B256::with_last_byte(tx),
             submitter: Address::ZERO,
             call_data: Bytes::new(),
-            post_batch_input: Bytes::new(),
             state_applied: true,
             settlement: crate::scan::Settlement::NONE,
             claimed_current_state: None,
