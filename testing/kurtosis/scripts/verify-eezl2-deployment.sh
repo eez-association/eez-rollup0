@@ -37,7 +37,8 @@ for name in \
     EEZ_L2_SYSTEM_ADDRESS \
     EEZ_L2_EEZL2_CODE_HASH \
     EEZ_ROLLUP_ID \
-    EEZ_INITIAL_STATE_ROOT
+    EEZ_INITIAL_STATE_ROOT \
+    EEZ_INITIAL_BLOCK_HASH
 do
     [[ -n "${!name:-}" ]] || { echo "$name missing from deployments.env" >&2; exit 1; }
 done
@@ -48,6 +49,7 @@ actual_use_gas_left="$(cast call "$EEZL2_ADDRESS" 'USE_GAS_LEFT()(bool)' --rpc-u
 runtime="$(cast code "$EEZL2_ADDRESS" --rpc-url "$L2")"
 actual_runtime_hash="$(cast keccak "$runtime")"
 actual_state_root="$(cast block 0 --rpc-url "$L2" --json | jq -er '.stateRoot')"
+actual_block_hash="$(cast block 0 --rpc-url "$L2" --json | jq -er '.hash')"
 
 [[ "${actual_system,,}" == "${EEZ_L2_SYSTEM_ADDRESS,,}" ]] || {
     echo "live EEZL2 SYSTEM_ADDRESS mismatch: $actual_system != $EEZ_L2_SYSTEM_ADDRESS" >&2
@@ -67,6 +69,12 @@ actual_state_root="$(cast block 0 --rpc-url "$L2" --json | jq -er '.stateRoot')"
 }
 [[ "${actual_state_root,,}" == "${EEZ_INITIAL_STATE_ROOT,,}" ]] || {
     echo "live L2 genesis state root mismatch: $actual_state_root != $EEZ_INITIAL_STATE_ROOT" >&2
+    exit 1
+}
+# What RegisterRollup seeded; a state root can survive a genesis rewrite that
+# changes the block hash, so this is the assertion that actually binds.
+[[ "${actual_block_hash,,}" == "${EEZ_INITIAL_BLOCK_HASH,,}" ]] || {
+    echo "live L2 genesis block hash mismatch: $actual_block_hash != $EEZ_INITIAL_BLOCK_HASH" >&2
     exit 1
 }
 

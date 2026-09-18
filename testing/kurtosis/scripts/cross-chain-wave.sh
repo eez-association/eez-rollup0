@@ -29,8 +29,13 @@ WAVES="${EEZ_WAVE_COUNT:-3}"
 for t in cast forge jq curl kurtosis openssl; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
 
 # L1 is the canonical shared chain; fronts are published by eez-node.
-# shellcheck disable=SC1091
-source "$K/ports.sh" >/dev/null
+# Endpoint discovery only matters for endpoints the caller did not supply. An
+# L1-only enclave cannot resolve the compose-hosted L2 services, and under
+# `set -e` a failed resolution would kill the run before it starts.
+if [[ -z "${L1:-}" || -z "${L2:-}" || -z "${L1F:-}" || -z "${L2F:-}" ]]; then
+    # shellcheck disable=SC1091
+    source "$K/ports.sh" >/dev/null
+fi
 # shellcheck disable=SC1091
 source "$K/scripts/lib.sh"
 : "${L1:=$EEZ_DEVNET_L1_RPC}"
@@ -181,8 +186,10 @@ FILLER_PER_GAP="${EEZ_FILLER_PER_GAP:-2}"
 INCLUDE_REVERTS="${EEZ_INCLUDE_REVERTS:-0}"
 PURE_RECIPIENT=0x2222222222222222222222222222222222222222
 
-refresh_node_log() { docker logs "$(docker ps --format "{{.Names}}" | grep -m1 "eez-node--")" >"$NODE_LOG" 2>&1 || true; }
-refresh_signer_log() { docker logs "$(docker ps --format "{{.Names}}" | grep -m1 "eez-proof-signer--")" >"$SIGNER_LOG" 2>&1 || true; }
+# Kurtosis names containers eez-node--<hash>; compose names them eez-node-kurtosis.
+_container() { docker ps --format "{{.Names}}" | grep -m1 -E "^$1(--|-)" ; }
+refresh_node_log() { local c; c=$(_container eez-node); [[ -n "$c" ]] && docker logs "$c" >"$NODE_LOG" 2>&1 || true; }
+refresh_signer_log() { local c; c=$(_container eez-proof-signer); [[ -n "$c" ]] && docker logs "$c" >"$SIGNER_LOG" 2>&1 || true; }
 
 # The relay needs a few L1 slots before it includes anything. Firing into that
 # window burns MAX_BUNDLE_ATTEMPTS and evicts the ops as poison — a harness
@@ -554,7 +561,7 @@ run_waves() {
                 "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
             SAFE_BLOCK=$(retry cast block safe --rpc-url "$L2" --json)
             L2_SAFE=$(jq -r '.number' <<<"$SAFE_BLOCK" | xargs cast to-dec)
-            L2_ROOT=$(jq -r '.stateRoot' <<<"$SAFE_BLOCK")
+            L2_ROOT=$(jq -r '.hash' <<<"$SAFE_BLOCK")
             L1_RECHECK=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' \
                 "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
             if [[ "${L1_TRACKED,,}" == "${L1_RECHECK,,}" \
@@ -565,9 +572,9 @@ run_waves() {
             sleep 1
         done
         if (( root_matched )); then
-            echo "    ✓ L1 rollups($EEZ_ROLLUP_ID).stateRoot == L2 safe root at height $L2_SAFE"
+            echo "    ✓ L1 rollups($EEZ_ROLLUP_ID) commitment == L2 safe block hash at height $L2_SAFE"
         else
-            echo "    ✗ L1 stateRoot $L1_RECHECK != L2 safe root $L2_ROOT at height $L2_SAFE"; ok_all=0
+            echo "    ✗ L1 commitment $L1_RECHECK != L2 safe block hash $L2_ROOT at height $L2_SAFE"; ok_all=0
         fi
         if (( L2_SAFE >= LAST_SETTLED )); then
             echo "    ✓ L2 safe head reached settled height: $L2_SAFE"

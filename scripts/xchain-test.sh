@@ -318,7 +318,8 @@ recon=FAIL; recon_n=0
 for _ in $(seq 1 12); do
   recon_n=$((recon_n+1))
   l1r=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' "$EEZ_ROLLUP_ID" --rpc-url "$L1" 2>/dev/null|sed -n '2p'|tr -d '[:space:]')
-  l2r=$(cast block safe --rpc-url "$L2" --json 2>/dev/null|jq -r '.stateRoot//empty')
+  # L1 commits the settled block's HASH, not its state root.
+  l2r=$(cast block safe --rpc-url "$L2" --json 2>/dev/null|jq -r '.hash//empty')
   [[ -n "$l1r" && "${l1r,,}" == "${l2r,,}" ]] && { recon=PASS; break; }
   sleep 5
 done

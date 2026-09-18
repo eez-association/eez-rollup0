@@ -15,8 +15,13 @@ for tool in cast forge jq curl kurtosis openssl; do
     command -v "$tool" >/dev/null || { echo "$tool not in PATH"; exit 1; }
 done
 
-# shellcheck disable=SC1091
-source "$K/ports.sh" >/dev/null
+# Endpoint discovery only matters for endpoints the caller did not supply. An
+# L1-only enclave cannot resolve the compose-hosted L2 services, and under
+# `set -e` a failed resolution would kill the run before it starts.
+if [[ -z "${L1:-}" || -z "${L2:-}" || -z "${L1F:-}" || -z "${L2F:-}" ]]; then
+    # shellcheck disable=SC1091
+    source "$K/ports.sh" >/dev/null
+fi
 # shellcheck disable=SC1091
 source "$K/scripts/lib.sh"
 : "${L1:=$EEZ_DEVNET_L1_RPC}"
@@ -136,24 +141,24 @@ unique_receipt_block() {
 }
 
 assert_root_convergence() {
-    local sync_height="$1" deadline l1_root l1_recheck safe_block safe_height l2_root
+    local sync_height="$1" deadline l1_root l1_recheck safe_block safe_height l2_hash
     deadline=$((SECONDS + ${EEZ_STATE_ROOT_WAIT_SECS:-60}))
     while (( SECONDS < deadline )); do
         l1_root=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' \
             "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
         safe_block=$(retry cast block safe --rpc-url "$L2" --json)
         safe_height=$(jq -r '.number' <<<"$safe_block" | xargs cast to-dec)
-        l2_root=$(jq -r '.stateRoot' <<<"$safe_block")
+        l2_hash=$(jq -r '.hash' <<<"$safe_block")
         l1_recheck=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' \
             "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
-        if [[ "${l1_root,,}" == "${l1_recheck,,}" && "${l1_recheck,,}" == "${l2_root,,}" ]] \
+        if [[ "${l1_root,,}" == "${l1_recheck,,}" && "${l1_recheck,,}" == "${l2_hash,,}" ]] \
             && (( safe_height >= sync_height )); then
-            echo "    ✓ L1 tracked root matches L2 safe root at height $safe_height"
+            echo "    ✓ L1 commitment matches L2 safe block hash at height $safe_height"
             return 0
         fi
         sleep 1
     done
-    echo "L1/L2 roots did not converge through Sync height $sync_height" >&2
+    echo "L1/L2 commitments did not converge through Sync height $sync_height" >&2
     return 1
 }
 
