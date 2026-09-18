@@ -10,7 +10,7 @@
 //! extended state: the Sync block under construction is itself the composition
 //! session, so a claim read off it is the value the committed block produces.
 
-use alloy_consensus::{BlockHeader, Header};
+use alloy_consensus::Header;
 use alloy_eips::Decodable2718;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
@@ -530,20 +530,21 @@ impl SyncBlockFork {
     }
 }
 
-/// Per-effect intermediate L2 state roots — the root after each cross-chain
-/// effect's tx group (its pair-end), in tx order, one per effect.
+/// Per-effect candidate block hashes — the hash of the block holding each
+/// cross-chain effect's tx group and everything before it, one per effect.
 ///
-/// The prover requires each settlement entry's `newState` to equal its effect's
-/// root (not the final Sync-block root), so the composer fills them with these.
-/// Computed by rebuilding the Sync block on each pair-end prefix of `sync_txs`;
-/// since our L2 blocks are state no-ops past the effects, a prefix block's root
-/// equals the full block's root at that tx. Settlement path only.
+/// Each settlement entry's `newState` is its effect's candidate hash, so a
+/// settlement that stops at that effect names the exact block L2 must hold.
+/// Built by rebuilding the Sync block on each pair-end prefix of `sync_txs`.
+/// The candidates are siblings at one height, not a chain: same parent, number
+/// and timestamp, differing only in how many transactions they carry. Exactly
+/// one becomes canonical — the prefix L1 consumed. Settlement path only.
 ///
 /// # Errors
 ///
 /// See [`BuildError`]. A sync tx that fails to decode is treated as a non-system
 /// tx (pair-end), matching the prover's fail-safe flagging.
-pub fn sync_block_pair_roots<P>(
+pub fn sync_block_pair_hashes<P>(
     l2_provider: &P,
     evm_config: &EezEvmConfig,
     parent: &SealedHeader<Header>,
@@ -577,7 +578,7 @@ where
                 suggested_fee_recipient,
                 &sync_txs[..=p],
             )
-            .map(|prefix| prefix.header.state_root())
+            .map(|prefix| prefix.header.hash())
         })
         .collect()
 }
@@ -712,7 +713,7 @@ mod tests {
         /// of every tx prefix — the arbiter the block itself agrees with.
         fn builder_gas(&self) -> Vec<u64> {
             let cumulative: Vec<u64> = (0..=self.txs.len())
-                .map(|k| self.build(&self.txs[..k]).header.gas_used())
+                .map(|k| self.build(&self.txs[..k]).header.gas_used)
                 .collect();
             cumulative.windows(2).map(|w| w[1] - w[0]).collect()
         }
@@ -917,7 +918,7 @@ mod tests {
         }
         assert_eq!(
             prefix.gas_used(),
-            f.build(&f.txs).header.gas_used(),
+            f.build(&f.txs).header.gas_used,
             "the live prefix and the built block must agree on block gas",
         );
     }
