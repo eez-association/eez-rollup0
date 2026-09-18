@@ -355,6 +355,60 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
 
     assert_eq!(run.unwrap().into_inner(), expected_hash);
 
+    // Reuse the same successful execution evidence. Only the submitted DA
+    // changes, so rejection must come from DA binding before signing.
+    // Backend execution is stubbed here; this exercises the real settlement pipeline.
+    let action =
+        eez_protocol::entries::manifest::action_from_entry(&sidecar, eez_protocol::RollupId(1))
+            .unwrap();
+    // A settlement entry has no incoming call descriptor and cannot even be
+    // projected into the current action-based DA representation.
+    assert!(
+        eez_protocol::entries::manifest::action_from_entry(
+            &batch.entries[1],
+            eez_protocol::RollupId(1),
+        )
+        .is_err()
+    );
+    let mut wrong_source = action.clone();
+    wrong_source.source_rollup_id = 2;
+    let mut wrong_destination = action;
+    wrong_destination.target_rollup_id = 2;
+    let span = [eez_payload_codec::SpanBlock::default()];
+    for (name, replacement, expected_code) in [
+        (
+            "L1 settlement ABI substituted for DA",
+            batch.entries[1].abi_encode(),
+            Code::InvalidArgument,
+        ),
+        (
+            "different source rollup",
+            eez_payload_codec::encode_container(1, &span, &[wrong_source]).unwrap(),
+            Code::FailedPrecondition,
+        ),
+        (
+            "different destination rollup",
+            eez_payload_codec::encode_container(1, &span, &[wrong_destination]).unwrap(),
+            Code::FailedPrecondition,
+        ),
+    ] {
+        let mut substituted = batch.clone();
+        substituted.callData = replacement.into();
+        let error = run_settlement(SettlementInput {
+            submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&substituted),
+            validated_window: &validated,
+            expected_rollup_id: expected_rollup_id(1),
+            expected_l2_system_address: TEST_SYSTEM_ADDRESS,
+            proof_system_vkey: test_proof_system_vkey(),
+            expected_proof_system: test_proof_system(),
+            system_transaction_reconstructor: &system_transaction_reconstructor,
+            cancellation: &cancellation,
+        })
+        .unwrap_err();
+        assert_eq!(error.gate(), "da_payload", "{name}: {error:?}");
+        assert_eq!(error.status().code(), expected_code, "{name}: {error:?}");
+    }
+
     let reverted_block = validate::ValidatedBlock::for_test(
         5,
         block_rlp,

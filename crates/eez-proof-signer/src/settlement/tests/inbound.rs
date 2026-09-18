@@ -32,7 +32,7 @@ fn inbound_candidate_requires_the_exact_l2_shape_and_rolling_hash() {
     let value = U256::from(5);
     let calldata = strict_inbound_calldata(value, true);
     let valid = inspect_inbound_candidate(value, &calldata, true, expected_rollup_id()).unwrap();
-    let sidecar = valid.derived_da_entry.as_entry();
+    let sidecar = valid.derived_da_entry.as_abi_entry();
     let [sidecar_call] = sidecar.l2ToL1Calls.as_slice() else {
         panic!("derived inbound sidecar must contain one call");
     };
@@ -113,6 +113,36 @@ fn inbound_candidate_requires_the_exact_l2_shape_and_rolling_hash() {
         inspect(&wrong_source_rollup),
         Some(InboundObservationError::SourceRollup { actual: 2 })
     );
+
+    // Rebuild all hashes for a different identity, rather than merely corrupting
+    // one field. Canonical foreign calldata still cannot authorize this rollup.
+    for source_changed in [true, false] {
+        let mut incoming = valid.derived_da_entry.incoming_entry();
+        if source_changed {
+            incoming.source_rollup_id = RollupId(2);
+        } else {
+            incoming.l2_rollup_id = RollupId(2);
+        }
+        let entry = eez_protocol::entries::build_l2_incoming_entry(incoming.clone()).unwrap();
+        let calldata = eez_protocol::entries::encode_execute_incoming(
+            incoming.target,
+            incoming.value,
+            incoming.data,
+            incoming.source,
+            incoming.source_rollup_id,
+            entry,
+        );
+        let error =
+            inspect_inbound_candidate(value, &calldata, true, expected_rollup_id()).unwrap_err();
+        if source_changed {
+            assert_eq!(error, InboundObservationError::SourceRollup { actual: 2 });
+        } else {
+            assert!(matches!(
+                error,
+                InboundObservationError::CallHashMismatch { .. }
+            ));
+        }
+    }
 }
 
 #[test]

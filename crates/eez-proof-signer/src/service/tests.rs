@@ -516,8 +516,9 @@ fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, Exe
         entry,
     );
     let context = system_transaction_context();
+    let inbound = eez_protocol::entries::InboundSidecar::try_from(&sidecar).unwrap();
     let raw = eez_protocol::system_tx::build_inbound_system_txs(
-        std::slice::from_ref(&sidecar),
+        std::slice::from_ref(&inbound),
         &context,
         0,
     )
