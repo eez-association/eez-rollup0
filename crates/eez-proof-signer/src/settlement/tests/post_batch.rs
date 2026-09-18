@@ -139,7 +139,7 @@ fn state_update_endpoints_are_committed_and_bound_to_reexecution() {
     assert_eq!(
         verify_state_update_chain(&wrong_parent, expected_rollup_id(), parent, final_root)
             .map(|_| ()),
-        Err(StateUpdateChainError::InitialRootMismatch {
+        Err(StateUpdateChainError::InitialBlockMismatch {
             validated: parent,
             claimed: wrong,
         })

@@ -33,9 +33,14 @@ changing `service/`; Operations is aimed at deployment and incident diagnosis.
   carry the effects bound to the posted batch.
 - **Effect candidate:** a locally derived transaction-framing boundary that may
   correspond to an effect. It is not authorization by itself.
+- **Candidate block:** the block holding exactly one transaction prefix of the
+  settling block. Candidates are siblings at one height, sharing a parent,
+  number and timestamp and differing only in how many transactions they carry;
+  exactly one becomes canonical.
 - **Transaction-state checkpoint:** a state root locally recomputed immediately
-  after a selected transaction and before post-block processing. Settlement
-  later binds it to a submitted state-update claim.
+  after a selected transaction and before post-block processing, paired with
+  the hash of the candidate block holding that prefix. Settlement later binds
+  that hash to a submitted state-update claim.
 - **DA sidecar / Sync block:** a sidecar is the canonical derivation projection
   for one effect; the Sync block is the terminal L2 block reconstructed from
   those projections and retained user transactions.
@@ -53,8 +58,8 @@ changing `service/`; Operations is aimed at deployment and incident diagnosis.
 - Protocol requirements belong in [`SPEC.md`](../SPEC.md).
 - Contributor constraints belong in [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 - Current implementation explanations belong here.
-- Validator-fork implementation details belong in
-  [`eez-association/stateless`](https://github.com/eez-association/stateless).
+- Validator-fork implementation details belong in the Stateless fork pinned as
+  `stateless-reth` in the workspace root `Cargo.toml`.
 - Focused behavior belongs close to the code and tests that own it.
 
 When code and an explainer diverge, correct the explainer. When code and the
@@ -80,8 +85,8 @@ only when one flat test file would obscure the same ownership boundary:
   orchestration, runtime behavior, attestation, and recorded regressions;
 - inline tests in [`src/attest.rs`](../src/attest.rs) cover key separation and
   signature encoding; and
-- the pinned [EEZ Stateless fork](https://github.com/eez-association/stateless)
-  maintains the checkpoint-extension tests in its own repository.
+- the pinned Stateless fork maintains the checkpoint-extension tests in its own
+  repository.
 
 This layout keeps production modules discoverable at `src/` while letting a
 large test suite scale without turning one source file into a test container.

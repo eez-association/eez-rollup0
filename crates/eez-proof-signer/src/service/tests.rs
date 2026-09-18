@@ -93,6 +93,44 @@ fn anchor_batch() -> eez_protocol::EvmBatch {
     anchor_batch_for(1)
 }
 
+/// Hash `block_chunk` gives block `number`: it seals blocks so that block `n`
+/// has hash `repeat_byte(n)` and parent `repeat_byte(n - 1)`.
+fn block_hash_of(number: u64) -> B256 {
+    B256::repeat_byte(u8::try_from(number).expect("fixture block numbers are small"))
+}
+
+/// The commitment endpoints of a `block_chunk` window over `from..=to`:
+/// the parent of `from`, the parent of `to`, and the hash of `to`.
+fn window_endpoints(from: u64, to: u64) -> (B256, B256, B256) {
+    (
+        block_hash_of(from - 1),
+        block_hash_of(to - 1),
+        block_hash_of(to),
+    )
+}
+
+/// An anchor-only batch whose commitment chain matches the blocks
+/// `block_chunk` produces for `from..=to`: the parent of `from` through to the
+/// hash of `to`.
+fn anchor_batch_spanning(from: u64, to: u64) -> eez_protocol::EvmBatch {
+    anchor_batch_spanning_for(1, from, to)
+}
+
+fn anchor_batch_spanning_for(rollup_id: u64, from: u64, to: u64) -> eez_protocol::EvmBatch {
+    let mut batch = anchor_batch_for(rollup_id);
+    batch.entries[0].stateUpdates[0].currentState = block_hash_of(from - 1);
+    batch.entries[0].stateUpdates[0].newState = block_hash_of(to);
+    eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
+    batch
+}
+
+/// The candidate block sealed over a transaction prefix that stops short of the
+/// settling block. It closes no window, so it is deliberately unrelated to the
+/// hashes `block_chunk` seals.
+fn interior_candidate() -> B256 {
+    B256::repeat_byte(0xc5)
+}
+
 fn anchor_batch_for(rollup_id: u64) -> eez_protocol::EvmBatch {
     let mut batch = eez_protocol::EvmBatch::default();
     batch.entries.push(ExecutionEntrySol {
@@ -120,19 +158,22 @@ fn anchor_batch_for(rollup_id: u64) -> eez_protocol::EvmBatch {
     batch
 }
 
+/// An anchor plus one outbound effect, chained over the window's block hashes:
+/// the anchor closes on the settling block's parent and the effect closes the
+/// window.
 fn outbound_batch(
-    anchor_root: B256,
-    pre_settling_root: B256,
-    final_root: B256,
+    window_pre: B256,
+    settling_pre: B256,
+    window_post: B256,
 ) -> eez_protocol::EvmBatch {
     let mut batch = anchor_batch();
     let anchor = &mut batch.entries[0];
-    anchor.stateUpdates[0].currentState = anchor_root;
-    anchor.stateUpdates[0].newState = pre_settling_root;
+    anchor.stateUpdates[0].currentState = window_pre;
+    anchor.stateUpdates[0].newState = settling_pre;
 
     let mut effect = anchor.clone();
-    effect.stateUpdates[0].currentState = pre_settling_root;
-    effect.stateUpdates[0].newState = final_root;
+    effect.stateUpdates[0].currentState = settling_pre;
+    effect.stateUpdates[0].newState = window_post;
     effect.l2ToL1Calls.push(l2_to_l1_call());
     batch.entries.push(effect);
     batch.immediateEntryCount = U256::from(2);
@@ -159,7 +200,8 @@ fn canonical_outbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256)
 }
 
 fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256) {
-    let mut batch = outbound_batch(B256::ZERO, B256::ZERO, B256::ZERO);
+    let (window_pre, settling_pre, window_post) = window_endpoints(5, 5);
+    let mut batch = outbound_batch(window_pre, settling_pre, window_post);
     batch.entries[1].l2ToL1Calls[0].value = value;
     batch.entries[1].stateUpdates[0].etherDelta = -I256::try_from(value).unwrap();
     eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
@@ -214,7 +256,9 @@ fn outbound_backend_output() -> validate::BackendWindowOutput {
     let inputs = [AdmittedBlock::test(5, 0x04, 0x05)];
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[0].set_transaction_results_for_test(vec![true, true]);
-    backend_output.blocks[0].transaction_state_checkpoints = vec![checkpoint(1, B256::ZERO)];
+    // The pair ends on the block's last transaction, so its candidate is the
+    // settling block itself.
+    backend_output.blocks[0].transaction_state_checkpoints = vec![checkpoint(1, block_hash_of(5))];
     backend_output.blocks[0]
         .settlement_evidence
         .set_system_sender_flags_for_test(vec![true, false]);
@@ -236,7 +280,14 @@ fn mixed_outbound_inbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, B256) {
     let (_unused_nonce_zero_tx, inbound_call_hash, return_data, inbound_sidecar) =
         strict_inbound_transaction(value);
 
+    // The outbound effect no longer ends the block, so it closes on the
+    // candidate sealed at its own transaction and the inbound effect takes over
+    // the window's closing hash.
+    let (_, _, window_post) = window_endpoints(5, 5);
+    batch.entries[1].stateUpdates[0].newState = interior_candidate();
     let mut inbound_entry = batch.entries[0].clone();
+    inbound_entry.stateUpdates[0].currentState = interior_candidate();
+    inbound_entry.stateUpdates[0].newState = window_post;
     inbound_entry.stateUpdates[0].etherDelta = I256::try_from(value).unwrap();
     inbound_entry.proxyEntryHash = inbound_call_hash;
     inbound_entry.returnData = return_data;
@@ -280,8 +331,10 @@ fn mixed_backend_output() -> validate::BackendWindowOutput {
     let inputs = [AdmittedBlock::test(5, 0x04, 0x05)];
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[0].set_transaction_results_for_test(vec![true, true, true]);
-    backend_output.blocks[0].transaction_state_checkpoints =
-        vec![checkpoint(1, B256::ZERO), checkpoint(2, B256::ZERO)];
+    backend_output.blocks[0].transaction_state_checkpoints = vec![
+        checkpoint(1, interior_candidate()),
+        checkpoint(2, block_hash_of(5)),
+    ];
     backend_output
 }
 
@@ -320,15 +373,16 @@ fn header_chunk(from: u64, to: u64) -> ProveChunk {
             from_block: from,
             to_block: to,
             post_batch: Some(public_input_post_batch_for_empty_blocks(
-                anchor_batch(),
+                anchor_batch_spanning(from, to),
                 block_count,
             )),
         })),
     }
 }
 
+/// The post-batch a [`happy_window`] carries: an anchor over blocks 5..=7.
 fn public_input_post_batch() -> PostBatch {
-    public_input_post_batch_for_empty_blocks(anchor_batch(), 3)
+    public_input_post_batch_for_empty_blocks(anchor_batch_spanning(5, 7), 3)
 }
 
 fn public_input_post_batch_for(batch: eez_protocol::EvmBatch) -> PostBatch {

@@ -73,8 +73,8 @@ already validated facts but cannot manufacture missing execution evidence.
    to its admitted block, and normalizes the checked result into
    `ValidatedWindow`.
 4. `ValidatedWindow` drops the consumed witnesses. It retains exact block RLP,
-   `window_pre_state_root`, `settling_pre_state_root`,
-   `window_post_state_root`, `preceding_blocks`, and the terminal
+   `window_pre_block_hash`, `settling_pre_block_hash`,
+   `window_post_block_hash`, `preceding_blocks`, and the terminal
    `settling_block` with its settlement evidence.
 5. Independently, the submitted `PostBatch` calldata becomes a
    `CanonicalPostBatch`. Canonical decoding does not validate its state or
@@ -107,11 +107,11 @@ ensure that only intended Composers can reach a non-loopback listener.
 ## What the signature does not claim
 
 The signature says that this supplied transition and batch passed the active
-profile from the validated parent state root. It does not establish canonical
+profile from the validated parent block. It does not establish canonical
 L2 ancestry, sequencer authorization, current L1 applicability, successful
 future L1 execution, immediate-versus-deferred dispatch, or independent code
 identity at the pinned EEZL2 address. The exact normative boundary is in
-`SPEC.md`, especially the state-root authority and attestation sections.
+`SPEC.md`, especially the authority and attestation sections.
 
 Continue with [Request lifecycle](request-lifecycle.md),
 [Validation evidence](validation-evidence.md), or the
