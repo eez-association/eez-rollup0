@@ -200,7 +200,7 @@ where
             );
             return;
         }
-        let l2_state_root = match self.l2_state_root_at(tail.last_l2_block) {
+        let l2_block_hash = match self.l2_hash_at(tail.last_l2_block) {
             Ok(root) => root,
             Err(err) => {
                 event!(
@@ -218,7 +218,7 @@ where
             l1_block_hash: tail.l1_block_hash,
             tx_hash: tail.tx_hash,
             l2_cursor: tail.last_l2_block,
-            l2_state_root,
+            l2_block_hash,
         };
         if let Err(err) = checkpoint.save(dir) {
             event!(
@@ -268,15 +268,15 @@ where
             .await
             .ok()
             .flatten();
-        let local_root = self.l2_state_root_at(checkpoint.l2_cursor).ok();
-        if let Err(reason) = checkpoint.usable_with(canonical, local_root) {
+        let local_hash = self.l2_hash_at(checkpoint.l2_cursor).ok();
+        if let Err(reason) = checkpoint.usable_with(canonical, local_hash) {
             event!(
                 name: "eez.deriver.checkpoint.rejected",
                 Level::WARN,
                 l1_block = checkpoint.l1_block,
                 l2_cursor = checkpoint.l2_cursor,
                 canonical = ?canonical,
-                local_root = ?local_root,
+                local_hash = ?local_hash,
                 reason,
                 "boot checkpoint rejected; rescanning from the deploy block",
             );
@@ -594,7 +594,7 @@ where
             // Cursor guard (as in on_batch_posted): a root this batch cannot leave at
             // the cursor means the scan is off L1, and replaying would fork us alone.
             if let Some(entry_state) = batch.settlement.entry_state {
-                let local_root = self.l2_state_root_at(anchor)?;
+                let local_root = self.l2_hash_at(anchor)?;
                 if !cursor_root_accepted(local_root, entry_state, batch.settlement.final_state) {
                     event!(
                         name: "eez.deriver.catch_up.cursor.misaligned",
@@ -1145,7 +1145,7 @@ where
         // Cursor guard: a root this batch cannot leave at the cursor means the local
         // index is off L1 (e.g. a dropped event); let the run-loop resync re-anchor.
         if let Some(entry_state) = settlement.entry_state {
-            let local_root = self.l2_state_root_at(anchor)?;
+            let local_root = self.l2_hash_at(anchor)?;
             if !cursor_root_accepted(local_root, entry_state, settlement.final_state) {
                 event!(
                     name: "eez.deriver.cursor.misaligned",
@@ -1207,7 +1207,7 @@ where
             tx_hash,
         )?;
 
-        let l1_settled_state_root = settlement.final_state.unwrap_or_default();
+        let l1_settled_commitment = settlement.final_state.unwrap_or_default();
         // Index first: the safe advance reads this cursor, and a replayed batch
         // must stay indexed even if the FCU fails. Use L1's real endpoint.
         self.inner.l1_head.append(BatchRecord {
@@ -1237,9 +1237,6 @@ where
         let Some(new_safe_hash) = self.sync_safe_to_cursor().await? else {
             return Ok(());
         };
-        let l2_safe_state_root = self
-            .l2_sealed_header_at(self.inner.l1_head.last_indexed_l2())?
-            .state_root();
         event!(
             name: "eez.deriver.safe.advanced",
             Level::INFO,
@@ -1247,12 +1244,11 @@ where
             from_block,
             to_block,
             applied_entries = settlement.len,
-            l1_settled_state_root = %l1_settled_state_root,
+            l1_settled_commitment = %l1_settled_commitment,
             l1_block_number,
             tx_hash = %tx_hash,
             submitter = %submitter,
             new_safe_hash = %new_safe_hash,
-            l2_safe_state_root = %l2_safe_state_root,
             "advanced L2 safe head from L1-confirmed batch",
         );
         Ok(())
@@ -1408,7 +1404,7 @@ where
         Ok(self.l2_sealed_header_at(l2_block)?.hash())
     }
 
-    /// Block whose root is `entry_state`: where this batch's run starts. A
+    /// Block whose hash is `entry_state`: where this batch's run starts. A
     /// competing composer's batch can begin below our cursor, so search back.
     fn batch_anchor(
         &self,
@@ -1416,13 +1412,7 @@ where
         entry_state: B256,
         window: u64,
     ) -> DeriverResult<Option<u64>> {
-        anchor_with_overlap_log(cursor, entry_state, window, |block| {
-            self.l2_state_root_at(block)
-        })
-    }
-
-    fn l2_state_root_at(&self, l2_block: u64) -> DeriverResult<B256> {
-        Ok(self.l2_sealed_header_at(l2_block)?.state_root())
+        anchor_with_overlap_log(cursor, entry_state, window, |block| self.l2_hash_at(block))
     }
 
     /// Per-block reconciliation against a decoded batch beginning at
@@ -1654,7 +1644,6 @@ where
         // Hash of the Sync block replayed this pass; the gate must read by hash.
         let mut sync_block_hash: Option<B256> = None;
         let stale_boundary = !local_batch_boundary_matches(&self.inner.l2_provider, from_block)?;
-        let mut suffix_replay = SuffixReplay::new(stale_boundary);
         let mut replayed: u64 = 0;
         let last_index = decoded.block_tx_counts.len().saturating_sub(1);
         let resumed = settlement.start > 0;
@@ -1673,6 +1662,7 @@ where
             event!(
                 name: "eez.deriver.resumed.placement",
                 Level::INFO,
+                event_name = "eez.deriver.resumed.placement",
                 l1_block_number,
                 tx_hash = %tx_hash,
                 from_block,
@@ -1682,7 +1672,7 @@ where
                 claimed_block_count = decoded.block_count(),
                 "resumed batch placement: appending settled entries to Sync block {from_block}",
             );
-            let mut block_txs: Vec<Vec<u8>> = self
+            let existing_txs: Vec<Vec<u8>> = self
                 .inner
                 .l2_provider
                 .block_by_number(from_block)
@@ -1696,27 +1686,39 @@ where
                 .map(Encodable2718::encoded_2718)
                 .collect();
             let new_content = sync_block_txs.clone().unwrap_or_default();
-            // `ends_with`, not equality: idempotent re-derivation (e.g. after a
-            // crash between this replay and recording it) must not re-append.
-            let already_applied = !new_content.is_empty()
-                && block_txs.ends_with(&new_content)
-                && local_header_inputs_match(
-                    &self.inner.l2_provider,
-                    from_block,
-                    &BlockHeaderInputs::from_span(decoded, last_index)?,
-                )?;
+            // The block exists (`stale_boundary` above refused otherwise), so its
+            // hash answers whether a previous pass already appended these entries.
+            let replay_txs = resume_replay_txs(
+                self.l2_hash_at(from_block)?,
+                settlement.final_state,
+                &existing_txs,
+                &new_content,
+            );
             event!(
                 name: "eez.deriver.reconcile.block",
                 Level::DEBUG,
                 l1_block_number,
                 tx_hash = %tx_hash,
                 l2_block = from_block,
-                action = if already_applied { "skip" } else { "replay" },
-                tx_count = block_txs.len() + new_content.len(),
+                action = if replay_txs.is_some() { "replay" } else { "skip" },
+                tx_count = replay_txs.as_ref().map_or(existing_txs.len(), Vec::len),
                 resumed_mid_chain = true,
                 "appending settled entries to the existing Sync block",
             );
-            if !already_applied {
+            if let Some(block_txs) = replay_txs {
+                // INFO, not debug: a resumed batch rewriting a Sync block is
+                // rare and consequential — the rewritten height briefly has a
+                // sibling reth can drop — so it should be visible without
+                // raising the log level, and observable by tests.
+                event!(
+                    name: "eez.deriver.resumed.appended",
+                    Level::INFO,
+                    event_name = "eez.deriver.resumed.appended",
+                    l2_block = from_block,
+                    tx_count = block_txs.len(),
+                    appended = new_content.len(),
+                    "rebuilding the existing Sync block with this batch's settled entries",
+                );
                 // Rewriting a height at or below `safe` orphans the stored safe hash
                 // and the engine rejects the FCU, so retreat safe to the parent.
                 if self.inner.safe_l2_block.load(Ordering::Acquire) >= from_block {
@@ -1746,11 +1748,11 @@ where
                     event!(
                         name: "eez.deriver.safe.retreated_for_resume",
                         Level::WARN,
+                        event_name = "eez.deriver.safe.retreated_for_resume",
                         l2_block = from_block,
                         "safe retreated to the parent for a same-height resumed replacement (finalized unchanged)",
                     );
                 }
-                block_txs.extend(new_content);
                 let outcome = self
                     .replay_block(
                         from_block - 1,
@@ -1764,7 +1766,26 @@ where
                 sync_block_hash = Some(outcome.block_hash);
                 replayed = 1;
             }
+        } else if range_already_derived(
+            stale_boundary,
+            self.inner
+                .l2_provider
+                .sealed_header(from_block + last_index as u64)
+                .map_err(DeriverError::l2_provider)?
+                .map(|header| header.hash()),
+            settlement.final_state,
+        ) {
+            event!(
+                name: "eez.deriver.reconcile.range_skipped",
+                Level::DEBUG,
+                l1_block_number,
+                tx_hash = %tx_hash,
+                from_block,
+                to_block = from_block + last_index as u64,
+                "terminal block is L1's settled commitment, so the whole range is already derived",
+            );
         } else {
+            let mut suffix_replay = SuffixReplay::new(stale_boundary);
             let mut tx_offset = 0usize;
             for (i, count) in decoded.block_tx_counts.iter().enumerate() {
                 let l2_block = from_block + i as u64;
@@ -1783,17 +1804,21 @@ where
                     (true, Some(full)) => full.clone(),
                     _ => user_txs.to_vec(),
                 };
-                let matched = if stale_boundary {
-                    false
-                } else {
-                    local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
-                        && local_header_inputs_match(
-                            &self.inner.l2_provider,
-                            l2_block,
-                            &BlockHeaderInputs::from_span(decoded, i)?,
-                        )?
-                };
-                let should_replay = suffix_replay.required(matched);
+                // The endpoint comparison above decides whether the range is
+                // right; this only avoids rewriting blocks that already are.
+                // Rewriting one is not free: it leaves reth a sibling at a
+                // canonical height that later vanishes from the headers table,
+                // and every forkchoice update after that fails.
+                //
+                // A wrong skip cannot pass silently — the terminal block's hash
+                // commits to its whole ancestry, so `check_claimed_state`
+                // rejects the range. That is why matching transactions is
+                // enough here and no header-field list is needed.
+                let should_replay = suffix_replay.required(local_block_matches(
+                    &self.inner.l2_provider,
+                    l2_block,
+                    &block_txs,
+                )?);
                 event!(
                     name: "eez.deriver.reconcile.block",
                     Level::DEBUG,
@@ -1946,7 +1971,7 @@ where
                 .ok_or_else(|| {
                     DeriverError::l2_provider(format!("local L2 header at {pre} missing"))
                 })?
-                .state_root();
+                .hash();
             if local_pre != claimed_curr {
                 event!(
                     name: "eez.deriver.state.diverged_pre",
@@ -1984,7 +2009,7 @@ where
             // fresh and `anchor` when resumed, so measure from the anchor.
             let window = to_block.saturating_sub(anchor);
             if let Some(settled_end) = find_batch_anchor(to_block, claimed_new, window, |block| {
-                self.l2_state_root_at(block)
+                self.l2_hash_at(block)
             })? {
                 if settled_end != to_block {
                     event!(
@@ -1999,26 +2024,20 @@ where
                 }
                 return Ok(Some(settled_end));
             }
-            let local_post = if let Some(hash) = to_block_hash {
-                self.inner
-                    .l2_provider
-                    .header(hash)
-                    .map_err(DeriverError::l2_provider)?
-                    .ok_or_else(|| {
-                        DeriverError::l2_provider(format!(
-                            "local L2 header for replayed block {hash} missing"
-                        ))
-                    })?
-                    .state_root
-            } else {
-                self.inner
+            // A resumed batch rewrote the tip, so reading by number can still
+            // return the superseded block; the replayed hash is authoritative.
+            // When we have it, it IS the answer — no lookup needed.
+            let local_post = match to_block_hash {
+                Some(hash) => hash,
+                None => self
+                    .inner
                     .l2_provider
                     .sealed_header(to_block)
                     .map_err(DeriverError::l2_provider)?
                     .ok_or_else(|| {
                         DeriverError::l2_provider(format!("local L2 header at {to_block} missing"))
                     })?
-                    .state_root()
+                    .hash(),
             };
             if local_post != claimed_new {
                 event!(
@@ -2104,6 +2123,32 @@ fn cursor_root_accepted(local_root: B256, entry_state: B256, final_state: Option
     local_root == entry_state || final_state == Some(local_root)
 }
 
+/// `true` iff the first local block in a batch is anchored to the current
+/// local parent. `false` if the block is missing or sits on stale ancestry.
+fn local_batch_boundary_matches<L2>(l2_provider: &Arc<L2>, from_block: u64) -> DeriverResult<bool>
+where
+    L2: BlockReader<Header = alloy_consensus::Header>,
+{
+    let Some(local_block) = l2_provider
+        .block_by_number(from_block)
+        .map_err(DeriverError::l2_provider)?
+    else {
+        return Ok(false);
+    };
+    let parent_block = from_block.checked_sub(1).ok_or_else(|| {
+        DeriverError::l2_provider("cannot reconcile a batch starting at genesis block")
+    })?;
+    let expected_parent_hash = l2_provider
+        .sealed_header(parent_block)
+        .map_err(DeriverError::l2_provider)?
+        .ok_or_else(|| {
+            DeriverError::l2_provider(format!("local L2 header at {parent_block} missing"))
+        })?
+        .hash();
+
+    Ok(local_block.header().parent_hash == expected_parent_hash)
+}
+
 /// `true` iff local reth has a block at `block_number` whose tx list
 /// matches `expected_txs`. `false` if the block is missing or has
 /// different txs — caller's signal to STF-replay this slot.
@@ -2137,89 +2182,6 @@ where
         .all(|(l, e)| l == e))
 }
 
-/// `true` iff the first local block in a batch is anchored to the current
-/// local parent. `false` if the block is missing or sits on stale ancestry.
-/// Whether the local block's header inputs are the ones the DA names.
-///
-/// Matching transactions is not enough: `beneficiary` and `extraData` seal into
-/// the header hash, and no state-root check downstream can see either, so a
-/// block that differs in them is a different block that nothing else catches.
-fn local_header_inputs_match<L2>(
-    l2_provider: &Arc<L2>,
-    block_number: u64,
-    expected: &BlockHeaderInputs,
-) -> DeriverResult<bool>
-where
-    L2: BlockReader<Header = alloy_consensus::Header>,
-{
-    let Some(header) = l2_provider
-        .sealed_header(block_number)
-        .map_err(DeriverError::l2_provider)?
-    else {
-        return Ok(false);
-    };
-    Ok(header_inputs_match(&header, expected))
-}
-
-/// The comparison itself, split out so it is testable without a provider.
-fn header_inputs_match(header: &alloy_consensus::Header, expected: &BlockHeaderInputs) -> bool {
-    header.beneficiary == expected.beneficiary && header.extra_data == expected.extra_data
-}
-
-#[cfg(test)]
-mod header_inputs_tests {
-    use super::{BlockHeaderInputs, header_inputs_match};
-    use alloy_primitives::{Address, Bytes};
-
-    /// A block whose txs match but whose header inputs do not is a DIFFERENT
-    /// block: both seal into the header hash, and no state-root check
-    /// downstream can see either, so the skip paths are the only guard.
-    #[test]
-    fn header_inputs_decide_block_identity_beyond_transactions() {
-        let expected = BlockHeaderInputs {
-            beneficiary: Address::with_last_byte(0xAA),
-            extra_data: Bytes::from_static(b"eez"),
-        };
-        let mut header = alloy_consensus::Header {
-            beneficiary: expected.beneficiary,
-            extra_data: expected.extra_data.clone(),
-            ..Default::default()
-        };
-        assert!(header_inputs_match(&header, &expected));
-
-        header.beneficiary = Address::with_last_byte(0xBB);
-        assert!(!header_inputs_match(&header, &expected), "beneficiary");
-
-        header.beneficiary = expected.beneficiary;
-        header.extra_data = Bytes::from_static(b"other");
-        assert!(!header_inputs_match(&header, &expected), "extraData");
-    }
-}
-
-fn local_batch_boundary_matches<L2>(l2_provider: &Arc<L2>, from_block: u64) -> DeriverResult<bool>
-where
-    L2: BlockReader<Header = alloy_consensus::Header>,
-{
-    let Some(local_block) = l2_provider
-        .block_by_number(from_block)
-        .map_err(DeriverError::l2_provider)?
-    else {
-        return Ok(false);
-    };
-    let parent_block = from_block.checked_sub(1).ok_or_else(|| {
-        DeriverError::l2_provider("cannot reconcile a batch starting at genesis block")
-    })?;
-    let expected_parent_hash = l2_provider
-        .sealed_header(parent_block)
-        .map_err(DeriverError::l2_provider)?
-        .ok_or_else(|| {
-            DeriverError::l2_provider(format!("local L2 header at {parent_block} missing"))
-        })?
-        .hash();
-
-    Ok(local_block.header().parent_hash == expected_parent_hash)
-}
-
 /// Once one block in a batch must be replayed, every descendant in that batch
 /// must be rebuilt on the new parent even when its transaction list matches.
 #[derive(Debug, Clone, Copy)]
@@ -2240,32 +2202,65 @@ impl SuffixReplay {
     }
 }
 
-#[cfg(test)]
-mod suffix_replay_tests {
-    use super::SuffixReplay;
-
-    fn decisions(stale_boundary: bool, local_matches: &[bool]) -> Vec<bool> {
-        let mut suffix = SuffixReplay::new(stale_boundary);
-        local_matches
-            .iter()
-            .map(|matches| suffix.required(*matches))
-            .collect()
-    }
-
-    #[test]
-    fn mismatch_replays_every_later_descendant() {
-        assert_eq!(
-            decisions(false, &[true, false, true, true]),
-            [false, true, true, true],
-        );
-    }
-
-    #[test]
-    fn stale_boundary_replays_the_complete_batch() {
-        assert_eq!(decisions(true, &[true, true, true]), [true, true, true]);
+/// `true` iff the batch's range is already derived, decided from its terminal
+/// block alone.
+///
+/// L1 commits the settled block's hash, and a block hash contains its parent's,
+/// so a match at the terminal proves every block beneath it — transactions,
+/// beneficiary, `extraData`, timestamp, and any header field that becomes
+/// DA-carried later. On a mismatch the whole range is rebuilt: the entries
+/// commit only to the endpoints, so there is no per-height value to localise a
+/// divergence with.
+///
+/// `stale_boundary` stays a precondition because a superseded sibling can still
+/// answer a read by number; requiring the range's first block to link to its
+/// local parent rules that out.
+fn range_already_derived(
+    stale_boundary: bool,
+    local_terminal: Option<B256>,
+    settled: Option<B256>,
+) -> bool {
+    match (stale_boundary, local_terminal, settled) {
+        (false, Some(local), Some(settled)) => local == settled,
+        _ => false,
     }
 }
 
+/// Transactions to replay a resumed batch's Sync block with, or `None` when
+/// local already holds L1's settled endpoint.
+///
+/// A resumed batch appends only the entries L1 settled to a Sync block a
+/// competing batch already committed, so the decision is whether a previous
+/// pass already appended them. Comparing the local block's hash against L1's
+/// settled commitment settles that outright.
+///
+/// The returned list drops any copy of `new_content` the existing block already
+/// ends with before appending: a block can carry this content and still hash
+/// differently (any header field differing is enough), and appending then would
+/// duplicate it.
+fn resume_replay_txs(
+    local_hash: B256,
+    settled: Option<B256>,
+    existing_txs: &[Vec<u8>],
+    new_content: &[Vec<u8>],
+) -> Option<Vec<Vec<u8>>> {
+    if settled == Some(local_hash) {
+        return None;
+    }
+    let base = if new_content.is_empty() {
+        existing_txs
+    } else {
+        existing_txs
+            .strip_suffix(new_content)
+            .unwrap_or(existing_txs)
+    };
+    let mut txs = base.to_vec();
+    txs.extend_from_slice(new_content);
+    Some(txs)
+}
+
+/// `true` iff the first local block in a batch is anchored to the current
+/// local parent. `false` if the block is missing or sits on stale ancestry.
 /// Which producing entries L1 ran, projected onto the partitioned
 /// `[outbound…, inbound…]` list (that concatenation is the claimed chain minus
 /// the anchor). A `skip` per list, not just a length: L1 resumes MID-CHAIN when
@@ -2320,6 +2315,142 @@ where
         .cloned()
         .collect();
     eez_protocol::outbound_gate::observations_from_logs(&logs, eez_l2)
+}
+
+#[cfg(test)]
+mod suffix_replay_tests {
+    use super::SuffixReplay;
+
+    fn decisions(stale_boundary: bool, local_matches: &[bool]) -> Vec<bool> {
+        let mut suffix = SuffixReplay::new(stale_boundary);
+        local_matches
+            .iter()
+            .map(|matches| suffix.required(*matches))
+            .collect()
+    }
+
+    #[test]
+    fn mismatch_replays_every_later_descendant() {
+        assert_eq!(
+            decisions(false, &[true, false, true, true]),
+            [false, true, true, true],
+        );
+    }
+
+    #[test]
+    fn stale_boundary_replays_the_complete_batch() {
+        assert_eq!(decisions(true, &[true, true, true]), [true, true, true]);
+    }
+}
+
+#[cfg(test)]
+mod reconcile_decision_tests {
+    use super::{range_already_derived, resume_replay_txs};
+    use alloy_primitives::B256;
+
+    fn tx(byte: u8) -> Vec<u8> {
+        vec![byte]
+    }
+
+    /// The terminal block's hash decides the whole range: a block hash contains
+    /// its parent's, so a match proves every block beneath it.
+    #[test]
+    fn a_range_is_derived_only_when_its_terminal_is_l1s_settled_block() {
+        let settled = B256::repeat_byte(0xAA);
+        let other = B256::repeat_byte(0xBB);
+
+        assert!(range_already_derived(false, Some(settled), Some(settled)));
+
+        assert!(
+            !range_already_derived(false, Some(other), Some(settled)),
+            "a different terminal block must be rebuilt"
+        );
+        assert!(
+            !range_already_derived(true, Some(settled), Some(settled)),
+            "a stale boundary means a read by number can return a superseded sibling"
+        );
+        assert!(
+            !range_already_derived(false, None, Some(settled)),
+            "a range whose terminal is not local yet cannot already be derived"
+        );
+        assert!(
+            !range_already_derived(false, None, None),
+            "two absent values must not compare equal"
+        );
+        assert!(
+            !range_already_derived(false, Some(settled), None),
+            "without a settled endpoint there is nothing to match against"
+        );
+    }
+
+    #[test]
+    fn a_resumed_batch_skips_only_when_local_is_already_l1s_settled_block() {
+        let settled = B256::repeat_byte(0xAA);
+        let existing = [tx(1), tx(2)];
+        let new_content = [tx(3)];
+
+        assert_eq!(
+            resume_replay_txs(settled, Some(settled), &existing, &new_content),
+            None,
+            "local already holds the settled endpoint"
+        );
+        assert_eq!(
+            resume_replay_txs(
+                B256::repeat_byte(0xBB),
+                Some(settled),
+                &existing,
+                &new_content
+            ),
+            Some(vec![tx(1), tx(2), tx(3)]),
+            "not yet appended, so append"
+        );
+    }
+
+    /// A block can already carry this content and still hash differently — any
+    /// header field differing is enough. Appending again would duplicate it.
+    #[test]
+    fn a_resumed_replay_never_duplicates_content_the_block_already_ends_with() {
+        let new_content = [tx(3), tx(4)];
+        let already_appended = [tx(1), tx(2), tx(3), tx(4)];
+
+        assert_eq!(
+            resume_replay_txs(
+                B256::repeat_byte(0xBB),
+                Some(B256::repeat_byte(0xAA)),
+                &already_appended,
+                &new_content
+            ),
+            Some(vec![tx(1), tx(2), tx(3), tx(4)]),
+            "the suffix is rebuilt in place, not appended a second time"
+        );
+    }
+
+    /// Without a settled endpoint there is nothing to prove applied-ness with,
+    /// so replay is the only safe answer.
+    #[test]
+    fn a_resumed_batch_with_no_settled_endpoint_replays() {
+        assert_eq!(
+            resume_replay_txs(B256::repeat_byte(0xAA), None, &[tx(1)], &[tx(2)]),
+            Some(vec![tx(1), tx(2)])
+        );
+    }
+
+    /// No reconstructed content plus a hash that is not the settled endpoint is a
+    /// real divergence. Rebuilding the block unchanged lets the endpoint check
+    /// downstream report it instead of silently skipping.
+    #[test]
+    fn a_resumed_batch_with_no_new_content_rebuilds_rather_than_skipping() {
+        let existing = [tx(1), tx(2)];
+        assert_eq!(
+            resume_replay_txs(
+                B256::repeat_byte(0xBB),
+                Some(B256::repeat_byte(0xAA)),
+                &existing,
+                &[]
+            ),
+            Some(vec![tx(1), tx(2)])
+        );
+    }
 }
 
 #[cfg(test)]

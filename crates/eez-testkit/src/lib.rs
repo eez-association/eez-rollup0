@@ -737,7 +737,7 @@ impl Harness {
         let ts = now_unix_secs();
         let l2_genesis = write_l2_genesis_at(ts)?;
         let cfg = AnvilConfig::standard(ts);
-        Self::with_anvil_config(cfg, l2_genesis_state_root(), l2_genesis).await
+        Self::with_anvil_config(cfg, l2_genesis_block_hash_at(ts)?, l2_genesis).await
     }
 
     async fn with_anvil_config(
@@ -942,6 +942,10 @@ pub struct Deployment {
     pub proof_system_address: Address,
     pub rollup_manager_address: Address,
     pub rollup_id: u64,
+    /// The commitment `registerRollup` seeded: the L2 genesis BLOCK HASH.
+    /// Recorded so tests compare against what was registered rather than
+    /// recomputing a genesis value of the wrong kind.
+    pub initial_commitment: B256,
 }
 
 sol! {
@@ -980,7 +984,24 @@ fn fixture_genesis() -> Result<alloy_genesis::Genesis> {
     serde_json::from_str(&raw).context("parse genesis.json")
 }
 
-/// State root registered on L1 for the shared L2 genesis fixture.
+/// Block hash L1 registers for an L2 genesis written at `ts`.
+///
+/// Commitments are candidate block hashes, so this is what `registerRollup`
+/// seeds. Unlike a state root it commits the timestamp, so it must be computed
+/// from the same genesis the node loads — the caller's `ts` — and not from the
+/// canned fixture.
+///
+/// # Errors
+/// If the genesis fixture cannot be read or parsed.
+pub fn l2_genesis_block_hash_at(ts: u64) -> Result<B256> {
+    let mut genesis = fixture_genesis()?;
+    genesis.timestamp = ts;
+    let spec: reth_chainspec::ChainSpec = genesis.into();
+    Ok(spec.genesis_hash())
+}
+
+/// State root of the shared L2 genesis fixture. Timestamp-independent, so it
+/// takes no `ts`; it is no longer what L1 registers.
 pub fn l2_genesis_state_root() -> B256 {
     static ROOT: LazyLock<B256> = LazyLock::new(|| {
         let spec: reth_chainspec::ChainSpec =
@@ -1056,12 +1077,14 @@ pub async fn send_l2_value_transfer_confirmed(
 }
 
 /// Return the latest safe block's state root, or `None` before one exists.
-pub async fn safe_block_state_root(rpc_url: &str) -> Result<Option<B256>> {
+/// Hash of the L2 safe block — what L1 commits to, so what reconciliation
+/// compares against. Its state root is not a commitment.
+pub async fn safe_block_hash(rpc_url: &str) -> Result<Option<B256>> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let block = provider
         .get_block_by_number(alloy_rpc_types_eth::BlockNumberOrTag::Safe)
         .await?;
-    Ok(block.map(|b| b.header.state_root))
+    Ok(block.map(|b| b.header.hash))
 }
 
 /// Block number and hash at a named tag (`latest`, `safe`, `finalized`, …).
@@ -1161,6 +1184,7 @@ async fn deploy_contracts_with_initial(
         proof_system_address,
         rollup_manager_address,
         rollup_id,
+        initial_commitment: initial_state,
     })
 }
 
@@ -1849,7 +1873,8 @@ pub struct ChainSnapshot {
     pub batches_posted: usize,
     pub executions_performed: usize,
     pub entries_skipped: usize,
-    pub state_root: B256,
+    /// What L1 stores for the rollup: a candidate block hash.
+    pub rollup_commitment: B256,
     pub latest_execution_state: Option<B256>,
 }
 
@@ -1858,11 +1883,13 @@ pub struct Chain<'a> {
     eez_address: Address,
     deploy_block: u64,
     rollup_id: u64,
+    initial_commitment: B256,
 }
 
 impl<'a> Chain<'a> {
     fn new(anvil: &'a Anvil, dep: &Deployment) -> Self {
         Self {
+            initial_commitment: dep.initial_commitment,
             rpc_url: &anvil.rpc_url,
             eez_address: dep.eez_address,
             deploy_block: dep.deploy_block,
@@ -1877,6 +1904,11 @@ impl<'a> Chain<'a> {
     pub fn eez_address(&self) -> Address {
         self.eez_address
     }
+    /// The commitment `registerRollup` seeded — the L2 genesis block hash.
+    pub const fn initial_commitment(&self) -> B256 {
+        self.initial_commitment
+    }
+
     pub fn deploy_block(&self) -> u64 {
         self.deploy_block
     }
@@ -1941,8 +1973,9 @@ impl<'a> Chain<'a> {
         .await
     }
 
-    pub async fn state_root(&self) -> Result<B256> {
-        state_root(self.rpc_url, self.eez_address, self.rollup_id).await
+    /// The commitment L1 stores for this rollup — a candidate block hash.
+    pub async fn commitment(&self) -> Result<B256> {
+        rollup_commitment(self.rpc_url, self.eez_address, self.rollup_id).await
     }
 
     /// Pin related reads to one L1 block so a batch landing between RPC calls
@@ -1974,8 +2007,13 @@ impl<'a> Chain<'a> {
                 Some(block),
             )
             .await?,
-            state_root: state_root_at(self.rpc_url, self.eez_address, self.rollup_id, Some(block))
-                .await?,
+            rollup_commitment: state_root_at(
+                self.rpc_url,
+                self.eez_address,
+                self.rollup_id,
+                Some(block),
+            )
+            .await?,
             latest_execution_state: latest_l2_execution_state_at(
                 self.rpc_url,
                 self.eez_address,
@@ -2130,7 +2168,9 @@ pub async fn wait_for_l1_blocks(rpc_url: &str, target: u64, timeout: Duration) -
     .await
 }
 
-pub async fn state_root(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<B256> {
+/// The commitment L1 stores for `rollup_id`. A candidate block hash, not a
+/// state root — the ABI field is still named `stateRoot`.
+pub async fn rollup_commitment(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<B256> {
     state_root_at(rpc_url, eez, rollup_id, None).await
 }
 
@@ -2391,34 +2431,44 @@ async fn all_l2_execution_events(
 
 /// Waits for a non-genesis safe state that appears anywhere in L1 execution history.
 /// Using the full history avoids racing an advancing on-chain head.
+/// Waits until the node's safe block is one L1 attested, and is past genesis.
+///
+/// Compares BLOCK HASHES: `executed_states` are the `newState` values L1
+/// emitted, which are candidate block hashes, so a state root could never
+/// appear in that set.
 pub async fn wait_for_safe_state(
     node: &NodeHandle,
     chain: &Chain<'_>,
-    genesis_root: B256,
+    genesis_commitment: B256,
     timeout: Duration,
 ) -> Result<()> {
     wait_for(timeout, || async {
-        let node_root = async {
+        let node_hash = async {
             let provider = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse()?);
             let block = provider
                 .get_block_by_number(alloy_rpc_types_eth::BlockNumberOrTag::Safe)
                 .await?;
-            Ok::<Option<B256>, anyhow::Error>(block.map(|b| b.header.state_root))
+            Ok::<Option<B256>, anyhow::Error>(block.map(|b| b.header.hash))
         }
         .await
         .ok()
         .flatten();
         let attested = chain.executed_states().await.unwrap_or_default();
-        Ok(match node_root {
-            Some(n) if n != B256::ZERO && n != genesis_root && attested.contains(&n) => Some(()),
+        Ok(match node_hash {
+            Some(n) if n != B256::ZERO && n != genesis_commitment && attested.contains(&n) => {
+                Some(())
+            }
             _ => None,
         })
     })
     .await
 }
 
-/// Waits for a safe block whose state was newly attested after `previous_states`.
-/// The returned number and hash distinguish the exact block when state roots repeat.
+/// Waits for a safe block L1 attested after `previous_states`.
+///
+/// `previous_states` and `executed_states` are both `L2ExecutionPerformed`
+/// `newState` values — candidate block hashes — so the safe block is matched by
+/// its hash. Its state root is not a commitment and would never appear there.
 pub async fn wait_for_new_attested_safe_block(
     node: &NodeHandle,
     chain: &Chain<'_>,
@@ -2437,12 +2487,11 @@ pub async fn wait_for_new_attested_safe_block(
             };
             let number = block.header.number;
             let hash = block.header.hash;
-            let root = block.header.state_root;
-            if number == 0 || root == B256::ZERO || previous_states.contains(&root) {
+            if number == 0 || hash == B256::ZERO || previous_states.contains(&hash) {
                 return Ok(None);
             }
             let attested = chain.executed_states().await?;
-            Ok(attested.contains(&root).then_some((number, hash)))
+            Ok(attested.contains(&hash).then_some((number, hash)))
         }
     })
     .await
@@ -2870,6 +2919,7 @@ pub async fn deploy_protocol_dev(
         proof_system_address,
         rollup_manager_address,
         rollup_id,
+        initial_commitment: initial_state,
     })
 }
 
@@ -3247,8 +3297,8 @@ impl CrossChainConfig {
         let eez_address = deployer.create(0);
         let proof_system_address = deployer.create(1);
         let rollup_manager_address = deployer.create(2);
-        let initial_state = l2_genesis_state_root();
         let ts = now_unix_secs();
+        let initial_state = l2_genesis_block_hash_at(ts)?;
         let l1_http_lease = PortLease::http_pair();
         let l1_auth_lease = PortLease::tcp();
         let l1_p2p_lease = PortLease::tcp_udp();
@@ -3849,8 +3899,8 @@ impl StandardOracleSnapshot {
                     reorg_authorized = false;
                     settlement_points.push((
                         record.u64("applied_entries")? as usize,
-                        record.b256("l1_settled_state_root")?,
-                        record.b256("l2_safe_state_root")?,
+                        record.b256("l1_settled_commitment")?,
+                        record.b256("new_safe_hash")?,
                         record.u64("l1_block_number")?,
                         record.b256("tx_hash")?,
                     ));
@@ -3883,12 +3933,11 @@ impl StandardOracleSnapshot {
         if execution_events.len() < self.execution_events.len() {
             bail!("{scenario_name}: L2ExecutionPerformed history retreated");
         }
-        for (applied, l1_settled_root, l2_safe_root, l1_block_number, batch_tx_hash) in
-            settlement_points
+        for (applied, l1_settled, l2_safe_hash, l1_block_number, batch_tx_hash) in settlement_points
         {
-            if l1_settled_root != l2_safe_root {
+            if l1_settled != l2_safe_hash {
                 bail!(
-                    "{scenario_name}: L1 settled root {l1_settled_root} != L2 safe block root {l2_safe_root}"
+                    "{scenario_name}: L1 settled commitment {l1_settled} != L2 safe block hash {l2_safe_hash}"
                 );
             }
             // A signal can be written after the snapshot cursor even though its
@@ -3900,11 +3949,11 @@ impl StandardOracleSnapshot {
             let endpoint = execution_events
                 .iter()
                 .rfind(|event| {
-                    event.block_number == l1_block_number && event.state == l1_settled_root
+                    event.block_number == l1_block_number && event.state == l1_settled
                 })
                 .ok_or_else(|| {
                     anyhow!(
-                        "{scenario_name}: batch {batch_tx_hash} reported L1 settled root {l1_settled_root}, but L1 block {l1_block_number} has no matching L2ExecutionPerformed event"
+                        "{scenario_name}: batch {batch_tx_hash} reported L1 settled commitment {l1_settled}, but L1 block {l1_block_number} has no matching L2ExecutionPerformed event"
                     )
                 })?;
 
@@ -3928,12 +3977,13 @@ impl StandardOracleSnapshot {
             }
         }
         if safe.is_some() && expect_settled {
-            let committed = state_root(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
-            let safe_root = safe_block_state_root(&l2_rpc)
+            let committed =
+                rollup_commitment(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
+            let safe_root = safe_block_hash(&l2_rpc)
                 .await?
                 .ok_or_else(|| anyhow!("{scenario_name}: safe L2 block is absent"))?;
             if committed != safe_root {
-                bail!("{scenario_name}: L1 committed root != L2 safe root");
+                bail!("{scenario_name}: L1 commitment != L2 safe block hash");
             }
         }
 
@@ -4172,8 +4222,8 @@ impl Scenario {
         if self.expect_settled {
             wait_for(SETTLE_TIMEOUT, || async {
                 let committed =
-                    state_root(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
-                let safe = safe_block_state_root(&l2_rpc).await?;
+                    rollup_commitment(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
+                let safe = safe_block_hash(&l2_rpc).await?;
                 Ok(safe.filter(|root| *root == committed).map(|_| ()))
             })
             .await

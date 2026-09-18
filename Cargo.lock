@@ -3351,6 +3351,7 @@ dependencies = [
  "alloy-rpc-types-debug",
  "alloy-rpc-types-eth",
  "alloy-signer-local",
+ "alloy-sol-types",
  "eez-composer",
  "eez-deriver",
  "eez-driver",
@@ -3615,6 +3616,7 @@ dependencies = [
  "reth-revm 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-storage-api 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "revm",
+ "stateless",
  "tokio",
  "tracing",
 ]
@@ -13837,7 +13839,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stateless"
 version = "0.1.0"
-source = "git+https://github.com/AdityaSripal/stateless?branch=aditya%2Fgeneric-recovered-validation#5c6be984353280e3d7d7f89fad1aa407ed97eb3f"
+source = "git+https://github.com/debjit-bw/stateless?rev=1489761aa30e8dda605a15e652d19a34fa5e47be#1489761aa30e8dda605a15e652d19a34fa5e47be"
 dependencies = [
  "alloy-consensus",
  "alloy-eips 2.0.5",
@@ -14751,7 +14753,7 @@ dependencies = [
 [[package]]
 name = "tries"
 version = "0.1.0"
-source = "git+https://github.com/AdityaSripal/stateless?branch=aditya%2Fgeneric-recovered-validation#5c6be984353280e3d7d7f89fad1aa407ed97eb3f"
+source = "git+https://github.com/debjit-bw/stateless?rev=1489761aa30e8dda605a15e652d19a34fa5e47be#1489761aa30e8dda605a15e652d19a34fa5e47be"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -16030,7 +16032,7 @@ dependencies = [
 [[package]]
 name = "zeth-mpt"
 version = "0.1.0"
-source = "git+https://github.com/AdityaSripal/stateless?branch=aditya%2Fgeneric-recovered-validation#5c6be984353280e3d7d7f89fad1aa407ed97eb3f"
+source = "git+https://github.com/debjit-bw/stateless?rev=1489761aa30e8dda605a15e652d19a34fa5e47be#1489761aa30e8dda605a15e652d19a34fa5e47be"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",

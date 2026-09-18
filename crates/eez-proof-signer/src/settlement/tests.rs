@@ -309,13 +309,13 @@ fn verified_state_chain_for_test(
     batch: &CanonicalPostBatch,
 ) -> super::state_chain::VerifiedStateUpdateChain<'_> {
     let entries = &batch.entries;
-    let window_pre_state_root = entries[0].stateUpdates[0].currentState;
-    let window_post_state_root = entries[entries.len() - 1].stateUpdates[0].newState;
+    let window_pre_block_hash = entries[0].stateUpdates[0].currentState;
+    let window_post_block_hash = entries[entries.len() - 1].stateUpdates[0].newState;
     verify_state_update_chain(
         batch,
         expected_rollup_id(),
-        window_pre_state_root,
-        window_post_state_root,
+        window_pre_block_hash,
+        window_post_block_hash,
     )
     .expect("effect-binding fixture must have a valid state-update chain")
 }
