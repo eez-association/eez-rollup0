@@ -14,14 +14,14 @@ use std::time::Duration;
 use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
-use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
+use eez_driver::{BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
+use eez_evm::EezEvmConfig;
 use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Reader, ScannedBatch};
+use eez_primitives::EezTxEnvelope as TransactionSigned;
+use eez_primitives::engine::EezEngineTypes;
 use eez_protocol::outbound_gate::OutboundCallObservation;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
-use reth_ethereum_engine_primitives::EthEngineTypes;
-use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes, execute::BlockBuilder};
-use reth_evm_ethereum::EthEvmConfig;
 use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody, SealedHeader, SignedTransaction};
 use reth_provider::StateProviderFactory;
@@ -32,6 +32,33 @@ use tokio::sync::broadcast;
 use tracing::{Level, event};
 
 use crate::error::{DeriverError, DeriverResult};
+
+/// Per-block header inputs the composer chose, carried in the DA span. Read
+/// from the payload, not assumed — a constant diverges the moment the composer
+/// picks something else.
+#[derive(Debug, Clone)]
+pub struct BlockHeaderInputs {
+    pub beneficiary: Address,
+    pub extra_data: Bytes,
+}
+
+impl BlockHeaderInputs {
+    /// The inputs the span carries for its `index`-th block.
+    fn from_span(span: &eez_payload_codec::DecodedSpan, index: usize) -> DeriverResult<Self> {
+        let (Some(beneficiary), Some(extra_data)) =
+            (span.beneficiaries.get(index), span.extra_data.get(index))
+        else {
+            return Err(DeriverError::l2_provider(format!(
+                "DA span has no header inputs for block index {index} (span covers {} blocks)",
+                span.block_count(),
+            )));
+        };
+        Ok(Self {
+            beneficiary: Address::from(*beneficiary),
+            extra_data: Bytes::copy_from_slice(extra_data),
+        })
+    }
+}
 
 /// Watcher seed: the finalized block, kept inside the range this scan read.
 /// Both bounds have wedged boot in the field. Separate fn so they stay
@@ -55,10 +82,10 @@ struct Inner<L2>
 where
     L2: BlockReader,
 {
-    committer: BlockCommitterHandle<EthEngineTypes>,
+    committer: BlockCommitterHandle<EezEngineTypes>,
     l2_provider: Arc<L2>,
     l1_reader: L1Reader,
-    evm_config: EthEvmConfig,
+    evm_config: EezEvmConfig,
     /// Chainspec-aware deriver
     chain_spec: Arc<ChainSpec>,
     /// L2 block time in seconds — `execute_block` derives each block's
@@ -120,12 +147,12 @@ where
     /// cursor) don't pollute the index.
     ///
     /// `system_tx_cfg = Some(_)` enables the cross-chain STF path: the
-    /// deriver reconstructs the same `SYSTEM_ADDRESS`-signed system txs
+    /// deriver reconstructs the same native system transactions
     /// the composer produced (from the postBatch's `entries[]` /
     /// `l2_entries[]`) and prepends them to the batch's Sync block, so
     /// local replay is byte-identical. `None` is the pure-user-tx STF.
     pub fn new(
-        committer: BlockCommitterHandle<EthEngineTypes>,
+        committer: BlockCommitterHandle<EezEngineTypes>,
         l2_provider: Arc<L2>,
         l1_reader: L1Reader,
         chain_spec: Arc<ChainSpec>,
@@ -135,7 +162,7 @@ where
         system_tx_cfg: Option<eez_protocol::system_tx::SystemTxContext>,
         checkpoint_dir: Option<PathBuf>,
     ) -> Self {
-        let evm_config = EthEvmConfig::new(Arc::clone(&chain_spec));
+        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec));
         Self {
             inner: Arc::new(Inner {
                 committer,
@@ -524,7 +551,12 @@ where
         let mut new_batches: Vec<BatchRecord> = Vec::new();
         let mut total_replayed: u64 = 0;
         for batch in scanned_batches {
-            let decoded = eez_payload_codec::decode(batch.call_data.as_ref())?;
+            let Some(container) =
+                self.decode_our_payload(batch.call_data.as_ref(), batch.l1_block_number)?
+            else {
+                continue;
+            };
+            let decoded = &container.span;
 
             // `settled_count == 0` = nothing applied on L1 (the claimed
             // roots are phantoms). Skip the whole reconcile — no
@@ -584,8 +616,8 @@ where
             let (replayed_here, scan_sync_hash) = self
                 .reconcile_batch_blocks(
                     batch_first_l2,
-                    &decoded,
-                    batch.post_batch_input.clone(),
+                    decoded,
+                    &container.actions,
                     batch.l1_block_number,
                     batch.tx_hash,
                     batch.settlement,
@@ -661,6 +693,7 @@ where
         &self,
         parent_block_number: u64,
         raw_txs: &[Vec<u8>],
+        header: &BlockHeaderInputs,
     ) -> DeriverResult<(ExecutionData, SealedHeader<alloy_consensus::Header>)> {
         // Diagnostic: log parent context before touching reth so we can
         // pinpoint failing `state_by_block_hash` lookups.
@@ -742,7 +775,7 @@ where
         let chain_spec = &self.inner.chain_spec;
         let attributes = NextBlockEnvAttributes {
             timestamp,
-            suggested_fee_recipient: Address::ZERO,
+            suggested_fee_recipient: header.beneficiary,
             prev_randao: B256::ZERO,
             gas_limit: BUILDER_GAS_LIMIT,
             parent_beacon_block_root: chain_spec
@@ -751,7 +784,7 @@ where
             withdrawals: chain_spec
                 .is_shanghai_active_at_timestamp(timestamp)
                 .then(alloy_eips::eip4895::Withdrawals::default),
-            extra_data: Bytes::from_static(BUILDER_EXTRA_DATA),
+            extra_data: header.extra_data.clone(),
             slot_number: None,
         };
 
@@ -794,7 +827,7 @@ where
 
         let sealed_block = outcome.block.sealed_block().clone();
         let sealed_header = sealed_block.sealed_header().clone();
-        let execution_data = <EthEngineTypes as PayloadTypes>::block_to_payload(sealed_block, None);
+        let execution_data = <EezEngineTypes as PayloadTypes>::block_to_payload(sealed_block, None);
         Ok((execution_data, sealed_header))
     }
 
@@ -810,8 +843,9 @@ where
         &self,
         parent_block_number: u64,
         raw_txs: &[Vec<u8>],
+        header_inputs: &BlockHeaderInputs,
     ) -> DeriverResult<DeriveOutcome> {
-        let (payload, header) = self.execute_block(parent_block_number, raw_txs)?;
+        let (payload, header) = self.execute_block(parent_block_number, raw_txs, header_inputs)?;
         // feed_witness=false: follower / L1-reconcile re-derive — the producer
         // already fed this block to the prover witness capture; don't double-feed.
         Ok(self
@@ -819,6 +853,32 @@ where
             .committer
             .commit_derived(payload, header, false)
             .await?)
+    }
+
+    /// Decode a posted DA payload, or `None` when it is not ours.
+    ///
+    /// Skipped rather than fatal: we read one `ChainOperation`, so a legitimate
+    /// multi-rollup batch reads as foreign, and halting would hand a peer a
+    /// stop. Unchecked outside cross-chain mode, which configures no rollup id.
+    fn decode_our_payload(
+        &self,
+        call_data: &[u8],
+        l1_block_number: u64,
+    ) -> DeriverResult<Option<eez_payload_codec::DecodedContainer>> {
+        let container = eez_payload_codec::decode_container(call_data)?;
+        let ours = self.inner.system_tx_cfg.as_ref().map(|c| c.this_rollup_id);
+        if ours.is_some_and(|ours| container.rollup_id != ours) {
+            event!(
+                name: "eez.deriver.foreign_rollup_payload",
+                Level::WARN,
+                l1_block_number,
+                payload_rollup = container.rollup_id,
+                ours = ?ours,
+                "DA payload carries another rollup's operations; skipping",
+            );
+            return Ok(None);
+        }
+        Ok(Some(container))
     }
 
     /// Runs the deriver loop, processing each event on `rx` until the
@@ -939,7 +999,6 @@ where
                 tx_hash,
                 submitter,
                 call_data,
-                post_batch_input,
                 state_applied,
                 settlement,
                 claimed_current_state,
@@ -952,7 +1011,6 @@ where
                     tx_hash,
                     submitter,
                     call_data,
-                    post_batch_input,
                     state_applied,
                     settlement,
                     claimed_current_state,
@@ -989,14 +1047,16 @@ where
         tx_hash: B256,
         submitter: Address,
         call_data: Bytes,
-        post_batch_input: Bytes,
         state_applied: bool,
         settlement: eez_l1::Settlement,
         claimed_current_state: Option<B256>,
         claimed_new_state: Option<B256>,
         last_in_l1_block: bool,
     ) -> DeriverResult<()> {
-        let decoded = eez_payload_codec::decode(call_data.as_ref())?;
+        let Some(container) = self.decode_our_payload(call_data.as_ref(), l1_block_number)? else {
+            return self.flush_deferred_safe(last_in_l1_block).await;
+        };
+        let decoded = &container.span;
         let block_count = decoded.block_count() as u64;
         if block_count == 0 {
             return self.flush_deferred_safe(last_in_l1_block).await;
@@ -1070,8 +1130,6 @@ where
             );
         }
 
-        // from_block is the next L2 block after the highest indexed
-        // batch — the shared L1CanonicalHead is the source of truth.
         let last_indexed_l2 = self.inner.l1_head.last_indexed_l2();
         let resumed = settlement.start > 0;
         // Anchor on the batch's own start, not our cursor: a competing
@@ -1112,8 +1170,8 @@ where
         let (replayed, sync_block_hash) = self
             .reconcile_batch_blocks(
                 from_block,
-                &decoded,
-                post_batch_input,
+                decoded,
+                &container.actions,
                 l1_block_number,
                 tx_hash,
                 settlement,
@@ -1383,8 +1441,8 @@ where
     async fn reconcile_batch_blocks(
         &self,
         from_block: u64,
-        decoded: &eez_payload_codec::DecodedBatch,
-        post_batch_input: Bytes,
+        decoded: &eez_payload_codec::DecodedSpan,
+        actions: &[eez_payload_codec::Action],
         l1_block_number: u64,
         tx_hash: B256,
         settlement: eez_l1::Settlement,
@@ -1404,7 +1462,7 @@ where
             tx_hash = %tx_hash,
             from_block,
             block_count = decoded.block_count(),
-            l2_entries_len = decoded.l2_entries.len(),
+            actions = actions.len(),
             cross_chain = self.inner.system_tx_cfg.is_some(),
             "reconcile_batch_blocks entered",
         );
@@ -1425,43 +1483,31 @@ where
         let mut gate_outbound: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
         let sync_block_txs: Option<Vec<Vec<u8>>> = match self.inner.system_tx_cfg.as_ref() {
             Some(cfg) => {
-                let mut entries = if decoded.l2_entries.is_empty() {
-                    // decode the on-chain `batch.entries[]`
-                    // from the postBatch tx input captured during the scan
-                    // (tx fetched by (block, index), pruning-robust). No
-                    // re-fetch by tx hash here — that lookup fails on a pruned
-                    // or still-resyncing embedded L1 and crashed boot catch_up
-                    // on restart-after-post.
-                    use alloy_sol_types::SolCall as _;
-                    let call =
-                        eez_protocol::abi::postAndVerifyBatchCall::abi_decode(&post_batch_input)
-                            .map_err(|e| {
-                                DeriverError::l2_provider(format!(
-                                    "decode postBatch({tx_hash}): {e}"
-                                ))
-                            })?;
-                    event!(
-                        name: "eez.deriver.reconcile.fallback_entries",
-                        Level::INFO,
-                        tx_hash = %tx_hash,
-                        entries = call.batch.entries.len(),
-                        "decoding scanned on-chain postBatch entries (codec v1 fallback)",
-                    );
-                    call.batch.entries
-                } else {
-                    use alloy_sol_types::SolValue as _;
-                    let mut out = Vec::with_capacity(decoded.l2_entries.len());
-                    for (i, raw) in decoded.l2_entries.iter().enumerate() {
-                        let entry =
-                            eez_protocol::abi::ExecutionEntrySol::abi_decode(raw).map_err(|e| {
-                                DeriverError::l2_provider(format!(
-                                    "decode l2_entries[{i}] for tx {tx_hash}: {e}"
-                                ))
-                            })?;
-                        out.push(entry);
-                    }
-                    out
-                };
+                // The DA publishes actions, not entries: an inbound entry's
+                // on-chain form binds its call only via `proxyEntryHash`, so
+                // this is the only published copy of what to deliver.
+                let mut entries = actions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, action)| {
+                        eez_protocol::entries::manifest::entry_from_action(
+                            action,
+                            eez_protocol::RollupId(cfg.this_rollup_id),
+                        )
+                        .map_err(|e| {
+                            DeriverError::l2_provider(format!(
+                                "rebuild entry from DA action[{i}] for tx {tx_hash}: {e}"
+                            ))
+                        })
+                    })
+                    .collect::<DeriverResult<Vec<_>>>()?;
+                event!(
+                    name: "eez.deriver.reconcile.actions",
+                    Level::INFO,
+                    tx_hash = %tx_hash,
+                    actions = entries.len(),
+                    "rebuilt execution entries from the DA action manifest",
+                );
                 // Drop non-producing entries (the anchor immediate signs no system
                 // tx), then split by direction: `proxyEntryHash == 0` = outbound
                 // settlement, `!= 0` = inbound delivery. `partition` keeps each
@@ -1505,7 +1551,7 @@ where
                     .block_tx_counts
                     .last()
                     .copied()
-                    .map(usize::from)
+                    .map(|c| c as usize)
                     .unwrap_or(0);
                 let sync_user_start = decoded.transactions.len().saturating_sub(last_count);
                 let sync_user_txs: Vec<Bytes> = decoded.transactions[sync_user_start..]
@@ -1652,7 +1698,13 @@ where
             let new_content = sync_block_txs.clone().unwrap_or_default();
             // `ends_with`, not equality: idempotent re-derivation (e.g. after a
             // crash between this replay and recording it) must not re-append.
-            let already_applied = !new_content.is_empty() && block_txs.ends_with(&new_content);
+            let already_applied = !new_content.is_empty()
+                && block_txs.ends_with(&new_content)
+                && local_header_inputs_match(
+                    &self.inner.l2_provider,
+                    from_block,
+                    &BlockHeaderInputs::from_span(decoded, last_index)?,
+                )?;
             event!(
                 name: "eez.deriver.reconcile.block",
                 Level::DEBUG,
@@ -1699,7 +1751,13 @@ where
                     );
                 }
                 block_txs.extend(new_content);
-                let outcome = self.replay_block(from_block - 1, &block_txs).await?;
+                let outcome = self
+                    .replay_block(
+                        from_block - 1,
+                        &block_txs,
+                        &BlockHeaderInputs::from_span(decoded, last_index)?,
+                    )
+                    .await?;
                 // No later block follows this one to make it canonical, so
                 // reading by number can still return the old block. Only an
                 // issue here; a forward replay is extended by the next commit.
@@ -1710,7 +1768,7 @@ where
             let mut tx_offset = 0usize;
             for (i, count) in decoded.block_tx_counts.iter().enumerate() {
                 let l2_block = from_block + i as u64;
-                let count_usize = usize::from(*count);
+                let count_usize = *count as usize;
                 let user_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
                 tx_offset += count_usize;
                 // Per Rollup-1 §1.3 + §13.4.23 the composer always sets
@@ -1729,6 +1787,11 @@ where
                     false
                 } else {
                     local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
+                        && local_header_inputs_match(
+                            &self.inner.l2_provider,
+                            l2_block,
+                            &BlockHeaderInputs::from_span(decoded, i)?,
+                        )?
                 };
                 let should_replay = suffix_replay.required(matched);
                 event!(
@@ -1745,7 +1808,13 @@ where
                 if !should_replay {
                     continue;
                 }
-                let outcome = self.replay_block(l2_block - 1, &block_txs).await?;
+                let outcome = self
+                    .replay_block(
+                        l2_block - 1,
+                        &block_txs,
+                        &BlockHeaderInputs::from_span(decoded, i)?,
+                    )
+                    .await?;
                 if is_sync_block {
                     sync_block_hash = Some(outcome.block_hash);
                 }
@@ -1813,11 +1882,8 @@ where
     /// SYSTEM_ADDRESS account nonce at the L2 parent block. Both
     /// composer and deriver query this at the same block hash; reth
     /// is deterministic so they read identical values, which makes
-    /// the signed system-tx hashes byte-equal.
+    /// the native system-tx hashes byte-equal.
     fn system_address_nonce_at(&self, parent_block_number: u64) -> DeriverResult<u64> {
-        let Some(cfg) = self.inner.system_tx_cfg.as_ref() else {
-            return Ok(0);
-        };
         let parent_header = self
             .inner
             .l2_provider
@@ -1833,7 +1899,7 @@ where
             .l2_provider
             .state_by_block_hash(parent_header.hash())
             .map_err(DeriverError::l2_provider)?;
-        let system_address = cfg.system_signer.address();
+        let system_address = eez_primitives::SYSTEM_ADDRESS;
         Ok(state
             .account_nonce(&system_address)
             .map_err(DeriverError::l2_provider)?
@@ -2073,6 +2139,63 @@ where
 
 /// `true` iff the first local block in a batch is anchored to the current
 /// local parent. `false` if the block is missing or sits on stale ancestry.
+/// Whether the local block's header inputs are the ones the DA names.
+///
+/// Matching transactions is not enough: `beneficiary` and `extraData` seal into
+/// the header hash, and no state-root check downstream can see either, so a
+/// block that differs in them is a different block that nothing else catches.
+fn local_header_inputs_match<L2>(
+    l2_provider: &Arc<L2>,
+    block_number: u64,
+    expected: &BlockHeaderInputs,
+) -> DeriverResult<bool>
+where
+    L2: BlockReader<Header = alloy_consensus::Header>,
+{
+    let Some(header) = l2_provider
+        .sealed_header(block_number)
+        .map_err(DeriverError::l2_provider)?
+    else {
+        return Ok(false);
+    };
+    Ok(header_inputs_match(&header, expected))
+}
+
+/// The comparison itself, split out so it is testable without a provider.
+fn header_inputs_match(header: &alloy_consensus::Header, expected: &BlockHeaderInputs) -> bool {
+    header.beneficiary == expected.beneficiary && header.extra_data == expected.extra_data
+}
+
+#[cfg(test)]
+mod header_inputs_tests {
+    use super::{BlockHeaderInputs, header_inputs_match};
+    use alloy_primitives::{Address, Bytes};
+
+    /// A block whose txs match but whose header inputs do not is a DIFFERENT
+    /// block: both seal into the header hash, and no state-root check
+    /// downstream can see either, so the skip paths are the only guard.
+    #[test]
+    fn header_inputs_decide_block_identity_beyond_transactions() {
+        let expected = BlockHeaderInputs {
+            beneficiary: Address::with_last_byte(0xAA),
+            extra_data: Bytes::from_static(b"eez"),
+        };
+        let mut header = alloy_consensus::Header {
+            beneficiary: expected.beneficiary,
+            extra_data: expected.extra_data.clone(),
+            ..Default::default()
+        };
+        assert!(header_inputs_match(&header, &expected));
+
+        header.beneficiary = Address::with_last_byte(0xBB);
+        assert!(!header_inputs_match(&header, &expected), "beneficiary");
+
+        header.beneficiary = expected.beneficiary;
+        header.extra_data = Bytes::from_static(b"other");
+        assert!(!header_inputs_match(&header, &expected), "extraData");
+    }
+}
+
 fn local_batch_boundary_matches<L2>(l2_provider: &Arc<L2>, from_block: u64) -> DeriverResult<bool>
 where
     L2: BlockReader<Header = alloy_consensus::Header>,

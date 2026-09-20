@@ -27,7 +27,6 @@ pub use eez_protocol::EEZL2_ADDRESS;
 
 pub use attest::{Attester, NonZeroProofSystemVkey};
 pub use service::{ProveSvc, ServiceLimits, ServiceLimitsParams, ServiceState};
-pub use settlement::SystemTransactionKey;
 pub use validate::{ValidationBackend, Validator};
 
 /// Backend-neutral configuration for one proof-signer service.
@@ -37,7 +36,6 @@ pub struct ServerConfig {
     pub limits: ServiceLimits,
     pub expected_rollup_id: NonZeroU64,
     pub attester: Attester,
-    pub system_transaction_key: SystemTransactionKey,
 }
 
 /// Initialize one backend and serve the shared proof-signer pipeline.
@@ -51,7 +49,6 @@ pub async fn serve(
         limits,
         expected_rollup_id,
         attester,
-        system_transaction_key,
     } = config;
     let validator = Validator::from_backend(backend);
     log_server_config(
@@ -62,12 +59,7 @@ pub async fn serve(
         &attester,
     );
     let svc = ProveSvc::new(
-        Arc::new(ServiceState::new(
-            validator,
-            expected_rollup_id,
-            attester,
-            system_transaction_key,
-        )?),
+        Arc::new(ServiceState::new(validator, expected_rollup_id, attester)?),
         limits,
     );
     if !listen_addr.ip().is_loopback() {

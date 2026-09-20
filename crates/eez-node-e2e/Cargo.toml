@@ -8,11 +8,18 @@ description            = "Cross-role integration tests for eez node binaries."
 publish                = false
 
 [dependencies]
+eez-primitives.workspace = true
 eez-follower.workspace = true
 eez-node.workspace     = true
 eyre.workspace         = true
 
 [dev-dependencies]
+alloy-consensus-any.workspace = true
+jsonrpsee.workspace = true
+alloy-eips.workspace = true
+reqwest.workspace = true
+alloy-rpc-types-engine.workspace = true
+reth-ethereum-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-contract.workspace = true
 alloy-genesis = { version = "2", default-features = false }

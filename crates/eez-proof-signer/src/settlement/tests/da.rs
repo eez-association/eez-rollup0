@@ -39,10 +39,25 @@ fn refresh_l1_rolling_hash(entry: &mut ExecutionEntrySol) {
 
 #[test]
 fn test_da_payload_encoder_matches_the_wire_format() {
-    assert_eq!(
-        encode_da_payload(&[Vec::new()], &[]),
-        [0x00, 0xc4, 0xc1, 0x80, 0xc0, 0xc0]
-    );
+    // 00            EEZ protocol version (never a message)
+    // 02            ChainOperation
+    // <u64 LE>      chain_id — EEZ's chain id IS the rollup id (spec §1.2)
+    // 1a <26 bytes> operations: the published 0x00 span, length-prefixed
+    let span = [
+        vec![0x00, 0x01, 0x00],
+        vec![0x01],
+        vec![0x00; 20],
+        vec![0x01, 0x00],
+    ]
+    .concat();
+    let expected = [
+        vec![0x00, 0x02],
+        1u64.to_le_bytes().to_vec(),
+        vec![u8::try_from(span.len()).unwrap()],
+        span,
+    ]
+    .concat();
+    assert_eq!(encode_da_payload(&[Vec::new()], &[]), expected);
 }
 
 #[test]
@@ -68,53 +83,64 @@ fn da_payload_rejects_trailing_bytes() {
     let mut payload = encode_da_payload(&[transactions], &[]);
     payload.extend_from_slice(&[0xde, 0xad]);
 
-    assert_eq!(
+    // The stream must end exactly at a message boundary, so trailing bytes are
+    // read as the start of another bracket and fail the grammar rather than
+    // being counted as a tail.
+    assert!(matches!(
         verify_anchor_only_da_payload(&payload, [(41, block_rlp.as_slice())]),
-        Err(DaPayloadError::TrailingBytes { trailing: 2 })
-    );
+        Err(DaPayloadError::Decode { .. })
+    ));
 }
 
 #[test]
 fn da_payload_rejects_noncanonical_outer_and_integer_encodings() {
     let block_rlp = block_rlp(Vec::new());
     let canonical = encode_da_payload(&[Vec::new()], &[]);
+    // 0: stream version | 1: message type | 2..10: chain_id | 10: operations len
+    let verify_rejects = |payload: &[u8]| {
+        matches!(
+            verify_anchor_only_da_payload(payload, [(41, block_rlp.as_slice())]),
+            Err(DaPayloadError::Decode { .. })
+        )
+    };
 
-    let mut wrong_tag = canonical.clone();
-    wrong_tag[0] = 0x01;
-    assert!(matches!(
-        verify_anchor_only_da_payload(&wrong_tag, [(41, block_rlp.as_slice())]),
-        Err(DaPayloadError::Decode { .. })
-    ));
+    let mut wrong_stream_version = canonical.clone();
+    wrong_stream_version[0] = 0x01;
+    assert!(verify_rejects(&wrong_stream_version), "stream version");
 
-    let mut long_outer_header = vec![0x00, 0xf8, 0x04];
-    long_outer_header.extend_from_slice(&canonical[2..]);
-    assert!(matches!(
-        verify_anchor_only_da_payload(&long_outer_header, [(41, block_rlp.as_slice())]),
-        Err(DaPayloadError::Decode { .. })
-    ));
+    let mut wrong_message_type = canonical.clone();
+    wrong_message_type[1] = 0x04; // Call where a ChainOperation must open
+    assert!(verify_rejects(&wrong_message_type), "message type");
 
-    let mut leading_zero_count = canonical.clone();
-    leading_zero_count[3] = 0x00;
-    assert!(matches!(
-        verify_anchor_only_da_payload(&leading_zero_count, [(41, block_rlp.as_slice())]),
-        Err(DaPayloadError::Decode { .. })
-    ));
+    let mut wrong_span_version = canonical.clone();
+    wrong_span_version[11] = 0x01; // the span's own payload version
+    assert!(verify_rejects(&wrong_span_version), "span version");
 
-    let mut extra_field = canonical;
-    extra_field[1] += 1;
-    extra_field.push(alloy_rlp::EMPTY_LIST_CODE);
-    assert!(matches!(
-        verify_anchor_only_da_payload(&extra_field, [(41, block_rlp.as_slice())]),
-        Err(DaPayloadError::Decode { .. })
-    ));
+    let over_long_len = [
+        &canonical[..10],
+        &[0x80, 0x80, 0x80, 0x80, 0x80, 0x00][..],
+        &canonical[11..],
+    ]
+    .concat();
+    assert!(verify_rejects(&over_long_len), "over-long varint");
 }
 
+/// A non-minimal prefix stays valid (§5 cond. 8). Padding the REAL length is
+/// what keeps this about minimality rather than a shifted offset.
 #[test]
-fn da_payload_rejects_a_noncanonical_transaction_byte() {
-    assert!(matches!(
-        super::super::encoded_bytes_match(&[0x81, 0x01], &[0x01]),
-        Err(DaPayloadError::Decode { .. })
-    ));
+fn da_payload_accepts_a_non_minimal_outer_length() {
+    let block_rlp = block_rlp(Vec::new());
+    let canonical = encode_da_payload(&[Vec::new()], &[]);
+    let padded = [
+        &canonical[..10],
+        &[canonical[10] | 0x80, 0x00][..],
+        &canonical[11..],
+    ]
+    .concat();
+
+    assert!(canonical[10] < 0x80, "fixture length must fit one byte");
+    verify_anchor_only_da_payload(&padded, [(41, block_rlp.as_slice())])
+        .expect("a padded length prefix is valid EEZ");
 }
 
 #[test]
@@ -133,11 +159,13 @@ fn da_payload_rejects_missing_or_surplus_blocks() {
     );
 
     let surplus = encode_da_payload(&[Vec::new(), second_transactions, Vec::new()], &[]);
+    // The span declares its block count up front, so a surplus is a count
+    // disagreement rather than leftover items in a trailing list.
     assert_eq!(
         verify_anchor_only_da_payload(&surplus, blocks),
-        Err(DaPayloadError::UnexpectedItems {
-            field: "blockTxCounts",
+        Err(DaPayloadError::BlockCount {
             expected: 2,
+            actual: 3,
         })
     );
 }
@@ -165,17 +193,16 @@ fn da_payload_rejects_transactions_assigned_to_the_wrong_block() {
 #[test]
 fn da_payload_rejects_a_canonical_short_transaction_list_as_a_window_mismatch() {
     let block_rlp = block_rlp(vec![transaction(CREATE_TX)]);
-    let mut payload = encode_da_payload(&[Vec::new()], &[]);
-    // The sole block count is one, while the canonical transaction list stays
-    // empty. Both values have one-byte encodings, so the list headers remain
-    // canonical and unchanged.
-    payload[3] = 0x01;
+    // A perfectly canonical payload that simply omits the block's transaction:
+    // the disagreement is with the validated window, not within the encoding.
+    let payload = encode_da_payload(&[Vec::new()], &[]);
 
     assert_eq!(
         verify_anchor_only_da_payload(&payload, [(41, block_rlp.as_slice())]),
-        Err(DaPayloadError::TransactionMismatch {
+        Err(DaPayloadError::ProjectedTransactionCount {
             block_number: 41,
-            transaction_index: 0,
+            submitted: 0,
+            expected: 1,
         })
     );
 }
@@ -220,15 +247,21 @@ fn da_payload_rejects_transactions_reordered_within_one_block() {
 #[test]
 fn da_payload_stops_lists_that_exceed_validated_window_bounds() {
     let block_rlp = block_rlp(Vec::new());
-    let mut payload = encode_da_payload(&[vec![Vec::new(), Vec::new()]], &[]);
-    // Keep both transaction items but claim zero for this one-block payload.
-    // The short-list encoding places its sole block count at byte 3.
-    payload[3] = alloy_rlp::EMPTY_STRING_CODE;
+    // A payload claiming more transactions than the window's block holds. The
+    // span derives its transaction total from the per-block counts and the
+    // codec requires the columns to agree, so surplus items cannot survive
+    // decoding — the overclaim can only show up against the validated block.
+    let (_, two_transactions) = block_and_payload_transactions(vec![
+        transaction(CREATE_TX),
+        transaction(SYSTEM_SIGNER_OTHER_TARGET_TX),
+    ]);
+    let payload = encode_da_payload(&[two_transactions], &[]);
 
     assert_eq!(
         verify_anchor_only_da_payload(&payload, [(41, block_rlp.as_slice())]),
-        Err(DaPayloadError::UnexpectedItems {
-            field: "transactions",
+        Err(DaPayloadError::ProjectedTransactionCount {
+            block_number: 41,
+            submitted: 2,
             expected: 0,
         })
     );
@@ -249,15 +282,34 @@ fn da_payload_compares_oversized_transactions_without_decoding_them_into_a_vec()
     );
 }
 
+/// A well-formed entry that no authorized effect claims.
+fn unbound_entry() -> ExecutionEntrySol {
+    ExecutionEntrySol {
+        l2ToL1Calls: vec![eez_protocol::abi::L2ToL1CallSol {
+            revertNextNCalls: 0,
+            isStatic: false,
+            gas: 0,
+            sourceAddress: alloy_primitives::Address::ZERO,
+            sourceRollupId: 0,
+            targetAddress: alloy_primitives::Address::ZERO,
+            value: alloy_primitives::U256::ZERO,
+            data: alloy_primitives::Bytes::new(),
+        }],
+        destinationRollupId: 1,
+        success: true,
+        ..Default::default()
+    }
+}
+
 #[test]
 fn da_payload_rejects_l2_entries_without_bound_inbound_effects() {
     let (block_rlp, transactions) = block_and_payload_transactions(Vec::new());
-    let payload = encode_da_payload(&[transactions], &[vec![0x01]]);
+    let payload = encode_da_payload(&[transactions], std::slice::from_ref(&unbound_entry()));
 
     assert_eq!(
         verify_anchor_only_da_payload(&payload, [(41, block_rlp.as_slice())]),
         Err(DaPayloadError::UnexpectedItems {
-            field: "l2Entries",
+            field: "actions",
             expected: 0,
         })
     );
@@ -292,6 +344,7 @@ fn da_payload_binds_inbound_sidecars_and_complete_reconstructed_transactions() {
         .iter()
         .map(|encoded| ExecutionEntrySol::abi_decode(encoded).unwrap())
         .collect::<Vec<_>>();
+    let sidecars = entries.clone();
     let transactions = build_inbound_transactions(&entries, &system_transaction_context(), 11);
     let (intermediate_rlp, intermediate_transactions) =
         block_and_payload_transactions(vec![transaction(CREATE_TX)]);
@@ -307,6 +360,7 @@ fn da_payload_binds_inbound_sidecars_and_complete_reconstructed_transactions() {
             &outbound,
             &inbound,
             &verifier,
+            1,
         )
     };
     let blocks = [
@@ -325,7 +379,7 @@ fn da_payload_binds_inbound_sidecars_and_complete_reconstructed_transactions() {
     );
     assert_eq!(
         verify(&missing, blocks),
-        Err(DaPayloadError::MissingL2Entry {
+        Err(DaPayloadError::MissingAction {
             entry_index: 1,
             transaction_index: 1,
         })
@@ -340,7 +394,7 @@ fn da_payload_binds_inbound_sidecars_and_complete_reconstructed_transactions() {
     assert_eq!(
         verify(&extra, blocks),
         Err(DaPayloadError::UnexpectedItems {
-            field: "l2Entries",
+            field: "actions",
             expected: 2,
         })
     );
@@ -353,21 +407,21 @@ fn da_payload_binds_inbound_sidecars_and_complete_reconstructed_transactions() {
     );
     assert_eq!(
         verify(&reordered, blocks),
-        Err(DaPayloadError::L2EntryMismatch {
+        Err(DaPayloadError::ActionMismatch {
             entry_index: 0,
             transaction_index: 0,
         })
     );
 
     let mut mutated_sidecars = sidecars.clone();
-    mutated_sidecars[1][0] ^= 1;
+    mutated_sidecars[1].l2ToL1Calls[0].value += alloy_primitives::U256::from(1);
     let mutated_second_sidecar = encode_da_payload(
         &[intermediate_transactions.clone(), Vec::new()],
         &mutated_sidecars,
     );
     assert_eq!(
         verify(&mutated_second_sidecar, blocks),
-        Err(DaPayloadError::L2EntryMismatch {
+        Err(DaPayloadError::ActionMismatch {
             entry_index: 1,
             transaction_index: 1,
         })
@@ -387,7 +441,7 @@ fn da_payload_binds_inbound_sidecars_and_complete_reconstructed_transactions() {
     );
 
     let mut noncanonical_context = system_transaction_context();
-    noncanonical_context.l2_gas_limit += 1;
+    noncanonical_context.l2_chain_id += 1;
     let noncanonical_transactions = build_inbound_transactions(&entries, &noncanonical_context, 11);
     let mut mutated_second_transaction = transactions;
     mutated_second_transaction[1] = noncanonical_transactions[1].clone();
@@ -439,11 +493,16 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
     let transactions = raw_transactions
         .iter()
-        .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
         .collect::<Vec<_>>();
     let settling_rlp = block_rlp(transactions);
     let verifier = system_transactions();
-    let payload = encode_da_payload(&[vec![user.clone()]], &[sidecar.abi_encode()]);
+    let payload = encode_da_payload(&[vec![user.clone()]], &[sidecar.clone()]);
     let inbound = AuthorizedInboundEffects::default();
     let verify = |payload: &[u8], blocks: [(u64, &[u8]); 1]| {
         let (settling, intermediates) = blocks.split_last().unwrap();
@@ -454,6 +513,7 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
             &outbound,
             &inbound,
             &verifier,
+            1,
         )
     };
 
@@ -462,7 +522,7 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     let missing_sidecar = encode_da_payload(&[vec![user.clone()]], &[]);
     assert_eq!(
         verify(&missing_sidecar, [(41, settling_rlp.as_slice())]),
-        Err(DaPayloadError::MissingL2Entry {
+        Err(DaPayloadError::MissingAction {
             entry_index: 0,
             transaction_index: 1,
         })
@@ -475,11 +535,15 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     let extra_block = block_rlp(
         extra_transactions
             .into_iter()
-            .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+            .map(|raw| {
+                <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                    raw.as_ref(),
+                )
+                .unwrap()
+            })
             .collect(),
     );
-    let extra_transaction =
-        encode_da_payload(&[vec![user.clone(), extra]], &[sidecar.abi_encode()]);
+    let extra_transaction = encode_da_payload(&[vec![user.clone(), extra]], &[sidecar.clone()]);
     assert_eq!(
         verify(&extra_transaction, [(41, extra_block.as_slice())]),
         Err(DaPayloadError::SyncBlockTransactionCount {
@@ -488,23 +552,28 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
         })
     );
 
-    // Composer DA carries the pre-settlement projection, not the batch entry
-    // after its state update has been attached.
-    let with_state_update =
-        encode_da_payload(&[vec![user.clone()]], &[batch.entries[1].abi_encode()]);
+    // An action describes the CALL, so the pre-settlement projection and the
+    // same entry with its state update attached project identically — the DA
+    // no longer distinguishes them, and does not need to: EEZ hashes the full
+    // entry (state updates included) into the public input this signer
+    // recomputes, and enforces the delta chain at execution.
+    let with_state_update = encode_da_payload(&[vec![user.clone()]], &[batch.entries[1].clone()]);
     assert_eq!(
         verify(&with_state_update, [(41, settling_rlp.as_slice())]),
-        Err(DaPayloadError::L2EntryMismatch {
+        Ok(())
+    );
+
+    let unrelated_call = encode_da_payload(&[vec![user.clone()]], &[unbound_entry()]);
+    assert_eq!(
+        verify(&unrelated_call, [(41, settling_rlp.as_slice())]),
+        Err(DaPayloadError::ActionMismatch {
             entry_index: 0,
             transaction_index: 1,
         })
     );
 
     let (_, mut different_user) = block_and_payload_transactions(vec![transaction(CREATE_TX)]);
-    let wrong_user = encode_da_payload(
-        &[vec![different_user.pop().unwrap()]],
-        &[sidecar.abi_encode()],
-    );
+    let wrong_user = encode_da_payload(&[vec![different_user.pop().unwrap()]], &[sidecar.clone()]);
     assert_eq!(
         verify(&wrong_user, [(41, settling_rlp.as_slice())]),
         Err(DaPayloadError::TransactionMismatch {
@@ -514,7 +583,7 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     );
 
     let mut noncanonical_context = system_transaction_context();
-    noncanonical_context.l2_gas_limit += 1;
+    noncanonical_context.l2_chain_id += 1;
     let wrong_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &[(sidecar.clone(), Bytes::from(user))],
         &[],
@@ -524,7 +593,12 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     .unwrap();
     let wrong_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&wrong_pairs)
         .into_iter()
-        .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
         .collect::<Vec<_>>();
     let wrong_block = block_rlp(wrong_transactions);
     assert_eq!(
@@ -588,14 +662,15 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
     let settling_rlp = block_rlp(
         raw_transactions
             .iter()
-            .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+            .map(|raw| {
+                <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                    raw.as_ref(),
+                )
+                .unwrap()
+            })
             .collect(),
     );
-    let encoded_sidecars = sidecars
-        .iter()
-        .map(alloy_sol_types::SolValue::abi_encode)
-        .collect::<Vec<_>>();
-    let payload = encode_da_payload(std::slice::from_ref(&users), &encoded_sidecars);
+    let payload = encode_da_payload(std::slice::from_ref(&users), &sidecars);
     let verifier = system_transactions();
     let inbound = AuthorizedInboundEffects::default();
     let verify = |payload: &[u8], blocks: [(u64, &[u8]); 1]| {
@@ -607,24 +682,25 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
             &outbound,
             &inbound,
             &verifier,
+            1,
         )
     };
 
     assert_eq!(verify(&payload, [(41, settling_rlp.as_slice())]), Ok(()));
 
-    let mut reversed_sidecars = encoded_sidecars.clone();
+    let mut reversed_sidecars = sidecars.clone();
     reversed_sidecars.reverse();
     let wrong_sidecars = encode_da_payload(std::slice::from_ref(&users), &reversed_sidecars);
     assert_eq!(
         verify(&wrong_sidecars, [(41, settling_rlp.as_slice())]),
-        Err(DaPayloadError::L2EntryMismatch {
+        Err(DaPayloadError::ActionMismatch {
             entry_index: 0,
             transaction_index: 1,
         })
     );
 
     let mut noncanonical_context = system_transaction_context();
-    noncanonical_context.l2_gas_limit += 1;
+    noncanonical_context.l2_chain_id += 1;
     let wrong_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &outbound_inputs,
         &[],
@@ -638,7 +714,12 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
     let wrong_block = block_rlp(
         mutated_second_load
             .into_iter()
-            .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+            .map(|raw| {
+                <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                    raw.as_ref(),
+                )
+                .unwrap()
+            })
             .collect(),
     );
     assert_eq!(
@@ -702,10 +783,15 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
     let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
     let transactions = raw_transactions
         .iter()
-        .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
         .collect::<Vec<_>>();
     let settling_rlp = block_rlp(transactions);
-    let sidecars = vec![outbound_sidecar.abi_encode(), inbound_sidecar.abi_encode()];
+    let sidecars = vec![outbound_sidecar.clone(), inbound_sidecar.clone()];
     let payload = encode_da_payload(&[vec![user]], &sidecars);
     let verifier = system_transactions();
     let verify = |payload: &[u8], blocks: [(u64, &[u8]); 1]| {
@@ -717,6 +803,7 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
             &outbound,
             &inbound,
             &verifier,
+            1,
         )
     };
 
@@ -728,7 +815,7 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
         encode_da_payload(&[vec![raw_transactions[1].to_vec()]], &reversed_sidecars);
     assert_eq!(
         verify(&wrong_sidecar_order, [(41, settling_rlp.as_slice())]),
-        Err(DaPayloadError::L2EntryMismatch {
+        Err(DaPayloadError::ActionMismatch {
             entry_index: 0,
             transaction_index: 1,
         })
@@ -739,7 +826,12 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
     let reordered_block = block_rlp(
         reordered
             .into_iter()
-            .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+            .map(|raw| {
+                <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                    raw.as_ref(),
+                )
+                .unwrap()
+            })
             .collect(),
     );
     assert_eq!(

@@ -14,7 +14,7 @@ checkpoint, event, receipt status, or DA sidecar authorizes an effect by itself.
 | Submitted `PostBatch` calldata | Composer input; `CanonicalPostBatch` proves only complete canonical decoding |
 | `ValidatedWindow` | Cross-checked backend output plus exact admitted block bytes and locally derived evidence |
 | Expected rollup ID, configured proof-system address and proof-system vkey | Independent operator-configured deployment bindings |
-| `SystemTransactionReconstructor` | Operator-configured system key combined with chain ID, expected rollup ID, and the fixed EEZL2 address |
+| `SystemTransactionReconstructor` | Chain ID, expected rollup ID, and the fixed EEZL2 address; no private key |
 
 ## Gate order
 

@@ -269,11 +269,8 @@ fn cancelled_settlement_stops_before_decoding_untrusted_input() {
 #[test]
 fn an_elapsed_deadline_stops_the_pipeline_between_validation_and_settlement() {
     let mut input = AdmittedBlock::test(5, 0x04, 0x05);
-    let empty_body: reth_ethereum_primitives::BlockBody = Default::default();
-    input.rlp = alloy_rlp::encode(reth_ethereum_primitives::Block::new(
-        Default::default(),
-        empty_body,
-    ));
+    let empty_body: eez_primitives::BlockBody = Default::default();
+    input.rlp = alloy_rlp::encode(eez_primitives::Block::new(Default::default(), empty_body));
     let inputs = vec![input];
     let state = inner(Validator::stub(vec![Ok(backend_output_for(&inputs))]));
     // A deadline captured now is already past when the boundary between
@@ -305,11 +302,11 @@ fn an_elapsed_deadline_stops_the_pipeline_between_validation_and_settlement() {
 fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     let value = U256::from(7);
     let (transaction, call_hash, return_data, sidecar) = strict_inbound_transaction(value);
-    let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
+    let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions: vec![transaction],
         ..Default::default()
     };
-    let block = reth_ethereum_primitives::Block::new(Default::default(), body);
+    let block = eez_primitives::Block::new(Default::default(), body);
     let block_rlp = alloy_rlp::encode(block);
     let settling_block = validate::ValidatedBlock::for_test(
         5,
@@ -334,7 +331,8 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         returnData: return_data,
     });
     eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
-    batch.callData = settlement::encode_da_payload(&[Vec::new()], &[sidecar.abi_encode()]).into();
+    batch.callData =
+        settlement::encode_da_payload(&[Vec::new()], std::slice::from_ref(&sidecar)).into();
     let expected_hash = recompute_test_public_inputs_hash(&batch);
     let calldata = eez_protocol::entries::encode_postbatch(&batch);
     let statuses = [true];
@@ -547,10 +545,14 @@ fn a_fully_bound_outbound_effect_is_authorized() {
 
     assert_eq!(run.unwrap().into_inner(), expected_hash);
 
+    // The DA describes the CALL, so an entry differing only by its attached
+    // state update projects to the same action — EEZ binds state updates
+    // through the entry hashes in the public input, not through the DA. A
+    // mismatch therefore has to be a different call.
     let mut mismatched_da = batch;
-    mismatched_da.callData =
-        settlement::encode_da_payload(&[vec![user]], &[mismatched_da.entries[1].abi_encode()])
-            .into();
+    let mut wrong_call = mismatched_da.entries[1].clone();
+    wrong_call.l2ToL1Calls[0].value += alloy_primitives::U256::from(1);
+    mismatched_da.callData = settlement::encode_da_payload(&[vec![user]], &[wrong_call]).into();
     let mismatched_calldata = eez_protocol::entries::encode_postbatch(&mismatched_da);
     let run = run_settlement(SettlementInput {
         submitted_post_batch_calldata: mismatched_calldata,
@@ -565,7 +567,7 @@ fn a_fully_bound_outbound_effect_is_authorized() {
     assert!(matches!(
         run,
         Err(SettlementPipelineError::DaPayload(
-            settlement::DaPayloadError::L2EntryMismatch { .. }
+            settlement::DaPayloadError::ActionMismatch { .. }
         ))
     ));
 }

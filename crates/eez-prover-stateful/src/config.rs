@@ -7,9 +7,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
-use eez_proof_signer::{
-    Attester, NonZeroProofSystemVkey, ServiceLimits, ServiceLimitsParams, SystemTransactionKey,
-};
+use eez_proof_signer::{Attester, NonZeroProofSystemVkey, ServiceLimits, ServiceLimitsParams};
 use tracing::warn;
 
 /// Complete configuration for one stateful proof service.
@@ -19,7 +17,6 @@ pub struct Config {
     pub(crate) expected_rollup_id: NonZeroU64,
     pub(crate) expected_l2_system_address: Address,
     pub(crate) attester: Attester,
-    pub(crate) system_transaction_key: SystemTransactionKey,
     pub(crate) limits: ServiceLimits,
 }
 
@@ -43,7 +40,6 @@ impl Config {
         let expected_proof_system = parse_required("EEZ_PROOF_SYSTEM")?;
         let expected_attester_address: Address = parse_required("EEZ_ATTESTER_ADDRESS")?;
         let attestation_key = parse_secret("EEZ_STATEFUL_PROOF_SIGNER_KEY")?;
-        let system_key = parse_secret("EEZ_L2_SYSTEM_KEY")?;
 
         let attester = Attester::new(
             attestation_key,
@@ -55,8 +51,10 @@ impl Config {
             attester.address() == expected_attester_address,
             "EEZ_STATEFUL_PROOF_SIGNER_KEY does not match EEZ_ATTESTER_ADDRESS",
         );
-        let system_transaction_key =
-            SystemTransactionKey::new(system_key, expected_l2_system_address)?;
+        eyre::ensure!(
+            expected_l2_system_address == eez_primitives::SYSTEM_ADDRESS,
+            "native system transactions require the reserved EEZ system address",
+        );
         let request_timeout_secs =
             parse_or::<NonZeroU64>("EEZ_PROOF_SIGNER_REQUEST_TIMEOUT_SECS", "240")?.get();
         if request_timeout_secs >= 300 {
@@ -85,7 +83,6 @@ impl Config {
             expected_rollup_id,
             expected_l2_system_address,
             attester,
-            system_transaction_key,
             limits,
         }))
     }

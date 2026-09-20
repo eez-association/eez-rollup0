@@ -27,8 +27,7 @@ use super::settlement_job::{
 use super::*;
 use crate::cancel::CancellationToken;
 use crate::testkit::{
-    SYSTEM_PRIVATE_KEY, TEST_SYSTEM_ADDRESS, checkpoint, system_transaction_context,
-    test_proof_system_vkey,
+    TEST_SYSTEM_ADDRESS, checkpoint, system_transaction_context, test_proof_system_vkey,
 };
 use crate::validate::Validator;
 use crate::validate::testing::backend_output_for;
@@ -68,34 +67,7 @@ fn test_attester_for(
 fn test_system_transaction_reconstructor(
     rollup_id: NonZeroU64,
 ) -> settlement::SystemTransactionReconstructor {
-    test_system_transaction_key().into_reconstructor(1, rollup_id)
-}
-
-fn test_system_transaction_key() -> settlement::SystemTransactionKey {
-    settlement::SystemTransactionKey::new(SYSTEM_PRIVATE_KEY, TEST_SYSTEM_ADDRESS).unwrap()
-}
-
-#[test]
-fn service_state_rejects_a_validator_for_another_system_identity() {
-    let other_address = address!("6f4c950442e1Af093BcfF730381E63Ae9171b87a");
-    let other_key = settlement::SystemTransactionKey::new(
-        b256!("0000000000000000000000000000000000000000000000000000000000000042"),
-        other_address,
-    )
-    .unwrap();
-
-    let error = ServiceState::new(
-        Validator::stub(Vec::new()),
-        expected_rollup_id(1),
-        test_attester(),
-        other_key,
-    )
-    .unwrap_err();
-
-    assert_eq!(
-        error.to_string(),
-        "validator and system-transaction key use different L2 system addresses"
-    );
+    settlement::SystemTransactionReconstructor::new(1, rollup_id)
 }
 
 #[test]
@@ -108,17 +80,12 @@ fn service_state_rejects_an_attester_bound_to_another_system_identity() {
     )
     .unwrap();
 
-    let error = ServiceState::new(
-        Validator::stub(Vec::new()),
-        expected_rollup_id(1),
-        attester,
-        test_system_transaction_key(),
-    )
-    .unwrap_err();
+    let error = ServiceState::new(Validator::stub(Vec::new()), expected_rollup_id(1), attester)
+        .unwrap_err();
 
     assert_eq!(
         error.to_string(),
-        "attester and system-transaction key use different L2 system addresses"
+        "attester and native system transactions use different L2 system addresses"
     );
 }
 
@@ -209,7 +176,7 @@ fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256
         },
         0,
     );
-    let user_body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
+    let user_body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions: vec![non_system_transaction()],
         ..Default::default()
     };
@@ -226,15 +193,20 @@ fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256
     .unwrap();
     let transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
         .into_iter()
-        .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
         .collect();
-    let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
+    let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions,
         ..Default::default()
     };
-    let block = reth_ethereum_primitives::Block::new(Default::default(), body);
+    let block = eez_primitives::Block::new(Default::default(), body);
     batch.callData =
-        settlement::encode_da_payload(&[vec![user.clone()]], &[sidecar.abi_encode()]).into();
+        settlement::encode_da_payload(&[vec![user.clone()]], &[sidecar.clone()]).into();
     (batch, alloy_rlp::encode(block), user, call_hash)
 }
 
@@ -283,16 +255,21 @@ fn mixed_outbound_inbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, B256) {
     .unwrap();
     let transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
         .into_iter()
-        .map(|raw| alloy_rlp::decode_exact(raw.as_ref()).unwrap())
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
         .collect();
-    let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
+    let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions,
         ..Default::default()
     };
-    let block = reth_ethereum_primitives::Block::new(Default::default(), body);
+    let block = eez_primitives::Block::new(Default::default(), body);
     batch.callData = settlement::encode_da_payload(
         &[vec![user]],
-        &[outbound_sidecar.abi_encode(), inbound_sidecar.abi_encode()],
+        &[outbound_sidecar.clone(), inbound_sidecar.clone()],
     )
     .into();
 
@@ -365,7 +342,18 @@ fn public_input_post_batch_for_empty_blocks(
     mut batch: eez_protocol::EvmBatch,
     block_count: usize,
 ) -> PostBatch {
-    batch.callData = settlement::encode_da_payload(&vec![Vec::new(); block_count], &[]).into();
+    // A span covers at least one block, so a zero-block window (an inverted
+    // range fixture) has no encodable payload — an empty one stands in, and is
+    // itself invalid, which is what such a fixture wants.
+    batch.callData = if block_count == 0 {
+        alloy_primitives::Bytes::new()
+    } else {
+        let rollup_id = batch
+            .rollupIdsWithProofSystems
+            .first()
+            .map_or(1, |r| r.rollupId);
+        settlement::encode_da_payload_for(rollup_id, &vec![Vec::new(); block_count], &[]).into()
+    };
     public_input_post_batch_for(batch)
 }
 
@@ -420,8 +408,7 @@ fn da_payload_for_window(window: &[ProveChunk]) -> Vec<u8> {
             let Some(prove_chunk::Kind::Block(block)) = &chunk.kind else {
                 panic!("test window contains a non-block chunk after its header");
             };
-            let block =
-                alloy_rlp::decode_exact::<reth_ethereum_primitives::Block>(&block.rlp).unwrap();
+            let block = alloy_rlp::decode_exact::<eez_primitives::Block>(&block.rlp).unwrap();
             block.body.encoded_2718_transactions_iter().collect()
         })
         .collect::<Vec<_>>();
@@ -434,10 +421,8 @@ fn replace_batch_bound_to_window(window: &mut [ProveChunk], mut batch: eez_proto
 }
 
 fn block_chunk(number: u64, parent: u8, hash: u8) -> ProveChunk {
-    let block = reth_ethereum_primitives::Block::new(
-        Default::default(),
-        reth_ethereum_primitives::BlockBody::default(),
-    );
+    let block =
+        eez_primitives::Block::new(Default::default(), eez_primitives::BlockBody::default());
     ProveChunk {
         kind: Some(prove_chunk::Kind::Block(BlockWitness {
             number,
@@ -462,7 +447,7 @@ fn happy_window() -> Vec<ProveChunk> {
     ]
 }
 
-type TestTransaction = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>;
+type TestTransaction = eez_primitives::EezTxEnvelope;
 
 fn single_non_system_transaction_window() -> Vec<ProveChunk> {
     single_transaction_window(non_system_transaction())
@@ -479,7 +464,10 @@ fn single_system_transaction_window() -> Vec<ProveChunk> {
 }
 
 fn system_transaction() -> TestTransaction {
-    alloy_rlp::decode_exact(hex::decode(crate::testkit::SYSTEM_TX).unwrap()).unwrap()
+    <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+        &hex::decode(crate::testkit::SYSTEM_TX).unwrap(),
+    )
+    .unwrap()
 }
 
 fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, ExecutionEntrySol) {
@@ -535,7 +523,11 @@ fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, Exe
     )
     .unwrap()
     .remove(0);
-    let transaction: TestTransaction = alloy_rlp::decode_exact(raw.as_ref()).unwrap();
+    let transaction: TestTransaction =
+        <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+            raw.as_ref(),
+        )
+        .unwrap();
     assert_eq!(transaction.input(), input.as_slice());
     (transaction, call_hash, return_data, sidecar)
 }
@@ -573,11 +565,11 @@ fn transactions_block_chunk(
     hash: u8,
     transactions: Vec<TestTransaction>,
 ) -> ProveChunk {
-    let body: reth_ethereum_primitives::BlockBody = alloy_consensus::BlockBody {
+    let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions,
         ..Default::default()
     };
-    let consensus_block = reth_ethereum_primitives::Block::new(Default::default(), body);
+    let consensus_block = eez_primitives::Block::new(Default::default(), body);
     let mut chunk = block_chunk(number, parent, hash);
     block_mut(&mut chunk).rlp = alloy_rlp::encode(consensus_block);
     chunk
@@ -729,13 +721,5 @@ fn inner(validator: Validator) -> Arc<ServiceState> {
 }
 
 fn inner_with_rollup(validator: Validator, expected_rollup_id: NonZeroU64) -> Arc<ServiceState> {
-    Arc::new(
-        ServiceState::new(
-            validator,
-            expected_rollup_id,
-            test_attester(),
-            test_system_transaction_key(),
-        )
-        .unwrap(),
-    )
+    Arc::new(ServiceState::new(validator, expected_rollup_id, test_attester()).unwrap())
 }

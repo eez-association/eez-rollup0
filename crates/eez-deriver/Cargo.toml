@@ -7,6 +7,8 @@ rust-version.workspace = true
 description            = "Consumes L1 events, decodes posted batches, drives the BlockCommitter to keep L2 in sync with L1."
 
 [dependencies]
+eez-primitives.workspace = true
+eez-evm.workspace = true
 eez-driver.workspace        = true
 eez-protocol.workspace      = true
 eez-l1.workspace            = true
@@ -14,14 +16,10 @@ eez-payload-codec.workspace = true
 
 # Decode postBatch calldata + reconstruct system txs (via
 # eez_protocol::system_tx) so the deriver's Sync block matches the composer's.
-alloy-sol-types.workspace   = true
 
 # reth — bounds + STF replay machinery (see deriver::execute_block).
 reth-chainspec.workspace                  = true
-reth-ethereum-engine-primitives.workspace = true
-reth-ethereum-primitives.workspace        = true
 reth-evm.workspace                        = true
-reth-evm-ethereum.workspace               = true
 reth-payload-primitives.workspace         = true
 reth-primitives-traits.workspace          = true
 reth-provider.workspace                   = true
@@ -43,6 +41,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+# tests build event logs; the lib itself no longer decodes ABI
+alloy-sol-types.workspace = true
 # Checkpoint tests write real files; atomicity is the point of the code.
 tempfile = "3"
 

@@ -30,10 +30,10 @@ use eez_driver::{
     SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
     witness::{ExecutionWitnessMode, block_witness},
 };
+use eez_evm::EezEvmConfig;
 use eez_l1::{BundleTarget, L1Event, SendOutcome, Submitter};
+use eez_primitives::engine::EezEngineTypes;
 use eez_prover::{ActionableProverFailure, BlockWitness, Prover, ProverError, ProvingContext};
-use reth_ethereum_engine_primitives::EthEngineTypes;
-use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
 use reth_storage_api::{
     BlockReader, BlockSource, StateProvider, StateProviderFactory, TransactionsProvider,
@@ -53,30 +53,16 @@ use crate::prover_retry::{
 };
 use crate::rollup::RollupState;
 
-/// Runtime config for the cross-chain execution path on Sync slots.
-/// Carried inside [`CrossChainWiring`] next to the wired
-/// cross-chain simulation: the keys and addresses needed to construct and sign
-/// canonical L2 system transactions from composition batch entries.
-///
-/// Owned by `eez-node` at startup and shared via `Arc` because the
-/// `PrivateKeySigner` is bigger than two-line clone-cheap.
+/// Shared contract identities, public L2 parameters, and L1 submission resources
+/// for cross-chain composition on Sync slots. Owned by `eez-node` at startup
+/// and carried inside [`CrossChainWiring`].
 #[derive(Clone)]
 pub struct CrossChainExecCtx {
-    /// Signing key for SYSTEM_ADDRESS — must match `EEZL2`'s
-    /// `SYSTEM_ADDRESS` immutable. Used for `loadExecutionTable` and
-    /// `executeIncomingCrossChainCall` system transactions.
-    pub system_signer: alloy_signer_local::PrivateKeySigner,
     /// `EEZL2` address, where SYSTEM_ADDRESS calls both
     /// `loadExecutionTable` and `executeIncomingCrossChainCall`.
     pub eezl2_address: Address,
-    /// L2 chain id for EIP-155 signing.
+    /// L2 chain id for native transaction replay protection.
     pub l2_chain_id: u64,
-    /// L2 system tx gas_price (legacy). 1 gwei is plenty above
-    /// devnet basefee.
-    pub l2_gas_price: u128,
-    /// Per-tx gas limit for the load + execute system txs. Matches
-    /// the reference `EXECUTE_INCOMING_GAS_LIMIT` (~2M).
-    pub l2_gas_limit: u64,
     /// Alloy provider for the embedded L1 RPC. Used to sign the
     /// `postAndVerifyBatch` transaction (nonce + fee reads). Submission goes
     /// through `submitter`.
@@ -90,7 +76,7 @@ pub struct CrossChainExecCtx {
     /// plain execution RPCs).
     pub submitter: eez_l1::Submitter,
     /// L1 EOA whose key signs the `postAndVerifyBatch` transaction. Different from
-    /// `system_signer` (which is the L2 SYSTEM_ADDRESS). For dev
+    /// the reserved L2 SYSTEM_ADDRESS. For dev
     /// smoke this is typically the hardhat #0 deployer key; in
     /// production this is the based-rollup composer's L1 wallet.
     pub l1_poster_signer: alloy_signer_local::PrivateKeySigner,
@@ -114,11 +100,9 @@ pub struct CrossChainExecCtx {
 impl std::fmt::Debug for CrossChainExecCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CrossChainExecCtx")
-            .field("system_address", &self.system_signer.address())
+            .field("system_address", &eez_primitives::SYSTEM_ADDRESS)
             .field("eezl2_address", &self.eezl2_address)
             .field("l2_chain_id", &self.l2_chain_id)
-            .field("l2_gas_price", &self.l2_gas_price)
-            .field("l2_gas_limit", &self.l2_gas_limit)
             .finish_non_exhaustive()
     }
 }
@@ -137,7 +121,7 @@ pub struct CrossChainWiring {
             eez_protocol::TargetConfig,
         ),
     >,
-    /// Runtime context for deriving and signing L2 system transactions from
+    /// Runtime context for deriving and encoding L2 system transactions from
     /// composition batches.
     pub exec_ctx: Arc<CrossChainExecCtx>,
     /// Concrete local clients for slot-scoped chained composition, un-erased so
@@ -185,7 +169,7 @@ fn compose_crosschain(
     raw_tx: &[u8],
     sessions: SlotSessions,
     source_state: &mut crate::local::build::DraftDb,
-    source_env: reth_evm::EvmEnvFor<EthEvmConfig>,
+    source_env: reth_evm::EvmEnvFor<EezEvmConfig>,
 ) -> eez_protocol::ComposerResult<(eez_protocol::Composition, SlotSessions, u64)> {
     use eez_protocol::ChainClient as _;
     use eez_protocol::composition::Rollup;
@@ -1006,14 +990,14 @@ struct Inner<L2: BlockReader> {
     submitter: Submitter,
     /// EVM config — used by [`build_sync_block`] to construct the
     /// per-Sync-slot block via reth-evm `BlockBuilder`.
-    evm_config: EthEvmConfig,
+    evm_config: EezEvmConfig,
     /// Cross-chain clients and execution context, guaranteed by the
     /// `eez-composer` entrypoint.
     cross_chain: CrossChainWiring,
     /// Handle to the binary-owned `BlockCommitter` actor (the sole engine-API
     /// owner), shared with the Sequencer and Deriver. Slot-context recovery
     /// uses it to reorg an optimistically committed Sync block after L1 failure.
-    committer: BlockCommitterHandle<EthEngineTypes>,
+    committer: BlockCommitterHandle<EezEngineTypes>,
     /// Per-block witnesses for [`eez_prover::ProvingContext::blocks`]. `None`
     /// means the configured in-process prover does not require block witnesses;
     /// it does not mean that the Composer has no prover.
@@ -1048,9 +1032,9 @@ where
     pub fn new(
         rollups: HashMap<u64, RollupState<L2>>,
         prover: Arc<dyn Prover>,
-        evm_config: EthEvmConfig,
+        evm_config: EezEvmConfig,
         cross_chain: CrossChainWiring,
-        committer: BlockCommitterHandle<EthEngineTypes>,
+        committer: BlockCommitterHandle<EezEngineTypes>,
         witness_source: Option<Arc<dyn eez_prover::ProvingWitnessSource>>,
         timing: RollupTiming,
     ) -> Result<Self, ComposerConfigError> {
@@ -1846,7 +1830,7 @@ where
             .l2_provider
             .state_by_block_hash(parent_hash)
             .map_err(|e| format!("state_by_block_hash({parent_hash}): {e}"))?;
-        let system_address = ctx.system_signer.address();
+        let system_address = eez_primitives::SYSTEM_ADDRESS;
         // Base SYSTEM_ADDRESS nonce; the canonical builder advances it
         // internally (outbound loads, then inbound deliveries) post-drain.
         let nonce = state
@@ -1855,11 +1839,8 @@ where
             .unwrap_or(0);
 
         let stf_cfg = eez_protocol::system_tx::SystemTxContext {
-            system_signer: ctx.system_signer.clone(),
             eezl2_address: ctx.eezl2_address,
             l2_chain_id: ctx.l2_chain_id,
-            l2_gas_price: ctx.l2_gas_price,
-            l2_gas_limit: ctx.l2_gas_limit,
             this_rollup_id: rollup_id,
         };
 
@@ -2200,8 +2181,7 @@ where
                     }
                     // `[load, user]` must fit the Sync block or `build_sync_block`
                     // hard-errors. Before the L1 budget, so a refusal costs nothing.
-                    let declared = stf_cfg
-                        .l2_gas_limit
+                    let declared = eez_primitives::SYSTEM_TX_GAS_LIMIT
                         .saturating_add(declared_gas_limit(&held.raw_tx));
                     match block_gas_fit(draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
                         BlockGasFit::Accept => {}
@@ -2549,10 +2529,9 @@ where
                         continue;
                     }
 
-                    // Same gate: one delivery tx per entry, each at `l2_gas_limit`.
+                    // Same gate: one delivery tx per entry, each at the protocol gas budget.
                     // Foreign entries never ship, so this over-counts at worst.
-                    let declared = stf_cfg
-                        .l2_gas_limit
+                    let declared = eez_primitives::SYSTEM_TX_GAS_LIMIT
                         .saturating_mul(target_entries.len() as u64);
                     match block_gas_fit(draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
                         BlockGasFit::Accept => {}
@@ -3006,8 +2985,6 @@ where
             timestamp,
             suggested_fee_recipient,
             &sync_txs,
-            ctx.system_signer.address(),
-            ctx.eezl2_address,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -3050,6 +3027,7 @@ where
                 &comp_refs,
                 parent_header,
                 built.header.state_root(),
+                &built.header,
                 Some(&built.block),
                 &pair_roots,
                 &outbound_entries,
@@ -3374,6 +3352,7 @@ where
                 &[], // no compositions → leading immediate only
                 parent_header,
                 empty_built.header.state_root(),
+                &empty_built.header,
                 Some(&empty_built.block),
                 &[], // no cross-chain effects → no per-effect roots
                 &[], // no outbound entries
@@ -3537,6 +3516,7 @@ where
                     &[], // no compositions → leading immediate only
                     &boundary_parent,
                     boundary_header.state_root(),
+                    &boundary_header,
                     None, // terminal is committed → witnesses come from the store
                     &[],
                     &[],
@@ -3682,7 +3662,8 @@ where
     /// proof system. Each effect entry's `newState` is its per-effect root from
     /// `pair_roots` (verified by the proof signer's effect-prefix checks); the
     /// last is the final Sync-block root. `sync_block_state_root` is the
-    /// required settlement-chain endpoint.
+    /// required settlement-chain endpoint; `terminal_header` carries it too,
+    /// and the two collapse into one once commitments become block hashes.
     ///
     /// `sync_block` is the terminal, `Some` only while freshly built; `None`
     /// (historical chunk) takes its witness from the store like the rest.
@@ -3701,9 +3682,8 @@ where
         compositions: &[&eez_protocol::Composition],
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         sync_block_state_root: B256,
-        sync_block: Option<
-            &reth_primitives_traits::RecoveredBlock<reth_ethereum_primitives::Block>,
-        >,
+        terminal_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
+        sync_block: Option<&reth_primitives_traits::RecoveredBlock<eez_primitives::Block>>,
         pair_roots: &[B256],
         outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
@@ -3970,7 +3950,8 @@ where
             .into());
         }
         let span_len = usize::try_from(span).map_err(|e| format!("batch span overflow: {e}"))?;
-        let mut blocks_rev: Vec<Vec<Vec<u8>>> = Vec::with_capacity(span_len.saturating_sub(1));
+        let mut blocks_rev: Vec<eez_payload_codec::SpanBlock> =
+            Vec::with_capacity(span_len.saturating_sub(1));
         let mut cursor_hash = parent_header.hash();
         let mut cursor_number = parent_header.number();
         while cursor_number >= from {
@@ -4000,7 +3981,7 @@ where
             // SYSTEM_ADDRESS-signed forms so an unrecovered failed Sync block
             // cannot reintroduce phantom cross-chain effects.
             for enc in &tx_bytes {
-                let is_system = if enc.first() == Some(&0x7E) {
+                let is_system = if enc.first() == Some(&eez_primitives::SYSTEM_TX_TYPE) {
                     true
                 } else {
                     use alloy_eips::eip2718::Decodable2718 as _;
@@ -4019,7 +4000,7 @@ where
                              intermediate block {cursor_number}: {e}"
                         )
                     })?;
-                    signer == ctx.system_signer.address()
+                    signer == eez_primitives::SYSTEM_ADDRESS
                 };
                 if is_system {
                     return Err(format!(
@@ -4029,7 +4010,13 @@ where
                     .into());
                 }
             }
-            blocks_rev.push(tx_bytes);
+            // Beneficiary and extraData are per-block choices, so the DA
+            // carries them rather than derivation assuming a constant.
+            blocks_rev.push(eez_payload_codec::SpanBlock {
+                beneficiary: block.header().beneficiary().into(),
+                extra_data: block.header().extra_data().to_vec(),
+                transactions: tx_bytes,
+            });
             if cursor_number == 0 {
                 break;
             }
@@ -4041,28 +4028,43 @@ where
         // Outbound user txs aren't reconstructible from the entries (only the load
         // is), so they travel in the Sync-block DA here; the deriver interleaves
         // them with the rebuilt loads. Inbound-only → empty.
-        blocks.push(outbound_user_txs.iter().map(|b| b.to_vec()).collect());
-        // Encoded `ExecutionEntrySol` values let followers reconstruct system
-        // transactions. Outbound entries describe L1 settlement and L2 loads;
-        // inbound target batches carry the L2 delivery inputs. Encode both into
-        // `batch.callData`, which enters the public-input preimage as opaque data.
-        use alloy_sol_types::SolValue as _;
-        // The DA sidecar stores the full derivation entry set in canonical
-        // order: outbound settlement entries first, then inbound deferred
-        // entries. This matches the deriver's prefix split.
-        let l2_entries_bytes: Vec<Vec<u8>> = outbound_entries
+        blocks.push(eez_payload_codec::SpanBlock {
+            // Read off the terminal header.
+            beneficiary: terminal_header.beneficiary().into(),
+            extra_data: terminal_header.extra_data().to_vec(),
+            transactions: outbound_user_txs.iter().map(|b| b.to_vec()).collect(),
+        });
+        // Outbound entries describe L1 settlement and L2 loads; inbound target
+        // batches carry the delivery inputs. Published as actions in that order
+        // — a lean inbound entry binds its call only via `proxyEntryHash`, so
+        // this is its only published copy.
+        let actions: Vec<eez_payload_codec::Action> = outbound_entries
             .iter()
-            .map(eez_protocol::abi::ExecutionEntrySol::abi_encode)
             .chain(
                 compositions
                     .iter()
                     .flat_map(|c| c.targets.iter())
-                    .flat_map(|t| t.batch.entries.iter())
-                    .map(eez_protocol::abi::ExecutionEntrySol::abi_encode),
+                    .flat_map(|t| t.batch.entries.iter()),
             )
-            .collect();
-        let payload = eez_payload_codec::encode(&blocks, &l2_entries_bytes)
-            .map_err(|e| format!("eez_payload_codec::encode: {e}"))?;
+            .map(|entry| {
+                eez_protocol::entries::manifest::action_from_entry(
+                    entry,
+                    eez_protocol::RollupId(rollup_id),
+                )
+                .map_err(|e| format!("DA action for entry: {e}"))
+            })
+            .collect::<Result<_, String>>()?;
+        // A failed action is never emitted: an unsuccessful call is rejected
+        // as unsupported long before it becomes an entry.
+        if let Some(at) = actions.iter().position(|a| !a.success) {
+            return Err(format!(
+                "action {at} of {} failed; we do not emit failed actions",
+                actions.len(),
+            )
+            .into());
+        }
+        let payload = eez_payload_codec::encode_container(rollup_id, &blocks, &actions)
+            .map_err(|e| format!("eez_payload_codec::encode_container: {e}"))?;
         batch.callData = alloy_primitives::Bytes::from(payload);
 
         // Priced on the encoded candidate before witnesses and proving; `Ok(None)`

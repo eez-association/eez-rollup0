@@ -11,7 +11,7 @@ use eez_control_rpc::v1::{
 };
 use eez_proof_signer::{
     Attester, NonZeroProofSystemVkey, ProveSvc, ServiceLimits, ServiceLimitsParams, ServiceState,
-    SystemTransactionKey, Validator,
+    Validator,
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -20,8 +20,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use crate::Backend;
 
 const FIXTURE: &str = "captured-anchor-40155";
-const SYSTEM_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-const SYSTEM_ADDRESS: &str = "f39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+const SYSTEM_ADDRESS: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076";
 const ATTESTER_KEY: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 
 fn fixture(name: &str) -> String {
@@ -64,6 +63,15 @@ fn recorded_wire_witness(encoded: &str) -> ExecutionWitness {
     }
 }
 
+/// Captured from Chiado under the RLP DA payload: `postbatch.hex` is the exact
+/// calldata mined in a real transaction, with a recorded digest and an
+/// independently generated signature. `native_block_span_v0` changes the bytes
+/// inside `batch.callData`, so this artifact can no longer validate and cannot
+/// be edited into one that does — a real anchor has to be recaptured on the new
+/// format and the fixture (calldata, digest, expected signature) regenerated
+/// with it. Ignored, not deleted: it is the only end-to-end regression anchor
+/// against captured production data.
+#[ignore = "fixture captures the pre-span DA payload; recapture on the new format"]
 #[tokio::test]
 async fn captured_window_is_validated_and_signed_by_the_shared_service() {
     let oracle: serde_json::Value = serde_json::from_str(&fixture("oracle.json")).unwrap();
@@ -100,7 +108,7 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
     for recorded in recorded_blocks.as_array().unwrap() {
         let number = fixture_u64(recorded, "number");
         let rlp = fixture_hex(&fixture(&format!("block-{number}.rlp.hex")));
-        let block = alloy_rlp::decode_exact::<reth_ethereum_primitives::Block>(&rlp).unwrap();
+        let block = alloy_rlp::decode_exact::<eez_primitives::Block>(&rlp).unwrap();
         window.push(ProveChunk {
             kind: Some(prove_chunk::Kind::Block(BlockWitness {
                 number,
@@ -130,8 +138,6 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
         system_address,
     )
     .unwrap();
-    let system_key =
-        SystemTransactionKey::new(SYSTEM_KEY.parse().unwrap(), system_address).unwrap();
     let limits = ServiceLimits::new(ServiceLimitsParams {
         max_window_blocks: NonZeroUsize::new(512).unwrap(),
         max_window_bytes: NonZeroUsize::new(512 * 1024 * 1024).unwrap(),
@@ -141,7 +147,7 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
     })
     .unwrap();
     let service = ProveSvc::new(
-        Arc::new(ServiceState::new(validator, rollup_id, attester, system_key).unwrap()),
+        Arc::new(ServiceState::new(validator, rollup_id, attester).unwrap()),
         limits,
     );
 

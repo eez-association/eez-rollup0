@@ -10,22 +10,21 @@ description            = "Shared EEZ proof-signer gRPC, settlement-validation, a
 test-utils = []
 
 [dependencies]
+eez-primitives.workspace = true
 # The `prove.v1` wire this daemon serves.
 eez-control-rpc.workspace = true
 # Canonical `postAndVerifyBatch` ABI types and codec.
 eez-protocol.workspace = true
+eez-payload-codec.workspace = true
 
 alloy-consensus.workspace = true
+alloy-eips.workspace = true
 alloy-primitives = { workspace = true, features = ["k256"] }
 alloy-rlp.workspace = true
 alloy-rpc-types-debug.workspace = true
-# The canonical signer type `SystemTxContext` stores; parsing the L2 system
-# key directly into it avoids a second secret representation.
-alloy-signer-local.workspace = true
 alloy-sol-types.workspace = true
 
 reth-chainspec.workspace = true
-reth-ethereum-primitives.workspace = true
 reth-primitives-traits.workspace = true
 
 eyre.workspace = true

@@ -43,7 +43,6 @@ struct DecodedBatchLog {
     /// This batch lists our rollup, so it wiped our queue — a window boundary.
     verifies_our_rollup: bool,
     call_data: Bytes,
-    post_batch_input: Bytes,
     claimed_current_state: Option<B256>,
     claimed_chain: Vec<B256>,
 }
@@ -91,13 +90,6 @@ pub struct ScannedBatch {
     pub tx_hash: B256,
     pub submitter: Address,
     pub call_data: Bytes,
-    /// The originating postBatch tx's full input (the `postAndVerifyBatch`
-    /// calldata), captured from the tx fetched by (block, index). Carried
-    /// so the Deriver's reconcile fallback decodes `batch.entries`
-    /// from these bytes instead of re-fetching the tx by hash — that lookup
-    /// fails on a pruned or still-resyncing embedded L1 and crashed boot
-    /// catch_up on restart-after-post.
-    pub post_batch_input: Bytes,
     pub state_applied: bool,
     /// Which of this batch's claimed steps L1 actually ran. See [`Settlement`].
     pub settlement: Settlement,
@@ -387,7 +379,6 @@ pub(crate) async fn scan_batch_logs_range(
                 .iter()
                 .any(|r| r.rollupId == rollup_id),
             call_data: decoded.batch.callData,
-            post_batch_input: input.clone(),
             claimed_current_state,
             claimed_chain,
         });
@@ -437,7 +428,6 @@ pub(crate) async fn scan_batch_logs_range(
             tx_hash: b.tx_hash,
             submitter: b.submitter,
             call_data: b.call_data,
-            post_batch_input: b.post_batch_input,
             state_applied: winner_tx_hashes.contains(&(b.l1_block_hash, b.tx_hash)),
             settlement,
             claimed_current_state: b.claimed_current_state,
