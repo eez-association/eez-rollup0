@@ -21,7 +21,6 @@ use blocks::EthereumBlock;
 #[cfg(test)]
 use blocks::RESERVED_SYSTEM_TRANSACTION_TYPE;
 #[cfg(test)]
-use da::encoded_bytes_match;
 #[cfg(test)]
 use inbound::inspect_inbound_candidate;
 
@@ -35,7 +34,7 @@ pub(crate) use blocks::{
 };
 pub(crate) use da::{DaPayloadError, verify_da_payload};
 #[cfg(test)]
-pub(crate) use da::{encode_da_payload, verify_da_payload_for_test};
+pub(crate) use da::{encode_da_payload, encode_da_payload_for, verify_da_payload_for_test};
 #[cfg(test)]
 pub(crate) use effect_binding::{BoundEffectSequence, ClaimedEntryShape, ObservedEffectKind};
 pub(crate) use effect_binding::{EffectPrefixError, bind_effects_to_execution};

@@ -77,6 +77,7 @@ fn verify_anchor_only_da_payload<'a>(
         &AuthorizedOutboundEffects::default(),
         &AuthorizedInboundEffects::default(),
         &system_transactions(),
+        1,
     )
 }
 
