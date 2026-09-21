@@ -99,10 +99,14 @@ run_forge() {
 
 compute_genesis_block_hash() {
     local genesis="$1"
-    (
-        cd "$REPO"
-        cargo run --quiet --locked --package eez-node --example genesis_block_hash -- "$genesis"
-    )
+    if command -v eez-genesis-block-hash >/dev/null 2>&1; then
+        eez-genesis-block-hash "$genesis"
+    else
+        (
+            cd "$REPO"
+            cargo run --quiet --locked --package eez-node --example genesis_block_hash -- "$genesis"
+        )
+    fi
 }
 
 compute_genesis_state_root() {
