@@ -125,28 +125,25 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
-      - name: Build E2E binaries
-        run: |
-          cargo build --locked \
-            -p eez-node \
-            -p eez-follower \
-            -p eez-prover-stateless \
-            -p eez-node-e2e \
-            --bins \
-            --examples \
-            --test e2e \
-            --test cross_chain \
-            --test chained_interstate \
-            --test resumption \
-            --test native_system
       - name: Archive integration test executables
         run: |
           mkdir -p artifacts/e2e-build
-          cargo nextest archive --locked -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test resumption --test native_system --archive-file artifacts/e2e-build/tests.tar.zst
-          cp target/debug/eez-composer artifacts/e2e-build/
-          cp target/debug/eez-follower artifacts/e2e-build/
-          cp target/debug/eez-proof-signer artifacts/e2e-build/
-          cp target/debug/examples/genesis_state_root artifacts/e2e-build/eez-genesis-state-root
+          cargo nextest archive --locked --cargo-profile ci-e2e -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test resumption --test native_system --archive-file artifacts/e2e-build/tests.tar.zst
+      - name: Build E2E runtime binaries
+        run: |
+          cargo build --locked \
+            --profile ci-e2e \
+            -p eez-node \
+            -p eez-follower \
+            -p eez-prover-stateless \
+            --bins \
+            --examples
+      - name: Stage E2E runtime binaries
+        run: |
+          cp target/ci-e2e/eez-composer artifacts/e2e-build/
+          cp target/ci-e2e/eez-follower artifacts/e2e-build/
+          cp target/ci-e2e/eez-proof-signer artifacts/e2e-build/
+          cp target/ci-e2e/examples/genesis_state_root artifacts/e2e-build/eez-genesis-state-root
           strip artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
