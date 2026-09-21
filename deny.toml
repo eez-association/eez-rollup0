@@ -22,6 +22,7 @@ ignore = [
     # Reached via reth's p2p DNS discovery, which we do not enable.
     "RUSTSEC-2026-0118",
     "RUSTSEC-2026-0119",
+    "RUSTSEC-2026-0292",
 ]
 
 [bans]
