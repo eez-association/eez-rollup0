@@ -125,12 +125,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
-      - name: Build helper binaries
+      - name: Build E2E binaries
         run: |
-          cargo build --locked -p eez-node --bin eez-composer
-          cargo build --locked -p eez-follower --bin eez-follower
-          cargo build --locked -p eez-prover-stateless --bin eez-proof-signer
-          cargo build --locked -p eez-node --example genesis_state_root
+          cargo build --locked \
+            -p eez-node \
+            -p eez-follower \
+            -p eez-prover-stateless \
+            -p eez-node-e2e \
+            --bins \
+            --examples \
+            --test e2e \
+            --test cross_chain \
+            --test chained_interstate \
+            --test resumption \
+            --test native_system
       - name: Archive integration test executables
         run: |
           mkdir -p artifacts/e2e-build
