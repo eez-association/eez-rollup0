@@ -530,15 +530,16 @@ impl SyncBlockFork {
     }
 }
 
-/// Per-effect candidate block hashes — the hash of the block holding each
-/// cross-chain effect's tx group and everything before it, one per effect.
+/// Per-effect candidate block hashes, one per effect.
+///
+/// Each candidate is the Sync block cut short right after that effect's tx
+/// group, so candidate `i` is a strict prefix of candidate `i + 1`.
 ///
 /// Each settlement entry's `newState` is its effect's candidate hash, so a
 /// settlement that stops at that effect names the exact block L2 must hold.
 /// Built by rebuilding the Sync block on each pair-end prefix of `sync_txs`.
-/// The candidates are siblings at one height, not a chain: same parent, number
-/// and timestamp, differing only in how many transactions they carry. Exactly
-/// one becomes canonical — the prefix L1 consumed. Settlement path only.
+/// Siblings at one height, not a chain: same parent, number and timestamp, with
+/// execution-derived commitments differing per prefix. One becomes canonical.
 ///
 /// # Errors
 ///

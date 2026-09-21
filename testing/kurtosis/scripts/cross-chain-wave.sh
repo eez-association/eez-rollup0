@@ -187,7 +187,9 @@ INCLUDE_REVERTS="${EEZ_INCLUDE_REVERTS:-0}"
 PURE_RECIPIENT=0x2222222222222222222222222222222222222222
 
 # Kurtosis names containers eez-node--<hash>; compose names them eez-node-kurtosis.
-_container() { docker ps --format "{{.Names}}" | grep -m1 -E "^$1(--|-)" ; }
+# `|| true`: no match is the normal pre-launch state, and grep exiting 1
+# would take the whole run down under `set -euo pipefail`.
+_container() { docker ps --format "{{.Names}}" | grep -m1 -E "^$1(--|-)" || true; }
 refresh_node_log() { local c; c=$(_container eez-node); [[ -n "$c" ]] && docker logs "$c" >"$NODE_LOG" 2>&1 || true; }
 refresh_signer_log() { local c; c=$(_container eez-proof-signer); [[ -n "$c" ]] && docker logs "$c" >"$SIGNER_LOG" 2>&1 || true; }
 

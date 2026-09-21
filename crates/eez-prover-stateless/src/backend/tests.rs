@@ -365,6 +365,48 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
     assert_eq!(plan.transaction_indices(), [1, 2]);
 }
 
+/// The final transaction is ALWAYS a planned boundary. The stateless backend's
+/// post-execution-neutrality check silently stops running if that ever breaks.
+#[test]
+fn checkpoint_plan_always_ends_at_the_final_transaction() {
+    let system = || {
+        <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(
+            &hex::decode(SYSTEM_TX).unwrap(),
+        )
+        .unwrap()
+    };
+    let user = || -> TransactionSigned {
+        TxLegacy::default()
+            .into_signed(Signature::test_signature())
+            .into()
+    };
+
+    // Every system/user shape up to six transactions.
+    for width in 1..=6usize {
+        for mask in 0..(1u32 << width) {
+            let shape: Vec<bool> = (0..width).map(|i| mask >> i & 1 == 1).collect();
+            let block = Block::new(
+                Default::default(),
+                alloy_consensus::BlockBody {
+                    transactions: shape
+                        .iter()
+                        .map(|&is_system| if is_system { system() } else { user() })
+                        .collect(),
+                    ..Default::default()
+                },
+            );
+            let recovered = RecoveredBlock::new_unhashed(block, vec![TEST_SYSTEM_ADDRESS; width]);
+            let (plan, _) = CheckpointPlan::from_recovered_block(&recovered, TEST_SYSTEM_ADDRESS);
+
+            assert_eq!(
+                plan.transaction_indices().last(),
+                Some(&(width - 1)),
+                "shape {shape:?} did not plan its final transaction",
+            );
+        }
+    }
+}
+
 #[test]
 fn checkpoint_plan_includes_every_inbound_boundary() {
     let transaction = || {

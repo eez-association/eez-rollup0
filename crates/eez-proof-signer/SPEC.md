@@ -465,9 +465,10 @@ U[n - 1].newState == window_post_block_hash
 ```
 
 Every committed value is a block hash. Interior values name candidate blocks:
-siblings at the terminal height sharing a parent, number and timestamp, and
-differing only in how many transactions they carry, of which exactly one
-becomes canonical. The sequence is therefore a commitment chain, not a
+siblings at the terminal height sharing the fixed header fields — parent,
+number and timestamp — while the commitments derived from execution are
+rebuilt from the transaction prefix each one carries. Exactly one becomes
+canonical. The sequence is therefore a commitment chain, not a
 parent-child chain.
 
 These checks bind the continuous Composer claim to validated endpoints. The

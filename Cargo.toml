@@ -117,7 +117,7 @@ reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", rev = "fd59f
 # Stateless execution, aligned with the same Reth revision used by the node.
 # Candidate block hashes, on a fork of the generic-primitives branch pending
 # upstream merge. Drop back to the source branch once the change lands there.
-stateless-reth = { package = "stateless", git = "https://github.com/debjit-bw/stateless", rev = "1489761aa30e8dda605a15e652d19a34fa5e47be" }
+stateless-reth = { package = "stateless", git = "https://github.com/eez-association/stateless", rev = "5727dd36b6d9eb9b0f518cb97cc57bc4b7ee35d7" }
 
 # reth_gnosis — Gnosis chain (chiado / gnosis mainnet) NodeBuilder.
 # Pinned to the rollup0-fd59fd22 branch which is the reth_gnosis

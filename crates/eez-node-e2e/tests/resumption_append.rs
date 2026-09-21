@@ -218,20 +218,24 @@ async fn a_resumed_batch_appends_the_l2_content_of_the_entries_it_settled() {
     w.node.assert_no_divergence_failure_logs();
     w.node.assert_no_process_death();
 
-    // And the pipeline must keep settling afterwards.
-    let head = ProviderBuilder::new()
-        .connect_http(l2.parse().unwrap())
-        .get_block_number()
-        .await
-        .unwrap();
+    // A rising local head proves nothing: a wrongly rebuilt Sync block still
+    // produces blocks while L1 stops accepting them. Require a settled one.
+    let rollup_id = w.cfg.rollup_id;
+    let before = eez_testkit::safe_block_hash(&l2).await.unwrap();
     eez_testkit::wait_for(TIMEOUT, || async {
-        let now = ProviderBuilder::new()
-            .connect_http(l2.parse().unwrap())
-            .get_block_number()
-            .await?;
-        Ok((now > head).then_some(now))
+        let Some(safe) = eez_testkit::safe_block_hash(&l2).await? else {
+            return Ok(None);
+        };
+        if Some(safe) == before {
+            return Ok(None);
+        }
+        let settled = eez_testkit::rollup_commitment(&l1, eez, rollup_id).await?;
+        Ok((settled == safe).then_some(safe))
     })
     .await
-    .expect("L2 stopped advancing after a resumed batch appended content");
+    .expect(
+        "no batch settled after the resumed append: the L1 commitment never \
+         caught up to a new L2 safe block",
+    );
     w.node.assert_no_divergence_failure_logs();
 }

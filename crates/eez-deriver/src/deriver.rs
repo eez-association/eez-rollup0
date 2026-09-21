@@ -1804,21 +1804,17 @@ where
                     (true, Some(full)) => full.clone(),
                     _ => user_txs.to_vec(),
                 };
-                // The endpoint comparison above decides whether the range is
-                // right; this only avoids rewriting blocks that already are.
-                // Rewriting one is not free: it leaves reth a sibling at a
-                // canonical height that later vanishes from the headers table,
-                // and every forkchoice update after that fails.
-                //
-                // A wrong skip cannot pass silently — the terminal block's hash
-                // commits to its whole ancestry, so `check_claimed_state`
-                // rejects the range. That is why matching transactions is
-                // enough here and no header-field list is needed.
-                let should_replay = suffix_replay.required(local_block_matches(
-                    &self.inner.l2_provider,
-                    l2_block,
-                    &block_txs,
-                )?);
+                // Skip only identical blocks: a needless rewrite wedges reth.
+                // Txs alone do not identify one; the header inputs seal in too.
+                let header_inputs = BlockHeaderInputs::from_span(decoded, i)?;
+                let local_matches =
+                    local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
+                        && local_header_inputs_match(
+                            &self.inner.l2_provider,
+                            l2_block,
+                            &header_inputs,
+                        )?;
+                let should_replay = suffix_replay.required(local_matches);
                 event!(
                     name: "eez.deriver.reconcile.block",
                     Level::DEBUG,
@@ -1834,11 +1830,7 @@ where
                     continue;
                 }
                 let outcome = self
-                    .replay_block(
-                        l2_block - 1,
-                        &block_txs,
-                        &BlockHeaderInputs::from_span(decoded, i)?,
-                    )
+                    .replay_block(l2_block - 1, &block_txs, &header_inputs)
                     .await?;
                 if is_sync_block {
                     sync_block_hash = Some(outcome.block_hash);
@@ -2125,6 +2117,61 @@ fn cursor_root_accepted(local_root: B256, entry_state: B256, final_state: Option
 
 /// `true` iff the first local block in a batch is anchored to the current
 /// local parent. `false` if the block is missing or sits on stale ancestry.
+/// Whether the local block's header inputs are the ones the DA names.
+///
+/// Matching transactions is not enough: these seal into the header hash too,
+/// so a block differing in them is a different block nothing else catches.
+fn local_header_inputs_match<L2>(
+    l2_provider: &Arc<L2>,
+    block_number: u64,
+    expected: &BlockHeaderInputs,
+) -> DeriverResult<bool>
+where
+    L2: BlockReader<Header = alloy_consensus::Header>,
+{
+    let Some(header) = l2_provider
+        .sealed_header(block_number)
+        .map_err(DeriverError::l2_provider)?
+    else {
+        return Ok(false);
+    };
+    Ok(header_inputs_match(&header, expected))
+}
+
+/// The comparison itself, split out so it is testable without a provider.
+fn header_inputs_match(header: &alloy_consensus::Header, expected: &BlockHeaderInputs) -> bool {
+    header.beneficiary == expected.beneficiary && header.extra_data == expected.extra_data
+}
+
+#[cfg(test)]
+mod header_inputs_tests {
+    use super::{BlockHeaderInputs, header_inputs_match};
+    use alloy_primitives::{Address, Bytes};
+
+    /// A block whose txs match but whose header inputs do not is a DIFFERENT
+    /// block, and the skip paths are the only guard against treating it as one.
+    #[test]
+    fn header_inputs_decide_block_identity_beyond_transactions() {
+        let expected = BlockHeaderInputs {
+            beneficiary: Address::with_last_byte(0xAA),
+            extra_data: Bytes::from_static(b"eez"),
+        };
+        let mut header = alloy_consensus::Header {
+            beneficiary: expected.beneficiary,
+            extra_data: expected.extra_data.clone(),
+            ..Default::default()
+        };
+        assert!(header_inputs_match(&header, &expected));
+
+        header.beneficiary = Address::with_last_byte(0xBB);
+        assert!(!header_inputs_match(&header, &expected), "beneficiary");
+
+        header.beneficiary = expected.beneficiary;
+        header.extra_data = Bytes::from_static(b"other");
+        assert!(!header_inputs_match(&header, &expected), "extraData");
+    }
+}
+
 fn local_batch_boundary_matches<L2>(l2_provider: &Arc<L2>, from_block: u64) -> DeriverResult<bool>
 where
     L2: BlockReader<Header = alloy_consensus::Header>,

@@ -114,10 +114,11 @@ through effect `i`'s effect-ending transaction:
 Each `R[i]` MUST be derived from execution of the exact terminal-block
 transaction prefix through that transaction from the terminal block's parent
 state, using the same block execution environment as the complete terminal
-block. Every candidate shares that parent, number and timestamp and differs
-only in how many transactions it carries, so `R` is a commitment chain rather
-than a parent-child chain. A Composer MAY capture these checkpoints during one
-complete execution or execute the prefixes separately.
+block. Every candidate shares the terminal block's fixed header fields —
+parent, number and timestamp — while the commitments derived from execution
+are rebuilt from the prefix it carries, so `R` is a commitment chain rather
+than a parent-child chain. A Composer MAY capture these checkpoints during
+one complete execution or execute the prefixes separately.
 
 Let `U[j] = entries[j].stateUpdates[0]`. For a batch with `E > 0` effects, the
 state updates MUST be:

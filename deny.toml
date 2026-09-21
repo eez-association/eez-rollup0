@@ -40,7 +40,7 @@ unknown-git = "deny"
 # deliberate, reviewed change rather than a silent one.
 allow-git = [
     "https://github.com/paradigmxyz/reth",
-    "https://github.com/AdityaSripal/stateless",
+    "https://github.com/eez-association/stateless",
     "https://github.com/gnosischain/reth_gnosis",
     "https://github.com/gnosischain/rust-primitives.git",
     "https://github.com/sigp/discv5",
