@@ -465,7 +465,6 @@ pub(crate) fn count_u32(what: &'static str, value: usize) -> CodecResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
 
     fn tx(byte: u8, n: usize) -> RawTx {
         vec![byte; n]

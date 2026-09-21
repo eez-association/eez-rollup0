@@ -11,7 +11,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 alloy-primitives.workspace = true
-proptest = "1"
 
 [lints]
 workspace = true

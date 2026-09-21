@@ -3180,6 +3180,7 @@ dependencies = [
  "eez-protocol",
  "eez-prover",
  "gnosis-primitives",
+ "proptest",
  "reth-chainspec 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-ethereum-primitives 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
  "reth-evm 2.2.0 (git+https://github.com/paradigmxyz/reth?rev=fd59fd2222b51239abebd9aa234f28b0b5f336eb)",
@@ -3486,7 +3487,6 @@ name = "eez-payload-codec"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
- "proptest",
  "thiserror 2.0.18",
 ]
 
