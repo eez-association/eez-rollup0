@@ -142,6 +142,9 @@ services:
       - ${FRESH_GENESIS:?set FRESH_GENESIS}:/app/genesis.json:ro
     command:
       - node
+      # Harnesses parse structured events out of this log; the default terminal
+      # format hides them behind ANSI codes and `key=value` framing.
+      - --log.stdout.format=json
       - --chain=/app/genesis.json
       - --datadir=/l2
       - --http
@@ -186,6 +189,8 @@ services:
       - --jwt-secrets=/jwt/jwt.hex
       - --datadir=/data
       - --checkpoint-sync-url=${LH_CHECKPOINT_URL:-https://checkpoint.chiadochain.net/}
+      # Current chiado CL bootnodes. Discovery alone is too sparse here.
+      - --boot-nodes=enr:-IS4QC9xcSNOKeUBrjOX1-qwcPDGOvRK-Aql_YnRfuYsuXElQawANMLTOz1YfrZTMI07B7DAl9hmk3ic5G7ZHQbq4HsUgmlkgnY0gmlwhDNL9gKJc2VjcDI1NmsxoQOzB8HdKe07eQBOxu5nexAWECV47zxlau23oEYqoToy9YN1ZHCCIyg,enr:-IS4QMpCWNqXmqbtXg7vQyYBwV2xTDpgTNpgAz060TY5cpJ3JdjuwAkLG01Vf9Vlfb0jtRhJEpj0CfteG-3K_V36bmECgmlkgnY0gmlwhDmBRt6Jc2VjcDI1NmsxoQNkoifSsk1ijP3-OR9pcL2VWCSfD5_syapyrXA83GcAvYN1ZHCCIyg,enr:-IS4QBa3hl_BcjrY4z_OvhRBx7qUMBFGkjkoedGNMXgC_fzLRBsg161SipeHWAkUnSuvBg_7529-Qfxcc7CAbokn4fMCgmlkgnY0gmlwhDmA_HuJc2VjcDI1NmsxoQL8xX-V_pyU_l3AIfVokHKMN1OMUG02vcy4AMOxdyi5jIN1ZHCCIyg,enr:-IS4QEuUku9zL0V3hFHt41fqmEdvphEvrOg0D4K_TgiiaePCDH2IPzt6B3O6NLHtgJNXk3UW68DL6KVBD4rjoW-nW9ACgmlkgnY0gmlwhDYnlGKJc2VjcDI1NmsxoQP3W66lisn2YOJF4B0QDEnURZ6tqzpi5gBy9rbMfpC70YN1ZHCCIyg
       # Direct chiado peers — discovery alone is too sparse on a fresh
       # lighthouse DB; without these the beacon head never advances (0
       # peers) and the embedded EL stalls. Copied from docker-compose.chiado.yml.

@@ -352,18 +352,20 @@ supplied witness and configured chain rules:
 - transaction execution and receipt results;
 - the computed block hash;
 - the computed post-state root and its header commitment; and
-- any selected post-transaction state roots.
+- at any selected post-transaction position, the state root and the hash of the
+  candidate block holding exactly that transaction prefix.
 
 The pre-state root of each block after the first MUST equal the preceding
-block's computed post-state root. The resulting window therefore exposes:
+block's computed post-state root. This telescope is self-consistency, not proof
+that the first pre-state belongs to the canonical chain.
 
-- `window_pre_state_root`: validated pre-state of the first block;
-- `settling_pre_state_root`: computed post-state of the preceding block, or the
-  window pre-state for a one-block window; and
-- `window_post_state_root`: computed post-state of the terminal block.
+The window exposes three settlement endpoints, each a block identity taken
+from a header rather than from a backend root:
 
-This telescope is self-consistency, not proof that the first pre-state belongs
-to the canonical chain.
+- `window_pre_block_hash`: parent hash of the first block, which for a
+  one-block window is the terminal block's parent;
+- `settling_pre_block_hash`: parent hash of the terminal block; and
+- `window_post_block_hash`: computed hash of the terminal block.
 
 ### 6.4 Stateful replay guarantees
 
@@ -377,8 +379,9 @@ For a request covering `m..=n`, the stateful backend MUST:
 4. open historical state at the canonical anchor and replay every proposed
    block through `n` in one disposable state overlay;
 5. apply sections 6.1 and 6.2 and validate each block's consensus/header rules,
-   transactions, receipts, block hash, post-state root, and selected
-   post-transaction state roots against the continuously updated overlay; and
+   transactions, receipts, block hash, post-state root, and the state root and
+   candidate block hash at every selected post-transaction position, against
+   the continuously updated overlay; and
 6. after replay, re-read the anchor and every requested height known canonical
    at completion, returning `Aborted` if that snapshot changed.
 
@@ -456,10 +459,17 @@ rollup ID.
 For entries `E[0..n)` with updates `U[0..n)`, the signer MUST require:
 
 ```text
-U[0].currentState == window_pre_state_root
+U[0].currentState == window_pre_block_hash
 U[i].currentState == U[i - 1].newState       for every i > 0
-U[n - 1].newState == window_post_state_root
+U[n - 1].newState == window_post_block_hash
 ```
+
+Every committed value is a block hash. Interior values name candidate blocks:
+siblings at the terminal height sharing the fixed header fields — parent,
+number and timestamp — while the commitments derived from execution are
+rebuilt from the transaction prefix each one carries. Exactly one becomes
+canonical. The sequence is therefore a commitment chain, not a
+parent-child chain.
 
 These checks bind the continuous Composer claim to validated endpoints. The
 interior `newState` values are additionally bound to execution checkpoints
@@ -516,12 +526,12 @@ Every later entry MUST be one of:
 A second anchor or any other shape MUST be rejected.
 
 The anchor's `etherDelta` MUST be zero. If at least one effect exists, the
-anchor's `newState` MUST equal `settling_pre_state_root`. If no effects exist,
+anchor's `newState` MUST equal `settling_pre_block_hash`. If no effects exist,
 the anchor alone covers the complete window transition.
 
 For every effect at candidate position `C[i]`, the backend checkpoint MUST
-target `C[i]`, and the effect's `StateUpdate.newState` MUST equal that computed
-post-transaction state root.
+target `C[i]`, and the effect's `StateUpdate.newState` MUST equal the hash of
+the candidate block that checkpoint sealed over the prefix ending at `C[i]`.
 
 ## 9. Inbound authorization
 

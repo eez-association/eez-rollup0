@@ -50,14 +50,14 @@ flowchart LR
    values. It retains the typed capability needed for later hash computation;
    it never accepts the wire hash as authoritative.
 3. `state_chain` requires exactly one expected-rollup state update per entry and a
-   continuous chain from `ValidatedWindow.window_pre_state_root` to
-   `window_post_state_root`.
+   continuous commitment chain from `ValidatedWindow.window_pre_block_hash` to
+   `window_post_block_hash`.
 4. `blocks` consumes the validated system-sender flags, receipt outcomes, and
    outbound observations in exact transaction order. It rejects
    privileged/effect evidence in `preceding_blocks` and derives the
    `settling_block` effect-candidate framing once.
 5. `effect_binding` enforces the leading-anchor and later-effect shapes,
-   including the anchor root and zero anchor ether delta, then joins every
+   including the anchor block hash and zero anchor ether delta, then joins every
    submitted effect, candidate transaction, and locally recomputed checkpoint by ordinal.
    It returns one ordered `BoundEffectSequence`.
 6. `inbound` returns `AuthorizedInboundEffects` only after canonical delivery

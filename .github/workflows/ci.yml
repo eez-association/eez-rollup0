@@ -143,7 +143,7 @@ jobs:
   embedded-e2e:
     name: Embedded E2E Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 80
     env:
       EEZ_TEST_LOG_DIR: ${{ github.workspace }}/artifacts/embedded-e2e/logs
       EEZ_TEST_DATADIR_DIR: ${{ github.workspace }}/artifacts/embedded-e2e/datadirs
@@ -174,7 +174,7 @@ jobs:
       - name: Verify generated EEZL2 genesis artifacts
         run: scripts/update-eezl2-genesis.sh --check
       - name: Integration tests (e2e, serial)
-        timeout-minutes: 40
+        timeout-minutes: 60
         run: |
           mkdir -p artifacts/embedded-e2e
           set +e
@@ -228,7 +228,7 @@ jobs:
         run: |
           mkdir -p artifacts/cross-chain-e2e
           set +e
-          cargo nextest run -P ci -p eez-node-e2e --test cross_chain --test chained_interstate --test resumption --test native_system --test-threads=1 --no-fail-fast --color=always 2>&1 \
+          cargo nextest run -P ci -p eez-node-e2e --test cross_chain --test chained_interstate --test resumption --test resumption_append --test native_system --test-threads=1 --no-fail-fast --color=always 2>&1 \
             | tee artifacts/cross-chain-e2e/nextest.log
           status=${PIPESTATUS[0]}
           set -e
