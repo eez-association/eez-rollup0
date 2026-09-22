@@ -2511,6 +2511,7 @@ mod applied_selection_tests {
     use super::{AppliedSlots, select_applied_slots};
     use alloy_primitives::{Address, B256, Bytes};
     use eez_l1::{AppliedEntry, EntryRole, Settlement};
+    use proptest::prelude::*;
 
     fn producing_entry(tag: u8) -> eez_protocol::abi::ExecutionEntrySol {
         eez_protocol::abi::ExecutionEntrySol {
@@ -2526,6 +2527,74 @@ mod applied_selection_tests {
                 data: Bytes::new(),
             }],
             ..Default::default()
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Selection is by ORDINAL, not offset: each applied outbound entry keeps
+        /// the user tx at its own ordinal and anchors contribute nothing, so a
+        /// non-contiguous applied set never shifts the rest.
+        #[test]
+        fn selection_pins_every_entry_to_its_own_ordinal(
+            outbound_len in 0usize..12,
+            inbound_len in 0usize..12,
+            picks in prop::collection::vec(any::<bool>(), 24),
+            with_anchor in any::<bool>(),
+        ) {
+            let outbound: Vec<_> = (0..outbound_len)
+                .map(|i| producing_entry(u8::try_from(i).unwrap()))
+                .collect();
+            let inbound: Vec<_> = (0..inbound_len)
+                .map(|i| producing_entry(0x80 | u8::try_from(i).unwrap()))
+                .collect();
+            let txs: Vec<Bytes> = (0..outbound_len)
+                .map(|i| user_tx(u8::try_from(i).unwrap()))
+                .collect();
+
+            let mut applied = Vec::new();
+            let mut index = 0usize;
+            if with_anchor {
+                applied.push(AppliedEntry { entry_index: index, role: EntryRole::Anchor });
+                index += 1;
+            }
+            let mut want_outbound = Vec::new();
+            for (ordinal, &pick) in picks.iter().enumerate().take(outbound_len) {
+                if pick {
+                    applied.push(AppliedEntry {
+                        entry_index: index,
+                        role: EntryRole::Outbound { ordinal },
+                    });
+                    want_outbound.push(ordinal);
+                }
+                index += 1;
+            }
+            let mut want_inbound = 0usize;
+            for (ordinal, &pick) in picks[12..].iter().enumerate().take(inbound_len) {
+                if pick {
+                    applied.push(AppliedEntry {
+                        entry_index: index,
+                        role: EntryRole::Inbound { ordinal },
+                    });
+                    want_inbound += 1;
+                }
+                index += 1;
+            }
+
+            let slots = select_applied_slots(
+                &Settlement::new(applied, None, None),
+                &outbound,
+                &inbound,
+                &txs,
+            )
+            .expect("every ordinal addresses the DA");
+
+            prop_assert_eq!(slots.outbound_paired.len(), want_outbound.len());
+            prop_assert_eq!(slots.inbound.len(), want_inbound);
+            for (slot, &ordinal) in slots.outbound_paired.iter().zip(&want_outbound) {
+                prop_assert_eq!(&slot.1, &txs[ordinal]);
+            }
         }
     }
 
