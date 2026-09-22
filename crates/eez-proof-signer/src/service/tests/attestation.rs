@@ -556,11 +556,9 @@ async fn a_batch_for_a_different_proof_system_is_rejected() {
     assert_eq!(inner.validator.stub_remaining(), 0);
 }
 
-/// The deployed signer profile attests exactly one proof system. A structurally
-/// valid-looking batch must not widen that trust boundary by adding a second
-/// proof system.
+/// The current proof signer supports exactly one configured proof system.
 #[tokio::test]
-async fn a_multi_proof_system_batch_is_rejected() {
+async fn rejects_batch_with_more_than_one_proof_system() {
     let inner = one_accepting_validator();
     let server = TestServer::new(Arc::clone(&inner)).await;
     let mut batch = anchor_batch();
@@ -583,7 +581,7 @@ async fn a_multi_proof_system_batch_is_rejected() {
 /// Block-number-bound public inputs remain disabled until the signer has an
 /// authenticated L1 block oracle.
 #[tokio::test]
-async fn a_non_timeless_batch_is_rejected() {
+async fn rejects_block_number_bound_batch_without_l1_oracle() {
     let inner = one_accepting_validator();
     let server = TestServer::new(Arc::clone(&inner)).await;
     let mut batch = anchor_batch();
