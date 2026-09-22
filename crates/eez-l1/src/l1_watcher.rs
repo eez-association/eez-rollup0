@@ -1001,6 +1001,7 @@ mod tests {
         ));
         asserter.push_success(&serde_json::json!([])); // BatchPosted logs
         asserter.push_success(&serde_json::json!([])); // winner logs
+        asserter.push_success(&serde_json::json!([])); // consumption events
 
         watcher
             .poll_cycle(&provider, &mut state, 1)
@@ -1045,6 +1046,7 @@ mod tests {
         ));
         asserter.push_success(&serde_json::json!([]));
         asserter.push_success(&serde_json::json!([]));
+        asserter.push_success(&serde_json::json!([])); // consumption events
         // Ancestor window: parent of latest, then grandparent.
         asserter.push_success(&mock_block(199_999, latest_parent, ancestor2_hash, 4_999));
         asserter.push_success(&mock_block(199_998, ancestor2_hash, ancestor1_hash, 4_998));
@@ -1100,6 +1102,7 @@ mod tests {
         asserter.push_success(&mock_block(10, tip_hash, B256::with_last_byte(9), 10)); // at_old_height check
         asserter.push_success(&serde_json::json!([])); // BatchPosted logs
         asserter.push_success(&serde_json::json!([])); // winner logs
+        asserter.push_success(&serde_json::json!([])); // consumption events
         asserter.push_success(&mock_block(49_999, latest_parent, grandparent_hash, 4_999));
         asserter.push_success(&mock_block(
             49_998,
@@ -1137,6 +1140,7 @@ mod tests {
         asserter.push_success(&mock_block(50_000, replacement_hash, latest_parent, 5_001));
         asserter.push_success(&serde_json::json!([])); // BatchPosted logs
         asserter.push_success(&serde_json::json!([])); // winner logs
+        asserter.push_success(&serde_json::json!([])); // consumption events
         asserter.push_success(&mock_block(50_000, replacement_hash, latest_parent, 5_001)); // fill_forward by-hash
 
         watcher
@@ -1308,6 +1312,7 @@ mod tests {
         asserter.push_success(&mock_block(11, next_hash, tip_hash, 100));
         asserter.push_success(&serde_json::json!([])); // BatchPosted logs
         asserter.push_success(&serde_json::json!([])); // winner logs
+        asserter.push_success(&serde_json::json!([])); // consumption events
 
         watcher
             .poll_cycle(&provider, &mut state, 2)
@@ -1369,6 +1374,7 @@ mod tests {
         asserter.push_success(&mock_block(11, h11, tip_hash, 110)); // walk-back fetch
         asserter.push_success(&serde_json::json!([])); // BatchPosted logs
         asserter.push_success(&serde_json::json!([])); // winner logs
+        asserter.push_success(&serde_json::json!([])); // consumption events
         asserter.push_success(&mock_block(12, h12, h11, 200)); // fill_forward: by-hash h12
         asserter.push_success(&mock_block(11, h11, tip_hash, 110)); // fill_forward: by-hash h11
 
@@ -1412,6 +1418,7 @@ mod tests {
         asserter.push_failure_msg("query returned more than 10000 results"); // get_logs [11,13]
         asserter.push_success(&serde_json::json!([])); // get_logs [11,12] BatchPosted
         asserter.push_success(&serde_json::json!([])); // get_logs [11,12] winners
+        asserter.push_success(&serde_json::json!([])); // consumption events
         asserter.push_success(&mock_block(12, h12, h11, 1_200)); // boundary fetch (reached != latest)
         asserter.push_success(&mock_block(12, h12, h11, 1_200)); // fill_forward: by-hash h12
         asserter.push_success(&mock_block(11, h11, tip_hash, 1_100)); // fill_forward: by-hash h11
