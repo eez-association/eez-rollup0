@@ -516,14 +516,8 @@ struct SettlementFailureOutcome {
 /// Count one failed settlement episode for every candidate, evict transactions
 /// that reach the bound, and cascade each eviction through its sender/direction
 /// nonce suffix. Survivors retain their attempt count and FIFO order.
-/// Three-way disposition of a recovered batch's in-flight transactions.
-///
-/// An L1 receipt means the transaction executed — its entry was consumed, or it
-/// reverted in place — so its nonce is burned and re-queueing it would
-/// double-spend that nonce; the user resubmits. No receipt means it never ran,
-/// so it goes back to the pool. This is what makes a partial settlement safe:
-/// the consumed prefix is released, the unconsumed tail is re-queued, and
-/// neither is inferred from a count.
+/// Three-way disposition of a recovered batch's in-flight transactions: a
+/// receipt burns the nonce, no receipt returns the tx to the pool.
 fn dispose_recovered_txs(
     rollup_id: u64,
     pool: &crate::HeldPool,
@@ -542,6 +536,7 @@ fn dispose_recovered_txs(
             event!(
                 name: "eez.composer.recovery.nonce_burned",
                 Level::WARN,
+                event_name = "eez.composer.recovery.nonce_burned",
                 rollup_id,
                 tx_hash = %tx.hash,
                 "user_tx already has an L1 receipt; not re-queueing (user must resubmit)",
@@ -1654,15 +1649,11 @@ where
         }
     }
 
-    /// Sweep a prefix-settled batch: L1 kept the entries that ran, so the height
-    /// stays canonical and NOTHING is rolled back — the Deriver rebuilds the
-    /// block L1 named. Only the transaction disposition is owed.
+    /// Sweep a prefix-settled batch: the height stays canonical, so nothing is
+    /// rolled back and only the tx disposition is owed.
     ///
-    /// Charges no attempt. The transaction that caused the short settle reverted
-    /// on L1, so it has a receipt and is removed by the burn below; the tail
-    /// behind it never ran and is not at fault. The attempt counter exists to
-    /// evict a transaction that keeps poisoning whole bundles, which a dropped
-    /// one no longer does.
+    /// Charges no attempt — the reverting tx is burned below, and the tail
+    /// behind it never ran.
     async fn recover_short_batch(
         &self,
         rollup_id: u64,
@@ -1676,9 +1667,8 @@ where
                 Ok(true) => landed.push(tx.hash),
                 Ok(false) => {}
                 Err(err) => {
-                    // Without the receipts we cannot tell a burned nonce from a
-                    // transaction that must be re-queued, and guessing either way
-                    // loses it silently. Hold the entry and retry next slot.
+                    // Without receipts a burned nonce is indistinguishable from
+                    // a re-queueable tx, so hold the entry and retry next slot.
                     event!(
                         name: "eez.composer.recovery.short_receipt_check_failed",
                         Level::WARN,
@@ -1696,6 +1686,7 @@ where
         event!(
             name: "eez.composer.recovery.settled_short",
             Level::INFO,
+            event_name = "eez.composer.recovery.settled_short",
             rollup_id,
             sync_height,
             txs = short.txs.len(),
@@ -4369,15 +4360,12 @@ async fn observe_bundle_outcome(
     };
     // Settled = L1 reached the claimed endpoint. Anything short is a prefix.
     let settled = settlement.is_some_and(|s| s.final_state == Some(expected_final_state));
-    // Whether the Sync block has any canonical content. The anchor moves the
-    // commitment but signs no system tx, so an anchor-only settlement leaves L1
-    // naming the block BEFORE this one: the block is unratified and must be
-    // reorged, not kept. Every other prefix names a block at this height.
+    // The anchor claims the block BEFORE this one, so an anchor-only settlement
+    // leaves this height unratified: reorged, not kept.
     let kept_an_effect = settlement.is_some_and(eez_l1::Settlement::applied_an_effect);
     match &outcome {
-        // Included and settled SHORT: L1 kept the entries that ran, so the
-        // height stays canonical and the Deriver rebuilds the block L1 named.
-        // Only the unconsumed tail's transactions are owed a disposition.
+        // Settled SHORT: the height stays canonical and the Deriver rebuilds the
+        // block L1 named; only the unconsumed tail is owed a disposition.
         Ok(o @ SendOutcome::Included { .. }) if !settled && kept_an_effect => event!(
             name: "eez.composer.bundle.observed",
             Level::WARN,
@@ -4436,9 +4424,8 @@ async fn observe_bundle_outcome(
         // recovery owes only the tail disposition — no rollback.
         optimistic.mark_settled_short(sync_height);
     } else {
-        // Includes the anchor-only case: L1 advanced the commitment but ran none
-        // of this block's effects, so the block itself is unratified and the
-        // reorg path is correct.
+        // Includes the anchor-only case: the commitment moved but no effect ran,
+        // so the block is unratified and the reorg path is correct.
         //
         // slot_skipped = the drop was NOT attributable to the bundled txs →
         // requeue without counting an attempt toward poison-eviction.
@@ -4574,10 +4561,8 @@ mod tests {
         ));
     }
 
-    /// THE partial-consumption safety property: an L1 receipt means the tx ran
-    /// (consumed, or reverted in place), so its nonce is burned and re-queueing
-    /// it would double-spend. No receipt means it never ran, so it must come
-    /// back. Neither side is inferred from a count.
+    /// The safety property: a receipt means the tx ran, so its nonce is burned;
+    /// no receipt means it never ran and must come back.
     #[test]
     fn a_prefix_settlement_releases_what_landed_and_requeues_only_the_tail() {
         let pool = crate::HeldPool::new();
@@ -4606,11 +4591,8 @@ mod tests {
         );
     }
 
-    /// A burned nonce must give up its in-flight reservation, or that
-    /// (sender, direction, nonce) slot stays blocked for the resubmission the
-    /// user is told to make. Probed with a DIFFERENT hash on the same nonce:
-    /// `push_contiguous` is idempotent for a repeated hash, so re-pushing the
-    /// same tx would pass whether or not the reservation was released.
+    /// A burned nonce must release its reservation, else the resubmission is
+    /// blocked. Probed with a different hash, since re-pushing one is idempotent.
     #[test]
     fn a_burned_nonce_releases_its_in_flight_reservation() {
         let pool = crate::HeldPool::new();

@@ -1404,11 +1404,8 @@ where
         Ok(self.l2_sealed_header_at(l2_block)?.hash())
     }
 
-    /// Number of the block a commitment names, or `None` when we do not hold it.
-    ///
-    /// A block hash identifies exactly one block, so this is an index read. It
-    /// was a backward scan while commitments were state roots, which name no
-    /// block and so had to be searched for.
+    /// Number of the block a commitment names, or `None` when we do not hold
+    /// it. A hash identifies one block, so this is an index read.
     fn block_at(&self, commitment: B256) -> DeriverResult<Option<u64>> {
         self.inner
             .l2_provider
@@ -1568,9 +1565,8 @@ where
                         ),
                     ));
                 }
-                // Address the DA by the roles L1 reported: each outbound entry
-                // takes its OWN ordinal's user tx, so a skipped or unconsumed
-                // entry never shifts the pairing of the rest.
+                // Each outbound entry takes its OWN ordinal's user tx, so a
+                // skipped entry never shifts the pairing of the rest.
                 let slots = select_applied_slots(settlement, &outbound, &inbound, &sync_user_txs)
                     .map_err(|e| DeriverError::local_diverged_with_msg(from_block, &e))?;
                 if slots.outbound_paired.len() < original_outbound_len
@@ -1579,6 +1575,7 @@ where
                     event!(
                         name: "eez.deriver.reconcile.partial_consumption",
                         Level::WARN,
+                        event_name = "eez.deriver.reconcile.partial_consumption",
                         tx_hash = %tx_hash,
                         outbound = original_outbound_len,
                         inbound = original_inbound_len,
@@ -1598,11 +1595,8 @@ where
                 gate_outbound = outbound_paired.iter().map(|(e, _)| e.clone()).collect();
 
                 let mut starting_nonce = self.system_address_nonce_at(from_block - 1)?;
-                // A resume starts mid-block: the entries before our first applied
-                // one were consumed by the batch that beat us here, so their system
-                // txs already sit in this block and the parent nonce predates them.
-                // Counted from the first applied entry's ROLE, which says exactly
-                // how many of each direction precede it.
+                // A resume starts mid-block: the rival's system txs already sit
+                // here, so count the skipped prefix from the first applied role.
                 let (outbound_skip, inbound_skip) =
                     match settlement.applied().first().map(|a| a.role) {
                         Some(eez_l1::EntryRole::Outbound { ordinal }) => (ordinal, 0),
@@ -2084,9 +2078,8 @@ where
     }
 }
 
-/// A commitment only names this batch's endpoint when the block it identifies
-/// lies in the range the batch can settle. Outside it the hash belongs to some
-/// other block we happen to hold, which is divergence, not a shorter settlement.
+/// A commitment names this batch's endpoint only inside the range it can settle;
+/// outside it the hash is some other block we hold, which is divergence.
 const fn in_settleable_range(found: Option<u64>, low: u64, high: u64) -> Option<u64> {
     match found {
         Some(block) if block >= low && block <= high => Some(block),
@@ -2311,17 +2304,11 @@ struct AppliedSlots {
     inbound: Vec<eez_protocol::abi::ExecutionEntrySol>,
 }
 
-/// Select the DA entries L1 applied, by the role it reported for each.
-///
-/// The applied set is READ from the consumption events, so this neither
-/// truncates nor front-skips: it selects. That tolerates a hole — an applied
-/// set that is not one contiguous run, which a peer's branching batch produces
-/// — and it pins each outbound entry to its ORIGINAL ordinal, so a skipped or
-/// unconsumed entry never shifts the pairing of the rest.
+/// Select the DA entries L1 applied, by the role it reported for each. Selects
+/// rather than truncates, so a non-contiguous applied set is fine.
 ///
 /// # Errors
-/// A role naming a slot the DA does not carry. Rebuilding a different block
-/// than L1 settled is divergence, so this is loud rather than clamped.
+/// A role naming a slot the DA does not carry — divergence, so it is loud.
 fn select_applied_slots(
     settlement: &eez_l1::Settlement,
     outbound: &[eez_protocol::abi::ExecutionEntrySol],
@@ -2590,9 +2577,8 @@ mod applied_selection_tests {
         assert!(s.outbound_paired.is_empty() && s.inbound.is_empty());
     }
 
-    /// THE pairing property: an outbound entry takes the user tx at its OWN
-    /// ordinal. Offset-based selection would hand entry 1 the tx meant for
-    /// entry 0 and shift every pair that follows.
+    /// An outbound entry takes the user tx at its OWN ordinal; offset-based
+    /// selection would shift every pair after a skip.
     #[test]
     fn outbound_pairing_follows_the_original_ordinal() {
         let s = slots(&[(2, EntryRole::Outbound { ordinal: 1 })]);
@@ -2621,9 +2607,8 @@ mod applied_selection_tests {
         );
     }
 
-    /// A role naming a slot the DA does not carry means the two readings
-    /// disagree. Rebuilding a different block than L1 settled is divergence, so
-    /// it must be loud rather than clamped to what fits.
+    /// A role naming a slot the DA lacks means the readings disagree — loud,
+    /// because rebuilding a different block than L1 settled is divergence.
     #[test]
     fn a_role_beyond_the_da_is_loud() {
         let outbound = vec![producing_entry(0x01)];
@@ -2638,9 +2623,8 @@ mod applied_selection_tests {
         assert!(error.contains("ordinal 5"), "got {error}");
     }
 
-    /// A resumed batch's `entry_state` is the rival's endpoint, not its own
-    /// claimed head — the cursor guard and `check_claimed_state` must agree on
-    /// it, or a mid-chain resume clears one and fails the other.
+    /// A resumed batch's `entry_state` is the rival's endpoint; the cursor guard
+    /// and `check_claimed_state` must agree on it.
     #[test]
     fn entry_state_on_a_resume_is_not_the_claimed_chain_head() {
         let (a, b) = (B256::repeat_byte(0x0A), B256::repeat_byte(0x0B));
@@ -2841,10 +2825,8 @@ mod anchor_range_tests {
     //! Two composers on one rollup post OVERLAPPING ranges: B's cursor sits a
     //! block behind A's, so B's batch starts below A's cursor (live 2026-08-24).
     //!
-    //! A block hash names exactly one block, so locating a commitment is an
-    //! index read. What survives from the state-root era is the RANGE a batch
-    //! may legally settle in — a hash we hold at some unrelated height is
-    //! divergence, not a short settlement.
+    //! Locating a commitment is an index read; what still matters is the RANGE a
+    //! batch may settle in.
 
     use super::{batch_l2_range, in_settleable_range};
 
@@ -2861,9 +2843,8 @@ mod anchor_range_tests {
         );
     }
 
-    /// The anchor itself is a legitimate endpoint — a single-block batch's
-    /// leading immediate can be a no-op, so L1 may accept it and stop there.
-    /// Its predecessor is not: that block predates the run.
+    /// The anchor is a legitimate endpoint; its predecessor is not, because that
+    /// block predates the run.
     #[test]
     fn the_range_includes_the_anchor_and_excludes_what_precedes_it() {
         for count in [1_u64, 6] {
@@ -2896,8 +2877,7 @@ mod anchor_range_tests {
     }
 
     /// A resumed batch collapses onto the anchor, so that block is its only
-    /// valid endpoint. Accepting its predecessor would settle at a root
-    /// predating the batch.
+    /// valid endpoint.
     #[test]
     fn a_resumed_batch_settles_only_at_its_own_sync_block() {
         let (from, to) = batch_l2_range(ANCHOR, true, 10);
@@ -2906,9 +2886,8 @@ mod anchor_range_tests {
         assert_eq!(in_settleable_range(Some(ANCHOR - 1), ANCHOR, to), None);
     }
 
-    /// A commitment naming a block we do not hold is not an endpoint. Under
-    /// state roots this was "the scan ran off the window"; now the index simply
-    /// has no entry, and the caller falls through to the divergence check.
+    /// A commitment naming a block we do not hold is not an endpoint; the caller
+    /// falls through to the divergence check.
     #[test]
     fn a_commitment_we_do_not_hold_is_not_an_endpoint() {
         assert_eq!(in_settleable_range(None, ANCHOR, ANCHOR + 6), None);
