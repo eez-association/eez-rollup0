@@ -78,6 +78,9 @@ enum Resolution {
     /// Deriver's cursor reaching this height overrides to Settled — the
     /// cursor is the stronger oracle.
     Failed,
+    /// Observer verdict: L1 kept a PREFIX. The height stays canonical, so only
+    /// the unconsumed entries' transactions are owed a disposition.
+    SettledShort,
 }
 
 #[derive(Debug)]
@@ -163,6 +166,11 @@ impl OptimisticallyIncluded {
         let mut map = self.by_sync_height.lock().unwrap();
         let mut newly_cursor_confirmed = Vec::new();
         for (_, entry) in map.range_mut(..=cursor) {
+            // The cursor confirms the height, not that every tx was consumed;
+            // releasing here would lose the unconsumed tail.
+            if entry.resolution == Resolution::SettledShort {
+                continue;
+            }
             if entry.resolution != Resolution::Settled {
                 entry.resolution = Resolution::Settled;
             }
@@ -172,6 +180,38 @@ impl OptimisticallyIncluded {
             }
         }
         newly_cursor_confirmed
+    }
+
+    /// L1 kept a prefix. Unlike [`Self::mark_failed`] the height is not rolled
+    /// back; recovery only disposes of the transactions.
+    pub fn mark_settled_short(&self, sync_height: u64) {
+        let mut map = self.by_sync_height.lock().unwrap();
+        if let Some(entry) = map.get_mut(&sync_height)
+            && entry.resolution == Resolution::Pending
+        {
+            entry.resolution = Resolution::SettledShort;
+        }
+    }
+
+    /// Extract a prefix-settled entry for tx disposition. The caller must NOT
+    /// reorg: the height is canonical.
+    #[must_use]
+    pub fn take_settled_short(&self, cursor: u64) -> Option<FailedBatch> {
+        let mut map = self.by_sync_height.lock().unwrap();
+        let h = map
+            .range(cursor + 1..)
+            .find(|(_, e)| e.resolution == Resolution::SettledShort)
+            .map(|(h, _)| *h)?;
+        let entry = map.get_mut(&h)?;
+        entry.resolution = Resolution::Settled;
+        Some(FailedBatch {
+            sync_height: h,
+            post_batch_hash: entry.post_batch_hash,
+            parent: entry.parent.clone(),
+            txs: std::mem::take(&mut entry.txs),
+            // A short settle is not a drop: the entries that ran, ran.
+            slot_skipped: false,
+        })
     }
 
     /// Observer verdict: the bundle settled on L1. Entry is retained
@@ -322,6 +362,54 @@ mod tests {
         assert_eq!(pool.blocking_height(5), Some(10));
         // …only the Deriver's cursor passing the height does.
         assert_eq!(pool.blocking_height(10), None);
+    }
+
+    /// The cursor confirms the HEIGHT only; promoting a prefix to Settled here
+    /// would release the tail's reservations and lose those transactions.
+    #[test]
+    fn a_prefix_settlement_is_not_released_by_the_cursor() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
+        pool.mark_settled_short(10);
+
+        assert!(
+            pool.resolve_below_cursor(10).is_empty(),
+            "a prefix settlement owes its tail a disposition; the cursor must not release it",
+        );
+        let swept = pool
+            .take_settled_short(0)
+            .expect("the prefix settlement is still there to sweep");
+        assert_eq!(swept.sync_height, 10);
+        assert_eq!(swept.txs.len(), 2);
+        assert!(
+            !swept.slot_skipped,
+            "a short settle is not a drop: the entries that ran, ran",
+        );
+        assert!(pool.take_settled_short(0).is_none(), "swept exactly once");
+    }
+
+    /// A prefix settlement keeps its height — the Deriver rebuilds the block L1
+    /// named — so it must never surface on the reorg path.
+    #[test]
+    fn a_prefix_settlement_is_never_recovered_as_a_failure() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.mark_settled_short(10);
+        assert!(
+            pool.take_failed_for_recovery(0).is_none(),
+            "a canonical height must not be reorged out",
+        );
+    }
+
+    /// The observer only records; a cursor-confirmed height is already settled,
+    /// so a late short verdict must not reopen it.
+    #[test]
+    fn a_short_verdict_cannot_override_a_settled_entry() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.mark_settled(10);
+        pool.mark_settled_short(10);
+        assert!(pool.take_settled_short(0).is_none());
     }
 
     #[test]

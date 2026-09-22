@@ -14,11 +14,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_eips::{BlockNumberOrTag, Decodable2718};
-use alloy_primitives::{TxHash, U256, hex};
+use alloy_primitives::{TxHash, hex};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types_eth::Filter;
-use alloy_sol_types::SolEvent;
-use eez_protocol::abi::L2ExecutionPerformed;
 use tracing::{Level, event};
 
 use crate::config::SubmitterConfig;
@@ -55,14 +52,44 @@ pub enum SendOutcome {
     Included {
         tx_hash: TxHash,
         l1_block: u64,
-        /// Same L1 tx emitted `L2ExecutionPerformed` for our rollup,
-        /// i.e. the contract advanced its state root.
-        state_applied: bool,
+        /// Which entries L1 applied, from the same windowed pass the deriver
+        /// uses; `final_state` distinguishes "settled short" from "nothing".
+        settlement: crate::scan::Settlement,
     },
     Dropped {
         tx_hash: TxHash,
         target_block: u64,
     },
+}
+
+/// Whether a bundled user_tx may revert without failing the bundle, leaving L1
+/// at a prefix. On by default; `EEZ_PARTIAL_CONSUMPTION=0` restores all-or-nothing.
+///
+/// Read once: flipping mid-run would make two bundles disagree.
+fn partial_consumption_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        // Absent or unrecognised reads as ON; only an explicit off-value opts out.
+        !std::env::var("EEZ_PARTIAL_CONSUMPTION")
+            .is_ok_and(|raw| matches!(raw.trim(), "0" | "false" | "FALSE"))
+    })
+}
+
+/// Bundle txs the relay may drop on revert. Index 0 is the postBatch and is
+/// never whitelisted: if it reverts, nothing settled.
+fn reverting_whitelist(raw_tx_hexes: &[&str], allow_partial: bool) -> Vec<String> {
+    if !allow_partial {
+        return Vec::new();
+    }
+    raw_tx_hexes
+        .get(1..)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|hex_tx| {
+            let bytes = alloy_primitives::hex::decode(hex_tx).ok()?;
+            Some(format!("{:#x}", alloy_primitives::keccak256(&bytes)))
+        })
+        .collect()
 }
 
 /// Thin L1-interaction primitive. Cheaply [`Clone`]able.
@@ -141,7 +168,6 @@ impl Submitter {
         &self,
         raw_txs: &[alloy_primitives::Bytes],
         target: BundleTarget,
-        expected_final_state: Option<alloy_primitives::B256>,
     ) -> L1Result<SendOutcome> {
         fail::fail_point!("submitter::send::start", |_| Err(L1Error::Submission(
             "injected failpoint: submitter::send::start".into()
@@ -192,13 +218,7 @@ impl Submitter {
         // API degrade to ordered mempool submission inside
         // `dispatch_and_observe`.
         self.inner
-            .dispatch_and_observe(
-                raw_txs,
-                post_batch_hash,
-                target_block,
-                pin_timestamp,
-                expected_final_state,
-            )
+            .dispatch_and_observe(raw_txs, post_batch_hash, target_block, pin_timestamp)
             .await
     }
 
@@ -262,7 +282,6 @@ impl Inner {
         post_batch_hash: TxHash,
         target_block: u64,
         pin_timestamp: Option<u64>,
-        expected_final_state: Option<alloy_primitives::B256>,
     ) -> L1Result<SendOutcome> {
         let hexes: Vec<String> = raw_txs
             .iter()
@@ -281,13 +300,8 @@ impl Inner {
             Ok(()) => {
                 // Relay path: the builder honors the min/max timestamp pin, so
                 // an Exact target's `pin_timestamp` unlocks the early verdict.
-                self.observe(
-                    post_batch_hash,
-                    target_block,
-                    pin_timestamp,
-                    expected_final_state,
-                )
-                .await
+                self.observe(post_batch_hash, target_block, pin_timestamp)
+                    .await
             }
             Err(L1Error::BundleRpcUnsupported) => {
                 // A multi-tx bundle needs its order kept: the deferred entries
@@ -339,8 +353,7 @@ impl Inner {
                 }
                 // No bundle API, no timestamp pin: these txs can genuinely land
                 // in a later block, so the conservative rule is the only one.
-                self.observe(post_batch_hash, target_block, None, expected_final_state)
-                    .await
+                self.observe(post_batch_hash, target_block, None).await
             }
             Err(other) => Err(other),
         }
@@ -351,7 +364,7 @@ impl Inner {
     /// late and the embedded L1 may lag the tip, so pinning to the exact
     /// target produced false `Dropped` verdicts), then derive
     /// `state_applied` from the inclusion block's `L2ExecutionPerformed`
-    /// events via [`Self::settlement_in_block`].
+    /// events via [`Self::observe_settlement`].
     ///
     /// `pinned` is the timestamp pin, set only for an [`BundleTarget::Exact`]
     /// bundle the relay accepted — those get the early verdict below.
@@ -360,7 +373,6 @@ impl Inner {
         tx_hash: TxHash,
         target_block: u64,
         pin_timestamp: Option<u64>,
-        expected_final_state: Option<alloy_primitives::B256>,
     ) -> L1Result<SendOutcome> {
         // Failure must mean PROVABLY DEAD, not merely slow. A bundle is
         // pinned to `target_block` — included in order there or never —
@@ -389,13 +401,13 @@ impl Inner {
                     let l1_block = receipt.block_number.ok_or_else(|| {
                         L1Error::Provider("receipt present but block_number missing".into())
                     })?;
-                    let state_applied = self
-                        .settlement_in_block(&target_provider, l1_block, expected_final_state)
+                    let settlement = self
+                        .observe_settlement(&target_provider, l1_block, tx_hash)
                         .await?;
                     return Ok(SendOutcome::Included {
                         tx_hash,
                         l1_block,
-                        state_applied,
+                        settlement,
                     });
                 }
                 Ok(None) => {
@@ -473,29 +485,27 @@ impl Inner {
     ///   event" would report settled even with every deferred entry
     ///   unconsumed; requiring the FINAL root means L1 reached exactly
     ///   the state the Sync block claims.
-    /// - `None`: any event for our rollupId.
-    async fn settlement_in_block<P: Provider>(
+    /// How far L1 got with our batch, via the shared windowed pass in
+    /// [`crate::scan`] — one reading of these logs, not a bespoke block scan.
+    async fn observe_settlement<P: Provider>(
         &self,
         provider: &P,
         l1_block: u64,
-        expected_final_state: Option<alloy_primitives::B256>,
-    ) -> L1Result<bool> {
-        let winners = Filter::new()
-            .address(self.reader.eez())
-            .event_signature(L2ExecutionPerformed::SIGNATURE_HASH)
-            .topic1(U256::from(self.reader.rollup_id()))
-            .from_block(l1_block)
-            .to_block(l1_block);
-        let logs = provider
-            .get_logs(&winners)
-            .await
-            .map_err(|e| L1Error::Provider(format!("get_logs(L2ExecutionPerformed): {e}")))?;
-        Ok(match expected_final_state {
-            Some(root) => logs
-                .iter()
-                .any(|l| l.data().data.as_ref() == root.as_slice()),
-            None => !logs.is_empty(),
-        })
+        tx_hash: TxHash,
+    ) -> L1Result<crate::scan::Settlement> {
+        let batches = crate::scan::scan_batch_logs_range(
+            provider,
+            self.reader.eez(),
+            self.reader.rollup_id(),
+            l1_block,
+            l1_block,
+        )
+        .await?;
+        Ok(batches
+            .into_iter()
+            .find(|batch| batch.tx_hash == tx_hash)
+            .map(|batch| batch.settlement)
+            .unwrap_or(crate::scan::Settlement::NONE))
     }
 }
 
@@ -521,19 +531,16 @@ async fn post_bundle(
     target_block: u64,
     pin_timestamp: Option<u64>,
 ) -> L1Result<()> {
-    // STRICT all-or-nothing: `revertingTxHashes`/`droppingTxHashes`
-    // empty. Per rbuilder's order commit, txs execute in submitted order
-    // and any revert outside those whitelists fails the WHOLE bundle.
-    // Whitelisting user_txs in `revertingTxHashes` instead lets the
-    // relay silently DROP a reverting one (observed on chiado: block
-    // 21566886 landed postBatch + 2 of 3 user_txs), advancing L1 to a
-    // mid-chain prefix root and desyncing the composer. Sim is in-order
-    // too, so user_txs simulate after the postBatch — no whitelist
-    // needed for a "pre-postBatch state" sim.
+    // Any revert OUTSIDE `revertingTxHashes` fails the bundle; whitelisting the
+    // user_txs lets one revert while the postBatch lands, stopping L1 at a prefix.
+    let reverting = reverting_whitelist(raw_tx_hexes, partial_consumption_enabled());
     let mut bundle_params = serde_json::json!({
         "txs": raw_tx_hexes,
         "blockNumber": format!("0x{target_block:x}"),
     });
+    if !reverting.is_empty() {
+        bundle_params["revertingTxHashes"] = serde_json::json!(reverting);
+    }
     if let Some(ts) = pin_timestamp {
         // Pin inclusion to the exact L1 slot the L2 Sync block anchored
         // to. The builder enforces min/maxTimestamp against block.timestamp
@@ -656,9 +663,41 @@ fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutc
 
 #[cfg(test)]
 mod tests {
-    use super::{PinnedVerdict, pinned_verdict};
+    use super::{PinnedVerdict, pinned_verdict, reverting_whitelist};
 
     const PIN: u64 = 1_700_000_012;
+
+    /// The postBatch at index 0 is never whitelisted: if it reverts nothing
+    /// settled, so letting the user_txs land would deliver calls with no state.
+    #[test]
+    fn reverting_whitelist_covers_every_arm() {
+        // Hashes are keccak of the raw EIP-2718 envelope, which is what the
+        // relay matches against.
+        let hash = |raw: &str| {
+            format!(
+                "{:#x}",
+                alloy_primitives::keccak256(alloy_primitives::hex::decode(raw).unwrap())
+            )
+        };
+        for (case, raw, allow, want) in [
+            (
+                "postBatch excluded, user_txs whitelisted",
+                &["0xaa00", "0xbb11", "0xcc22"][..],
+                true,
+                vec![hash("0xbb11"), hash("0xcc22")],
+            ),
+            (
+                "opted out restores all-or-nothing",
+                &["0xaa00", "0xbb11"][..],
+                false,
+                Vec::new(),
+            ),
+            ("lone postBatch", &["0xaa00"][..], true, Vec::new()),
+            ("empty bundle", &[][..], true, Vec::new()),
+        ] {
+            assert_eq!(reverting_whitelist(raw, allow), want, "{case}");
+        }
+    }
 
     #[test]
     fn pinned_verdict_covers_every_arm() {
