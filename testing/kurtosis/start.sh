@@ -80,7 +80,13 @@ fi
 
 if [[ -n "$PREBUILT_BIN_DIR" ]]; then
     PREBUILT_BIN_DIR="$(cd "$PREBUILT_BIN_DIR" && pwd)"
-    for binary in eez-composer eez-follower eez-genesis-state-root eez-proof-signer; do
+    for binary in \
+        eez-composer \
+        eez-follower \
+        eez-genesis-state-root \
+        eez-genesis-block-hash \
+        eez-proof-signer
+    do
         if [[ ! -x "$PREBUILT_BIN_DIR/$binary" ]]; then
             echo "prebuilt binary is missing or not executable: $PREBUILT_BIN_DIR/$binary" >&2
             exit 1

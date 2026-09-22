@@ -144,7 +144,8 @@ jobs:
           cp target/ci-e2e/eez-follower artifacts/e2e-build/
           cp target/ci-e2e/eez-proof-signer artifacts/e2e-build/
           cp target/ci-e2e/examples/genesis_state_root artifacts/e2e-build/eez-genesis-state-root
-          strip artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root || true
+          cp target/ci-e2e/examples/genesis_block_hash artifacts/e2e-build/eez-genesis-block-hash
+          strip artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e-build
@@ -185,7 +186,7 @@ jobs:
           path: artifacts/e2e-build
       - name: Restore helper executable permissions
         run: |
-          chmod +x artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root
+          chmod +x artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash
           echo "$GITHUB_WORKSPACE/artifacts/e2e-build" >> "$GITHUB_PATH"
       - name: Verify generated EEZL2 genesis artifacts
         run: scripts/update-eezl2-genesis.sh --check
@@ -302,7 +303,7 @@ jobs:
           name: e2e-build
           path: artifacts/e2e-build
       - name: Restore runtime binary permissions
-        run: chmod +x artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root
+        run: chmod +x artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash
       - name: Reclaim runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
