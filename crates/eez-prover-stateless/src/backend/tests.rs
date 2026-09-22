@@ -42,7 +42,10 @@ fn fixture_input() -> AdmittedBlock {
     )
 }
 
-fn checkpoint_fixture() -> (AdmittedBlock, ChainConfig, Vec<TransactionStateCheckpoint>) {
+/// The recorded fixture plus the `(transaction_index, state_root)` pairs its
+/// oracle states. The oracle records no block hashes; tests assert those
+/// against the block itself.
+fn checkpoint_fixture() -> (AdmittedBlock, ChainConfig, Vec<(usize, B256)>) {
     let rlp = hex::decode(
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -74,12 +77,12 @@ fn checkpoint_fixture() -> (AdmittedBlock, ChainConfig, Vec<TransactionStateChec
     let checkpoints = indices
         .iter()
         .zip(roots)
-        .map(
-            |(transaction_index, state_root)| TransactionStateCheckpoint {
-                transaction_index: usize::try_from(transaction_index.as_u64().unwrap()).unwrap(),
-                state_root: state_root.as_str().unwrap().parse::<B256>().unwrap(),
-            },
-        )
+        .map(|(transaction_index, state_root)| {
+            (
+                usize::try_from(transaction_index.as_u64().unwrap()).unwrap(),
+                state_root.as_str().unwrap().parse::<B256>().unwrap(),
+            )
+        })
         .collect();
 
     (
@@ -145,6 +148,7 @@ fn checkpoint(transaction_index: usize) -> TransactionStateCheckpoint {
     TransactionStateCheckpoint {
         transaction_index,
         state_root: B256::ZERO,
+        block_hash: B256::with_last_byte(0xc0 ^ (transaction_index as u8)),
     }
 }
 
@@ -173,6 +177,22 @@ fn receipt_with_logs(logs: Vec<Log>) -> EthereumReceipt {
         logs,
         ..Default::default()
     }
+}
+
+/// A window is one contiguous execution, not a set of independently valid
+/// blocks. Nothing else covers this: real replay cannot produce a
+/// non-telescoping window, so the check is driven directly.
+#[test]
+fn a_block_not_executing_from_its_predecessors_post_state_is_rejected() {
+    let root = B256::repeat_byte(0x11);
+    assert!(super::executes_from_previous_post_state(5, root, root).is_ok());
+
+    let error = super::executes_from_previous_post_state(5, root, B256::repeat_byte(0x22))
+        .expect_err("a block not executing from its predecessor's post-state must be rejected");
+    assert!(
+        error.contains("do not telescope at block 5"),
+        "unexpected: {error}"
+    );
 }
 
 #[test]
@@ -345,6 +365,48 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
     assert_eq!(plan.transaction_indices(), [1, 2]);
 }
 
+/// The final transaction is ALWAYS a planned boundary. The stateless backend's
+/// post-execution-neutrality check silently stops running if that ever breaks.
+#[test]
+fn checkpoint_plan_always_ends_at_the_final_transaction() {
+    let system = || {
+        <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(
+            &hex::decode(SYSTEM_TX).unwrap(),
+        )
+        .unwrap()
+    };
+    let user = || -> TransactionSigned {
+        TxLegacy::default()
+            .into_signed(Signature::test_signature())
+            .into()
+    };
+
+    // Every system/user shape up to six transactions.
+    for width in 1..=6usize {
+        for mask in 0..(1u32 << width) {
+            let shape: Vec<bool> = (0..width).map(|i| mask >> i & 1 == 1).collect();
+            let block = Block::new(
+                Default::default(),
+                alloy_consensus::BlockBody {
+                    transactions: shape
+                        .iter()
+                        .map(|&is_system| if is_system { system() } else { user() })
+                        .collect(),
+                    ..Default::default()
+                },
+            );
+            let recovered = RecoveredBlock::new_unhashed(block, vec![TEST_SYSTEM_ADDRESS; width]);
+            let (plan, _) = CheckpointPlan::from_recovered_block(&recovered, TEST_SYSTEM_ADDRESS);
+
+            assert_eq!(
+                plan.transaction_indices().last(),
+                Some(&(width - 1)),
+                "shape {shape:?} did not plan its final transaction",
+            );
+        }
+    }
+}
+
 #[test]
 fn checkpoint_plan_includes_every_inbound_boundary() {
     let transaction = || {
@@ -454,16 +516,18 @@ fn validates_the_golden_block_through_stateless() {
     let output = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
         .validate(vec![fixture_input()])
         .unwrap();
-    let root = b256!("f09d8f7da5bc5036f8dd9536c953e2212390a46fb3e553ece2b7d419131537b1");
-
-    assert_eq!(output.pre_state_root, root);
     assert_eq!(output.blocks.len(), 1);
     let block = &output.blocks[0];
     assert_eq!(
         block.computed_hash,
         b256!("16b64a78e9b3e0d533cafe81f9121735f6a2c8122c69b0bb5994ee75fe7bface")
     );
-    assert_eq!(block.post_state_root, root);
+    // Still asserted: `post_state_root` feeds the continuity check that proves
+    // each block executed from its predecessor's post-state.
+    assert_eq!(
+        block.post_state_root,
+        b256!("f09d8f7da5bc5036f8dd9536c953e2212390a46fb3e553ece2b7d419131537b1")
+    );
     assert!(block.receipt_successes.is_empty());
     assert!(block.transaction_state_checkpoints.is_empty());
     assert!(block.settlement_evidence.system_sender_flags.is_empty());
@@ -499,7 +563,31 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
             .is_empty()
     );
     assert_eq!(block.computed_hash, expected_hash);
-    assert_eq!(block.transaction_state_checkpoints, expected);
+
+    let observed = &block.transaction_state_checkpoints;
+    assert_eq!(
+        observed
+            .iter()
+            .map(|c| (c.transaction_index, c.state_root))
+            .collect::<Vec<_>>(),
+        expected,
+        "indices and state roots must match the recorded oracle",
+    );
+
+    // The oracle records no block hashes, so assert what must hold of real
+    // ones: the full-prefix candidate IS this block, and shorter prefixes are
+    // different blocks.
+    let last = observed.last().expect("the fixture selects every boundary");
+    assert_eq!(last.transaction_index, 2);
+    assert_eq!(
+        last.block_hash, expected_hash,
+        "the candidate holding every transaction must be the block itself",
+    );
+    assert!(
+        observed[..2].iter().all(|c| c.block_hash != expected_hash),
+        "a proper prefix must not seal to the block's own hash",
+    );
+    assert_ne!(observed[0].block_hash, observed[1].block_hash);
 }
 
 #[test]
@@ -535,14 +623,8 @@ fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
         .validate_admitted(&mut blocks, &CancellationToken::default())
         .unwrap();
 
-    assert_eq!(
-        output.pre_state_root,
-        oracle["batch_anchor_root"]
-            .as_str()
-            .unwrap()
-            .parse::<B256>()
-            .unwrap()
-    );
+    // The window no longer carries a pre-state root; per-block post-state roots
+    // are what the continuity check chains, and that check has its own test.
     assert_eq!(
         output.blocks.last().unwrap().post_state_root,
         oracle["final_state_root"]

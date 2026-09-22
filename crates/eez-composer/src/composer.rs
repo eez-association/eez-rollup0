@@ -45,7 +45,7 @@ use crate::held_pool::{HeldPool, HeldTx};
 use crate::ingress::Direction;
 use crate::local::{
     BuildError, InboundL2TargetSession, L1SlotState, L1TargetSession, build::SyncBlockState,
-    build_sync_block, sync_block_pair_roots,
+    build_sync_block, sync_block_pair_hashes,
 };
 use crate::optimistic::OptimisticallyIncluded;
 use crate::prover_retry::{
@@ -2978,7 +2978,7 @@ where
         // Per-effect intermediate L2 roots: the prover requires each entry's
         // `newState` to be its own effect's root, not the final Sync-block root.
         // Failure here is systemic (like build/prepare) → degrade.
-        let pair_roots = match sync_block_pair_roots(
+        let pair_hashes = match sync_block_pair_hashes(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
             parent_header,
@@ -2993,7 +2993,7 @@ where
                     Level::WARN,
                     rollup_id,
                     error = %e,
-                    "sync_block_pair_roots failed; re-queueing survivors, degrading to minimal postBatch",
+                    "sync_block_pair_hashes failed; re-queueing survivors, degrading to minimal postBatch",
                 );
                 pool.push_front_batch(survivors);
                 return self
@@ -3026,10 +3026,9 @@ where
                 rollup_id,
                 &comp_refs,
                 parent_header,
-                built.header.state_root(),
                 &built.header,
                 Some(&built.block),
-                &pair_roots,
+                &pair_hashes,
                 &outbound_entries,
                 &outbound_user_txs,
                 outbound_target_gas,
@@ -3296,7 +3295,7 @@ where
             rollup_id,
             sync_height,
             bundle,
-            built.header.state_root(),
+            built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
         );
@@ -3351,7 +3350,6 @@ where
                 rollup_id,
                 &[], // no compositions → leading immediate only
                 parent_header,
-                empty_built.header.state_root(),
                 &empty_built.header,
                 Some(&empty_built.block),
                 &[], // no cross-chain effects → no per-effect roots
@@ -3426,7 +3424,7 @@ where
             rollup_id,
             sync_height,
             vec![minimal_postbatch_raw],
-            empty_built.header.state_root(),
+            empty_built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
         );
@@ -3515,7 +3513,6 @@ where
                     rollup_id,
                     &[], // no compositions → leading immediate only
                     &boundary_parent,
-                    boundary_header.state_root(),
                     &boundary_header,
                     None, // terminal is committed → witnesses come from the store
                     &[],
@@ -3555,7 +3552,7 @@ where
                 rollup_id,
                 boundary,
                 vec![raw],
-                boundary_header.state_root(),
+                boundary_header.hash(),
                 Arc::clone(&rollup.optimistic),
                 BundleTarget::NextBlock,
             );
@@ -3660,10 +3657,9 @@ where
     /// entries[k-1].newState` per rollup; EEZ.sol's `_applyStateUpdates`
     /// enforces the chain on L1 (`StateRootMismatch` revert) regardless of
     /// proof system. Each effect entry's `newState` is its per-effect root from
-    /// `pair_roots` (verified by the proof signer's effect-prefix checks); the
-    /// last is the final Sync-block root. `sync_block_state_root` is the
-    /// required settlement-chain endpoint; `terminal_header` carries it too,
-    /// and the two collapse into one once commitments become block hashes.
+    /// `pair_hashes` (verified by the proof signer's effect-prefix checks); the
+    /// last is the terminal block's own hash, which is the required
+    /// settlement-chain endpoint and comes from `terminal_header`.
     ///
     /// `sync_block` is the terminal, `Some` only while freshly built; `None`
     /// (historical chunk) takes its witness from the store like the rest.
@@ -3681,10 +3677,9 @@ where
         rollup_id: u64,
         compositions: &[&eez_protocol::Composition],
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
-        sync_block_state_root: B256,
         terminal_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         sync_block: Option<&reth_primitives_traits::RecoveredBlock<eez_primitives::Block>>,
-        pair_roots: &[B256],
+        pair_hashes: &[B256],
         outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
         outbound_target_gas: u64,
@@ -3692,6 +3687,8 @@ where
     ) -> Result<Option<Bytes>, PreparePostBatchError> {
         use alloy_sol_types::SolCall;
         use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
+
+        let sync_block_hash = terminal_header.hash();
 
         // Merge inbound compositions' L1 source batches, or start empty so an
         // idle Sync slot can carry only the leading immediate entry that
@@ -3713,11 +3710,11 @@ where
         // it inline during postAndVerifyBatch, applying its state update
         // against L1's recorded root.
         //
-        // `currentState` = L2.stateRoot(posted) (the L1-confirmed cursor)
-        // — must equal L1.config.stateRoot at postBatch time so the
-        // deriver's check_claimed_state agrees. `newState` initially equals the
-        // pre-Sync root so later effect entries chain from it; an anchor-only
-        // batch replaces it below with the empty Sync block's final root.
+        // `currentState` = hash(posted), the L1-confirmed cursor block — must
+        // equal L1.config.stateRoot at postBatch time so the deriver's
+        // check_claimed_state agrees. `newState` initially equals the pre-Sync
+        // block's hash so later effect entries chain from it; an anchor-only
+        // batch replaces it below with the empty Sync block's hash.
         let posted = self
             .inner
             .rollups
@@ -3725,7 +3722,7 @@ where
             .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
             .l1_head
             .cursor();
-        let pre_state_root: B256 = {
+        let pre_block_hash: B256 = {
             let h = self
                 .inner
                 .rollups
@@ -3735,14 +3732,14 @@ where
                 .sealed_header(posted)
                 .map_err(|e| format!("sealed_header({posted}): {e}"))?
                 .ok_or_else(|| format!("local L2 header at {posted} missing"))?;
-            h.state_root()
+            h.hash()
         };
-        let pre_sync_state_root = parent_header.state_root();
+        let pre_sync_block_hash = parent_header.hash();
         let immediate_entry = eez_protocol::abi::ExecutionEntrySol {
             stateUpdates: vec![eez_protocol::abi::StateUpdateSol {
                 rollupId: rollup_id,
-                currentState: pre_state_root,
-                newState: pre_sync_state_root,
+                currentState: pre_block_hash,
+                newState: pre_sync_block_hash,
                 etherDelta: alloy_primitives::I256::ZERO,
             }],
             proxyEntryHash: B256::ZERO,
@@ -3790,7 +3787,7 @@ where
         // `proxyEntryHash`: outbound (== 0) → `-V` (via `outbound_ether_out`; None =
         // multi-call-with-value, unsupported → reject); inbound (!= 0) → `+V` deposit.
         // Value-free → 0.
-        // `newState` = effect `k`'s per-effect root `pair_roots[k]`; entries are
+        // `newState` = effect `k`'s per-effect root `pair_hashes[k]`; entries are
         // ordered `[outbound… | inbound…]`, matching the Sync block's pair-ends.
         // The prover requires this exact per-entry value. `currentState` is fixed
         // by the stitch below.
@@ -3821,11 +3818,11 @@ where
                     .copied()
                     .unwrap_or(alloy_primitives::I256::ZERO)
             };
-            let new_state = *pair_roots.get(effect_k).ok_or_else(|| {
+            let new_state = *pair_hashes.get(effect_k).ok_or_else(|| {
                 format!(
                     "settlement stitch: effect entry {effect_k} has no per-effect root \
                      (only {} pair-end roots — pair-end/entry misalignment)",
-                    pair_roots.len(),
+                    pair_hashes.len(),
                 )
             })?;
             entry.stateUpdates = vec![eez_protocol::abi::StateUpdateSol {
@@ -3836,11 +3833,11 @@ where
             }];
             effect_k += 1;
         }
-        if effect_k != pair_roots.len() {
+        if effect_k != pair_hashes.len() {
             return Err(format!(
                 "settlement stitch: {effect_k} effect entries but {} per-effect roots \
                  (pair-end/entry misalignment)",
-                pair_roots.len(),
+                pair_hashes.len(),
             )
             .into());
         }
@@ -3865,12 +3862,12 @@ where
         // (EIP-2935 / EIP-4788 system writes), so `parent.stateRoot` differs from
         // the re-executed final root and the endpoint gate would fail. With
         // effects, the last effect's root already is the final root.
-        if pair_roots.is_empty()
+        if pair_hashes.is_empty()
             && let Some(last) = batch.entries.last_mut()
         {
             for update in last.stateUpdates.iter_mut().rev() {
                 if update.rollupId == rollup_id {
-                    update.newState = sync_block_state_root;
+                    update.newState = sync_block_hash;
                     break;
                 }
             }
@@ -3885,7 +3882,7 @@ where
                 .last()
                 .and_then(|entry| entry.stateUpdates.last())
                 .map(|update| update.newState),
-            Some(sync_block_state_root),
+            Some(sync_block_hash),
             "settlement chain must end at the Sync-block state root",
         );
 
@@ -4213,9 +4210,9 @@ where
             span,
             calldata_bytes = calldata.len(),
             floor_gas = calldata_floor_gas(&calldata),
-            current_state = %pre_state_root,
-            claimed_final = %sync_block_state_root,
-            "postBatch anchors: currentState at cursor, claimed final at Sync block",
+            current_state = %pre_block_hash,
+            claimed_final = %sync_block_hash,
+            "postBatch anchors: cursor block hash, claimed final Sync block hash",
         );
 
         // Read the deployment-specific EEZ registry address from the

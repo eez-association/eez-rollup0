@@ -29,12 +29,19 @@ pub(crate) fn test_proof_system_vkey() -> crate::attest::NonZeroProofSystemVkey 
     crate::attest::NonZeroProofSystemVkey::new(B256::repeat_byte(0x42)).unwrap()
 }
 
+/// A checkpoint claiming `block_hash` as its candidate — the value settlement
+/// gates compare against.
+///
+/// `state_root` is deliberately set to a *different*, index-derived value: no
+/// gate compares it any more, so anything that starts to will not silently
+/// agree with the candidate.
 pub(crate) fn checkpoint(
     transaction_index: usize,
-    state_root: B256,
+    block_hash: B256,
 ) -> crate::validate::TransactionStateCheckpoint {
     crate::validate::TransactionStateCheckpoint {
         transaction_index,
-        state_root,
+        state_root: B256::with_last_byte(0xc0 ^ (transaction_index as u8)),
+        block_hash,
     }
 }

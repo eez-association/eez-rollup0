@@ -17,7 +17,7 @@ use crate::EEZL2_ADDRESS;
 use crate::cancel::CancellationToken;
 use crate::window::AdmittedBlock;
 
-/// Transaction boundaries at which settlement framing needs state roots.
+/// Transaction boundaries at which settlement framing needs replay outputs.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CheckpointPlan {
     transaction_indices: Vec<usize>,
