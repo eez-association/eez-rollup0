@@ -420,8 +420,8 @@ places a deployed non-proxy between two valid inbound calls and verifies that
 only the poison transaction is evicted while both ordered survivors settle. A
 final mixed-direction drain verifies that an outbound source transaction and
 inbound delivery share the canonical L2 Sync block. Every scenario also
-verifies bundle settlement, proof-signer acceptance, and L1/L2 state-root
-convergence.
+verifies bundle settlement, proof-signer acceptance, and L1/L2 block-hash
+commitment convergence.
 
 ### Run all included workloads
 
@@ -436,10 +436,49 @@ bash testing/kurtosis/scripts/verify-cross-chain-waves.sh
 
 Despite the variable's historical `CI` name, this command operates on the
 already-running local enclave and leaves it running. It executes one `inbound`,
-`outbound`, and `mixed` wave, followed by three `mixed-pure` waves and the
-inbound/outbound state-chaining regression. Per-mode output is stored under
-`$EEZ_CI_RESULT_DIR/checks`. Override the stress count with
+`outbound`, and `mixed` wave, followed by three `mixed-pure` waves. Per-mode
+output is stored under `$EEZ_CI_RESULT_DIR/checks`. Override the stress count with
 `EEZ_MIXED_PURE_WAVE_COUNT`.
+
+### Run the production-shaped scenario lane
+
+Run this against an already-running enclave when you want the same adversarial
+lane used by `run-ci.sh`:
+
+```bash
+export EEZ_CI_RESULT_DIR="$PWD/artifacts/kurtosis-production"
+bash testing/kurtosis/scripts/run-production-scenarios.sh
+```
+
+The lane first runs ordered source/destination state chains, poison isolation,
+same-source multicalls, and mixed-direction drains. It then sends malformed
+transactions to both cross-chain fronts, checks that unknown RPC methods fail
+closed, and runs bidirectional deposits, withdrawals, contract calls,
+intentional reverts, and ordinary L2 traffic at the same time. A concurrent
+observer repeatedly reads the L1 rollup commitment
+and resolves it with `eth_getBlockByHash` on L2. Stable commitments must name a
+canonical block at or below the safe head and must not equal that block's state
+root. It also inspects every resulting native `0x76` system transaction and
+receipt (sender, target, nonce sequence, fee, signature placeholders, selector,
+and outbound load/user ordering), proves that replaying a privileged envelope
+through the public RPC is rejected, and decodes every landed `postAndVerifyBatch`
+DA stream with the production codec. The lane finishes by proving that both
+chains continue to advance.
+
+Artifacts are written to `$EEZ_CI_RESULT_DIR/production`, including every
+commitment sample as JSON Lines, workload output, observer diagnostics, and a
+machine-readable `summary.json`. Useful tuning variables are:
+
+- `EEZ_PRODUCTION_WAVES` (default `3`) controls mixed workload duration.
+- `EEZ_PRODUCTION_FILLER_PER_GAP` (default `4`) controls ordinary L2 pressure.
+- `EEZ_PRODUCTION_SAMPLE_INTERVAL_SECS` (default `2`) controls commitment
+  sampling frequency.
+- `EEZ_PRODUCTION_LIVENESS_WINDOW_SECS` (default `15`) controls the final head
+  advancement window.
+
+The pull-request workflow invokes this lane with two waves after the functional
+wave and core-protocol suites; state-chaining and poison isolation run inside
+this lane.
 
 ## Customize the network
 
