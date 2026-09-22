@@ -70,6 +70,7 @@ tokio.workspace   = true
 tracing.workspace = true
 
 [dev-dependencies]
+alloy-sol-types.workspace = true
 alloy-genesis = { version = "2", default-features = false }
 alloy-network.workspace = true
 alloy-rpc-types-eth.workspace = true

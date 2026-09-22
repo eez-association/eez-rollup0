@@ -19,7 +19,7 @@ use eez_protocol::abi::{
 use eez_protocol::signer::EcdsaProofSigner;
 
 use eez_testkit::{
-    ANVIL_ATTESTER_KEY, ANVIL_KEY_1, Chain, Harness, NodeConfig, NodeHandle, wait_for,
+    ANVIL_ATTESTER_KEY, ANVIL_KEY_1, Chain, Harness, NodeConfig, NodeHandle, signals, wait_for,
     wait_for_latest_height,
 };
 
@@ -130,7 +130,7 @@ async fn resumed_batch_settles_only_its_new_suffix() {
     let entries_before = original.entries.len();
     let skipped_before = chain.entries_skipped().await.unwrap();
     let executions_before = chain.executions_performed().await.unwrap();
-    let live_root = chain.state_root().await.unwrap();
+    let live_commitment = chain.commitment().await.unwrap();
 
     // A round trip `live -> probe -> live`: both apply and the root ends where
     // it started. A single no-op would not do — its `newState` equals the
@@ -139,12 +139,16 @@ async fn resumed_batch_settles_only_its_new_suffix() {
     // `immediateEntryCount` must cover the whole leading zero-hash run.
     let probe = B256::repeat_byte(0xA7);
     let mut resumed = original.clone();
-    resumed
-        .entries
-        .push(transition_immediate(chain.rollup_id(), live_root, probe));
-    resumed
-        .entries
-        .push(transition_immediate(chain.rollup_id(), probe, live_root));
+    resumed.entries.push(transition_immediate(
+        chain.rollup_id(),
+        live_commitment,
+        probe,
+    ));
+    resumed.entries.push(transition_immediate(
+        chain.rollup_id(),
+        probe,
+        live_commitment,
+    ));
     resumed.immediateEntryCount = U256::from(resumed.entries.len());
     // `_executeEntry` checks `_rollingHash != entry.rollingHash`, and the
     // entry-begin hash binds the starting state and identity — so it is never
@@ -200,9 +204,32 @@ async fn resumed_batch_settles_only_its_new_suffix() {
     );
     // A no-op leaves the root where it was.
     assert_eq!(
-        chain.state_root().await.unwrap(),
-        live_root,
+        chain.commitment().await.unwrap(),
+        live_commitment,
         "a no-op suffix must not move the stored root",
+    );
+
+    // The whole point of this test is the resumed branch, and every assertion
+    // above passes just as well if the deriver never saw `settlement.start > 0`.
+    // Pin it explicitly.
+    let resumed = wait_for(TIMEOUT, || async {
+        Ok(node
+            .count_signal(signals::DERIVER_RESUMED_PLACEMENT)
+            .ok()
+            .filter(|seen| *seen > 0))
+    })
+    .await
+    .expect("deriver never entered the resumed-batch branch");
+    assert!(resumed > 0);
+
+    // A no-op suffix leaves the Sync block exactly as L1 settled it, so the
+    // block-hash comparison skips it. Replaying would rewrite a canonical
+    // height and retreat `safe` for nothing.
+    assert_eq!(
+        node.count_signal(signals::DERIVER_SAFE_RETREATED_FOR_RESUME)
+            .unwrap_or_default(),
+        0,
+        "a resumed batch whose settled endpoint is already local must not rewrite it",
     );
 
     // The deriver has now seen a resumed batch. It must neither diverge nor

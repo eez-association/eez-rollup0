@@ -59,14 +59,14 @@ echo "==> [3/5] docker compose up (eez-node + eez-proof-signer + lighthouse)"
 echo "==> [4/5] waiting for L1 catch-up + L2 production + first settle (up to ~15 min)"
 L1=http://localhost:18645
 L2=http://localhost:18688
-GEN_ROOT="${EEZ_INITIAL_STATE_ROOT:-}"
+GEN_COMMITMENT="${EEZ_INITIAL_BLOCK_HASH:-}"
 healthy=0
 for i in $(seq 1 90); do
     l2h=$(cast block-number --rpc-url "$L2" 2>/dev/null || echo 0)
     l1r=$(cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' "${EEZ_ROLLUP_ID:-1}" \
             --rpc-url "$L1" 2>/dev/null | sed -n '2p' | tr -d '[:space:]' || echo "")
     echo "    [$i] L2 head=$l2h  L1 settled root=${l1r:0:14}…"
-    if [[ "$l2h" -gt 3 && -n "$l1r" && "$l1r" != "$GEN_ROOT" ]]; then
+    if [[ "$l2h" -gt 3 && -n "$l1r" && "$l1r" != "$GEN_COMMITMENT" ]]; then
         healthy=1; echo "    ✓ pipeline healthy"; break
     fi
     sleep 10

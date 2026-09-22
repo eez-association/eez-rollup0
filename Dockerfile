@@ -56,11 +56,12 @@ COPY crates ./crates
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=eez-node-target,target=/build/target,sharing=locked \
-    cargo build --profile "$BUILD_PROFILE" -p eez-node --bin eez-composer --example genesis_state_root \
+    cargo build --profile "$BUILD_PROFILE" -p eez-node --bin eez-composer --example genesis_state_root --example genesis_block_hash \
     && cargo build --profile "$BUILD_PROFILE" -p eez-follower --bin eez-follower \
     && cp "target/$BUILD_PROFILE/eez-composer" /build/eez-composer \
     && cp "target/$BUILD_PROFILE/eez-follower" /build/eez-follower \
-    && cp "target/$BUILD_PROFILE/examples/genesis_state_root" /build/genesis_state_root
+    && cp "target/$BUILD_PROFILE/examples/genesis_state_root" /build/genesis_state_root \
+    && cp "target/$BUILD_PROFILE/examples/genesis_block_hash" /build/genesis_block_hash
 
 # ── runtime: slim image with just the binaries ──────────────────
 FROM debian:bookworm-slim AS runtime
@@ -70,6 +71,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /build/eez-composer /usr/local/bin/eez-composer
 COPY --from=builder /build/eez-follower /usr/local/bin/eez-follower
 COPY --from=builder /build/genesis_state_root /usr/local/bin/eez-genesis-state-root
+COPY --from=builder /build/genesis_block_hash /usr/local/bin/eez-genesis-block-hash
 # Deployment generates the L2 genesis with its own system address. It must be
 # mounted explicitly; the image must never ship a privileged test identity.
 ENTRYPOINT ["eez-composer"]
