@@ -100,12 +100,17 @@ services:
       - ${FRESH_GENESIS:?deploy writes ./datadir/genesis.json}:/app/genesis.json:ro
     command:
       - node
+      # The wave harness parses structured events out of this log; the default
+      # terminal format hides them behind ANSI codes and `key=value` framing.
+      - --log.stdout.format=json
       - --chain=/app/genesis.json
       - --datadir=/l2
       - --http
       - --http.addr=0.0.0.0
       - --http.port=18688
-      - --http.api=eth,net,web3
+      # `debug` is needed to capture signer fixtures: debug_getRawBlock for
+      # consensus RLP and debug_executionWitness for the replay witness.
+      - --http.api=eth,net,web3,debug
       - --authrpc.addr=127.0.0.1
       - --authrpc.port=18684
       - --port=30640

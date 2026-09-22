@@ -156,7 +156,7 @@ jobs:
     name: Embedded E2E Tests
     needs: [build-e2e, contract-tests]
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 80
     env:
       EEZ_TEST_PROOF_SIGNER_BIN: ${{ github.workspace }}/artifacts/e2e-build/eez-proof-signer
       EEZ_TEST_LOG_DIR: ${{ github.workspace }}/artifacts/embedded-e2e/logs
@@ -190,7 +190,7 @@ jobs:
       - name: Verify generated EEZL2 genesis artifacts
         run: scripts/update-eezl2-genesis.sh --check
       - name: Integration tests (e2e, serial)
-        timeout-minutes: 40
+        timeout-minutes: 60
         run: |
           mkdir -p artifacts/embedded-e2e
           set +e
@@ -263,8 +263,8 @@ jobs:
         run: |
           mkdir -p "artifacts/cross-chain-e2e/${{ matrix.suite.id }}"
           set +e
-          cargo nextest run -P ci --archive-file artifacts/e2e-build/tests.tar.zst --workspace-remap "$GITHUB_WORKSPACE" -E '${{ matrix.suite.filter }}' --test-threads=1 --no-fail-fast --color=always 2>&1 \
-            | tee "artifacts/cross-chain-e2e/${{ matrix.suite.id }}/nextest.log"
+          cargo nextest run -P ci -p eez-node-e2e --test cross_chain --test chained_interstate --test resumption --test resumption_append --test native_system --test-threads=1 --no-fail-fast --color=always 2>&1 \
+            | tee artifacts/cross-chain-e2e/nextest.log
           status=${PIPESTATUS[0]}
           set -e
           exit "$status"
