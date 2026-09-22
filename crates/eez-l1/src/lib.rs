@@ -37,6 +37,6 @@ pub use l1_reader::{L1Reader, L1Readiness};
 #[doc(inline)]
 pub use l1_watcher::{L1Event, L1Watcher, L1WatcherConfig};
 #[doc(inline)]
-pub use scan::{BatchLogChunks, ScannedBatch, Settlement};
+pub use scan::{AppliedEntry, BatchLogChunks, EntryRole, ScannedBatch, Settlement};
 #[doc(inline)]
 pub use submitter::{BundleTarget, SendOutcome, Submitter};
