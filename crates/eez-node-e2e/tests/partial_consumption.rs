@@ -1,26 +1,10 @@
 //! A user transaction that reverts AT INCLUSION leaves L1 settled at a PREFIX:
-//! the entries before it ran, its own did not, and every entry after it fails
-//! its `currentState` precondition.
+//! its entry goes unconsumed, and every entry after it fails `currentState`.
 //!
-//! The revert has to be invisible at compose time and certain at inclusion.
-//! Compose-time simulation evicts every revert it can reproduce, so a target
-//! that simply reverts would never reach a bundle. `ParityGate` forwards to the
-//! real cross-chain proxy but reverts on ODD L1 block numbers: the composer
-//! simulates against the anchor block and the batch lands one or more blocks
-//! later, so a call composed at an even anchor passes and then reverts.
+//! `ParityGate` reverts on ODD L1 blocks, so a call composed at an even anchor
+//! passes simulation and reverts when the batch lands a block later.
 //!
-//! Both calls land in the same L1 block and therefore see the same parity, so
-//! the one sent DIRECT always succeeds while the gated one reverts on odd
-//! blocks. Direct is queued first, so the surviving prefix is non-empty — a
-//! gated-first order would strand the direct entry too and produce an
-//! anchor-only settlement, which is the reorg path rather than the prefix one.
-//!
-//! No builder here: `scripts/builder-stub.py` refuses multi-transaction
-//! bundles, so the submitter degrades to ordered mempool submission. That is
-//! non-atomic, which is exactly what lets one transaction revert while the
-//! postBatch still lands — the same shape `revertingTxHashes` produces against
-//! a real relay.
-
+//! Direct is queued first, so the surviving prefix is non-empty.
 use std::time::Duration;
 
 use alloy_primitives::U256;
@@ -35,25 +19,16 @@ const TIMEOUT: Duration = Duration::from_mins(6);
 /// several rounds are needed before one lands.
 const ROUNDS: usize = 12;
 
-/// IGNORED: the gate never reverts in this harness, so the test cannot reach
-/// its subject. What the apparatus is confirmed to do (run 2026-09-22):
+/// IGNORED: `builder-stub.py` refuses multi-tx bundles, so the submitter falls
+/// back to the mempool and `revertingTxHashes` never reaches a relay.
 ///
-/// - both calls are classified cross-chain and drained into ONE slot
-///   (`pool_len_before: 2, drained_count: 2`), so the gate is genuinely in the
-///   inbound path and both become entries (`entry_count: 2`);
-/// - nothing is evicted at compose time (`evicted_poison: 0`), so the revert is
-///   invisible then, as intended;
-/// - inclusion blocks split 44 even / 44 odd, so the gate had ~44 chances to
-///   revert and took none.
+/// The apparatus itself is sound: both calls drain into one slot and become
+/// entries, and nothing is evicted at compose time.
 ///
-/// So the parity premise holds and the plumbing is right, yet no revert occurs.
-/// Something in the inbound path stops a contract in front of the proxy from
-/// reverting at inclusion; until that is understood this test would only fail
-/// noisily. Kept because it is the only end-to-end probe of the prefix path,
-/// and the 28 passing e2e tests do NOT cover it: a check of every node log
-/// found zero prefix markers, so partial consumption is enabled there but never
-/// triggered.
-#[ignore = "gate does not revert at inclusion in this harness; see doc comment"]
+/// The prefix path is covered on the kurtosis rig, whose rbuilder honours the
+/// whitelist — see `testing/kurtosis/scripts/parity-gate-host.sh`.
+#[ignore = "builder-stub refuses multi-tx bundles, so revertingTxHashes never \
+            reaches a relay; the kurtosis rig covers this path"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revert_at_inclusion_settles_a_prefix_and_burns_only_that_nonce() {
     let w = setup_cross_chain().await.unwrap();
@@ -139,9 +114,8 @@ async fn a_revert_at_inclusion_settles_a_prefix_and_burns_only_that_nonce() {
     w.node.assert_no_divergence_failure_logs();
     w.node.assert_no_process_death();
 
-    // The reverting transaction has an L1 receipt, so its nonce is burned and
-    // it is NOT re-queued — the user resubmits. Anything else would either
-    // double-spend the nonce or silently lose the transaction.
+    // The reverting tx has an L1 receipt, so its nonce is burned and it is NOT
+    // re-queued — the user resubmits.
     assert!(
         w.node
             .count_signal(signals::COMPOSER_NONCE_BURNED)
