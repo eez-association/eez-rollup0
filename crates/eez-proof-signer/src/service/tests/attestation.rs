@@ -556,6 +556,49 @@ async fn a_batch_for_a_different_proof_system_is_rejected() {
     assert_eq!(inner.validator.stub_remaining(), 0);
 }
 
+/// The current proof signer supports exactly one configured proof system.
+#[tokio::test]
+async fn rejects_batch_with_more_than_one_proof_system() {
+    let inner = one_accepting_validator();
+    let server = TestServer::new(Arc::clone(&inner)).await;
+    let mut batch = anchor_batch();
+    batch
+        .proofSystems
+        .push(address!("00000000000000000000000000000000000000bb"));
+    let mut window = happy_window();
+    replace_post_batch(
+        &mut window,
+        public_input_post_batch_for_empty_blocks(batch, 3),
+    );
+
+    let status = server.prove(window).await;
+
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+    assert_eq!(status.message(), "settlement validation rejected");
+    assert_eq!(inner.validator.stub_remaining(), 0);
+}
+
+/// Block-number-bound public inputs remain disabled until the signer has an
+/// authenticated L1 block oracle.
+#[tokio::test]
+async fn rejects_block_number_bound_batch_without_l1_oracle() {
+    let inner = one_accepting_validator();
+    let server = TestServer::new(Arc::clone(&inner)).await;
+    let mut batch = anchor_batch();
+    batch.blockNumber = 7;
+    let mut window = happy_window();
+    replace_post_batch(
+        &mut window,
+        public_input_post_batch_for_empty_blocks(batch, 3),
+    );
+
+    let status = server.prove(window).await;
+
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+    assert_eq!(status.message(), "settlement validation rejected");
+    assert_eq!(inner.validator.stub_remaining(), 0);
+}
+
 #[tokio::test]
 async fn malformed_settlement_calldata_is_rejected_after_validation() {
     let inner = one_accepting_validator();
