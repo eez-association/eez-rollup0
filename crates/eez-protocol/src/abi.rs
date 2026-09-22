@@ -110,6 +110,8 @@ sol! {
         bytes32 indexed crossChainCallHash, uint64 indexed rollupId, uint256 indexed entryQueueIndex
     );
 
+    event L2TxSkipped(uint256 indexed transientIdx, bytes revertData);
+
     event CrossChainCallExecuted(
         bytes32 indexed crossChainCallHash,
         address indexed proxy,
@@ -297,6 +299,34 @@ mod selector_locks {
             staticCrossChainCallCall::SELECTOR,
             [0x31, 0x34, 0x4a, 0xde],
             "staticCrossChainCall selector drifted from pinned protocol"
+        );
+    }
+
+    /// Attribution reads these three by topic0, and drift is silent: `get_logs`
+    /// returns nothing and the scan reports "no entries applied".
+    #[test]
+    fn consumption_event_topics_match_upstream() {
+        use alloy_sol_types::SolEvent;
+        assert_eq!(
+            L2ExecutionPerformed::SIGNATURE_HASH,
+            alloy_primitives::b256!(
+                "c0b8d01bb696973c75a58d377245b23ce450af0ed8c4cf808cd0a3d85c6f3da1"
+            ),
+            "L2ExecutionPerformed topic0 drifted; settlement endpoints would read empty"
+        );
+        assert_eq!(
+            ExecutionConsumed::SIGNATURE_HASH,
+            alloy_primitives::b256!(
+                "a17dc82da628b280737819918ee433b966773121ff974c081d8cbac4c6199d7d"
+            ),
+            "ExecutionConsumed topic0 drifted; consumed entries would read as unconsumed"
+        );
+        assert_eq!(
+            L2TxSkipped::SIGNATURE_HASH,
+            alloy_primitives::b256!(
+                "31dea3928d6f7bb415eb371434f719dfc337c078c82d58146f2b8a4726002e40"
+            ),
+            "L2TxSkipped topic0 drifted; a skipped immediate would read as applied"
         );
     }
 }
