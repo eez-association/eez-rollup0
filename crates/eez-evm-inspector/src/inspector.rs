@@ -311,7 +311,8 @@ where
         let sim = match sim {
             Ok(response) => response,
             Err(e) => {
-                tracing::error!(error = %e, "target execution failed");
+                // Expected outcome; `record_error` still carries it up.
+                tracing::warn!(error = %e, "target execution failed");
                 self.record_error(e);
                 return Some(CallOutcome::new(
                     InterpreterResult::new(
