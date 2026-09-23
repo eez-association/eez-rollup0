@@ -40,6 +40,7 @@ tokio.workspace   = true
 tracing.workspace = true
 
 [dev-dependencies]
+proptest = "1"
 # tests build event logs; the lib itself no longer decodes ABI
 alloy-sol-types.workspace = true
 # Checkpoint tests write real files; atomicity is the point of the code.
