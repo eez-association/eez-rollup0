@@ -155,8 +155,10 @@ fn immediate_run_end(batch: &ProofSystemBatchPerVerificationEntriesSol, immediat
 }
 
 /// Queue slot -> entry index: `ExecutionConsumed.entryQueueIndex` indexes the
-/// rollup's queue, not `batch.entries`. `_saveRemainderEntries` queues only
-/// from `immediateEntryCount` on, so the prefix never appears here.
+/// rollup's queue, not `batch.entries`. That queue is per-batch despite being
+/// storage: every verify wipes it and zeroes the cursor before the batch pushes,
+/// so slot 0 is this batch's first queued entry. `_saveRemainderEntries` starts
+/// at `immediateEntryCount`, so the prefix never appears here.
 fn deferred_queue_map(
     batch: &ProofSystemBatchPerVerificationEntriesSol,
     rollup_id: u64,
