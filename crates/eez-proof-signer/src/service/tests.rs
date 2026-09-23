@@ -27,7 +27,8 @@ use super::settlement_job::{
 use super::*;
 use crate::cancel::CancellationToken;
 use crate::testkit::{
-    TEST_SYSTEM_ADDRESS, checkpoint, system_transaction_context, test_proof_system_vkey,
+    TEST_SYSTEM_ADDRESS, checkpoint, empty_prefix_candidate, pre_execution_checkpoint,
+    system_transaction_context, test_proof_system_vkey,
 };
 use crate::validate::Validator;
 use crate::validate::testing::backend_output_for;
@@ -161,18 +162,14 @@ fn anchor_batch_for(rollup_id: u64) -> eez_protocol::EvmBatch {
 /// An anchor plus one outbound effect, chained over the window's block hashes:
 /// the anchor closes on the settling block's parent and the effect closes the
 /// window.
-fn outbound_batch(
-    window_pre: B256,
-    settling_pre: B256,
-    window_post: B256,
-) -> eez_protocol::EvmBatch {
+fn outbound_batch(window_pre: B256, window_post: B256) -> eez_protocol::EvmBatch {
     let mut batch = anchor_batch();
     let anchor = &mut batch.entries[0];
     anchor.stateUpdates[0].currentState = window_pre;
-    anchor.stateUpdates[0].newState = settling_pre;
+    anchor.stateUpdates[0].newState = empty_prefix_candidate();
 
     let mut effect = anchor.clone();
-    effect.stateUpdates[0].currentState = settling_pre;
+    effect.stateUpdates[0].currentState = empty_prefix_candidate();
     effect.stateUpdates[0].newState = window_post;
     effect.l2ToL1Calls.push(l2_to_l1_call());
     batch.entries.push(effect);
@@ -200,8 +197,8 @@ fn canonical_outbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256)
 }
 
 fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256) {
-    let (window_pre, settling_pre, window_post) = window_endpoints(5, 5);
-    let mut batch = outbound_batch(window_pre, settling_pre, window_post);
+    let (window_pre, _settling_pre, window_post) = window_endpoints(5, 5);
+    let mut batch = outbound_batch(window_pre, window_post);
     batch.entries[1].l2ToL1Calls[0].value = value;
     batch.entries[1].stateUpdates[0].etherDelta = -I256::try_from(value).unwrap();
     eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
@@ -258,7 +255,10 @@ fn outbound_backend_output() -> validate::BackendWindowOutput {
     backend_output.blocks[0].set_transaction_results_for_test(vec![true, true]);
     // The pair ends on the block's last transaction, so its candidate is the
     // settling block itself.
-    backend_output.blocks[0].transaction_state_checkpoints = vec![checkpoint(1, block_hash_of(5))];
+    backend_output.blocks[0].transaction_state_checkpoints = vec![
+        pre_execution_checkpoint(empty_prefix_candidate()),
+        checkpoint(1, block_hash_of(5)),
+    ];
     backend_output.blocks[0]
         .settlement_evidence
         .set_system_sender_flags_for_test(vec![true, false]);
@@ -332,6 +332,7 @@ fn mixed_backend_output() -> validate::BackendWindowOutput {
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[0].set_transaction_results_for_test(vec![true, true, true]);
     backend_output.blocks[0].transaction_state_checkpoints = vec![
+        pre_execution_checkpoint(empty_prefix_candidate()),
         checkpoint(1, interior_candidate()),
         checkpoint(2, block_hash_of(5)),
     ];
