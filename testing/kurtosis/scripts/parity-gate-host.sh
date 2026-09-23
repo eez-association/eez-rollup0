@@ -17,7 +17,7 @@ set -euo pipefail
 export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 
 K="$(cd "$(dirname "$0")/.." && pwd)"
-REPO="$(cd "$K/.." && pwd)"
+REPO="$(cd "$K/../.." && pwd)"
 source "$K/scripts/lib.sh"
 : "${L1:=http://127.0.0.1:8545}"
 : "${L2:=http://127.0.0.1:18688}"
