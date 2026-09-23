@@ -2964,28 +2964,6 @@ pub async fn deploy_value_no_ret(
     .await
 }
 
-/// Deploy a `ParityGate` forwarding to `target`. It reverts on ODD L1 blocks, so
-/// the revert is invisible to compose-time simulation and certain at inclusion.
-///
-/// # Errors
-/// Propagates deployment failures.
-pub async fn deploy_parity_gate(
-    rpc_url: &str,
-    key: &str,
-    chain_id: u64,
-    target: Address,
-) -> Result<Address> {
-    let out = repo_root().join("contracts/out");
-    deploy_raw(
-        rpc_url,
-        key,
-        chain_id,
-        &out.join("ParityGate.sol/ParityGate.json"),
-        target.abi_encode(),
-    )
-    .await
-}
-
 async fn deploy_reverting_target(rpc_url: &str, key: &str, chain_id: u64) -> Result<Address> {
     let out = repo_root().join("contracts/out");
     deploy_raw(
