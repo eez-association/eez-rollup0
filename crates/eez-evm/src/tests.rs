@@ -410,8 +410,11 @@ fn native_gasprice_is_zero_in_nested_calls_including_reimbursement_and_positive_
             assert!(result.result.is_success());
             let output = result.result.output().unwrap();
             let words = output
-                .chunks_exact(32)
-                .map(U256::from_be_slice)
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .copied()
+                .map(U256::from_be_bytes)
                 .collect::<Vec<_>>();
             assert_eq!(
                 words,
