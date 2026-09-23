@@ -513,9 +513,6 @@ struct SettlementFailureOutcome {
     evicted: usize,
 }
 
-/// Count one failed settlement episode for every candidate, evict transactions
-/// that reach the bound, and cascade each eviction through its sender/direction
-/// nonce suffix. Survivors retain their attempt count and FIFO order.
 /// Three-way disposition of a recovered batch's in-flight transactions: a
 /// receipt burns the nonce, no receipt returns the tx to the pool.
 fn dispose_recovered_txs(
@@ -569,6 +566,9 @@ fn dispose_recovered_txs(
     }
 }
 
+/// Count one failed settlement episode for every candidate, evict transactions
+/// that reach the bound, and cascade each eviction through its sender/direction
+/// nonce suffix. Survivors retain their attempt count and FIFO order.
 fn recover_settlement_failure(
     pool: &HeldPool,
     rollup_id: u64,
@@ -1413,7 +1413,7 @@ where
         // failed Sync block has either committed (head ≥ height →
         // reorg it out) or permanently didn't (stale-parent bail —
         // nothing to roll back).
-        if let Some(short) = rollup.optimistic.take_settled_short(cursor) {
+        if let Some(short) = rollup.optimistic.take_settled_short() {
             // No rollback: the height is canonical, so this owes the slot
             // nothing beyond the tx disposition and the slot proceeds normally.
             self.recover_short_batch(rollup_id, rollup, short).await;
@@ -1590,7 +1590,7 @@ where
             return;
         };
         let cursor = rollup.l1_head.cursor();
-        if let Some(short) = rollup.optimistic.take_settled_short(cursor) {
+        if let Some(short) = rollup.optimistic.take_settled_short() {
             self.recover_short_batch(rollup_id, rollup, short).await;
         }
         if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
@@ -1678,7 +1678,7 @@ where
                         error = %err,
                         "receipt lookup failed for a prefix-settled batch; retaining for retry",
                     );
-                    rollup.optimistic.reinsert_failed(short);
+                    rollup.optimistic.reinsert_settled_short(short);
                     return;
                 }
             }

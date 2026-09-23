@@ -16,7 +16,9 @@
 set -euo pipefail
 export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 
-REPO="$(cd "$(dirname "$0")/../../.." && pwd)"
+K="$(cd "$(dirname "$0")/.." && pwd)"
+REPO="$(cd "$K/.." && pwd)"
+source "$K/scripts/lib.sh"
 : "${L1:=http://127.0.0.1:8545}"
 : "${L2:=http://127.0.0.1:18688}"
 : "${L1F:=http://127.0.0.1:18999}"
@@ -32,12 +34,10 @@ FUND_KEY="${EEZ_FUND_FROM_KEY:-0xbcdf20249abf0ed6d944c0288fad489e33f66b3960d9e62
 
 L1_CHAIN_ID=$(cast chain-id --rpc-url "$L1")
 HH_KEY_2=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
-GAS=$(( $(cast gas-price --rpc-url "$L1") * 3 ))
+GAS=$(gas_price_for "$L1")
 
 refresh_log() { docker logs eez-node-kurtosis >"$NODE_LOG" 2>&1 || true; }
 count() { refresh_log; grep -c "$1" "$NODE_LOG" 2>/dev/null || true; }
-send_raw() { curl -s -X POST "$1" -H 'Content-Type: application/json' \
-    -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$2\"],\"id\":1}"; }
 
 echo "════════════════════════════════════════════════════════════"
 echo " PARITY GATE — partial consumption (rounds=$ROUNDS)"
@@ -120,8 +120,11 @@ for r in $(seq 1 "$ROUNDS"); do
     GATED=$(cast mktx --rpc-url "$L1" --chain-id "$L1_CHAIN_ID" --private-key "$GKEY" \
         --nonce "$(cast nonce "$GADDR" --rpc-url "$L1")" \
         --gas-limit 900000 --gas-price "$GAS" "$GATE" 'setValue(uint256)' "$((200 + r))")
-    send_raw "$L1F" "$DIRECT" >/dev/null
-    send_raw "$L1F" "$GATED"  >/dev/null
+    # `send_front` waits out the front's startup backoff and fails LOUDLY on a
+    # rejection; swallowing the response would report "no prefix" for a tx that
+    # was never accepted.
+    send_front "$L1F" "$DIRECT" "$(cast keccak "$DIRECT")" || exit 1
+    send_front "$L1F" "$GATED" "$(cast keccak "$GATED")" || exit 1
     sleep 18
     S=$(count 'eez.composer.recovery.settled_short')
     P=$(count 'eez.deriver.reconcile.partial_consumption')

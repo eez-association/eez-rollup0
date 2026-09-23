@@ -46,11 +46,8 @@ struct DecodedBatchLog {
     submitter: Address,
     /// This batch lists our rollup, so it wiped our queue — a window boundary.
     verifies_our_rollup: bool,
-    call_data: Bytes,
-    claimed_current_state: Option<B256>,
-    claimed_chain: Vec<B256>,
-    /// Kept whole: attribution classifies entries by role and maps queue slots
-    /// back to them, neither of which the claimed root chain can express.
+    /// Kept whole — it carries the calldata too, so no second copy is held.
+    /// Attribution classifies entries by role and maps queue slots back to them.
     batch: ProofSystemBatchPerVerificationEntriesSol,
 }
 
@@ -100,8 +97,6 @@ pub struct ScannedBatch {
     pub state_applied: bool,
     /// Which of this batch's claimed steps L1 actually ran. See [`Settlement`].
     pub settlement: Settlement,
-    pub claimed_current_state: Option<B256>,
-    pub claimed_new_state: Option<B256>,
 }
 
 /// What an applied entry contributes to the Sync block. `ordinal` ranks within
@@ -161,6 +156,10 @@ fn immediate_run_end(batch: &ProofSystemBatchPerVerificationEntriesSol, immediat
 
 /// Queue slot -> entry index: `ExecutionConsumed.entryQueueIndex` indexes the
 /// rollup's queue, not `batch.entries`.
+///
+/// Models the queue path only. EEZ.sol's meta-hook (`i < immediateEntryCount &&
+/// msg.sender.code.length > 0`) instead loads the remaining immediates into
+/// `_transientEntries`, and `ExecutionConsumed` then indexes THAT table.
 fn deferred_queue_map(
     batch: &ProofSystemBatchPerVerificationEntriesSol,
     rollup_id: u64,
@@ -441,8 +440,8 @@ pub(crate) async fn scan_batch_logs_range(
         .map_err(|e| L1Error::Provider(format!("get_logs(consumption): {e}")))?;
 
     let mut consumed_by_block: HashMap<u64, Vec<ConsumedEntry>> = HashMap::new();
-    // `transientIdx` indexes the posting tx's own transient table, so a rival's
-    // indices are meaningless here.
+    // `L2TxSkipped(i)` labels the posting tx's OWN `batch.entries` (EEZ.sol
+    // step 5), so a rival's indices name different entries and must not merge.
     let mut skipped_by_tx: HashMap<(B256, B256), HashSet<usize>> = HashMap::new();
     for l in &consumption_logs {
         let (Some(bn), Some(tx_index), Some(block_hash), Some(tx_hash)) = (
@@ -546,7 +545,6 @@ pub(crate) async fn scan_batch_logs_range(
             data: log.data().clone(),
         })
         .map_err(|e| L1Error::Decode(format!("decode BatchPosted({tx_hash}): {e}")))?;
-        let (claimed_current_state, claimed_chain) = our_state_chain(&decoded.batch, rollup_id);
         decoded_batches.push(DecodedBatchLog {
             l1_block_number,
             l1_block_hash,
@@ -560,9 +558,6 @@ pub(crate) async fn scan_batch_logs_range(
                 .rollupIdsWithProofSystems
                 .iter()
                 .any(|r| r.rollupId == rollup_id),
-            call_data: decoded.batch.callData.clone(),
-            claimed_current_state,
-            claimed_chain,
             batch: decoded.batch,
         });
     }
@@ -616,46 +611,27 @@ pub(crate) async fn scan_batch_logs_range(
                 .map(|set| set.iter().copied().collect())
                 .unwrap_or_default(),
         };
-        let settlement = attribute_settlement(
-            &b.batch,
-            rollup_id,
-            &evidence,
-            b.claimed_current_state.unwrap_or_default(),
-        )?;
+        // Every attribution failure halts the node, so name the locus: the
+        // counts alone leave an operator nothing to grep L1 for.
+        let settlement =
+            attribute_settlement(&b.batch, rollup_id, &evidence).map_err(|e| match e {
+                L1Error::Decode(msg) => L1Error::Decode(format!(
+                    "{msg} (L1 block {} {}, postBatch {})",
+                    b.l1_block_number, b.l1_block_hash, b.tx_hash,
+                )),
+                other => other,
+            })?;
         out.push(ScannedBatch {
             l1_block_number: b.l1_block_number,
             l1_block_hash: b.l1_block_hash,
             tx_hash: b.tx_hash,
             submitter: b.submitter,
-            call_data: b.call_data,
+            call_data: b.batch.callData,
             state_applied: winner_tx_hashes.contains(&(b.l1_block_hash, b.tx_hash)),
             settlement,
-            claimed_current_state: b.claimed_current_state,
-            claimed_new_state: b.claimed_chain.last().copied(),
         });
     }
     Ok(out)
-}
-
-/// Our rollup's state-update chain in a batch: the first update's
-/// `currentState` (pre-batch root) and the ordered per-update `newState` roots.
-fn our_state_chain(
-    batch: &ProofSystemBatchPerVerificationEntriesSol,
-    rollup_id: u64,
-) -> (Option<B256>, Vec<B256>) {
-    let mut first_curr: Option<B256> = None;
-    let mut new_states: Vec<B256> = Vec::new();
-    for entry in &batch.entries {
-        for update in &entry.stateUpdates {
-            if update.rollupId == rollup_id {
-                if first_curr.is_none() {
-                    first_curr = Some(update.currentState);
-                }
-                new_states.push(update.newState);
-            }
-        }
-    }
-    (first_curr, new_states)
 }
 
 /// Payloads inside this batch's tx-index window and on its own block hash.
@@ -679,7 +655,6 @@ fn attribute_settlement(
     batch: &ProofSystemBatchPerVerificationEntriesSol,
     rollup_id: u64,
     evidence: &ConsumptionEvidence,
-    claimed_current: B256,
 ) -> L1Result<Settlement> {
     if evidence.observed.is_empty() {
         return Ok(Settlement::NONE);
@@ -727,15 +702,20 @@ fn attribute_settlement(
                 .any(|update| update.rollupId == rollup_id)
         })
         .collect();
+    // EEZ.sol rejects duplicate rollups within an entry's `stateUpdates`
+    // (`StateUpdatesNotStrictlyIncreasing`), so one applied entry emits exactly
+    // one root for us — a disagreement means the window was mis-attributed.
+    //
+    // Terminal like the other two evidence disagreements: the Deriver stops
+    // rather than rebuild a block from a reading it cannot trust. It does NOT
+    // spare the optimistic height — the composer's observer maps every error to
+    // a failed bundle and rolls back regardless.
     if ours.len() != evidence.observed.len() {
-        event!(
-            name: "eez.l1.scan_batch_logs.evidence_disagrees",
-            Level::WARN,
-            entries = ours.len(),
-            roots = evidence.observed.len(),
-            "consumption events and settled roots disagree on how many entries ran",
-        );
-        return Ok(Settlement::NONE);
+        return Err(L1Error::Decode(format!(
+            "consumption events name {} applied entries but {} roots settled for rollup {rollup_id}",
+            ours.len(),
+            evidence.observed.len(),
+        )));
     }
 
     let applied: Vec<AppliedEntry> = ours
@@ -745,15 +725,15 @@ fn attribute_settlement(
             role: roles[entry_index],
         })
         .collect();
-    // The run began at the commitment the first applied entry expected: its own
-    // claim when it leads, else whatever a competing batch had already reached.
+    // The run began at the commitment the first applied entry expected — its
+    // own claim when it leads, else whatever a competing batch had reached.
+    // `ours` only holds entries carrying an update for us, so this always finds.
     let entry_state = applied.first().and_then(|first| {
         batch.entries[first.entry_index]
             .stateUpdates
             .iter()
             .find(|update| update.rollupId == rollup_id)
             .map(|update| update.currentState)
-            .or(Some(claimed_current))
     });
     Ok(Settlement::new(
         applied,
@@ -982,12 +962,7 @@ mod tests {
         batch: &ProofSystemBatchPerVerificationEntriesSol,
         applied: &[usize],
     ) -> crate::error::L1Result<Settlement> {
-        attribute_settlement(
-            batch,
-            TEST_ROLLUP,
-            &evidence_for(batch, applied),
-            B256::ZERO,
-        )
+        attribute_settlement(batch, TEST_ROLLUP, &evidence_for(batch, applied))
     }
 
     /// Idle `A→A` and rich `A→B` share an L1 block; each is judged against the
@@ -1090,7 +1065,7 @@ mod tests {
         let batch = batch_chain(pre, &[B256::repeat_byte(0x11), B256::repeat_byte(0x12)], 1);
         let mut evidence = evidence_for(&batch, &[0, 1]);
         evidence.consumed = vec![(99, batch.entries[1].proxyEntryHash)];
-        let error = attribute_settlement(&batch, TEST_ROLLUP, &evidence, B256::ZERO)
+        let error = attribute_settlement(&batch, TEST_ROLLUP, &evidence)
             .expect_err("an out-of-range queue slot must be terminal");
         assert!(
             matches!(error, L1Error::Decode(ref m) if m.contains("queue slot 99")),
@@ -1107,7 +1082,7 @@ mod tests {
         let mut evidence = evidence_for(&batch, &[0, 1]);
         evidence.consumed = vec![(0, B256::repeat_byte(0xEE))];
         assert!(
-            attribute_settlement(&batch, TEST_ROLLUP, &evidence, B256::ZERO).is_err(),
+            attribute_settlement(&batch, TEST_ROLLUP, &evidence).is_err(),
             "a call hash naming another entry must not be attributed to this one",
         );
     }
@@ -1430,7 +1405,12 @@ mod tests {
 
         let hash_a = B256::with_last_byte(0xA1);
         let hash_b = B256::with_last_byte(0xB2);
-        let tx = batch_tx(1, None, 0);
+        // An entry, because the root on our own hash below implies one applied.
+        let tx = batch_tx(
+            1,
+            Some((B256::repeat_byte(0x50), B256::repeat_byte(0xD4))),
+            0,
+        );
         let tx_hash = *tx.inner.tx_hash();
 
         asserter.push_success(&vec![batch_posted_log(100, hash_a, tx_hash, 0)]);
@@ -1473,7 +1453,9 @@ mod tests {
         let (c0, c1) = (B256::repeat_byte(0x50), B256::repeat_byte(0x51));
 
         let ours = batch_tx(1, Some((c0, c1)), 0);
-        let rival = batch_tx(1, None, 1); // same block NUMBER, different HASH
+        // An entry, because its decoy root below implies one applied: a root
+        // with no entry is unreachable on-chain.
+        let rival = batch_tx(1, Some((c0, B256::repeat_byte(0x99))), 1);
         let boundary = batch_tx(1, None, 2); // our real next boundary, hash A
         let (ours_hash, rival_hash, boundary_hash) = (
             *ours.inner.tx_hash(),

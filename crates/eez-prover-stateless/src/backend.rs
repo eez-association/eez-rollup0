@@ -32,7 +32,7 @@ use reth_chainspec::ChainSpec;
 use reth_primitives_traits::RecoveredBlock;
 use stateless_reth::validation::StatelessValidationError;
 use stateless_reth::{
-    CheckpointAt, StatelessValidationOutput, stateless_validation_recovered,
+    StatelessValidationOutput, stateless_validation_recovered,
     stateless_validation_recovered_with_state_checkpoints,
 };
 use tracing::{debug, info, trace};
@@ -248,21 +248,19 @@ impl Backend {
                         witness,
                         Arc::clone(&self.chain_spec),
                         self.evm_config.clone(),
-                        &checkpoint_positions(plan.transaction_indices()),
+                        plan.transaction_indices(),
                     )
                     .map_err(|error| map_stateless_error(block_number, error))?;
                     let checkpoints = output
                         .checkpoints
-                        .checkpoints
+                        .transaction_state_checkpoints
                         .into_iter()
-                        .map(|checkpoint| {
-                            Ok(TransactionStateCheckpoint {
-                                transaction_index: transaction_index_of(checkpoint.at)?,
-                                state_root: checkpoint.state_root,
-                                block_hash: checkpoint.block_hash,
-                            })
+                        .map(|checkpoint| TransactionStateCheckpoint {
+                            transaction_index: checkpoint.transaction_index,
+                            state_root: checkpoint.state_root,
+                            block_hash: checkpoint.block_hash,
                         })
-                        .collect::<Result<Vec<_>, ValidationError>>()?;
+                        .collect::<Vec<_>>();
                     plan.verify_returned(&checkpoints)?;
                     (output.validation, checkpoints)
                 }
@@ -390,30 +388,11 @@ impl ValidationBackend for Backend {
     }
 }
 
-/// The plan's transaction boundaries as backend checkpoint positions. Choosing
-/// WHICH boundary stays the plan's job, not the backend's.
-fn checkpoint_positions(transaction_indices: &[usize]) -> Vec<CheckpointAt> {
-    transaction_indices
-        .iter()
-        .map(|&index| CheckpointAt::Transaction(index))
-        .collect()
-}
-
-/// Unwrap a position this backend requested, which is always a transaction.
-fn transaction_index_of(at: CheckpointAt) -> Result<usize, ValidationError> {
-    match at {
-        CheckpointAt::Transaction(index) => Ok(index),
-        CheckpointAt::PreExecution => Err(ValidationError::InvalidBackendOutput(
-            "backend sealed a pre-execution candidate that was never requested".into(),
-        )),
-    }
-}
-
 /// Classify a rejected local checkpoint plan as an internal invariant failure;
 /// all other Stateless errors reject the input.
 fn map_stateless_error(block_number: u64, error: StatelessValidationError) -> ValidationError {
     match error {
-        error @ (StatelessValidationError::UnorderedCheckpoints { .. }
+        error @ (StatelessValidationError::UnorderedTransactionCheckpoints { .. }
         | StatelessValidationError::TransactionCheckpointOutOfBounds { .. }) => {
             ValidationError::InternalInvariant(format!(
                 "stateless rejected the locally derived checkpoint plan for block {block_number}: \

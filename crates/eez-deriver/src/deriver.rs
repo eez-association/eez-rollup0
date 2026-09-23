@@ -634,9 +634,9 @@ where
                 if resumed {
                     None
                 } else {
-                    batch.settlement.entry_state.or(batch.claimed_current_state)
+                    batch.settlement.entry_state
                 },
-                batch.settlement.final_state.or(batch.claimed_new_state),
+                batch.settlement.final_state,
                 anchor,
                 batch_first_l2,
                 batch_last_l2,
@@ -1001,8 +1001,6 @@ where
                 call_data,
                 state_applied,
                 settlement,
-                claimed_current_state,
-                claimed_new_state,
                 last_in_l1_block,
             } => {
                 self.on_batch_posted(
@@ -1013,8 +1011,6 @@ where
                     call_data,
                     state_applied,
                     settlement,
-                    claimed_current_state,
-                    claimed_new_state,
                     last_in_l1_block,
                 )
                 .await
@@ -1049,8 +1045,6 @@ where
         call_data: Bytes,
         state_applied: bool,
         settlement: eez_l1::Settlement,
-        claimed_current_state: Option<B256>,
-        claimed_new_state: Option<B256>,
         last_in_l1_block: bool,
     ) -> DeriverResult<()> {
         let Some(container) = self.decode_our_payload(call_data.as_ref(), l1_block_number)? else {
@@ -1196,9 +1190,9 @@ where
             if resumed {
                 None
             } else {
-                settlement.entry_state.or(claimed_current_state)
+                settlement.entry_state
             },
-            settlement.final_state.or(claimed_new_state),
+            settlement.final_state,
             anchor,
             from_block,
             to_block,
@@ -1615,7 +1609,7 @@ where
                             .collect();
                     let prefix_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
                         &skipped_paired,
-                        &inbound[..inbound_skip.min(inbound.len())],
+                        &inbound[..inbound_skip],
                         cfg,
                         starting_nonce,
                     )

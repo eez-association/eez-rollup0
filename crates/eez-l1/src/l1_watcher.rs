@@ -103,13 +103,6 @@ pub enum L1Event {
         /// (its postBatch tx up to the next postBatch verifying our rollup).
         /// `is_empty()` = nothing settled → Deriver skips the batch.
         settlement: crate::scan::Settlement,
-        /// FIRST stateDelta's `currentState` for our rollup. Deriver
-        /// compares to local STF result at `from_block - 1` to catch
-        /// claimed-vs-derived divergence at the batch entry point.
-        claimed_current_state: Option<B256>,
-        /// LAST stateDelta's `newState` for our rollup — the claimed
-        /// full-chain end. Diagnostics only; see `settlement.final_state`.
-        claimed_new_state: Option<B256>,
         /// `true` for the LAST batch of its L1 block. The Deriver waits for it to
         /// move safe: two batches in one L1 block can rewrite the same L2 height.
         last_in_l1_block: bool,
@@ -718,8 +711,6 @@ impl L1Watcher {
                 call_data: b.call_data,
                 state_applied: b.state_applied,
                 settlement: b.settlement,
-                claimed_current_state: b.claimed_current_state,
-                claimed_new_state: b.claimed_new_state,
                 last_in_l1_block,
             });
         }
@@ -1482,8 +1473,6 @@ mod tests {
             call_data: Bytes::new(),
             state_applied: true,
             settlement: crate::scan::Settlement::NONE,
-            claimed_current_state: None,
-            claimed_new_state: None,
         }
     }
 

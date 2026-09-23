@@ -362,9 +362,8 @@ impl Inner {
     /// Bundle observation, transport-agnostic: poll for the postBatch
     /// receipt (no block pinning — a builder may land the bundle a block
     /// late and the embedded L1 may lag the tip, so pinning to the exact
-    /// target produced false `Dropped` verdicts), then derive
-    /// `state_applied` from the inclusion block's `L2ExecutionPerformed`
-    /// events via [`Self::observe_settlement`].
+    /// target produced false `Dropped` verdicts), then attribute the applied
+    /// entries from the inclusion block via [`Self::observe_settlement`].
     ///
     /// `pinned` is the timestamp pin, set only for an [`BundleTarget::Exact`]
     /// bundle the relay accepted — those get the early verdict below.

@@ -196,10 +196,10 @@ impl OptimisticallyIncluded {
     /// Extract a prefix-settled entry for tx disposition. The caller must NOT
     /// reorg: the height is canonical.
     #[must_use]
-    pub fn take_settled_short(&self, cursor: u64) -> Option<FailedBatch> {
+    pub fn take_settled_short(&self) -> Option<FailedBatch> {
         let mut map = self.by_sync_height.lock().unwrap();
         let h = map
-            .range(cursor + 1..)
+            .iter()
             .find(|(_, e)| e.resolution == Resolution::SettledShort)
             .map(|(h, _)| *h)?;
         let entry = map.get_mut(&h)?;
@@ -265,6 +265,17 @@ impl OptimisticallyIncluded {
 
     /// Put a failed entry back after an unsuccessful recovery attempt.
     pub fn reinsert_failed(&self, batch: FailedBatch) {
+        self.reinsert(batch, Resolution::Failed);
+    }
+
+    /// Retain a prefix settlement for another attempt. It must NOT come back as
+    /// `Failed`: the height is canonical, so recovery would reorg out a height
+    /// L1 ratified.
+    pub fn reinsert_settled_short(&self, batch: FailedBatch) {
+        self.reinsert(batch, Resolution::SettledShort);
+    }
+
+    fn reinsert(&self, batch: FailedBatch, resolution: Resolution) {
         let mut map = self.by_sync_height.lock().unwrap();
         map.insert(
             batch.sync_height,
@@ -272,7 +283,7 @@ impl OptimisticallyIncluded {
                 txs: batch.txs,
                 post_batch_hash: batch.post_batch_hash,
                 parent: batch.parent,
-                resolution: Resolution::Failed,
+                resolution,
                 cursor_confirmed: false,
                 slot_skipped: batch.slot_skipped,
             },
@@ -456,7 +467,7 @@ mod tests {
             "a prefix settlement owes its tail a disposition; the cursor must not release it",
         );
         let swept = pool
-            .take_settled_short(0)
+            .take_settled_short()
             .expect("the prefix settlement is still there to sweep");
         assert_eq!(swept.sync_height, 10);
         assert_eq!(swept.txs.len(), 2);
@@ -464,7 +475,7 @@ mod tests {
             !swept.slot_skipped,
             "a short settle is not a drop: the entries that ran, ran",
         );
-        assert!(pool.take_settled_short(0).is_none(), "swept exactly once");
+        assert!(pool.take_settled_short().is_none(), "swept exactly once");
     }
 
     /// A prefix settlement keeps its height — the Deriver rebuilds the block L1
@@ -488,7 +499,7 @@ mod tests {
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
         pool.mark_settled(10);
         pool.mark_settled_short(10);
-        assert!(pool.take_settled_short(0).is_none());
+        assert!(pool.take_settled_short().is_none());
     }
 
     #[test]
