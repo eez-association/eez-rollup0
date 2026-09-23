@@ -4357,20 +4357,20 @@ async fn observe_bundle_outcome(
     };
     // Settled = L1 reached the claimed endpoint. Anything short is a prefix.
     let settled = settlement.is_some_and(|s| s.final_state == Some(expected_final_state));
-    // The anchor claims the block BEFORE this one, so an anchor-only settlement
-    // leaves this height unratified: reorged, not kept.
-    let kept_an_effect = settlement.is_some_and(eez_l1::Settlement::applied_an_effect);
+    // The anchor names a candidate at THIS height, so any applied entry keeps
+    // the height canonical; only an empty settlement leaves it unratified.
+    let applied_any = settlement.is_some_and(|s| !s.is_empty());
     match &outcome {
         // Settled SHORT: the height stays canonical and the Deriver rebuilds the
         // block L1 named; only the unconsumed tail is owed a disposition.
-        Ok(o @ SendOutcome::Included { .. }) if !settled && kept_an_effect => event!(
+        Ok(o @ SendOutcome::Included { .. }) if !settled && applied_any => event!(
             name: "eez.composer.bundle.observed",
             Level::WARN,
             event_name = "eez.composer.bundle.observed",
             rollup_id,
             sync_height,
             settled,
-            kept_an_effect,
+            applied_any,
             applied = ?settlement.map(eez_l1::Settlement::applied_indices),
             outcome = ?o,
             "postBatch settled a PREFIX; L1 kept part of this batch",
@@ -4416,13 +4416,13 @@ async fn observe_bundle_outcome(
     }
     if settled {
         optimistic.mark_settled(sync_height);
-    } else if kept_an_effect {
-        // L1 kept a prefix of the effects, so this height stays canonical and
-        // recovery owes only the tail disposition — no rollback.
+    } else if applied_any {
+        // L1 kept a prefix, so this height stays canonical and recovery owes
+        // only the tail disposition — no rollback.
         optimistic.mark_settled_short(sync_height);
     } else {
-        // Includes the anchor-only case: the commitment moved but no effect ran,
-        // so the block is unratified and the reorg path is correct.
+        // L1 ran nothing of this batch, so the height is unratified and the
+        // reorg path is correct.
         //
         // slot_skipped = the drop was NOT attributable to the bundled txs →
         // requeue without counting an attempt toward poison-eviction.

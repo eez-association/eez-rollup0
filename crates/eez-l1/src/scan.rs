@@ -271,15 +271,6 @@ impl Settlement {
     pub fn resumed(&self) -> bool {
         self.first_applied().is_some_and(|first| first > 0)
     }
-
-    /// L1 ran at least one entry that puts content in the Sync block. The anchor
-    /// claims the block BEFORE it, so an anchor-only prefix is reorged, not kept.
-    #[must_use]
-    pub fn applied_an_effect(&self) -> bool {
-        self.applied
-            .iter()
-            .any(|entry| entry.role != EntryRole::Anchor)
-    }
 }
 
 fn initial_log_scan_ranges(from_block: u64, to_block: u64) -> Vec<(u64, u64)> {
@@ -1027,7 +1018,7 @@ mod tests {
         let settlement = attribute(&batch, &[0]).unwrap();
         assert_eq!(settlement.applied_indices(), &[0]);
         assert_eq!(settlement.final_state, Some(r1));
-        assert!(!settlement.applied_an_effect(), "anchor-only ran no effect");
+        assert_eq!(settlement.applied().len(), 1, "only the anchor ran");
     }
 
     /// Inbound entries carry no `l2ToL1Calls`, so classifying on that field
@@ -1047,7 +1038,10 @@ mod tests {
             EntryRole::Inbound { ordinal: 0 },
             "a zero-call entry with a non-zero proxyEntryHash is a DELIVERY",
         );
-        assert!(attribute(&batch, &[0, 1]).unwrap().applied_an_effect());
+        assert_eq!(
+            attribute(&batch, &[0, 1]).unwrap().applied_indices(),
+            &[0, 1]
+        );
     }
 
     /// Outbound and anchor are both zero-hash; only the calls tell them apart.
@@ -1085,7 +1079,7 @@ mod tests {
     #[test]
     fn a_settlement_that_applied_nothing_is_not_resumed() {
         assert!(!Settlement::NONE.resumed());
-        assert!(!Settlement::NONE.applied_an_effect());
+        assert!(Settlement::NONE.is_empty());
     }
 
     /// A consumption naming a slot the batch lacks means the window was
