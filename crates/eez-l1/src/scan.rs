@@ -155,11 +155,8 @@ fn immediate_run_end(batch: &ProofSystemBatchPerVerificationEntriesSol, immediat
 }
 
 /// Queue slot -> entry index: `ExecutionConsumed.entryQueueIndex` indexes the
-/// rollup's queue, not `batch.entries`.
-///
-/// Models the queue path only. EEZ.sol's meta-hook (`i < immediateEntryCount &&
-/// msg.sender.code.length > 0`) instead loads the remaining immediates into
-/// `_transientEntries`, and `ExecutionConsumed` then indexes THAT table.
+/// rollup's queue, not `batch.entries`. `_saveRemainderEntries` queues only
+/// from `immediateEntryCount` on, so the prefix never appears here.
 fn deferred_queue_map(
     batch: &ProofSystemBatchPerVerificationEntriesSol,
     rollup_id: u64,
@@ -173,6 +170,16 @@ fn deferred_queue_map(
         .filter(|(_, entry)| entry.destinationRollupId == rollup_id)
         .map(|(index, _)| index)
         .collect()
+}
+
+/// Transient slot -> entry index. A contract poster trips EEZ.sol's meta-hook
+/// (`i < immediateEntryCount && msg.sender.code.length > 0`), which loads
+/// `entries[run_end..immediate]` into `_transientEntries` and routes consumption
+/// through THAT table. Unfiltered, because the transient cursor is global: other
+/// rollups' entries occupy slots too.
+fn transient_prefix_index(run_end: usize, immediate: usize, slot: usize) -> Option<usize> {
+    let index = run_end.checked_add(slot)?;
+    (index < immediate).then_some(index)
 }
 
 /// What L1 emitted inside one batch's window, before it is matched to entries.
@@ -190,8 +197,10 @@ struct ConsumptionEvidence {
 /// rather than inferred from the roots it emitted.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Settlement {
-    /// Ascending entry index, which is application order: the queue cursor only
-    /// moves forward and every immediate precedes every deferred consumption.
+    /// Ascending entry index, which is application order: both cursors only move
+    /// forward, and the three windows run in index order — inline immediates,
+    /// then the transient prefix, then the queue, which this batch does not even
+    /// populate until after its own meta-hook has returned.
     applied: Vec<AppliedEntry>,
     /// `newState` of the last entry that applied — L1's actual commitment, and
     /// the only valid reconciliation endpoint under partial consumption.
@@ -669,24 +678,35 @@ fn attribute_settlement(
         .filter(|index| !evidence.skipped_immediates.contains(index))
         .collect();
 
-    // Deferred entries: each consumption names its queue slot outright.
+    // Deferred entries: each consumption names a slot, but in one of two index
+    // spaces — the rollup's persistent queue, or a contract poster's transient
+    // prefix. The entry's own key picks the space, mirroring `_entryMatches`
+    // on-chain. At most one candidate can match: a consumption always carries a
+    // real call hash, and those are unique per entry (invariant 5).
     for &(slot, call_hash) in &evidence.consumed {
         let slot = usize::try_from(slot).unwrap_or(usize::MAX);
-        let Some(&entry_index) = queue.get(slot) else {
-            return Err(L1Error::Decode(format!(
-                "ExecutionConsumed names queue slot {slot} but the batch queues {} entries",
+        let entry_index = [
+            queue.get(slot).copied(),
+            transient_prefix_index(run_end, immediate, slot),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|&index| {
+            batch.entries[index].proxyEntryHash == call_hash
+                && batch.entries[index].destinationRollupId == rollup_id
+        })
+        .ok_or_else(|| {
+            // No reading of the slot lands on an entry the event could name, so
+            // the window picked up a rival's consumption and the whole
+            // attribution is suspect.
+            L1Error::Decode(format!(
+                "ExecutionConsumed slot {slot} names call hash {call_hash}, which matches no \
+                 entry of rollup {rollup_id} in this batch ({} queued, {} in the transient \
+                 prefix)",
                 queue.len(),
-            )));
-        };
-        // The queue map and the call hash must agree, or the window picked up a
-        // rival's consumption and the whole attribution is suspect.
-        if batch.entries[entry_index].proxyEntryHash != call_hash {
-            return Err(L1Error::Decode(format!(
-                "ExecutionConsumed slot {slot} names call hash {call_hash} but entry \
-                 {entry_index} carries {}",
-                batch.entries[entry_index].proxyEntryHash,
-            )));
-        }
+                immediate.saturating_sub(run_end),
+            ))
+        })?;
         applied.push(entry_index);
     }
     applied.sort_unstable();
@@ -1068,9 +1088,46 @@ mod tests {
         let error = attribute_settlement(&batch, TEST_ROLLUP, &evidence)
             .expect_err("an out-of-range queue slot must be terminal");
         assert!(
-            matches!(error, L1Error::Decode(ref m) if m.contains("queue slot 99")),
+            matches!(error, L1Error::Decode(ref m) if m.contains("slot 99")),
             "got {error}",
         );
+    }
+
+    /// A contract poster trips EEZ.sol's meta-hook, which runs the immediates
+    /// past the leading L2Tx run out of `_transientEntries` — a table the queue
+    /// map cannot address, since `_saveRemainderEntries` never queues them. We
+    /// do not post this shape, but a peer may, and misreading it would diverge.
+    #[test]
+    fn a_meta_hook_consumption_resolves_against_the_transient_prefix() {
+        let pre = B256::repeat_byte(0x01);
+        let roots: Vec<B256> = (0x11..=0x12).map(B256::repeat_byte).collect();
+        let mut batch = batch_chain(pre, &roots, 1);
+        // Entry 1 carries a call hash yet sits inside the immediate prefix, so
+        // the leading run ends at 1 and entry 1 goes to the transient table.
+        batch.immediateEntryCount = U256::from(2u64);
+        assert!(
+            super::deferred_queue_map(&batch, TEST_ROLLUP, 2).is_empty(),
+            "the transient prefix must be unreachable through the queue",
+        );
+
+        let evidence = super::ConsumptionEvidence {
+            observed: roots.clone(),
+            consumed: vec![(0, batch.entries[1].proxyEntryHash)],
+            skipped_immediates: Vec::new(),
+        };
+        let settlement = attribute_settlement(&batch, TEST_ROLLUP, &evidence)
+            .expect("transient slot 0 names entry 1");
+        assert_eq!(settlement.applied_indices(), &[0, 1]);
+        assert_eq!(settlement.final_state, Some(roots[1]));
+
+        // The hash decides, so a slot inside the window that no entry answers
+        // for stays terminal instead of resolving positionally.
+        let bogus = super::ConsumptionEvidence {
+            consumed: vec![(0, B256::repeat_byte(0xEE))],
+            ..evidence
+        };
+        attribute_settlement(&batch, TEST_ROLLUP, &bogus)
+            .expect_err("a call hash no entry carries must be terminal");
     }
 
     /// The queue map and the call hash are independent readings of the same
