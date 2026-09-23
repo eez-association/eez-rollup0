@@ -607,14 +607,23 @@ pub(crate) async fn scan_batch_logs_range(
                 detail: "settlement logs are from another fork of this block; retry".into(),
             });
         }
+        // Consumption is a SEPARATE `get_logs`: silently dropping its off-fork
+        // records leaves a terminal count mismatch from a transient cause.
+        let block_consumed = consumed_by_block.get(&b.l1_block_number);
+        if block_consumed.is_some_and(|cs| cs.iter().all(|c| c.block_hash != b.l1_block_hash)) {
+            return Err(L1Error::SourceIncomplete {
+                block: b.l1_block_number,
+                tx_hash: b.tx_hash,
+                detail: "consumption logs are from another fork of this block; retry".into(),
+            });
+        }
         // One window serves every event family: from this batch's own tx up to
         // the next postBatch that verifies our rollup, pinned to this fork.
         let evidence = ConsumptionEvidence {
             observed: block_roots
                 .map(|roots| in_window(roots, b.tx_index, window_end, b.l1_block_hash))
                 .unwrap_or_default(),
-            consumed: consumed_by_block
-                .get(&b.l1_block_number)
+            consumed: block_consumed
                 .map(|entries| in_window(entries, b.tx_index, window_end, b.l1_block_hash))
                 .unwrap_or_default(),
             skipped_immediates: skipped_by_tx

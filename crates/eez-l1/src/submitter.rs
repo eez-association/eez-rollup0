@@ -400,14 +400,29 @@ impl Inner {
                     let l1_block = receipt.block_number.ok_or_else(|| {
                         L1Error::Provider("receipt present but block_number missing".into())
                     })?;
-                    let settlement = self
+                    match self
                         .observe_settlement(&target_provider, l1_block, tx_hash)
-                        .await?;
-                    return Ok(SendOutcome::Included {
-                        tx_hash,
-                        l1_block,
-                        settlement,
-                    });
+                        .await
+                    {
+                        Ok(settlement) => {
+                            return Ok(SendOutcome::Included {
+                                tx_hash,
+                                l1_block,
+                                settlement,
+                            });
+                        }
+                        // The receipt proves it LANDED: a transient read
+                        // escaping here would reorg out a ratified height.
+                        Err(err) if !err.is_terminal() => event!(
+                            name: "eez.submitter.observe.settlement_read_failed",
+                            Level::WARN,
+                            tx_hash = %tx_hash,
+                            l1_block,
+                            error = %err,
+                            "settlement read failed after inclusion; retrying",
+                        ),
+                        Err(err) => return Err(err),
+                    }
                 }
                 Ok(None) => {
                     let verdict = match pin_timestamp {
