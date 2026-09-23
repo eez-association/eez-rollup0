@@ -20,8 +20,8 @@ use eez_proof_signer::validate::support::{
     system_sender_flags,
 };
 use eez_proof_signer::validate::{
-    BackendBlockOutput, BackendWindowOutput, SettlementBlockEvidence, TransactionStateCheckpoint,
-    ValidationBackend, ValidationError,
+    BackendBlockOutput, BackendWindowOutput, CheckpointAt, SettlementBlockEvidence,
+    StateCheckpoint, ValidationBackend, ValidationError,
 };
 use eez_proof_signer::window::AdmittedBlock;
 use reth_chainspec::ChainSpec;
@@ -202,13 +202,13 @@ where
     for (index, admitted) in blocks.iter().enumerate() {
         check_cancellation(cancellation, index, total_blocks)?;
         let is_settling = index + 1 == total_blocks;
-        let (block, checkpoint_indices, sender_flags) = if is_settling {
+        let (block, checkpoint_positions, sender_flags) = if is_settling {
             let (block, plan, flags) = prepared_settling_block.take().ok_or_else(|| {
                 ValidationError::InternalInvariant(
                     "prepared stateful settling block unexpectedly missing".to_owned(),
                 )
             })?;
-            (block, plan.transaction_indices().to_vec(), flags)
+            (block, plan.positions().to_vec(), flags)
         } else {
             let block = decode_match_and_recover_signers(admitted, chain_spec)?;
             let flags = system_sender_flags(&block, expected_l2_system_address);
@@ -234,21 +234,22 @@ where
             transactions = block.body().transactions.len(),
             "replaying stateful proof block",
         );
-        let (result, checkpoints, block_access_list_hash) =
-            if checkpoint_indices.is_empty() && block.header().block_access_list_hash().is_none() {
-                (
-                    execute_block(evm_config, &mut state, &block)?,
-                    Vec::new(),
-                    None,
-                )
-            } else {
-                execute_block_with_state_checkpoints(
-                    evm_config,
-                    &mut state,
-                    &block,
-                    &checkpoint_indices,
-                )?
-            };
+        let (result, checkpoints, block_access_list_hash) = if checkpoint_positions.is_empty()
+            && block.header().block_access_list_hash().is_none()
+        {
+            (
+                execute_block(evm_config, &mut state, &block)?,
+                Vec::new(),
+                None,
+            )
+        } else {
+            execute_block_with_state_checkpoints(
+                evm_config,
+                &mut state,
+                &block,
+                &checkpoint_positions,
+            )?
+        };
         validate_block_post_execution(
             &block,
             chain_spec.as_ref(),
@@ -364,11 +365,11 @@ fn execute_block_with_state_checkpoints(
     evm_config: &EezEvmConfig,
     state: &mut State<StateProviderDatabase<Box<dyn StateProvider + Send>>>,
     block: &RecoveredBlock<Block>,
-    checkpoint_indices: &[usize],
+    checkpoint_positions: &[CheckpointAt],
 ) -> Result<
     (
         BlockExecutionResult<EthereumReceipt>,
-        Vec<TransactionStateCheckpoint>,
+        Vec<StateCheckpoint>,
         Option<B256>,
     ),
     ValidationError,
@@ -392,8 +393,30 @@ fn execute_block_with_state_checkpoints(
             executor.evm_mut().db_mut().bump_bal_index();
         }
 
-        let mut checkpoints = Vec::with_capacity(checkpoint_indices.len());
-        let mut next_checkpoint = checkpoint_indices.iter().copied().peekable();
+        let mut checkpoints = Vec::with_capacity(checkpoint_positions.len());
+        let mut next_checkpoint = checkpoint_positions.iter().copied().peekable();
+        // Sealed before the loop: the anchor's candidate is this block holding
+        // no transactions, after the pre-block system calls have run.
+        if next_checkpoint.peek() == Some(&CheckpointAt::PreExecution) {
+            let state_root = {
+                let db = executor.evm_mut().db_mut();
+                db.merge_transitions(BundleRetention::Reverts);
+                state_root(db)?
+            };
+            let block_hash =
+                candidate_block_hash::<EezPrimitives>(block.sealed_header(), &[], &[], state_root)
+                    .map_err(|error| {
+                        ValidationError::Rejected(format!(
+                            "stateful candidate block hash rejected: {error}"
+                        ))
+                    })?;
+            checkpoints.push(StateCheckpoint {
+                at: CheckpointAt::PreExecution,
+                state_root,
+                block_hash,
+            });
+            next_checkpoint.next();
+        }
         for (transaction_index, transaction) in block.transactions_recovered().enumerate() {
             executor
                 .execute_transaction(transaction)
@@ -401,7 +424,7 @@ fn execute_block_with_state_checkpoints(
             if has_bal {
                 executor.evm_mut().db_mut().bump_bal_index();
             }
-            if next_checkpoint.peek() == Some(&transaction_index) {
+            if next_checkpoint.peek() == Some(&CheckpointAt::Transaction(transaction_index)) {
                 let state_root = {
                     let db = executor.evm_mut().db_mut();
                     db.merge_transitions(BundleRetention::Reverts);
@@ -418,8 +441,8 @@ fn execute_block_with_state_checkpoints(
                         "stateful candidate block hash rejected: {error}"
                     ))
                 })?;
-                checkpoints.push(TransactionStateCheckpoint {
-                    transaction_index,
+                checkpoints.push(StateCheckpoint {
+                    at: CheckpointAt::Transaction(transaction_index),
                     state_root,
                     block_hash,
                 });

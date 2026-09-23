@@ -24,7 +24,8 @@ use eez_protocol::{
 use reth_primitives_traits::{BlockBody as _, SignerRecoverable as _};
 
 use crate::testkit::{
-    SYSTEM_TX, TEST_SYSTEM_ADDRESS, checkpoint, system_transaction_context, test_proof_system_vkey,
+    SYSTEM_TX, TEST_SYSTEM_ADDRESS, checkpoint, pre_execution_checkpoint,
+    system_transaction_context, test_proof_system_vkey,
 };
 use crate::validate::{OutboundEventObservation, SettlementBlockEvidence, ValidatedBlock};
 
@@ -276,29 +277,31 @@ fn effect_plan<'batch, 'settling>(
     batch: &'batch CanonicalPostBatch,
     settling: &'settling SettlingBlockObservations,
 ) -> BoundEffectSequence<'batch, 'settling> {
-    let checkpoints = settling
-        .effect_candidate_positions()
-        .into_iter()
-        .map(|transaction_index| checkpoint(transaction_index, B256::ZERO))
-        .collect::<Vec<_>>();
+    // The anchor's candidate leads the list, then one per effect position.
+    let mut checkpoints = vec![pre_execution_checkpoint(B256::ZERO)];
+    checkpoints.extend(
+        settling
+            .effect_candidate_positions()
+            .into_iter()
+            .map(|transaction_index| checkpoint(transaction_index, B256::ZERO)),
+    );
     let verified_state_chain = verified_state_chain_for_test(batch);
-    bind_effects_to_execution(&verified_state_chain, B256::ZERO, &checkpoints, settling).unwrap()
+    bind_effects_to_execution(&verified_state_chain, &checkpoints, settling).unwrap()
 }
 
 /// Test shorthand for the fixture's fixed rollup identity.
 fn verify_effect_prefix<'batch, 'settling>(
     batch: &'batch CanonicalPostBatch,
     pre_settling_root: B256,
-    transaction_state_checkpoints: &[crate::validate::TransactionStateCheckpoint],
+    transaction_state_checkpoints: &[crate::validate::StateCheckpoint],
     settling: &'settling SettlingBlockObservations,
 ) -> Result<BoundEffectSequence<'batch, 'settling>, EffectPrefixError> {
     let verified_state_chain = verified_state_chain_for_test(batch);
-    bind_effects_to_execution(
-        &verified_state_chain,
-        pre_settling_root,
-        transaction_state_checkpoints,
-        settling,
-    )
+    // Fixtures describe the anchor by the root it claims; it now leads the
+    // checkpoint list as the settling block's empty prefix.
+    let mut checkpoints = vec![pre_execution_checkpoint(pre_settling_root)];
+    checkpoints.extend_from_slice(transaction_state_checkpoints);
+    bind_effects_to_execution(&verified_state_chain, &checkpoints, settling)
 }
 
 /// Build the state-chain capability required by effect-binding unit tests.

@@ -5,7 +5,7 @@ use alloy_primitives::{B256, Bytes, Log, Signature, U256, b256};
 use alloy_sol_types::SolEvent as _;
 use eez_primitives::{EezTxEnvelope as TransactionSigned, Receipt as EthereumReceipt};
 use eez_proof_signer::EEZL2_ADDRESS;
-use eez_proof_signer::validate::{DecodedOutboundEvent, OutboundEventObservation};
+use eez_proof_signer::validate::{CheckpointAt, DecodedOutboundEvent, OutboundEventObservation};
 use eez_proof_signer::window::testing::admitted_block_with_witness;
 use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
 use reth_primitives_traits::SignerRecoverable as _;
@@ -144,9 +144,9 @@ fn high_s_ethereum_transaction() -> TransactionSigned {
     .into()
 }
 
-fn checkpoint(transaction_index: usize) -> TransactionStateCheckpoint {
-    TransactionStateCheckpoint {
-        transaction_index,
+fn checkpoint(transaction_index: usize) -> StateCheckpoint {
+    StateCheckpoint {
+        at: CheckpointAt::Transaction(transaction_index),
         state_root: B256::ZERO,
         block_hash: B256::with_last_byte(0xc0 ^ (transaction_index as u8)),
     }
@@ -314,7 +314,10 @@ fn outbound_observations_preserve_receipt_log_order_and_duplicates() {
 
 #[test]
 fn checkpoint_response_must_match_the_plan_exactly() {
-    let plan = CheckpointPlan::new(vec![0, 2]);
+    let plan = CheckpointPlan::new(vec![
+        CheckpointAt::Transaction(0),
+        CheckpointAt::Transaction(2),
+    ]);
     assert!(
         plan.verify_returned(&[checkpoint(0), checkpoint(2)])
             .is_ok()
@@ -362,7 +365,15 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
         CheckpointPlan::from_recovered_block(&recovered, TEST_SYSTEM_ADDRESS);
 
     assert_eq!(system_sender_flags, [true, false, true]);
-    assert_eq!(plan.transaction_indices(), [1, 2]);
+    // The anchor's candidate leads, then the pair ends.
+    assert_eq!(
+        plan.positions(),
+        [
+            CheckpointAt::PreExecution,
+            CheckpointAt::Transaction(1),
+            CheckpointAt::Transaction(2),
+        ]
+    );
 }
 
 /// The final transaction is ALWAYS a planned boundary. The stateless backend's
@@ -399,8 +410,8 @@ fn checkpoint_plan_always_ends_at_the_final_transaction() {
             let (plan, _) = CheckpointPlan::from_recovered_block(&recovered, TEST_SYSTEM_ADDRESS);
 
             assert_eq!(
-                plan.transaction_indices().last(),
-                Some(&(width - 1)),
+                plan.positions().last(),
+                Some(&CheckpointAt::Transaction(width - 1)),
                 "shape {shape:?} did not plan its final transaction",
             );
         }
@@ -433,10 +444,9 @@ fn checkpoint_plan_includes_every_inbound_boundary() {
             CheckpointPlan::from_recovered_block(&recovered, TEST_SYSTEM_ADDRESS);
 
         assert_eq!(system_sender_flags, vec![true; transaction_count]);
-        assert_eq!(
-            plan.transaction_indices(),
-            (0..transaction_count).collect::<Vec<_>>()
-        );
+        let mut expected = vec![CheckpointAt::PreExecution];
+        expected.extend((0..transaction_count).map(CheckpointAt::Transaction));
+        assert_eq!(plan.positions(), expected);
     }
 }
 
@@ -568,7 +578,10 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
     assert_eq!(
         observed
             .iter()
-            .map(|c| (c.transaction_index, c.state_root))
+            .filter_map(|c| match c.at {
+                CheckpointAt::Transaction(index) => Some((index, c.state_root)),
+                CheckpointAt::PreExecution => None,
+            })
             .collect::<Vec<_>>(),
         expected,
         "indices and state roots must match the recorded oracle",
@@ -578,7 +591,7 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
     // ones: the full-prefix candidate IS this block, and shorter prefixes are
     // different blocks.
     let last = observed.last().expect("the fixture selects every boundary");
-    assert_eq!(last.transaction_index, 2);
+    assert_eq!(last.at, CheckpointAt::Transaction(2));
     assert_eq!(
         last.block_hash, expected_hash,
         "the candidate holding every transaction must be the block itself",

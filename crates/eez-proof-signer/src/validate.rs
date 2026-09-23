@@ -16,13 +16,18 @@ pub mod support;
 
 type EthereumBlock = eez_primitives::Block;
 
-/// One transaction boundary's replay outputs: the cumulative state root and
-/// the hash of the candidate block sealed over that prefix.
+/// Where a candidate is sealed: the pre-execution seal or a transaction
+/// boundary. Re-exported from the validator so both backends and this contract
+/// name one type.
+pub use stateless_reth::CheckpointAt;
+
+/// One checkpoint position's replay outputs: the cumulative state root and the
+/// hash of the candidate block sealed over that prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransactionStateCheckpoint {
-    /// Zero-based position of the transaction within its block.
-    pub transaction_index: usize,
-    /// State root immediately after this transaction, before post-block changes.
+pub struct StateCheckpoint {
+    /// Where in the block this was sealed.
+    pub at: CheckpointAt,
+    /// State root at this position, before post-block changes.
     pub state_root: B256,
     /// Hash of the candidate block holding exactly this prefix — what settlement
     /// gates compare an entry's claimed `newState` against.
@@ -44,7 +49,7 @@ pub struct BackendBlockOutput {
     pub receipt_successes: Vec<bool>,
     /// Locally computed roots at selected transaction boundaries, strictly
     /// ordered by transaction index. Non-settling blocks have no checkpoints.
-    pub transaction_state_checkpoints: Vec<TransactionStateCheckpoint>,
+    pub transaction_state_checkpoints: Vec<StateCheckpoint>,
     /// Post-state root recomputed and matched against the block header.
     pub post_state_root: B256,
     /// Locally derived facts retained specifically for settlement gates.
@@ -246,7 +251,7 @@ pub(crate) struct ValidatedSettlingBlock {
     /// Receipt status for every transaction in the settling block.
     receipt_successes: Vec<bool>,
     /// Locally recomputed boundaries selected for settlement effects.
-    transaction_state_checkpoints: Vec<TransactionStateCheckpoint>,
+    transaction_state_checkpoints: Vec<StateCheckpoint>,
 }
 
 impl ValidatedSettlingBlock {
@@ -261,7 +266,7 @@ impl ValidatedSettlingBlock {
     }
 
     /// Locally recomputed roots requested at selected transaction boundaries.
-    pub(crate) fn transaction_state_checkpoints(&self) -> &[TransactionStateCheckpoint] {
+    pub(crate) fn transaction_state_checkpoints(&self) -> &[StateCheckpoint] {
         &self.transaction_state_checkpoints
     }
 
@@ -270,7 +275,7 @@ impl ValidatedSettlingBlock {
     pub(crate) fn for_test(
         block: ValidatedBlock,
         receipt_successes: Vec<bool>,
-        transaction_state_checkpoints: Vec<TransactionStateCheckpoint>,
+        transaction_state_checkpoints: Vec<StateCheckpoint>,
     ) -> Self {
         Self {
             block,
@@ -307,7 +312,10 @@ impl ValidatedWindow {
         self.window_pre_block_hash
     }
 
-    /// Hash of the block immediately before the terminal block.
+    /// Hash of the block immediately before the terminal block. Test-only: the
+    /// anchor's gate reads the settling block's own empty-prefix candidate, so
+    /// nothing in the pipeline needs the parent any more.
+    #[cfg(test)]
     pub(crate) fn settling_pre_block_hash(&self) -> B256 {
         self.settling_pre_block_hash
     }
@@ -581,22 +589,27 @@ fn check_backend_window_output(
             "backend output supplied transaction state checkpoints for preceding block {}",
             admitted.declared_number,
         );
+        // `CheckpointAt`'s variant order is execution order, so `Ord` is the
+        // ordering check: pre-execution precedes every transaction boundary.
         for pair in checkpoints.windows(2) {
             eyre::ensure!(
-                pair[0].transaction_index < pair[1].transaction_index,
-                "transaction state checkpoints for block {} are not strictly ordered: index \
-                 {} is followed by {}",
+                pair[0].at < pair[1].at,
+                "state checkpoints for block {} are not strictly ordered: {} is followed by {}",
                 admitted.declared_number,
-                pair[0].transaction_index,
-                pair[1].transaction_index,
+                pair[0].at,
+                pair[1].at,
             );
         }
         for checkpoint in checkpoints {
+            let CheckpointAt::Transaction(index) = checkpoint.at else {
+                // A pre-execution candidate names no transaction, so there is
+                // nothing to bound; an empty block still has one.
+                continue;
+            };
             eyre::ensure!(
-                checkpoint.transaction_index < transaction_count,
-                "transaction state checkpoint index {} is out of bounds for block {} with {} \
-                 transactions",
-                checkpoint.transaction_index,
+                index < transaction_count,
+                "state checkpoint at {} is out of bounds for block {} with {} transactions",
+                checkpoint.at,
                 admitted.declared_number,
                 transaction_count,
             );
