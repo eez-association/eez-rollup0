@@ -49,7 +49,9 @@ mod tests {
         OutboundFailure, ProveChunk, ProveFailure, ProveHeader, ProveResponse, prove_chunk,
         prove_failure,
     };
-    use super::v2::{Begin, ClientFrame, ServerFrame, Validated, client_frame, server_frame};
+    use super::v2::{
+        Begin, ClientFrame, Ready, ServerFrame, Validated, client_frame, server_frame,
+    };
     use super::{MAX_MESSAGE_BYTES, decode_prove_failure, encode_prove_failure};
 
     #[test]
@@ -114,8 +116,22 @@ mod tests {
             begin
         );
 
+        let session_id = vec![0x33; 32];
+        let ready = ServerFrame {
+            session_id: session_id.clone(),
+            request_id: begin.request_id,
+            kind: Some(server_frame::Kind::Ready(Ready {
+                validated_through: 100,
+                validated_hash: vec![0x11; 32],
+            })),
+        };
+        assert_eq!(
+            ServerFrame::decode(ready.encode_to_vec().as_slice()).unwrap(),
+            ready
+        );
+
         let acknowledged = ServerFrame {
-            session_id: vec![0x33; 32],
+            session_id,
             request_id: 18,
             kind: Some(server_frame::Kind::Validated(Validated {
                 number: 101,

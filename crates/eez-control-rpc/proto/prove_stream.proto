@@ -12,7 +12,7 @@ service Prover {
 }
 
 message ClientFrame {
-  // Zero only on Begin. The server issues this opaque ID; it is never a block
+  // Empty only on Begin. The server issues this opaque ID; it is never a block
   // or proof identity and is not shared between Composers.
   bytes session_id = 1;
   // Chosen by the client and echoed on every response to this operation.
@@ -57,7 +57,10 @@ message Finalize {
 message Abort {}
 
 message ServerFrame {
+  // A successful Begin carries the new nonempty ID; a rejected Begin carries
+  // an empty ID. Every response after Ready echoes the established session ID.
   bytes session_id = 1;
+  // Echoes the request_id of the ClientFrame this response addresses.
   uint64 request_id = 2;
   oneof kind {
     Ready ready = 3;

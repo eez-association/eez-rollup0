@@ -7,14 +7,18 @@ remains the only active runtime endpoint in this PR. The wire schema is
 ## Identity and sharing
 
 One `ProveStream` belongs to one Composer session. `Begin` creates an opaque
-server-issued session ID; `Resume` can reconnect to that session. Every response
-echoes the session and client request IDs. A server MUST NOT use either ID as a
-block, validation, or proof identity. An authorized Composer's session may refer
-to immutable validated-block artifacts already computed for another session,
-but cannot mutate another session's cursor, pending finalization, or result.
-Where multiple independently operated Composers share a prover, the transport
-MUST authenticate them and bind the session ID to that identity. The opaque ID
-is not a substitute for authentication.
+server-issued session ID; `Resume` can reconnect to that session. `Begin` MUST
+carry an empty session ID. A successful `Ready` echoes its request ID and carries
+the newly issued nonempty session ID. A `Rejected` response to `Begin` echoes
+the request ID and carries an empty session ID because no session was created.
+After `Ready`, every response echoes the established session ID and its client
+request ID. A server MUST NOT use either ID as a block, validation, or proof
+identity. An authorized Composer's session may refer to immutable validated-block
+artifacts already computed for another session, but cannot mutate another
+session's cursor, pending finalization, or result. Where multiple independently
+operated Composers share a prover, the transport MUST authenticate them and bind
+the session ID to that identity. The opaque ID is not a substitute for
+authentication.
 
 The reusable block identity includes the operator-configured rollup/chain and
 validation profile, exact consensus RLP, computed block hash, parent hash, and
