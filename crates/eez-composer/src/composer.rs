@@ -3426,10 +3426,7 @@ where
                 // No effects: the anchor is the only entry, so it carries the
                 // endpoint. The block holds no transactions, so that endpoint
                 // IS its empty prefix.
-                &SyncCandidates {
-                    anchor: empty_built.header.hash(),
-                    per_effect: Vec::new(),
-                },
+                &SyncCandidates::anchor_only(empty_built.header.hash()),
                 &[], // no outbound entries
                 &[], // no outbound user txs
                 0,   // no inline outbound target calls
@@ -3594,10 +3591,7 @@ where
                     None, // terminal is committed → witnesses come from the store
                     // No effects: the anchor carries the committed terminal's
                     // own hash as the endpoint.
-                    &SyncCandidates {
-                        anchor: boundary_header.hash(),
-                        per_effect: Vec::new(),
-                    },
+                    &SyncCandidates::anchor_only(boundary_header.hash()),
                     &[],
                     &[],
                     0, // no inline outbound target calls
