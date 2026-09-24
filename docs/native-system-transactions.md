@@ -21,6 +21,25 @@ remain enabled. The implicit protocol budget is `SYSTEM_TX_GAS_LIMIT` (2,000,000
 execution is metered and actual gas usage counts toward receipts and the block
 limit. The full budget must fit the remaining block gas before execution.
 
+Zero gas price is also visible to contracts: `tx.gasprice` (`GASPRICE`) returns
+zero throughout an inbound native transaction, including nested calls through
+EEZL2 and application proxies. It is not replaced by the block base fee or the
+gas price of the originating L1 transaction. A reimbursement calculated as
+`gasUsed * tx.gasprice` is therefore zero, and a target that requires a positive
+gas price can revert. Applications depending on those assumptions need to
+support fee-free inbound execution explicitly; arbitrary application behavior
+is not guaranteed to match a paid transaction. Ordinary signed L2 user
+transactions retain their normal gas-price and fee semantics, including the
+user transaction in an outbound `[load, user]` pair.
+
+The Composer probes inbound targets using the same native delivery path and
+rejects reverting targets before accepting the composition. The EVM regression
+`native_gasprice_is_zero_in_nested_calls_including_reimbursement_and_positive_price_guards`
+executes small contracts with a positive block base fee, checking direct and
+nested `GASPRICE`, reimbursement arithmetic, and a positive-price guard for both
+native and paid transactions. These are representative behavior tests with
+stand-in contracts, not a compatibility audit of third-party applications.
+
 An inbound transaction mints exactly its `value` before the ordinary EVM call,
 independently of any existing system balance. The shared `eez-evm` wrapper journals
 this credit, delegates execution to Ethereum's EVM, and removes the credit if the
@@ -57,6 +76,44 @@ transactions calling EEZL2 do not gain native status.
 The proof signer replays actual typed transactions/receipts, derives transaction
 checkpoints, verifies effects, and compares omitted system transactions with the
 independently reconstructed sequence byte for byte.
+
+Inbound reconstruction uses `eez_protocol::entries::InboundSidecar`, distinct
+from L1 settlement entries. Its checked constructor derives the L2 call and
+rolling hashes from `IncomingEntry`. The internal entry representation retains
+`ExecutionEntrySol`: one incoming call occupies `l2ToL1Calls`, state updates and
+expected calls are empty, and the hashes follow the L2 rules. Explicit conversion
+checks the complete shape and hashes before lowering it to
+`L2ExecutionEntrySol.incomingCalls` and a native transaction. L1 settlement
+entries cannot pass as inbound sidecars.
+
+The DA container in `batch.callData` publishes `Action` values with explicit
+source and destination rollup IDs, not ABI-encoded entries. The Composer projects
+entries into actions; the Deriver reconstructs entries and checks them through
+`InboundSidecar` before lowering incoming transactions. The typed boundary
+preserves the existing action encoding, entry hashes, and native transaction
+bytes.
+
+Shape validation does not authorize an inbound call. Before attesting, the
+shared proof-signer settlement pipeline inspects the executed native calldata
+and successful receipt, requires source rollup 0, and recomputes the call hash
+using its configured destination rollup. It binds the observation to the
+settlement entry's call hash, return data, state transition, and ETH delta, then
+reconstructs the entry from each DA action and compares its ABI bytes with the
+independently derived sidecar. The container must also identify the configured
+rollup. Finally it reconstructs the entire Sync transaction sequence and compares
+the exact executed bytes. A well-formed sidecar for another source or destination
+therefore still fails authorization/DA binding. Deriver reconstruction alone
+is not an attestation check; it operates on L1-authenticated batches.
+
+`inbound_sidecar_preserves_entry_encoding_and_rejects_other_entry_shapes` checks
+the entry encoding and rejects altered shapes and identity fields. The signer
+regression `a_fully_bound_inbound_passes_settlement_and_da_validation` accepts
+the valid control, then rejects raw L1 settlement ABI substituted for DA and
+valid DA containers whose actions have different source/destination identities.
+Action hashes are recomputed during verification, so those identity mutations
+do not depend on stale submitted hashes. This test uses stubbed execution
+evidence and the real settlement/DA pipeline; rejection occurs before the
+signing stage.
 
 This implementation targets a **fresh genesis**. Regenerate genesis with
 `scripts/update-eezl2-genesis.sh` and redeploy the L1 commitment. EEZL2's immutable
