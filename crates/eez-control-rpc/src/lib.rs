@@ -1,4 +1,4 @@
-//! Wire contract for the composer-controlled `Prove` RPC.
+//! Wire contracts for composer-controlled proof signing.
 //!
 //! The composer (client, `eez-prover-client`) dials `eez-proof-signer` and
 //! streams one posted settlement window — a
@@ -7,12 +7,16 @@
 //! recomputed `publicInputsHash`, and returns a [`v1::ProveResponse`]. One
 //! request/response: no feed, no dispatch, no sink.
 //!
-//! Only generated types + tonic stubs live here — no `Prover`-trait coupling.
+//! `prove.v2.Prover/ProveStream` adds resumable per-block validation while v1
+//! remains available during migration. Only generated types + tonic stubs live
+//! here — no `Prover`-trait coupling.
 
 mod generated;
 
 /// Tonic-generated protobuf module for the `prove.v1` package.
 pub use generated::v1;
+/// Tonic-generated protobuf module for the incremental `prove.v2` package.
+pub use generated::v2;
 
 use prost::Message;
 
@@ -45,6 +49,7 @@ mod tests {
         OutboundFailure, ProveChunk, ProveFailure, ProveHeader, ProveResponse, prove_chunk,
         prove_failure,
     };
+    use super::v2::{Begin, ClientFrame, ServerFrame, Validated, client_frame, server_frame};
     use super::{MAX_MESSAGE_BYTES, decode_prove_failure, encode_prove_failure};
 
     #[test]
@@ -89,6 +94,39 @@ mod tests {
         assert_eq!(
             decode_prove_failure(&encode_prove_failure(&failure)).unwrap(),
             failure
+        );
+    }
+
+    #[test]
+    fn incremental_frames_round_trip_with_correlated_session_and_request() {
+        let begin = ClientFrame {
+            session_id: Vec::new(),
+            request_id: 17,
+            kind: Some(client_frame::Kind::Begin(Begin {
+                rollup_id: 7,
+                anchor_number: 100,
+                anchor_hash: vec![0x11; 32],
+                anchor_state_root: vec![0x22; 32],
+            })),
+        };
+        assert_eq!(
+            ClientFrame::decode(begin.encode_to_vec().as_slice()).unwrap(),
+            begin
+        );
+
+        let acknowledged = ServerFrame {
+            session_id: vec![0x33; 32],
+            request_id: 18,
+            kind: Some(server_frame::Kind::Validated(Validated {
+                number: 101,
+                hash: vec![0x44; 32],
+                post_state_root: vec![0x55; 32],
+                reused: true,
+            })),
+        };
+        assert_eq!(
+            ServerFrame::decode(acknowledged.encode_to_vec().as_slice()).unwrap(),
+            acknowledged
         );
     }
 

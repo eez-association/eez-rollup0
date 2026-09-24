@@ -1,0 +1,96 @@
+// Incremental Composer-to-prover protocol. prove.v1.Prover/Prove remains available
+// during migration. A stream carries one logical Composer session; reconnecting
+// uses Resume and the opaque session ID returned by Begin.
+syntax = "proto3";
+
+package prove.v2;
+
+import "prove.proto";
+
+service Prover {
+  rpc ProveStream(stream ClientFrame) returns (stream ServerFrame);
+}
+
+message ClientFrame {
+  // Zero only on Begin. The server issues this opaque ID; it is never a block
+  // or proof identity and is not shared between Composers.
+  bytes session_id = 1;
+  // Chosen by the client and echoed on every response to this operation.
+  uint64 request_id = 2;
+  oneof kind {
+    Begin begin = 3;
+    Resume resume = 4;
+    Block block = 5;
+    Finalize finalize = 6;
+    Abort abort = 7;
+  }
+}
+
+message Begin {
+  uint64 rollup_id = 1;
+  // Last settled block. The first expected streamed block is anchor_number + 1.
+  uint64 anchor_number = 2;
+  bytes anchor_hash = 3;
+  bytes anchor_state_root = 4;
+}
+
+message Resume {}
+
+message Block {
+  // One block per stream frame. A contiguous run is sent as back-to-back frames
+  // on this same RPC without waiting for a Validated response between blocks.
+  // Contains exact consensus bytes and, for the stateless backend, its witness.
+  prove.v1.BlockWitness data = 1;
+}
+
+message Finalize {
+  uint64 from_block = 1;
+  uint64 to_block = 2;
+  bytes terminal_hash = 3;
+  // Exact proofless postAndVerifyBatch calldata. No proof may be returned until
+  // it has been checked against this session's ordered validated prefix. A
+  // Proof closes this transport stream but leaves the session resumable while
+  // the safe anchor is unchanged.
+  prove.v1.PostBatch post_batch = 4;
+}
+
+message Abort {}
+
+message ServerFrame {
+  bytes session_id = 1;
+  uint64 request_id = 2;
+  oneof kind {
+    Ready ready = 3;
+    Validated validated = 4;
+    Proof proof = 5;
+    Rejected rejected = 6;
+  }
+}
+
+message Ready {
+  // This is the last FULLY VALIDATED block, not the last received message.
+  uint64 validated_through = 1;
+  bytes validated_hash = 2;
+}
+
+message Validated {
+  uint64 number = 1;
+  bytes hash = 2;
+  bytes post_state_root = 3;
+  // True only when another session's completed validation was reused.
+  bool reused = 4;
+}
+
+message Proof {
+  bytes public_inputs_hash = 1;
+  bytes proof = 2;
+}
+
+message Rejected {
+  // The numeric tonic::Code value. A rejection applies only to the named
+  // session/request; it must not terminate unrelated Composer sessions.
+  int32 code = 1;
+  string message = 2;
+  // Encoded prove.v1.ProveFailure when an actionable candidate is known.
+  bytes details = 3;
+}

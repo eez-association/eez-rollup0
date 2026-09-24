@@ -9,3 +9,7 @@
 pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/prove.v1.rs"));
 }
+
+pub mod v2 {
+    include!(concat!(env!("OUT_DIR"), "/prove.v2.rs"));
+}
