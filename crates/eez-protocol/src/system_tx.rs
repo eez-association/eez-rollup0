@@ -10,7 +10,7 @@ use eez_primitives::{EEZL2_ADDRESS, SystemTransaction};
 use crate::RollupId;
 use crate::abi::{ExecutionEntrySol, L2ExecutionEntrySol, loadExecutionTableCall};
 use crate::entries::{
-    IncomingEntry, OutboundEntry, build_l2_incoming_entry, build_l2_outbound_entry,
+    InboundSidecar, OutboundEntry, build_l2_incoming_entry, build_l2_outbound_entry,
     encode_execute_incoming,
 };
 
@@ -26,13 +26,10 @@ pub struct SystemTxContext {
     pub this_rollup_id: u64,
 }
 
-/// Build unsigned L2 inbound system txs from a postBatch's entries.
+/// Build unsigned L2 inbound system txs from canonical inbound sidecars.
 ///
-/// For each entry whose `destinationRollupId == cfg.this_rollup_id`,
-/// reconstructs the outer cross-chain call from
-/// `entry.L2ToL1Calls[0]` and produces one native system tx invoking
-/// `EEZL2.executeIncomingCrossChainCall(...)`. Entries for other
-/// rollups are skipped.
+/// Entries for other rollups are skipped. Raw `ExecutionEntrySol` values must
+/// first pass [`InboundSidecar::try_from`] at the DA/batch ABI boundary.
 ///
 /// `starting_nonce` is the SYSTEM_ADDRESS account nonce at the L2
 /// parent block. The function advances locally by one per emitted
@@ -42,46 +39,32 @@ pub struct SystemTxContext {
 ///
 /// Returns an error for an invalid predeploy address, entry shape, or nonce overflow.
 pub fn build_inbound_system_txs(
-    entries: &[ExecutionEntrySol],
+    entries: &[InboundSidecar],
     cfg: &SystemTxContext,
     starting_nonce: u64,
 ) -> Result<Vec<Bytes>, String> {
     let mut nonce = starting_nonce;
     let mut out: Vec<Bytes> = Vec::new();
     for entry in entries {
-        if entry.destinationRollupId != cfg.this_rollup_id {
+        let incoming = entry.incoming_entry();
+        if incoming.l2_rollup_id.0 != cfg.this_rollup_id {
             continue;
         }
-        if entry.l2ToL1Calls.is_empty() {
-            continue;
-        }
-        check_entry_shape(entry, "inbound")?;
-        let outer = &entry.l2ToL1Calls[0];
-        let source_rollup = outer.sourceRollupId;
-        let l2_entry = build_l2_incoming_entry(IncomingEntry {
-            target: outer.targetAddress,
-            source: outer.sourceAddress,
-            value: outer.value,
-            data: outer.data.clone(),
-            source_rollup_id: RollupId(source_rollup),
-            l2_rollup_id: RollupId(cfg.this_rollup_id),
-            return_data: entry.returnData.clone(),
-            success: entry.success,
-        })
-        .map_err(|error| error.to_string())?;
+        let l2_entry =
+            build_l2_incoming_entry(incoming.clone()).map_err(|error| error.to_string())?;
         let calldata = encode_execute_incoming(
-            outer.targetAddress,
-            outer.value,
-            outer.data.clone(),
-            outer.sourceAddress,
-            RollupId(source_rollup),
+            incoming.target,
+            incoming.value,
+            incoming.data,
+            incoming.source,
+            incoming.source_rollup_id,
             l2_entry,
         );
         let raw = encode_system_tx(
             nonce,
             cfg.eezl2_address,
             calldata,
-            outer.value,
+            incoming.value,
             cfg.l2_chain_id,
         )?;
         nonce = nonce.checked_add(1).ok_or_else(|| {
@@ -187,9 +170,8 @@ pub fn interleave_sync_block_txs(pairs: &[SyncPair]) -> Vec<Bytes> {
 /// Reject the entry shapes the Sync-block lowering cannot represent.
 ///
 /// N>=2 multi-call is NOT yet supported. An entry with multiple l2ToL1Calls
-/// would be SILENTLY TRUNCATED to call[0] by the lowering (the outbound
-/// `.first()` and [`build_inbound_system_txs`] both read only [0]), diverging
-/// the Sync-block root with no error. Fail LOUD until multi-call lands (design
+/// cannot be represented by the one-call outbound lowering or an
+/// [`InboundSidecar`]. Fail LOUD until multi-call lands (design
 /// parked; no doc yet). Today the composer only ever produces single-call
 /// entries, so this never fires on the happy path; it is the safe boundary for
 /// the parked feature.
@@ -296,8 +278,9 @@ pub fn build_outbound_pair(
 /// `outbound`: each `(L1-shape outbound ExecutionEntrySol, its consuming user
 /// tx)` in canonical (entry) order; the L2→L1 call is rebuilt from
 /// `entry.l2ToL1Calls[0]` (the same lowering both sides apply). `inbound`: the
-/// L1-shape inbound deferred entries (`build_inbound_system_txs` reads
-/// `l2ToL1Calls[0]`; entries for other rollups / empty are skipped).
+/// ABI-encoded inbound sidecars. This mixed-direction ABI boundary converts
+/// them to [`InboundSidecar`] before lowering; L1 settlement entries are rejected.
+/// Canonical entries for other rollups are skipped.
 ///
 /// Single-direction degenerates EXACTLY: outbound-only → `[load,user,…]`;
 /// inbound-only → `[deliver,…]` (all `user_tx == None`) — byte-identical to
@@ -316,9 +299,13 @@ pub fn build_cross_chain_sync_pairs(
     let mut pairs: Vec<SyncPair> = Vec::with_capacity(outbound.len() + inbound.len());
 
     // Validate even foreign inbound entries, which the delivery builder skips.
-    for entry in inbound {
-        check_entry_shape(entry, "inbound")?;
-    }
+    let inbound = inbound
+        .iter()
+        .map(|entry| {
+            check_entry_shape(entry, "inbound")?;
+            InboundSidecar::try_from(entry).map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
 
     // Each user must consume its load before the next load resets the execution table.
     for (entry, user_tx) in outbound {
@@ -330,7 +317,7 @@ pub fn build_cross_chain_sync_pairs(
     }
 
     // Inbound deliveries continue the nonce sequence after all outbound loads.
-    let deliveries = build_inbound_system_txs(inbound, cfg, nonce)?;
+    let deliveries = build_inbound_system_txs(&inbound, cfg, nonce)?;
     for d in deliveries {
         pairs.push(SyncPair {
             system_tx: d,
@@ -369,9 +356,9 @@ fn encode_system_tx(
 mod tests {
     use super::*;
     use crate::EvmBatch;
-    use crate::abi::{L2ToL1CallSol, RollupIdWithProofSystemsSol, StateUpdateSol};
-    use crate::entries::{decode_postbatch, encode_postbatch};
-    use alloy_primitives::{B256, I256, address};
+    use crate::abi::{L2ToL1CallSol, RollupIdWithProofSystemsSol};
+    use crate::entries::{IncomingEntry, decode_postbatch, encode_postbatch};
+    use alloy_primitives::{B256, address};
     use eez_primitives::EezTxEnvelope as TransactionSigned;
 
     fn ctx() -> SystemTxContext {
@@ -382,34 +369,27 @@ mod tests {
         }
     }
 
-    /// One inbound L1→L2 deferred entry (the call lives in `l2ToL1Calls[0]`,
-    /// `destinationRollupId == this_rollup_id`), the shape `build_inbound_system_txs`
-    /// lowers to an `executeIncomingCrossChainCall` system tx.
     fn inbound_entry() -> ExecutionEntrySol {
-        ExecutionEntrySol {
-            stateUpdates: vec![StateUpdateSol {
-                rollupId: 1,
-                currentState: B256::ZERO,
-                newState: B256::repeat_byte(0x11),
-                etherDelta: I256::ZERO,
-            }],
-            proxyEntryHash: B256::repeat_byte(0xab),
-            l2ToL1Calls: vec![L2ToL1CallSol {
-                revertNextNCalls: 0,
-                isStatic: false,
-                gas: 0,
-                sourceAddress: address!("00000000000000000000000000000000000000cc"),
-                sourceRollupId: 0, // MAINNET source for an L1→L2 inbound
-                targetAddress: address!("00000000000000000000000000000000000000bb"),
-                value: U256::ZERO,
-                data: Bytes::from(vec![0x12, 0x34]),
-            }],
-            expectedL1ToL2Calls: Vec::new(),
-            rollingHash: B256::ZERO,
-            destinationRollupId: 1,
+        InboundSidecar::new(IncomingEntry {
+            target: address!("00000000000000000000000000000000000000bb"),
+            source: address!("00000000000000000000000000000000000000cc"),
+            value: U256::ZERO,
+            data: Bytes::from(vec![0x12, 0x34]),
+            source_rollup_id: RollupId::MAINNET,
+            l2_rollup_id: RollupId(1),
+            return_data: Bytes::from(vec![0xab, 0xcd]),
             success: true,
-            returnData: Bytes::from(vec![0xab, 0xcd]),
-        }
+        })
+        .unwrap()
+        .as_abi_entry()
+        .clone()
+    }
+
+    fn inbound_sidecars(entries: &[ExecutionEntrySol]) -> Vec<InboundSidecar> {
+        entries
+            .iter()
+            .map(|entry| InboundSidecar::try_from(entry).unwrap())
+            .collect()
     }
 
     fn round_tripped(entries: &[ExecutionEntrySol]) -> Vec<ExecutionEntrySol> {
@@ -605,7 +585,8 @@ mod tests {
 
         // Inbound-only == build_inbound_system_txs at the same nonce.
         let in_pairs = build_cross_chain_sync_pairs(&[], &[inbound_entry()], &cfg, n).unwrap();
-        let direct_in = build_inbound_system_txs(&[inbound_entry()], &cfg, n).unwrap();
+        let direct_in =
+            build_inbound_system_txs(&inbound_sidecars(&[inbound_entry()]), &cfg, n).unwrap();
         assert_eq!(in_pairs.len(), 1);
         assert_eq!(
             in_pairs[0].system_tx, direct_in[0],
@@ -654,8 +635,11 @@ mod tests {
         o1.l2ToL1Calls[0].data = Bytes::from(vec![0x99, 0x88]);
         // An inbound entry for ANOTHER rollup: passes the shape gate, emits no
         // system tx on this L2.
-        let mut foreign = inbound_entry();
-        foreign.destinationRollupId = 2;
+        let mut foreign = InboundSidecar::try_from(&inbound_entry())
+            .unwrap()
+            .incoming_entry();
+        foreign.l2_rollup_id = RollupId(2);
+        let foreign = InboundSidecar::new(foreign).unwrap().as_abi_entry().clone();
         let in1 = inbound_entry();
 
         // Composer: the whole claimed chain, nonces N.. in emit order.
@@ -730,10 +714,12 @@ mod tests {
         let nonce = 7u64;
         let entries = vec![inbound_entry()];
 
-        let emitted = build_inbound_system_txs(&entries, &cfg, nonce).unwrap();
+        let emitted = build_inbound_system_txs(&inbound_sidecars(&entries), &cfg, nonce).unwrap();
         assert_eq!(emitted.len(), 1, "one inbound entry → one system tx");
 
-        let rebuilt = build_inbound_system_txs(&round_tripped(&entries), &cfg, nonce).unwrap();
+        let rebuilt =
+            build_inbound_system_txs(&inbound_sidecars(&round_tripped(&entries)), &cfg, nonce)
+                .unwrap();
         assert_eq!(
             emitted, rebuilt,
             "composer-emit must equal deriver-rebuild byte-for-byte (Phase-C invariant)",
@@ -746,11 +732,12 @@ mod tests {
     fn byte_identity_is_non_vacuous_and_holds_across_nonces() {
         let cfg = ctx();
         let entries = vec![inbound_entry()];
-        let at0 = build_inbound_system_txs(&entries, &cfg, 0).unwrap();
-        let at99 = build_inbound_system_txs(&entries, &cfg, 99).unwrap();
+        let at0 = build_inbound_system_txs(&inbound_sidecars(&entries), &cfg, 0).unwrap();
+        let at99 = build_inbound_system_txs(&inbound_sidecars(&entries), &cfg, 99).unwrap();
         assert_ne!(at0, at99, "different nonce must change the native bytes");
         assert_eq!(
-            build_inbound_system_txs(&round_tripped(&entries), &cfg, 99).unwrap(),
+            build_inbound_system_txs(&inbound_sidecars(&round_tripped(&entries)), &cfg, 99)
+                .unwrap(),
             at99,
             "emit==rebuild at the second nonce too",
         );

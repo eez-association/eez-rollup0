@@ -52,7 +52,11 @@ fn build_inbound_transactions(
     context: &eez_protocol::system_tx::SystemTxContext,
     starting_nonce: u64,
 ) -> Vec<TransactionSigned> {
-    eez_protocol::system_tx::build_inbound_system_txs(entries, context, starting_nonce)
+    let sidecars = entries
+        .iter()
+        .map(|entry| eez_protocol::entries::InboundSidecar::try_from(entry).unwrap())
+        .collect::<Vec<_>>();
+    eez_protocol::system_tx::build_inbound_system_txs(&sidecars, context, starting_nonce)
         .unwrap()
         .into_iter()
         .map(|raw| {
@@ -409,14 +413,20 @@ fn transaction(encoded: &str) -> TransactionSigned {
 
 /// Build a canonical native system transaction carrying the current inbound ABI.
 fn target_system_inbound_transaction() -> TransactionSigned {
-    let mut call = l2_to_l1_call();
-    call.sourceRollupId = RollupId::MAINNET.0;
-    let entry = ExecutionEntrySol {
-        destinationRollupId: expected_rollup_id().get(),
-        l2ToL1Calls: vec![call],
-        success: true,
-        ..Default::default()
-    };
+    let call = l2_to_l1_call();
+    let sidecar =
+        eez_protocol::entries::InboundSidecar::new(eez_protocol::entries::IncomingEntry {
+            target: call.targetAddress,
+            source: call.sourceAddress,
+            value: call.value,
+            data: call.data,
+            source_rollup_id: RollupId::MAINNET,
+            l2_rollup_id: RollupId(expected_rollup_id().get()),
+            return_data: Bytes::new(),
+            success: true,
+        })
+        .unwrap();
+    let entry = sidecar.as_abi_entry().clone();
 
     build_inbound_transactions(&[entry], &system_transaction_context(), 0)
         .into_iter()

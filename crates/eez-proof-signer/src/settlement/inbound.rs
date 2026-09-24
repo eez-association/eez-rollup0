@@ -1,11 +1,11 @@
 //! Inbound transaction inspection and settlement-effect authorization.
 
-use std::fmt;
 use std::num::NonZeroU64;
 
 use alloy_primitives::{B256, Bytes, I256, U256};
-use alloy_sol_types::{SolCall as _, SolValue as _};
-use eez_protocol::abi::{ExecutionEntrySol, L2ToL1CallSol, executeIncomingCrossChainCallCall};
+use alloy_sol_types::SolCall as _;
+use eez_protocol::abi::executeIncomingCrossChainCallCall;
+use eez_protocol::entries::{InboundSidecar, IncomingEntry};
 use eez_protocol::rolling_hash::EntryRollingHash;
 use eez_protocol::{CallHashInput, CallMode, RollupId, common_cross_chain_call_hash};
 use thiserror::Error;
@@ -20,40 +20,8 @@ pub(crate) struct InboundObservation {
     pub(crate) recomputed_call_hash: B256,
     pub(crate) value: U256,
     pub(crate) return_data: Bytes,
-    pub(super) derived_da_entry: DerivedInboundDaEntry,
+    pub(super) derived_da_entry: InboundSidecar,
 }
-
-/// Sidecar wrapper whose diagnostics and equality use canonical ABI bytes.
-pub(super) struct DerivedInboundDaEntry(ExecutionEntrySol);
-
-impl DerivedInboundDaEntry {
-    /// Borrow the typed entry for canonical Sync reconstruction.
-    pub(super) fn as_entry(&self) -> &ExecutionEntrySol {
-        &self.0
-    }
-
-    /// Encode the exact wire identity expected in `l2Entries`.
-    pub(super) fn encoded(&self) -> Vec<u8> {
-        self.0.abi_encode()
-    }
-}
-
-impl fmt::Debug for DerivedInboundDaEntry {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("DerivedInboundDaEntry")
-            .field(&self.encoded())
-            .finish()
-    }
-}
-
-impl PartialEq for DerivedInboundDaEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.encoded() == other.encoded()
-    }
-}
-
-impl Eq for DerivedInboundDaEntry {}
 
 /// One selector-level inbound candidate and the result of checking its call
 /// envelope and execution-table shape. Byte-exact transaction reconstruction
@@ -196,30 +164,22 @@ pub(super) fn inspect_inbound_candidate(
             field: "rollingHash",
         });
     }
-    let derived_da_entry = ExecutionEntrySol {
-        stateUpdates: Vec::new(),
-        proxyEntryHash: recomputed_call_hash,
-        l2ToL1Calls: vec![L2ToL1CallSol {
-            revertNextNCalls: inner.revertNextNCalls,
-            isStatic: inner.isStatic,
-            gas: inner.gas,
-            sourceAddress: inner.sourceAddress,
-            sourceRollupId: inner.sourceRollupId,
-            targetAddress: inner.targetAddress,
-            value: inner.value,
-            data: inner.data.clone(),
-        }],
-        expectedL1ToL2Calls: Vec::new(),
-        rollingHash: entry.rollingHash,
-        destinationRollupId: expected_rollup_id.get(),
+    let derived_da_entry = InboundSidecar::new(IncomingEntry {
+        target: inner.targetAddress,
+        source: inner.sourceAddress,
+        value: inner.value,
+        data: inner.data.clone(),
+        source_rollup_id: RollupId(inner.sourceRollupId),
+        l2_rollup_id: RollupId(expected_rollup_id.get()),
+        return_data: entry.returnData.clone(),
         success: entry.success,
-        returnData: entry.returnData.clone(),
-    };
+    })
+    .map_err(|_| InboundObservationError::InvalidEntryShape { field: "sidecar" })?;
     Ok(InboundObservation {
         recomputed_call_hash,
         value: call.value,
         return_data: entry.returnData.clone(),
-        derived_da_entry: DerivedInboundDaEntry(derived_da_entry),
+        derived_da_entry,
     })
 }
 

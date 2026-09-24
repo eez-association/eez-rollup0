@@ -4,7 +4,7 @@
 //! revert span. It rejects other shapes before emitting entries.
 
 use alloy_primitives::{Address, B256, Bytes, U256};
-use alloy_sol_types::SolCall;
+use alloy_sol_types::{SolCall, SolValue};
 use tracing::{debug, trace};
 
 pub mod manifest;
@@ -262,6 +262,113 @@ pub struct IncomingEntry {
     pub success: bool,
 }
 
+/// Canonical inbound L2 reconstruction data, distinct from L1 settlement entries.
+///
+/// The private representation retains the existing entry ABI: its `l2ToL1Calls`
+/// slot carries one *incoming* call. Construction checks the L2 profile and
+/// derives its hashes; conversion checks every entry field against that profile.
+/// This establishes shape, not authority. The proof signer must still bind the
+/// sidecar to executed calldata, its configured rollup, and settlement effects.
+#[derive(Clone, Debug)]
+pub struct InboundSidecar(ExecutionEntrySol);
+
+impl InboundSidecar {
+    /// Derive the canonical sidecar for one successful incoming L2 call.
+    pub fn new(entry: IncomingEntry) -> ProtocolResult<Self> {
+        if entry.l2_rollup_id.is_mainnet() || entry.source_rollup_id == entry.l2_rollup_id {
+            return Err(crate::ProtocolErrorKind::Unsupported(
+                "inbound sidecars require a different, non-L1 destination rollup",
+            )
+            .into());
+        }
+        let destination = entry.l2_rollup_id.0;
+        let l2_entry = build_l2_incoming_entry(entry)?;
+        let call = &l2_entry.incomingCalls[0];
+        Ok(Self(ExecutionEntrySol {
+            stateUpdates: Vec::new(),
+            proxyEntryHash: l2_entry.proxyEntryHash,
+            l2ToL1Calls: vec![L2ToL1CallSol {
+                revertNextNCalls: 0,
+                isStatic: false,
+                gas: 0,
+                sourceAddress: call.sourceAddress,
+                sourceRollupId: call.sourceRollupId,
+                targetAddress: call.targetAddress,
+                value: call.value,
+                data: call.data.clone(),
+            }],
+            expectedL1ToL2Calls: Vec::new(),
+            rollingHash: l2_entry.rollingHash,
+            destinationRollupId: destination,
+            success: true,
+            returnData: l2_entry.returnData,
+        }))
+    }
+
+    /// Borrow the entry representation for action projection and ABI comparison.
+    pub fn as_abi_entry(&self) -> &ExecutionEntrySol {
+        &self.0
+    }
+
+    /// Encode the canonical entry identity used in DA verification.
+    pub fn encoded(&self) -> Vec<u8> {
+        self.0.abi_encode()
+    }
+
+    /// Semantic inputs for the incoming L2 execution table.
+    pub fn incoming_entry(&self) -> IncomingEntry {
+        let call = &self.0.l2ToL1Calls[0];
+        IncomingEntry {
+            target: call.targetAddress,
+            source: call.sourceAddress,
+            value: call.value,
+            data: call.data.clone(),
+            source_rollup_id: RollupId(call.sourceRollupId),
+            l2_rollup_id: RollupId(self.0.destinationRollupId),
+            return_data: self.0.returnData.clone(),
+            success: true,
+        }
+    }
+}
+
+impl TryFrom<&ExecutionEntrySol> for InboundSidecar {
+    type Error = crate::ProtocolError;
+
+    fn try_from(entry: &ExecutionEntrySol) -> ProtocolResult<Self> {
+        let [call] = entry.l2ToL1Calls.as_slice() else {
+            return Err(crate::ProtocolErrorKind::InvalidEncoding(
+                "inbound sidecar must contain exactly one incoming call".into(),
+            )
+            .into());
+        };
+        let sidecar = Self::new(IncomingEntry {
+            target: call.targetAddress,
+            source: call.sourceAddress,
+            value: call.value,
+            data: call.data.clone(),
+            source_rollup_id: RollupId(call.sourceRollupId),
+            l2_rollup_id: RollupId(entry.destinationRollupId),
+            return_data: entry.returnData.clone(),
+            success: entry.success,
+        })?;
+        if sidecar.encoded() != entry.abi_encode() {
+            return Err(crate::ProtocolErrorKind::InvalidEncoding(
+                "noncanonical inbound sidecar (shape or L2 hashes differ)".into(),
+            )
+            .into());
+        }
+        Ok(sidecar)
+    }
+}
+
+impl PartialEq for InboundSidecar {
+    fn eq(&self, other: &Self) -> bool {
+        self.encoded() == other.encoded()
+    }
+}
+
+impl Eq for InboundSidecar {}
+
 /// Build one exact L2 entry for an incoming mutable call.
 ///
 /// # Errors
@@ -435,29 +542,17 @@ pub(crate) fn build_inbound_target_entries(
             .into());
         }
 
-        let call_hash = common_cross_chain_call_hash(CallHashInput {
-            call_mode: CallMode::Mutable,
-            source_address: call.source_address,
-            source_rollup_id: call.source_rollup_id,
-            target_address: call.target_address,
-            target_rollup_id,
+        let sidecar = InboundSidecar::new(IncomingEntry {
+            target: call.target_address,
+            source: call.source_address,
             value: call.value,
-            data: &call.data,
-        });
-        let mut rolling_hash = EntryRollingHash::seed_for_l2(call_hash);
-        rolling_hash.call_begin(call_hash);
-        rolling_hash.call_end(true, return_data);
-
-        entries.push(ExecutionEntrySol {
-            stateUpdates: Vec::new(),
-            proxyEntryHash: call_hash,
-            l2ToL1Calls: vec![l1_call_from_action(call)],
-            expectedL1ToL2Calls: Vec::new(),
-            rollingHash: rolling_hash.current(),
-            destinationRollupId: target_rollup_id.0,
+            data: call.data.clone(),
+            source_rollup_id: call.source_rollup_id,
+            l2_rollup_id: target_rollup_id,
+            return_data: Bytes::copy_from_slice(return_data),
             success: true,
-            returnData: Bytes::copy_from_slice(return_data),
-        });
+        })?;
+        entries.push(sidecar.as_abi_entry().clone());
     }
 
     Ok(batch_with_entries(entries, 0))
@@ -715,6 +810,67 @@ mod tests {
             newState: B256::with_last_byte(0xff),
             etherDelta: I256::ZERO,
         }
+    }
+
+    #[test]
+    fn inbound_sidecar_preserves_entry_encoding_and_rejects_other_entry_shapes() {
+        let call = record(RollupId(7), RollupId::MAINNET);
+        let return_data = Bytes::copy_from_slice(supported_return_data(&call).unwrap());
+        let hash = source_side_call_hash(&call);
+        let mut rolling = EntryRollingHash::seed_for_l2(hash);
+        rolling.call_begin(hash);
+        rolling.call_end(true, &return_data);
+        // The original entry representation, independent of InboundSidecar's encoder.
+        let wire = ExecutionEntrySol {
+            stateUpdates: Vec::new(),
+            proxyEntryHash: hash,
+            l2ToL1Calls: vec![l1_call_from_action(&call)],
+            expectedL1ToL2Calls: Vec::new(),
+            rollingHash: rolling.current(),
+            destinationRollupId: 7,
+            success: true,
+            returnData: return_data,
+        };
+        let materialized = build_inbound_target_entries(&[call], RollupId(7)).unwrap();
+        assert_eq!(materialized.entries[0].abi_encode(), wire.abi_encode());
+        let sidecar = InboundSidecar::try_from(&wire).unwrap();
+        assert_eq!(sidecar.encoded(), wire.abi_encode());
+        assert_eq!(
+            InboundSidecar::new(sidecar.incoming_entry()).unwrap(),
+            sidecar
+        );
+
+        let mutations: [fn(&mut ExecutionEntrySol); 11] = [
+            |e| e.stateUpdates.push(state_update(7, B256::ZERO)),
+            |e| e.l2ToL1Calls.clear(),
+            |e| e.l2ToL1Calls.push(e.l2ToL1Calls[0].clone()),
+            |e| e.l2ToL1Calls[0].isStatic = true,
+            |e| e.l2ToL1Calls[0].gas = 1,
+            |e| e.l2ToL1Calls[0].revertNextNCalls = 1,
+            |e| e.l2ToL1Calls[0].sourceRollupId = 2,
+            |e| e.destinationRollupId = 8,
+            |e| e.success = false,
+            |e| e.proxyEntryHash = B256::ZERO,
+            |e| e.rollingHash = B256::ZERO,
+        ];
+        for (index, mutate) in mutations.into_iter().enumerate() {
+            let mut invalid = wire.clone();
+            mutate(&mut invalid);
+            assert!(
+                InboundSidecar::try_from(&invalid).is_err(),
+                "mutation {index}"
+            );
+        }
+        let incoming = sidecar.incoming_entry();
+        let settlement = build_l1_inbound_entry(
+            incoming.target,
+            incoming.value,
+            incoming.data,
+            incoming.source,
+            incoming.l2_rollup_id,
+            incoming.return_data,
+        );
+        assert!(InboundSidecar::try_from(&settlement.entries[0]).is_err());
     }
 
     #[test]
