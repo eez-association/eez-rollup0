@@ -554,6 +554,18 @@ pub struct SyncCandidates {
     pub per_effect: Vec<B256>,
 }
 
+impl SyncCandidates {
+    /// A batch with no effects: the anchor is the only entry, so it carries the
+    /// endpoint rather than a prefix.
+    #[must_use]
+    pub fn anchor_only(anchor: B256) -> Self {
+        Self {
+            anchor,
+            per_effect: Vec::new(),
+        }
+    }
+}
+
 /// Built by rebuilding the Sync block on the empty prefix and on each pair-end
 /// prefix of `sync_txs`.
 ///

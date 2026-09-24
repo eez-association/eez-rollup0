@@ -1,6 +1,7 @@
 //! Direct tests for synchronous settlement processing.
 
 use super::*;
+use crate::validate::CheckpointAt;
 
 /// A window holding only block 5, sealed on the same `parent -> hash` grid the
 /// streamed fixtures use, so batches chain over identical endpoints here and in
@@ -175,7 +176,7 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
             crate::settlement::EffectPrefixError::TransactionStateCheckpointIndexMismatch {
                 checkpoint_index: 0,
                 expected: 1,
-                actual: "transaction 0".to_owned(),
+                actual: CheckpointAt::Transaction(0),
             },
         ),
         SettlementPipelineError::DaPayload(crate::settlement::DaPayloadError::InvalidBlockRlp {

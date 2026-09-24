@@ -131,7 +131,7 @@ pub(crate) enum EffectPrefixError {
     #[error(
         "the leading state checkpoint is at {actual}; the anchor's candidate is sealed before transaction 0"
     )]
-    AnchorCheckpointPositionMismatch { actual: String },
+    AnchorCheckpointPositionMismatch { actual: CheckpointAt },
     #[error(
         "settlement effects require {expected} transaction state checkpoints, but received {actual}"
     )]
@@ -142,7 +142,7 @@ pub(crate) enum EffectPrefixError {
     TransactionStateCheckpointIndexMismatch {
         checkpoint_index: usize,
         expected: usize,
-        actual: String,
+        actual: CheckpointAt,
     },
     #[error(
         "settlement entry {entry_index} is {claimed:?}, but effect-candidate transaction {transaction_index} is observed as {observed:?}"
@@ -234,17 +234,18 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
     // settling block sealed over no transactions. Effects follow, one per
     // candidate position, so every commitment names a block at this height and
     // a short settlement is a sibling swap rather than a retreat.
-    let expected_checkpoints = observed + 1;
-    if computed_transaction_state_checkpoints.len() != expected_checkpoints {
-        return Err(EffectPrefixError::TransactionStateCheckpointCountMismatch {
-            expected: expected_checkpoints,
+    // Split rather than index: the anchor is the head and the effects are the
+    // tail, so neither a `[0]` nor an `effect_index + 1` can drift apart.
+    let (anchor_checkpoint, effect_checkpoints) = computed_transaction_state_checkpoints
+        .split_first()
+        .filter(|(_, effects)| effects.len() == observed)
+        .ok_or(EffectPrefixError::TransactionStateCheckpointCountMismatch {
+            expected: observed + 1,
             actual: computed_transaction_state_checkpoints.len(),
-        });
-    }
-    let anchor_checkpoint = &computed_transaction_state_checkpoints[0];
+        })?;
     if anchor_checkpoint.at != CheckpointAt::PreExecution {
         return Err(EffectPrefixError::AnchorCheckpointPositionMismatch {
-            actual: anchor_checkpoint.at.to_string(),
+            actual: anchor_checkpoint.at,
         });
     }
     if anchor_update.newState != anchor_checkpoint.block_hash {
@@ -261,8 +262,7 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
         claimed_effects.into_iter().enumerate()
     {
         let transaction_index = effect_candidate_positions[effect_index];
-        // Offset by one: index 0 is the anchor's pre-execution candidate.
-        let checkpoint = &computed_transaction_state_checkpoints[effect_index + 1];
+        let checkpoint = &effect_checkpoints[effect_index];
         let claimed_kind = kind.claimed_shape();
         let observed_kind = if settling_observations.system_sender_flags()[transaction_index] {
             ObservedEffectKind::Inbound
@@ -286,7 +286,7 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
             return Err(EffectPrefixError::TransactionStateCheckpointIndexMismatch {
                 checkpoint_index: effect_index,
                 expected: transaction_index,
-                actual: checkpoint.at.to_string(),
+                actual: checkpoint.at,
             });
         }
         // The entry claims the block a settlement stopping here must leave L2

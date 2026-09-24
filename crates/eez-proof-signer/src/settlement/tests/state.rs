@@ -1,4 +1,5 @@
 use super::*;
+use crate::validate::CheckpointAt;
 
 #[test]
 fn accepts_a_single_or_multi_entry_state_update_chain() {
@@ -347,7 +348,7 @@ fn rejects_wrong_anchor_or_invalid_effect_checkpoints() {
         Some(EffectPrefixError::TransactionStateCheckpointIndexMismatch {
             checkpoint_index: 0,
             expected: 0,
-            actual: "transaction 1".to_owned(),
+            actual: CheckpointAt::Transaction(1),
         })
     );
     assert_eq!(
