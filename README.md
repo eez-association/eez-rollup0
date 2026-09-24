@@ -125,7 +125,7 @@ cast block-number --rpc-url http://localhost:18688   # L2 producing
 | **L2→L1 front** (Outbound) | `http://localhost:18998` | send L2-origin cross-chain txs here |
 
 Composer nodes also expose `eez_composerInfo` on the L2 RPC. It takes no
-parameters and returns the configured L1 EEZ contract, the supported L1 EVM
+parameters and returns the configured L1 EEZ contract, the supported EVM
 chain IDs, and the running composer version:
 
 ```json
