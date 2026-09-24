@@ -128,7 +128,7 @@ jobs:
       - name: Archive integration test executables
         run: |
           mkdir -p artifacts/e2e-build
-          cargo nextest archive --locked --cargo-profile ci-e2e -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test resumption --test native_system --archive-file artifacts/e2e-build/tests.tar.zst
+          cargo nextest archive --locked --cargo-profile ci-e2e -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test resumption --test resumption_append --test native_system --archive-file artifacts/e2e-build/tests.tar.zst
       - name: Build E2E runtime binaries
         run: |
           cargo build --locked \
@@ -228,7 +228,7 @@ jobs:
             filter: binary(=chained_interstate)
           - id: resumption
             name: resumption
-            filter: binary(=resumption)
+            filter: binary(=resumption) | binary(=resumption_append)
           - id: native-system
             name: native system
             filter: binary(=native_system)
@@ -264,8 +264,8 @@ jobs:
         run: |
           mkdir -p "artifacts/cross-chain-e2e/${{ matrix.suite.id }}"
           set +e
-          cargo nextest run -P ci -p eez-node-e2e --test cross_chain --test chained_interstate --test resumption --test resumption_append --test native_system --test-threads=1 --no-fail-fast --color=always 2>&1 \
-            | tee artifacts/cross-chain-e2e/nextest.log
+          cargo nextest run -P ci --archive-file artifacts/e2e-build/tests.tar.zst --workspace-remap "$GITHUB_WORKSPACE" -E '${{ matrix.suite.filter }}' --test-threads=1 --no-fail-fast --color=always 2>&1 \
+            | tee "artifacts/cross-chain-e2e/${{ matrix.suite.id }}/nextest.log"
           status=${PIPESTATUS[0]}
           set -e
           exit "$status"
