@@ -124,6 +124,18 @@ cast block-number --rpc-url http://localhost:18688   # L2 producing
 | **L1→L2 front** (Inbound) | `http://localhost:18999` | send L1-origin cross-chain txs here |
 | **L2→L1 front** (Outbound) | `http://localhost:18998` | send L2-origin cross-chain txs here |
 
+Composer nodes also expose `eez_composerInfo` on the L2 RPC. It takes no
+parameters and returns the configured L1 EEZ contract, the supported EVM
+chain IDs, and the running composer version:
+
+```json
+{
+  "eezContract": "0x…",
+  "supportedNetworks": [10200],
+  "version": "0.1.0"
+}
+```
+
 The two **cross-chain ingress fronts** are transparent proxies:
 `eth_sendRawTransaction` sent to a front is held and composed into the next Sync
 block; every other `eth_*` is forwarded to that front's source-chain RPC. They
