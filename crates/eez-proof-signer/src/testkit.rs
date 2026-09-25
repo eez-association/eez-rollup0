@@ -38,10 +38,25 @@ pub(crate) fn test_proof_system_vkey() -> crate::attest::NonZeroProofSystemVkey 
 pub(crate) fn checkpoint(
     transaction_index: usize,
     block_hash: B256,
-) -> crate::validate::TransactionStateCheckpoint {
-    crate::validate::TransactionStateCheckpoint {
-        transaction_index,
+) -> crate::validate::StateCheckpoint {
+    crate::validate::StateCheckpoint {
+        at: crate::validate::CheckpointAt::Transaction(transaction_index),
         state_root: B256::with_last_byte(0xc0 ^ (transaction_index as u8)),
+        block_hash,
+    }
+}
+
+/// The candidate the anchor claims: the settling block sealed over no
+/// transactions. Deliberately not the parent's hash.
+pub(crate) fn empty_prefix_candidate() -> B256 {
+    B256::repeat_byte(0xe0)
+}
+
+/// The anchor's candidate: the settling block sealed over no transactions.
+pub(crate) fn pre_execution_checkpoint(block_hash: B256) -> crate::validate::StateCheckpoint {
+    crate::validate::StateCheckpoint {
+        at: crate::validate::CheckpointAt::PreExecution,
+        state_root: B256::with_last_byte(0xc0),
         block_hash,
     }
 }

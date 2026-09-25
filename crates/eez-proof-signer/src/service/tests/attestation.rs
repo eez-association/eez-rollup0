@@ -275,14 +275,17 @@ async fn a_multi_block_effect_uses_the_penultimate_block_root() {
     backend_output.blocks[1]
         .settlement_evidence
         .set_system_sender_flags_for_test(vec![false]);
-    backend_output.blocks[1].transaction_state_checkpoints = vec![checkpoint(0, final_root)];
+    backend_output.blocks[1].transaction_state_checkpoints = vec![
+        pre_execution_checkpoint(empty_prefix_candidate()),
+        checkpoint(0, final_root),
+    ];
     let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output)]))).await;
 
     let mut window =
         two_block_transaction_window(non_system_transaction(), non_system_transaction());
     replace_post_batch(
         &mut window,
-        public_input_post_batch_for(outbound_batch(window_pre, pre_settling_root, final_root)),
+        public_input_post_batch_for(outbound_batch(window_pre, final_root)),
     );
 
     let status = server.prove(window).await;
@@ -470,14 +473,17 @@ async fn a_successful_system_transaction_reaches_the_effect_prefix_gate() {
 
 #[tokio::test]
 async fn an_inbound_candidate_hidden_in_an_outbound_pair_is_rejected() {
-    let (window_pre, settling_pre, window_post) = window_endpoints(5, 5);
+    let (window_pre, _settling_pre, window_post) = window_endpoints(5, 5);
     let inputs = [AdmittedBlock::test(5, 0x04, 0x05)];
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[0].set_transaction_results_for_test(vec![true, true]);
     backend_output.blocks[0]
         .settlement_evidence
         .set_system_sender_flags_for_test(vec![true, false]);
-    backend_output.blocks[0].transaction_state_checkpoints = vec![checkpoint(1, block_hash_of(5))];
+    backend_output.blocks[0].transaction_state_checkpoints = vec![
+        pre_execution_checkpoint(empty_prefix_candidate()),
+        checkpoint(1, block_hash_of(5)),
+    ];
     let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output)]))).await;
     let mut window = vec![
         header_chunk(5, 5),
@@ -493,7 +499,7 @@ async fn an_inbound_candidate_hidden_in_an_outbound_pair_is_rejected() {
     ];
     replace_post_batch(
         &mut window,
-        public_input_post_batch_for(outbound_batch(window_pre, settling_pre, window_post)),
+        public_input_post_batch_for(outbound_batch(window_pre, window_post)),
     );
 
     let status = server.prove(window).await;

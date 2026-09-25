@@ -22,7 +22,7 @@ use eez_proof_signer::validate::support::{
     system_sender_flags,
 };
 use eez_proof_signer::validate::{
-    BackendBlockOutput, BackendWindowOutput, SettlementBlockEvidence, TransactionStateCheckpoint,
+    BackendBlockOutput, BackendWindowOutput, SettlementBlockEvidence, StateCheckpoint,
     ValidationBackend, ValidationError,
 };
 use eez_proof_signer::window::AdmittedBlock;
@@ -242,21 +242,21 @@ impl Backend {
             // passed. Only a non-empty final selection uses the checkpoint path.
             let witness = std::mem::take(witness);
             let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
-                Some(plan) if !plan.transaction_indices().is_empty() => {
+                Some(plan) if !plan.positions().is_empty() => {
                     let output = stateless_validation_recovered_with_state_checkpoints(
                         recovered_block,
                         witness,
                         Arc::clone(&self.chain_spec),
                         self.evm_config.clone(),
-                        plan.transaction_indices(),
+                        plan.positions(),
                     )
                     .map_err(|error| map_stateless_error(block_number, error))?;
                     let checkpoints = output
                         .checkpoints
-                        .transaction_state_checkpoints
+                        .checkpoints
                         .into_iter()
-                        .map(|checkpoint| TransactionStateCheckpoint {
-                            transaction_index: checkpoint.transaction_index,
+                        .map(|checkpoint| StateCheckpoint {
+                            at: checkpoint.at,
                             state_root: checkpoint.state_root,
                             block_hash: checkpoint.block_hash,
                         })
@@ -392,7 +392,7 @@ impl ValidationBackend for Backend {
 /// all other Stateless errors reject the input.
 fn map_stateless_error(block_number: u64, error: StatelessValidationError) -> ValidationError {
     match error {
-        error @ (StatelessValidationError::UnorderedTransactionCheckpoints { .. }
+        error @ (StatelessValidationError::UnorderedCheckpoints { .. }
         | StatelessValidationError::TransactionCheckpointOutOfBounds { .. }) => {
             ValidationError::InternalInvariant(format!(
                 "stateless rejected the locally derived checkpoint plan for block {block_number}: \
