@@ -168,9 +168,10 @@ pub fn decode_container(payload: &[u8]) -> CodecResult<DecodedContainer> {
 fn decode_action(cur: &mut Cursor<'_>) -> CodecResult<Action> {
     expect_message(cur, MSG_INITIATE)?;
     let source_rollup_id = u64::from_le_bytes(cur.take_array::<8>("initiate chain_id")?);
-    // Chain-defined and opaque to EEZ (§2.3): read past a peer's rather than
-    // rejecting the stream. We emit none.
-    take_bytes(cur, "tx_data")?;
+    // Generic EEZ leaves `tx_data` chain-defined; Rollup0 V1 requires empty.
+    if !take_bytes(cur, "tx_data")?.is_empty() {
+        return Err(CodecError::NonEmptyTransactionData);
+    }
 
     expect_message(cur, MSG_CALL)?;
     let target_rollup_id = u64::from_le_bytes(cur.take_array::<8>("to_chain")?);
@@ -428,9 +429,9 @@ mod tests {
         );
     }
 
-    /// `tx_data` is chain-defined (§2.3), so a peer's must still decode.
+    /// Rollup0 V1 rejects the whole container when `tx_data` is non-empty.
     #[test]
-    fn a_non_empty_tx_data_is_accepted() {
+    fn a_non_empty_tx_data_is_rejected() {
         let clean = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();
         let mut forged = clean.clone();
         let at = first_bracket_offset();
@@ -439,9 +440,82 @@ mod tests {
         forged.insert(at + 10, 0xff);
 
         assert_eq!(
-            decode_container(&forged).unwrap().actions,
-            decode_container(&clean).unwrap().actions,
+            decode_container(&forged).unwrap_err(),
+            CodecError::NonEmptyTransactionData,
         );
+    }
+
+    #[test]
+    fn multibyte_tx_data_is_rejected() {
+        let mut forged = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();
+        let at = first_bracket_offset();
+        forged[at + 9] = 0x02;
+        forged.splice(at + 10..at + 10, [0xde, 0xad]);
+
+        assert_eq!(
+            decode_container(&forged).unwrap_err(),
+            CodecError::NonEmptyTransactionData,
+        );
+    }
+
+    #[test]
+    fn truncated_tx_data_is_rejected_as_truncated() {
+        let mut forged = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();
+        let at = first_bracket_offset();
+        forged[at + 9] = 0x02;
+        forged.truncate(at + 10);
+
+        assert_eq!(
+            decode_container(&forged).unwrap_err(),
+            CodecError::Truncated("tx_data"),
+        );
+    }
+
+    #[test]
+    fn non_empty_tx_data_in_a_later_action_rejects_the_whole_container() {
+        let first = action(true);
+        let second = action(false);
+        let one_action_len = encode_container(ROLLUP, &span(), std::slice::from_ref(&first))
+            .unwrap()
+            .len();
+        let mut forged = encode_container(ROLLUP, &span(), &[first, second]).unwrap();
+        assert_eq!(forged[one_action_len], MSG_INITIATE);
+        forged[one_action_len + 9] = 0x01;
+        forged.insert(one_action_len + 10, 0xff);
+
+        assert_eq!(
+            decode_container(&forged).unwrap_err(),
+            CodecError::NonEmptyTransactionData,
+        );
+    }
+
+    #[test]
+    fn every_truncated_action_prefix_is_rejected() {
+        let encoded = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();
+        let action_at = first_bracket_offset();
+        for cut in action_at + 1..encoded.len() {
+            assert!(
+                decode_container(&encoded[..cut]).is_err(),
+                "action prefix ending at {cut} unexpectedly decoded",
+            );
+        }
+    }
+
+    #[test]
+    fn action_field_boundaries_and_extremes_round_trip() {
+        let action = Action {
+            source_rollup_id: u64::MAX,
+            target_rollup_id: u64::MAX,
+            source_address: [0x00; 20],
+            target_address: [0xff; 20],
+            value: [0xff; VALUE_BYTES],
+            gas: u64::MAX,
+            data: vec![0x5a; 128],
+            success: false,
+            return_data: vec![0xa5; 128],
+        };
+        let encoded = encode_container(ROLLUP, &span(), std::slice::from_ref(&action)).unwrap();
+        assert_eq!(decode_container(&encoded).unwrap().actions, vec![action]);
     }
 
     /// A bracket must be complete: truncating anywhere fails the whole stream.
@@ -453,6 +527,70 @@ mod tests {
                 decode_container(&encoded[..cut]).is_err(),
                 "truncation at {cut} must be rejected",
             );
+        }
+    }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn action_strategy() -> impl Strategy<Value = Action> {
+            (
+                any::<u64>(),
+                any::<u64>(),
+                any::<[u8; 20]>(),
+                any::<[u8; 20]>(),
+                any::<[u8; VALUE_BYTES]>(),
+                any::<u64>(),
+                proptest::collection::vec(any::<u8>(), 0..128),
+                any::<bool>(),
+                proptest::collection::vec(any::<u8>(), 0..128),
+            )
+                .prop_map(
+                    |(
+                        source_rollup_id,
+                        target_rollup_id,
+                        source_address,
+                        target_address,
+                        value,
+                        gas,
+                        data,
+                        success,
+                        return_data,
+                    )| Action {
+                        source_rollup_id,
+                        target_rollup_id,
+                        source_address,
+                        target_address,
+                        value,
+                        gas,
+                        data,
+                        success,
+                        return_data,
+                    },
+                )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            #[test]
+            fn arbitrary_valid_action_manifests_round_trip_exactly(
+                rollup_id in any::<u64>(),
+                actions in proptest::collection::vec(action_strategy(), 0..8),
+            ) {
+                let encoded = encode_container(rollup_id, &span(), &actions)
+                    .expect("bounded generated manifest encodes");
+                let decoded = decode_container(&encoded)
+                    .expect("encoded manifest decodes");
+                prop_assert_eq!(decoded.rollup_id, rollup_id);
+                prop_assert_eq!(&decoded.actions, &actions);
+                prop_assert_eq!(
+                    encode_container(decoded.rollup_id, &span(), &decoded.actions)
+                        .expect("decoded manifest re-encodes"),
+                    encoded,
+                );
+            }
         }
     }
 }

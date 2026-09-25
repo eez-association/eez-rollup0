@@ -66,6 +66,8 @@ jobs:
           --test public_inputs_hash_vectors
           --test rolling_hash_vectors
           --no-fail-fast
+      - name: Payload conformance vectors
+        run: cargo nextest run -p eez-payload-codec --test conformance --no-fail-fast
 
   contract-tests:
     name: Contract Tests

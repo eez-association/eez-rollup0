@@ -3489,6 +3489,10 @@ name = "eez-payload-codec"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "hex",
+ "proptest",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

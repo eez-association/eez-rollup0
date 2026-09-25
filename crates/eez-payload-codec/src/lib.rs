@@ -141,6 +141,9 @@ pub enum CodecError {
     /// A message type byte is not assigned by the format.
     #[error("unknown message type {0}")]
     UnknownMessage(u8),
+    /// An initiating bracket's `tx_data` was non-empty.
+    #[error("action bracket has non-empty tx_data")]
+    NonEmptyTransactionData,
     /// A value did not fit the `uvarint32` domain on encode.
     #[error("{what} = {value} exceeds u32")]
     ValueTooLarge {
@@ -695,6 +698,61 @@ mod tests {
         let blocks = vec![block(0x00, b"", vec![raw.clone()])];
         let decoded = decode(&encode(&blocks).unwrap()).unwrap();
         assert_eq!(decoded.transactions[0], raw);
+    }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn block_strategy() -> impl Strategy<Value = SpanBlock> {
+            (
+                any::<[u8; 20]>(),
+                proptest::collection::vec(any::<u8>(), 0..=MAX_EXTRA_DATA),
+                proptest::collection::vec(proptest::collection::vec(any::<u8>(), 1..64), 0..4),
+            )
+                .prop_map(|(beneficiary, extra_data, transactions)| SpanBlock {
+                    beneficiary,
+                    extra_data,
+                    transactions,
+                })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// The encoder's domain has one canonical byte representation.
+            #[test]
+            fn arbitrary_valid_spans_round_trip_exactly(
+                blocks in proptest::collection::vec(block_strategy(), 1..12),
+            ) {
+                let encoded = encode(&blocks).expect("bounded generated span encodes");
+                let decoded_blocks = decode_blocks(&encoded).expect("encoded span decodes");
+                prop_assert_eq!(&decoded_blocks, &blocks);
+                prop_assert_eq!(
+                    encode(&decoded_blocks).expect("decoded span re-encodes"),
+                    encoded,
+                );
+            }
+
+            /// DA is adversarial input. Any byte string must return a value or
+            /// a typed error without panicking or allocating from unchecked
+            /// declared counts.
+            #[test]
+            fn arbitrary_payload_bytes_never_panic(
+                payload in proptest::collection::vec(any::<u8>(), 0..4096),
+            ) {
+                let _ = decode(&payload);
+            }
+
+            /// The enclosing EEZ message stream is equally untrusted and must
+            /// fail closed for arbitrary truncation and message bytes.
+            #[test]
+            fn arbitrary_container_bytes_never_panic(
+                payload in proptest::collection::vec(any::<u8>(), 0..4096),
+            ) {
+                let _ = decode_container(&payload);
+            }
+        }
     }
 
     /// Rollup0 golden vectors for this chain-defined encoding. The encoding is

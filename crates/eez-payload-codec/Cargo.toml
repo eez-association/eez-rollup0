@@ -11,6 +11,10 @@ thiserror.workspace = true
 
 [dev-dependencies]
 alloy-primitives.workspace = true
+hex.workspace = true
+proptest = "1"
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

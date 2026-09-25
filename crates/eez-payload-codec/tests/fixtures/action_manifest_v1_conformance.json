@@ -1,0 +1,105 @@
+{
+  "schemaVersion": 1,
+  "specCommit": "7c99bcf923e0ee0f867549a750d1ab1373bf845d",
+  "valid": [
+    {
+      "name": "empty-catch-up-manifest",
+      "container": "0x000201000000000000001f00060000000000000600000000000000000000000000000000000000000600",
+      "rollupId": 1,
+      "blockTxCounts": [0, 0, 0, 0, 0, 0],
+      "actions": []
+    },
+    {
+      "name": "span-with-pure-transaction-and-empty-manifest",
+      "container": "0x00020100000000000000ab0100060100000000000211111111111111111111111111111111111111110422222222222222222222222222222222222222220101aa0202bbcc03006f02f86c820539808405f5e100843b9aca0082520894000000000000000000000000000000000000dead8080c001a04849ec4d7eed2e9eb1da330cdb0a22cdb4c1e32d682556dcc2b491ea5d747dfda05e38e68ce47b2ae70e6b36de8f1e1413df4dbc73a30610675f0a8e8c1505e7a7",
+      "rollupId": 1,
+      "blockTxCounts": [1, 0, 0, 0, 0, 0],
+      "actions": []
+    },
+    {
+      "name": "one-successful-action",
+      "container": "0x000201000000000000001f0006000000000000060000000000000000000000000000000000000000060003000000000000000000040100000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2a0000000000000000000000000000000000000000000000000000000000000008520000000000000451dd0af60601010a",
+      "rollupId": 1,
+      "blockTxCounts": [0, 0, 0, 0, 0, 0],
+      "actions": [
+        {
+          "sourceRollupId": 0,
+          "targetRollupId": 1,
+          "sourceAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "targetAddress": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "value": "0x000000000000000000000000000000000000000000000000000000000000002a",
+          "gas": 21000,
+          "data": "0x51dd0af6",
+          "success": true,
+          "returnData": "0x01"
+        }
+      ]
+    },
+    {
+      "name": "one-terminal-failed-action",
+      "container": "0x000201000000000000001f0006000000000000060000000000000000000000000000000000000000060003000000000000000000040100000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2a0000000000000000000000000000000000000000000000000000000000000008520000000000000451dd0af60704deadbeef0a",
+      "rollupId": 1,
+      "blockTxCounts": [0, 0, 0, 0, 0, 0],
+      "actions": [
+        {
+          "sourceRollupId": 0,
+          "targetRollupId": 1,
+          "sourceAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "targetAddress": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "value": "0x000000000000000000000000000000000000000000000000000000000000002a",
+          "gas": 21000,
+          "data": "0x51dd0af6",
+          "success": false,
+          "returnData": "0xdeadbeef"
+        }
+      ]
+    },
+    {
+      "name": "action-after-failed-action-is-permitted",
+      "container": "0x000201000000000000001f0006000000000000060000000000000000000000000000000000000000060003000000000000000000040100000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2a0000000000000000000000000000000000000000000000000000000000000008520000000000000451dd0af60704deadbeef0a03000000000000000000040100000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2a0000000000000000000000000000000000000000000000000000000000000008520000000000000451dd0af60601010a",
+      "rollupId": 1,
+      "blockTxCounts": [0, 0, 0, 0, 0, 0],
+      "actions": [
+        {
+          "sourceRollupId": 0,
+          "targetRollupId": 1,
+          "sourceAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "targetAddress": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "value": "0x000000000000000000000000000000000000000000000000000000000000002a",
+          "gas": 21000,
+          "data": "0x51dd0af6",
+          "success": false,
+          "returnData": "0xdeadbeef"
+        },
+        {
+          "sourceRollupId": 0,
+          "targetRollupId": 1,
+          "sourceAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "targetAddress": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "value": "0x000000000000000000000000000000000000000000000000000000000000002a",
+          "gas": 21000,
+          "data": "0x51dd0af6",
+          "success": true,
+          "returnData": "0x01"
+        }
+      ]
+    }
+  ],
+  "invalid": [
+    {
+      "name": "non-empty-initiating-tx-data",
+      "operations": "0x000201000000000000001f0006000000000000060000000000000000000000000000000000000000060003000000000000000001ff040100000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2a0000000000000000000000000000000000000000000000000000000000000008520000000000000451dd0af60601010a",
+      "error": "NON_EMPTY_TRANSACTION_DATA"
+    },
+    {
+      "name": "missing-finish-marker",
+      "operations": "0x000201000000000000001f0006000000000000060000000000000000000000000000000000000000060003000000000000000000040100000000000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2a0000000000000000000000000000000000000000000000000000000000000008520000000000000451dd0af6060101",
+      "error": "TRUNCATED"
+    },
+    {
+      "name": "second-chain-operation",
+      "operations": "0x000201000000000000001f0006000000000000060000000000000000000000000000000000000000060002",
+      "error": "UNEXPECTED_MESSAGE"
+    }
+  ]
+}

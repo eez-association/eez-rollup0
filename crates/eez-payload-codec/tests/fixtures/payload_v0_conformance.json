@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "specCommit": "7c99bcf923e0ee0f867549a750d1ab1373bf845d",
+  "valid": [
+    {
+      "name": "d4.2-vector-1-six-empty-blocks",
+      "operations": "0x00060000000000000600000000000000000000000000000000000000000600",
+      "blockTxCounts": [0, 0, 0, 0, 0, 0],
+      "beneficiaries": [
+        "0x0000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000"
+      ],
+      "extraData": ["0x", "0x", "0x", "0x", "0x", "0x"],
+      "transactions": []
+    },
+    {
+      "name": "d4.2-vector-2-one-transaction-and-multiple-runs",
+      "operations": "0x00060100000000000211111111111111111111111111111111111111110422222222222222222222222222222222222222220101aa0202bbcc03006f02f86c820539808405f5e100843b9aca0082520894000000000000000000000000000000000000dead8080c001a04849ec4d7eed2e9eb1da330cdb0a22cdb4c1e32d682556dcc2b491ea5d747dfda05e38e68ce47b2ae70e6b36de8f1e1413df4dbc73a30610675f0a8e8c1505e7a7",
+      "blockTxCounts": [1, 0, 0, 0, 0, 0],
+      "beneficiaries": [
+        "0x1111111111111111111111111111111111111111",
+        "0x1111111111111111111111111111111111111111",
+        "0x2222222222222222222222222222222222222222",
+        "0x2222222222222222222222222222222222222222",
+        "0x2222222222222222222222222222222222222222",
+        "0x2222222222222222222222222222222222222222"
+      ],
+      "extraData": ["0xaa", "0xbbcc", "0xbbcc", "0x", "0x", "0x"],
+      "transactions": ["0x02f86c820539808405f5e100843b9aca0082520894000000000000000000000000000000000000dead8080c001a04849ec4d7eed2e9eb1da330cdb0a22cdb4c1e32d682556dcc2b491ea5d747dfda05e38e68ce47b2ae70e6b36de8f1e1413df4dbc73a30610675f0a8e8c1505e7a7"]
+    }
+  ],
+  "invalid": [
+    { "name": "d4.2-vector-3-empty", "operations": "0x", "error": "EMPTY" },
+    { "name": "d4.2-vector-4-unknown-version", "operations": "0x01", "error": "UNSUPPORTED_VERSION" },
+    { "name": "d4.2-vector-5-non-shortest-block-count", "operations": "0x008600", "error": "NON_CANONICAL_VARINT" },
+    { "name": "d4.2-vector-6-impossible-block-count", "operations": "0x0006", "error": "IMPLAUSIBLE_COUNT" },
+    { "name": "d4.2-vector-7-trailing-byte", "operations": "0x0006000000000000060000000000000000000000000000000000000000060000", "error": "TRANSACTION_BYTES_MISMATCH" },
+    { "name": "zero-block-count", "operations": "0x0000", "error": "EMPTY_SPAN" },
+    { "name": "truncated-block-count-varint", "operations": "0x0080", "error": "TRUNCATED" },
+    { "name": "six-byte-block-count-varint", "operations": "0x00808080808000", "error": "NON_CANONICAL_VARINT" },
+    { "name": "fifth-byte-overflow", "operations": "0x00ffffffff10", "error": "NON_CANONICAL_VARINT" },
+    { "name": "zero-beneficiary-run", "operations": "0x00010000", "error": "RUN_COVERAGE" },
+    { "name": "beneficiary-run-overshoots", "operations": "0x0002000003aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "error": "RUN_COVERAGE" },
+    { "name": "adjacent-beneficiary-runs-repeat", "operations": "0x0002000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "error": "NON_MAXIMAL_RUN" },
+    { "name": "extra-data-over-32-bytes", "operations": "0x00010001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0121", "error": "EXTRA_DATA_TOO_LONG" },
+    { "name": "adjacent-empty-extra-data-runs-repeat", "operations": "0x0002000002aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01000100", "error": "NON_MAXIMAL_RUN" },
+    { "name": "zero-length-transaction", "operations": "0x00010101aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa010000", "error": "EMPTY_TRANSACTION" },
+    { "name": "transaction-body-shorter-than-length", "operations": "0x00010101aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa010002ff", "error": "TRANSACTION_BYTES_MISMATCH" }
+  ]
+}
