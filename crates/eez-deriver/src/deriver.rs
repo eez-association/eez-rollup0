@@ -579,7 +579,7 @@ where
                 continue;
             }
 
-            let resumed = batch.settlement.start > 0;
+            let resumed = batch.settlement.resumed();
             // Anchor on the batch's own start, not our cursor: a competing
             // composer's batch can cover a range that begins below it.
             let anchor = match batch.settlement.entry_state {
@@ -606,7 +606,7 @@ where
                         local_root = %local_root,
                         entry_state = %entry_state,
                         final_state = ?batch.settlement.final_state,
-                        applied_start = batch.settlement.start,
+                        applied_first = ?batch.settlement.first_applied(),
                         "local state root at the scan cursor is neither the root the batch's applied run started from nor its settled endpoint; refusing to replay",
                     );
                     return Err(DeriverError::local_diverged(batch_first_l2));
@@ -620,7 +620,7 @@ where
                     &container.actions,
                     batch.l1_block_number,
                     batch.tx_hash,
-                    batch.settlement,
+                    &batch.settlement,
                 )
                 .await?;
             total_replayed += replayed_here;
@@ -634,9 +634,9 @@ where
                 if resumed {
                     None
                 } else {
-                    batch.settlement.entry_state.or(batch.claimed_current_state)
+                    batch.settlement.entry_state
                 },
-                batch.settlement.final_state.or(batch.claimed_new_state),
+                batch.settlement.final_state,
                 anchor,
                 batch_first_l2,
                 batch_last_l2,
@@ -1001,8 +1001,6 @@ where
                 call_data,
                 state_applied,
                 settlement,
-                claimed_current_state,
-                claimed_new_state,
                 last_in_l1_block,
             } => {
                 self.on_batch_posted(
@@ -1013,8 +1011,6 @@ where
                     call_data,
                     state_applied,
                     settlement,
-                    claimed_current_state,
-                    claimed_new_state,
                     last_in_l1_block,
                 )
                 .await
@@ -1049,8 +1045,6 @@ where
         call_data: Bytes,
         state_applied: bool,
         settlement: eez_l1::Settlement,
-        claimed_current_state: Option<B256>,
-        claimed_new_state: Option<B256>,
         last_in_l1_block: bool,
     ) -> DeriverResult<()> {
         let Some(container) = self.decode_our_payload(call_data.as_ref(), l1_block_number)? else {
@@ -1131,7 +1125,7 @@ where
         }
 
         let last_indexed_l2 = self.inner.l1_head.last_indexed_l2();
-        let resumed = settlement.start > 0;
+        let resumed = settlement.resumed();
         // Anchor on the batch's own start, not our cursor: a competing
         // composer's batch can cover a range that begins below it.
         let anchor = match settlement.entry_state {
@@ -1157,7 +1151,7 @@ where
                     local_root = %local_root,
                     entry_state = %entry_state,
                     final_state = ?settlement.final_state,
-                    applied_start = settlement.start,
+                    applied_first = ?settlement.first_applied(),
                     "local state root at cursor is neither the root the batch's applied run started from nor its settled endpoint; resync required",
                 );
                 return Err(DeriverError::local_diverged(from_block));
@@ -1174,7 +1168,7 @@ where
                 &container.actions,
                 l1_block_number,
                 tx_hash,
-                settlement,
+                &settlement,
             )
             .await?;
         event!(
@@ -1196,9 +1190,9 @@ where
             if resumed {
                 None
             } else {
-                settlement.entry_state.or(claimed_current_state)
+                settlement.entry_state
             },
-            settlement.final_state.or(claimed_new_state),
+            settlement.final_state,
             anchor,
             from_block,
             to_block,
@@ -1243,7 +1237,7 @@ where
             event_name = "eez.deriver.safe.advanced",
             from_block,
             to_block,
-            applied_entries = settlement.len,
+            applied_entries = settlement.applied().len(),
             l1_settled_commitment = %l1_settled_commitment,
             l1_block_number,
             tx_hash = %tx_hash,
@@ -1404,15 +1398,42 @@ where
         Ok(self.l2_sealed_header_at(l2_block)?.hash())
     }
 
+    /// Number of the block a commitment names, or `None` when we do not hold
+    /// it. A hash identifies one block, so this is an index read.
+    fn block_at(&self, commitment: B256) -> DeriverResult<Option<u64>> {
+        self.inner
+            .l2_provider
+            .block_number(commitment)
+            .map_err(DeriverError::l2_provider)
+    }
+
     /// Block whose hash is `entry_state`: where this batch's run starts. A
-    /// competing composer's batch can begin below our cursor, so search back.
+    /// competing composer's batch can begin below our cursor, so the answer is
+    /// bounded by the range the batch could legally cover, not pinned to it.
     fn batch_anchor(
         &self,
         cursor: u64,
         entry_state: B256,
         window: u64,
     ) -> DeriverResult<Option<u64>> {
-        anchor_with_overlap_log(cursor, entry_state, window, |block| self.l2_hash_at(block))
+        let anchor = in_settleable_range(
+            self.block_at(entry_state)?,
+            cursor.saturating_sub(window),
+            cursor,
+        );
+        // Overlapping range: a competing composer's batch starts below our cursor.
+        if let Some(anchor) = anchor
+            && anchor != cursor
+        {
+            event!(
+                name: "eez.deriver.batch.anchored_below_cursor",
+                Level::INFO,
+                cursor,
+                anchor,
+                "batch anchored below the cursor; its range overlaps ours",
+            );
+        }
+        Ok(anchor)
     }
 
     /// Per-block reconciliation against a decoded batch beginning at
@@ -1435,16 +1456,11 @@ where
         actions: &[eez_payload_codec::Action],
         l1_block_number: u64,
         tx_hash: B256,
-        settlement: eez_l1::Settlement,
+        settlement: &eez_l1::Settlement,
     ) -> DeriverResult<(u64, Option<B256>)> {
         // Cross-chain path (skipped when `system_tx_cfg` is `None`):
-        // reconstruct the system txs the composer produced, from either
-        // codec branch:
-        //
-        // - `decoded.l2_entries` non-empty: the L2-shape entries travel
-        //   in the payload directly (value-bearing batches).
-        // - empty: fall back to the on-chain `batch.entries[]` (L1
-        //   entries) — for value-free calls L1 and L2 shapes coincide.
+        // reconstruct the system txs the composer produced from the DA action
+        // manifest, which is their only published form.
         event!(
             name: "eez.deriver.reconcile.start",
             Level::INFO,
@@ -1503,36 +1519,14 @@ where
                 // settlement, `!= 0` = inbound delivery. `partition` keeps each
                 // side's order, preserving `[outbound…, inbound…]`.
                 entries.retain(|e| !e.l2ToL1Calls.is_empty());
-                let (mut outbound, mut inbound): (Vec<_>, Vec<_>) = entries
+                let (outbound, inbound): (Vec<_>, Vec<_>) = entries
                     .into_iter()
                     .partition(|e| e.proxyEntryHash == alloy_primitives::B256::ZERO);
                 // Captured before drain/truncate: all originally-claimed entries,
                 // settled or not, were paired 1:1 with Sync-block user txs.
                 let original_outbound_len = outbound.len();
 
-                // Rebuild exactly the steps L1 ran; `skip > 0` = it resumed
-                // mid-chain (see `ProducingSlice`).
-                let slice = ProducingSlice::split(settlement, outbound.len(), inbound.len());
-                let outbound_skip = slice.outbound_skip;
-                if slice.leaves_entries_unconsumed(outbound.len(), inbound.len()) {
-                    event!(
-                        name: "eez.deriver.reconcile.partial_consumption",
-                        Level::WARN,
-                        tx_hash = %tx_hash,
-                        outbound = outbound.len(),
-                        inbound = inbound.len(),
-                        outbound_skip = slice.outbound_skip,
-                        outbound_take = slice.outbound_take,
-                        inbound_skip = slice.inbound_skip,
-                        inbound_take = slice.inbound_take,
-                        anchor_applied = settlement.start == 0,
-                        "L1 ran only part of this batch; reconstructing exactly that slice",
-                    );
-                }
-                let skipped_outbound: Vec<_> = outbound.drain(..slice.outbound_skip).collect();
-                outbound.truncate(slice.outbound_take);
-                let skipped_inbound: Vec<_> = inbound.drain(..slice.inbound_skip).collect();
-                inbound.truncate(slice.inbound_take);
+                let original_inbound_len = inbound.len();
 
                 // The Sync block is the LAST block of the range; its user txs are
                 // the tail of `decoded.transactions`. Pair the i-th outbound entry
@@ -1565,28 +1559,57 @@ where
                         ),
                     ));
                 }
-                let outbound_paired: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> = outbound
-                    .iter()
-                    .cloned()
-                    .zip(sync_user_txs[outbound_skip..].iter().cloned())
-                    .collect();
+                // Each outbound entry takes its OWN ordinal's user tx, so a
+                // skipped entry never shifts the pairing of the rest.
+                let slots = select_applied_slots(settlement, &outbound, &inbound, &sync_user_txs)
+                    .map_err(|e| DeriverError::local_diverged_with_msg(from_block, &e))?;
+                if slots.outbound_paired.len() < original_outbound_len
+                    || slots.inbound.len() < original_inbound_len
+                {
+                    event!(
+                        name: "eez.deriver.reconcile.partial_consumption",
+                        Level::WARN,
+                        event_name = "eez.deriver.reconcile.partial_consumption",
+                        tx_hash = %tx_hash,
+                        outbound = original_outbound_len,
+                        inbound = original_inbound_len,
+                        outbound_applied = slots.outbound_paired.len(),
+                        inbound_applied = slots.inbound.len(),
+                        applied = ?settlement.applied_indices(),
+                        "L1 ran only part of this batch; rebuilding exactly what ran",
+                    );
+                }
+                let outbound_paired = slots.outbound_paired;
+                // `inbound` stays the FULL claimed list: the skipped-prefix nonce
+                // count below indexes it. Applied deliveries are separate.
+                let applied_inbound = slots.inbound;
 
                 // Stash for the post-replay gate — it needs the
                 // `CrossChainCallExecuted` events, observable only after replay.
-                gate_outbound.clone_from(&outbound);
+                gate_outbound = outbound_paired.iter().map(|(e, _)| e.clone()).collect();
 
                 let mut starting_nonce = self.system_address_nonce_at(from_block - 1)?;
-                // The skipped prefix's system txs already sit in this block, so the
-                // parent nonce predates them; entry counts are not that offset.
-                if !skipped_outbound.is_empty() || !skipped_inbound.is_empty() {
+                // A resume starts mid-block: the rival's system txs already sit
+                // here, so count the skipped prefix from the first applied role.
+                let (outbound_skip, inbound_skip) =
+                    match settlement.applied().first().map(|a| a.role) {
+                        Some(eez_l1::EntryRole::Outbound { ordinal }) => (ordinal, 0),
+                        // Every outbound entry precedes every inbound one.
+                        Some(eez_l1::EntryRole::Inbound { ordinal }) => {
+                            (original_outbound_len, ordinal)
+                        }
+                        _ => (0, 0),
+                    };
+                if outbound_skip > 0 || inbound_skip > 0 {
                     let skipped_paired: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> =
-                        skipped_outbound
-                            .into_iter()
+                        outbound[..outbound_skip]
+                            .iter()
+                            .cloned()
                             .zip(sync_user_txs[..outbound_skip].iter().cloned())
                             .collect();
                     let prefix_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
                         &skipped_paired,
-                        &skipped_inbound,
+                        &inbound[..inbound_skip],
                         cfg,
                         starting_nonce,
                     )
@@ -1605,7 +1628,7 @@ where
                 }
                 let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
                     &outbound_paired,
-                    &inbound,
+                    &applied_inbound,
                     cfg,
                     starting_nonce,
                 )
@@ -1646,7 +1669,7 @@ where
         let stale_boundary = !local_batch_boundary_matches(&self.inner.l2_provider, from_block)?;
         let mut replayed: u64 = 0;
         let last_index = decoded.block_tx_counts.len().saturating_sub(1);
-        let resumed = settlement.start > 0;
+        let resumed = settlement.resumed();
         if resumed {
             // The competing batch already committed this Sync block; only the
             // entries this batch settled are new. Append them to its EXISTING
@@ -1666,8 +1689,7 @@ where
                 l1_block_number,
                 tx_hash = %tx_hash,
                 from_block,
-                applied_start = settlement.start,
-                applied_len = settlement.len,
+                applied = ?settlement.applied_indices(),
                 entry_state = ?settlement.entry_state,
                 claimed_block_count = decoded.block_count(),
                 "resumed batch placement: appending settled entries to Sync block {from_block}",
@@ -1997,12 +2019,11 @@ where
                 );
                 return Err(DeriverError::local_diverged(to_block));
             }
-            // A depth, not a block count. `from_block` is `anchor + 1` when
-            // fresh and `anchor` when resumed, so measure from the anchor.
-            let window = to_block.saturating_sub(anchor);
-            if let Some(settled_end) = find_batch_anchor(to_block, claimed_new, window, |block| {
-                self.l2_hash_at(block)
-            })? {
+            // `from_block` is `anchor + 1` when fresh and `anchor` when
+            // resumed, so the settleable range starts at the anchor either way.
+            if let Some(settled_end) =
+                in_settleable_range(self.block_at(claimed_new)?, anchor, to_block)
+            {
                 if settled_end != to_block {
                     event!(
                         name: "eez.deriver.state.settled_prefix",
@@ -2051,51 +2072,12 @@ where
     }
 }
 
-/// [`find_batch_anchor`] plus the overlap log. Free fn so a test can drive it
-/// with a closure and assert the event, with no live `Deriver`.
-///
-/// # Errors
-/// Propagates `root_at` failures.
-fn anchor_with_overlap_log(
-    cursor: u64,
-    entry_state: B256,
-    window: u64,
-    root_at: impl FnMut(u64) -> DeriverResult<B256>,
-) -> DeriverResult<Option<u64>> {
-    let anchor = find_batch_anchor(cursor, entry_state, window, root_at)?;
-    // Overlapping range: a competing composer's batch starts below our cursor.
-    if let Some(anchor) = anchor
-        && anchor != cursor
-    {
-        event!(
-            name: "eez.deriver.batch.anchored_below_cursor",
-            Level::INFO,
-            cursor,
-            anchor,
-            "batch anchored below the cursor; its range overlaps ours",
-        );
-    }
-    Ok(anchor)
-}
-
-/// Walks back from `cursor` for the block whose root is `entry_state`. `None`
-/// means the batch starts outside the window, which the caller treats as loud.
-fn find_batch_anchor(
-    cursor: u64,
-    entry_state: B256,
-    window: u64,
-    mut root_at: impl FnMut(u64) -> DeriverResult<B256>,
-) -> DeriverResult<Option<u64>> {
-    let floor = cursor.saturating_sub(window);
-    let mut block = cursor;
-    loop {
-        if root_at(block)? == entry_state {
-            return Ok(Some(block));
-        }
-        if block == floor {
-            return Ok(None);
-        }
-        block -= 1;
+/// A commitment names this batch's endpoint only inside the range it can settle;
+/// outside it the hash is some other block we hold, which is divergence.
+const fn in_settleable_range(found: Option<u64>, low: u64, high: u64) -> Option<u64> {
+    match found {
+        Some(block) if block >= low && block <= high => Some(block),
+        _ => None,
     }
 }
 
@@ -2306,46 +2288,60 @@ fn resume_replay_txs(
     Some(txs)
 }
 
-/// `true` iff the first local block in a batch is anchored to the current
-/// local parent. `false` if the block is missing or sits on stale ancestry.
-/// Which producing entries L1 ran, projected onto the partitioned
-/// `[outbound…, inbound…]` list (that concatenation is the claimed chain minus
-/// the anchor). A `skip` per list, not just a length: L1 resumes MID-CHAIN when
-/// a competing same-block batch already made the leading hops, so those entries
-/// drop from the FRONT — which prefix truncation cannot express.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProducingSlice {
-    outbound_skip: usize,
-    outbound_take: usize,
-    inbound_skip: usize,
-    inbound_take: usize,
+/// The DA slots L1 actually applied, addressed by role rather than by offset.
+#[derive(Debug, Default)]
+struct AppliedSlots {
+    /// Applied outbound entries, each with the Sync-block user tx at its own
+    /// ordinal.
+    outbound_paired: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)>,
+    /// Applied inbound delivery entries, in application order.
+    inbound: Vec<eez_protocol::abi::ExecutionEntrySol>,
 }
 
-impl ProducingSlice {
-    /// Project `settlement`'s producing run onto lists of the given lengths.
-    fn split(settlement: eez_l1::Settlement, outbound_len: usize, inbound_len: usize) -> Self {
-        let (skip, take) = settlement.producing_slice();
-        let outbound_skip = skip.min(outbound_len);
-        let outbound_take = take.min(outbound_len - outbound_skip);
-        // Any skip beyond the outbound list falls through into inbound.
-        let inbound_skip = skip.saturating_sub(outbound_skip).min(inbound_len);
-        let inbound_take = take
-            .saturating_sub(outbound_take)
-            .min(inbound_len - inbound_skip);
-        Self {
-            outbound_skip,
-            outbound_take,
-            inbound_skip,
-            inbound_take,
+/// Select the DA entries L1 applied, by the role it reported for each. Selects
+/// rather than truncates, so a non-contiguous applied set is fine.
+///
+/// # Errors
+/// A role naming a slot the DA does not carry — divergence, so it is loud.
+fn select_applied_slots(
+    settlement: &eez_l1::Settlement,
+    outbound: &[eez_protocol::abi::ExecutionEntrySol],
+    inbound: &[eez_protocol::abi::ExecutionEntrySol],
+    sync_user_txs: &[Bytes],
+) -> Result<AppliedSlots, String> {
+    let mut slots = AppliedSlots::default();
+    for applied in settlement.applied() {
+        match applied.role {
+            // State-only: moves the commitment, signs no system tx.
+            eez_l1::EntryRole::Anchor => {}
+            eez_l1::EntryRole::Outbound { ordinal } => {
+                let (Some(entry), Some(user_tx)) =
+                    (outbound.get(ordinal), sync_user_txs.get(ordinal))
+                else {
+                    return Err(format!(
+                        "L1 applied outbound entry {} (ordinal {ordinal}) but the DA carries {} \
+                         outbound entries and {} Sync-block user txs",
+                        applied.entry_index,
+                        outbound.len(),
+                        sync_user_txs.len(),
+                    ));
+                };
+                slots.outbound_paired.push((entry.clone(), user_tx.clone()));
+            }
+            eez_l1::EntryRole::Inbound { ordinal } => {
+                let Some(entry) = inbound.get(ordinal) else {
+                    return Err(format!(
+                        "L1 applied inbound entry {} (ordinal {ordinal}) but the DA carries {} \
+                         inbound entries",
+                        applied.entry_index,
+                        inbound.len(),
+                    ));
+                };
+                slots.inbound.push(entry.clone());
+            }
         }
     }
-
-    /// True when entries are left over at the TAIL (partial consumption). A pure
-    /// mid-chain resume does NOT trip this — front skips are counted in `*_skip`.
-    const fn leaves_entries_unconsumed(&self, outbound_len: usize, inbound_len: usize) -> bool {
-        self.outbound_skip + self.outbound_take < outbound_len
-            || self.inbound_skip + self.inbound_take < inbound_len
-    }
+    Ok(slots)
 }
 
 /// Decode outbound-call events emitted by the configured L2 manager.
@@ -2501,203 +2497,212 @@ mod reconcile_decision_tests {
 }
 
 #[cfg(test)]
-mod producing_slice_tests {
+mod applied_selection_tests {
     //! Two composers post into ONE L1 block: `pb1` claims `A→B` and lands, so
-    //! `pb2`'s leading step(s) are refused as redundant and L1 resumes MID-CHAIN
-    //! inside it. The deriver must rebuild exactly the steps that ran.
+    //! `pb2`'s leading entries are refused as redundant and L1 resumes
+    //! MID-CHAIN inside it. The deriver must rebuild exactly what ran.
 
-    use super::ProducingSlice;
-    use alloy_primitives::B256;
-    use eez_l1::Settlement;
+    use super::{AppliedSlots, select_applied_slots};
+    use alloy_primitives::{Address, B256, Bytes};
+    use eez_l1::{AppliedEntry, EntryRole, Settlement};
     use proptest::prelude::*;
 
-    /// Cursor guard and `check_claimed_state` must agree on entry root, else a
-    /// mid-chain resume clears one and fails the other.
-    #[test]
-    fn state_check_entry_root_is_not_the_claimed_chain_head() {
-        let (a, b) = (B256::repeat_byte(0x0A), B256::repeat_byte(0x0B));
-        let claimed_head = Some(a);
-
-        // Mid-chain resume: B is what both guards check.
-        let resumed = Settlement {
-            start: 1,
-            len: 1,
-            final_state: None,
-            entry_state: Some(b),
-        };
-        assert_eq!(resumed.entry_state.or(claimed_head), Some(b));
-        assert_ne!(resumed.entry_state.or(claimed_head), claimed_head);
-
-        // Uncontested: unchanged.
-        let plain = Settlement {
-            start: 0,
-            len: 1,
-            final_state: None,
-            entry_state: claimed_head,
-        };
-        assert_eq!(plain.entry_state.or(claimed_head), claimed_head);
-    }
-
-    /// The superseded reconstruction: keep `settled_count - 1` entries from the
-    /// FRONT (outbound first, then inbound). Its skips are structurally 0 — the
-    /// defect. Shaped as `(outbound_skip, outbound_take, inbound_skip, inbound_take)` to compare.
-    fn old_prefix_split(
-        settled_count: usize,
-        outbound_len: usize,
-        inbound_len: usize,
-    ) -> (usize, usize, usize, usize) {
-        let applied = settled_count.saturating_sub(1);
-        let applied_outbound = applied.min(outbound_len);
-        let consumed_inbound = (applied - applied_outbound).min(inbound_len);
-        (0, applied_outbound, 0, consumed_inbound)
-    }
-
-    fn settlement(start: usize, len: usize) -> Settlement {
-        Settlement {
-            start,
-            len,
-            final_state: None,
-            entry_state: None,
+    fn producing_entry(tag: u8) -> eez_protocol::abi::ExecutionEntrySol {
+        eez_protocol::abi::ExecutionEntrySol {
+            proxyEntryHash: B256::repeat_byte(tag),
+            l2ToL1Calls: vec![eez_protocol::abi::L2ToL1CallSol {
+                revertNextNCalls: 0,
+                isStatic: false,
+                gas: 0,
+                sourceAddress: Address::ZERO,
+                sourceRollupId: 1,
+                targetAddress: Address::ZERO,
+                value: alloy_primitives::U256::ZERO,
+                data: Bytes::new(),
+            }],
+            ..Default::default()
         }
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
-        /// For every settlement run and outbound/inbound partition,
-        /// reconstruction selects exactly the consumed producing prefix/run.
-        /// An anchor at claimed index zero never becomes a system transaction,
-        /// and a resumed batch skips the already-landed producing prefix.
+        /// Selection is by ORDINAL, not offset: each applied outbound entry keeps
+        /// the user tx at its own ordinal and anchors contribute nothing, so a
+        /// non-contiguous applied set never shifts the rest.
         #[test]
-        fn reconcile_selects_exact_settled_producing_run(
-            start in 0usize..96,
-            len in 0usize..96,
-            outbound_len in 0usize..48,
-            inbound_len in 0usize..48,
+        fn selection_pins_every_entry_to_its_own_ordinal(
+            outbound_len in 0usize..12,
+            inbound_len in 0usize..12,
+            picks in prop::collection::vec(any::<bool>(), 24),
+            with_anchor in any::<bool>(),
         ) {
-            let total = outbound_len + inbound_len;
-            let settlement = settlement(start, len);
-            let (raw_skip, raw_take) = settlement.producing_slice();
-            let expected_skip = raw_skip.min(total);
-            let expected_take = raw_take.min(total - expected_skip);
-            let slice = ProducingSlice::split(settlement, outbound_len, inbound_len);
+            let outbound: Vec<_> = (0..outbound_len)
+                .map(|i| producing_entry(u8::try_from(i).unwrap()))
+                .collect();
+            let inbound: Vec<_> = (0..inbound_len)
+                .map(|i| producing_entry(0x80 | u8::try_from(i).unwrap()))
+                .collect();
+            let txs: Vec<Bytes> = (0..outbound_len)
+                .map(|i| user_tx(u8::try_from(i).unwrap()))
+                .collect();
 
-            prop_assert_eq!(slice.outbound_skip, expected_skip.min(outbound_len));
-            prop_assert_eq!(slice.outbound_take + slice.inbound_take, expected_take);
-            prop_assert_eq!(
-                slice.outbound_skip + slice.inbound_skip,
-                expected_skip,
-                "the full already-consumed prefix must be skipped",
-            );
-            prop_assert_eq!(
-                slice.leaves_entries_unconsumed(outbound_len, inbound_len),
-                expected_skip + expected_take < total,
-            );
+            let mut applied = Vec::new();
+            let mut index = 0usize;
+            if with_anchor {
+                applied.push(AppliedEntry { entry_index: index, role: EntryRole::Anchor });
+                index += 1;
+            }
+            let mut want_outbound = Vec::new();
+            for (ordinal, &pick) in picks.iter().enumerate().take(outbound_len) {
+                if pick {
+                    applied.push(AppliedEntry {
+                        entry_index: index,
+                        role: EntryRole::Outbound { ordinal },
+                    });
+                    want_outbound.push(ordinal);
+                }
+                index += 1;
+            }
+            let mut want_inbound = 0usize;
+            for (ordinal, &pick) in picks[12..].iter().enumerate().take(inbound_len) {
+                if pick {
+                    applied.push(AppliedEntry {
+                        entry_index: index,
+                        role: EntryRole::Inbound { ordinal },
+                    });
+                    want_inbound += 1;
+                }
+                index += 1;
+            }
+
+            let slots = select_applied_slots(
+                &Settlement::new(applied, None, None),
+                &outbound,
+                &inbound,
+                &txs,
+            )
+            .expect("every ordinal addresses the DA");
+
+            prop_assert_eq!(slots.outbound_paired.len(), want_outbound.len());
+            prop_assert_eq!(slots.inbound.len(), want_inbound);
+            for (slot, &ordinal) in slots.outbound_paired.iter().zip(&want_outbound) {
+                prop_assert_eq!(&slot.1, &txs[ordinal]);
+            }
         }
     }
 
-    /// Anchor skipped, one producing step ran → rebuild that one, not zero.
+    fn user_tx(tag: u8) -> Bytes {
+        Bytes::from(vec![tag])
+    }
+
+    /// `applied` is a list of (entry_index, role).
+    fn settlement_of(applied: &[(usize, EntryRole)]) -> Settlement {
+        Settlement::new(
+            applied
+                .iter()
+                .map(|&(entry_index, role)| AppliedEntry { entry_index, role })
+                .collect(),
+            None,
+            None,
+        )
+    }
+
+    fn slots(applied: &[(usize, EntryRole)]) -> AppliedSlots {
+        let outbound = vec![producing_entry(0x01), producing_entry(0x02)];
+        let inbound = vec![producing_entry(0xB1), producing_entry(0xB2)];
+        let txs = vec![user_tx(0xA), user_tx(0xB)];
+        select_applied_slots(&settlement_of(applied), &outbound, &inbound, &txs)
+            .expect("roles address the DA")
+    }
+
+    /// A partial settlement rebuilds only the entries that ran. The unconsumed
+    /// tail is absent, not truncated-to-length.
     #[test]
-    fn second_batch_rebuilds_the_single_step_that_ran() {
-        let s = ProducingSlice::split(settlement(1, 1), 0, 1);
-        assert_eq!(
-            s,
-            ProducingSlice {
-                outbound_skip: 0,
-                outbound_take: 0,
-                inbound_skip: 0,
-                inbound_take: 1
-            },
+    fn stopping_short_selects_only_what_ran() {
+        let s = slots(&[
+            (0, EntryRole::Anchor),
+            (1, EntryRole::Outbound { ordinal: 0 }),
+        ]);
+        assert_eq!(s.outbound_paired.len(), 1);
+        assert_eq!(s.outbound_paired[0].1, user_tx(0xA));
+        assert!(
+            s.inbound.is_empty(),
+            "an unconsumed delivery is not rebuilt"
         );
-        assert!(!s.leaves_entries_unconsumed(0, 1));
     }
 
-    /// Competitor made the anchor AND the first producing hop, so L1 resumed at
-    /// the second. The prefix formula keeps the already-settled entry and drops
-    /// the one that ran — rebuilding a different tx than L1 executed.
+    /// The anchor moves the commitment but signs no system tx, so an
+    /// anchor-only settlement rebuilds nothing.
     #[test]
-    fn deeper_resume_skips_the_front_where_prefix_truncation_cannot() {
-        // claimed [anchor, p0, p1]; competitor made anchor + p0; only p1 ran.
-        let s = ProducingSlice::split(settlement(2, 1), 0, 2);
+    fn anchor_only_settlement_rebuilds_nothing() {
+        let s = slots(&[(0, EntryRole::Anchor)]);
+        assert!(s.outbound_paired.is_empty() && s.inbound.is_empty());
+    }
+
+    /// An outbound entry takes the user tx at its OWN ordinal; offset-based
+    /// selection would shift every pair after a skip.
+    #[test]
+    fn outbound_pairing_follows_the_original_ordinal() {
+        let s = slots(&[(2, EntryRole::Outbound { ordinal: 1 })]);
+        assert_eq!(s.outbound_paired.len(), 1);
         assert_eq!(
-            s,
-            ProducingSlice {
-                outbound_skip: 0,
-                outbound_take: 0,
-                inbound_skip: 1,
-                inbound_take: 1,
-            },
+            s.outbound_paired[0].1,
+            user_tx(0xB),
+            "ordinal 1 keeps the second user tx even when ordinal 0 was skipped",
         );
-        // Front skips are counted, so nothing reads as left over.
-        assert!(!s.leaves_entries_unconsumed(0, 2));
-
-        let old = old_prefix_split(1, 0, 2);
-        assert_eq!(old, (0, 0, 0, 0), "prefix formula rebuilds nothing here");
-        assert_ne!((old.2, old.3), (s.inbound_skip, s.inbound_take));
     }
 
-    /// A skip longer than the outbound list falls through into inbound.
+    /// A hole — an applied set that is not one contiguous run, which a peer's
+    /// branching batch produces — is selected around rather than refused.
     #[test]
-    fn skip_and_take_span_outbound_into_inbound() {
-        let s = ProducingSlice::split(settlement(3, 2), 2, 3);
-        assert_eq!((s.outbound_skip, s.outbound_take), (2, 0));
-        assert_eq!((s.inbound_skip, s.inbound_take), (0, 2));
+    fn a_hole_in_the_applied_set_is_selected_around() {
+        let s = slots(&[
+            (1, EntryRole::Outbound { ordinal: 0 }),
+            (4, EntryRole::Inbound { ordinal: 1 }),
+        ]);
+        assert_eq!(s.outbound_paired.len(), 1);
+        assert_eq!(s.outbound_paired[0].1, user_tx(0xA));
+        assert_eq!(
+            s.inbound.len(),
+            1,
+            "the entry after the hole still rebuilds"
+        );
     }
 
-    /// Anchor ran: producing entries are `len - 1`, nothing skipped. The ordinary
-    /// single-composer path must derive exactly as the prefix formula did.
+    /// A role naming a slot the DA lacks means the readings disagree — loud,
+    /// because rebuilding a different block than L1 settled is divergence.
     #[test]
-    fn anchor_applied_matches_the_prefix_formula() {
-        let s = ProducingSlice::split(settlement(0, 3), 1, 1);
-        assert_eq!(s.outbound_skip, 0);
-        assert_eq!(s.inbound_skip, 0);
-        assert_eq!((s.outbound_take, s.inbound_take), (1, 1));
-        let old = old_prefix_split(3, 1, 1);
-        assert_eq!((old.1, old.3), (s.outbound_take, s.inbound_take));
+    fn a_role_beyond_the_da_is_loud() {
+        let outbound = vec![producing_entry(0x01)];
+        let txs = vec![user_tx(0xA)];
+        let error = select_applied_slots(
+            &settlement_of(&[(1, EntryRole::Outbound { ordinal: 5 })]),
+            &outbound,
+            &[],
+            &txs,
+        )
+        .expect_err("a role beyond the DA must not be clamped");
+        assert!(error.contains("ordinal 5"), "got {error}");
     }
 
-    /// L1 stopped SHORT (a reverting user tx left its entry and the rest
-    /// unconsumed) — truncate the tail, no skip.
+    /// A resumed batch's `entry_state` is the rival's endpoint; the cursor guard
+    /// and `check_claimed_state` must agree on it.
     #[test]
-    fn stopping_short_truncates_the_tail() {
-        let s = ProducingSlice::split(settlement(0, 2), 0, 3);
-        assert_eq!((s.inbound_skip, s.inbound_take), (0, 1));
-        assert!(s.leaves_entries_unconsumed(0, 3));
-    }
-
-    /// A run longer than the available entries clamps instead of panicking.
-    #[test]
-    fn oversized_run_clamps_to_available_entries() {
-        let s = ProducingSlice::split(settlement(0, 99), 1, 1);
-        assert_eq!((s.outbound_take, s.inbound_take), (1, 1));
-        let s = ProducingSlice::split(settlement(50, 99), 1, 1);
-        assert_eq!(s.outbound_skip + s.outbound_take, 1);
-        assert_eq!(s.inbound_skip + s.inbound_take, 1);
-    }
-
-    /// The trailing-append boundary must skip unconsumed tail entries too, not
-    /// just `outbound_skip + outbound_take`.
-    #[test]
-    fn tail_truncation_boundary_must_skip_the_unconsumed_entry_too() {
-        let original_outbound_len = 2; // [E0, E1]
-        let s = ProducingSlice::split(settlement(0, 2), original_outbound_len, 0);
-        assert_eq!((s.outbound_skip, s.outbound_take), (0, 1));
-        assert!(s.leaves_entries_unconsumed(original_outbound_len, 0));
-
-        let buggy_boundary = s.outbound_skip + s.outbound_take;
-        assert_ne!(buggy_boundary, original_outbound_len);
-    }
-
-    /// Two composers built from cursor 100, both claiming 101..=110: batch 1
-    /// (plain) spans that full range, advancing the cursor to 110; batch 2
-    /// (resumed) settles within that SAME Sync block, not a new one.
-    #[test]
-    fn resumed_batch_settles_within_the_existing_sync_block_not_a_new_one() {
-        let (first, last) = super::batch_l2_range(100, settlement(0, 2).start > 0, 10);
-        assert_eq!((first, last), (101, 110));
-
-        let (first, last) = super::batch_l2_range(110, settlement(2, 1).start > 0, 10);
-        assert_eq!((first, last), (110, 110));
+    fn entry_state_on_a_resume_is_not_the_claimed_chain_head() {
+        let (a, b) = (B256::repeat_byte(0x0A), B256::repeat_byte(0x0B));
+        let claimed_head = Some(a);
+        let resumed = Settlement::new(
+            vec![AppliedEntry {
+                entry_index: 1,
+                role: EntryRole::Outbound { ordinal: 0 },
+            }],
+            None,
+            Some(b),
+        );
+        assert!(resumed.resumed());
+        assert_eq!(resumed.entry_state.or(claimed_head), Some(b));
+        assert_ne!(resumed.entry_state.or(claimed_head), claimed_head);
     }
 }
 
@@ -2879,161 +2884,76 @@ mod outbound_wiring_tests {
 }
 
 #[cfg(test)]
-mod batch_anchor_tests {
+mod anchor_range_tests {
     //! Two composers on one rollup post OVERLAPPING ranges: B's cursor sits a
     //! block behind A's, so B's batch starts below A's cursor (live 2026-08-24).
+    //!
+    //! Locating a commitment is an index read; what still matters is the RANGE a
+    //! batch may settle in.
 
-    use super::{batch_l2_range, find_batch_anchor};
-    use alloy_primitives::B256;
+    use super::{batch_l2_range, in_settleable_range};
 
-    /// Roots of the live stall: B's batch covered 174192..174197, A's cursor was
-    /// 174192, and L1's stored root was block 174197's.
-    fn root_at(block: u64) -> B256 {
-        B256::with_last_byte(u8::try_from(block % 251).expect("fits"))
-    }
+    const ANCHOR: u64 = 174_192;
 
+    /// The live stall: B's batch covered 174192..174197 while A's cursor was
+    /// 174192, so B's run started one block below it.
     #[test]
-    fn overlapping_batch_anchors_below_the_cursor_and_lands_on_the_settled_block() {
-        let cursor = 174_192_u64;
+    fn a_batch_may_anchor_below_the_cursor() {
         let block_count = 6_u64;
-        // B's batch declares the root of 174191 as where its run starts.
-        let entry_state = root_at(174_191);
-
-        let anchor = find_batch_anchor(cursor, entry_state, block_count, |b| Ok(root_at(b)))
-            .expect("lookup")
-            .expect("anchor is inside the window");
-        assert_eq!(anchor, 174_191);
-
-        // Anchored: the range is B's real one and ends where L1 stored its root.
         assert_eq!(
-            batch_l2_range(anchor, false, block_count),
-            (174_192, 174_197)
-        );
-        // Cursor-relative (the bug): one block too high, so the endpoint check
-        // compared L1's stored root against block 174198 and refused.
-        assert_eq!(
-            batch_l2_range(cursor, false, block_count),
-            (174_193, 174_198)
+            in_settleable_range(Some(174_191), ANCHOR.saturating_sub(block_count), ANCHOR),
+            Some(174_191),
         );
     }
 
+    /// The anchor is a legitimate endpoint; its predecessor is not, because that
+    /// block predates the run.
     #[test]
-    fn a_partial_settlement_endpoint_is_found_below_the_claimed_range_end() {
-        // Live 2026-08-24: the batch claimed 174193..174198, but L1 stopped at
-        // the hop whose newState is block 174197's root.
-        let claimed_end = 174_198_u64;
-        let settled = find_batch_anchor(claimed_end, root_at(174_197), 6, |b| Ok(root_at(b)))
-            .expect("lookup")
-            .expect("endpoint inside the window");
-        assert_eq!(settled, 174_197);
-        assert_ne!(settled, claimed_end, "cursor must not run past L1's root");
-    }
-
-    #[test]
-    fn a_full_settlement_endpoint_is_the_range_end() {
-        let claimed_end = 174_198_u64;
-        let settled = find_batch_anchor(claimed_end, root_at(claimed_end), 6, |b| Ok(root_at(b)))
-            .expect("lookup")
-            .expect("endpoint");
-        assert_eq!(settled, claimed_end);
-    }
-
-    #[test]
-    fn disjoint_batch_still_anchors_at_the_cursor() {
-        let cursor = 1_000_u64;
-        let anchor = find_batch_anchor(cursor, root_at(cursor), 6, |b| Ok(root_at(b)))
-            .expect("lookup")
-            .expect("anchor");
-        assert_eq!(anchor, cursor);
-        assert_eq!(batch_l2_range(anchor, false, 6), (1_001, 1_006));
-    }
-
-    #[test]
-    fn a_root_outside_the_window_stays_loud() {
-        let cursor = 1_000_u64;
-        let anchor =
-            find_batch_anchor(cursor, B256::repeat_byte(0xEE), 6, |b| Ok(root_at(b))).expect("ok");
-        assert!(anchor.is_none(), "unknown root must not be anchored");
-    }
-
-    /// Endpoint depth is measured from the ANCHOR, not `from_block`, which is
-    /// `anchor + 1` when fresh and `anchor` when resumed. Both from-relative
-    /// forms are wrong in opposite directions.
-    ///
-    /// The anchor is a legitimate endpoint: a single-block batch's leading
-    /// immediate is a no-op (`newState == parent.stateRoot == root(anchor)`),
-    /// so L1 can accept it and leave the root there.
-    #[test]
-    fn endpoint_depth_is_measured_from_the_anchor() {
+    fn the_range_includes_the_anchor_and_excludes_what_precedes_it() {
         for count in [1_u64, 6] {
-            let anchor = 174_192_u64;
-            let (from, to) = batch_l2_range(anchor, false, count);
-            let probe = |b| Ok(root_at(b));
-
+            let (_, to) = batch_l2_range(ANCHOR, false, count);
             assert_eq!(
-                find_batch_anchor(to, root_at(anchor), to - anchor, probe).expect("lookup"),
-                Some(anchor),
+                in_settleable_range(Some(ANCHOR), ANCHOR, to),
+                Some(ANCHOR),
                 "count={count}: the anchor must stay reachable",
             );
-            // `to - from` misses it — one short for a fresh batch.
-            assert!(
-                find_batch_anchor(to, root_at(anchor), to - from, probe)
-                    .expect("lookup")
-                    .is_none(),
-                "count={count}: from-relative depth wrongly excludes the anchor",
-            );
-            for endpoint in from..=to {
-                assert_eq!(
-                    find_batch_anchor(to, root_at(endpoint), to - anchor, probe).expect("lookup"),
-                    Some(endpoint),
-                );
-            }
-            assert!(
-                find_batch_anchor(to, root_at(anchor - 1), to - anchor, probe)
-                    .expect("lookup")
-                    .is_none(),
-                "count={count}: a root predating the run must not be accepted",
+            assert_eq!(
+                in_settleable_range(Some(ANCHOR - 1), ANCHOR, to),
+                None,
+                "count={count}: a block predating the run is not an endpoint",
             );
         }
     }
 
-    /// A resumed batch collapses onto the anchor (`from == to == anchor`), so
-    /// its only valid endpoint is that block — depth 0. The inclusive count
-    /// would reach the anchor's parent and accept a root predating the batch.
+    /// L1 can stop at any entry, so every block the batch claims is a possible
+    /// endpoint — and nothing above the claimed end is.
     #[test]
-    fn resumed_batch_endpoint_is_its_own_sync_block_only() {
-        let anchor = 174_197_u64;
-        let (from, to) = batch_l2_range(anchor, true, 10);
-        assert_eq!((from, to), (anchor, anchor));
-        assert_eq!(to - anchor, 0);
-
-        assert_eq!(
-            find_batch_anchor(to, root_at(anchor), 0, |b| Ok(root_at(b))).expect("lookup"),
-            Some(anchor),
-        );
-        assert!(
-            find_batch_anchor(to, root_at(anchor - 1), 0, |b| Ok(root_at(b)))
-                .expect("lookup")
-                .is_none(),
-            "must not settle at its predecessor's root",
-        );
-        // The old inclusive count accepted exactly that.
-        assert_eq!(
-            find_batch_anchor(to, root_at(anchor - 1), to - from + 1, |b| Ok(root_at(b)))
-                .expect("lookup"),
-            Some(anchor - 1),
-        );
+    fn every_claimed_block_is_a_valid_endpoint() {
+        let (from, to) = batch_l2_range(ANCHOR, false, 6);
+        for endpoint in from..=to {
+            assert_eq!(
+                in_settleable_range(Some(endpoint), ANCHOR, to),
+                Some(endpoint)
+            );
+        }
+        assert_eq!(in_settleable_range(Some(to + 1), ANCHOR, to), None);
     }
 
+    /// A resumed batch collapses onto the anchor, so that block is its only
+    /// valid endpoint.
     #[test]
-    fn search_is_bounded_by_the_window() {
-        let cursor = 1_000_u64;
-        let mut reads = 0_u32;
-        let _ = find_batch_anchor(cursor, B256::repeat_byte(0xEE), 6, |b| {
-            reads += 1;
-            Ok(root_at(b))
-        });
-        assert_eq!(reads, 7, "cursor plus the window, nothing deeper");
+    fn a_resumed_batch_settles_only_at_its_own_sync_block() {
+        let (from, to) = batch_l2_range(ANCHOR, true, 10);
+        assert_eq!((from, to), (ANCHOR, ANCHOR));
+        assert_eq!(in_settleable_range(Some(ANCHOR), ANCHOR, to), Some(ANCHOR));
+        assert_eq!(in_settleable_range(Some(ANCHOR - 1), ANCHOR, to), None);
+    }
+
+    /// A commitment naming a block we do not hold is not an endpoint; the caller
+    /// falls through to the divergence check.
+    #[test]
+    fn a_commitment_we_do_not_hold_is_not_an_endpoint() {
+        assert_eq!(in_settleable_range(None, ANCHOR, ANCHOR + 6), None);
     }
 }
 

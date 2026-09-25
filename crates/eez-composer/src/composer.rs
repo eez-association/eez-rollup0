@@ -513,6 +513,59 @@ struct SettlementFailureOutcome {
     evicted: usize,
 }
 
+/// Three-way disposition of a recovered batch's in-flight transactions: a
+/// receipt burns the nonce, no receipt returns the tx to the pool.
+fn dispose_recovered_txs(
+    rollup_id: u64,
+    pool: &crate::HeldPool,
+    sync_height: u64,
+    txs: Vec<crate::HeldTx>,
+    landed: &[alloy_primitives::TxHash],
+    charge_attempt: bool,
+) {
+    let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(txs.len());
+    let mut release: Vec<crate::HeldTx> = Vec::new();
+    let mut dropped = 0usize;
+    for tx in txs {
+        if landed.contains(&tx.hash) {
+            dropped += 1;
+            release.push(tx.clone());
+            event!(
+                name: "eez.composer.recovery.nonce_burned",
+                Level::WARN,
+                event_name = "eez.composer.recovery.nonce_burned",
+                rollup_id,
+                tx_hash = %tx.hash,
+                "user_tx already has an L1 receipt; not re-queueing (user must resubmit)",
+            );
+        } else {
+            keep.push(tx);
+        }
+    }
+    pool.release_in_flight_batch(&release);
+    let (re_pushed, settlement_evicted) = if charge_attempt {
+        let recovery =
+            recover_settlement_failure(pool, rollup_id, keep, SettlementFailureSource::Relay);
+        (recovery.requeued, recovery.evicted)
+    } else {
+        let re_pushed = keep.len();
+        pool.push_front_batch(keep);
+        (re_pushed, 0)
+    };
+    dropped += settlement_evicted;
+    if re_pushed > 0 || dropped > 0 {
+        event!(
+            name: "eez.composer.recovery.re_pushed",
+            Level::INFO,
+            rollup_id,
+            sync_height,
+            re_pushed,
+            dropped,
+            "batch recovered; user_txs re-queued (front) for the next Sync slot",
+        );
+    }
+}
+
 /// Count one failed settlement episode for every candidate, evict transactions
 /// that reach the bound, and cascade each eviction through its sender/direction
 /// nonce suffix. Survivors retain their attempt count and FIFO order.
@@ -1360,6 +1413,11 @@ where
         // failed Sync block has either committed (head ≥ height →
         // reorg it out) or permanently didn't (stale-parent bail —
         // nothing to roll back).
+        if let Some(short) = rollup.optimistic.take_settled_short() {
+            // No rollback: the height is canonical, so this owes the slot
+            // nothing beyond the tx disposition and the slot proceeds normally.
+            self.recover_short_batch(rollup_id, rollup, short).await;
+        }
         if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
             // A moved head makes this slot's parent stale — the Sequencer's bail
             // covers it. An UNCHANGED head (reinsert / stale-verdict) still owes
@@ -1532,6 +1590,9 @@ where
             return;
         };
         let cursor = rollup.l1_head.cursor();
+        if let Some(short) = rollup.optimistic.take_settled_short() {
+            self.recover_short_batch(rollup_id, rollup, short).await;
+        }
         if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
             // Deliberately ignored: a tick owes no block, and the Sequencer
             // re-reads the head right after this hook returns.
@@ -1586,6 +1647,60 @@ where
                 "settlement backlog",
             );
         }
+    }
+
+    /// Sweep a prefix-settled batch: the height stays canonical, so nothing is
+    /// rolled back and only the tx disposition is owed.
+    ///
+    /// Charges no attempt — the reverting tx is burned below, and the tail
+    /// behind it never ran.
+    async fn recover_short_batch(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        short: crate::optimistic::FailedBatch,
+    ) {
+        let sync_height = short.sync_height;
+        let mut landed = Vec::new();
+        for tx in &short.txs {
+            match self.inner.submitter.receipt_exists(tx.hash).await {
+                Ok(true) => landed.push(tx.hash),
+                Ok(false) => {}
+                Err(err) => {
+                    // Without receipts a burned nonce is indistinguishable from
+                    // a re-queueable tx, so hold the entry and retry next slot.
+                    event!(
+                        name: "eez.composer.recovery.short_receipt_check_failed",
+                        Level::WARN,
+                        rollup_id,
+                        sync_height,
+                        tx_hash = %tx.hash,
+                        error = %err,
+                        "receipt lookup failed for a prefix-settled batch; retaining for retry",
+                    );
+                    rollup.optimistic.reinsert_settled_short(short);
+                    return;
+                }
+            }
+        }
+        event!(
+            name: "eez.composer.recovery.settled_short",
+            Level::INFO,
+            event_name = "eez.composer.recovery.settled_short",
+            rollup_id,
+            sync_height,
+            txs = short.txs.len(),
+            landed = landed.len(),
+            "prefix settlement: releasing consumed txs, re-queueing the tail",
+        );
+        dispose_recovered_txs(
+            rollup_id,
+            rollup.held_pool.as_ref(),
+            sync_height,
+            short.txs,
+            &landed,
+            false,
+        );
     }
 
     /// Reorg a landed failed batch out, substitute an empty sibling (the shape
@@ -1738,60 +1853,16 @@ where
                 }
             }
         }
-        // Re-push user_txs whose nonce survived — to the FRONT of the
-        // pool, ahead of anything submitted since, so user ordering is
-        // preserved across retries. An included-but-reverted tx has a
-        // burned nonce — re-bundling it would poison the next bundle's
-        // simulation.
-        {
-            let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(failed.txs.len());
-            let mut release: Vec<crate::HeldTx> = Vec::new();
-            let mut dropped = 0usize;
-            // slot_skipped: the drop wasn't the txs' fault (skipped L1 slot or
-            // relay transport failure) — re-queue without counting an attempt.
-            let slot_skipped = failed.slot_skipped;
-            for tx in failed.txs {
-                if landed.contains(&tx.hash) {
-                    dropped += 1;
-                    release.push(tx.clone());
-                    event!(
-                        name: "eez.composer.recovery.nonce_burned",
-                        Level::WARN,
-                        rollup_id,
-                        tx_hash = %tx.hash,
-                        "user_tx already has an L1 receipt; not re-queueing (user must resubmit)",
-                    );
-                } else {
-                    keep.push(tx);
-                }
-            }
-            pool.release_in_flight_batch(&release);
-            let (re_pushed, settlement_evicted) = if slot_skipped {
-                let re_pushed = keep.len();
-                pool.push_front_batch(keep);
-                (re_pushed, 0)
-            } else {
-                let recovery = recover_settlement_failure(
-                    pool,
-                    rollup_id,
-                    keep,
-                    SettlementFailureSource::Relay,
-                );
-                (recovery.requeued, recovery.evicted)
-            };
-            dropped += settlement_evicted;
-            if re_pushed > 0 || dropped > 0 {
-                event!(
-                    name: "eez.composer.recovery.re_pushed",
-                    Level::INFO,
-                    rollup_id,
-                    sync_height,
-                    re_pushed,
-                    dropped,
-                    "failed batch recovered; user_txs re-queued (front) for next Sync slot",
-                );
-            }
-        }
+        dispose_recovered_txs(
+            rollup_id,
+            pool,
+            sync_height,
+            failed.txs,
+            &landed,
+            // A drop the txs caused counts toward poison-eviction; a skipped L1
+            // slot or relay transport failure does not.
+            !failed.slot_skipped,
+        );
         outcome
     }
 
@@ -4288,25 +4359,33 @@ async fn observe_bundle_outcome(
     submitter: Submitter,
     target: BundleTarget,
 ) {
-    let outcome = submitter
-        .send_bundle(&bundle, target, Some(expected_final_state))
-        .await;
-    // Only an included submission with the expected state transition settles.
-    // Every other outcome remains recoverable at the next Sync slot.
-    let settled = matches!(
-        outcome,
-        Ok(SendOutcome::Included {
-            state_applied: true,
-            ..
-        })
-    );
+    let outcome = submitter.send_bundle(&bundle, target).await;
+    // How far L1 got with this batch, attributed to our own postBatch tx.
+    let settlement = match &outcome {
+        Ok(SendOutcome::Included { settlement, .. }) => Some(settlement),
+        _ => None,
+    };
+    // Settled = L1 reached the claimed endpoint. Anything short is a prefix.
+    let settled = settlement.is_some_and(|s| s.final_state == Some(expected_final_state));
+    // The anchor claims the block BEFORE this one, so an anchor-only settlement
+    // leaves this height unratified: reorged, not kept.
+    let kept_an_effect = settlement.is_some_and(eez_l1::Settlement::applied_an_effect);
     match &outcome {
-        Ok(
-            o @ SendOutcome::Included {
-                state_applied: false,
-                ..
-            },
-        ) => event!(
+        // Settled SHORT: the height stays canonical and the Deriver rebuilds the
+        // block L1 named; only the unconsumed tail is owed a disposition.
+        Ok(o @ SendOutcome::Included { .. }) if !settled && kept_an_effect => event!(
+            name: "eez.composer.bundle.observed",
+            Level::WARN,
+            event_name = "eez.composer.bundle.observed",
+            rollup_id,
+            sync_height,
+            settled,
+            kept_an_effect,
+            applied = ?settlement.map(eez_l1::Settlement::applied_indices),
+            outcome = ?o,
+            "postBatch settled a PREFIX; L1 kept part of this batch",
+        ),
+        Ok(o @ SendOutcome::Included { .. }) if !settled => event!(
             name: "eez.composer.bundle.observed",
             Level::ERROR,
             event_name = "eez.composer.bundle.observed",
@@ -4347,7 +4426,14 @@ async fn observe_bundle_outcome(
     }
     if settled {
         optimistic.mark_settled(sync_height);
+    } else if kept_an_effect {
+        // L1 kept a prefix of the effects, so this height stays canonical and
+        // recovery owes only the tail disposition — no rollback.
+        optimistic.mark_settled_short(sync_height);
     } else {
+        // Includes the anchor-only case: the commitment moved but no effect ran,
+        // so the block is unratified and the reorg path is correct.
+        //
         // slot_skipped = the drop was NOT attributable to the bundled txs →
         // requeue without counting an attempt toward poison-eviction.
         let slot_skipped = match &outcome {
@@ -4480,6 +4566,73 @@ mod tests {
                 post_batch_signer,
             } if submitter_poster == poster && post_batch_signer == Address::repeat_byte(0xb)
         ));
+    }
+
+    /// The safety property: a receipt means the tx ran, so its nonce is burned;
+    /// no receipt means it never ran and must come back.
+    #[test]
+    fn a_prefix_settlement_releases_what_landed_and_requeues_only_the_tail() {
+        let pool = crate::HeldPool::new();
+        let sender = Address::repeat_byte(0x11);
+        for (nonce, byte) in [(1u64, 0xA1u8), (2, 0xA2), (3, 0xA3)] {
+            pool.push_contiguous(held(sender, Direction::Inbound, nonce, byte), 1)
+                .unwrap();
+        }
+        let drained = pool.pop_n(3);
+        assert_eq!(drained.len(), 3);
+
+        // L1 consumed the first two entries; the third never ran.
+        let landed = [TxHash::repeat_byte(0xA1), TxHash::repeat_byte(0xA2)];
+        dispose_recovered_txs(1, &pool, 100, drained, &landed, false);
+
+        let queued = pool.pop_all();
+        assert_eq!(
+            queued.iter().map(|t| t.hash).collect::<Vec<_>>(),
+            vec![TxHash::repeat_byte(0xA3)],
+            "only the unconsumed tail is re-queued; burned nonces are not",
+        );
+        assert_eq!(
+            queued[0].attempts, 0,
+            "a short settle charges no attempt: the reverting tx is removed by \
+             the burn, and the tail behind it is not at fault",
+        );
+    }
+
+    /// A burned nonce must release its reservation, else the resubmission is
+    /// blocked. Probed with a different hash, since re-pushing one is idempotent.
+    #[test]
+    fn a_burned_nonce_releases_its_in_flight_reservation() {
+        let pool = crate::HeldPool::new();
+        let sender = Address::repeat_byte(0x22);
+        pool.push_contiguous(held(sender, Direction::Inbound, 1, 0xB1), 1)
+            .unwrap();
+        let drained = pool.pop_n(1);
+
+        let resubmission = held(sender, Direction::Inbound, 1, 0xB2);
+        assert!(
+            pool.push_contiguous(resubmission.clone(), 1).is_err(),
+            "an in-flight reservation must block the nonce before disposition",
+        );
+
+        dispose_recovered_txs(1, &pool, 100, drained, &[TxHash::repeat_byte(0xB1)], false);
+        pool.push_contiguous(resubmission, 1)
+            .expect("the nonce must be free once the burned tx releases its reservation");
+        assert_eq!(pool.len(), 1);
+    }
+
+    /// The eviction backstop still applies where the bundle genuinely failed and
+    /// we cannot tell whose fault it was.
+    #[test]
+    fn a_charged_attempt_still_evicts_at_the_cap() {
+        let pool = crate::HeldPool::new();
+        let sender = Address::repeat_byte(0x44);
+        let mut tx = held(sender, Direction::Inbound, 1, 0xD1);
+        tx.attempts = MAX_BUNDLE_ATTEMPTS - 1;
+        pool.push_contiguous(tx, 1).unwrap();
+        let drained = pool.pop_n(1);
+
+        dispose_recovered_txs(1, &pool, 100, drained, &[], true);
+        assert_eq!(pool.len(), 0, "at MAX_BUNDLE_ATTEMPTS the tx is evicted");
     }
 
     fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {

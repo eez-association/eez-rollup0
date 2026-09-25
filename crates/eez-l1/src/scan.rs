@@ -8,8 +8,8 @@ use alloy_provider::Provider;
 use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::{SolCall, SolEvent};
 use eez_protocol::abi::{
-    BatchPosted, L2ExecutionPerformed, ProofSystemBatchPerVerificationEntriesSol,
-    postAndVerifyBatchCall,
+    BatchPosted, ExecutionConsumed, L2ExecutionPerformed, L2TxSkipped,
+    ProofSystemBatchPerVerificationEntriesSol, postAndVerifyBatchCall,
 };
 use tracing::{Level, event};
 
@@ -19,17 +19,21 @@ use crate::error::{L1Error, L1Result};
 /// split before hitting RPCs that reject long `eth_getLogs` ranges.
 pub(crate) const LOG_SCAN_CHUNK_BLOCKS: u64 = 100_000;
 
-/// One `L2ExecutionPerformed.newState` for our rollup, tagged with where in the
-/// L1 block it was emitted so it can be attributed to the owning batch.
-#[derive(Debug, Clone, Copy)]
-struct SettledRoot {
+/// One log payload, tagged with where it sat in the L1 block: two composers can
+/// post for one rollup in a block, so position decides which batch owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Positioned<T> {
     tx_index: u64,
     log_index: u64,
-    /// L1 block this root's log landed in — attribution requires it to
-    /// match the batch's block hash (fork-pinning).
     block_hash: B256,
-    root: B256,
+    payload: T,
 }
+
+/// A root L1 stored for our rollup.
+type SettledRoot = Positioned<B256>;
+
+/// A deferred entry L1 consumed, by its position in the rollup's entry queue.
+type ConsumedEntry = Positioned<(u64, B256)>;
 
 /// A decoded `BatchPosted` log, before settlement attribution. Held between the
 /// scan's two passes: windows need every batch in the block decoded first.
@@ -42,9 +46,9 @@ struct DecodedBatchLog {
     submitter: Address,
     /// This batch lists our rollup, so it wiped our queue — a window boundary.
     verifies_our_rollup: bool,
-    call_data: Bytes,
-    claimed_current_state: Option<B256>,
-    claimed_chain: Vec<B256>,
+    /// Kept whole — it carries the calldata too, so no second copy is held.
+    /// Attribution classifies entries by role and maps queue slots back to them.
+    batch: ProofSystemBatchPerVerificationEntriesSol,
 }
 
 /// Stateful `BatchPosted` log chunks. Callers own when scanned ranges are
@@ -93,71 +97,188 @@ pub struct ScannedBatch {
     pub state_applied: bool,
     /// Which of this batch's claimed steps L1 actually ran. See [`Settlement`].
     pub settlement: Settlement,
-    pub claimed_current_state: Option<B256>,
-    pub claimed_new_state: Option<B256>,
 }
 
-/// Which of a batch's claimed steps L1 actually ran. Each step moves the stored
-/// root one hop and emits one `L2ExecutionPerformed`, in order, so the observed
-/// roots identify them. The run is always contiguous — a skipped step stops the
-/// root advancing, failing every later `currentState` check
-/// (`EEZ.sol:_applyStateDeltas`) — so `(start, len)` describes it fully.
-///
-/// `start > 0` = leading steps skipped: a competing same-block batch already made
-/// those hops (routine with two composers on a shared tx stream, since identical
-/// txs produce identical roots).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// What an applied entry contributes to the Sync block. `ordinal` ranks within
+/// its own direction — the DA layout — so a skipped entry never shifts the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryRole {
+    /// State-only: moves the commitment but signs no system tx.
+    Anchor,
+    /// L2→L1 settlement — its DA slot and its Sync-block user tx.
+    Outbound { ordinal: usize },
+    /// L1→L2 delivery.
+    Inbound { ordinal: usize },
+}
+
+/// One entry L1 applied, with what it contributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppliedEntry {
+    /// Index into the on-chain `batch.entries`.
+    pub entry_index: usize,
+    pub role: EntryRole,
+}
+
+/// Classify every entry in array order, counting ordinals per direction.
+/// `proxyEntryHash` must be tested first: inbound entries carry no `l2ToL1Calls`.
+fn classify_entries(batch: &ProofSystemBatchPerVerificationEntriesSol) -> Vec<EntryRole> {
+    let mut outbound = 0;
+    let mut inbound = 0;
+    batch
+        .entries
+        .iter()
+        .map(|entry| {
+            if entry.proxyEntryHash != B256::ZERO {
+                let ordinal = inbound;
+                inbound += 1;
+                EntryRole::Inbound { ordinal }
+            } else if entry.l2ToL1Calls.is_empty() {
+                EntryRole::Anchor
+            } else {
+                let ordinal = outbound;
+                outbound += 1;
+                EntryRole::Outbound { ordinal }
+            }
+        })
+        .collect()
+}
+
+/// End of the leading `proxyEntryHash == 0` run: the entries EEZ.sol runs
+/// inline, and so the only ones that can emit `L2TxSkipped`.
+fn immediate_run_end(batch: &ProofSystemBatchPerVerificationEntriesSol, immediate: usize) -> usize {
+    batch
+        .entries
+        .iter()
+        .take(immediate)
+        .take_while(|entry| entry.proxyEntryHash == B256::ZERO)
+        .count()
+}
+
+/// Queue slot -> entry index: `ExecutionConsumed.entryQueueIndex` indexes the
+/// rollup's queue, not `batch.entries`. That queue is per-batch despite being
+/// storage: every verify wipes it and zeroes the cursor before the batch pushes,
+/// so slot 0 is this batch's first queued entry. `_saveRemainderEntries` starts
+/// at `immediateEntryCount`, so the prefix never appears here.
+fn deferred_queue_map(
+    batch: &ProofSystemBatchPerVerificationEntriesSol,
+    rollup_id: u64,
+    immediate: usize,
+) -> Vec<usize> {
+    batch
+        .entries
+        .iter()
+        .enumerate()
+        .skip(immediate)
+        .filter(|(_, entry)| entry.destinationRollupId == rollup_id)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Transient slot -> entry index. A contract poster trips EEZ.sol's meta-hook
+/// (`i < immediateEntryCount && msg.sender.code.length > 0`), which loads
+/// `entries[run_end..immediate]` into `_transientEntries` and routes consumption
+/// through THAT table. Unfiltered, because the transient cursor is global: other
+/// rollups' entries occupy slots too.
+fn transient_prefix_index(run_end: usize, immediate: usize, slot: usize) -> Option<usize> {
+    let index = run_end.checked_add(slot)?;
+    (index < immediate).then_some(index)
+}
+
+/// What L1 emitted inside one batch's window, before it is matched to entries.
+#[derive(Debug, Default)]
+struct ConsumptionEvidence {
+    /// `L2ExecutionPerformed.newState`, in emission order.
+    observed: Vec<B256>,
+    /// `(entryQueueIndex, crossChainCallHash)` per consumed deferred entry.
+    consumed: Vec<(u64, B256)>,
+    /// Entry indices of inline immediates L1 skipped.
+    skipped_immediates: Vec<usize>,
+}
+
+/// Which of a batch's ENTRIES L1 applied, read from its own consumption events
+/// rather than inferred from the roots it emitted.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Settlement {
-    /// Index into the claimed chain where the applied run starts. Meaningless
-    /// when `len == 0`.
-    pub start: usize,
-    /// How many consecutive steps ran. `0` = nothing settled → skip the batch.
-    pub len: usize,
-    /// `newState` of the last step that ran — L1's ACTUAL stored root after this
-    /// batch (a prefix endpoint under partial consumption). Reconciliation
-    /// validates against THIS, never the claimed full-chain end.
+    /// Ascending entry index, which is application order: both cursors only move
+    /// forward, and the three windows run in index order — inline immediates,
+    /// then the transient prefix, then the queue, which this batch does not even
+    /// populate until after its own meta-hook has returned.
+    applied: Vec<AppliedEntry>,
+    /// `newState` of the last entry that applied — L1's actual commitment, and
+    /// the only valid reconciliation endpoint under partial consumption.
     pub final_state: Option<B256>,
-    /// The stored root the applied run STARTED from — what reconciliation compares
-    /// its local cursor against. The claimed `currentState` when `start == 0`,
-    /// else `claimed_chain[start - 1]`; using the claimed value on a mid-chain
-    /// resume reports a divergence that isn't one.
+    /// The stored commitment the applied run STARTED from. On a mid-chain
+    /// resume this is a competing batch's endpoint, not this batch's claim.
     pub entry_state: Option<B256>,
 }
 
 impl Settlement {
     /// Nothing of this batch applied on L1.
     pub const NONE: Self = Self {
-        start: 0,
-        len: 0,
+        applied: Vec::new(),
         final_state: None,
         entry_state: None,
     };
 
-    /// True when L1 ran none of this batch's steps — the claimed roots are
-    /// phantoms and the batch must be skipped entirely.
+    /// Build from an ascending applied-entry list.
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
+    pub fn new(
+        applied: Vec<AppliedEntry>,
+        final_state: Option<B256>,
+        entry_state: Option<B256>,
+    ) -> Self {
+        debug_assert!(
+            applied
+                .windows(2)
+                .all(|w| w[0].entry_index < w[1].entry_index),
+            "applied entry indices must be strictly ascending: {applied:?}",
+        );
+        Self {
+            applied,
+            final_state,
+            entry_state,
+        }
     }
 
-    /// Which "producing" entries ran, as `(skip, take)` over that list. Producing
-    /// entries carry L2 calls and map 1:1 to reconstructed system txs; claimed
-    /// index 0 is the anchor (state-only, signs no system tx), so claimed `i` is
-    /// producing `i - 1`:
-    /// - `start == 0` — anchor ran → `(0, len - 1)`.
-    /// - `start >= 1` — anchor plus `start - 1` producing entries skipped →
-    ///   `(start - 1, len)`.
-    ///
-    /// `start > 1` is not an error: composer 1 posting `A→B→C` and composer 2
-    /// posting `A→B→C→D` yield an identical `C`, so composer 2's anchor and `B→C`
-    /// are refused as redundant while `C→D` still runs. Refusing to reconstruct
-    /// that step would stall the cursor at `C` forever.
+    /// True when L1 ran none of this batch's entries — the claimed commitments
+    /// are phantoms and the batch must be skipped entirely.
     #[must_use]
-    pub const fn producing_slice(&self) -> (usize, usize) {
-        match self.start {
-            0 => (0, self.len.saturating_sub(1)),
-            s => (s - 1, self.len),
-        }
+    pub fn is_empty(&self) -> bool {
+        self.applied.is_empty()
+    }
+
+    /// The applied entries, in application order.
+    #[must_use]
+    pub fn applied(&self) -> &[AppliedEntry] {
+        &self.applied
+    }
+
+    /// Just the applied entry indices, for assertions and diagnostics.
+    #[must_use]
+    pub fn applied_indices(&self) -> Vec<usize> {
+        self.applied.iter().map(|entry| entry.entry_index).collect()
+    }
+
+    /// Lowest applied entry index. Diagnostics; see [`Settlement::resumed`].
+    #[must_use]
+    pub fn first_applied(&self) -> Option<usize> {
+        self.applied.first().map(|entry| entry.entry_index)
+    }
+
+    /// A mid-chain resume: entries applied but not index 0. Positional, not
+    /// role-derived — a peer batch need not lead with an anchor.
+    #[must_use]
+    pub fn resumed(&self) -> bool {
+        self.first_applied().is_some_and(|first| first > 0)
+    }
+
+    /// L1 ran at least one entry that puts content in the Sync block. The anchor
+    /// claims the block BEFORE it, so an anchor-only prefix is reorged, not kept.
+    #[must_use]
+    pub fn applied_an_effect(&self) -> bool {
+        self.applied
+            .iter()
+            .any(|entry| entry.role != EntryRole::Anchor)
     }
 }
 
@@ -291,8 +412,7 @@ pub(crate) async fn scan_batch_logs_range(
     // Settled roots per L1 block, in emission order and tagged with the emitting
     // tx index. Per-TX-INDEX because two composers can post for the same rollup
     // in one L1 block: crediting a batch with the whole block's roots would hand
-    // a loser its rival's settlement. Ordered (not a set) because attribution
-    // matches steps positionally.
+    // a loser its rival's settlement.
     let mut settled_by_block: HashMap<u64, Vec<SettledRoot>> = HashMap::new();
     for l in &winner_logs {
         let (Some(bn), Some(tx_index)) = (l.block_number, l.transaction_index) else {
@@ -307,12 +427,84 @@ pub(crate) async fn scan_batch_logs_range(
                 tx_index,
                 log_index: l.log_index.unwrap_or_default(),
                 block_hash,
-                root: B256::from_slice(data),
+                payload: B256::from_slice(data),
             });
         }
     }
     for roots in settled_by_block.values_mut() {
         roots.sort_by_key(|r| (r.tx_index, r.log_index));
+    }
+
+    // Both topics in ONE `get_logs`, so the two readings can never straddle
+    // different chain views.
+    let consumption_filter = Filter::new()
+        .address(eez)
+        .event_signature(vec![
+            ExecutionConsumed::SIGNATURE_HASH,
+            L2TxSkipped::SIGNATURE_HASH,
+        ])
+        .from_block(from_block)
+        .to_block(BlockNumberOrTag::Number(to_block));
+    let consumption_logs = provider
+        .get_logs(&consumption_filter)
+        .await
+        .map_err(|e| L1Error::Provider(format!("get_logs(consumption): {e}")))?;
+
+    let mut consumed_by_block: HashMap<u64, Vec<ConsumedEntry>> = HashMap::new();
+    // `L2TxSkipped(i)` labels the posting tx's OWN `batch.entries` (EEZ.sol
+    // step 5), so a rival's indices name different entries and must not merge.
+    let mut skipped_by_tx: HashMap<(B256, B256), HashSet<usize>> = HashMap::new();
+    for l in &consumption_logs {
+        let (Some(bn), Some(tx_index), Some(block_hash), Some(tx_hash)) = (
+            l.block_number,
+            l.transaction_index,
+            l.block_hash,
+            l.transaction_hash,
+        ) else {
+            continue;
+        };
+        match l.topic0() {
+            Some(t) if *t == ExecutionConsumed::SIGNATURE_HASH => {
+                let decoded = ExecutionConsumed::decode_log(&alloy_primitives::Log {
+                    address: l.address(),
+                    data: l.data().clone(),
+                })
+                .map_err(|e| L1Error::Decode(format!("decode ExecutionConsumed: {e}")))?;
+                if decoded.rollupId != rollup_id {
+                    continue;
+                }
+                let slot = u64::try_from(decoded.entryQueueIndex).map_err(|_| {
+                    L1Error::Decode("ExecutionConsumed queue index overflows u64".into())
+                })?;
+                consumed_by_block
+                    .entry(bn)
+                    .or_default()
+                    .push(ConsumedEntry {
+                        tx_index,
+                        log_index: l.log_index.unwrap_or_default(),
+                        block_hash,
+                        payload: (slot, decoded.crossChainCallHash),
+                    });
+            }
+            Some(t) if *t == L2TxSkipped::SIGNATURE_HASH => {
+                let decoded = L2TxSkipped::decode_log(&alloy_primitives::Log {
+                    address: l.address(),
+                    data: l.data().clone(),
+                })
+                .map_err(|e| L1Error::Decode(format!("decode L2TxSkipped: {e}")))?;
+                let index = usize::try_from(decoded.transientIdx).map_err(|_| {
+                    L1Error::Decode("L2TxSkipped transient index overflows usize".into())
+                })?;
+                skipped_by_tx
+                    .entry((block_hash, tx_hash))
+                    .or_default()
+                    .insert(index);
+            }
+            _ => {}
+        }
+    }
+    for entries in consumed_by_block.values_mut() {
+        entries.sort_by_key(|c| (c.tx_index, c.log_index));
     }
 
     // Pass 1: decode every postBatch. Windows can't be computed until we know
@@ -364,7 +556,6 @@ pub(crate) async fn scan_batch_logs_range(
             data: log.data().clone(),
         })
         .map_err(|e| L1Error::Decode(format!("decode BatchPosted({tx_hash}): {e}")))?;
-        let (claimed_current_state, claimed_chain) = our_state_chain(&decoded.batch, rollup_id);
         decoded_batches.push(DecodedBatchLog {
             l1_block_number,
             l1_block_hash,
@@ -378,9 +569,7 @@ pub(crate) async fn scan_batch_logs_range(
                 .rollupIdsWithProofSystems
                 .iter()
                 .any(|r| r.rollupId == rollup_id),
-            call_data: decoded.batch.callData,
-            claimed_current_state,
-            claimed_chain,
+            batch: decoded.batch,
         });
     }
 
@@ -418,105 +607,170 @@ pub(crate) async fn scan_batch_logs_range(
                 detail: "settlement logs are from another fork of this block; retry".into(),
             });
         }
-        let observed: Vec<B256> = block_roots
-            .map(|roots| window_roots(roots, b.tx_index, window_end, b.l1_block_hash))
-            .unwrap_or_default();
-        let settlement = attribute_settlement(b.claimed_current_state, &b.claimed_chain, &observed);
+        // Consumption is a SEPARATE `get_logs`: silently dropping its off-fork
+        // records leaves a terminal count mismatch from a transient cause.
+        let block_consumed = consumed_by_block.get(&b.l1_block_number);
+        if block_consumed.is_some_and(|cs| cs.iter().all(|c| c.block_hash != b.l1_block_hash)) {
+            return Err(L1Error::SourceIncomplete {
+                block: b.l1_block_number,
+                tx_hash: b.tx_hash,
+                detail: "consumption logs are from another fork of this block; retry".into(),
+            });
+        }
+        // One window serves every event family: from this batch's own tx up to
+        // the next postBatch that verifies our rollup, pinned to this fork.
+        let evidence = ConsumptionEvidence {
+            observed: block_roots
+                .map(|roots| in_window(roots, b.tx_index, window_end, b.l1_block_hash))
+                .unwrap_or_default(),
+            consumed: block_consumed
+                .map(|entries| in_window(entries, b.tx_index, window_end, b.l1_block_hash))
+                .unwrap_or_default(),
+            skipped_immediates: skipped_by_tx
+                .get(&(b.l1_block_hash, b.tx_hash))
+                .map(|set| set.iter().copied().collect())
+                .unwrap_or_default(),
+        };
+        // Every attribution failure halts the node, so name the locus: the
+        // counts alone leave an operator nothing to grep L1 for.
+        let settlement =
+            attribute_settlement(&b.batch, rollup_id, &evidence).map_err(|e| match e {
+                L1Error::Decode(msg) => L1Error::Decode(format!(
+                    "{msg} (L1 block {} {}, postBatch {})",
+                    b.l1_block_number, b.l1_block_hash, b.tx_hash,
+                )),
+                other => other,
+            })?;
         out.push(ScannedBatch {
             l1_block_number: b.l1_block_number,
             l1_block_hash: b.l1_block_hash,
             tx_hash: b.tx_hash,
             submitter: b.submitter,
-            call_data: b.call_data,
+            call_data: b.batch.callData,
             state_applied: winner_tx_hashes.contains(&(b.l1_block_hash, b.tx_hash)),
             settlement,
-            claimed_current_state: b.claimed_current_state,
-            claimed_new_state: b.claimed_chain.last().copied(),
         });
     }
     Ok(out)
 }
 
-/// Our rollup's state-update chain in a batch: the first update's
-/// `currentState` (pre-batch root) and the ordered per-update `newState` roots.
-fn our_state_chain(
-    batch: &ProofSystemBatchPerVerificationEntriesSol,
-    rollup_id: u64,
-) -> (Option<B256>, Vec<B256>) {
-    let mut first_curr: Option<B256> = None;
-    let mut new_states: Vec<B256> = Vec::new();
-    for entry in &batch.entries {
-        for update in &entry.stateUpdates {
-            if update.rollupId == rollup_id {
-                if first_curr.is_none() {
-                    first_curr = Some(update.currentState);
-                }
-                new_states.push(update.newState);
-            }
-        }
-    }
-    (first_curr, new_states)
-}
-
-/// Roots settled inside this batch's tx-index window AND on this batch's own
-/// L1 block hash — a same-numbered root from a different fork never attributes.
-fn window_roots(
-    roots: &[SettledRoot],
+/// Payloads inside this batch's tx-index window and on its own block hash.
+/// `window_end` is the next postBatch verifying us, which wipes the queue.
+fn in_window<T: Copy>(
+    events: &[Positioned<T>],
     tx_index: u64,
     window_end: u64,
     block_hash: B256,
-) -> Vec<B256> {
-    roots
+) -> Vec<T> {
+    events
         .iter()
-        .filter(|r| r.tx_index >= tx_index && r.tx_index < window_end && r.block_hash == block_hash)
-        .map(|r| r.root)
+        .filter(|e| e.tx_index >= tx_index && e.tx_index < window_end && e.block_hash == block_hash)
+        .map(|e| e.payload)
         .collect()
 }
 
-/// Which of this batch's claimed steps L1 ran (see [`Settlement`]). `observed` is
-/// the ordered `newState` sequence emitted inside this batch's window, located as
-/// a consecutive slice of `claimed_chain` — positional, not set membership, so
-/// duplicate roots stay distinct and a coincidental match can't inflate the count.
-/// [`Settlement::NONE`] when nothing matches (empty window or phantom roots).
+/// Which entries L1 applied, read from the events inside this batch's window.
+/// Errors when the evidence names an entry the batch does not carry.
 fn attribute_settlement(
-    claimed_current: Option<B256>,
-    claimed_chain: &[B256],
-    observed: &[B256],
-) -> Settlement {
-    if observed.is_empty() || claimed_chain.is_empty() {
-        return Settlement::NONE;
+    batch: &ProofSystemBatchPerVerificationEntriesSol,
+    rollup_id: u64,
+    evidence: &ConsumptionEvidence,
+) -> L1Result<Settlement> {
+    if evidence.observed.is_empty() {
+        return Ok(Settlement::NONE);
     }
-    // The run must appear as a consecutive slice of the claimed chain.
-    if observed.len() > claimed_chain.len() {
-        return Settlement::NONE;
+    let roles = classify_entries(batch);
+    let immediate = usize::try_from(batch.immediateEntryCount).unwrap_or(usize::MAX);
+    let run_end = immediate_run_end(batch, immediate);
+    let queue = deferred_queue_map(batch, rollup_id, immediate);
+
+    // Every immediate in the leading run ran except those L1 reported skipped.
+    let mut applied: Vec<usize> = (0..run_end)
+        .filter(|index| !evidence.skipped_immediates.contains(index))
+        .collect();
+
+    // Deferred entries: each consumption names a slot, but in one of two index
+    // spaces — the rollup's persistent queue, or a contract poster's transient
+    // prefix. The entry's own key picks the space, mirroring `_entryMatches`
+    // on-chain. At most one candidate can match: a consumption always carries a
+    // real call hash, and those are unique per entry (invariant 5).
+    for &(slot, call_hash) in &evidence.consumed {
+        let slot = usize::try_from(slot).unwrap_or(usize::MAX);
+        let entry_index = [
+            queue.get(slot).copied(),
+            transient_prefix_index(run_end, immediate, slot),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|&index| {
+            batch.entries[index].proxyEntryHash == call_hash
+                && batch.entries[index].destinationRollupId == rollup_id
+        })
+        .ok_or_else(|| {
+            // No reading of the slot lands on an entry the event could name, so
+            // the window picked up a rival's consumption and the whole
+            // attribution is suspect.
+            L1Error::Decode(format!(
+                "ExecutionConsumed slot {slot} names call hash {call_hash}, which matches no \
+                 entry of rollup {rollup_id} in this batch ({} queued, {} in the transient \
+                 prefix)",
+                queue.len(),
+                immediate.saturating_sub(run_end),
+            ))
+        })?;
+        applied.push(entry_index);
     }
-    let Some(start) = (0..=(claimed_chain.len() - observed.len()))
-        .find(|&s| claimed_chain[s..].starts_with(observed))
-    else {
-        // The window settled roots this batch never claimed. Not attributable
-        // to it — treat as "nothing of ours applied" and let the caller skip;
-        // the cursor guard catches any real misalignment loudly.
-        event!(
-            name: "eez.l1.scan_batch_logs.settlement_unmatched",
-            Level::WARN,
-            observed = observed.len(),
-            claimed = claimed_chain.len(),
-            "settled roots in this batch's window match no consecutive run of its claimed chain",
-        );
-        return Settlement::NONE;
-    };
-    Settlement {
-        start,
-        len: observed.len(),
-        final_state: observed.last().copied(),
-        // Leading steps skipped ⇒ the run began at the last skipped step's
-        // `newState` (a competing batch had already made that hop).
-        entry_state: if start == 0 {
-            claimed_current
-        } else {
-            claimed_chain.get(start - 1).copied()
-        },
+    applied.sort_unstable();
+
+    // Observed roots count exactly the entries that move OUR commitment, which
+    // cross-checks the event evidence against the root evidence.
+    let ours: Vec<usize> = applied
+        .into_iter()
+        .filter(|&index| {
+            batch.entries[index]
+                .stateUpdates
+                .iter()
+                .any(|update| update.rollupId == rollup_id)
+        })
+        .collect();
+    // EEZ.sol rejects duplicate rollups within an entry's `stateUpdates`
+    // (`StateUpdatesNotStrictlyIncreasing`), so one applied entry emits exactly
+    // one root for us — a disagreement means the window was mis-attributed.
+    //
+    // Terminal like the other two evidence disagreements: the Deriver stops
+    // rather than rebuild a block from a reading it cannot trust. It does NOT
+    // spare the optimistic height — the composer's observer maps every error to
+    // a failed bundle and rolls back regardless.
+    if ours.len() != evidence.observed.len() {
+        return Err(L1Error::Decode(format!(
+            "consumption events name {} applied entries but {} roots settled for rollup {rollup_id}",
+            ours.len(),
+            evidence.observed.len(),
+        )));
     }
+
+    let applied: Vec<AppliedEntry> = ours
+        .iter()
+        .map(|&entry_index| AppliedEntry {
+            entry_index,
+            role: roles[entry_index],
+        })
+        .collect();
+    // The run began at the commitment the first applied entry expected — its
+    // own claim when it leads, else whatever a competing batch had reached.
+    // `ours` only holds entries carrying an update for us, so this always finds.
+    let entry_state = applied.first().and_then(|first| {
+        batch.entries[first.entry_index]
+            .stateUpdates
+            .iter()
+            .find(|update| update.rollupId == rollup_id)
+            .map(|update| update.currentState)
+    });
+    Ok(Settlement::new(
+        applied,
+        evidence.observed.last().copied(),
+        entry_state,
+    ))
 }
 
 /// Fetches the postBatch tx by (block hash, index) — never by tx hash, which
@@ -560,9 +814,9 @@ async fn fetch_log_transaction(
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchLogChunks, LOG_SCAN_CHUNK_BLOCKS, SettledRoot, Settlement, attribute_settlement,
-        fetch_log_transaction, initial_log_scan_ranges, scan_batch_logs_range,
-        scan_next_batch_log_chunk, window_roots,
+        BatchLogChunks, EntryRole, LOG_SCAN_CHUNK_BLOCKS, SettledRoot, Settlement,
+        attribute_settlement, classify_entries, fetch_log_transaction, in_window,
+        initial_log_scan_ranges, scan_batch_logs_range, scan_next_batch_log_chunk,
     };
     use crate::error::L1Error;
     use alloy_consensus::transaction::TxHashRef;
@@ -652,238 +906,259 @@ mod tests {
         }
     }
 
+    const TEST_ROLLUP: u64 = 1;
+
+    fn dummy_call() -> eez_protocol::abi::L2ToL1CallSol {
+        eez_protocol::abi::L2ToL1CallSol {
+            revertNextNCalls: 0,
+            isStatic: false,
+            gas: 0,
+            sourceAddress: Address::ZERO,
+            sourceRollupId: TEST_ROLLUP,
+            targetAddress: Address::ZERO,
+            value: U256::ZERO,
+            data: Bytes::new(),
+        }
+    }
+
+    /// Entry 0 is the state-only anchor; entries below `immediate_count` run
+    /// inline, the rest are queued deliveries.
+    fn batch_chain(
+        pre: B256,
+        roots: &[B256],
+        immediate_count: usize,
+    ) -> ProofSystemBatchPerVerificationEntriesSol {
+        let entries = roots
+            .iter()
+            .enumerate()
+            .map(|(i, &new_state)| ExecutionEntrySol {
+                stateUpdates: vec![StateUpdateSol {
+                    rollupId: TEST_ROLLUP,
+                    currentState: if i == 0 { pre } else { roots[i - 1] },
+                    newState: new_state,
+                    etherDelta: I256::ZERO,
+                }],
+                proxyEntryHash: if i < immediate_count {
+                    B256::ZERO
+                } else {
+                    B256::repeat_byte(0x80 + u8::try_from(i).unwrap())
+                },
+                // Entry 0 is the state-only anchor; every later entry produces.
+                l2ToL1Calls: if i == 0 {
+                    Vec::new()
+                } else {
+                    vec![dummy_call()]
+                },
+                destinationRollupId: TEST_ROLLUP,
+                success: true,
+                ..Default::default()
+            })
+            .collect();
+        ProofSystemBatchPerVerificationEntriesSol {
+            entries,
+            immediateEntryCount: U256::from(immediate_count),
+            ..Default::default()
+        }
+    }
+
+    /// The evidence L1 would emit for a batch where exactly `applied` ran.
+    fn evidence_for(
+        batch: &ProofSystemBatchPerVerificationEntriesSol,
+        applied: &[usize],
+    ) -> super::ConsumptionEvidence {
+        let immediate = usize::try_from(batch.immediateEntryCount).unwrap();
+        let run_end = super::immediate_run_end(batch, immediate);
+        let queue = super::deferred_queue_map(batch, TEST_ROLLUP, immediate);
+        super::ConsumptionEvidence {
+            observed: applied
+                .iter()
+                .map(|&i| batch.entries[i].stateUpdates[0].newState)
+                .collect(),
+            consumed: applied
+                .iter()
+                .filter(|&&i| i >= run_end)
+                .map(|&i| {
+                    let slot = queue.iter().position(|&e| e == i).expect("queued entry");
+                    (
+                        u64::try_from(slot).unwrap(),
+                        batch.entries[i].proxyEntryHash,
+                    )
+                })
+                .collect(),
+            skipped_immediates: (0..run_end).filter(|i| !applied.contains(i)).collect(),
+        }
+    }
+
+    fn attribute(
+        batch: &ProofSystemBatchPerVerificationEntriesSol,
+        applied: &[usize],
+    ) -> crate::error::L1Result<Settlement> {
+        attribute_settlement(batch, TEST_ROLLUP, &evidence_for(batch, applied))
+    }
+
     /// Idle `A→A` and rich `A→B` share an L1 block; each is judged against the
-    /// roots settled in ITS OWN window, not the block's last root.
+    /// evidence in ITS OWN window, not the block's last root.
     #[test]
     fn same_block_batches_attributed_per_window_not_block_last() {
-        let a = B256::repeat_byte(0xAA);
-        let b = B256::repeat_byte(0xBB);
+        let pre = B256::repeat_byte(0x01);
+        for root in [B256::repeat_byte(0xAA), B256::repeat_byte(0xBB)] {
+            let batch = batch_chain(pre, &[root], 1);
+            let settlement = attribute(&batch, &[0]).unwrap();
+            assert_eq!(settlement.applied_indices(), &[0]);
+            assert_eq!(settlement.final_state, Some(root));
+            assert_eq!(settlement.entry_state, Some(pre));
+        }
+    }
+
+    /// Nothing settled in our window means the batch is not ours to derive.
+    #[test]
+    fn an_empty_window_settles_nothing() {
+        let batch = batch_chain(B256::repeat_byte(0x01), &[B256::repeat_byte(0xAA)], 1);
+        assert_eq!(attribute(&batch, &[]).unwrap(), Settlement::NONE);
+    }
+
+    /// A partial settlement is READ, not inferred: entry 2 is absent and the
+    /// endpoint is entry 1's commitment.
+    #[test]
+    fn a_partial_settlement_names_the_entries_that_ran() {
+        let pre = B256::repeat_byte(0x01);
+        let (r1, r2) = (B256::repeat_byte(0x11), B256::repeat_byte(0x12));
+        let batch = batch_chain(pre, &[r1, r2], 2);
+        let settlement = attribute(&batch, &[0]).unwrap();
+        assert_eq!(settlement.applied_indices(), &[0]);
+        assert_eq!(settlement.final_state, Some(r1));
+        assert!(!settlement.applied_an_effect(), "anchor-only ran no effect");
+    }
+
+    /// Inbound entries carry no `l2ToL1Calls`, so classifying on that field
+    /// alone makes every delivery an anchor. `proxyEntryHash` decides first.
+    #[test]
+    fn an_inbound_entry_without_l2_to_l1_calls_is_not_an_anchor() {
+        let pre = B256::repeat_byte(0x01);
+        let (r1, r2) = (B256::repeat_byte(0x11), B256::repeat_byte(0x12));
+        let mut batch = batch_chain(pre, &[r1, r2], 1);
+        batch.entries[1].l2ToL1Calls = Vec::new();
+        assert_ne!(batch.entries[1].proxyEntryHash, B256::ZERO);
+
+        let roles = classify_entries(&batch);
+        assert_eq!(roles[0], EntryRole::Anchor, "only entry 0 is state-only");
         assert_eq!(
-            attribute_settlement(None, &[a], &[a]),
-            Settlement {
-                start: 0,
-                len: 1,
-                final_state: Some(a),
-                entry_state: None
-            },
+            roles[1],
+            EntryRole::Inbound { ordinal: 0 },
+            "a zero-call entry with a non-zero proxyEntryHash is a DELIVERY",
         );
+        assert!(attribute(&batch, &[0, 1]).unwrap().applied_an_effect());
+    }
+
+    /// Outbound and anchor are both zero-hash; only the calls tell them apart.
+    #[test]
+    fn outbound_and_anchor_are_told_apart_by_their_calls() {
+        let pre = B256::repeat_byte(0x01);
+        let roots: Vec<B256> = (1..=3).map(B256::repeat_byte).collect();
+        let roles = classify_entries(&batch_chain(pre, &roots, 3));
+        assert_eq!(roles[0], EntryRole::Anchor);
+        assert_eq!(roles[1], EntryRole::Outbound { ordinal: 0 });
+        assert_eq!(roles[2], EntryRole::Outbound { ordinal: 1 });
+    }
+
+    /// Resume is positional: the batch's FIRST entry did not apply. Roles say
+    /// what an entry contributes, not whether we joined mid-chain.
+    #[test]
+    fn resumed_is_true_exactly_when_the_first_entry_did_not_apply() {
+        let pre = B256::repeat_byte(0x01);
+        let roots: Vec<B256> = (0x11..=0x13).map(B256::repeat_byte).collect();
+        let batch = batch_chain(pre, &roots, 1);
+
+        assert!(!attribute(&batch, &[0, 1, 2]).unwrap().resumed());
+        assert!(!attribute(&batch, &[0]).unwrap().resumed());
+
+        let resumed = attribute(&batch, &[1, 2]).unwrap();
+        assert!(resumed.resumed());
         assert_eq!(
-            attribute_settlement(None, &[b], &[b]),
-            Settlement {
-                start: 0,
-                len: 1,
-                final_state: Some(b),
-                entry_state: None
-            },
+            resumed.entry_state,
+            Some(roots[0]),
+            "the run resumes at the rival's endpoint",
         );
     }
 
-    /// A loser gets an EMPTY window (its rival's events belong to the rival's
-    /// window), so nothing is attributed to it ⇒ the deriver skips it. Crediting
-    /// the loser with the winner's root let its phantom `currentState` reach the
-    /// cursor guard and fail boot catch_up.
+    /// Nothing applied is a total loss, not a resume.
     #[test]
-    fn loser_with_empty_window_is_skipped() {
-        let b = B256::repeat_byte(0xBB);
-        let y = B256::repeat_byte(0xCC);
-        assert_eq!(attribute_settlement(None, &[y], &[]), Settlement::NONE);
-        // Even when the loser's chain SHARES a root with the winner's (overlapping
-        // ranges), an empty window keeps it unattributed.
-        assert_eq!(attribute_settlement(None, &[y, b], &[]), Settlement::NONE);
+    fn a_settlement_that_applied_nothing_is_not_resumed() {
+        assert!(!Settlement::NONE.resumed());
+        assert!(!Settlement::NONE.applied_an_effect());
     }
 
-    /// Partial consumption: only a prefix ran → endpoint is the last root that
-    /// ran, not the claimed end.
+    /// A consumption naming a slot the batch lacks means the window was
+    /// mis-attributed, so it is terminal rather than guessed.
     #[test]
-    fn partial_consumption_uses_last_root_that_ran() {
-        let b = B256::repeat_byte(0x0B);
-        let c = B256::repeat_byte(0x0C);
-        let d = B256::repeat_byte(0x0D);
-        assert_eq!(
-            attribute_settlement(None, &[b, c, d], &[b, c]),
-            Settlement {
-                start: 0,
-                len: 2,
-                final_state: Some(c),
-                entry_state: None
-            },
+    fn a_queue_slot_beyond_the_batch_is_terminal() {
+        let pre = B256::repeat_byte(0x01);
+        let batch = batch_chain(pre, &[B256::repeat_byte(0x11), B256::repeat_byte(0x12)], 1);
+        let mut evidence = evidence_for(&batch, &[0, 1]);
+        evidence.consumed = vec![(99, batch.entries[1].proxyEntryHash)];
+        let error = attribute_settlement(&batch, TEST_ROLLUP, &evidence)
+            .expect_err("an out-of-range queue slot must be terminal");
+        assert!(
+            matches!(error, L1Error::Decode(ref m) if m.contains("slot 99")),
+            "got {error}",
         );
     }
 
-    /// Full consumption: the claimed end ran → it's the endpoint.
+    /// A contract poster trips EEZ.sol's meta-hook, which runs the immediates
+    /// past the leading L2Tx run out of `_transientEntries` — a table the queue
+    /// map cannot address, since `_saveRemainderEntries` never queues them. We
+    /// do not post this shape, but a peer may, and misreading it would diverge.
     #[test]
-    fn full_consumption_uses_claimed_end() {
-        let b = B256::repeat_byte(0x0B);
-        let c = B256::repeat_byte(0x0C);
-        assert_eq!(
-            attribute_settlement(None, &[b, c], &[b, c]),
-            Settlement {
-                start: 0,
-                len: 2,
-                final_state: Some(c),
-                entry_state: None
-            },
+    fn a_meta_hook_consumption_resolves_against_the_transient_prefix() {
+        let pre = B256::repeat_byte(0x01);
+        let roots: Vec<B256> = (0x11..=0x12).map(B256::repeat_byte).collect();
+        let mut batch = batch_chain(pre, &roots, 1);
+        // Entry 1 carries a call hash yet sits inside the immediate prefix, so
+        // the leading run ends at 1 and entry 1 goes to the transient table.
+        batch.immediateEntryCount = U256::from(2u64);
+        assert!(
+            super::deferred_queue_map(&batch, TEST_ROLLUP, 2).is_empty(),
+            "the transient prefix must be unreachable through the queue",
         );
+
+        let evidence = super::ConsumptionEvidence {
+            observed: roots.clone(),
+            consumed: vec![(0, batch.entries[1].proxyEntryHash)],
+            skipped_immediates: Vec::new(),
+        };
+        let settlement = attribute_settlement(&batch, TEST_ROLLUP, &evidence)
+            .expect("transient slot 0 names entry 1");
+        assert_eq!(settlement.applied_indices(), &[0, 1]);
+        assert_eq!(settlement.final_state, Some(roots[1]));
+
+        // The hash decides, so a slot inside the window that no entry answers
+        // for stays terminal instead of resolving positionally.
+        let bogus = super::ConsumptionEvidence {
+            consumed: vec![(0, B256::repeat_byte(0xEE))],
+            ..evidence
+        };
+        attribute_settlement(&batch, TEST_ROLLUP, &bogus)
+            .expect_err("a call hash no entry carries must be terminal");
     }
 
-    /// Empty window (nothing settled for our rollup) → unsettled.
+    /// The queue map and the call hash are independent readings of the same
+    /// fact; disagreement means the window picked up a rival's consumption.
     #[test]
-    fn empty_window_is_unsettled() {
-        assert_eq!(
-            attribute_settlement(None, &[B256::repeat_byte(1)], &[]),
-            Settlement::NONE,
+    fn queue_slot_and_call_hash_must_agree() {
+        let pre = B256::repeat_byte(0x01);
+        let batch = batch_chain(pre, &[B256::repeat_byte(0x11), B256::repeat_byte(0x12)], 1);
+        let mut evidence = evidence_for(&batch, &[0, 1]);
+        evidence.consumed = vec![(0, B256::repeat_byte(0xEE))];
+        assert!(
+            attribute_settlement(&batch, TEST_ROLLUP, &evidence).is_err(),
+            "a call hash naming another entry must not be attributed to this one",
         );
-    }
-
-    /// Two composers in ONE L1 block: pb1 claims A→B and lands; pb2 claims
-    /// A→B→C, so its A→B is refused as redundant and only B→C runs. pb2 must be
-    /// credited with C alone and aligned on B — the claimed A reported a false
-    /// `local_diverged`.
-    #[test]
-    fn two_composers_second_batch_resumes_after_first_hop() {
-        let (a, b, c) = (
-            B256::repeat_byte(0x0A),
-            B256::repeat_byte(0x0B),
-            B256::repeat_byte(0x0C),
-        );
-
-        let s1 = attribute_settlement(Some(a), &[b], &[b]);
-        assert_eq!(
-            s1,
-            Settlement {
-                start: 0,
-                len: 1,
-                final_state: Some(b),
-                entry_state: Some(a),
-            },
-        );
-
-        let s2 = attribute_settlement(Some(a), &[b, c], &[c]);
-        assert_eq!(
-            s2,
-            Settlement {
-                start: 1,
-                len: 1,
-                final_state: Some(c),
-                entry_state: Some(b),
-            },
-        );
-        assert_ne!(s2.entry_state, Some(a));
-        assert_eq!(s2.producing_slice(), (0, 1));
-
-        // Per-block attribution hands pb2 both roots, claiming pb1's hop as its
-        // own — that disagreement was the bug.
-        let per_block = attribute_settlement(Some(a), &[b, c], &[b, c]);
-        assert_eq!((per_block.start, per_block.len), (0, 2));
-        assert_ne!((per_block.start, per_block.len), (s2.start, s2.len));
-    }
-
-    /// Anchor skipped: a competing same-block batch already made the anchor's
-    /// hop (A→B), so ours was refused as redundant while the producing steps
-    /// still ran. The run starts at index 1 — counting producing entries as
-    /// `len - 1` would under-count them and truncate a system tx.
-    #[test]
-    fn anchor_skipped_run_starts_at_one() {
-        let b = B256::repeat_byte(0x0B); // anchor's newState
-        let c = B256::repeat_byte(0x0C);
-        let d = B256::repeat_byte(0x0D);
-        let s = attribute_settlement(None, &[b, c, d], &[c, d]);
-        assert_eq!(
-            s,
-            Settlement {
-                start: 1,
-                len: 2,
-                final_state: Some(d),
-                entry_state: Some(b)
-            }
-        );
-        // Both producing steps ran — NOT `len - 1`.
-        assert_eq!(s.producing_slice(), (0, 2));
-    }
-
-    /// Anchor ran: producing entries are `len - 1`.
-    #[test]
-    fn anchor_applied_excludes_itself_from_producing_count() {
-        let b = B256::repeat_byte(0x0B);
-        let c = B256::repeat_byte(0x0C);
-        let s = attribute_settlement(None, &[b, c], &[b, c]);
-        assert_eq!(s.start, 0);
-        assert_eq!(s.producing_slice(), (0, 1));
-    }
-
-    /// Two composers on a SHARED tx stream: composer 1 posts `A→B→C` and lands
-    /// first, composer 2 posts `A→B→C→D` over the same txs. Composer 2's anchor
-    /// and `B→C` are refused as redundant (root is already `C`), but `C→D`
-    /// matches the live root and RUNS. The run resumes mid-chain and must be
-    /// reconstructed — refusing would stall the cursor at `C` forever.
-    #[test]
-    fn shared_tx_stream_run_resumes_mid_chain() {
-        let b = B256::repeat_byte(0x0B); // anchor A→B
-        let c = B256::repeat_byte(0x0C); // tx-1   B→C  (competitor already made this hop)
-        let d = B256::repeat_byte(0x0D); // tx-2   C→D  (only this one ran)
-        let s = attribute_settlement(None, &[b, c, d], &[d]);
-        assert_eq!(
-            s,
-            Settlement {
-                start: 2,
-                len: 1,
-                final_state: Some(d),
-                entry_state: Some(c)
-            }
-        );
-        // Skip the producing entry the competitor settled (tx-1), take tx-2.
-        assert_eq!(s.producing_slice(), (1, 1));
-        // Reconciliation compares its cursor against `C` — the root the run began
-        // at — not the claimed `currentState` (`A`), which would look diverged.
-        assert_eq!(s.entry_state, Some(c));
-    }
-
-    /// Deeper resume: a competitor supplied the anchor plus TWO producing hops.
-    #[test]
-    fn producing_slice_skips_every_step_before_the_run() {
-        let r: Vec<B256> = (0x0Bu8..=0x0F).map(B256::repeat_byte).collect();
-        let s = attribute_settlement(None, &r, &r[3..]);
-        assert_eq!((s.start, s.len), (3, 2));
-        // claimed [3,4] → producing [2,3] → skip 2, take 2
-        assert_eq!(s.producing_slice(), (2, 2));
-    }
-
-    /// Matching is positional, so a duplicate root can't inflate the run and an
-    /// out-of-order coincidence isn't credited.
-    #[test]
-    fn matching_is_positional_not_set_membership() {
-        let b = B256::repeat_byte(0x0B);
-        let c = B256::repeat_byte(0x0C);
-        // Repeated root: the run is located, not counted twice.
-        assert_eq!(
-            attribute_settlement(None, &[b, b, c], &[b, b]),
-            Settlement {
-                start: 0,
-                len: 2,
-                final_state: Some(b),
-                entry_state: None
-            },
-        );
-        // Out of order → no consecutive run matches → unattributed.
-        assert_eq!(
-            attribute_settlement(None, &[b, c], &[c, b]),
-            Settlement::NONE
-        );
-    }
-
-    /// Roots this batch never claimed (window contamination) are not attributed.
-    #[test]
-    fn unclaimed_roots_are_not_attributed() {
-        let b = B256::repeat_byte(0x0B);
-        let z = B256::repeat_byte(0x7A);
-        assert_eq!(attribute_settlement(None, &[b], &[z]), Settlement::NONE);
     }
 
     /// A root logged against a DIFFERENT fork of the same block NUMBER (hash B,
-    /// not this batch's hash A) must not be attributed — it settles as empty,
-    /// exactly like any other non-matching root.
+    /// not this batch's hash A) must not be attributed.
     #[test]
-    fn window_roots_excludes_a_different_forks_root_at_the_same_block_number() {
+    fn in_window_excludes_a_different_forks_record_at_the_same_block_number() {
         let hash_a = B256::repeat_byte(0xA1);
         let hash_b = B256::repeat_byte(0xB2);
         let root = B256::repeat_byte(0x0D);
@@ -891,10 +1166,13 @@ mod tests {
             tx_index: 0,
             log_index: 0,
             block_hash: hash_b,
-            root,
+            payload: root,
         }];
-        assert!(window_roots(&roots, 0, u64::MAX, hash_a).is_empty());
-        assert_eq!(window_roots(&roots, 0, u64::MAX, hash_b), vec![root]);
+        assert!(in_window(&roots, 0, u64::MAX, hash_a).is_empty());
+        assert_eq!(in_window(&roots, 0, u64::MAX, hash_b), vec![root]);
+        // Half-open: a record AT `window_end` belongs to the next batch, whose
+        // verify already wiped our queue.
+        assert!(in_window(&roots, 0, 0, hash_b).is_empty());
     }
 
     /// A minimal, serializable RPC transaction for mocked provider
@@ -938,7 +1216,9 @@ mod tests {
                 rollupId: rollup_id,
                 proofSystemIndexes: vec![],
             }],
-            immediateEntryCount: U256::from(salt),
+            // Attribution reads the applied set from the events an INLINE entry
+            // emits, so a queued fixture would settle as empty.
+            immediateEntryCount: U256::from(u64::from(step.is_some())),
             entries: step
                 .map(|(current, new)| {
                     vec![ExecutionEntrySol {
@@ -948,10 +1228,13 @@ mod tests {
                             newState: new,
                             etherDelta: I256::ZERO,
                         }],
+                        destinationRollupId: rollup_id,
                         ..Default::default()
                     }]
                 })
                 .unwrap_or_default(),
+            // Varies the encoded input so each fixture tx gets its own hash.
+            blockNumber: salt,
             ..Default::default()
         };
         mock_post_batch_tx(postAndVerifyBatchCall { batch }.abi_encode())
@@ -1103,6 +1386,7 @@ mod tests {
         asserter
             .push_failure_msg("query exceeds max results 20000, retry with the range 1288-33632");
         asserter.push_success(&serde_json::json!([]));
+        asserter.push_success(&serde_json::json!([])); // consumption events
         asserter.push_success(&serde_json::json!([]));
         let scanned = scan_next_batch_log_chunk(&provider, Address::ZERO, 1, &mut chunks)
             .await
@@ -1164,6 +1448,7 @@ mod tests {
 
         // Retry succeeds (BatchPosted logs + winners logs, both empty).
         asserter.push_success(&serde_json::json!([]));
+        asserter.push_success(&serde_json::json!([])); // consumption events
         asserter.push_success(&serde_json::json!([]));
         let scanned = scan_next_batch_log_chunk(&provider, Address::ZERO, 1, &mut chunks)
             .await
@@ -1188,7 +1473,12 @@ mod tests {
 
         let hash_a = B256::with_last_byte(0xA1);
         let hash_b = B256::with_last_byte(0xB2);
-        let tx = batch_tx(1, None, 0);
+        // An entry, because the root on our own hash below implies one applied.
+        let tx = batch_tx(
+            1,
+            Some((B256::repeat_byte(0x50), B256::repeat_byte(0xD4))),
+            0,
+        );
         let tx_hash = *tx.inner.tx_hash();
 
         asserter.push_success(&vec![batch_posted_log(100, hash_a, tx_hash, 0)]);
@@ -1207,6 +1497,7 @@ mod tests {
             // Same tx hash as our postBatch tx, but a DIFFERENT block hash.
             settled_root_log(1, B256::repeat_byte(0xE5), 100, hash_b, tx_hash, 2, 0),
         ]);
+        asserter.push_success(&serde_json::json!([])); // consumption events
         asserter.push_success(&tx);
 
         let scanned = scan_batch_logs_range(&provider, Address::ZERO, 1, 100, 100)
@@ -1230,7 +1521,9 @@ mod tests {
         let (c0, c1) = (B256::repeat_byte(0x50), B256::repeat_byte(0x51));
 
         let ours = batch_tx(1, Some((c0, c1)), 0);
-        let rival = batch_tx(1, None, 1); // same block NUMBER, different HASH
+        // An entry, because its decoy root below implies one applied: a root
+        // with no entry is unreachable on-chain.
+        let rival = batch_tx(1, Some((c0, B256::repeat_byte(0x99))), 1);
         let boundary = batch_tx(1, None, 2); // our real next boundary, hash A
         let (ours_hash, rival_hash, boundary_hash) = (
             *ours.inner.tx_hash(),
@@ -1258,6 +1551,7 @@ mod tests {
                 0,
             ),
         ]);
+        asserter.push_success(&serde_json::json!([])); // consumption events
         asserter.push_success(&ours);
         asserter.push_success(&rival);
         asserter.push_success(&boundary);
@@ -1270,15 +1564,12 @@ mod tests {
             .find(|b| b.tx_hash == ours_hash)
             .expect("our batch scanned");
         assert_eq!(
-            ours.settlement,
-            Settlement {
-                start: 0,
-                len: 1,
-                final_state: Some(c1),
-                entry_state: Some(c0),
-            },
+            ours.settlement.applied_indices(),
+            &[0],
             "the rival on another fork must not cut our window at its tx_index"
         );
+        assert_eq!(ours.settlement.final_state, Some(c1));
+        assert_eq!(ours.settlement.entry_state, Some(c0));
     }
 
     #[tokio::test]
@@ -1301,6 +1592,7 @@ mod tests {
             1,
             0,
         )]);
+        asserter.push_success(&serde_json::json!([])); // consumption events
         asserter.push_success(&tx);
 
         let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
@@ -1323,6 +1615,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         asserter.push_success(&vec![batch_posted_log(700, block_hash, tx_hash, 0)]);
         asserter.push_success(&Vec::<alloy_rpc_types_eth::Log>::new());
+        asserter.push_success(&serde_json::json!([])); // consumption events
         asserter.push_success(&tx);
         let scanned = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
             .await
@@ -1342,6 +1635,7 @@ mod tests {
             0,
             0,
         )]);
+        asserter.push_success(&serde_json::json!([])); // consumption events
         asserter.push_success(&tx);
         let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
             .await

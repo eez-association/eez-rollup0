@@ -38,6 +38,28 @@ if [[ -z "${L1:-}" || -z "${L2:-}" || -z "${L1F:-}" || -z "${L2F:-}" ]]; then
 fi
 # shellcheck disable=SC1091
 source "$K/scripts/lib.sh"
+
+# A host-run rig serves a PREBUILT image, so a result only counts if the binary
+# matches the tree. Opportunistic: skipped when the node is not that container.
+if [[ "${EEZ_SKIP_IMAGE_CHECK:-0}" != "1" ]]; then
+    _bin=/tmp/eez-composer-image-check
+    if docker cp eez-node-kurtosis:/usr/local/bin/eez-composer "$_bin" >/dev/null 2>&1; then
+        # Extract once, then grep the FILE: `strings | grep -q` makes strings die
+        # of SIGPIPE on a match, and under `pipefail` that reads as failure.
+        strings "$_bin" | sort -u > "$_bin.syms"
+        _missing=""
+        while read -r _sym; do
+            grep -qF -- "$_sym" "$_bin.syms" || _missing="$_missing $_sym"
+        done < <(grep -rhoE '"eez\.[a-z0-9_.]+"' \
+                    "$REPO/crates/eez-l1/src/submitter.rs" \
+                    "$REPO/crates/eez-composer/src/composer.rs" | tr -d '"' | sort -u)
+        rm -f "$_bin" "$_bin.syms"
+        [[ -z "$_missing" ]] || {
+            echo "STALE IMAGE: running node is missing$_missing"
+            exit 1
+        }
+    fi
+fi
 : "${L1:=$EEZ_DEVNET_L1_RPC}"
 : "${L2:=$EEZ_DEVNET_L2_RPC}"
 : "${L1F:=$EEZ_DEVNET_L1_FRONT}"
