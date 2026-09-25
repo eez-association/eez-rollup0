@@ -81,7 +81,7 @@ write_result() {
             modes: ["inbound", "outbound", "mixed", "mixed-pure"],
             cross_chain_convergence: "pass",
             state_chaining: "pass",
-            l1_l2_root_divergence: 0,
+            l1_l2_block_hash_divergence: 0,
             safe_head_convergence: "pass"
         } else {} end' >"$RESULT_DIR/result.json"
 }
@@ -209,7 +209,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         echo "- Supported protocol network scenarios: pass"
         echo "- Signed windows observed: $signed_window_count"
         echo "- Remote attestations observed: $remote_attestation_count"
-        echo "- L1/L2 root divergence: 0"
+        echo "- L1/L2 block-hash commitment divergence: 0"
         echo "- L2 safe head: converged"
     } >>"$GITHUB_STEP_SUMMARY"
 fi

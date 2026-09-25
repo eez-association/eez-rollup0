@@ -152,7 +152,7 @@ unique_receipt_block() {
 
 assert_root_convergence() {
     local sync_height="$1" deadline l1_root l1_recheck safe_block safe_height l2_hash
-    deadline=$((SECONDS + ${EEZ_STATE_ROOT_WAIT_SECS:-60}))
+    deadline=$((SECONDS + ${EEZ_BLOCK_HASH_WAIT_SECS:-${EEZ_STATE_ROOT_WAIT_SECS:-60}}))
     while (( SECONDS < deadline )); do
         l1_root=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' \
             "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')

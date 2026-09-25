@@ -56,7 +56,7 @@ git submodule update --init --recursive
 
 # 1. Build the node and proof-signer images.
 docker build -t eez-node:local .
-docker build -f Dockerfile.signer -t eez-proof-signer:local .
+docker build --target proof-signer -t eez-proof-signer:local .
 
 # 2. Download a minimal chiado L1 snapshot (skips syncing from genesis).
 mkdir -p data
