@@ -2648,11 +2648,18 @@ where
                         break;
                     }
                     // ── ACCEPT ───────────────────────────────────────
-                    let deliveries = match eez_protocol::system_tx::build_inbound_system_txs(
-                        &target_entries,
-                        &stf_cfg,
-                        nonce + system_txs_appended,
-                    ) {
+                    let deliveries = match target_entries
+                        .iter()
+                        .map(eez_protocol::entries::InboundSidecar::try_from)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| error.to_string())
+                        .and_then(|inbound| {
+                            eez_protocol::system_tx::build_inbound_system_txs(
+                                &inbound,
+                                &stf_cfg,
+                                nonce + system_txs_appended,
+                            )
+                        }) {
                         Ok(deliveries) if deliveries.is_empty() && !target_entries.is_empty() => {
                             event!(
                                 name: "eez.composer.cc_compose.shape_evicted",
