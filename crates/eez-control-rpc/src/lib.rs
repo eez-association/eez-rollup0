@@ -7,9 +7,9 @@
 //! recomputed `publicInputsHash`, and returns a [`v1::ProveResponse`]. One
 //! request/response: no feed, no dispatch, no sink.
 //!
-//! `prove.v2.Prover/ProveStream` adds resumable per-block validation while v1
-//! remains available during migration. Only generated types + tonic stubs live
-//! here — no `Prover`-trait coupling.
+//! `prove.v2.Prover/ProveStream` adds resumable, reorg-safe per-block validation
+//! while v1 remains available during migration. Only generated types + tonic
+//! stubs live here — no `Prover`-trait coupling.
 
 mod generated;
 
@@ -50,7 +50,7 @@ mod tests {
         prove_failure,
     };
     use super::v2::{
-        Begin, ClientFrame, Ready, ServerFrame, Validated, client_frame, server_frame,
+        Begin, ClientFrame, Ready, Rewind, ServerFrame, Validated, client_frame, server_frame,
     };
     use super::{MAX_MESSAGE_BYTES, decode_prove_failure, encode_prove_failure};
 
@@ -104,6 +104,7 @@ mod tests {
         let begin = ClientFrame {
             session_id: Vec::new(),
             request_id: 17,
+            epoch: 0,
             kind: Some(client_frame::Kind::Begin(Begin {
                 rollup_id: 7,
                 anchor_number: 100,
@@ -120,6 +121,7 @@ mod tests {
         let ready = ServerFrame {
             session_id: session_id.clone(),
             request_id: begin.request_id,
+            epoch: 1,
             kind: Some(server_frame::Kind::Ready(Ready {
                 validated_through: 100,
                 validated_hash: vec![0x11; 32],
@@ -131,8 +133,9 @@ mod tests {
         );
 
         let acknowledged = ServerFrame {
-            session_id,
+            session_id: session_id.clone(),
             request_id: 18,
+            epoch: 1,
             kind: Some(server_frame::Kind::Validated(Validated {
                 number: 101,
                 hash: vec![0x44; 32],
@@ -143,6 +146,33 @@ mod tests {
         assert_eq!(
             ServerFrame::decode(acknowledged.encode_to_vec().as_slice()).unwrap(),
             acknowledged
+        );
+
+        let rewind = ClientFrame {
+            session_id: session_id.clone(),
+            request_id: 19,
+            epoch: 1,
+            kind: Some(client_frame::Kind::Rewind(Rewind {
+                ancestor_hash: vec![0x11; 32],
+            })),
+        };
+        assert_eq!(
+            ClientFrame::decode(rewind.encode_to_vec().as_slice()).unwrap(),
+            rewind
+        );
+
+        let rewound = ServerFrame {
+            session_id,
+            request_id: rewind.request_id,
+            epoch: 2,
+            kind: Some(server_frame::Kind::Ready(Ready {
+                validated_through: 100,
+                validated_hash: vec![0x11; 32],
+            })),
+        };
+        assert_eq!(
+            ServerFrame::decode(rewound.encode_to_vec().as_slice()).unwrap(),
+            rewound
         );
     }
 
