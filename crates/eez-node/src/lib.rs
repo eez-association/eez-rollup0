@@ -135,6 +135,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 "EEZ_REGISTRY_ADDRESS required for the cross-chain composer (set by deploy.sh)"
             )
         })?)?;
+    let eezl2_address: Address = Address::from_str(&env::var("EEZL2_ADDRESS").map_err(|_| {
+        eyre::eyre!("EEZL2_ADDRESS required for the cross-chain composer (set by deploy.sh)")
+    })?)?;
     // Launch the embedded L1 reth first in composer mode — its
     // `StateProviderFactory` backs `LocalChainClient::new_entry` for
     // L1 source-tx simulation. Inline (not in `l1_embedded.rs`)
@@ -259,7 +262,11 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         EmbeddedL1::Ethereum(l1_handle) => l1_handle.node.chain_spec().chain().id(),
         EmbeddedL1::Chiado(chiado_handle) => chiado_handle.node.chain_spec().inner.chain().id(),
     };
-    let composer_info = composer_rpc::ComposerInfo::new(eez_registry, l1_source_chain_id);
+    let l2_chain_id = builder.config().chain.chain().id();
+    let composer_info = composer_rpc::ComposerInfo::new(
+        vec![eez_registry, eezl2_address],
+        vec![l1_source_chain_id, l2_chain_id],
+    );
     let handle = builder
         .node(EezNode)
         .extend_rpc_modules(move |ctx| {
@@ -336,12 +343,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         use eez_protocol::rollup_id::RollupId;
         use eez_protocol::{ProxyLookupConfig, TargetConfig};
 
-        let eezl2_address: Address =
-            Address::from_str(&env::var("EEZL2_ADDRESS").map_err(|_| {
-                eyre::eyre!(
-                    "EEZL2_ADDRESS required for the cross-chain composer (set by deploy.sh)"
-                )
-            })?)?;
         let l1_rollup_id_u64 = read_l1_rollup_id()?;
         let l1_rollup_id = RollupId(l1_rollup_id_u64);
         let l2_rollup_id_typed = RollupId(rollup_id);
