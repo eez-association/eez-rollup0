@@ -16,6 +16,8 @@ use std::time::Duration;
 use alloy_eips::{BlockNumberOrTag, Decodable2718};
 use alloy_primitives::{TxHash, hex};
 use alloy_provider::{Provider, ProviderBuilder};
+use alloy_sol_types::SolEvent;
+use eez_protocol::abi::BatchPosted;
 use tracing::{Level, event};
 
 use crate::config::SubmitterConfig;
@@ -406,8 +408,15 @@ impl Inner {
                     let l1_block = receipt.block_number.ok_or_else(|| {
                         L1Error::Provider("receipt present but block_number missing".into())
                     })?;
+                    // The receipt's own logs say whether a batch was posted: a
+                    // call that succeeds can still post nothing, e.g. before
+                    // the contract exists.
+                    let posted = receipt.inner.logs().iter().any(|log| {
+                        log.address() == self.reader.eez()
+                            && log.topic0() == Some(&BatchPosted::SIGNATURE_HASH)
+                    });
                     match self
-                        .observe_settlement(&target_provider, l1_block, tx_hash, receipt.status())
+                        .observe_settlement(&target_provider, l1_block, tx_hash, posted)
                         .await
                     {
                         Ok(settlement) => {
@@ -522,7 +531,7 @@ impl Inner {
         provider: &P,
         l1_block: u64,
         tx_hash: TxHash,
-        succeeded: bool,
+        posted: bool,
     ) -> L1Result<crate::scan::Settlement> {
         let batches = crate::scan::scan_batch_logs_range(
             provider,
@@ -534,14 +543,12 @@ impl Inner {
         .await?;
         match batches.into_iter().find(|batch| batch.tx_hash == tx_hash) {
             Some(batch) => Ok(batch.settlement),
-            // A reverted postBatch emits nothing. One that succeeded always
-            // emits `BatchPosted`, so its absence is a log index lagging the
-            // receipt, not a batch that applied nothing.
-            None if succeeded => Err(L1Error::SourceIncomplete {
+            // The receipt shows a BatchPosted the scan lacks: a log index
+            // lagging the receipt, not a batch that applied nothing.
+            None if posted => Err(L1Error::SourceIncomplete {
                 block: l1_block,
                 tx_hash,
-                detail: "postBatch receipt succeeded but its BatchPosted log is missing; retry"
-                    .into(),
+                detail: "postBatch receipt has a BatchPosted log the scan lacks; retry".into(),
             }),
             None => Ok(crate::scan::Settlement::NONE),
         }
