@@ -48,6 +48,7 @@ hex                = "0.4"
 tonic                 = "0.14"
 tonic-prost           = "0.14"
 tonic-prost-build     = "0.14"
+protoc-bin-vendored   = "3"
 prost                 = "0.14"
 tokio-stream          = "0.1"
 # compact binary serialization for the persistent witness store's values
@@ -202,6 +203,12 @@ proptest.opt-level = 3
 rand_chacha.opt-level = 3
 rand_xorshift.opt-level = 3
 unarray.opt-level = 3
+
+[profile.ci-e2e]
+inherits = "dev"
+debug = "none"
+split-debuginfo = "off"
+incremental = false
 
 [profile.release]
 opt-level = 3

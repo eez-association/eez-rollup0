@@ -1,5 +1,5 @@
 # cargo-deny policy for the `Dependency Audit` CI job
-# (`cargo deny check advisories bans sources`). We build against a pinned reth
+# (`cargo deny check bans sources`). We build against a pinned reth
 # revision plus several git forks, so dependency drift is the main supply-chain
 # risk this job exists to catch: anything NOT listed below fails the build.
 

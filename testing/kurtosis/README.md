@@ -65,6 +65,12 @@ the Ethereum client images. It can take several minutes. The command returns
 after Kurtosis has deployed the contracts and started the network services. It
 leaves the enclave running.
 
+CI may set `EEZ_PREBUILT_BIN_DIR` to a directory containing prebuilt
+`eez-composer`, `eez-follower`, `eez-proof-signer`, and
+`eez-genesis-state-root` and `eez-genesis-block-hash` binaries. In that mode
+`start.sh` builds thin runtime images from those binaries instead of compiling
+Rust inside Docker.
+
 ### 3. Check the deployment
 
 ```bash
@@ -73,8 +79,9 @@ bash testing/kurtosis/scripts/verify-eezl2-deployment.sh
 ```
 
 The verification checks the live EEZL2 system address, rollup ID,
-`USE_GAS_LEFT` setting, runtime code hash, and genesis state root against the
-generated deployment bindings.
+`USE_GAS_LEFT` setting, runtime code hash, genesis state root, and genesis block
+hash against the generated deployment bindings. Only the block hash is the L1
+rollup commitment; the state root check validates the rendered genesis alloc.
 
 ### 4. Connect to the RPC endpoints
 
@@ -147,7 +154,7 @@ The local topology contains:
 - An rbuilder, relay, MEV-Boost, and proposer path for atomic bundle inclusion.
 - A deployment task that deploys the L1 contracts, derives the configured L2
   system address, renders the EEZL2 runtime and L2 genesis, and registers
-  the resulting genesis state root.
+  the resulting genesis block hash.
 - An `eez-node` running the L2, composer, cross-chain RPC fronts, and an
   embedded L1 execution client.
 - An `eez-follower` Lighthouse beacon node that follows the canonical L1 and
@@ -381,7 +388,7 @@ Available modes are:
 | `mixed-pure` | Mixed traffic plus ordinary L2 mempool transactions between waves. |
 
 Each workload verifies transaction inclusion, cross-chain state convergence,
-`postBatch` settlement on L1, L1/L2 state-root agreement, L2 safe-head progress,
+`postBatch` settlement on L1, L1/L2 block-hash commitment agreement, L2 safe-head progress,
 and correlation between the proof signer's result and the node's accepted
 attestation.
 
@@ -398,8 +405,9 @@ Useful workload controls include:
   seconds.
 - `EEZ_EFFECTS_WAIT_SECS`: destination-state convergence timeout after source
   receipts land; the default is 120 seconds.
-- `EEZ_STATE_ROOT_WAIT_SECS`: state-root convergence timeout; the default is 30
-  seconds.
+- `EEZ_BLOCK_HASH_WAIT_SECS`: block-hash commitment convergence timeout; the
+  default is 30 seconds. `EEZ_STATE_ROOT_WAIT_SECS` remains a compatibility
+  alias for older invocations.
 
 ### Run the state-chaining regression
 
@@ -420,8 +428,8 @@ places a deployed non-proxy between two valid inbound calls and verifies that
 only the poison transaction is evicted while both ordered survivors settle. A
 final mixed-direction drain verifies that an outbound source transaction and
 inbound delivery share the canonical L2 Sync block. Every scenario also
-verifies bundle settlement, proof-signer acceptance, and L1/L2 state-root
-convergence.
+verifies bundle settlement, proof-signer acceptance, and L1/L2 block-hash
+commitment convergence.
 
 ### Run all included workloads
 
@@ -492,8 +500,8 @@ EEZ_SKIP_DEPLOY_BUILD=1 \
 ```
 
 The deployment image is built from the selected node image because it copies
-the `eez-genesis-state-root` utility from that image. If the node changes,
-rebuild the deployment image as well.
+the `eez-genesis-state-root` and `eez-genesis-block-hash` utilities from that
+image. If the node changes, rebuild the deployment image as well.
 
 Set `EEZ_PRUNE_BUILD_CACHE=1` to run
 `docker builder prune --all --force` after building the images. This deletes
@@ -543,7 +551,9 @@ Kurtosis assigns different host ports automatically. Remember that
 - `l2-genesis-profile.json`: reproducible public inputs and hashes for the
   committed test genesis; it contains no private key.
 - `Dockerfile.deploy`: deployment image containing Foundry, contracts, scripts,
-  and the genesis state-root utility copied from the selected node image.
+  and the genesis validation utilities copied from the selected node image.
+- `Dockerfile.prebuilt`: CI runtime images that copy prebuilt node and
+  proof-signer binaries from the shared `e2e-build` artifact.
 - `start.sh` and `stop.sh`: local network lifecycle.
 - `ports.sh`: endpoint discovery, summary, and shell exports.
 - `scripts/verify-eezl2-deployment.sh`: live EEZL2 deployment verification.

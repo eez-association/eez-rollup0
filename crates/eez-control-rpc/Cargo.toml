@@ -13,8 +13,10 @@ tonic-prost = { workspace = true }
 prost       = { workspace = true }
 
 [build-dependencies]
-# Compiles `proto/prove.proto`. Needs `protoc` on PATH.
-tonic-prost-build = { workspace = true }
+# Compile `proto/prove.proto` with a pinned Cargo-resolved `protoc`; CI and
+# downstream builds must not depend on a system protobuf installation.
+protoc-bin-vendored = { workspace = true }
+tonic-prost-build   = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

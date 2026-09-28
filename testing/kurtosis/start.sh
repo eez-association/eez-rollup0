@@ -40,8 +40,36 @@ yv() { grep -E "^[[:space:]]*$1:" "$ARGS_FILE" | head -1 \
 NODE_IMAGE="$(yv eez_node_image)";                NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
 PROOF_SIGNER_IMAGE="$(yv proof_signer_image)";    PROOF_SIGNER_IMAGE="${PROOF_SIGNER_IMAGE:-eez-proof-signer:dev}"
 DEPLOY_IMAGE="$(yv deploy_image)";                DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
+PREBUILT_BIN_DIR="${EEZ_PREBUILT_BIN_DIR:-}"
 
 export DOCKER_BUILDKIT=1
+
+# Source builds can opt into the GitHub Actions cache backend so dependency
+# layers survive across commits. CI Kurtosis sets EEZ_PREBUILT_BIN_DIR instead
+# and builds thin images from the shared e2e-build artifact.
+# Local runs keep using the ordinary Docker builder and its local cache.
+docker_build() {
+    local cache_scope="$1"
+    shift
+    if [[ "$cache_scope" == "deploy" ]]; then
+        docker build "$@"
+        return
+    fi
+    if [[ "${EEZ_DOCKER_CACHE:-}" == "gha" ]]; then
+        local cache_args=(
+            --cache-from "type=gha,scope=eez-$cache_scope"
+            --cache-to "type=gha,mode=max,scope=eez-$cache_scope"
+        )
+        if [[ "$cache_scope" != "node" ]]; then
+            cache_args+=(--cache-from "type=gha,scope=eez-node")
+        fi
+        docker buildx build --load \
+            "${cache_args[@]}" \
+            "$@"
+    else
+        docker build "$@"
+    fi
+}
 
 # The default `release` profile is already the fast build; set
 # EEZ_OPTIMIZED_BUILD=1 for production (maxperf) binaries.
@@ -50,23 +78,55 @@ if [[ "${EEZ_OPTIMIZED_BUILD:-0}" == "1" ]]; then
     release_build_args=(--build-arg BUILD_PROFILE=maxperf)
 fi
 
+if [[ -n "$PREBUILT_BIN_DIR" ]]; then
+    PREBUILT_BIN_DIR="$(cd "$PREBUILT_BIN_DIR" && pwd)"
+    for binary in \
+        eez-composer \
+        eez-follower \
+        eez-genesis-state-root \
+        eez-genesis-block-hash \
+        eez-proof-signer
+    do
+        if [[ ! -x "$PREBUILT_BIN_DIR/$binary" ]]; then
+            echo "prebuilt binary is missing or not executable: $PREBUILT_BIN_DIR/$binary" >&2
+            exit 1
+        fi
+    done
+fi
+
 if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
-    echo "==> building $NODE_IMAGE (fast development profile)"
-    docker build "${release_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
+    if [[ -n "$PREBUILT_BIN_DIR" ]]; then
+        echo "==> building $NODE_IMAGE from prebuilt CI binaries"
+        docker build \
+            -f "$HERE/Dockerfile.prebuilt" --target node \
+            -t "$NODE_IMAGE" \
+            "$PREBUILT_BIN_DIR"
+    else
+        echo "==> building $NODE_IMAGE (fast development profile)"
+        docker_build node "${release_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
+    fi
 fi
 
 if [[ "${EEZ_SKIP_PROOF_SIGNER_BUILD:-0}" != "1" ]]; then
-    echo "==> building $PROOF_SIGNER_IMAGE (fast development profile)"
-    docker build "${release_build_args[@]}" \
-        -f "$REPO/Dockerfile.signer" \
-        -t "$PROOF_SIGNER_IMAGE" "$REPO"
+    if [[ -n "$PREBUILT_BIN_DIR" ]]; then
+        echo "==> building $PROOF_SIGNER_IMAGE from prebuilt CI binaries"
+        docker build \
+            -f "$HERE/Dockerfile.prebuilt" --target proof-signer \
+            -t "$PROOF_SIGNER_IMAGE" \
+            "$PREBUILT_BIN_DIR"
+    else
+        echo "==> building $PROOF_SIGNER_IMAGE (fast development profile)"
+        docker_build signer "${release_build_args[@]}" \
+            -f "$REPO/Dockerfile" --target proof-signer \
+            -t "$PROOF_SIGNER_IMAGE" "$REPO"
+    fi
 else
     echo "==> reusing $PROOF_SIGNER_IMAGE (EEZ_SKIP_PROOF_SIGNER_BUILD=1)"
 fi
 
 if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then
     echo "==> building $DEPLOY_IMAGE (foundry + contracts)"
-    docker build \
+    docker_build deploy \
         --build-arg "EEZ_NODE_IMAGE=$NODE_IMAGE" \
         -f "$HERE/Dockerfile.deploy" \
         -t "$DEPLOY_IMAGE" \

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run supported eez-core-protocol scenarios against the CI enclave.
-# The full scenario suite runs separately against Anvil in the normal CI.
+# The full scenario suite runs against Anvil in eez-core-protocol CI.
 set -euo pipefail
 
 KURTOSIS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
