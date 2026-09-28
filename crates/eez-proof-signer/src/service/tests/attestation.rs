@@ -257,7 +257,7 @@ async fn an_outbound_effect_without_an_observed_call_is_rejected() {
 
 #[tokio::test]
 async fn a_multi_block_effect_uses_the_penultimate_block_root() {
-    // The window closes on real block hashes now, so the batch must claim the
+    // The window closes on real block hashes, so the batch must claim the
     // blocks the fixture actually seals rather than arbitrary roots.
     let (window_pre, pre_settling_root, final_root) = window_endpoints(5, 6);
     let inputs = [
@@ -296,7 +296,7 @@ async fn a_multi_block_effect_uses_the_penultimate_block_root() {
 
 #[tokio::test]
 async fn a_state_update_final_block_mismatch_is_rejected() {
-    // The window now closes on the settling block's own hash, so a window that
+    // The window closes on the settling block's own hash, so a window that
     // seals a block other than the one the batch claims is the mismatch.
     let mut blocks = happy_block_inputs();
     *blocks.last_mut().unwrap() = AdmittedBlock::test(7, 0x06, 0xee);

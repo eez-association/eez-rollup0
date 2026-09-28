@@ -3514,10 +3514,7 @@ where
                 parent_header,
                 &empty_built.header,
                 Some(&empty_built.block),
-                // No effects: the anchor is the only entry, so it carries the
-                // endpoint. The block holds no transactions, so that endpoint
-                // IS its empty prefix.
-                &SyncCandidates::anchor_only(empty_built.header.hash()),
+                &SyncCandidates::anchor_only(),
                 &[], // no outbound entries
                 &[], // no outbound user txs
                 0,   // no inline outbound target calls
@@ -3681,9 +3678,7 @@ where
                     &boundary_parent,
                     &boundary_header,
                     None, // terminal is committed → witnesses come from the store
-                    // No effects: the anchor carries the committed terminal's
-                    // own hash as the endpoint.
-                    &SyncCandidates::anchor_only(boundary_header.hash()),
+                    &SyncCandidates::anchor_only(),
                     &[],
                     &[],
                     0, // no inline outbound target calls
@@ -3829,7 +3824,7 @@ where
     /// enforces the chain on L1 (`StateRootMismatch` revert) regardless of
     /// proof system. Each effect entry's `newState` is its per-effect root from
     /// `candidates.per_effect` (verified by the proof signer's effect-prefix
-    /// checks); the anchor claims `candidates.empty_prefix`, so every entry
+    /// checks); the anchor claims `candidates.anchor`, so every entry
     /// commits to a candidate at the Sync block's height. The
     /// last is the terminal block's own hash, which is the required
     /// settlement-chain endpoint and comes from `terminal_header`.
@@ -3912,7 +3907,13 @@ where
             stateUpdates: vec![eez_protocol::abi::StateUpdateSol {
                 rollupId: rollup_id,
                 currentState: pre_block_hash,
-                newState: candidates.anchor,
+                // Alone, the anchor is the endpoint, so take it from the
+                // terminal rather than trust a caller for it.
+                newState: if candidates.per_effect.is_empty() {
+                    sync_block_hash
+                } else {
+                    candidates.anchor
+                },
                 etherDelta: alloy_primitives::I256::ZERO,
             }],
             proxyEntryHash: B256::ZERO,
@@ -4018,8 +4019,9 @@ where
         // Stitch the per-rollup state-update chain: EEZ.sol `_applyStateUpdates`
         // enforces `config.stateRoot == update.currentState` then sets it to
         // `newState`, so each entry's `currentState` must chain to the prior
-        // entry's `newState`. This chains `pre_sync → R_0 → … → R_last (final
-        // root)`, satisfying both EEZ.sol and the prover's effect-prefix gate.
+        // entry's `newState`. This chains `posted → E → R_0 → … → R_last`, with
+        // `E` the empty prefix and `R_last` the terminal, satisfying both EEZ.sol
+        // and the prover's effect-prefix gate.
         let mut running_roots: HashMap<u64, B256> = HashMap::new();
         for entry in &mut batch.entries {
             for update in &mut entry.stateUpdates {
@@ -4045,7 +4047,7 @@ where
 
         // The L1 rolling seed commits the finalized ordered state updates, so
         // it can only be computed after the stitch above has set every
-        // `currentState` and the anchor-only path has set its final root.
+        // `currentState`.
         eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch)
             .map_err(|error| format!("finalize L1 rolling hashes: {error}"))?;
 

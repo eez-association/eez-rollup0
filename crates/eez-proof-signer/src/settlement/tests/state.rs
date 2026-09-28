@@ -313,7 +313,7 @@ fn rejects_wrong_anchor_or_invalid_effect_checkpoints() {
     assert_eq!(
         verify_effect_prefix(&batch, wrong, &valid_checkpoints, &settling).err(),
         Some(EffectPrefixError::AnchorRootMismatch {
-            validated_pre_settling_hash: wrong,
+            empty_prefix_hash: wrong,
             claimed_anchor_post_state: pre_settling,
         })
     );
@@ -409,7 +409,7 @@ fn effect_checkpoints_cannot_hide_a_post_block_state_change() {
 }
 
 #[test]
-fn rejects_reexecuted_effects_for_an_anchor_only_claim() {
+fn rejects_reexecuted_effects_and_unused_checkpoints_for_an_anchor_only_claim() {
     let root = B256::ZERO;
     let batch = state_chain(&[root, root]);
 
@@ -420,15 +420,17 @@ fn rejects_reexecuted_effects_for_an_anchor_only_claim() {
             observed: 1,
         })
     );
-    // An anchor-only claim carries the endpoint, not a prefix, so the leading
-    // pre-execution candidate the plan always requests is simply unused.
-    assert!(
+    assert_eq!(
         verify_effect_prefix(
             &batch,
             root,
             &[checkpoint(0, root)],
             &settling_with_effect_candidates(Vec::new()),
         )
-        .is_ok()
+        .err(),
+        Some(EffectPrefixError::TransactionStateCheckpointCountMismatch {
+            expected: 0,
+            actual: 1,
+        })
     );
 }

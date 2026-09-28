@@ -530,44 +530,38 @@ impl SyncBlockFork {
     }
 }
 
-/// Per-effect candidate block hashes, one per effect.
-///
-/// Each candidate is the Sync block cut short right after that effect's tx
-/// group, so candidate `i` is a strict prefix of candidate `i + 1`.
-///
-/// Each settlement entry's `newState` is its effect's candidate hash, so a
-/// settlement that stops at that effect names the exact block L2 must hold.
 /// The Sync block's candidate commitments: the empty prefix the anchor claims,
-/// then one per pair end.
+/// then one per pair end. Candidate `i` is the Sync block cut short right after
+/// effect `i`'s tx group, so a settlement that stops there names the exact block
+/// L2 must hold.
 ///
 /// Siblings at one height, not a chain: same parent, number and timestamp, with
 /// execution-derived commitments differing per prefix. One becomes canonical.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncCandidates {
-    /// The candidate the anchor entry claims. With effects that is the block
+    /// The candidate the anchor entry claims when there are effects: the block
     /// holding no transactions, sealed after the pre-block system calls
-    /// (EIP-2935 / EIP-4788) — an empty Sync block still mutates state, so it is
-    /// not the parent's hash. With no effects the anchor is the only entry and
-    /// carries the endpoint instead, which callers supply directly.
+    /// (EIP-2935 / EIP-4788). An empty Sync block still mutates state, so it is
+    /// not the parent's hash. Unused without effects.
     pub anchor: B256,
     /// One commitment per pair end, in effect order.
     pub per_effect: Vec<B256>,
 }
 
 impl SyncCandidates {
-    /// A batch with no effects: the anchor is the only entry, so it carries the
-    /// endpoint rather than a prefix.
+    /// A batch with no effects. The anchor is then the only entry and carries
+    /// the endpoint, which `prepare_post_batch_raw` takes from the terminal.
     #[must_use]
-    pub fn anchor_only(anchor: B256) -> Self {
+    pub fn anchor_only() -> Self {
         Self {
-            anchor,
+            anchor: B256::ZERO,
             per_effect: Vec::new(),
         }
     }
 }
 
-/// Built by rebuilding the Sync block on the empty prefix and on each pair-end
-/// prefix of `sync_txs`.
+/// Build the Sync block's candidates by rebuilding it on the empty prefix and on
+/// each pair-end prefix of `sync_txs`.
 ///
 /// # Errors
 ///

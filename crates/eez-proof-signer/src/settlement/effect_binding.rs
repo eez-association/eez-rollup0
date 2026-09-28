@@ -122,10 +122,10 @@ pub(crate) enum EffectPrefixError {
     )]
     EffectCountMismatch { claimed: usize, observed: usize },
     #[error(
-        "anchor claims post-state {claimed_anchor_post_state}; validated pre-settling block is {validated_pre_settling_hash}"
+        "anchor claims post-state {claimed_anchor_post_state}; the settling block's empty prefix is {empty_prefix_hash}"
     )]
     AnchorRootMismatch {
-        validated_pre_settling_hash: B256,
+        empty_prefix_hash: B256,
         claimed_anchor_post_state: B256,
     },
     #[error(
@@ -221,9 +221,15 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
     }
     // With no effects the anchor is the batch's only entry, so it carries the
     // endpoint rather than a prefix; the state-update-chain gate binds it to the
-    // final root. The leading pre-execution candidate is still requested and so
-    // still returned, but nothing here reads it.
+    // final root. Such a settling block holds no transactions, so nothing was
+    // requested and any checkpoint is a backend fault.
     if claimed == 0 {
+        if !computed_transaction_state_checkpoints.is_empty() {
+            return Err(EffectPrefixError::TransactionStateCheckpointCountMismatch {
+                expected: 0,
+                actual: computed_transaction_state_checkpoints.len(),
+            });
+        }
         return Ok(BoundEffectSequence {
             effects: Vec::new(),
             settling_observations,
@@ -250,7 +256,7 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
     }
     if anchor_update.newState != anchor_checkpoint.block_hash {
         return Err(EffectPrefixError::AnchorRootMismatch {
-            validated_pre_settling_hash: anchor_checkpoint.block_hash,
+            empty_prefix_hash: anchor_checkpoint.block_hash,
             claimed_anchor_post_state: anchor_update.newState,
         });
     }

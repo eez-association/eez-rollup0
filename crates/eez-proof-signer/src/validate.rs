@@ -47,8 +47,9 @@ pub struct BackendBlockOutput {
     pub decoded_transaction_count: usize,
     /// Receipt success flag for every replayed transaction, in block order.
     pub receipt_successes: Vec<bool>,
-    /// Locally computed roots at selected transaction boundaries, strictly
-    /// ordered by transaction index. Non-settling blocks have no checkpoints.
+    /// Locally computed roots at the selected positions, in execution order: the
+    /// empty prefix first, then transaction boundaries. Non-settling blocks have
+    /// no checkpoints.
     pub transaction_state_checkpoints: Vec<StateCheckpoint>,
     /// Post-state root recomputed and matched against the block header.
     pub post_state_root: B256,
@@ -313,8 +314,8 @@ impl ValidatedWindow {
     }
 
     /// Hash of the block immediately before the terminal block. Test-only: the
-    /// anchor's gate reads the settling block's own empty-prefix candidate, so
-    /// nothing in the pipeline needs the parent any more.
+    /// anchor's gate reads the settling block's own empty-prefix candidate, not
+    /// its parent.
     #[cfg(test)]
     pub(crate) fn settling_pre_block_hash(&self) -> B256 {
         self.settling_pre_block_hash
@@ -601,10 +602,11 @@ fn check_backend_window_output(
             );
         }
         for checkpoint in checkpoints {
-            let CheckpointAt::Transaction(index) = checkpoint.at else {
-                // A pre-execution candidate names no transaction, so there is
-                // nothing to bound; an empty block still has one.
-                continue;
+            // Exhaustive, so a new position kind cannot skip this check unseen.
+            let index = match checkpoint.at {
+                CheckpointAt::Transaction(index) => index,
+                // Names no transaction, so there is nothing to bound.
+                CheckpointAt::PreExecution => continue,
             };
             eyre::ensure!(
                 index < transaction_count,

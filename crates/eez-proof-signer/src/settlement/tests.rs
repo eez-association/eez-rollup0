@@ -296,14 +296,17 @@ fn effect_plan<'batch, 'settling>(
 /// Test shorthand for the fixture's fixed rollup identity.
 fn verify_effect_prefix<'batch, 'settling>(
     batch: &'batch CanonicalPostBatch,
-    pre_settling_root: B256,
+    empty_prefix_root: B256,
     transaction_state_checkpoints: &[crate::validate::StateCheckpoint],
     settling: &'settling SettlingBlockObservations,
 ) -> Result<BoundEffectSequence<'batch, 'settling>, EffectPrefixError> {
     let verified_state_chain = verified_state_chain_for_test(batch);
-    // Fixtures describe the anchor by the root it claims; it now leads the
-    // checkpoint list as the settling block's empty prefix.
-    let mut checkpoints = vec![pre_execution_checkpoint(pre_settling_root)];
+    // Fixtures describe the anchor by the root it claims. Like the plan, lead
+    // with the empty prefix only when the settling block holds transactions.
+    let mut checkpoints = Vec::new();
+    if !settling.system_sender_flags().is_empty() {
+        checkpoints.push(pre_execution_checkpoint(empty_prefix_root));
+    }
     checkpoints.extend_from_slice(transaction_state_checkpoints);
     bind_effects_to_execution(&verified_state_chain, &checkpoints, settling)
 }

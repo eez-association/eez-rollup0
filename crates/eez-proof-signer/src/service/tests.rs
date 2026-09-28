@@ -160,7 +160,7 @@ fn anchor_batch_for(rollup_id: u64) -> eez_protocol::EvmBatch {
 }
 
 /// An anchor plus one outbound effect, chained over the window's block hashes:
-/// the anchor closes on the settling block's parent and the effect closes the
+/// the anchor claims the settling block's empty prefix and the effect closes the
 /// window.
 fn outbound_batch(window_pre: B256, window_post: B256) -> eez_protocol::EvmBatch {
     let mut batch = anchor_batch();
