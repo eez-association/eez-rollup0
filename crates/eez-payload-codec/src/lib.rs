@@ -278,9 +278,9 @@ pub fn decode(payload: &[u8]) -> CodecResult<DecodedSpan> {
         Ok(cur.take("extra_data", usize::from(len))?.to_vec())
     })?;
 
-    // Each transaction needs at least one length byte and, since zero length is
-    // invalid, at least one content byte.
-    cur.check_plausible("pure_transaction_counts", total_txs, 2)?;
+    // Each transaction needs at least one length byte. Validate the lengths
+    // themselves below so an explicit zero receives the precise typed error.
+    cur.check_plausible("pure_transaction_counts", total_txs, 1)?;
     let mut lengths = Vec::with_capacity(total_txs as usize);
     let mut total_bytes: u64 = 0;
     for i in 0..total_txs {
