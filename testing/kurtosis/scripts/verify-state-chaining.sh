@@ -174,7 +174,8 @@ assert_root_convergence() {
 
 assert_proof_for_height() {
     local sync_height="$1" node_baseline="$2" signer_baseline="$3"
-    local deadline node_evidence signer_evidence settled attested_hash signed
+    local deadline node_evidence signer_evidence settled attested_hash signed safe_advanced
+    local l1_settled_commitment l2_safe_hash
     deadline=$((SECONDS + ${EEZ_STATE_CHAINING_PROOF_WAIT_SECS:-180}))
     while (( SECONDS < deadline )); do
         refresh_node_log
@@ -195,8 +196,15 @@ assert_proof_for_height() {
                 | grep -F "\"recomputed_public_inputs_hash\":\"$attested_hash\"" \
                 | tail -1 || true)
         fi
-        [[ -n "$settled" && -n "$signed" ]] && {
+        safe_advanced=$(grep -F '"event_name":"eez.deriver.safe.advanced"' <<<"$node_evidence" \
+            | grep -F "\"to_block\":$sync_height," | tail -1 || true)
+        l1_settled_commitment=$(jq -r '.fields.l1_settled_commitment // empty' <<<"$safe_advanced" 2>/dev/null || true)
+        l2_safe_hash=$(jq -r '.fields.new_safe_hash // empty' <<<"$safe_advanced" 2>/dev/null || true)
+        [[ -n "$settled" && -n "$signed" && -n "$safe_advanced" \
+            && -n "$l1_settled_commitment" \
+            && "${l1_settled_commitment,,}" == "${l2_safe_hash,,}" ]] && {
             echo "    ✓ bundle settled and proof signer validated Sync height $sync_height"
+            echo "    ✓ exact Sync-height L1 commitment matches the advanced L2 safe block hash"
             return 0
         }
         sleep 3

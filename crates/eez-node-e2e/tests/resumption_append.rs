@@ -22,7 +22,8 @@ use alloy_sol_types::SolCall;
 use eez_protocol::abi::{EvmBatch, postAndVerifyBatchCall};
 use eez_protocol::signer::EcdsaProofSigner;
 use eez_testkit::{
-    IValue, OUTBOUND_USER, onchain_nonce, setup_cross_chain, sign_and_send, signals,
+    IValue, OUTBOUND_USER, all_l2_execution_states, onchain_nonce, setup_cross_chain,
+    sign_and_send, signals,
 };
 
 const TIMEOUT: Duration = Duration::from_mins(6);
@@ -219,14 +220,23 @@ async fn a_resumed_batch_appends_the_l2_content_of_the_entries_it_settled() {
     w.node.assert_no_process_death();
 
     // A rising local head proves nothing: a wrongly rebuilt Sync block still
-    // produces blocks while L1 stops accepting them. Require a settled one.
+    // produces blocks while L1 stops accepting them. Require a later L1
+    // execution, not the resumed batch's own commitment, to settle.
     let rollup_id = w.cfg.rollup_id;
+    let executions_before = all_l2_execution_states(&l1, eez, rollup_id, w.dep.deploy_block)
+        .await
+        .expect("read L1 executions after resumed append")
+        .len();
     let before = eez_testkit::safe_block_hash(&l2).await.unwrap();
     eez_testkit::wait_for(TIMEOUT, || async {
         let Some(safe) = eez_testkit::safe_block_hash(&l2).await? else {
             return Ok(None);
         };
         if Some(safe) == before {
+            return Ok(None);
+        }
+        let executions = all_l2_execution_states(&l1, eez, rollup_id, w.dep.deploy_block).await?;
+        if executions.len() <= executions_before || executions.last() != Some(&safe) {
             return Ok(None);
         }
         let settled = eez_testkit::rollup_commitment(&l1, eez, rollup_id).await?;
