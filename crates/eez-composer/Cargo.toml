@@ -9,9 +9,8 @@ description            = "Composer umbrella — owns per-rollup Sequencer/Schedu
 [dependencies]
 eez-primitives.workspace = true
 eez-evm.workspace = true
-# Internal — protocol, EVM port + inspector, and the existing umbrella siblings
+# Internal — protocol, EVM port, and the existing umbrella siblings
 eez-driver = { workspace = true, features = ["witness"] }
-eez-evm-inspector.workspace  = true
 eez-l1.workspace             = true
 eez-payload-codec.workspace  = true
 eez-protocol.workspace       = true
