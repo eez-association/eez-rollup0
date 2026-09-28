@@ -59,9 +59,6 @@ pub struct FailedBatch {
     pub parent: SealedHeader<alloy_consensus::Header>,
     /// The user txs whose effects the block carried.
     pub txs: Vec<HeldTx>,
-    /// Outbound txs whose entries L1 applied: they stay in the Sync block, so
-    /// their nonces are spent without an L1 receipt. Partial settlements only.
-    pub kept_outbound: Vec<TxHash>,
     /// Drop not attributable to the txs (skipped L1 slot, relay transport
     /// failure) — recovery re-queues without counting toward poison-eviction.
     pub slot_skipped: bool,
@@ -102,8 +99,6 @@ struct InFlight {
     cursor_confirmed: bool,
     /// Set by `mark_failed` when the drop wasn't the bundled txs' fault.
     slot_skipped: bool,
-    /// Set by `mark_settled_partial`; see [`FailedBatch::kept_outbound`].
-    kept_outbound: Vec<TxHash>,
 }
 
 /// Ledger of in-flight and settled-but-unfinalized optimistic batches.
@@ -142,7 +137,6 @@ impl OptimisticallyIncluded {
                 resolution: Resolution::Pending,
                 cursor_confirmed: false,
                 slot_skipped: false,
-                kept_outbound: Vec::new(),
             },
         );
     }
@@ -191,26 +185,28 @@ impl OptimisticallyIncluded {
 
     /// L1 kept part of the batch. Unlike [`Self::mark_failed`] the height is not rolled
     /// back; recovery only disposes of the transactions.
-    pub fn mark_settled_partial(&self, sync_height: u64, kept_outbound: Vec<TxHash>) {
+    pub fn mark_settled_partial(&self, sync_height: u64, post_batch_hash: TxHash) {
         let mut map = self.by_sync_height.lock().unwrap();
         if let Some(entry) = map.get_mut(&sync_height)
+            && entry.post_batch_hash == post_batch_hash
             // The cursor confirms the height, not which txs ran, so a partial
             // verdict still applies. An observer's full-settle verdict stands.
             && (entry.resolution == Resolution::Pending
                 || (entry.resolution == Resolution::Settled && entry.cursor_confirmed))
         {
             entry.resolution = Resolution::SettledPartial;
-            entry.kept_outbound = kept_outbound;
         }
     }
 
-    /// Extract a partially settled entry for tx disposition. The caller must NOT
-    /// reorg: the height is canonical.
+    /// Extract a partially settled entry for tx disposition, once `cursor`
+    /// covers it: the Deriver has then rebuilt the block, so L2 nonces show
+    /// which outbound txs it kept. The caller must NOT reorg: the height is
+    /// canonical.
     #[must_use]
-    pub fn take_settled_partial(&self) -> Option<FailedBatch> {
+    pub fn take_settled_partial(&self, cursor: u64) -> Option<FailedBatch> {
         let mut map = self.by_sync_height.lock().unwrap();
         let h = map
-            .iter()
+            .range(..=cursor)
             .find(|(_, e)| e.resolution == Resolution::SettledPartial)
             .map(|(h, _)| *h)?;
         let entry = map.get_mut(&h)?;
@@ -219,11 +215,10 @@ impl OptimisticallyIncluded {
             sync_height: h,
             post_batch_hash: entry.post_batch_hash,
             parent: entry.parent.clone(),
-            // Copied, not drained: disposition awaits receipt reads, and a reorg
+            // Copied, not drained: disposition awaits nonce reads, and a reorg
             // in that window must still find every tx here to recover. The full
             // set is right then, since the reorg also undoes their spent nonces.
             txs: entry.txs.clone(),
-            kept_outbound: std::mem::take(&mut entry.kept_outbound),
             // A partial settlement is not a drop: the entries that ran, ran.
             slot_skipped: false,
         })
@@ -246,9 +241,15 @@ impl OptimisticallyIncluded {
 
     /// Observer verdict: the bundle settled on L1. Entry is retained
     /// (Settled) until [`Self::take_finalized`].
-    pub fn mark_settled(&self, sync_height: u64) {
+    ///
+    /// Every verdict names its bundle: a slot can rebuild at the same height
+    /// while an old observer still runs, and its verdict must not land on the
+    /// new batch.
+    pub fn mark_settled(&self, sync_height: u64, post_batch_hash: TxHash) {
         let mut map = self.by_sync_height.lock().unwrap();
-        if let Some(entry) = map.get_mut(&sync_height) {
+        if let Some(entry) = map.get_mut(&sync_height)
+            && entry.post_batch_hash == post_batch_hash
+        {
             entry.resolution = Resolution::Settled;
         }
     }
@@ -260,9 +261,10 @@ impl OptimisticallyIncluded {
     /// task never mutates chain state. No-op if the entry is already
     /// Settled (cursor confirmation wins) or gone. See
     /// [`FailedBatch::slot_skipped`] for the flag.
-    pub fn mark_failed(&self, sync_height: u64, slot_skipped: bool) {
+    pub fn mark_failed(&self, sync_height: u64, post_batch_hash: TxHash, slot_skipped: bool) {
         let mut map = self.by_sync_height.lock().unwrap();
         if let Some(entry) = map.get_mut(&sync_height)
+            && entry.post_batch_hash == post_batch_hash
             && entry.resolution == Resolution::Pending
         {
             entry.resolution = Resolution::Failed;
@@ -289,24 +291,12 @@ impl OptimisticallyIncluded {
             post_batch_hash: entry.post_batch_hash,
             parent: entry.parent,
             txs: entry.txs,
-            kept_outbound: entry.kept_outbound,
             slot_skipped: entry.slot_skipped,
         })
     }
 
     /// Put a failed entry back after an unsuccessful recovery attempt.
     pub fn reinsert_failed(&self, batch: FailedBatch) {
-        self.reinsert(batch, Resolution::Failed);
-    }
-
-    /// Retain a partial settlement for another attempt. It must NOT come back as
-    /// `Failed`: the height is canonical, so recovery would reorg out a height
-    /// L1 ratified.
-    pub fn reinsert_settled_partial(&self, batch: FailedBatch) {
-        self.reinsert(batch, Resolution::SettledPartial);
-    }
-
-    fn reinsert(&self, batch: FailedBatch, resolution: Resolution) {
         let mut map = self.by_sync_height.lock().unwrap();
         map.insert(
             batch.sync_height,
@@ -314,10 +304,9 @@ impl OptimisticallyIncluded {
                 txs: batch.txs,
                 post_batch_hash: batch.post_batch_hash,
                 parent: batch.parent,
-                resolution,
+                resolution: Resolution::Failed,
                 cursor_confirmed: false,
                 slot_skipped: batch.slot_skipped,
-                kept_outbound: batch.kept_outbound,
             },
         );
     }
@@ -411,10 +400,10 @@ mod tests {
 
         // Deriver wins the race, observer reports the partial verdict afterwards.
         ledger.resolve_below_cursor(10);
-        ledger.mark_settled_partial(10, Vec::new());
+        ledger.mark_settled_partial(10, pb_hash(0xA1));
 
         let partial = ledger
-            .take_settled_partial()
+            .take_settled_partial(10)
             .expect("the partial verdict must survive a cursor that already confirmed the height");
         assert_eq!(partial.sync_height, 10);
         assert_eq!(
@@ -431,8 +420,8 @@ mod tests {
         let ledger = OptimisticallyIncluded::new();
         let (burned, requeued) = (tx(3), tx(4));
         ledger.begin(20, pb_hash(0xB2), hdr(), vec![burned.clone(), requeued]);
-        ledger.mark_settled_partial(20, Vec::new());
-        let disposed = ledger.take_settled_partial().expect("partial settlement");
+        ledger.mark_settled_partial(20, pb_hash(0xB2));
+        let disposed = ledger.take_settled_partial(20).expect("partial settlement");
         assert_eq!(disposed.txs.len(), 2, "disposition sees the whole bundle");
 
         // Disposition burned tx(3) (it held a receipt) and re-queued tx(4).
@@ -453,14 +442,14 @@ mod tests {
     fn retain_for_reorg_ignores_a_rebuilt_height() {
         let ledger = OptimisticallyIncluded::new();
         ledger.begin(30, pb_hash(0xC1), hdr(), vec![tx(5)]);
-        ledger.mark_settled_partial(30, Vec::new());
-        let old = ledger.take_settled_partial().expect("partial settlement");
+        ledger.mark_settled_partial(30, pb_hash(0xC1));
+        let old = ledger.take_settled_partial(30).expect("partial settlement");
 
         // The slot rebuilds at the same height with a different bundle.
         ledger.begin(30, pb_hash(0xC2), hdr(), vec![tx(6)]);
         ledger.retain_for_reorg(30, old.post_batch_hash, vec![tx(5)]);
 
-        ledger.mark_settled(30);
+        ledger.mark_settled(30, pb_hash(0xC2));
         let rolled = ledger.take_rolled_out(29);
         assert_eq!(rolled.len(), 1);
         assert_eq!(
@@ -497,12 +486,14 @@ mod tests {
                     }
                     1 => {
                         if let Some(height) = blocking {
-                            ledger.mark_settled(height);
+                            let batch = ledger.by_sync_height.lock().unwrap()[&height].post_batch_hash;
+                            ledger.mark_settled(height, batch);
                         }
                     }
                     2 => {
                         if let Some(height) = blocking {
-                            ledger.mark_failed(height, flag);
+                            let batch = ledger.by_sync_height.lock().unwrap()[&height].post_batch_hash;
+                            ledger.mark_failed(height, batch, flag);
                         }
                     }
                     3 => {
@@ -554,7 +545,7 @@ mod tests {
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
         assert_eq!(pool.blocking_height(5), Some(10));
         // Observer settle-verdict does NOT re-open the gate…
-        pool.mark_settled(10);
+        pool.mark_settled(10, pb_hash(0xa));
         assert_eq!(pool.blocking_height(5), Some(10));
         // …only the Deriver's cursor passing the height does.
         assert_eq!(pool.blocking_height(10), None);
@@ -566,14 +557,14 @@ mod tests {
     fn a_partial_settlement_is_not_released_by_the_cursor() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
-        pool.mark_settled_partial(10, Vec::new());
+        pool.mark_settled_partial(10, pb_hash(0xa));
 
         assert!(
             pool.resolve_below_cursor(10).is_empty(),
             "a partial settlement owes its tail a disposition; the cursor must not release it",
         );
         let swept = pool
-            .take_settled_partial()
+            .take_settled_partial(10)
             .expect("the partial settlement is still there to sweep");
         assert_eq!(swept.sync_height, 10);
         assert_eq!(swept.txs.len(), 2);
@@ -581,7 +572,10 @@ mod tests {
             !swept.slot_skipped,
             "a partial settlement is not a drop: the entries that ran, ran",
         );
-        assert!(pool.take_settled_partial().is_none(), "swept exactly once");
+        assert!(
+            pool.take_settled_partial(10).is_none(),
+            "swept exactly once"
+        );
     }
 
     /// A partial settlement keeps its height — the Deriver rebuilds the block L1
@@ -590,7 +584,7 @@ mod tests {
     fn a_partial_settlement_is_never_recovered_as_a_failure() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
-        pool.mark_settled_partial(10, Vec::new());
+        pool.mark_settled_partial(10, pb_hash(0xa));
         assert!(
             pool.take_failed_for_recovery(0).is_none(),
             "a canonical height must not be reorged out",
@@ -603,9 +597,9 @@ mod tests {
     fn a_partial_verdict_cannot_override_a_settled_entry() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
-        pool.mark_settled(10);
-        pool.mark_settled_partial(10, Vec::new());
-        assert!(pool.take_settled_partial().is_none());
+        pool.mark_settled(10, pb_hash(0xa));
+        pool.mark_settled_partial(10, pb_hash(0xa));
+        assert!(pool.take_settled_partial(10).is_none());
     }
 
     /// An L1 reorg can land before the slot sweeps a partial verdict. The entry
@@ -614,7 +608,7 @@ mod tests {
     fn an_unswept_partial_settlement_rolls_out_with_its_l1_block() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
-        pool.mark_settled_partial(10, vec![tx(1).hash]);
+        pool.mark_settled_partial(10, pb_hash(0xa));
 
         let rolled = pool.take_rolled_out(9);
         assert_eq!(
@@ -627,14 +621,53 @@ mod tests {
             None,
             "nothing left to hold the gate"
         );
-        assert!(pool.take_settled_partial().is_none());
+        assert!(pool.take_settled_partial(10).is_none());
+    }
+
+    /// A slot can rebuild at a height while the old bundle's observer still
+    /// runs. Its verdict names the old bundle, so the new batch is untouched.
+    #[test]
+    fn a_verdict_for_a_replaced_batch_is_ignored() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.begin(10, pb_hash(0xb), hdr(), vec![tx(2)]);
+
+        pool.mark_failed(10, pb_hash(0xa), false);
+        pool.mark_settled(10, pb_hash(0xa));
+        pool.mark_settled_partial(10, pb_hash(0xa));
+        assert!(pool.take_failed_for_recovery(0).is_none());
+        assert!(pool.take_settled_partial(10).is_none());
+
+        // Still Pending, so the new bundle's own verdict applies.
+        pool.mark_failed(10, pb_hash(0xb), false);
+        let failed = pool
+            .take_failed_for_recovery(0)
+            .expect("the new batch's verdict");
+        assert_eq!(failed.post_batch_hash, pb_hash(0xb));
+    }
+
+    /// Disposition reads L2 nonces, which show the kept outbound txs only once
+    /// the Deriver has rebuilt the block, so the sweep waits for the cursor.
+    #[test]
+    fn a_partial_settlement_waits_for_the_deriver() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.mark_settled_partial(10, pb_hash(0xa));
+
+        assert!(pool.take_settled_partial(9).is_none(), "not derived yet");
+        assert_eq!(
+            pool.blocking_height(9),
+            Some(10),
+            "the gate stays shut meanwhile"
+        );
+        assert!(pool.take_settled_partial(10).is_some());
     }
 
     #[test]
     fn failed_recovery_extracts_once_and_unblocks() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
-        pool.mark_failed(10, false);
+        pool.mark_failed(10, pb_hash(0xa), false);
         // Failed entry still blocks until recovered.
         assert_eq!(pool.blocking_height(0), Some(10));
         let batch = pool.take_failed_for_recovery(0).expect("failed entry");
@@ -657,7 +690,7 @@ mod tests {
 
         let optimistic = OptimisticallyIncluded::new();
         optimistic.begin(10, pb_hash(0xa), hdr(), reserved);
-        optimistic.mark_failed(10, false);
+        optimistic.mark_failed(10, pb_hash(0xa), false);
         let failed = optimistic.take_failed_for_recovery(0).unwrap();
         optimistic.reinsert_failed(failed);
 
@@ -674,7 +707,7 @@ mod tests {
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
         // A skipped-slot drop isn't the tx's fault; the flag must reach
         // recovery so the caller requeues without poison-eviction.
-        pool.mark_failed(10, true);
+        pool.mark_failed(10, pb_hash(0xa), true);
         let batch = pool.take_failed_for_recovery(0).expect("failed entry");
         assert!(batch.slot_skipped);
         assert_eq!(batch.txs.len(), 2);
@@ -684,7 +717,7 @@ mod tests {
     fn cursor_resolution_overrides_false_failure() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
-        pool.mark_failed(10, false);
+        pool.mark_failed(10, pb_hash(0xa), false);
         // Deriver confirmed the batch — false-negative verdict overridden.
         let released = pool.resolve_below_cursor(10);
         assert_eq!(released.len(), 1);
@@ -696,7 +729,7 @@ mod tests {
     fn cursor_resolution_releases_observer_settled_once() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
-        pool.mark_settled(10);
+        pool.mark_settled(10, pb_hash(0xa));
 
         let released = pool.resolve_below_cursor(10);
         assert_eq!(released.len(), 2);
@@ -707,7 +740,7 @@ mod tests {
     fn rolled_out_recovers_only_settled() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
-        pool.mark_settled(10);
+        pool.mark_settled(10, pb_hash(0xa));
         pool.begin(15, pb_hash(0xb), hdr(), vec![tx(2)]); // Pending — in-flight bundle
         let recovered = pool.take_rolled_out(8);
         // Only the settled batch's txs come back; the pending bundle's
@@ -720,7 +753,7 @@ mod tests {
     fn finalize_extracts_settled_for_audit() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
-        pool.mark_settled(10);
+        pool.mark_settled(10, pb_hash(0xa));
         pool.begin(15, pb_hash(0xb), hdr(), vec![tx(2)]); // Pending — stays
         let finalized = pool.take_finalized(12);
         // The settled entry is returned with its postBatch hash so the

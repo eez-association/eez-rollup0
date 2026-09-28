@@ -566,20 +566,32 @@ fn dispose_recovered_txs(
     }
 }
 
-/// Outbound txs whose entries L1 applied. They never ride the L1 bundle, so no
-/// receipt can show it; the applied entry is the only evidence.
-fn kept_outbound(
-    settlement: &eez_l1::Settlement,
-    outbound_hashes: &[alloy_primitives::TxHash],
-) -> Vec<alloy_primitives::TxHash> {
-    settlement
-        .applied()
+/// Split a partially settled batch's txs by their senders' nonces: a tx is
+/// spent once its sender's nonce has moved past it. Of the rest, the first in
+/// batch order is where L1 stopped; outbound entries come before inbound ones.
+fn partial_disposition(
+    txs: &[HeldTx],
+    nonces: &HashMap<(Address, Direction), u64>,
+) -> (
+    Vec<alloy_primitives::TxHash>,
+    Option<alloy_primitives::TxHash>,
+) {
+    let spent: Vec<_> = txs
         .iter()
-        .filter_map(|entry| match entry.role {
-            eez_l1::EntryRole::Outbound { ordinal } => outbound_hashes.get(ordinal).copied(),
-            _ => None,
+        .filter(|tx| {
+            nonces
+                .get(&(tx.sender, tx.direction))
+                .is_some_and(|&nonce| nonce > tx.nonce)
         })
-        .collect()
+        .map(|tx| tx.hash)
+        .collect();
+    let first_unspent = |direction| {
+        txs.iter()
+            .find(|tx| tx.direction == direction && !spent.contains(&tx.hash))
+            .map(|tx| tx.hash)
+    };
+    let culprit = first_unspent(Direction::Outbound).or_else(|| first_unspent(Direction::Inbound));
+    (spent, culprit)
 }
 
 /// Count one failed settlement episode for every candidate, evict transactions
@@ -789,7 +801,7 @@ async fn inbound_source_nonces_for_drain(
                 sender = %tx.sender,
                 direction = ?tx.direction,
                 error = %err,
-                "canonical source-chain nonce preflight failed; proceeding with simulation",
+                "canonical source-chain nonce read failed; treating the tx as not yet spent",
             ),
         }
     }
@@ -819,7 +831,7 @@ fn outbound_source_nonces_for_drain(
                 sender = %tx.sender,
                 direction = ?tx.direction,
                 error = %err,
-                "parent-state source nonce preflight failed; proceeding with simulation",
+                "L2 source nonce read failed; treating the tx as not yet spent",
             ),
         }
     }
@@ -1429,7 +1441,7 @@ where
         // failed Sync block has either committed (head ≥ height →
         // reorg it out) or permanently didn't (stale-parent bail —
         // nothing to roll back).
-        if let Some(partial) = rollup.optimistic.take_settled_partial() {
+        if let Some(partial) = rollup.optimistic.take_settled_partial(cursor) {
             // No rollback: the height is canonical, so this owes the slot
             // nothing beyond the tx disposition and the slot proceeds normally.
             self.recover_partial_batch(rollup_id, rollup, partial).await;
@@ -1606,7 +1618,7 @@ where
             return;
         };
         let cursor = rollup.l1_head.cursor();
-        if let Some(partial) = rollup.optimistic.take_settled_partial() {
+        if let Some(partial) = rollup.optimistic.take_settled_partial(cursor) {
             self.recover_partial_batch(rollup_id, rollup, partial).await;
         }
         if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
@@ -1665,12 +1677,12 @@ where
         }
     }
 
-    /// Sweep a partially settled batch: the height stays canonical, so nothing is
-    /// rolled back and only the tx disposition is owed.
+    /// Sweep a partially settled batch once the Deriver has rebuilt it: the
+    /// height stays canonical, so only the tx disposition is owed.
     ///
-    /// Txs with a spent nonce are released, the rest re-queue. An inbound tx's
-    /// nonce is spent if it has an L1 receipt, reverted or not; an outbound
-    /// tx's if its entry applied, which keeps it in the Sync block.
+    /// A tx is spent once its sender's nonce has moved past it. Spent txs are
+    /// released and the rest re-queue; the first of those is where L1 stopped,
+    /// so it alone is charged an attempt, since the ones behind it did nothing wrong.
     async fn recover_partial_batch(
         &self,
         rollup_id: u64,
@@ -1678,32 +1690,31 @@ where
         partial: crate::optimistic::FailedBatch,
     ) {
         let sync_height = partial.sync_height;
-        let mut landed = partial.kept_outbound.clone();
-        for tx in partial
-            .txs
-            .iter()
-            .filter(|tx| tx.direction == Direction::Inbound)
-        {
-            match self.inner.submitter.receipt_exists(tx.hash).await {
-                Ok(true) => landed.push(tx.hash),
-                Ok(false) => {}
-                Err(err) => {
-                    // Without receipts a burned nonce is indistinguishable from
-                    // a re-queueable tx, so hold the entry and retry next slot.
-                    event!(
-                        name: "eez.composer.recovery.partial_receipt_check_failed",
-                        Level::WARN,
-                        rollup_id,
-                        sync_height,
-                        tx_hash = %tx.hash,
-                        error = %err,
-                        "receipt lookup failed for a partially settled batch; retaining for retry",
-                    );
-                    rollup.optimistic.reinsert_settled_partial(partial);
-                    return;
-                }
+        // The drain's own stale check. A failed read leaves a tx unspent, so it
+        // re-queues and the next drain drops it if its nonce is gone.
+        let mut nonces = match rollup.l2_provider.latest() {
+            Ok(head) => outbound_source_nonces_for_drain(head.as_ref(), rollup_id, &partial.txs),
+            Err(error) => {
+                event!(
+                    name: "eez.composer.recovery.l2_head_unreadable",
+                    Level::WARN,
+                    rollup_id,
+                    sync_height,
+                    error = %error,
+                    "L2 head state unreadable; the partial batch's outbound txs re-queue",
+                );
+                HashMap::new()
             }
-        }
+        };
+        nonces.extend(
+            inbound_source_nonces_for_drain(
+                &self.inner.cross_chain.exec_ctx,
+                rollup_id,
+                &partial.txs,
+            )
+            .await,
+        );
+        let (spent, culprit) = partial_disposition(&partial.txs, &nonces);
         event!(
             name: "eez.composer.recovery.settled_partial",
             Level::INFO,
@@ -1711,28 +1722,25 @@ where
             rollup_id,
             sync_height,
             txs = partial.txs.len(),
-            landed = landed.len(),
-            kept_outbound = partial.kept_outbound.len(),
-            "partial settlement: txs with a spent nonce are released, the rest re-queue",
+            spent = spent.len(),
+            culprit = ?culprit,
+            "partial settlement: spent txs are released, the rest re-queue",
         );
-        // Only spent-nonce txs can be stranded by a reorg; the re-queued ones
-        // are the pool's again.
+        // Only spent txs can be stranded by a reorg; the re-queued ones are the
+        // pool's again.
         let stranded: Vec<crate::HeldTx> = partial
             .txs
             .iter()
-            .filter(|tx| landed.contains(&tx.hash))
+            .filter(|tx| spent.contains(&tx.hash))
             .cloned()
             .collect();
-        // No attempt charged: the txs behind the cut are collateral, and
-        // charging them all would evict txs that did nothing wrong.
-        dispose_recovered_txs(
-            rollup_id,
-            rollup.held_pool.as_ref(),
-            sync_height,
-            partial.txs,
-            &landed,
-            false,
-        );
+        let (charged, rest): (Vec<_>, Vec<_>) = partial
+            .txs
+            .into_iter()
+            .partition(|tx| culprit == Some(tx.hash));
+        let pool = rollup.held_pool.as_ref();
+        dispose_recovered_txs(rollup_id, pool, sync_height, rest, &spent, false);
+        dispose_recovered_txs(rollup_id, pool, sync_height, charged, &[], true);
         rollup
             .optimistic
             .retain_for_reorg(sync_height, partial.post_batch_hash, stranded);
@@ -3408,10 +3416,7 @@ where
             rollup_id,
             sync_height,
             bundle,
-            outbound_user_txs
-                .iter()
-                .map(alloy_primitives::keccak256)
-                .collect(),
+            post_batch_hash,
             built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
@@ -3541,7 +3546,7 @@ where
             rollup_id,
             sync_height,
             vec![minimal_postbatch_raw],
-            Vec::new(),
+            post_batch_hash,
             empty_built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
@@ -3670,7 +3675,7 @@ where
                 rollup_id,
                 boundary,
                 vec![raw],
-                Vec::new(),
+                post_batch_hash,
                 boundary_header.hash(),
                 Arc::clone(&rollup.optimistic),
                 BundleTarget::NextBlock,
@@ -3743,7 +3748,7 @@ where
         rollup_id: u64,
         sync_height: u64,
         bundle: Vec<Bytes>,
-        outbound_hashes: Vec<alloy_primitives::TxHash>,
+        post_batch_hash: alloy_primitives::TxHash,
         expected_final_state: B256,
         optimistic: Arc<OptimisticallyIncluded>,
         target: BundleTarget,
@@ -3753,7 +3758,7 @@ where
             rollup_id,
             sync_height,
             bundle,
-            outbound_hashes,
+            post_batch_hash,
             expected_final_state,
             optimistic,
             submitter,
@@ -4397,8 +4402,9 @@ async fn observe_bundle_outcome(
     rollup_id: u64,
     sync_height: u64,
     bundle: Vec<Bytes>,
-    // Outbound user tx hashes by ordinal — the index L1 reports them under.
-    outbound_hashes: Vec<alloy_primitives::TxHash>,
+    // The verdict names this bundle, so it cannot land on a batch rebuilt at
+    // the same height.
+    post_batch_hash: alloy_primitives::TxHash,
     expected_final_state: B256,
     optimistic: Arc<OptimisticallyIncluded>,
     submitter: Submitter,
@@ -4470,12 +4476,11 @@ async fn observe_bundle_outcome(
         ),
     }
     if settled {
-        optimistic.mark_settled(sync_height);
+        optimistic.mark_settled(sync_height, post_batch_hash);
     } else if kept_an_effect {
         // L1 kept part of the effects, so this height stays canonical and
         // recovery owes only the tail disposition — no rollback.
-        let kept = settlement.map_or_else(Vec::new, |s| kept_outbound(s, &outbound_hashes));
-        optimistic.mark_settled_partial(sync_height, kept);
+        optimistic.mark_settled_partial(sync_height, post_batch_hash);
     } else {
         // Includes the anchor-only case: the commitment moved but no effect ran,
         // so the block is unratified and the reorg path is correct.
@@ -4494,7 +4499,7 @@ async fn observe_bundle_outcome(
                 BundleTarget::NextBlock => false,
             },
         };
-        optimistic.mark_failed(sync_height, slot_skipped);
+        optimistic.mark_failed(sync_height, post_batch_hash, slot_skipped);
     }
 }
 
@@ -4644,35 +4649,59 @@ mod tests {
         );
     }
 
-    /// L1 reports an applied outbound entry by ordinal; it must name the tx at
-    /// that ordinal, and anchors and deliveries name none.
+    /// A tx is spent once its sender's nonce moves past it, in either
+    /// direction; of the rest, the first outbound one is where L1 stopped.
     #[test]
-    fn kept_outbound_maps_each_applied_ordinal_to_its_own_tx() {
-        use eez_l1::{AppliedEntry, EntryRole, Settlement};
-        let hashes = [TxHash::repeat_byte(0x01), TxHash::repeat_byte(0x02)];
-        let settlement = Settlement::new(
-            vec![
-                AppliedEntry {
-                    entry_index: 0,
-                    role: EntryRole::Anchor,
-                },
-                AppliedEntry {
-                    entry_index: 2,
-                    role: EntryRole::Outbound { ordinal: 1 },
-                },
-                AppliedEntry {
-                    entry_index: 3,
-                    role: EntryRole::Inbound { ordinal: 0 },
-                },
-            ],
-            None,
-            None,
-        );
-        assert_eq!(
-            kept_outbound(&settlement, &hashes),
-            vec![TxHash::repeat_byte(0x02)],
-            "ordinal 0 was not applied, so only the second outbound tx is kept",
-        );
+    fn partial_disposition_splits_by_nonce_and_names_the_first_unspent() {
+        let (a, b) = (Address::repeat_byte(0x0A), Address::repeat_byte(0x0B));
+        let kept_out = held(a, Direction::Outbound, 5, 0x01);
+        let cut_out = held(a, Direction::Outbound, 6, 0x02);
+        let included_in = held(b, Direction::Inbound, 3, 0x03);
+        let dropped_in = held(b, Direction::Inbound, 4, 0x04);
+        // Pool order puts an inbound tx first; batch order still leads with outbound.
+        let txs = [
+            included_in.clone(),
+            kept_out.clone(),
+            cut_out.clone(),
+            dropped_in,
+        ];
+        let nonces = HashMap::from([((a, Direction::Outbound), 6), ((b, Direction::Inbound), 4)]);
+
+        let (spent, culprit) = partial_disposition(&txs, &nonces);
+        assert_eq!(spent, vec![included_in.hash, kept_out.hash]);
+        assert_eq!(culprit, Some(cut_out.hash));
+    }
+
+    /// With every outbound tx kept, the cut is at the first unspent inbound
+    /// one — a reverting tx the builder dropped instead of including.
+    #[test]
+    fn partial_disposition_falls_back_to_the_first_unspent_inbound() {
+        let (a, b) = (Address::repeat_byte(0x0A), Address::repeat_byte(0x0B));
+        let kept_out = held(a, Direction::Outbound, 5, 0x01);
+        let dropped_in = held(b, Direction::Inbound, 4, 0x04);
+        let behind_in = held(b, Direction::Inbound, 5, 0x05);
+        let txs = [kept_out, dropped_in.clone(), behind_in];
+        let nonces = HashMap::from([((a, Direction::Outbound), 6), ((b, Direction::Inbound), 4)]);
+
+        let (spent, culprit) = partial_disposition(&txs, &nonces);
+        assert_eq!(spent.len(), 1, "only the kept outbound tx");
+        assert_eq!(culprit, Some(dropped_in.hash), "not the tx behind it");
+    }
+
+    /// When every tx is spent, as on a builder that includes reverting txs,
+    /// nothing re-queues and nobody is charged.
+    #[test]
+    fn partial_disposition_charges_nobody_when_every_nonce_is_spent() {
+        let a = Address::repeat_byte(0x0A);
+        let txs = [
+            held(a, Direction::Inbound, 1, 0x01),
+            held(a, Direction::Inbound, 2, 0x02),
+        ];
+        let nonces = HashMap::from([((a, Direction::Inbound), 3)]);
+
+        let (spent, culprit) = partial_disposition(&txs, &nonces);
+        assert_eq!(spent.len(), 2);
+        assert_eq!(culprit, None);
     }
 
     /// A burned nonce must release its reservation, else the resubmission is
