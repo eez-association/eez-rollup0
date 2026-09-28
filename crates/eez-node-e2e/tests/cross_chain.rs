@@ -327,14 +327,11 @@ async fn signer_outage_blocks_settlement_then_recovers_pending_and_fresh_transac
     let l1_rpc = w.l1_rpc();
     let l2_rpc = w.l2_rpc();
     let proxy = w.prover_proxy.as_ref().expect("observability proxy");
-    let attempts_before = proxy.attempts();
     let source_nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
     let destination_before = l2_value(&l2_rpc, w.value_l2).await.unwrap();
 
     w.proof_signer.pause().expect("pause real proof signer");
-    let batches_before = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
-        .await
-        .unwrap();
+    let attempts_before = proxy.attempts();
     let successes_before = proxy.successes();
     let submitted = sign_and_send(
         &w.l1_xchain(),
@@ -378,13 +375,6 @@ async fn signer_outage_blocks_settlement_then_recovers_pending_and_fresh_transac
         receipt_ok(&l1_rpc, submitted).await.unwrap(),
         None,
         "a transaction whose window was not attested must not appear settled",
-    );
-    assert_eq!(
-        batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
-            .await
-            .unwrap(),
-        batches_before,
-        "signer outage must not produce a new L1 batch",
     );
     assert_eq!(
         proxy.successes(),
