@@ -432,7 +432,10 @@ pub(crate) async fn scan_batch_logs_range(
             l.block_hash,
             l.transaction_hash,
         ) else {
-            continue;
+            // Mined logs always carry these. Dropping one could hide a root.
+            return Err(L1Error::Provider(
+                "log missing its block or tx position".into(),
+            ));
         };
         match l.topic0() {
             Some(t) if *t == L2ExecutionPerformed::SIGNATURE_HASH => {
@@ -1676,6 +1679,31 @@ mod tests {
         );
         assert_eq!(ours.settlement.final_state, Some(c1));
         assert_eq!(ours.settlement.entry_state, Some(c0));
+    }
+
+    /// A root the provider returned without its block hash cannot be placed in a
+    /// window. Skipping it would read a settled batch as settling nothing, so
+    /// the scan fails and retries instead.
+    #[tokio::test]
+    async fn a_log_without_its_position_fails_the_scan_instead_of_vanishing() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut root = settled_root_log(
+            1,
+            B256::repeat_byte(0x51),
+            700,
+            B256::with_last_byte(0xA1),
+            B256::with_last_byte(0xF0),
+            1,
+            0,
+        );
+        root.block_hash = None;
+        asserter.push_success(&serde_json::json!([root]));
+
+        let error = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
+            .await
+            .expect_err("a positionless log must not be skipped");
+        assert!(error.is_transport(), "retryable, not terminal: {error}");
     }
 
     /// A postBatch for another rollup shares our block without closing our

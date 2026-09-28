@@ -407,7 +407,7 @@ impl Inner {
                         L1Error::Provider("receipt present but block_number missing".into())
                     })?;
                     match self
-                        .observe_settlement(&target_provider, l1_block, tx_hash)
+                        .observe_settlement(&target_provider, l1_block, tx_hash, receipt.status())
                         .await
                     {
                         Ok(settlement) => {
@@ -522,6 +522,7 @@ impl Inner {
         provider: &P,
         l1_block: u64,
         tx_hash: TxHash,
+        succeeded: bool,
     ) -> L1Result<crate::scan::Settlement> {
         let batches = crate::scan::scan_batch_logs_range(
             provider,
@@ -531,11 +532,19 @@ impl Inner {
             l1_block,
         )
         .await?;
-        Ok(batches
-            .into_iter()
-            .find(|batch| batch.tx_hash == tx_hash)
-            .map(|batch| batch.settlement)
-            .unwrap_or(crate::scan::Settlement::NONE))
+        match batches.into_iter().find(|batch| batch.tx_hash == tx_hash) {
+            Some(batch) => Ok(batch.settlement),
+            // A reverted postBatch emits nothing. One that succeeded always
+            // emits `BatchPosted`, so its absence is a log index lagging the
+            // receipt, not a batch that applied nothing.
+            None if succeeded => Err(L1Error::SourceIncomplete {
+                block: l1_block,
+                tx_hash,
+                detail: "postBatch receipt succeeded but its BatchPosted log is missing; retry"
+                    .into(),
+            }),
+            None => Ok(crate::scan::Settlement::NONE),
+        }
     }
 }
 

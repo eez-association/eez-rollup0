@@ -30,7 +30,7 @@ pub const L1_REORG_DETECTED: &str = "eez.l1_watcher.reorg.detected";
 pub const TX_NONCE_CHAIN_EVICTED: &str = "eez.composer.recovery.nonce_chain_evicted";
 /// L1 kept only some of a batch's entries — the composer's partial verdict.
 pub const COMPOSER_SETTLED_PARTIAL: &str = "eez.composer.recovery.settled_partial";
-/// A user_tx that already has an L1 receipt is not re-queued; the user resubmits.
+/// A user_tx whose nonce is spent is not re-queued; if it reverted, its user resubmits.
 pub const COMPOSER_NONCE_BURNED: &str = "eez.composer.recovery.nonce_burned";
 /// The deriver rebuilt only the entries L1 ran.
 pub const DERIVER_PARTIAL_CONSUMPTION: &str = "eez.deriver.reconcile.partial_consumption";

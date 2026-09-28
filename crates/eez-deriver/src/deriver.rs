@@ -1599,14 +1599,45 @@ where
                 // `CrossChainCallExecuted` events, observable only after replay.
                 gate_outbound = outbound_paired.iter().map(|(e, _)| e.clone()).collect();
 
-                // A resume appends to the rival's existing Sync block, so start
-                // from that block's nonce rather than infer it from ordinals,
-                // which assumes the skipped prefix had no holes.
-                let starting_nonce = if settlement.resumed() {
-                    self.system_address_nonce_at(from_block)?
-                } else {
-                    self.system_address_nonce_at(from_block - 1)?
-                };
+                // A resume appends after the rival's system txs, so count the
+                // skipped prefix. Not the block's own nonce: an earlier append
+                // would count, shift the rebuilt txs and defeat the resume dedup.
+                let mut starting_nonce = self.system_address_nonce_at(from_block - 1)?;
+                let (outbound_skip, inbound_skip) =
+                    match settlement.applied().first().map(|a| a.role) {
+                        Some(eez_l1::EntryRole::Outbound { ordinal }) => (ordinal, 0),
+                        // Every outbound entry precedes every inbound one.
+                        Some(eez_l1::EntryRole::Inbound { ordinal }) => {
+                            (original_outbound_len, ordinal)
+                        }
+                        _ => (0, 0),
+                    };
+                if outbound_skip > 0 || inbound_skip > 0 {
+                    let skipped_paired: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> =
+                        outbound[..outbound_skip]
+                            .iter()
+                            .cloned()
+                            .zip(sync_user_txs[..outbound_skip].iter().cloned())
+                            .collect();
+                    let prefix_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
+                        &skipped_paired,
+                        &inbound[..inbound_skip],
+                        cfg,
+                        starting_nonce,
+                    )
+                    .map_err(|e| {
+                        DeriverError::l2_provider(format!(
+                            "build_cross_chain_sync_pairs(skipped prefix, tx={tx_hash}): {e}"
+                        ))
+                    })?;
+                    starting_nonce = starting_nonce
+                        .checked_add(prefix_pairs.len() as u64)
+                        .ok_or_else(|| {
+                            DeriverError::l2_provider(format!(
+                                "SYSTEM_ADDRESS nonce overflow over the skipped prefix (tx={tx_hash})"
+                            ))
+                        })?;
+                }
                 let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
                     &outbound_paired,
                     &applied_inbound,

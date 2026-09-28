@@ -156,26 +156,18 @@ impl OptimisticallyIncluded {
         map.range(cursor + 1..).next().map(|(h, _)| *h)
     }
 
-    /// Flip Pending AND Failed entries at or below the Deriver's
-    /// cursor to Settled — the cursor only advances past a batch after
-    /// `check_claimed_state` accepted it, which is a stronger
-    /// settlement proof than the observer's log scan. A Failed verdict
-    /// is overridden here: a false-negative observation must not undo
-    /// a batch the Deriver confirmed. Returns the txs newly resolved so
-    /// the held pool can release their in-flight nonce reservations.
+    /// Resolve entries the Deriver's cursor covers; the cursor outranks any
+    /// observer verdict, including Failed. It confirms the height, not which txs
+    /// ran, so it releases txs only for a full-settle verdict and sends every
+    /// other entry to nonce disposition, which is what finds an unconsumed tail.
     pub fn resolve_below_cursor(&self, cursor: u64) -> Vec<HeldTx> {
         let mut map = self.by_sync_height.lock().unwrap();
         let mut newly_cursor_confirmed = Vec::new();
         for (_, entry) in map.range_mut(..=cursor) {
-            // The cursor confirms the height, not that every tx was consumed;
-            // releasing here would lose the unconsumed tail.
-            if entry.resolution == Resolution::SettledPartial {
-                continue;
+            if matches!(entry.resolution, Resolution::Pending | Resolution::Failed) {
+                entry.resolution = Resolution::SettledPartial;
             }
-            if entry.resolution != Resolution::Settled {
-                entry.resolution = Resolution::Settled;
-            }
-            if !entry.cursor_confirmed {
+            if entry.resolution == Resolution::Settled && !entry.cursor_confirmed {
                 newly_cursor_confirmed.extend(entry.txs.iter().cloned());
                 entry.cursor_confirmed = true;
             }
@@ -189,28 +181,24 @@ impl OptimisticallyIncluded {
         let mut map = self.by_sync_height.lock().unwrap();
         if let Some(entry) = map.get_mut(&sync_height)
             && entry.post_batch_hash == post_batch_hash
-            // The cursor confirms the height, not which txs ran, so a partial
-            // verdict still applies. An observer's full-settle verdict stands.
-            && (entry.resolution == Resolution::Pending
-                || (entry.resolution == Resolution::Settled && entry.cursor_confirmed))
+            && entry.resolution == Resolution::Pending
         {
             entry.resolution = Resolution::SettledPartial;
         }
     }
 
-    /// Extract a partially settled entry for tx disposition, once `cursor`
-    /// covers it: the Deriver has then rebuilt the block, so L2 nonces show
-    /// which outbound txs it kept. The caller must NOT reorg: the height is
+    /// The next entry at or below `cursor` awaiting tx disposition: the Deriver
+    /// has then rebuilt the block, so L2 nonces show which outbound txs it kept. The caller must NOT reorg: the height is
     /// canonical.
+    ///
+    /// The entry stays until [`Self::finish_partial`], so a disposition that
+    /// cannot read nonces yet simply retries on the next tick.
     #[must_use]
-    pub fn take_settled_partial(&self, cursor: u64) -> Option<FailedBatch> {
-        let mut map = self.by_sync_height.lock().unwrap();
-        let h = map
+    pub fn partial_to_dispose(&self, cursor: u64) -> Option<FailedBatch> {
+        let map = self.by_sync_height.lock().unwrap();
+        let (&h, entry) = map
             .range(..=cursor)
-            .find(|(_, e)| e.resolution == Resolution::SettledPartial)
-            .map(|(h, _)| *h)?;
-        let entry = map.get_mut(&h)?;
-        entry.resolution = Resolution::Settled;
+            .find(|(_, e)| e.resolution == Resolution::SettledPartial)?;
         Some(FailedBatch {
             sync_height: h,
             post_batch_hash: entry.post_batch_hash,
@@ -224,18 +212,19 @@ impl OptimisticallyIncluded {
         })
     }
 
-    /// Narrow a partially settled entry to the txs disposition found spent: only
-    /// those can be stranded by a reorg. The re-queued ones belong to the pool,
-    /// and releasing them from here would drop a reservation they retook.
+    /// Settle a disposed entry, keeping only its spent txs: only those can be
+    /// stranded by a reorg, and the re-queued ones now belong to the pool.
     ///
     /// `post_batch_hash` names the bundle disposed: a rebuild can replace the
     /// entry at this height meanwhile, and must keep its own txs.
-    pub fn retain_for_reorg(&self, sync_height: u64, post_batch_hash: TxHash, txs: Vec<HeldTx>) {
+    pub fn finish_partial(&self, sync_height: u64, post_batch_hash: TxHash, spent: Vec<HeldTx>) {
         let mut map = self.by_sync_height.lock().unwrap();
         if let Some(entry) = map.get_mut(&sync_height)
             && entry.post_batch_hash == post_batch_hash
         {
-            entry.txs = txs;
+            entry.txs = spent;
+            entry.resolution = Resolution::Settled;
+            entry.cursor_confirmed = true;
         }
     }
 
@@ -391,20 +380,24 @@ mod tests {
         TxHash::repeat_byte(tag)
     }
 
-    /// A partial verdict still applies once the cursor has confirmed the height,
-    /// or the unconsumed tail never returns to the pool.
+    /// The cursor confirms the height, not which txs ran. When it arrives before
+    /// any verdict, the batch still goes to disposition, or an unconsumed tail
+    /// never returns to the pool.
     #[test]
-    fn a_partial_verdict_still_applies_after_the_cursor_confirmed_the_height() {
+    fn a_cursor_that_confirms_first_hands_the_batch_to_disposition() {
         let ledger = OptimisticallyIncluded::new();
         ledger.begin(10, pb_hash(0xA1), hdr(), vec![tx(1), tx(2)]);
 
-        // Deriver wins the race, observer reports the partial verdict afterwards.
-        ledger.resolve_below_cursor(10);
+        // Deriver wins the race; the observer's verdict comes too late to matter.
+        assert!(
+            ledger.resolve_below_cursor(10).is_empty(),
+            "nothing is released blind"
+        );
         ledger.mark_settled_partial(10, pb_hash(0xA1));
 
         let partial = ledger
-            .take_settled_partial(10)
-            .expect("the partial verdict must survive a cursor that already confirmed the height");
+            .partial_to_dispose(10)
+            .expect("the confirmed batch must reach disposition");
         assert_eq!(partial.sync_height, 10);
         assert_eq!(
             partial.txs.len(),
@@ -421,11 +414,11 @@ mod tests {
         let (burned, requeued) = (tx(3), tx(4));
         ledger.begin(20, pb_hash(0xB2), hdr(), vec![burned.clone(), requeued]);
         ledger.mark_settled_partial(20, pb_hash(0xB2));
-        let disposed = ledger.take_settled_partial(20).expect("partial settlement");
+        let disposed = ledger.partial_to_dispose(20).expect("partial settlement");
         assert_eq!(disposed.txs.len(), 2, "disposition sees the whole bundle");
 
-        // Disposition burned tx(3) (it held a receipt) and re-queued tx(4).
-        ledger.retain_for_reorg(20, pb_hash(0xB2), vec![burned.clone()]);
+        // Disposition found tx(3)'s nonce spent and re-queued tx(4).
+        ledger.finish_partial(20, pb_hash(0xB2), vec![burned.clone()]);
 
         let rolled = ledger.take_rolled_out(19);
         assert_eq!(
@@ -439,15 +432,15 @@ mod tests {
     /// A slot can rebuild at the same height; a disposition still running for
     /// the old bundle must not overwrite the new bundle's txs.
     #[test]
-    fn retain_for_reorg_ignores_a_rebuilt_height() {
+    fn finish_partial_ignores_a_rebuilt_height() {
         let ledger = OptimisticallyIncluded::new();
         ledger.begin(30, pb_hash(0xC1), hdr(), vec![tx(5)]);
         ledger.mark_settled_partial(30, pb_hash(0xC1));
-        let old = ledger.take_settled_partial(30).expect("partial settlement");
+        let old = ledger.partial_to_dispose(30).expect("partial settlement");
 
         // The slot rebuilds at the same height with a different bundle.
         ledger.begin(30, pb_hash(0xC2), hdr(), vec![tx(6)]);
-        ledger.retain_for_reorg(30, old.post_batch_hash, vec![tx(5)]);
+        ledger.finish_partial(30, old.post_batch_hash, vec![tx(5)]);
 
         ledger.mark_settled(30, pb_hash(0xC2));
         let rolled = ledger.take_rolled_out(29);
@@ -502,6 +495,13 @@ mod tests {
                             for tx in ledger.resolve_below_cursor(cursor) {
                                 prop_assert!(released.insert(tx.hash), "tx released twice");
                             }
+                            // Disposition finds every nonce spent in this model.
+                            while let Some(batch) = ledger.partial_to_dispose(cursor) {
+                                for tx in &batch.txs {
+                                    prop_assert!(released.insert(tx.hash), "tx released twice");
+                                }
+                                ledger.finish_partial(batch.sync_height, batch.post_batch_hash, batch.txs);
+                            }
                         }
                     }
                     4 => {
@@ -524,8 +524,8 @@ mod tests {
 
                 let map = ledger.by_sync_height.lock().unwrap();
                 let unresolved = map
-                    .values()
-                    .filter(|entry| entry.resolution != Resolution::Settled)
+                    .range(cursor.saturating_add(1)..)
+                    .filter(|(_, entry)| entry.resolution != Resolution::Settled)
                     .count();
                 prop_assert!(unresolved <= 1, "more than one optimistic batch is unresolved");
                 let expected_blocking = map.range(cursor.saturating_add(1)..).next().map(|(h, _)| *h);
@@ -564,7 +564,7 @@ mod tests {
             "a partial settlement owes its tail a disposition; the cursor must not release it",
         );
         let swept = pool
-            .take_settled_partial(10)
+            .partial_to_dispose(10)
             .expect("the partial settlement is still there to sweep");
         assert_eq!(swept.sync_height, 10);
         assert_eq!(swept.txs.len(), 2);
@@ -573,9 +573,11 @@ mod tests {
             "a partial settlement is not a drop: the entries that ran, ran",
         );
         assert!(
-            pool.take_settled_partial(10).is_none(),
-            "swept exactly once"
+            pool.partial_to_dispose(10).is_some(),
+            "a read that fails leaves it for the next tick"
         );
+        pool.finish_partial(10, pb_hash(0xa), Vec::new());
+        assert!(pool.partial_to_dispose(10).is_none(), "swept exactly once");
     }
 
     /// A partial settlement keeps its height — the Deriver rebuilds the block L1
@@ -591,15 +593,15 @@ mod tests {
         );
     }
 
-    /// An observer's full-settle verdict stands against a later partial one. A
-    /// cursor confirmation does not: it confirms the height, not which txs ran.
+    /// An observer's full-settle verdict stands: a later partial one for the
+    /// same bundle is ignored.
     #[test]
     fn a_partial_verdict_cannot_override_a_settled_entry() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
         pool.mark_settled(10, pb_hash(0xa));
         pool.mark_settled_partial(10, pb_hash(0xa));
-        assert!(pool.take_settled_partial(10).is_none());
+        assert!(pool.partial_to_dispose(10).is_none());
     }
 
     /// An L1 reorg can land before the slot sweeps a partial verdict. The entry
@@ -621,7 +623,7 @@ mod tests {
             None,
             "nothing left to hold the gate"
         );
-        assert!(pool.take_settled_partial(10).is_none());
+        assert!(pool.partial_to_dispose(10).is_none());
     }
 
     /// A slot can rebuild at a height while the old bundle's observer still
@@ -636,7 +638,7 @@ mod tests {
         pool.mark_settled(10, pb_hash(0xa));
         pool.mark_settled_partial(10, pb_hash(0xa));
         assert!(pool.take_failed_for_recovery(0).is_none());
-        assert!(pool.take_settled_partial(10).is_none());
+        assert!(pool.partial_to_dispose(10).is_none());
 
         // Still Pending, so the new bundle's own verdict applies.
         pool.mark_failed(10, pb_hash(0xb), false);
@@ -654,13 +656,13 @@ mod tests {
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
         pool.mark_settled_partial(10, pb_hash(0xa));
 
-        assert!(pool.take_settled_partial(9).is_none(), "not derived yet");
+        assert!(pool.partial_to_dispose(9).is_none(), "not derived yet");
         assert_eq!(
             pool.blocking_height(9),
             Some(10),
             "the gate stays shut meanwhile"
         );
-        assert!(pool.take_settled_partial(10).is_some());
+        assert!(pool.partial_to_dispose(10).is_some());
     }
 
     #[test]
@@ -718,10 +720,11 @@ mod tests {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
         pool.mark_failed(10, pb_hash(0xa), false);
-        // Deriver confirmed the batch — false-negative verdict overridden.
-        let released = pool.resolve_below_cursor(10);
-        assert_eq!(released.len(), 1);
+        // Deriver confirmed the batch — the false-negative verdict is overridden,
+        // and nonces, not the verdict, decide what happens to its txs.
+        assert!(pool.resolve_below_cursor(10).is_empty());
         assert!(pool.take_failed_for_recovery(0).is_none());
+        assert!(pool.partial_to_dispose(10).is_some());
         assert_eq!(pool.blocking_height(10), None);
     }
 
