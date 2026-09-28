@@ -277,7 +277,7 @@ impl Settlement {
     }
 
     /// L1 ran at least one entry that puts content in the Sync block. The anchor
-    /// claims the block BEFORE it, so an anchor-only prefix is reorged, not kept.
+    /// claims the block BEFORE it, so an anchor-only settlement is reorged, not kept.
     #[must_use]
     pub fn applied_an_effect(&self) -> bool {
         self.applied

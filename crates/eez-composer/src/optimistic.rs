@@ -60,7 +60,7 @@ pub struct FailedBatch {
     /// The user txs whose effects the block carried.
     pub txs: Vec<HeldTx>,
     /// Outbound txs whose entries L1 applied: they stay in the Sync block, so
-    /// their nonces are spent without an L1 receipt. Short settlements only.
+    /// their nonces are spent without an L1 receipt. Partial settlements only.
     pub kept_outbound: Vec<TxHash>,
     /// Drop not attributable to the txs (skipped L1 slot, relay transport
     /// failure) — recovery re-queues without counting toward poison-eviction.
@@ -81,10 +81,10 @@ enum Resolution {
     /// Deriver's cursor reaching this height overrides to Settled — the
     /// cursor is the stronger oracle.
     Failed,
-    /// Observer verdict: L1 kept a prefix. The height stays canonical and
+    /// Observer verdict: L1 kept part of the batch. The height stays canonical and
     /// nothing rolls back; txs with a spent nonce are released, the rest
     /// re-queue.
-    SettledShort,
+    SettledPartial,
 }
 
 #[derive(Debug)]
@@ -102,7 +102,7 @@ struct InFlight {
     cursor_confirmed: bool,
     /// Set by `mark_failed` when the drop wasn't the bundled txs' fault.
     slot_skipped: bool,
-    /// Set by `mark_settled_short`; see [`FailedBatch::kept_outbound`].
+    /// Set by `mark_settled_partial`; see [`FailedBatch::kept_outbound`].
     kept_outbound: Vec<TxHash>,
 }
 
@@ -175,7 +175,7 @@ impl OptimisticallyIncluded {
         for (_, entry) in map.range_mut(..=cursor) {
             // The cursor confirms the height, not that every tx was consumed;
             // releasing here would lose the unconsumed tail.
-            if entry.resolution == Resolution::SettledShort {
+            if entry.resolution == Resolution::SettledPartial {
                 continue;
             }
             if entry.resolution != Resolution::Settled {
@@ -189,29 +189,29 @@ impl OptimisticallyIncluded {
         newly_cursor_confirmed
     }
 
-    /// L1 kept a prefix. Unlike [`Self::mark_failed`] the height is not rolled
+    /// L1 kept part of the batch. Unlike [`Self::mark_failed`] the height is not rolled
     /// back; recovery only disposes of the transactions.
-    pub fn mark_settled_short(&self, sync_height: u64, kept_outbound: Vec<TxHash>) {
+    pub fn mark_settled_partial(&self, sync_height: u64, kept_outbound: Vec<TxHash>) {
         let mut map = self.by_sync_height.lock().unwrap();
         if let Some(entry) = map.get_mut(&sync_height)
-            // The cursor confirms the height, not which txs ran, so a prefix
+            // The cursor confirms the height, not which txs ran, so a partial
             // verdict still applies. An observer's full-settle verdict stands.
             && (entry.resolution == Resolution::Pending
                 || (entry.resolution == Resolution::Settled && entry.cursor_confirmed))
         {
-            entry.resolution = Resolution::SettledShort;
+            entry.resolution = Resolution::SettledPartial;
             entry.kept_outbound = kept_outbound;
         }
     }
 
-    /// Extract a prefix-settled entry for tx disposition. The caller must NOT
+    /// Extract a partially settled entry for tx disposition. The caller must NOT
     /// reorg: the height is canonical.
     #[must_use]
-    pub fn take_settled_short(&self) -> Option<FailedBatch> {
+    pub fn take_settled_partial(&self) -> Option<FailedBatch> {
         let mut map = self.by_sync_height.lock().unwrap();
         let h = map
             .iter()
-            .find(|(_, e)| e.resolution == Resolution::SettledShort)
+            .find(|(_, e)| e.resolution == Resolution::SettledPartial)
             .map(|(h, _)| *h)?;
         let entry = map.get_mut(&h)?;
         entry.resolution = Resolution::Settled;
@@ -224,12 +224,12 @@ impl OptimisticallyIncluded {
             // set is right then, since the reorg also undoes their spent nonces.
             txs: entry.txs.clone(),
             kept_outbound: std::mem::take(&mut entry.kept_outbound),
-            // A short settle is not a drop: the entries that ran, ran.
+            // A partial settlement is not a drop: the entries that ran, ran.
             slot_skipped: false,
         })
     }
 
-    /// Narrow a settled-short entry to the txs disposition found spent: only
+    /// Narrow a partially settled entry to the txs disposition found spent: only
     /// those can be stranded by a reorg. The re-queued ones belong to the pool,
     /// and releasing them from here would drop a reservation they retook.
     ///
@@ -299,11 +299,11 @@ impl OptimisticallyIncluded {
         self.reinsert(batch, Resolution::Failed);
     }
 
-    /// Retain a prefix settlement for another attempt. It must NOT come back as
+    /// Retain a partial settlement for another attempt. It must NOT come back as
     /// `Failed`: the height is canonical, so recovery would reorg out a height
     /// L1 ratified.
-    pub fn reinsert_settled_short(&self, batch: FailedBatch) {
-        self.reinsert(batch, Resolution::SettledShort);
+    pub fn reinsert_settled_partial(&self, batch: FailedBatch) {
+        self.reinsert(batch, Resolution::SettledPartial);
     }
 
     fn reinsert(&self, batch: FailedBatch, resolution: Resolution) {
@@ -327,14 +327,19 @@ impl OptimisticallyIncluded {
     /// for re-queueing. Pending entries stay — an L1 reorg does not
     /// invalidate an in-flight bundle targeting a future L1 block (its
     /// observer will resolve it); Failed entries stay for the slot
-    /// recovery path. A prefix settlement not yet swept rolls out too:
+    /// recovery path. A partial settlement not yet swept rolls out too:
     /// left behind, it would sit above the cursor and hold the gate shut.
     #[must_use]
     pub fn take_rolled_out(&self, new_l2_cursor: u64) -> Vec<HeldTx> {
         let mut map = self.by_sync_height.lock().unwrap();
         let heights: Vec<u64> = map
             .range(new_l2_cursor + 1..)
-            .filter(|(_, e)| matches!(e.resolution, Resolution::Settled | Resolution::SettledShort))
+            .filter(|(_, e)| {
+                matches!(
+                    e.resolution,
+                    Resolution::Settled | Resolution::SettledPartial
+                )
+            })
             .map(|(h, _)| *h)
             .collect();
         heights
@@ -397,23 +402,23 @@ mod tests {
         TxHash::repeat_byte(tag)
     }
 
-    /// A prefix verdict still applies once the cursor has confirmed the height,
+    /// A partial verdict still applies once the cursor has confirmed the height,
     /// or the unconsumed tail never returns to the pool.
     #[test]
     fn a_partial_verdict_still_applies_after_the_cursor_confirmed_the_height() {
         let ledger = OptimisticallyIncluded::new();
         ledger.begin(10, pb_hash(0xA1), hdr(), vec![tx(1), tx(2)]);
 
-        // Deriver wins the race, observer reports the prefix afterwards.
+        // Deriver wins the race, observer reports the partial verdict afterwards.
         ledger.resolve_below_cursor(10);
-        ledger.mark_settled_short(10, Vec::new());
+        ledger.mark_settled_partial(10, Vec::new());
 
-        let short = ledger
-            .take_settled_short()
-            .expect("the prefix verdict must survive a cursor that already confirmed the height");
-        assert_eq!(short.sync_height, 10);
+        let partial = ledger
+            .take_settled_partial()
+            .expect("the partial verdict must survive a cursor that already confirmed the height");
+        assert_eq!(partial.sync_height, 10);
         assert_eq!(
-            short.txs.len(),
+            partial.txs.len(),
             2,
             "the tail must be available for disposal"
         );
@@ -426,8 +431,8 @@ mod tests {
         let ledger = OptimisticallyIncluded::new();
         let (burned, requeued) = (tx(3), tx(4));
         ledger.begin(20, pb_hash(0xB2), hdr(), vec![burned.clone(), requeued]);
-        ledger.mark_settled_short(20, Vec::new());
-        let disposed = ledger.take_settled_short().expect("prefix settlement");
+        ledger.mark_settled_partial(20, Vec::new());
+        let disposed = ledger.take_settled_partial().expect("partial settlement");
         assert_eq!(disposed.txs.len(), 2, "disposition sees the whole bundle");
 
         // Disposition burned tx(3) (it held a receipt) and re-queued tx(4).
@@ -448,8 +453,8 @@ mod tests {
     fn retain_for_reorg_ignores_a_rebuilt_height() {
         let ledger = OptimisticallyIncluded::new();
         ledger.begin(30, pb_hash(0xC1), hdr(), vec![tx(5)]);
-        ledger.mark_settled_short(30, Vec::new());
-        let old = ledger.take_settled_short().expect("prefix settlement");
+        ledger.mark_settled_partial(30, Vec::new());
+        let old = ledger.take_settled_partial().expect("partial settlement");
 
         // The slot rebuilds at the same height with a different bundle.
         ledger.begin(30, pb_hash(0xC2), hdr(), vec![tx(6)]);
@@ -555,61 +560,61 @@ mod tests {
         assert_eq!(pool.blocking_height(10), None);
     }
 
-    /// The cursor confirms the HEIGHT only; promoting a prefix to Settled here
+    /// The cursor confirms the HEIGHT only; promoting a partial settlement to Settled here
     /// would release the tail's reservations and lose those transactions.
     #[test]
-    fn a_prefix_settlement_is_not_released_by_the_cursor() {
+    fn a_partial_settlement_is_not_released_by_the_cursor() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
-        pool.mark_settled_short(10, Vec::new());
+        pool.mark_settled_partial(10, Vec::new());
 
         assert!(
             pool.resolve_below_cursor(10).is_empty(),
-            "a prefix settlement owes its tail a disposition; the cursor must not release it",
+            "a partial settlement owes its tail a disposition; the cursor must not release it",
         );
         let swept = pool
-            .take_settled_short()
-            .expect("the prefix settlement is still there to sweep");
+            .take_settled_partial()
+            .expect("the partial settlement is still there to sweep");
         assert_eq!(swept.sync_height, 10);
         assert_eq!(swept.txs.len(), 2);
         assert!(
             !swept.slot_skipped,
-            "a short settle is not a drop: the entries that ran, ran",
+            "a partial settlement is not a drop: the entries that ran, ran",
         );
-        assert!(pool.take_settled_short().is_none(), "swept exactly once");
+        assert!(pool.take_settled_partial().is_none(), "swept exactly once");
     }
 
-    /// A prefix settlement keeps its height — the Deriver rebuilds the block L1
+    /// A partial settlement keeps its height — the Deriver rebuilds the block L1
     /// named — so it must never surface on the reorg path.
     #[test]
-    fn a_prefix_settlement_is_never_recovered_as_a_failure() {
+    fn a_partial_settlement_is_never_recovered_as_a_failure() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
-        pool.mark_settled_short(10, Vec::new());
+        pool.mark_settled_partial(10, Vec::new());
         assert!(
             pool.take_failed_for_recovery(0).is_none(),
             "a canonical height must not be reorged out",
         );
     }
 
-    /// An observer's full-settle verdict stands against a later short one. A
+    /// An observer's full-settle verdict stands against a later partial one. A
     /// cursor confirmation does not: it confirms the height, not which txs ran.
     #[test]
-    fn a_short_verdict_cannot_override_a_settled_entry() {
+    fn a_partial_verdict_cannot_override_a_settled_entry() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
         pool.mark_settled(10);
-        pool.mark_settled_short(10, Vec::new());
-        assert!(pool.take_settled_short().is_none());
+        pool.mark_settled_partial(10, Vec::new());
+        assert!(pool.take_settled_partial().is_none());
     }
 
-    /// An L1 reorg can land before the slot sweeps a prefix verdict. The entry
+    /// An L1 reorg can land before the slot sweeps a partial verdict. The entry
     /// must roll out with its block, or it holds the gate shut for good.
     #[test]
-    fn an_unswept_prefix_settlement_rolls_out_with_its_l1_block() {
+    fn an_unswept_partial_settlement_rolls_out_with_its_l1_block() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
-        pool.mark_settled_short(10, vec![tx(1).hash]);
+        pool.mark_settled_partial(10, vec![tx(1).hash]);
 
         let rolled = pool.take_rolled_out(9);
         assert_eq!(
@@ -622,7 +627,7 @@ mod tests {
             None,
             "nothing left to hold the gate"
         );
-        assert!(pool.take_settled_short().is_none());
+        assert!(pool.take_settled_partial().is_none());
     }
 
     #[test]

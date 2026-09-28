@@ -1429,10 +1429,10 @@ where
         // failed Sync block has either committed (head ≥ height →
         // reorg it out) or permanently didn't (stale-parent bail —
         // nothing to roll back).
-        if let Some(short) = rollup.optimistic.take_settled_short() {
+        if let Some(partial) = rollup.optimistic.take_settled_partial() {
             // No rollback: the height is canonical, so this owes the slot
             // nothing beyond the tx disposition and the slot proceeds normally.
-            self.recover_short_batch(rollup_id, rollup, short).await;
+            self.recover_partial_batch(rollup_id, rollup, partial).await;
         }
         if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
             // A moved head makes this slot's parent stale — the Sequencer's bail
@@ -1606,8 +1606,8 @@ where
             return;
         };
         let cursor = rollup.l1_head.cursor();
-        if let Some(short) = rollup.optimistic.take_settled_short() {
-            self.recover_short_batch(rollup_id, rollup, short).await;
+        if let Some(partial) = rollup.optimistic.take_settled_partial() {
+            self.recover_partial_batch(rollup_id, rollup, partial).await;
         }
         if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
             // Deliberately ignored: a tick owes no block, and the Sequencer
@@ -1665,21 +1665,21 @@ where
         }
     }
 
-    /// Sweep a prefix-settled batch: the height stays canonical, so nothing is
+    /// Sweep a partially settled batch: the height stays canonical, so nothing is
     /// rolled back and only the tx disposition is owed.
     ///
     /// Txs with a spent nonce are released, the rest re-queue. An inbound tx's
     /// nonce is spent if it has an L1 receipt, reverted or not; an outbound
     /// tx's if its entry applied, which keeps it in the Sync block.
-    async fn recover_short_batch(
+    async fn recover_partial_batch(
         &self,
         rollup_id: u64,
         rollup: &RollupState<L2>,
-        short: crate::optimistic::FailedBatch,
+        partial: crate::optimistic::FailedBatch,
     ) {
-        let sync_height = short.sync_height;
-        let mut landed = short.kept_outbound.clone();
-        for tx in short
+        let sync_height = partial.sync_height;
+        let mut landed = partial.kept_outbound.clone();
+        for tx in partial
             .txs
             .iter()
             .filter(|tx| tx.direction == Direction::Inbound)
@@ -1691,33 +1691,33 @@ where
                     // Without receipts a burned nonce is indistinguishable from
                     // a re-queueable tx, so hold the entry and retry next slot.
                     event!(
-                        name: "eez.composer.recovery.short_receipt_check_failed",
+                        name: "eez.composer.recovery.partial_receipt_check_failed",
                         Level::WARN,
                         rollup_id,
                         sync_height,
                         tx_hash = %tx.hash,
                         error = %err,
-                        "receipt lookup failed for a prefix-settled batch; retaining for retry",
+                        "receipt lookup failed for a partially settled batch; retaining for retry",
                     );
-                    rollup.optimistic.reinsert_settled_short(short);
+                    rollup.optimistic.reinsert_settled_partial(partial);
                     return;
                 }
             }
         }
         event!(
-            name: "eez.composer.recovery.settled_short",
+            name: "eez.composer.recovery.settled_partial",
             Level::INFO,
-            event_name = "eez.composer.recovery.settled_short",
+            event_name = "eez.composer.recovery.settled_partial",
             rollup_id,
             sync_height,
-            txs = short.txs.len(),
+            txs = partial.txs.len(),
             landed = landed.len(),
-            kept_outbound = short.kept_outbound.len(),
-            "prefix settlement: txs with a spent nonce are released, the rest re-queue",
+            kept_outbound = partial.kept_outbound.len(),
+            "partial settlement: txs with a spent nonce are released, the rest re-queue",
         );
         // Only spent-nonce txs can be stranded by a reorg; the re-queued ones
         // are the pool's again.
-        let stranded: Vec<crate::HeldTx> = short
+        let stranded: Vec<crate::HeldTx> = partial
             .txs
             .iter()
             .filter(|tx| landed.contains(&tx.hash))
@@ -1729,13 +1729,13 @@ where
             rollup_id,
             rollup.held_pool.as_ref(),
             sync_height,
-            short.txs,
+            partial.txs,
             &landed,
             false,
         );
         rollup
             .optimistic
-            .retain_for_reorg(sync_height, short.post_batch_hash, stranded);
+            .retain_for_reorg(sync_height, partial.post_batch_hash, stranded);
     }
 
     /// Reorg a landed failed batch out, substitute an empty sibling (the shape
@@ -4410,13 +4410,13 @@ async fn observe_bundle_outcome(
         Ok(SendOutcome::Included { settlement, .. }) => Some(settlement),
         _ => None,
     };
-    // Settled = L1 reached the claimed endpoint. Anything short is a prefix.
+    // Settled = L1 reached the claimed endpoint. Anything less is partial.
     let settled = settlement.is_some_and(|s| s.final_state == Some(expected_final_state));
     // The anchor claims the block BEFORE this one, so an anchor-only settlement
     // leaves this height unratified: reorged, not kept.
     let kept_an_effect = settlement.is_some_and(eez_l1::Settlement::applied_an_effect);
     match &outcome {
-        // Settled SHORT: the height stays canonical and the Deriver rebuilds the
+        // Settled partially: the height stays canonical and the Deriver rebuilds the
         // block L1 named; only the unconsumed tail is owed a disposition.
         Ok(o @ SendOutcome::Included { .. }) if !settled && kept_an_effect => event!(
             name: "eez.composer.bundle.observed",
@@ -4428,7 +4428,7 @@ async fn observe_bundle_outcome(
             kept_an_effect,
             applied = ?settlement.map(eez_l1::Settlement::applied_indices),
             outcome = ?o,
-            "postBatch settled a PREFIX; L1 kept part of this batch",
+            "postBatch settled partially; L1 kept part of this batch",
         ),
         Ok(o @ SendOutcome::Included { .. }) if !settled => event!(
             name: "eez.composer.bundle.observed",
@@ -4472,10 +4472,10 @@ async fn observe_bundle_outcome(
     if settled {
         optimistic.mark_settled(sync_height);
     } else if kept_an_effect {
-        // L1 kept a prefix of the effects, so this height stays canonical and
+        // L1 kept part of the effects, so this height stays canonical and
         // recovery owes only the tail disposition — no rollback.
         let kept = settlement.map_or_else(Vec::new, |s| kept_outbound(s, &outbound_hashes));
-        optimistic.mark_settled_short(sync_height, kept);
+        optimistic.mark_settled_partial(sync_height, kept);
     } else {
         // Includes the anchor-only case: the commitment moved but no effect ran,
         // so the block is unratified and the reorg path is correct.
@@ -4617,7 +4617,7 @@ mod tests {
     /// The safety property: a receipt means the tx ran, so its nonce is burned;
     /// no receipt means it never ran and must come back.
     #[test]
-    fn a_prefix_settlement_releases_what_landed_and_requeues_only_the_tail() {
+    fn a_partial_settlement_releases_what_landed_and_requeues_only_the_tail() {
         let pool = crate::HeldPool::new();
         let sender = Address::repeat_byte(0x11);
         for (nonce, byte) in [(1u64, 0xA1u8), (2, 0xA2), (3, 0xA3)] {
@@ -4639,7 +4639,7 @@ mod tests {
         );
         assert_eq!(
             queued[0].attempts, 0,
-            "a short settle charges no attempt: the reverting tx is removed by \
+            "a partial settlement charges no attempt: the reverting tx is removed by \
              the burn, and the tail behind it is not at fault",
         );
     }

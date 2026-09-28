@@ -56,7 +56,7 @@ pub enum SendOutcome {
         tx_hash: TxHash,
         l1_block: u64,
         /// Which entries L1 applied, from the same windowed pass the deriver
-        /// uses; `final_state` distinguishes "settled short" from "nothing".
+        /// uses; `final_state` distinguishes "settled partially" from "nothing".
         settlement: crate::scan::Settlement,
     },
     Dropped {
@@ -65,8 +65,8 @@ pub enum SendOutcome {
     },
 }
 
-/// Whether a bundled user_tx may revert without failing the bundle, leaving L1
-/// at a prefix. On by default; `EEZ_PARTIAL_CONSUMPTION=0` restores all-or-nothing.
+/// Whether a bundled user_tx may revert without failing the bundle, so L1
+/// settles partially. On by default; `EEZ_PARTIAL_CONSUMPTION=0` restores all-or-nothing.
 ///
 /// Read once: flipping mid-run would make two bundles disagree.
 fn partial_consumption_enabled() -> bool {
@@ -562,7 +562,7 @@ async fn post_bundle(
     pin_timestamp: Option<u64>,
 ) -> L1Result<()> {
     // Any revert OUTSIDE `revertingTxHashes` fails the bundle; whitelisting the
-    // user_txs lets one revert while the postBatch lands, stopping L1 at a prefix.
+    // user_txs lets one revert while the postBatch lands, so L1 settles partially.
     let reverting = reverting_whitelist(raw_tx_hexes, partial_consumption_enabled());
     let mut bundle_params = serde_json::json!({
         "txs": raw_tx_hexes,

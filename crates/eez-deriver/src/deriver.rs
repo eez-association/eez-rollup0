@@ -2605,7 +2605,7 @@ mod applied_selection_tests {
     /// A partial settlement rebuilds only the entries that ran. The unconsumed
     /// tail is absent, not truncated-to-length.
     #[test]
-    fn stopping_short_selects_only_what_ran() {
+    fn a_partial_run_selects_only_what_ran() {
         let s = slots(&[
             (0, EntryRole::Anchor),
             (1, EntryRole::Outbound { ordinal: 0 }),
