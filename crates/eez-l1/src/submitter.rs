@@ -24,6 +24,9 @@ use crate::l1_reader::L1Reader;
 
 /// Wall-clock cap on the target-block + inclusion check.
 const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
+/// How long to retry the settlement read of an included bundle before
+/// returning the error.
+const SETTLEMENT_READ_BUDGET: Duration = Duration::from_mins(3);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// L1 block offset for [`BundleTarget::NextBlock`]. slack=2 (over the
 /// minimal latest+1) gives a one-block cushion for when our local
@@ -391,6 +394,9 @@ impl Inner {
         let start = tokio::time::Instant::now();
         let target_provider = self.build_target_provider();
         let mut slow_logged = false;
+        // Starts when inclusion is first seen: timing from `start` would spend
+        // the budget on the receipt wait, leaving a late bundle no retries.
+        let mut settlement_read_since: Option<tokio::time::Instant> = None;
         loop {
             // Transient RPC failures are retried, never escalated to a
             // failure verdict — while polling, the ledger stays Pending
@@ -411,16 +417,26 @@ impl Inner {
                                 settlement,
                             });
                         }
-                        // The receipt proves it LANDED: a transient read
-                        // escaping here would reorg out a ratified height.
-                        Err(err) if !err.is_terminal() => event!(
+                        // The receipt proves it landed, so a transient read
+                        // error must not reorg the height out. Give up after
+                        // the budget, so a stuck provider cannot hold the gate
+                        // shut.
+                        Err(err)
+                            if !err.is_terminal()
+                                && settlement_read_since
+                                    .get_or_insert_with(tokio::time::Instant::now)
+                                    .elapsed()
+                                    < SETTLEMENT_READ_BUDGET =>
+                        {
+                            event!(
                             name: "eez.submitter.observe.settlement_read_failed",
                             Level::WARN,
                             tx_hash = %tx_hash,
                             l1_block,
-                            error = %err,
-                            "settlement read failed after inclusion; retrying",
-                        ),
+                                error = %err,
+                                "settlement read failed after inclusion; retrying",
+                            );
+                        }
                         Err(err) => return Err(err),
                     }
                 }

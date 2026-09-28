@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use alloy_consensus::Transaction;
 use alloy_consensus::transaction::TxHashRef;
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::Filter;
 use alloy_sol_types::{SolCall, SolEvent};
@@ -32,8 +32,8 @@ struct Positioned<T> {
 /// A root L1 stored for our rollup.
 type SettledRoot = Positioned<B256>;
 
-/// A deferred entry L1 consumed, by its position in the rollup's entry queue.
-type ConsumedEntry = Positioned<(u64, B256)>;
+/// A consumed entry: slot, call hash, and the consuming log's index.
+type ConsumedEntry = Positioned<(u64, B256, u64)>;
 
 /// A decoded `BatchPosted` log, before settlement attribution. Held between the
 /// scan's two passes: windows need every batch in the block decoded first.
@@ -43,6 +43,10 @@ struct DecodedBatchLog {
     l1_block_hash: B256,
     tx_hash: B256,
     tx_index: u64,
+    /// Log index of this batch's `BatchPosted`. EEZ.sol clears the transient
+    /// table just before emitting it, so a consumption logged earlier read that
+    /// table, and one logged later read the queue.
+    log_index: u64,
     submitter: Address,
     /// This batch lists our rollup, so it wiped our queue — a window boundary.
     verifies_our_rollup: bool,
@@ -189,8 +193,8 @@ fn transient_prefix_index(run_end: usize, immediate: usize, slot: usize) -> Opti
 struct ConsumptionEvidence {
     /// `L2ExecutionPerformed.newState`, in emission order.
     observed: Vec<B256>,
-    /// `(entryQueueIndex, crossChainCallHash)` per consumed deferred entry.
-    consumed: Vec<(u64, B256)>,
+    /// `(slot, crossChainCallHash, consuming log index)`.
+    consumed: Vec<(u64, B256, u64)>,
     /// Entry indices of inline immediates L1 skipped.
     skipped_immediates: Vec<usize>,
 }
@@ -384,77 +388,44 @@ pub(crate) async fn scan_batch_logs_range(
     from_block: u64,
     to_block: u64,
 ) -> L1Result<Vec<ScannedBatch>> {
+    // One `get_logs` for batches and all evidence: separate calls can answer
+    // from different forks, and a missing family looks like one that never
+    // emitted. Roots lose their server-side rollup filter and are matched below.
     let filter = Filter::new()
         .address(eez)
-        .event_signature(BatchPosted::SIGNATURE_HASH)
-        .from_block(from_block)
-        .to_block(BlockNumberOrTag::Number(to_block));
-    let logs = provider
-        .get_logs(&filter)
-        .await
-        .map_err(|e| L1Error::Provider(format!("get_logs(BatchPosted): {e}")))?;
-
-    let winners_filter = Filter::new()
-        .address(eez)
-        .event_signature(L2ExecutionPerformed::SIGNATURE_HASH)
-        .topic1(U256::from(rollup_id))
-        .from_block(from_block)
-        .to_block(BlockNumberOrTag::Number(to_block));
-    let winner_logs = provider
-        .get_logs(&winners_filter)
-        .await
-        .map_err(|e| L1Error::Provider(format!("get_logs(L2ExecutionPerformed): {e}")))?;
-    // Pinned by block hash too: the same tx can sit on both sides of a fork.
-    let winner_tx_hashes: HashSet<(B256, B256)> = winner_logs
-        .iter()
-        .filter_map(|l| Some((l.block_hash?, l.transaction_hash?)))
-        .collect();
-    // Settled roots per L1 block, in emission order and tagged with the emitting
-    // tx index. Per-TX-INDEX because two composers can post for the same rollup
-    // in one L1 block: crediting a batch with the whole block's roots would hand
-    // a loser its rival's settlement.
-    let mut settled_by_block: HashMap<u64, Vec<SettledRoot>> = HashMap::new();
-    for l in &winner_logs {
-        let (Some(bn), Some(tx_index)) = (l.block_number, l.transaction_index) else {
-            continue;
-        };
-        let block_hash = l.block_hash.ok_or_else(|| {
-            L1Error::Provider("L2ExecutionPerformed log missing block_hash".into())
-        })?;
-        let data = l.data().data.as_ref();
-        if data.len() == 32 {
-            settled_by_block.entry(bn).or_default().push(SettledRoot {
-                tx_index,
-                log_index: l.log_index.unwrap_or_default(),
-                block_hash,
-                payload: B256::from_slice(data),
-            });
-        }
-    }
-    for roots in settled_by_block.values_mut() {
-        roots.sort_by_key(|r| (r.tx_index, r.log_index));
-    }
-
-    // Both topics in ONE `get_logs`, so the two readings can never straddle
-    // different chain views.
-    let consumption_filter = Filter::new()
-        .address(eez)
         .event_signature(vec![
+            BatchPosted::SIGNATURE_HASH,
+            L2ExecutionPerformed::SIGNATURE_HASH,
             ExecutionConsumed::SIGNATURE_HASH,
             L2TxSkipped::SIGNATURE_HASH,
         ])
         .from_block(from_block)
         .to_block(BlockNumberOrTag::Number(to_block));
-    let consumption_logs = provider
-        .get_logs(&consumption_filter)
+    let all_logs = provider
+        .get_logs(&filter)
         .await
-        .map_err(|e| L1Error::Provider(format!("get_logs(consumption): {e}")))?;
+        .map_err(|e| L1Error::Provider(format!("get_logs(batches + evidence): {e}")))?;
+    let logs: Vec<_> = all_logs
+        .iter()
+        .filter(|l| l.topic0() == Some(&BatchPosted::SIGNATURE_HASH))
+        .cloned()
+        .collect();
+    let evidence_logs = all_logs;
 
     let mut consumed_by_block: HashMap<u64, Vec<ConsumedEntry>> = HashMap::new();
     // `L2TxSkipped(i)` labels the posting tx's OWN `batch.entries` (EEZ.sol
     // step 5), so a rival's indices name different entries and must not merge.
     let mut skipped_by_tx: HashMap<(B256, B256), HashSet<usize>> = HashMap::new();
-    for l in &consumption_logs {
+    let mut winner_tx_hashes: HashSet<(B256, B256)> = HashSet::new();
+    // Roots per L1 block, tagged by tx index: when two composers post in one
+    // block, neither batch may be credited with the other's roots.
+    let mut settled_by_block: HashMap<u64, Vec<SettledRoot>> = HashMap::new();
+    // Forks seen per block, per family. A lagging provider can answer from a
+    // fork the batch is not on, and an off-fork record reads as "nothing ran".
+    let mut root_forks: HashMap<u64, HashSet<B256>> = HashMap::new();
+    let mut consumed_forks: HashMap<u64, HashSet<B256>> = HashMap::new();
+    let mut skip_forks: HashMap<u64, HashSet<B256>> = HashMap::new();
+    for l in &evidence_logs {
         let (Some(bn), Some(tx_index), Some(block_hash), Some(tx_hash)) = (
             l.block_number,
             l.transaction_index,
@@ -464,6 +435,24 @@ pub(crate) async fn scan_batch_logs_range(
             continue;
         };
         match l.topic0() {
+            Some(t) if *t == L2ExecutionPerformed::SIGNATURE_HASH => {
+                let decoded = L2ExecutionPerformed::decode_log(&alloy_primitives::Log {
+                    address: l.address(),
+                    data: l.data().clone(),
+                })
+                .map_err(|e| L1Error::Decode(format!("decode L2ExecutionPerformed: {e}")))?;
+                if decoded.rollupId != rollup_id {
+                    continue;
+                }
+                root_forks.entry(bn).or_default().insert(block_hash);
+                winner_tx_hashes.insert((block_hash, tx_hash));
+                settled_by_block.entry(bn).or_default().push(SettledRoot {
+                    tx_index,
+                    log_index: l.log_index.unwrap_or_default(),
+                    block_hash,
+                    payload: decoded.newState,
+                });
+            }
             Some(t) if *t == ExecutionConsumed::SIGNATURE_HASH => {
                 let decoded = ExecutionConsumed::decode_log(&alloy_primitives::Log {
                     address: l.address(),
@@ -476,6 +465,7 @@ pub(crate) async fn scan_batch_logs_range(
                 let slot = u64::try_from(decoded.entryQueueIndex).map_err(|_| {
                     L1Error::Decode("ExecutionConsumed queue index overflows u64".into())
                 })?;
+                consumed_forks.entry(bn).or_default().insert(block_hash);
                 consumed_by_block
                     .entry(bn)
                     .or_default()
@@ -483,7 +473,11 @@ pub(crate) async fn scan_batch_logs_range(
                         tx_index,
                         log_index: l.log_index.unwrap_or_default(),
                         block_hash,
-                        payload: (slot, decoded.crossChainCallHash),
+                        payload: (
+                            slot,
+                            decoded.crossChainCallHash,
+                            l.log_index.unwrap_or_default(),
+                        ),
                     });
             }
             Some(t) if *t == L2TxSkipped::SIGNATURE_HASH => {
@@ -495,6 +489,7 @@ pub(crate) async fn scan_batch_logs_range(
                 let index = usize::try_from(decoded.transientIdx).map_err(|_| {
                     L1Error::Decode("L2TxSkipped transient index overflows usize".into())
                 })?;
+                skip_forks.entry(bn).or_default().insert(block_hash);
                 skipped_by_tx
                     .entry((block_hash, tx_hash))
                     .or_default()
@@ -502,6 +497,9 @@ pub(crate) async fn scan_batch_logs_range(
             }
             _ => {}
         }
+    }
+    for roots in settled_by_block.values_mut() {
+        roots.sort_by_key(|r| (r.tx_index, r.log_index));
     }
     for entries in consumed_by_block.values_mut() {
         entries.sort_by_key(|c| (c.tx_index, c.log_index));
@@ -560,6 +558,7 @@ pub(crate) async fn scan_batch_logs_range(
             l1_block_number,
             l1_block_hash,
             tx_hash,
+            log_index: log.log_index.unwrap_or_default(),
             tx_index,
             submitter,
             // A batch verifies (and therefore wipes) our rollup iff it lists it
@@ -597,26 +596,36 @@ pub(crate) async fn scan_batch_logs_range(
             .get(&(b.l1_block_number, b.l1_block_hash))
             .and_then(|idxs| idxs.iter().copied().find(|&i| i > b.tx_index))
             .unwrap_or(u64::MAX);
-        // Roots at this height on a DIFFERENT hash mean the two log queries
-        // straddled a reorg; retry rather than silently settling empty.
+        // A batch that does not verify our rollup cannot settle it.
+        if !b.verifies_our_rollup {
+            out.push(ScannedBatch {
+                l1_block_number: b.l1_block_number,
+                l1_block_hash: b.l1_block_hash,
+                tx_hash: b.tx_hash,
+                submitter: b.submitter,
+                call_data: b.batch.callData,
+                state_applied: winner_tx_hashes.contains(&(b.l1_block_hash, b.tx_hash)),
+                settlement: Settlement::NONE,
+            });
+            continue;
+        }
+        // Per family: pooled, one on-fork root would vouch for an off-fork
+        // consumption and turn a retryable straddle into a halt.
+        for (family, forks) in [
+            ("settlement", root_forks.get(&b.l1_block_number)),
+            ("consumption", consumed_forks.get(&b.l1_block_number)),
+            ("skip", skip_forks.get(&b.l1_block_number)),
+        ] {
+            if forks.is_some_and(|hashes| !hashes.contains(&b.l1_block_hash)) {
+                return Err(L1Error::SourceIncomplete {
+                    block: b.l1_block_number,
+                    tx_hash: b.tx_hash,
+                    detail: format!("{family} logs are from another fork of this block; retry"),
+                });
+            }
+        }
         let block_roots = settled_by_block.get(&b.l1_block_number);
-        if block_roots.is_some_and(|roots| roots.iter().all(|r| r.block_hash != b.l1_block_hash)) {
-            return Err(L1Error::SourceIncomplete {
-                block: b.l1_block_number,
-                tx_hash: b.tx_hash,
-                detail: "settlement logs are from another fork of this block; retry".into(),
-            });
-        }
-        // Consumption is a SEPARATE `get_logs`: silently dropping its off-fork
-        // records leaves a terminal count mismatch from a transient cause.
         let block_consumed = consumed_by_block.get(&b.l1_block_number);
-        if block_consumed.is_some_and(|cs| cs.iter().all(|c| c.block_hash != b.l1_block_hash)) {
-            return Err(L1Error::SourceIncomplete {
-                block: b.l1_block_number,
-                tx_hash: b.tx_hash,
-                detail: "consumption logs are from another fork of this block; retry".into(),
-            });
-        }
         // One window serves every event family: from this batch's own tx up to
         // the next postBatch that verifies our rollup, pinned to this fork.
         let evidence = ConsumptionEvidence {
@@ -633,8 +642,8 @@ pub(crate) async fn scan_batch_logs_range(
         };
         // Every attribution failure halts the node, so name the locus: the
         // counts alone leave an operator nothing to grep L1 for.
-        let settlement =
-            attribute_settlement(&b.batch, rollup_id, &evidence).map_err(|e| match e {
+        let settlement = attribute_settlement(&b.batch, rollup_id, b.log_index, &evidence)
+            .map_err(|e| match e {
                 L1Error::Decode(msg) => L1Error::Decode(format!(
                     "{msg} (L1 block {} {}, postBatch {})",
                     b.l1_block_number, b.l1_block_hash, b.tx_hash,
@@ -674,6 +683,7 @@ fn in_window<T: Copy>(
 fn attribute_settlement(
     batch: &ProofSystemBatchPerVerificationEntriesSol,
     rollup_id: u64,
+    batch_log_index: u64,
     evidence: &ConsumptionEvidence,
 ) -> L1Result<Settlement> {
     if evidence.observed.is_empty() {
@@ -689,35 +699,35 @@ fn attribute_settlement(
         .filter(|index| !evidence.skipped_immediates.contains(index))
         .collect();
 
-    // Deferred entries: each consumption names a slot, but in one of two index
-    // spaces — the rollup's persistent queue, or a contract poster's transient
-    // prefix. The entry's own key picks the space, mirroring `_entryMatches`
-    // on-chain. At most one candidate can match: a consumption always carries a
-    // real call hash, and those are unique per entry (invariant 5).
-    for &(slot, call_hash) in &evidence.consumed {
+    // A slot indexes one of two tables, and the log's position says which: the
+    // transient table exists only before this batch's `BatchPosted`, and the
+    // window starts at the batch's own tx. The call hash cannot choose
+    // (identical calls share one), but it confirms the entry the table names.
+    for &(slot, call_hash, consumed_at) in &evidence.consumed {
         let slot = usize::try_from(slot).unwrap_or(usize::MAX);
-        let entry_index = [
-            queue.get(slot).copied(),
-            transient_prefix_index(run_end, immediate, slot),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|&index| {
-            batch.entries[index].proxyEntryHash == call_hash
-                && batch.entries[index].destinationRollupId == rollup_id
-        })
-        .ok_or_else(|| {
-            // No reading of the slot lands on an entry the event could name, so
-            // the window picked up a rival's consumption and the whole
-            // attribution is suspect.
-            L1Error::Decode(format!(
-                "ExecutionConsumed slot {slot} names call hash {call_hash}, which matches no \
-                 entry of rollup {rollup_id} in this batch ({} queued, {} in the transient \
-                 prefix)",
-                queue.len(),
-                immediate.saturating_sub(run_end),
-            ))
-        })?;
+        let from_transient = consumed_at < batch_log_index;
+        let table = if from_transient {
+            transient_prefix_index(run_end, immediate, slot)
+        } else {
+            queue.get(slot).copied()
+        };
+        let entry_index = table
+            .filter(|&index| {
+                batch.entries[index].proxyEntryHash == call_hash
+                    && batch.entries[index].destinationRollupId == rollup_id
+            })
+            .ok_or_else(|| {
+                // No entry of ours at that slot: the window caught a rival's
+                // consumption.
+                L1Error::Decode(format!(
+                    "ExecutionConsumed slot {slot} (call hash {call_hash}, {} table) matches no \
+                     entry of rollup {rollup_id} in this batch ({} queued, {} in the transient \
+                     prefix)",
+                    if from_transient { "transient" } else { "queue" },
+                    queue.len(),
+                    immediate.saturating_sub(run_end),
+                ))
+            })?;
         applied.push(entry_index);
     }
     applied.sort_unstable();
@@ -825,7 +835,7 @@ mod tests {
     use alloy_sol_types::{SolCall, SolEvent};
     use alloy_transport::mock::Asserter;
     use eez_protocol::abi::{
-        BatchPosted, ExecutionEntrySol, L2ExecutionPerformed,
+        BatchPosted, ExecutionEntrySol, L2ExecutionPerformed, L2TxSkipped,
         ProofSystemBatchPerVerificationEntriesSol, RollupIdWithProofSystemsSol, StateUpdateSol,
         postAndVerifyBatchCall,
     };
@@ -907,6 +917,11 @@ mod tests {
     }
 
     const TEST_ROLLUP: u64 = 1;
+    /// The postBatch's own `BatchPosted` log index. A transient consumption is
+    /// logged below it, a queue consumption above it.
+    const BATCH_LOG: u64 = 5;
+    /// A queue consumption's log index, from a later tx.
+    const LATER_LOG: u64 = 9;
 
     fn dummy_call() -> eez_protocol::abi::L2ToL1CallSol {
         eez_protocol::abi::L2ToL1CallSol {
@@ -982,6 +997,7 @@ mod tests {
                     (
                         u64::try_from(slot).unwrap(),
                         batch.entries[i].proxyEntryHash,
+                        LATER_LOG,
                     )
                 })
                 .collect(),
@@ -993,7 +1009,7 @@ mod tests {
         batch: &ProofSystemBatchPerVerificationEntriesSol,
         applied: &[usize],
     ) -> crate::error::L1Result<Settlement> {
-        attribute_settlement(batch, TEST_ROLLUP, &evidence_for(batch, applied))
+        attribute_settlement(batch, TEST_ROLLUP, BATCH_LOG, &evidence_for(batch, applied))
     }
 
     /// Idle `A→A` and rich `A→B` share an L1 block; each is judged against the
@@ -1095,8 +1111,8 @@ mod tests {
         let pre = B256::repeat_byte(0x01);
         let batch = batch_chain(pre, &[B256::repeat_byte(0x11), B256::repeat_byte(0x12)], 1);
         let mut evidence = evidence_for(&batch, &[0, 1]);
-        evidence.consumed = vec![(99, batch.entries[1].proxyEntryHash)];
-        let error = attribute_settlement(&batch, TEST_ROLLUP, &evidence)
+        evidence.consumed = vec![(99, batch.entries[1].proxyEntryHash, LATER_LOG)];
+        let error = attribute_settlement(&batch, TEST_ROLLUP, BATCH_LOG, &evidence)
             .expect_err("an out-of-range queue slot must be terminal");
         assert!(
             matches!(error, L1Error::Decode(ref m) if m.contains("slot 99")),
@@ -1123,10 +1139,10 @@ mod tests {
 
         let evidence = super::ConsumptionEvidence {
             observed: roots.clone(),
-            consumed: vec![(0, batch.entries[1].proxyEntryHash)],
+            consumed: vec![(0, batch.entries[1].proxyEntryHash, 1)],
             skipped_immediates: Vec::new(),
         };
-        let settlement = attribute_settlement(&batch, TEST_ROLLUP, &evidence)
+        let settlement = attribute_settlement(&batch, TEST_ROLLUP, BATCH_LOG, &evidence)
             .expect("transient slot 0 names entry 1");
         assert_eq!(settlement.applied_indices(), &[0, 1]);
         assert_eq!(settlement.final_state, Some(roots[1]));
@@ -1134,11 +1150,52 @@ mod tests {
         // The hash decides, so a slot inside the window that no entry answers
         // for stays terminal instead of resolving positionally.
         let bogus = super::ConsumptionEvidence {
-            consumed: vec![(0, B256::repeat_byte(0xEE))],
+            consumed: vec![(0, B256::repeat_byte(0xEE), LATER_LOG)],
             ..evidence
         };
-        attribute_settlement(&batch, TEST_ROLLUP, &bogus)
+        attribute_settlement(&batch, TEST_ROLLUP, BATCH_LOG, &bogus)
             .expect_err("a call hash no entry carries must be terminal");
+    }
+
+    /// Identical calls share a hash (`computeCrossChainCallHash` has no nonce), so
+    /// with one in each table only where the consumption was logged tells them
+    /// apart.
+    #[test]
+    fn colliding_call_hashes_are_told_apart_by_log_position() {
+        let pre = B256::repeat_byte(0x01);
+        let roots: Vec<B256> = (0x11..=0x13).map(B256::repeat_byte).collect();
+        let mut batch = batch_chain(pre, &roots, 1);
+        // Entry 1 is transient, entry 2 queued, and both answer one hash.
+        batch.immediateEntryCount = U256::from(2u64);
+        let shared = B256::repeat_byte(0x77);
+        batch.entries[1].proxyEntryHash = shared;
+        batch.entries[2].proxyEntryHash = shared;
+
+        // Logged before the batch's `BatchPosted`: the transient table was live.
+        let transient = super::ConsumptionEvidence {
+            observed: vec![roots[0], roots[1]],
+            consumed: vec![(0, shared, 1)],
+            skipped_immediates: Vec::new(),
+        };
+        assert_eq!(
+            attribute_settlement(&batch, TEST_ROLLUP, BATCH_LOG, &transient)
+                .expect("transient consumption")
+                .applied_indices(),
+            &[0, 1],
+        );
+
+        // Logged by a later tx: the transient table was already cleared.
+        let queued = super::ConsumptionEvidence {
+            observed: vec![roots[0], roots[2]],
+            consumed: vec![(0, shared, LATER_LOG)],
+            skipped_immediates: Vec::new(),
+        };
+        assert_eq!(
+            attribute_settlement(&batch, TEST_ROLLUP, BATCH_LOG, &queued)
+                .expect("queued consumption")
+                .applied_indices(),
+            &[0, 2],
+        );
     }
 
     /// The queue map and the call hash are independent readings of the same
@@ -1148,9 +1205,9 @@ mod tests {
         let pre = B256::repeat_byte(0x01);
         let batch = batch_chain(pre, &[B256::repeat_byte(0x11), B256::repeat_byte(0x12)], 1);
         let mut evidence = evidence_for(&batch, &[0, 1]);
-        evidence.consumed = vec![(0, B256::repeat_byte(0xEE))];
+        evidence.consumed = vec![(0, B256::repeat_byte(0xEE), LATER_LOG)];
         assert!(
-            attribute_settlement(&batch, TEST_ROLLUP, &evidence).is_err(),
+            attribute_settlement(&batch, TEST_ROLLUP, BATCH_LOG, &evidence).is_err(),
             "a call hash naming another entry must not be attributed to this one",
         );
     }
@@ -1317,6 +1374,63 @@ mod tests {
         }
     }
 
+    fn skipped_log(
+        transient_idx: u64,
+        block_number: u64,
+        block_hash: B256,
+        tx_hash: B256,
+        tx_index: u64,
+        log_index: u64,
+    ) -> alloy_rpc_types_eth::Log {
+        alloy_rpc_types_eth::Log {
+            inner: alloy_primitives::Log {
+                address: Address::ZERO,
+                data: L2TxSkipped {
+                    transientIdx: U256::from(transient_idx),
+                    revertData: Bytes::new(),
+                }
+                .encode_log_data(),
+            },
+            block_hash: Some(block_hash),
+            block_number: Some(block_number),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: Some(tx_index),
+            log_index: Some(log_index),
+            removed: false,
+        }
+    }
+
+    /// Skips are indexed by block hash, so an off-fork one reads as "nothing
+    /// skipped" and every immediate wrongly counts as applied.
+    #[tokio::test]
+    async fn cross_fork_skip_logs_are_source_incomplete_not_applied() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let hash_a = B256::with_last_byte(0xA1);
+        let hash_b = B256::with_last_byte(0xB2);
+        let tx = batch_tx(
+            1,
+            Some((B256::repeat_byte(0x10), B256::repeat_byte(0x11))),
+            0,
+        );
+        let tx_hash = *tx.inner.tx_hash();
+
+        // The batch on fork A with no roots (its entry was skipped); the skip on
+        // fork B.
+        asserter.push_success(&serde_json::json!([
+            batch_posted_log(700, hash_a, tx_hash, 0),
+            skipped_log(0, 700, hash_b, tx_hash, 0, 0),
+        ]));
+        asserter.push_success(&tx);
+
+        let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
+            .await
+            .expect_err("off-fork skips must be retryable, not silently 'nothing skipped'");
+        assert!(err.is_source_incomplete(), "unexpected error: {err}");
+    }
+
     /// The boot-crash fix's linchpin: a tx the L1 serves at (block hash, index) is
     /// returned when its hash matches the log's; a null lookup classifies as
     /// `SourceIncomplete` (retryable) rather than a fatal provider error.
@@ -1386,8 +1500,6 @@ mod tests {
         asserter
             .push_failure_msg("query exceeds max results 20000, retry with the range 1288-33632");
         asserter.push_success(&serde_json::json!([]));
-        asserter.push_success(&serde_json::json!([])); // consumption events
-        asserter.push_success(&serde_json::json!([]));
         let scanned = scan_next_batch_log_chunk(&provider, Address::ZERO, 1, &mut chunks)
             .await
             .expect("must NOT propagate — narrowing is the remedy")
@@ -1448,8 +1560,6 @@ mod tests {
 
         // Retry succeeds (BatchPosted logs + winners logs, both empty).
         asserter.push_success(&serde_json::json!([]));
-        asserter.push_success(&serde_json::json!([])); // consumption events
-        asserter.push_success(&serde_json::json!([]));
         let scanned = scan_next_batch_log_chunk(&provider, Address::ZERO, 1, &mut chunks)
             .await
             .expect("retry succeeds")
@@ -1481,8 +1591,8 @@ mod tests {
         );
         let tx_hash = *tx.inner.tx_hash();
 
-        asserter.push_success(&vec![batch_posted_log(100, hash_a, tx_hash, 0)]);
-        asserter.push_success(&vec![
+        asserter.push_success(&serde_json::json!([
+            batch_posted_log(100, hash_a, tx_hash, 0),
             // Unrelated settlement on our OWN hash — keeps this distinct from
             // the all-different-fork case (SourceIncomplete; tested separately).
             settled_root_log(
@@ -1496,8 +1606,7 @@ mod tests {
             ),
             // Same tx hash as our postBatch tx, but a DIFFERENT block hash.
             settled_root_log(1, B256::repeat_byte(0xE5), 100, hash_b, tx_hash, 2, 0),
-        ]);
-        asserter.push_success(&serde_json::json!([])); // consumption events
+        ]));
         asserter.push_success(&tx);
 
         let scanned = scan_batch_logs_range(&provider, Address::ZERO, 1, 100, 100)
@@ -1531,16 +1640,14 @@ mod tests {
             *boundary.inner.tx_hash(),
         );
 
-        asserter.push_success(&vec![
+        asserter.push_success(&serde_json::json!([
             batch_posted_log(500, hash_a, ours_hash, 3),
             batch_posted_log(500, hash_b, rival_hash, 5),
             batch_posted_log(500, hash_a, boundary_hash, 9),
-        ]);
-        asserter.push_success(&vec![
             // tx_index 7: past the rival's 5, before our real boundary at 9.
             settled_root_log(1, c1, 500, hash_a, B256::with_last_byte(0xF0), 7, 0),
             // Decoy on the rival's hash so its own pass doesn't trip the
-            // all-roots-on-a-foreign-fork guard first.
+            // fork guard first.
             settled_root_log(
                 1,
                 B256::repeat_byte(0x99),
@@ -1550,8 +1657,7 @@ mod tests {
                 5,
                 0,
             ),
-        ]);
-        asserter.push_success(&serde_json::json!([])); // consumption events
+        ]));
         asserter.push_success(&ours);
         asserter.push_success(&rival);
         asserter.push_success(&boundary);
@@ -1572,6 +1678,44 @@ mod tests {
         assert_eq!(ours.settlement.entry_state, Some(c0));
     }
 
+    /// A postBatch for another rollup shares our block without closing our
+    /// window, so our evidence falls inside its window too. It must settle
+    /// nothing rather than halt us.
+    #[tokio::test]
+    async fn a_foreign_only_batch_settles_nothing_instead_of_halting_us() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let block_hash = B256::with_last_byte(0xA1);
+        // The posted batch verifies rollup 2; we are scanning for rollup 1.
+        let foreign = batch_tx(2, None, 0);
+        let foreign_hash = *foreign.inner.tx_hash();
+
+        // One response: the foreign batch, and our root inside its window.
+        asserter.push_success(&serde_json::json!([
+            batch_posted_log(700, block_hash, foreign_hash, 0),
+            settled_root_log(
+                1,
+                B256::repeat_byte(0x77),
+                700,
+                block_hash,
+                B256::with_last_byte(0xC3),
+                1,
+                0,
+            ),
+        ]));
+        asserter.push_success(&foreign);
+
+        let scanned = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
+            .await
+            .expect("a batch that does not verify us must not halt derivation");
+        assert_eq!(scanned.len(), 1);
+        assert!(
+            scanned[0].settlement.is_empty(),
+            "a foreign batch cannot settle our rollup",
+        );
+    }
+
     #[tokio::test]
     async fn cross_fork_settlement_logs_are_source_incomplete_not_empty() {
         let asserter = Asserter::new();
@@ -1582,17 +1726,20 @@ mod tests {
         let tx = batch_tx(1, None, 0);
         let tx_hash = *tx.inner.tx_hash();
 
-        asserter.push_success(&vec![batch_posted_log(700, hash_a, tx_hash, 0)]);
-        asserter.push_success(&vec![settled_root_log(
-            1,
-            B256::repeat_byte(0x77),
-            700,
-            hash_b,
-            B256::with_last_byte(0xC3),
-            1,
-            0,
-        )]);
-        asserter.push_success(&serde_json::json!([])); // consumption events
+        // One response with the batch on fork A and every root on fork B, as a
+        // lagging or load-balanced provider can return.
+        asserter.push_success(&serde_json::json!([
+            batch_posted_log(700, hash_a, tx_hash, 0),
+            settled_root_log(
+                1,
+                B256::repeat_byte(0x77),
+                700,
+                hash_b,
+                B256::with_last_byte(0xC3),
+                1,
+                0,
+            ),
+        ]));
         asserter.push_success(&tx);
 
         let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
@@ -1614,8 +1761,6 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
         asserter.push_success(&vec![batch_posted_log(700, block_hash, tx_hash, 0)]);
-        asserter.push_success(&Vec::<alloy_rpc_types_eth::Log>::new());
-        asserter.push_success(&serde_json::json!([])); // consumption events
         asserter.push_success(&tx);
         let scanned = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
             .await
@@ -1625,17 +1770,10 @@ mod tests {
         // Settled our rollup: we cannot derive it, so fail loudly.
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
-        asserter.push_success(&vec![batch_posted_log(700, block_hash, tx_hash, 0)]);
-        asserter.push_success(&vec![settled_root_log(
-            1,
-            B256::repeat_byte(0x77),
-            700,
-            block_hash,
-            tx_hash,
-            0,
-            0,
-        )]);
-        asserter.push_success(&serde_json::json!([])); // consumption events
+        asserter.push_success(&serde_json::json!([
+            batch_posted_log(700, block_hash, tx_hash, 0),
+            settled_root_log(1, B256::repeat_byte(0x77), 700, block_hash, tx_hash, 0, 0),
+        ]));
         asserter.push_success(&tx);
         let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
             .await

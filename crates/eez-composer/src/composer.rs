@@ -513,8 +513,8 @@ struct SettlementFailureOutcome {
     evicted: usize,
 }
 
-/// Three-way disposition of a recovered batch's in-flight transactions: a
-/// receipt burns the nonce, no receipt returns the tx to the pool.
+/// Dispose of a recovered batch's txs: a spent nonce (`landed`) releases the
+/// tx, anything else returns it to the pool.
 fn dispose_recovered_txs(
     rollup_id: u64,
     pool: &crate::HeldPool,
@@ -536,7 +536,7 @@ fn dispose_recovered_txs(
                 event_name = "eez.composer.recovery.nonce_burned",
                 rollup_id,
                 tx_hash = %tx.hash,
-                "user_tx already has an L1 receipt; not re-queueing (user must resubmit)",
+                "user_tx nonce already spent; not re-queueing (a reverted one must be resubmitted)",
             );
         } else {
             keep.push(tx);
@@ -564,6 +564,22 @@ fn dispose_recovered_txs(
             "batch recovered; user_txs re-queued (front) for the next Sync slot",
         );
     }
+}
+
+/// Outbound txs whose entries L1 applied. They never ride the L1 bundle, so no
+/// receipt can show it; the applied entry is the only evidence.
+fn kept_outbound(
+    settlement: &eez_l1::Settlement,
+    outbound_hashes: &[alloy_primitives::TxHash],
+) -> Vec<alloy_primitives::TxHash> {
+    settlement
+        .applied()
+        .iter()
+        .filter_map(|entry| match entry.role {
+            eez_l1::EntryRole::Outbound { ordinal } => outbound_hashes.get(ordinal).copied(),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Count one failed settlement episode for every candidate, evict transactions
@@ -1652,8 +1668,9 @@ where
     /// Sweep a prefix-settled batch: the height stays canonical, so nothing is
     /// rolled back and only the tx disposition is owed.
     ///
-    /// Charges no attempt — the reverting tx is burned below, and the tail
-    /// behind it never ran.
+    /// Txs with a spent nonce are released, the rest re-queue. An inbound tx's
+    /// nonce is spent if it has an L1 receipt, reverted or not; an outbound
+    /// tx's if its entry applied, which keeps it in the Sync block.
     async fn recover_short_batch(
         &self,
         rollup_id: u64,
@@ -1661,8 +1678,12 @@ where
         short: crate::optimistic::FailedBatch,
     ) {
         let sync_height = short.sync_height;
-        let mut landed = Vec::new();
-        for tx in &short.txs {
+        let mut landed = short.kept_outbound.clone();
+        for tx in short
+            .txs
+            .iter()
+            .filter(|tx| tx.direction == Direction::Inbound)
+        {
             match self.inner.submitter.receipt_exists(tx.hash).await {
                 Ok(true) => landed.push(tx.hash),
                 Ok(false) => {}
@@ -1691,8 +1712,19 @@ where
             sync_height,
             txs = short.txs.len(),
             landed = landed.len(),
-            "prefix settlement: releasing consumed txs, re-queueing the tail",
+            kept_outbound = short.kept_outbound.len(),
+            "prefix settlement: txs with a spent nonce are released, the rest re-queue",
         );
+        // Only spent-nonce txs can be stranded by a reorg; the re-queued ones
+        // are the pool's again.
+        let stranded: Vec<crate::HeldTx> = short
+            .txs
+            .iter()
+            .filter(|tx| landed.contains(&tx.hash))
+            .cloned()
+            .collect();
+        // No attempt charged: the txs behind the cut are collateral, and
+        // charging them all would evict txs that did nothing wrong.
         dispose_recovered_txs(
             rollup_id,
             rollup.held_pool.as_ref(),
@@ -1701,6 +1733,9 @@ where
             &landed,
             false,
         );
+        rollup
+            .optimistic
+            .retain_for_reorg(sync_height, short.post_batch_hash, stranded);
     }
 
     /// Reorg a landed failed batch out, substitute an empty sibling (the shape
@@ -3373,6 +3408,10 @@ where
             rollup_id,
             sync_height,
             bundle,
+            outbound_user_txs
+                .iter()
+                .map(alloy_primitives::keccak256)
+                .collect(),
             built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
@@ -3502,6 +3541,7 @@ where
             rollup_id,
             sync_height,
             vec![minimal_postbatch_raw],
+            Vec::new(),
             empty_built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
@@ -3630,6 +3670,7 @@ where
                 rollup_id,
                 boundary,
                 vec![raw],
+                Vec::new(),
                 boundary_header.hash(),
                 Arc::clone(&rollup.optimistic),
                 BundleTarget::NextBlock,
@@ -3702,6 +3743,7 @@ where
         rollup_id: u64,
         sync_height: u64,
         bundle: Vec<Bytes>,
+        outbound_hashes: Vec<alloy_primitives::TxHash>,
         expected_final_state: B256,
         optimistic: Arc<OptimisticallyIncluded>,
         target: BundleTarget,
@@ -3711,6 +3753,7 @@ where
             rollup_id,
             sync_height,
             bundle,
+            outbound_hashes,
             expected_final_state,
             optimistic,
             submitter,
@@ -4354,6 +4397,8 @@ async fn observe_bundle_outcome(
     rollup_id: u64,
     sync_height: u64,
     bundle: Vec<Bytes>,
+    // Outbound user tx hashes by ordinal — the index L1 reports them under.
+    outbound_hashes: Vec<alloy_primitives::TxHash>,
     expected_final_state: B256,
     optimistic: Arc<OptimisticallyIncluded>,
     submitter: Submitter,
@@ -4429,7 +4474,8 @@ async fn observe_bundle_outcome(
     } else if kept_an_effect {
         // L1 kept a prefix of the effects, so this height stays canonical and
         // recovery owes only the tail disposition — no rollback.
-        optimistic.mark_settled_short(sync_height);
+        let kept = settlement.map_or_else(Vec::new, |s| kept_outbound(s, &outbound_hashes));
+        optimistic.mark_settled_short(sync_height, kept);
     } else {
         // Includes the anchor-only case: the commitment moved but no effect ran,
         // so the block is unratified and the reorg path is correct.
@@ -4595,6 +4641,37 @@ mod tests {
             queued[0].attempts, 0,
             "a short settle charges no attempt: the reverting tx is removed by \
              the burn, and the tail behind it is not at fault",
+        );
+    }
+
+    /// L1 reports an applied outbound entry by ordinal; it must name the tx at
+    /// that ordinal, and anchors and deliveries name none.
+    #[test]
+    fn kept_outbound_maps_each_applied_ordinal_to_its_own_tx() {
+        use eez_l1::{AppliedEntry, EntryRole, Settlement};
+        let hashes = [TxHash::repeat_byte(0x01), TxHash::repeat_byte(0x02)];
+        let settlement = Settlement::new(
+            vec![
+                AppliedEntry {
+                    entry_index: 0,
+                    role: EntryRole::Anchor,
+                },
+                AppliedEntry {
+                    entry_index: 2,
+                    role: EntryRole::Outbound { ordinal: 1 },
+                },
+                AppliedEntry {
+                    entry_index: 3,
+                    role: EntryRole::Inbound { ordinal: 0 },
+                },
+            ],
+            None,
+            None,
+        );
+        assert_eq!(
+            kept_outbound(&settlement, &hashes),
+            vec![TxHash::repeat_byte(0x02)],
+            "ordinal 0 was not applied, so only the second outbound tx is kept",
         );
     }
 

@@ -551,13 +551,10 @@ where
         let mut new_batches: Vec<BatchRecord> = Vec::new();
         let mut total_replayed: u64 = 0;
         for batch in scanned_batches {
-            let Some(container) =
-                self.decode_our_payload(batch.call_data.as_ref(), batch.l1_block_number)?
-            else {
-                continue;
-            };
-            let decoded = &container.span;
-
+            // Settlement first: a batch that applied nothing for us is skipped
+            // unread, so a peer's payload in a codec we do not read cannot halt
+            // us.
+            //
             // `settled_count == 0` = nothing applied on L1 (the claimed
             // roots are phantoms). Skip the whole reconcile — no
             // cursor advance, no replay, no state check; the composer's
@@ -572,6 +569,12 @@ where
                 );
                 continue;
             }
+            let Some(container) =
+                self.decode_our_payload(batch.call_data.as_ref(), batch.l1_block_number)?
+            else {
+                continue;
+            };
+            let decoded = &container.span;
 
             // Already indexed — processed by an earlier sync; its L2
             // range is accounted for in `cumulative_start`.
@@ -1047,15 +1050,6 @@ where
         settlement: eez_l1::Settlement,
         last_in_l1_block: bool,
     ) -> DeriverResult<()> {
-        let Some(container) = self.decode_our_payload(call_data.as_ref(), l1_block_number)? else {
-            return self.flush_deferred_safe(last_in_l1_block).await;
-        };
-        let decoded = &container.span;
-        let block_count = decoded.block_count() as u64;
-        if block_count == 0 {
-            return self.flush_deferred_safe(last_in_l1_block).await;
-        }
-
         // Dedup by tx_hash — already-indexed = already processed by
         // catch_up; this is a stale live event.
         if self.inner.l1_head.contains_l1_tx(&tx_hash) {
@@ -1084,6 +1078,17 @@ where
                 submitter = %submitter,
                 "postBatch's L1 block has no L2ExecutionPerformed for our rollup; bundle didn't settle, skipping (re-attempt expected)",
             );
+            return self.flush_deferred_safe(last_in_l1_block).await;
+        }
+
+        // Decode only after the gates above, so a skipped peer batch in a codec
+        // we do not read cannot halt us.
+        let Some(container) = self.decode_our_payload(call_data.as_ref(), l1_block_number)? else {
+            return self.flush_deferred_safe(last_in_l1_block).await;
+        };
+        let decoded = &container.span;
+        let block_count = decoded.block_count() as u64;
+        if block_count == 0 {
             return self.flush_deferred_safe(last_in_l1_block).await;
         }
 
@@ -1398,13 +1403,25 @@ where
         Ok(self.l2_sealed_header_at(l2_block)?.hash())
     }
 
-    /// Number of the block a commitment names, or `None` when we do not hold
-    /// it. A hash identifies one block, so this is an index read.
+    /// Height of the canonical block with hash `commitment`, if we hold one.
     fn block_at(&self, commitment: B256) -> DeriverResult<Option<u64>> {
-        self.inner
+        let Some(number) = self
+            .inner
             .l2_provider
             .block_number(commitment)
-            .map_err(DeriverError::l2_provider)
+            .map_err(DeriverError::l2_provider)?
+        else {
+            return Ok(None);
+        };
+        // The hash index still holds replaced siblings, so confirm the canonical
+        // block at that height is this one.
+        let canonical = self
+            .inner
+            .l2_provider
+            .sealed_header(number)
+            .map_err(DeriverError::l2_provider)?
+            .map(|header| header.hash());
+        Ok((canonical == Some(commitment)).then_some(number))
     }
 
     /// Block whose hash is `entry_state`: where this batch's run starts. A
@@ -1522,10 +1539,9 @@ where
                 let (outbound, inbound): (Vec<_>, Vec<_>) = entries
                     .into_iter()
                     .partition(|e| e.proxyEntryHash == alloy_primitives::B256::ZERO);
-                // Captured before drain/truncate: all originally-claimed entries,
-                // settled or not, were paired 1:1 with Sync-block user txs.
+                // Every claimed entry, applied or not, has its DA slot; the
+                // applied subset is selected below.
                 let original_outbound_len = outbound.len();
-
                 let original_inbound_len = inbound.len();
 
                 // The Sync block is the LAST block of the range; its user txs are
@@ -1542,14 +1558,9 @@ where
                     .iter()
                     .map(|t| Bytes::from(t.clone()))
                     .collect();
-                // Outbound entries pair POSITIONALLY with the Sync block's user
-                // txs, so a skipped OR unconsumed outbound entry must drop its user
-                // tx too, else every pair shifts by one. Neither ever lands on this
-                // chain as a bare tx: a skipped entry's tx already landed under the
-                // competing batch that consumed it; an unconsumed one is rolled back
-                // by the composer's own recovery (rich Sync blocks reorg out on
-                // partial settlement) and retried later. Checked against the
-                // pre-truncation count so the unconsumed tail is covered too.
+                // Every claimed outbound entry owns the user tx at its ordinal.
+                // An entry L1 did not apply leaves its tx out of the rebuilt
+                // block, and the composer re-queues it.
                 if sync_user_txs.len() < original_outbound_len {
                     return Err(DeriverError::local_diverged_with_msg(
                         from_block,
@@ -1588,44 +1599,14 @@ where
                 // `CrossChainCallExecuted` events, observable only after replay.
                 gate_outbound = outbound_paired.iter().map(|(e, _)| e.clone()).collect();
 
-                let mut starting_nonce = self.system_address_nonce_at(from_block - 1)?;
-                // A resume starts mid-block: the rival's system txs already sit
-                // here, so count the skipped prefix from the first applied role.
-                let (outbound_skip, inbound_skip) =
-                    match settlement.applied().first().map(|a| a.role) {
-                        Some(eez_l1::EntryRole::Outbound { ordinal }) => (ordinal, 0),
-                        // Every outbound entry precedes every inbound one.
-                        Some(eez_l1::EntryRole::Inbound { ordinal }) => {
-                            (original_outbound_len, ordinal)
-                        }
-                        _ => (0, 0),
-                    };
-                if outbound_skip > 0 || inbound_skip > 0 {
-                    let skipped_paired: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> =
-                        outbound[..outbound_skip]
-                            .iter()
-                            .cloned()
-                            .zip(sync_user_txs[..outbound_skip].iter().cloned())
-                            .collect();
-                    let prefix_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
-                        &skipped_paired,
-                        &inbound[..inbound_skip],
-                        cfg,
-                        starting_nonce,
-                    )
-                    .map_err(|e| {
-                        DeriverError::l2_provider(format!(
-                            "build_cross_chain_sync_pairs(skipped prefix, tx={tx_hash}): {e}"
-                        ))
-                    })?;
-                    starting_nonce = starting_nonce
-                        .checked_add(prefix_pairs.len() as u64)
-                        .ok_or_else(|| {
-                            DeriverError::l2_provider(format!(
-                                "SYSTEM_ADDRESS nonce overflow over the skipped prefix (tx={tx_hash})"
-                            ))
-                        })?;
-                }
+                // A resume appends to the rival's existing Sync block, so start
+                // from that block's nonce rather than infer it from ordinals,
+                // which assumes the skipped prefix had no holes.
+                let starting_nonce = if settlement.resumed() {
+                    self.system_address_nonce_at(from_block)?
+                } else {
+                    self.system_address_nonce_at(from_block - 1)?
+                };
                 let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
                     &outbound_paired,
                     &applied_inbound,
@@ -2564,14 +2545,14 @@ mod applied_selection_tests {
                 }
                 index += 1;
             }
-            let mut want_inbound = 0usize;
+            let mut want_inbound = Vec::new();
             for (ordinal, &pick) in picks[12..].iter().enumerate().take(inbound_len) {
                 if pick {
                     applied.push(AppliedEntry {
                         entry_index: index,
                         role: EntryRole::Inbound { ordinal },
                     });
-                    want_inbound += 1;
+                    want_inbound.push(ordinal);
                 }
                 index += 1;
             }
@@ -2585,9 +2566,14 @@ mod applied_selection_tests {
             .expect("every ordinal addresses the DA");
 
             prop_assert_eq!(slots.outbound_paired.len(), want_outbound.len());
-            prop_assert_eq!(slots.inbound.len(), want_inbound);
+            prop_assert_eq!(slots.inbound.len(), want_inbound.len());
             for (slot, &ordinal) in slots.outbound_paired.iter().zip(&want_outbound) {
                 prop_assert_eq!(&slot.1, &txs[ordinal]);
+            }
+            // Check identity, not just count: a wrong selection can have the
+            // right length.
+            for (slot, &ordinal) in slots.inbound.iter().zip(&want_inbound) {
+                prop_assert_eq!(slot.proxyEntryHash, inbound[ordinal].proxyEntryHash);
             }
         }
     }
