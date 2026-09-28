@@ -25,7 +25,7 @@ use tracing::{Level, event};
 const FILE_NAME: &str = "eez-reconcile-checkpoint";
 
 /// Bumped when the field set changes; an older file is discarded, not guessed.
-const VERSION: &str = "eez-reconcile-checkpoint v1";
+const VERSION: &str = "eez-reconcile-checkpoint v2";
 
 /// Last batch whose effects are committed to local L2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,8 +38,8 @@ pub struct ReconcileCheckpoint {
     pub tx_hash: B256,
     /// Highest L2 block this batch confirmed.
     pub l2_cursor: u64,
-    /// Local L2 state root at `l2_cursor`, to catch a mismatched datadir.
-    pub l2_state_root: B256,
+    /// Local L2 block hash at `l2_cursor`, to catch a mismatched datadir.
+    pub l2_block_hash: B256,
 }
 
 impl ReconcileCheckpoint {
@@ -112,7 +112,7 @@ impl ReconcileCheckpoint {
     pub fn usable_with(
         &self,
         canonical_l1_hash: Option<B256>,
-        local_l2_root: Option<B256>,
+        local_l2_hash: Option<B256>,
     ) -> Result<(), &'static str> {
         match canonical_l1_hash {
             None => return Err("L1 did not serve the checkpoint block"),
@@ -121,10 +121,10 @@ impl ReconcileCheckpoint {
             }
             Some(_) => {}
         }
-        match local_l2_root {
+        match local_l2_hash {
             None => return Err("local L2 has no block at the checkpoint cursor"),
-            Some(root) if root != self.l2_state_root => {
-                return Err("local L2 root differs from the checkpoint");
+            Some(hash) if hash != self.l2_block_hash => {
+                return Err("local L2 block differs from the checkpoint");
             }
             Some(_) => {}
         }
@@ -133,8 +133,8 @@ impl ReconcileCheckpoint {
 
     fn encode(&self) -> String {
         format!(
-            "{VERSION}\nl1_block={}\nl1_block_hash={:#x}\ntx_hash={:#x}\nl2_cursor={}\nl2_state_root={:#x}\n",
-            self.l1_block, self.l1_block_hash, self.tx_hash, self.l2_cursor, self.l2_state_root,
+            "{VERSION}\nl1_block={}\nl1_block_hash={:#x}\ntx_hash={:#x}\nl2_cursor={}\nl2_block_hash={:#x}\n",
+            self.l1_block, self.l1_block_hash, self.tx_hash, self.l2_cursor, self.l2_block_hash,
         )
     }
 
@@ -147,7 +147,7 @@ impl ReconcileCheckpoint {
         let mut l1_block_hash = None;
         let mut tx_hash = None;
         let mut l2_cursor = None;
-        let mut l2_state_root = None;
+        let mut l2_block_hash = None;
         for line in lines {
             let line = line.trim();
             if line.is_empty() {
@@ -159,7 +159,7 @@ impl ReconcileCheckpoint {
                 "l1_block_hash" => l1_block_hash = Some(value.parse().ok()?),
                 "tx_hash" => tx_hash = Some(value.parse().ok()?),
                 "l2_cursor" => l2_cursor = Some(value.parse().ok()?),
-                "l2_state_root" => l2_state_root = Some(value.parse().ok()?),
+                "l2_block_hash" => l2_block_hash = Some(value.parse().ok()?),
                 // An unknown key means a newer writer; refuse rather than
                 // guess which fields still mean what they used to.
                 _ => return None,
@@ -170,7 +170,7 @@ impl ReconcileCheckpoint {
             l1_block_hash: l1_block_hash?,
             tx_hash: tx_hash?,
             l2_cursor: l2_cursor?,
-            l2_state_root: l2_state_root?,
+            l2_block_hash: l2_block_hash?,
         })
     }
 }
@@ -185,7 +185,7 @@ mod tests {
             l1_block_hash: B256::repeat_byte(0xa1),
             tx_hash: B256::repeat_byte(0xb2),
             l2_cursor: 111_540,
-            l2_state_root: B256::repeat_byte(0xc3),
+            l2_block_hash: B256::repeat_byte(0xc3),
         }
     }
 
@@ -274,18 +274,18 @@ mod tests {
         let other = B256::repeat_byte(0xee);
 
         assert_eq!(
-            cp.usable_with(Some(cp.l1_block_hash), Some(cp.l2_state_root)),
+            cp.usable_with(Some(cp.l1_block_hash), Some(cp.l2_block_hash)),
             Ok(()),
             "both facts hold — the only accepting case",
         );
 
         // L1 side.
         assert!(
-            cp.usable_with(None, Some(cp.l2_state_root)).is_err(),
+            cp.usable_with(None, Some(cp.l2_block_hash)).is_err(),
             "L1 not serving the block must reject, not be read as agreement",
         );
         assert!(
-            cp.usable_with(Some(other), Some(cp.l2_state_root)).is_err(),
+            cp.usable_with(Some(other), Some(cp.l2_block_hash)).is_err(),
             "reorged-out L1 block must reject",
         );
 
@@ -310,7 +310,7 @@ mod tests {
     fn zero_hashes_are_compared_not_treated_as_unknown() {
         let cp = ReconcileCheckpoint {
             l1_block_hash: B256::ZERO,
-            l2_state_root: B256::ZERO,
+            l2_block_hash: B256::ZERO,
             ..sample()
         };
         assert_eq!(cp.usable_with(Some(B256::ZERO), Some(B256::ZERO)), Ok(()));
@@ -334,7 +334,7 @@ mod tests {
             ]),
             tx_hash: B256::ZERO,
             l2_cursor: u64::MAX,
-            l2_state_root: B256::repeat_byte(0xff),
+            l2_block_hash: B256::repeat_byte(0xff),
         };
         cp.save(dir.path()).unwrap();
         assert_eq!(ReconcileCheckpoint::load(dir.path()), Some(cp));

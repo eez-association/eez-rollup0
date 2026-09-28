@@ -133,11 +133,11 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
     );
     wait_for(SETTLE_TIMEOUT, || async {
         composer.assert_healthy();
-        let root = state_root(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
+        let root = rollup_commitment(&l1_rpc, world.cfg.eez_address, world.cfg.rollup_id).await?;
         Ok((l2_balance(&l1_rpc, world.withdrawal_recipient).await?
             == withdrawal_before + withdrawal
-            && safe_block_state_root(&primary_rpc).await? == Some(root)
-            && safe_block_state_root(&mirror_rpc).await? == Some(root))
+            && safe_block_hash(&primary_rpc).await? == Some(root)
+            && safe_block_hash(&mirror_rpc).await? == Some(root))
         .then_some(()))
     })
     .await?;

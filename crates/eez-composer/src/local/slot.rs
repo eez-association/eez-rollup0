@@ -30,10 +30,10 @@ use revm::interpreter::{CallInputs, CallOutcome, CallScheme};
 use revm::{DatabaseCommit, Inspector};
 
 use eez_protocol::abi::{
-    ExecutionEntrySol, L2ToL1CallSol, authorizedProxiesCall, computeCrossChainProxyAddressCall,
-    createCrossChainProxyCall, executeOnBehalfCall,
+    authorizedProxiesCall, computeCrossChainProxyAddressCall, createCrossChainProxyCall,
+    executeOnBehalfCall,
 };
-use eez_protocol::entries::{IncomingEntry, build_l2_incoming_entry};
+use eez_protocol::entries::{InboundSidecar, IncomingEntry};
 use eez_protocol::system_tx::{SystemTxContext, build_inbound_system_txs};
 use eez_protocol::{
     CallMode, CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError,
@@ -546,49 +546,29 @@ impl InboundL2TargetSession {
         }
     }
 
-    /// Build the L1-shape entry for one inbound call. `return_data` is the
+    /// Build the typed sidecar for one inbound call. `return_data` is the
     /// placeholder on the probe pass and the captured output on the real pass;
     /// the lean L2 entry (the canonical builder) supplies both hashes.
-    fn l1_entry_for_call(
+    fn inbound_sidecar_for_call(
         &self,
         req: &ExecutionRequest,
         return_data: Bytes,
-    ) -> ExecutorResult<ExecutionEntrySol> {
-        let lean = build_l2_incoming_entry(IncomingEntry {
+    ) -> ExecutorResult<InboundSidecar> {
+        InboundSidecar::new(IncomingEntry {
             target: req.target_address,
             source: req.source_address,
             value: req.value,
             data: req.data.clone(),
             source_rollup_id: req.source_rollup_id,
             l2_rollup_id: RollupId(self.this_rollup_id),
-            return_data: return_data.clone(),
+            return_data,
             success: true,
         })
-        .map_err(|e| encoding_err(format!("build_l2_incoming_entry: {e}")))?;
-
-        Ok(ExecutionEntrySol {
-            stateUpdates: Vec::new(),
-            proxyEntryHash: lean.proxyEntryHash,
-            l2ToL1Calls: vec![L2ToL1CallSol {
-                revertNextNCalls: 0,
-                isStatic: false,
-                gas: 0,
-                sourceAddress: req.source_address,
-                sourceRollupId: req.source_rollup_id.0,
-                targetAddress: req.target_address,
-                value: req.value,
-                data: req.data.clone(),
-            }],
-            expectedL1ToL2Calls: Vec::new(),
-            rollingHash: lean.rollingHash,
-            destinationRollupId: self.this_rollup_id,
-            success: true,
-            returnData: return_data,
-        })
+        .map_err(|e| encoding_err(format!("inbound sidecar: {e}")))
     }
 
     /// Lower one entry to its single delivery system tx at the current cursor.
-    fn delivery_tx(&self, entry: &ExecutionEntrySol) -> ExecutorResult<Bytes> {
+    fn delivery_tx(&self, entry: &InboundSidecar) -> ExecutorResult<Bytes> {
         let txs =
             build_inbound_system_txs(std::slice::from_ref(entry), &self.cfg, self.delivery_nonce)
                 .map_err(|e| encoding_err(format!("build_inbound_system_txs: {e}")))?;
@@ -619,7 +599,7 @@ impl TargetExecutionSession for InboundL2TargetSession {
         // Placeholder return data: the entry hash is exact (it is computable a
         // priori) so the delivery reaches the proxy call; only the rolling-hash
         // compare afterwards can fail, and by then the frame has run.
-        let probe_entry = self.l1_entry_for_call(&req, Bytes::new())?;
+        let probe_entry = self.inbound_sidecar_for_call(&req, Bytes::new())?;
         let probe_tx = self.delivery_tx(&probe_entry)?;
 
         let snapshot = self.fork.snapshot();
@@ -663,7 +643,7 @@ impl TargetExecutionSession for InboundL2TargetSession {
         // Same state, same path, now with the observed outcome folded into the
         // rolling hash — the on-chain claim verifier. A failure here is claim
         // or state drift and the transaction must be evicted.
-        let final_entry = self.l1_entry_for_call(&req, captured.output.clone())?;
+        let final_entry = self.inbound_sidecar_for_call(&req, captured.output.clone())?;
         let final_tx = self.delivery_tx(&final_entry)?;
         let real = self.fork.execute_tx(&final_tx).map_err(fork_err)?;
         if !real.success {

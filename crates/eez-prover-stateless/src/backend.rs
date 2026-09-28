@@ -12,7 +12,7 @@ use std::time::Instant;
 #[cfg(test)]
 use alloy_genesis::ChainConfig;
 use alloy_genesis::Genesis;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use alloy_rpc_types_debug::ExecutionWitness;
 use eez_evm::EezEvmConfig;
 use eez_primitives::Block;
@@ -52,6 +52,28 @@ struct PreparedSettlingBlock {
     block: RecoveredBlock<Block>,
     checkpoint_plan: CheckpointPlan,
     system_sender_flags: Vec<bool>,
+}
+
+/// Each block must execute from its predecessor's post-state.
+///
+/// This is what proves a window is one contiguous execution rather than a set
+/// of independently valid blocks. Free fn so a test can drive it directly —
+/// real replay cannot produce a discontinuous window to exercise it with.
+///
+/// The rejection message keeps the word "telescope": that is the term the
+/// signer SPEC and operator runbooks use for this property.
+fn executes_from_previous_post_state(
+    block_number: u64,
+    pre_state_root: B256,
+    previous_post_state_root: B256,
+) -> Result<(), String> {
+    if pre_state_root != previous_post_state_root {
+        return Err(format!(
+            "stateless state roots do not telescope at block {block_number}: expected \
+             pre-state root {previous_post_state_root}, got {pre_state_root}",
+        ));
+    }
+    Ok(())
 }
 
 /// In-process Stateless/Reth backend configured from operator-selected rules.
@@ -158,7 +180,6 @@ impl Backend {
             )));
         }
         let mut block_outputs = Vec::<BackendBlockOutput>::with_capacity(total_blocks);
-        let mut window_pre_state_root = None;
 
         // Derive the final block's complete checkpoint plan before any witness
         // is consumed or earlier block is replayed.
@@ -237,6 +258,7 @@ impl Backend {
                         .map(|checkpoint| TransactionStateCheckpoint {
                             transaction_index: checkpoint.transaction_index,
                             state_root: checkpoint.state_root,
+                            block_hash: checkpoint.block_hash,
                         })
                         .collect::<Vec<_>>();
                     plan.verify_returned(&checkpoints)?;
@@ -263,14 +285,14 @@ impl Backend {
             } = stateless_output;
             if let Some(previous_post_state_root) =
                 block_outputs.last().map(|output| output.post_state_root)
-                && pre_state_root != previous_post_state_root
             {
-                return Err(ValidationError::Rejected(format!(
-                    "stateless state roots do not telescope at block {block_number}: expected \
-                     pre-state root {previous_post_state_root}, got {pre_state_root}",
-                )));
+                executes_from_previous_post_state(
+                    block_number,
+                    pre_state_root,
+                    previous_post_state_root,
+                )
+                .map_err(ValidationError::Rejected)?;
             }
-            window_pre_state_root.get_or_insert(pre_state_root);
 
             // These receipts come from successful replay. Observed outbound
             // events are retained here but authorized against batch entries only
@@ -332,11 +354,12 @@ impl Backend {
             }
         }
 
-        let pre_state_root = window_pre_state_root.ok_or_else(|| {
-            ValidationError::Rejected("refusing to validate an empty window".to_owned())
-        })?;
+        if block_outputs.is_empty() {
+            return Err(ValidationError::Rejected(
+                "refusing to validate an empty window".to_owned(),
+            ));
+        }
         Ok(BackendWindowOutput {
-            pre_state_root,
             blocks: block_outputs,
         })
     }

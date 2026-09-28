@@ -66,32 +66,34 @@ pub(crate) enum StateUpdateChainError {
         claimed: u64,
     },
     #[error(
-        "leading state update claims initial root {claimed}; validated window root is {validated}"
+        "leading state update claims initial block {claimed}; validated window opens at {validated}"
     )]
-    InitialRootMismatch { validated: B256, claimed: B256 },
+    InitialBlockMismatch { validated: B256, claimed: B256 },
     #[error(
-        "state-update chain breaks before entry {entry_index}: previous claimed post-state is {previous_claimed_post_state}, next claimed pre-state is {next_claimed_pre_state}"
+        "commitment chain breaks before entry {entry_index}: previous claimed block is {previous_claimed_candidate}, next claimed predecessor is {next_claimed_predecessor}"
     )]
     ChainBreak {
         entry_index: usize,
-        previous_claimed_post_state: B256,
-        next_claimed_pre_state: B256,
+        previous_claimed_candidate: B256,
+        next_claimed_predecessor: B256,
     },
-    #[error("state-update chain claims final root {claimed}; validated final root is {validated}")]
+    #[error(
+        "commitment chain claims final block {claimed}; validated window closes at {validated}"
+    )]
     FinalMismatch { validated: B256, claimed: B256 },
 }
 
 /// Require one claimed state update per entry, the expected rollup, and a
-/// continuous root chain between the locally validated window endpoints.
+/// continuous commitment chain between the locally validated window endpoints.
 ///
 /// This checks continuity of Composer claims; `bind_effects_to_execution`
 /// separately proves that the leading entry is an anchor and binds interior
-/// roots to transaction checkpoints.
+/// commitments to the candidate blocks sealed at each transaction boundary.
 pub(crate) fn verify_state_update_chain(
     batch: &CanonicalPostBatch,
     expected_rollup_id: NonZeroU64,
-    validated_window_pre_state_root: B256,
-    validated_window_post_state_root: B256,
+    validated_window_pre_block_hash: B256,
+    validated_window_post_block_hash: B256,
 ) -> Result<VerifiedStateUpdateChain<'_>, StateUpdateChainError> {
     let submitted_batch = batch.as_batch();
     let (leading_claimed_entry, trailing_claimed_entries) =
@@ -107,15 +109,15 @@ pub(crate) fn verify_state_update_chain(
             claimed: leading_claimed_update.rollupId,
         });
     }
-    if leading_claimed_update.currentState != validated_window_pre_state_root {
-        return Err(StateUpdateChainError::InitialRootMismatch {
-            validated: validated_window_pre_state_root,
+    if leading_claimed_update.currentState != validated_window_pre_block_hash {
+        return Err(StateUpdateChainError::InitialBlockMismatch {
+            validated: validated_window_pre_block_hash,
             claimed: leading_claimed_update.currentState,
         });
     }
 
     let claimed_rollup = leading_claimed_update.rollupId;
-    let mut previous_claimed_post_state = leading_claimed_update.newState;
+    let mut previous_claimed_candidate = leading_claimed_update.newState;
     let mut verified_trailing = Vec::with_capacity(trailing_claimed_entries.len());
     for (entry_index, entry) in trailing_claimed_entries.iter().enumerate() {
         let entry_index = entry_index + 1;
@@ -127,24 +129,24 @@ pub(crate) fn verify_state_update_chain(
                 claimed: claimed_update.rollupId,
             });
         }
-        if claimed_update.currentState != previous_claimed_post_state {
+        if claimed_update.currentState != previous_claimed_candidate {
             return Err(StateUpdateChainError::ChainBreak {
                 entry_index,
-                previous_claimed_post_state,
-                next_claimed_pre_state: claimed_update.currentState,
+                previous_claimed_candidate,
+                next_claimed_predecessor: claimed_update.currentState,
             });
         }
-        previous_claimed_post_state = claimed_update.newState;
+        previous_claimed_candidate = claimed_update.newState;
         verified_trailing.push(VerifiedStateUpdateEntry {
             claimed_entry: entry,
             claimed_update,
         });
     }
 
-    if previous_claimed_post_state != validated_window_post_state_root {
+    if previous_claimed_candidate != validated_window_post_block_hash {
         return Err(StateUpdateChainError::FinalMismatch {
-            validated: validated_window_post_state_root,
-            claimed: previous_claimed_post_state,
+            validated: validated_window_post_block_hash,
+            claimed: previous_claimed_candidate,
         });
     }
 

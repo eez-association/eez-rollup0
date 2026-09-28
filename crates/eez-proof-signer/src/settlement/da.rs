@@ -557,7 +557,13 @@ fn verify_reconstructed_sync_block(
         .collect::<Result<Vec<_>, DaPayloadError>>()?;
     let inbound_reconstruction_entries = inbound_effects
         .iter()
-        .map(|binding| binding.observation().derived_da_entry.as_entry().clone())
+        .map(|binding| {
+            binding
+                .observation()
+                .derived_da_entry
+                .as_abi_entry()
+                .clone()
+        })
         .collect::<Vec<_>>();
     let pairs = reconstructor
         .reconstruct_sync_pairs(

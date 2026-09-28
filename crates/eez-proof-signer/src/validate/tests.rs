@@ -8,6 +8,14 @@ fn admitted_block(number: u64, hash: u8) -> AdmittedBlock {
     input
 }
 
+/// A block sealed on the `repeat_byte(n - 1) -> repeat_byte(n)` grid, so a
+/// window built from consecutive numbers has three distinct endpoints.
+fn chained_admitted_block(number: u64) -> AdmittedBlock {
+    let mut input = admitted_block(number, u8::try_from(number).unwrap());
+    input.claimed_parent_hash = B256::repeat_byte(u8::try_from(number - 1).unwrap());
+    input
+}
+
 fn admitted_block_with_transactions(number: u64, hash: u8, count: usize) -> AdmittedBlock {
     let transaction: eez_primitives::EezTxEnvelope = TxLegacy::default()
         .into_signed(alloy_primitives::Signature::test_signature())
@@ -26,6 +34,7 @@ fn checkpoint(transaction_index: usize, state_root: u8) -> TransactionStateCheck
     TransactionStateCheckpoint {
         transaction_index,
         state_root: B256::repeat_byte(state_root),
+        block_hash: B256::with_last_byte(0xc0 ^ (transaction_index as u8)),
     }
 }
 
@@ -289,12 +298,11 @@ fn rejects_transaction_state_checkpoints_on_preceding_blocks() {
 #[test]
 fn normalizes_validated_output_for_settlement() {
     let window = vec![
-        admitted_block(5, 0x05),
-        admitted_block(6, 0x06),
-        admitted_block(7, 0x07),
+        chained_admitted_block(5),
+        chained_admitted_block(6),
+        chained_admitted_block(7),
     ];
     let mut output = backend_output_for(&window);
-    output.pre_state_root = B256::repeat_byte(0x10);
     for (block, post_state_root) in output.blocks.iter_mut().zip([
         B256::repeat_byte(0x11),
         B256::repeat_byte(0x12),
@@ -311,9 +319,11 @@ fn normalizes_validated_output_for_settlement() {
         )
         .unwrap();
 
-    assert_eq!(validated.window_pre_state_root(), B256::repeat_byte(0x10));
-    assert_eq!(validated.settling_pre_state_root(), B256::repeat_byte(0x12));
-    assert_eq!(validated.window_post_state_root(), B256::repeat_byte(0x13));
+    // Endpoints come from the block headers; the re-executed state roots set
+    // above must reach none of them.
+    assert_eq!(validated.window_pre_block_hash(), B256::repeat_byte(0x04));
+    assert_eq!(validated.settling_pre_block_hash(), B256::repeat_byte(0x06));
+    assert_eq!(validated.window_post_block_hash(), B256::repeat_byte(0x07));
     assert_eq!(
         validated
             .preceding_blocks()
@@ -327,9 +337,8 @@ fn normalizes_validated_output_for_settlement() {
 
 #[test]
 fn uses_the_window_pre_state_as_the_settling_pre_state_for_one_block() {
-    let window = vec![admitted_block(5, 0x05)];
+    let window = vec![chained_admitted_block(5)];
     let mut output = backend_output_for(&window);
-    output.pre_state_root = B256::repeat_byte(0x10);
     output.blocks[0].post_state_root = B256::repeat_byte(0x11);
     let validator = Validator::stub(vec![Ok(output)]);
 
@@ -340,9 +349,10 @@ fn uses_the_window_pre_state_as_the_settling_pre_state_for_one_block() {
         )
         .unwrap();
 
+    assert_eq!(validated.settling_pre_block_hash(), B256::repeat_byte(0x04));
     assert_eq!(
-        validated.settling_pre_state_root(),
-        validated.window_pre_state_root()
+        validated.window_pre_block_hash(),
+        validated.settling_pre_block_hash()
     );
     assert!(validated.preceding_blocks().is_empty());
 }

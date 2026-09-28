@@ -88,7 +88,7 @@ fn rejects_wrong_state_update_endpoints_or_a_chain_break() {
 
     assert_eq!(
         verify_state_update_chain(&batch, expected_rollup_id(), wrong, c).map(|_| ()),
-        Err(StateUpdateChainError::InitialRootMismatch {
+        Err(StateUpdateChainError::InitialBlockMismatch {
             validated: wrong,
             claimed: a,
         })
@@ -107,8 +107,8 @@ fn rejects_wrong_state_update_endpoints_or_a_chain_break() {
         verify_state_update_chain(&broken, expected_rollup_id(), a, c).map(|_| ()),
         Err(StateUpdateChainError::ChainBreak {
             entry_index: 1,
-            previous_claimed_post_state: b,
-            next_claimed_pre_state: wrong,
+            previous_claimed_candidate: b,
+            next_claimed_predecessor: wrong,
         })
     );
 }
@@ -312,7 +312,7 @@ fn rejects_wrong_anchor_or_invalid_effect_checkpoints() {
     assert_eq!(
         verify_effect_prefix(&batch, wrong, &valid_checkpoints, &settling).err(),
         Some(EffectPrefixError::AnchorRootMismatch {
-            validated_pre_settling_root: wrong,
+            validated_pre_settling_hash: wrong,
             claimed_anchor_post_state: pre_settling,
         })
     );
@@ -352,11 +352,11 @@ fn rejects_wrong_anchor_or_invalid_effect_checkpoints() {
     );
     assert_eq!(
         verify_effect_prefix(&batch, pre_settling, &[checkpoint(0, wrong)], &settling,).err(),
-        Some(EffectPrefixError::EffectStateRootMismatch {
+        Some(EffectPrefixError::EffectCandidateMismatch {
             entry_index: 1,
             transaction_index: 0,
-            recomputed_checkpoint: wrong,
-            claimed_post_state: effect_root,
+            recomputed_candidate: wrong,
+            claimed_candidate: effect_root,
         })
     );
 }
@@ -398,11 +398,11 @@ fn effect_checkpoints_cannot_hide_a_post_block_state_change() {
     );
     assert_eq!(
         verify_effect_prefix(&final_endpoint, pre_settling, &checkpoints, &settling,).err(),
-        Some(EffectPrefixError::EffectStateRootMismatch {
+        Some(EffectPrefixError::EffectCandidateMismatch {
             entry_index: 1,
             transaction_index: 0,
-            recomputed_checkpoint: transaction_root,
-            claimed_post_state: final_root,
+            recomputed_candidate: transaction_root,
+            claimed_candidate: final_root,
         })
     );
 }

@@ -19,7 +19,7 @@ use eez_testkit::{
     ANVIL_KEY_6, CrossChainWorld, DEV_CHAIN_ID, ICounter, IEEZ, INBOUND_USER, ISetterWrapper,
     IValue, OUTBOUND_USER, SETTLE_TIMEOUT, TARGET_DEPLOYER, counter_count,
     create_cross_chain_proxy, create_l2_cross_chain_proxy, deploy_counter, l2_value, onchain_nonce,
-    receipt_ok, safe_block_state_root, setup_cross_chain_with_env, sign_and_send, state_root,
+    receipt_ok, rollup_commitment, safe_block_hash, setup_cross_chain_with_env, sign_and_send,
     wait_for,
 };
 
@@ -163,13 +163,13 @@ async fn assert_reconciled(w: &CrossChainWorld) {
     wait_for(SETTLE_TIMEOUT, || {
         let (l1_rpc, l2_rpc) = (l1_rpc.clone(), l2_rpc.clone());
         async move {
-            let l1_root = state_root(&l1_rpc, eez, rollup_id).await?;
-            let l2_root = safe_block_state_root(&l2_rpc).await?;
-            Ok(l2_root.filter(|root| *root == l1_root).map(|_| ()))
+            let l1_commitment = rollup_commitment(&l1_rpc, eez, rollup_id).await?;
+            let l2_hash = safe_block_hash(&l2_rpc).await?;
+            Ok(l2_hash.filter(|root| *root == l1_commitment).map(|_| ()))
         }
     })
     .await
-    .expect("L1 stored stateRoot never matched the L2 safe stateRoot");
+    .expect("L1 commitment never matched the L2 safe block hash");
 }
 
 /// Return just after the composer drains its pool. Transactions submitted next

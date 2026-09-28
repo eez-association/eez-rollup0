@@ -63,9 +63,9 @@ For each admitted window, the adapter:
    Composer root claim.
 
 The Stateless output exposes both the validated pre-state root and the
-independently recomputed post-state root. The adapter carries those returned
-values into `BackendWindowOutput`; it does not promote a copied Composer or
-header claim merely by renaming it.
+independently recomputed post-state root. The adapter telescopes against the
+pre-state root and carries the post-state root into `BackendBlockOutput`; it
+does not promote a copied Composer or header claim merely by renaming it.
 
 The checkpoint-enabled path is used only when the final selection is non-empty.
 An empty selection uses ordinary Stateless validation and reports an empty
@@ -75,8 +75,8 @@ vector; it does not authorize an effect position.
 
 | Output | Contents |
 | --- | --- |
-| `BackendWindowOutput.pre_state_root` | Validated state root from which the first block was replayed |
-| `BackendBlockOutput` | Exact-decoded number, parent hash and transaction count; computed hash; recomputed post-state root; exact receipt outcomes; selected transaction-state checkpoints; and settlement evidence for the same block |
+| `BackendWindowOutput` | One `BackendBlockOutput` per replayed block, oldest first |
+| `BackendBlockOutput` | Exact-decoded number, parent hash and transaction count; computed hash; recomputed post-state root; exact receipt outcomes; selected transaction-state checkpoints, each carrying a state root and the hash of the candidate block sealed over that prefix; and settlement evidence for the same block |
 | `SettlementBlockEvidence` | Fork-aware system-sender flags and ordered outbound receipt observations derived from that block's accepted execution |
 
 The backend output is not handed directly to settlement.
@@ -96,14 +96,15 @@ execution result. `BackendBlockOutput` first keeps associated results together,
 and `ValidatedWindow` is the only production handoff after shared checks. It:
 
 - separates `preceding_blocks` from the terminal `settling_block`;
-- carries `window_pre_state_root` and `window_post_state_root`;
-- derives `settling_pre_state_root` from the preceding output, or from the
-  window pre-state root for a one-block window;
+- carries `window_pre_block_hash` and `window_post_block_hash`;
+- reads every endpoint from a header field: `settling_pre_block_hash` is the
+  settling block's own parent hash, and `window_pre_block_hash` falls back to
+  it for a one-block window;
 - keeps the settling block's receipt outcomes and selected checkpoints beside
   that block; and
 - drops witnesses that execution has already consumed.
 
-The window pre-state root is not automatically a batch anchor. Settlement must
+The window pre-block hash is not automatically a batch anchor. Settlement must
 still bind the leading submitted state update to it. `ValidatedWindow` is an
 architectural boundary, not another proof: construction is safe because the
 backend-output contract and admitted input were consumed and checked
@@ -111,10 +112,10 @@ immediately beforehand.
 
 ## Pinned Stateless extension
 
-This crate depends directly on an exact commit of the
-[`eez-association/stateless`](https://github.com/eez-association/stateless)
-fork. The fork adds opt-in selected transaction-state checkpoints and returns
-the computed pre-state and post-state roots already produced during validation.
+This crate depends directly on an exact commit of the Stateless fork, pinned
+as `stateless-reth` in the workspace root `Cargo.toml`. The fork adds opt-in selected transaction-state checkpoints, each
+carrying a state root and a candidate block hash, and returns the computed
+pre-state and post-state roots already produced during validation.
 Consensus, execution, receipt, gas, and state-root validation remain
 Stateless/Reth responsibilities.
 

@@ -16,13 +16,17 @@ pub mod support;
 
 type EthereumBlock = eez_primitives::Block;
 
-/// A cumulative state root locally recomputed during successful block replay.
+/// One transaction boundary's replay outputs: the cumulative state root and
+/// the hash of the candidate block sealed over that prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransactionStateCheckpoint {
     /// Zero-based position of the transaction within its block.
     pub transaction_index: usize,
     /// State root immediately after this transaction, before post-block changes.
     pub state_root: B256,
+    /// Hash of the candidate block holding exactly this prefix — what settlement
+    /// gates compare an entry's claimed `newState` against.
+    pub block_hash: B256,
 }
 
 /// Successful backend output for one block before the shared consuming check.
@@ -53,8 +57,6 @@ pub struct BackendBlockOutput {
 /// computed hash and transaction count to its corresponding admitted block.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BackendWindowOutput {
-    /// Validated state root from which the first block was replayed.
-    pub pre_state_root: B256,
     /// One associated output per replayed block, oldest first.
     pub blocks: Vec<BackendBlockOutput>,
 }
@@ -243,7 +245,7 @@ pub(crate) struct ValidatedSettlingBlock {
     block: ValidatedBlock,
     /// Receipt status for every transaction in the settling block.
     receipt_successes: Vec<bool>,
-    /// Locally recomputed state roots selected for settlement effects.
+    /// Locally recomputed boundaries selected for settlement effects.
     transaction_state_checkpoints: Vec<TransactionStateCheckpoint>,
 }
 
@@ -286,13 +288,13 @@ impl ValidatedSettlingBlock {
 /// vector manipulation.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ValidatedWindow {
-    /// Validated state root before the first streamed block. Settlement still
-    /// has to bind the batch's claimed anchor to this value.
-    window_pre_state_root: B256,
-    /// Validated state root immediately before the settling block.
-    settling_pre_state_root: B256,
-    /// Validated state root after the settling block and complete window.
-    window_post_state_root: B256,
+    /// Hash of the block before the first streamed one. Settlement still has
+    /// to bind the batch's claimed anchor to this value.
+    window_pre_block_hash: B256,
+    /// Hash of the block immediately before the settling block.
+    settling_pre_block_hash: B256,
+    /// Hash of the settling block, closing the window.
+    window_post_block_hash: B256,
     /// Validated blocks preceding the terminal settling block.
     preceding_blocks: Vec<ValidatedBlock>,
     /// Terminal block together with its settlement-specific replay results.
@@ -300,19 +302,19 @@ pub(crate) struct ValidatedWindow {
 }
 
 impl ValidatedWindow {
-    /// Validated state root before the first streamed block.
-    pub(crate) fn window_pre_state_root(&self) -> B256 {
-        self.window_pre_state_root
+    /// Hash of the block before the first streamed one.
+    pub(crate) fn window_pre_block_hash(&self) -> B256 {
+        self.window_pre_block_hash
     }
 
-    /// Validated state root immediately before the terminal block.
-    pub(crate) fn settling_pre_state_root(&self) -> B256 {
-        self.settling_pre_state_root
+    /// Hash of the block immediately before the terminal block.
+    pub(crate) fn settling_pre_block_hash(&self) -> B256 {
+        self.settling_pre_block_hash
     }
 
-    /// Validated state root after the complete window.
-    pub(crate) fn window_post_state_root(&self) -> B256 {
-        self.window_post_state_root
+    /// Hash of the settling block, closing the window.
+    pub(crate) fn window_post_block_hash(&self) -> B256 {
+        self.window_post_block_hash
     }
 
     /// Validated blocks preceding the terminal settling block.
@@ -328,16 +330,16 @@ impl ValidatedWindow {
     /// Construct an explicitly synthetic validated window for unit tests.
     #[cfg(test)]
     pub(crate) fn for_test(
-        window_pre_state_root: B256,
-        settling_pre_state_root: B256,
-        window_post_state_root: B256,
+        window_pre_block_hash: B256,
+        settling_pre_block_hash: B256,
+        window_post_block_hash: B256,
         preceding_blocks: Vec<ValidatedBlock>,
         settling_block: ValidatedSettlingBlock,
     ) -> Self {
         Self {
-            window_pre_state_root,
-            settling_pre_state_root,
-            window_post_state_root,
+            window_pre_block_hash,
+            settling_pre_block_hash,
+            window_post_block_hash,
             preceding_blocks,
             settling_block,
         }
@@ -353,7 +355,6 @@ struct CheckedBlock {
 /// Backend output whose shape and Composer-facing claims have been consumed
 /// and cross-checked. Private fields make bypassing that boundary impossible.
 struct CheckedBackendWindowOutput {
-    window_pre_state_root: B256,
     preceding_blocks: Vec<CheckedBlock>,
     settling_block: CheckedBlock,
 }
@@ -608,7 +609,6 @@ fn check_backend_window_output(
         .pop()
         .ok_or_else(|| eyre::eyre!("backend output unexpectedly has no blocks"))?;
     Ok(CheckedBackendWindowOutput {
-        window_pre_state_root: backend_output.pre_state_root,
         preceding_blocks: checked_blocks,
         settling_block,
     })
@@ -618,16 +618,20 @@ impl CheckedBackendWindowOutput {
     /// Rearrange already checked evidence for settlement without performing
     /// another trust transition.
     fn into_validated_window(self) -> ValidatedWindow {
-        let settling_pre_state_root = self
+        // Every endpoint is a header field, so none needs deriving from the
+        // backend's roots — and the settling block's predecessor is simply its
+        // own parent, with no empty-window special case.
+        let settling_pre_block_hash = self.settling_block.output.decoded_parent_hash;
+        let window_pre_block_hash = self
             .preceding_blocks
-            .last()
-            .map(|block| block.output.post_state_root)
-            .unwrap_or(self.window_pre_state_root);
-        let window_post_state_root = self.settling_block.output.post_state_root;
+            .first()
+            .map_or(settling_pre_block_hash, |block| {
+                block.output.decoded_parent_hash
+            });
         ValidatedWindow {
-            window_pre_state_root: self.window_pre_state_root,
-            settling_pre_state_root,
-            window_post_state_root,
+            window_pre_block_hash,
+            settling_pre_block_hash,
+            window_post_block_hash: self.settling_block.output.computed_hash,
             preceding_blocks: self
                 .preceding_blocks
                 .into_iter()

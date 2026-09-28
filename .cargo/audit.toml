@@ -15,6 +15,9 @@ ignore = [
     # compression DoS. Reached via reth's p2p DNS discovery, not enabled here.
     "RUSTSEC-2026-0118",
     "RUSTSEC-2026-0119",
+    # imbl-sized-chunks double free when a stored element's `Drop` panics.
+    # Reached via reth's tx pool, which stores plain data; imbl pins 0.1.3.
+    "RUSTSEC-2026-0292",
 
     # ── seen only by cargo-audit's graph ───────────────────────────────────
     # tracing-subscriber 0.2.x ANSI escape injection through log fields.

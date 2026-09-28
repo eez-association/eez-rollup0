@@ -86,6 +86,5 @@ retaining the detailed internal cause in logs.
 
 The full contributor command set is maintained in
 [`CONTRIBUTING.md`](../CONTRIBUTING.md#verify). A change to the pinned
-[`eez-association/stateless`](https://github.com/eez-association/stateless)
-fork must pass that repository's tests and strict Clippy checks before the
+Stateless fork must pass that repository's tests and strict Clippy checks before the
 signer updates its commit pin; the pin update must then pass the signer checks.

@@ -122,10 +122,10 @@ pub(crate) enum EffectPrefixError {
     )]
     EffectCountMismatch { claimed: usize, observed: usize },
     #[error(
-        "anchor claims post-state {claimed_anchor_post_state}; validated pre-settling root is {validated_pre_settling_root}"
+        "anchor claims post-state {claimed_anchor_post_state}; validated pre-settling block is {validated_pre_settling_hash}"
     )]
     AnchorRootMismatch {
-        validated_pre_settling_root: B256,
+        validated_pre_settling_hash: B256,
         claimed_anchor_post_state: B256,
     },
     #[error(
@@ -150,13 +150,13 @@ pub(crate) enum EffectPrefixError {
         observed: ObservedEffectKind,
     },
     #[error(
-        "settlement entry {entry_index} claims post-state {claimed_post_state}; transaction {transaction_index} recomputed {recomputed_checkpoint}"
+        "settlement entry {entry_index} claims block {claimed_candidate}; transaction {transaction_index} sealed {recomputed_candidate}"
     )]
-    EffectStateRootMismatch {
+    EffectCandidateMismatch {
         entry_index: usize,
         transaction_index: usize,
-        recomputed_checkpoint: B256,
-        claimed_post_state: B256,
+        recomputed_candidate: B256,
+        claimed_candidate: B256,
     },
     #[error("anchor ether delta is {claimed}; expected zero")]
     NonZeroAnchorEtherDelta { claimed: I256 },
@@ -171,7 +171,7 @@ pub(crate) enum EffectPrefixError {
 /// `newState` must equal the validated pre-settling root.
 pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
     verified_state_chain: &VerifiedStateUpdateChain<'batch>,
-    validated_settling_pre_state_root: B256,
+    validated_settling_pre_block_hash: B256,
     computed_transaction_state_checkpoints: &[TransactionStateCheckpoint],
     settling_observations: &'settling SettlingBlockObservations,
 ) -> Result<BoundEffectSequence<'batch, 'settling>, EffectPrefixError> {
@@ -230,9 +230,9 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
         });
     }
 
-    if anchor_update.newState != validated_settling_pre_state_root {
+    if anchor_update.newState != validated_settling_pre_block_hash {
         return Err(EffectPrefixError::AnchorRootMismatch {
-            validated_pre_settling_root: validated_settling_pre_state_root,
+            validated_pre_settling_hash: validated_settling_pre_block_hash,
             claimed_anchor_post_state: anchor_update.newState,
         });
     }
@@ -277,14 +277,17 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
                 actual: checkpoint.transaction_index,
             });
         }
-        let recomputed_checkpoint = checkpoint.state_root;
-        let claimed_post_state = update.newState;
-        if claimed_post_state != recomputed_checkpoint {
-            return Err(EffectPrefixError::EffectStateRootMismatch {
+        // The entry claims the block a settlement stopping here must leave L2
+        // holding. Compare it to the candidate the backend sealed over the same
+        // transaction prefix.
+        let recomputed_candidate = checkpoint.block_hash;
+        let claimed_candidate = update.newState;
+        if claimed_candidate != recomputed_candidate {
+            return Err(EffectPrefixError::EffectCandidateMismatch {
                 entry_index,
                 transaction_index,
-                recomputed_checkpoint,
-                claimed_post_state,
+                recomputed_candidate,
+                claimed_candidate,
             });
         }
         bound_effects.push(BoundEffect {

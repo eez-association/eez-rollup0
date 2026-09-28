@@ -29,8 +29,13 @@ WAVES="${EEZ_WAVE_COUNT:-3}"
 for t in cast forge jq curl kurtosis openssl; do command -v "$t" >/dev/null || { echo "$t not in PATH"; exit 1; }; done
 
 # L1 is the canonical shared chain; fronts are published by eez-node.
-# shellcheck disable=SC1091
-source "$K/ports.sh" >/dev/null
+# Endpoint discovery only matters for endpoints the caller did not supply. An
+# L1-only enclave cannot resolve the compose-hosted L2 services, and under
+# `set -e` a failed resolution would kill the run before it starts.
+if [[ -z "${L1:-}" || -z "${L2:-}" || -z "${L1F:-}" || -z "${L2F:-}" ]]; then
+    # shellcheck disable=SC1091
+    source "$K/ports.sh" >/dev/null
+fi
 # shellcheck disable=SC1091
 source "$K/scripts/lib.sh"
 : "${L1:=$EEZ_DEVNET_L1_RPC}"
@@ -181,8 +186,12 @@ FILLER_PER_GAP="${EEZ_FILLER_PER_GAP:-2}"
 INCLUDE_REVERTS="${EEZ_INCLUDE_REVERTS:-0}"
 PURE_RECIPIENT=0x2222222222222222222222222222222222222222
 
-refresh_node_log() { docker logs "$(docker ps --format "{{.Names}}" | grep -m1 "eez-node--")" >"$NODE_LOG" 2>&1 || true; }
-refresh_signer_log() { docker logs "$(docker ps --format "{{.Names}}" | grep -m1 "eez-proof-signer--")" >"$SIGNER_LOG" 2>&1 || true; }
+# Kurtosis names containers eez-node--<hash>; compose names them eez-node-kurtosis.
+# `|| true`: no match is the normal pre-launch state, and grep exiting 1
+# would take the whole run down under `set -euo pipefail`.
+_container() { docker ps --format "{{.Names}}" | grep -m1 -E "^$1(--|-)" || true; }
+refresh_node_log() { local c; c=$(_container eez-node); [[ -n "$c" ]] && docker logs "$c" >"$NODE_LOG" 2>&1 || true; }
+refresh_signer_log() { local c; c=$(_container eez-proof-signer); [[ -n "$c" ]] && docker logs "$c" >"$SIGNER_LOG" 2>&1 || true; }
 
 # The relay needs a few L1 slots before it includes anything. Firing into that
 # window burns MAX_BUNDLE_ATTEMPTS and evicts the ops as poison — a harness
@@ -540,34 +549,35 @@ run_waves() {
         echo "    ✗ no L2ExecutionPerformed event found"; ok_all=0
     fi
 
-    # L1's stored state root must converge with the current L2 safe block.
-    local LAST_SETTLED="" L1_TRACKED="" L1_RECHECK="" L2_ROOT="" L2_SAFE=0 SAFE_BLOCK=""
-    local root_deadline=$((SECONDS + ${EEZ_STATE_ROOT_WAIT_SECS:-30})) root_matched=0
+    # L1's stored block-hash commitment must converge with the L2 safe block.
+    local LAST_SETTLED="" L1_TRACKED="" L1_RECHECK="" L2_BLOCK_HASH="" L2_SAFE=0 SAFE_BLOCK=""
+    local commitment_deadline=$((SECONDS + ${EEZ_BLOCK_HASH_WAIT_SECS:-${EEZ_STATE_ROOT_WAIT_SECS:-30}}))
+    local commitment_matched=0
     LAST_SETTLED=$(strip_ansi <"$NODE_LOG" \
         | grep -F '"event_name":"eez.composer.bundle.observed"' \
         | grep -F '"settled":true' \
         | grep -oE '"sync_height":[0-9]+' | grep -oE '[0-9]+' \
         | sort -n | tail -1 || true)
     if [[ -n "$LAST_SETTLED" ]]; then
-        while (( SECONDS < root_deadline )); do
+        while (( SECONDS < commitment_deadline )); do
             L1_TRACKED=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' \
                 "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
             SAFE_BLOCK=$(retry cast block safe --rpc-url "$L2" --json)
             L2_SAFE=$(jq -r '.number' <<<"$SAFE_BLOCK" | xargs cast to-dec)
-            L2_ROOT=$(jq -r '.stateRoot' <<<"$SAFE_BLOCK")
+            L2_BLOCK_HASH=$(jq -r '.hash' <<<"$SAFE_BLOCK")
             L1_RECHECK=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' \
                 "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
             if [[ "${L1_TRACKED,,}" == "${L1_RECHECK,,}" \
-                && "${L1_RECHECK,,}" == "${L2_ROOT,,}" ]]; then
-                root_matched=1
+                && "${L1_RECHECK,,}" == "${L2_BLOCK_HASH,,}" ]]; then
+                commitment_matched=1
                 break
             fi
             sleep 1
         done
-        if (( root_matched )); then
-            echo "    ✓ L1 rollups($EEZ_ROLLUP_ID).stateRoot == L2 safe root at height $L2_SAFE"
+        if (( commitment_matched )); then
+            echo "    ✓ L1 rollups($EEZ_ROLLUP_ID) commitment == L2 safe block hash at height $L2_SAFE"
         else
-            echo "    ✗ L1 stateRoot $L1_RECHECK != L2 safe root $L2_ROOT at height $L2_SAFE"; ok_all=0
+            echo "    ✗ L1 commitment $L1_RECHECK != L2 safe block hash $L2_BLOCK_HASH at height $L2_SAFE"; ok_all=0
         fi
         if (( L2_SAFE >= LAST_SETTLED )); then
             echo "    ✓ L2 safe head reached settled height: $L2_SAFE"
@@ -582,9 +592,9 @@ run_waves() {
     local DIVERGED
     DIVERGED=$(grep -c '"event_name":"eez.deriver.state.diverged_' "$NODE_LOG" 2>/dev/null || true); DIVERGED=${DIVERGED:-0}
     if (( DIVERGED == 0 )); then
-        echo "    ✓ zero state-root divergence events"
+        echo "    ✓ zero block-hash commitment divergence events"
     else
-        echo "    ✗ $DIVERGED state-root divergence event(s)"; ok_all=0
+        echo "    ✗ $DIVERGED block-hash commitment divergence event(s)"; ok_all=0
     fi
 
     # Dropped-bundle telemetry.

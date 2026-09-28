@@ -363,6 +363,74 @@ fn inspection_and_normal_execution_apply_identical_mint_and_rollback_rules() {
 }
 
 #[test]
+fn native_gasprice_is_zero_in_nested_calls_including_reimbursement_and_positive_price_guards() {
+    let target = Address::repeat_byte(0x22);
+    let user = Address::repeat_byte(0x11);
+    // Return [outer GASPRICE, inner GASPRICE, inner 21_000 * GASPRICE, CALL success].
+    // The stand-in EEZL2 contract calls a second contract through an ordinary CALL.
+    let mut outer = bytes!("3a6000526040602060006000600073").to_vec();
+    outer.extend_from_slice(target.as_slice());
+    outer.extend_from_slice(&bytes!("5af160605260806000f3"));
+    for require_positive_price in [false, true] {
+        let mut inner = Vec::new();
+        if require_positive_price {
+            // require(tx.gasprice > 0), then continue at JUMPDEST 7.
+            inner.extend_from_slice(&bytes!("3a6007575f5ffd5b"));
+        }
+        inner.extend_from_slice(&bytes!("3a6000523a6152080260205260406000f3"));
+        for native in [true, false] {
+            let mut db = database(U256::ZERO, outer.clone().into());
+            let code = Bytecode::new_raw(inner.clone().into());
+            db.insert_account_info(
+                target,
+                AccountInfo {
+                    code_hash: code.hash_slow(),
+                    code: Some(code),
+                    ..Default::default()
+                },
+            );
+            db.insert_account_info(
+                user,
+                AccountInfo {
+                    balance: U256::from(20_000_000),
+                    ..Default::default()
+                },
+            );
+            let block = block(0, 1);
+            let mut evm = EezEvmFactory.create_evm(db, config().evm_env(block.header()).unwrap());
+            assert_eq!(evm.block().basefee, 1);
+            let mut tx = TxEnv::from_recovered_tx(&block.body().transactions[0], SYSTEM_ADDRESS);
+            let price = if native { 0 } else { 7 };
+            if !native {
+                tx.tx_type = 0;
+                tx.caller = user;
+                tx.gas_price = price;
+            }
+            let result = evm.transact_raw(tx).unwrap();
+            assert!(result.result.is_success());
+            let output = result.result.output().unwrap();
+            let words = output
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .copied()
+                .map(U256::from_be_bytes)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                words,
+                vec![
+                    U256::from(price),
+                    U256::from(price),
+                    U256::from(21_000 * price),
+                    U256::from(u64::from(!native || !require_positive_price)),
+                ],
+                "native={native}, require_positive_price={require_positive_price}"
+            );
+        }
+    }
+}
+
+#[test]
 fn ordinary_transactions_still_pay_fees_and_outbound_eth_stays_at_the_system_address() {
     let user = address!("1111111111111111111111111111111111111111");
     let balance = U256::from(1_000_000);

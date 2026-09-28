@@ -10,10 +10,10 @@ use eez_testkit::signals;
 use eez_testkit::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
     ANVIL_KEY_6, Harness, INVALID_PROOF_SELECTOR, INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary,
-    NodeConfig, NodeHandle, STAGING_USER_KEY, block_number_and_hash_at, l2_genesis_state_root,
-    override_env, safe_block_state_root, send_l2_value_transfer, send_l2_value_transfer_confirmed,
-    wait_for, wait_for_latest_height, wait_for_new_attested_safe_block,
-    wait_for_safe_chain_contains, wait_for_safe_prefix_convergence, wait_for_safe_state,
+    NodeConfig, NodeHandle, STAGING_USER_KEY, block_number_and_hash_at, override_env,
+    safe_block_hash, send_l2_value_transfer, send_l2_value_transfer_confirmed, wait_for,
+    wait_for_latest_height, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
+    wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_mins(5);
@@ -172,7 +172,7 @@ async fn happy_case_composer_sustained() {
         wait_for_safe_state(
             &node_before_restart,
             &chain,
-            l2_genesis_state_root(),
+            chain.initial_commitment(),
             DEFAULT_TIMEOUT,
         )
         .await
@@ -185,10 +185,16 @@ async fn happy_case_composer_sustained() {
         n_before = before.batches_posted;
         assert_eq!(before.executions_performed, n_before, "lockstep");
         assert_eq!(before.entries_skipped, 0, "no entry should revert");
-        assert_ne!(before.state_root, l2_genesis_state_root());
+        // Against the genesis BLOCK HASH: comparing a commitment with the
+        // genesis state root can never match, so it would pass vacuously.
+        assert_ne!(
+            before.rollup_commitment,
+            chain.initial_commitment(),
+            "the commitment must have moved off genesis",
+        );
         assert_eq!(
             before.latest_execution_state.unwrap(),
-            before.state_root,
+            before.rollup_commitment,
             "latest event's newState == on-chain stateRoot",
         );
     }
@@ -224,7 +230,7 @@ async fn happy_case_composer_sustained() {
     assert_eq!(after.entries_skipped, 0, "no skipped entries after restart");
     assert_eq!(
         after.latest_execution_state.unwrap(),
-        after.state_root,
+        after.rollup_commitment,
         "event-state consistency holds across restart",
     );
 
@@ -236,9 +242,14 @@ async fn happy_case_composer_sustained() {
     let follower = NodeHandle::start("follower", &follower_cfg, &follower_env)
         .await
         .unwrap();
-    wait_for_safe_state(&follower, &chain, l2_genesis_state_root(), DEFAULT_TIMEOUT)
-        .await
-        .expect("follower did not catch up via L1 replay");
+    wait_for_safe_state(
+        &follower,
+        &chain,
+        chain.initial_commitment(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("follower did not catch up via L1 replay");
     wait_for_safe_prefix_convergence(
         &[&node, &follower],
         post_restart_target_height,
@@ -285,7 +296,7 @@ async fn failure_wrong_rollup_id() {
     let snapshot = chain.snapshot().await.unwrap();
     assert_eq!(snapshot.batches_posted, 0);
     assert_eq!(snapshot.executions_performed, 0);
-    assert_eq!(snapshot.state_root, l2_genesis_state_root());
+    assert_eq!(snapshot.rollup_commitment, chain.initial_commitment());
     node.assert_no_process_death();
 }
 
@@ -380,7 +391,7 @@ async fn failure_prover_signer_mismatch() {
     let snapshot = chain.snapshot().await.unwrap();
     assert_eq!(snapshot.batches_posted, 0);
     assert_eq!(snapshot.executions_performed, 0);
-    assert_eq!(snapshot.state_root, l2_genesis_state_root());
+    assert_eq!(snapshot.rollup_commitment, chain.initial_commitment());
     node.assert_no_process_death();
 }
 
@@ -552,14 +563,14 @@ async fn multi_composer_steady_state_stays_converged_with_l1() {
             if number == 0 {
                 continue;
             }
-            let safe_root = safe_block_state_root(&node.l2_rpc_url())
+            let safe_hash = safe_block_hash(&node.l2_rpc_url())
                 .await
                 .unwrap()
                 .unwrap_or_default();
             compared += 1;
             assert!(
-                recorded.contains(&safe_root),
-                "{name} safe root {safe_root} at L2 height {number} was never recorded by L1 \
+                recorded.contains(&safe_hash),
+                "{name} safe root {safe_hash} at L2 height {number} was never recorded by L1 \
                  (settlement {settled}); the composer derived a chain L1 did not ratify",
             );
             if number > last_safe[i] {
@@ -625,9 +636,14 @@ async fn happy_case_follower_l1_derived() {
         .expect("sequencer landed batches");
 
     let follower = spawn_follower("follower", &harness, None).await.unwrap();
-    wait_for_safe_state(&follower, &chain, l2_genesis_state_root(), DEFAULT_TIMEOUT)
-        .await
-        .expect("follower did not catch up via L1 replay");
+    wait_for_safe_state(
+        &follower,
+        &chain,
+        chain.initial_commitment(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("follower did not catch up via L1 replay");
     wait_for_safe_prefix_convergence(&[&seq, &follower], 1, DEFAULT_TIMEOUT)
         .await
         .expect("follower safe chain did not converge with the sequencer");
@@ -663,9 +679,14 @@ async fn happy_case_follower_sequencer_rpc() {
         .wait_for_batches(2, DEFAULT_TIMEOUT)
         .await
         .expect("sequencer landed batches");
-    wait_for_safe_state(&follower, &chain, l2_genesis_state_root(), DEFAULT_TIMEOUT)
-        .await
-        .expect("follower did not catch up via L1 replay");
+    wait_for_safe_state(
+        &follower,
+        &chain,
+        chain.initial_commitment(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("follower did not catch up via L1 replay");
 
     wait_for_safe_prefix_convergence(&[&seq, &follower], 1, DEFAULT_TIMEOUT)
         .await
@@ -767,10 +788,10 @@ async fn happy_case_follower_cross_safe_parity() {
         spawn_follower("f_seq", &harness, Some(&seq_rpc)),
     )
     .unwrap();
-    wait_for_safe_state(&f_l1, &chain, l2_genesis_state_root(), DEFAULT_TIMEOUT)
+    wait_for_safe_state(&f_l1, &chain, chain.initial_commitment(), DEFAULT_TIMEOUT)
         .await
         .expect("f_l1 did not catch up");
-    wait_for_safe_state(&f_seq, &chain, l2_genesis_state_root(), DEFAULT_TIMEOUT)
+    wait_for_safe_state(&f_seq, &chain, chain.initial_commitment(), DEFAULT_TIMEOUT)
         .await
         .expect("f_seq did not catch up");
 
@@ -816,11 +837,14 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         .await
         .unwrap();
 
-    wait_for_safe_state(&follower, &chain, l2_genesis_state_root(), DEFAULT_TIMEOUT)
-        .await
-        .expect(
-            "follower safe head did not reach a non-genesis attested stateRoot while on the rogue",
-        );
+    wait_for_safe_state(
+        &follower,
+        &chain,
+        chain.initial_commitment(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("follower safe head did not reach a non-genesis attested stateRoot while on the rogue");
 
     // Stop canonical batch production and let any already-submitted batch land
     // before fixing the safe anchor used by this assertion.
@@ -838,10 +862,7 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     // An arbitrary historical attestation is insufficient here: a final batch
     // may have landed while the composer was shutting down.
     wait_for(DEFAULT_TIMEOUT, || async {
-        Ok(
-            (safe_block_state_root(&follower.l2_rpc_url()).await? == Some(final_state))
-                .then_some(()),
-        )
+        Ok((safe_block_hash(&follower.l2_rpc_url()).await? == Some(final_state)).then_some(()))
     })
     .await
     .expect("follower did not derive the composer's final landed batch");
@@ -905,9 +926,14 @@ async fn happy_case_follower_deep_backfill_late_join() {
 
     let follower = spawn_follower("follower", &harness, None).await.unwrap();
 
-    wait_for_safe_state(&follower, &chain, l2_genesis_state_root(), DEFAULT_TIMEOUT)
-        .await
-        .expect("late-joining follower did not backfill into an attested stateRoot");
+    wait_for_safe_state(
+        &follower,
+        &chain,
+        chain.initial_commitment(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("late-joining follower did not backfill into an attested stateRoot");
 
     wait_for_safe_chain_contains(&follower, backlog_depth, backlog_hash, DEFAULT_TIMEOUT)
         .await

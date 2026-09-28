@@ -769,7 +769,7 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
         .as_ref()
         .unwrap()
         .derived_da_entry
-        .as_entry()
+        .as_abi_entry()
         .clone();
     let (_, mut user_payload) = block_and_payload_transactions(vec![user_transaction(7)]);
     let user = user_payload.pop().unwrap();

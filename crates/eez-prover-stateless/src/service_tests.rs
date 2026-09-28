@@ -19,7 +19,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 
 use crate::Backend;
 
-const FIXTURE: &str = "captured-anchor-40155";
+const FIXTURE: &str = "captured-devnet-window-84";
 const SYSTEM_ADDRESS: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076";
 const ATTESTER_KEY: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 
@@ -63,15 +63,17 @@ fn recorded_wire_witness(encoded: &str) -> ExecutionWitness {
     }
 }
 
-/// Captured from Chiado under the RLP DA payload: `postbatch.hex` is the exact
-/// calldata mined in a real transaction, with a recorded digest and an
-/// independently generated signature. `native_block_span_v0` changes the bytes
-/// inside `batch.callData`, so this artifact can no longer validate and cannot
-/// be edited into one that does — a real anchor has to be recaptured on the new
-/// format and the fixture (calldata, digest, expected signature) regenerated
-/// with it. Ignored, not deleted: it is the only end-to-end regression anchor
-/// against captured production data.
-#[ignore = "fixture captures the pre-span DA payload; recapture on the new format"]
+/// The end-to-end regression anchor: a complete window recorded from a live rig,
+/// replayed through the real service.
+///
+/// `postbatch.hex` is the calldata actually mined on L1, correlated to this
+/// window through the composer's settlement record; the digest is the one the
+/// signer attested; the signature is generated independently, so the assertion
+/// compares against a value this service did not produce. The window endpoints
+/// are block hashes — under state-root commitments those fields held a
+/// different kind of value, which is what this pins.
+///
+/// Regenerate with `scripts/capture-signer-window.sh`.
 #[tokio::test]
 async fn captured_window_is_validated_and_signed_by_the_shared_service() {
     let oracle: serde_json::Value = serde_json::from_str(&fixture("oracle.json")).unwrap();

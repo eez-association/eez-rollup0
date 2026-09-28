@@ -43,8 +43,8 @@ retained only after successful replay.
 
 Avoid the unqualified word `trusted` when a more precise source exists. Prefer
 `expected_rollup_id`, `configured_chain_spec`, or
-`validated_window_pre_state_root` over `trusted_id`, `trusted_config`, or
-`trusted_root`.
+`validated_window_pre_block_hash` over `trusted_id`, `trusted_config`, or
+`trusted_hash`.
 
 ## Boundary guarantees
 
@@ -74,12 +74,12 @@ contract check succeeds.
 ### `ValidatedWindow`
 
 This is the settlement-facing output of execution validation. It contains exact
-admitted block bytes, locally validated endpoint roots, system-sender flags,
+admitted block bytes, locally validated endpoint hashes, system-sender flags,
 and outbound receipt observations. The terminal block additionally retains
 receipt outcomes and selected transaction checkpoints. It contains no execution
 witnesses; validation consumed them.
 
-Its `window_pre_state_root` is not yet a batch anchor. It becomes an anchor only
+Its `window_pre_block_hash` is not yet a batch anchor. It becomes an anchor only
 when settlement matches the leading submitted state update against it.
 
 ### `CanonicalPostBatch`

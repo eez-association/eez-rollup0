@@ -13,11 +13,11 @@ use eez_testkit::{
     assert_latest_batch_signature, batches_posted, call_read, call_revert_data,
     completed_proxy_calls, count_events, cross_chain_source_proxy, deploy_nested_setter_inner,
     deploy_nested_setter_outer, events_since, l2_balance, l2_value, last_proxy_result,
-    onchain_nonce, read_state_word, receipt_ok, run_scenarios, safe_block_state_root, setter_call,
-    setup_cross_chain, setup_cross_chain_codeless, setup_cross_chain_empty_call,
+    onchain_nonce, read_state_word, receipt_ok, rollup_commitment, run_scenarios, safe_block_hash,
+    setter_call, setup_cross_chain, setup_cross_chain_codeless, setup_cross_chain_empty_call,
     setup_cross_chain_nested_setter, setup_cross_chain_outbound_return_data,
     setup_cross_chain_proxied, setup_cross_chain_return_data, setup_cross_chain_reverting,
-    sign_and_send, signer_address, state_root, value_no_ret, value_read, wait_for,
+    sign_and_send, signer_address, value_no_ret, value_read, wait_for,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -209,9 +209,12 @@ async fn minimal_bidirectional_cross_chain_smoke() {
         async move {
             let inbound_applied = l2_value(&l2_rpc, w.value_l2).await? == U256::from(41u64);
             let outbound_applied = l2_value(&l1_rpc, w.outbound_value).await? == U256::from(43u64);
-            let l1_root = state_root(&l1_rpc, eez, rollup_id).await?;
-            let l2_root = safe_block_state_root(&l2_rpc).await?;
-            Ok((inbound_applied && outbound_applied && l2_root == Some(l1_root)).then_some(()))
+            let l1_commitment = rollup_commitment(&l1_rpc, eez, rollup_id).await?;
+            let l2_hash = safe_block_hash(&l2_rpc).await?;
+            Ok(
+                (inbound_applied && outbound_applied && l2_hash == Some(l1_commitment))
+                    .then_some(()),
+            )
         }
     })
     .await;
@@ -272,7 +275,7 @@ async fn assert_real_signer_rejects(mutation: ProverMutation, tampered_input: &s
     let batches_after_rejection = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
         .await
         .unwrap();
-    let root_after_rejection = state_root(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id)
+    let root_after_rejection = rollup_commitment(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id)
         .await
         .unwrap();
     wait_for(SETTLE_TIMEOUT, || async {
@@ -288,7 +291,7 @@ async fn assert_real_signer_rejects(mutation: ProverMutation, tampered_input: &s
         "batch count advanced while the signer repeatedly rejected tampered {tampered_input}",
     );
     assert_eq!(
-        state_root(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id)
+        rollup_commitment(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id)
             .await
             .unwrap(),
         root_after_rejection,
@@ -430,7 +433,7 @@ async fn real_signer_attester_mismatch_never_submits_a_batch() {
         "an attestation from an unexpected signer must never reach L1",
     );
     assert_eq!(
-        state_root(&w.l1_rpc(), w.cfg.eez_address, w.cfg.rollup_id)
+        rollup_commitment(&w.l1_rpc(), w.cfg.eez_address, w.cfg.rollup_id)
             .await
             .unwrap(),
         w.cfg.initial_state,
@@ -750,13 +753,13 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     wait_for(SETTLE_TIMEOUT, || {
         let (l1_rpc, l2_rpc) = (l1_rpc.clone(), l2_rpc.clone());
         async move {
-            let l1_root = state_root(&l1_rpc, eez, rollup_id).await?;
-            let l2_root = safe_block_state_root(&l2_rpc).await?;
-            Ok(l2_root.filter(|r| *r == l1_root).map(|_| ()))
+            let l1_commitment = rollup_commitment(&l1_rpc, eez, rollup_id).await?;
+            let l2_hash = safe_block_hash(&l2_rpc).await?;
+            Ok(l2_hash.filter(|r| *r == l1_commitment).map(|_| ()))
         }
     })
     .await
-    .expect("L1 stored stateRoot never matched L2 safe stateRoot");
+    .expect("L1 commitment never matched the L2 safe block hash");
 
     let batches = batches_posted(&l1_rpc, w.cfg.eez_address, w.dep.deploy_block)
         .await

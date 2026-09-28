@@ -514,7 +514,6 @@ fn replays_an_empty_terminal_block_from_local_anchor_state() {
     )
     .unwrap();
 
-    assert_eq!(output.pre_state_root, anchor_root);
     assert_eq!(output.blocks.len(), 1);
     assert_eq!(output.blocks[0].post_state_root, terminal_root);
 }

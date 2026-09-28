@@ -93,10 +93,10 @@ execution binding, value, call-hash, and outcome checks in `settlement/`.
 
 ## Pinned Stateless fork
 
-The production dependency pins an exact commit from
-[`eez-association/stateless`](https://github.com/eez-association/stateless)
-in the workspace root `Cargo.toml`; this crate consumes it through its workspace
-dependency. The fork exposes the computed pre-state and post-state roots and
+The production dependency pins an exact commit of the Stateless fork as
+`stateless-reth` in the workspace root `Cargo.toml`, which is the authority on
+which fork and revision are in use; this crate consumes it through its
+workspace dependency. The fork exposes the computed pre-state and post-state roots and
 selected transaction-state checkpoints while preserving upstream
 Stateless/Reth consensus and execution validation.
 

@@ -95,15 +95,15 @@ Every entry MUST contain exactly one state update for the expected rollup. The
 updates MUST form one continuous chain:
 
 ```text
-entries[0].stateUpdates[0].currentState = state root at posted
+entries[0].stateUpdates[0].currentState = hash of block posted
 entries[i].stateUpdates[0].currentState = entries[i - 1].stateUpdates[0].newState
-entries[last].stateUpdates[0].newState = terminal Sync-block state root
+entries[last].stateUpdates[0].newState = terminal Sync-block hash
 ```
 
 The anchor is `entries[0]` and is not counted as a cross-chain effect. Effect
-`i` is `entries[i + 1]`. Let `P` be the terminal Sync block's parent state root,
-and let `R[i]` be the state root immediately after effect `i`'s effect-ending
-transaction:
+`i` is `entries[i + 1]`. Let `P` be the terminal Sync block's parent hash, and
+let `R[i]` be the hash of the candidate block holding the transaction prefix
+through effect `i`'s effect-ending transaction:
 
 - for an outbound effect, the effect-ending transaction is the user
   transaction in its `[system load, user]` pair; the system load alone is not a
@@ -112,28 +112,31 @@ transaction:
   transaction.
 
 Each `R[i]` MUST be derived from execution of the exact terminal-block
-transaction prefix through that transaction from state `P`, using the same
-block execution environment as the complete terminal block. A Composer MAY
-capture these checkpoints during one complete execution or execute the prefixes
-separately.
+transaction prefix through that transaction from the terminal block's parent
+state, using the same block execution environment as the complete terminal
+block. Every candidate shares the terminal block's fixed header fields —
+parent, number and timestamp — while the commitments derived from execution
+are rebuilt from the prefix it carries, so `R` is a commitment chain rather
+than a parent-child chain. A Composer MAY capture these checkpoints during
+one complete execution or execute the prefixes separately.
 
 Let `U[j] = entries[j].stateUpdates[0]`. For a batch with `E > 0` effects, the
 state updates MUST be:
 
 ```text
-U[0].currentState = state root at posted       // anchor
+U[0].currentState = hash of block posted       // anchor
 U[0].newState = P
 
 U[1].currentState = P                          // effect 0
 U[i + 1].currentState = R[i - 1]               for every 0 < i < E
 U[i + 1].newState = R[i]                       for every 0 <= i < E
 
-R[E - 1] = terminal Sync-block final state root
+R[E - 1] = terminal Sync-block hash
 ```
 
 For an anchor-only batch (`E = 0`), there are no effect checkpoints:
-`U[0].currentState` is the state root at `posted` and `U[0].newState` is the
-terminal Sync block's final state root. The Composer MUST finalize every entry's
+`U[0].currentState` is the hash of block `posted` and `U[0].newState` is the
+terminal Sync block's hash. The Composer MUST finalize every entry's
 L1 rolling hash only after all state updates have been assigned, because the
 rolling-hash seed commits to those updates.
 
@@ -247,7 +250,7 @@ following checks pass:
 - `post_batch.abi_calldata` is the canonical encoding of the supported batch
   profile and matches the configured rollup and proof system;
 - the entry state updates form the required chain, and every effect entry's
-  `newState` matches the corresponding post-transaction root described in
+  `newState` matches the corresponding candidate block hash described in
   section 3.1;
 - every inbound and outbound entry matches the applicable executed transaction,
   receipt, event, call hash, value, and ether-delta evidence for that effect;
@@ -456,5 +459,5 @@ A Composer implementation SHOULD test:
   `ECDSAProofSystem` contracts.
 
 The captured successful request in
-[`captured-anchor-40155`](../eez-prover-stateless/tests/fixtures/captured-anchor-40155/README.md)
+[`captured-devnet-window-84`](../eez-prover-stateless/tests/fixtures/captured-devnet-window-84/README.md)
 provides a complete positive window and expected public-input hash.

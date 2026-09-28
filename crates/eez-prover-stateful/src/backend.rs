@@ -12,6 +12,7 @@ use alloy_primitives::{Address, B256};
 use alloy_rpc_types_debug::ExecutionWitness;
 use eez_evm::EezEvmConfig;
 use eez_primitives::Block;
+use eez_primitives::EezPrimitives;
 use eez_primitives::Receipt as EthereumReceipt;
 use eez_proof_signer::cancel::CancellationToken;
 use eez_proof_signer::validate::support::{
@@ -39,6 +40,7 @@ use reth_storage_api::{
 };
 use revm::database::states::bundle_state::BundleRetention;
 use revm::state::bal::Bal;
+use stateless_reth::candidate_block_hash;
 use tracing::{debug, trace};
 
 /// Stateful validation over one live Ethereum node provider.
@@ -193,7 +195,6 @@ where
         .with_database(StateProviderDatabase::new(anchor_state))
         .with_bundle_update()
         .build();
-    let pre_state_root = anchor_header.state_root;
     let mut previous_header = SealedHeader::new(anchor_header, claimed_anchor_hash);
     let consensus = EthBeaconConsensus::new(Arc::clone(chain_spec));
     let mut outputs = Vec::with_capacity(total_blocks);
@@ -301,10 +302,7 @@ where
         blocks,
     )?;
 
-    Ok(BackendWindowOutput {
-        pre_state_root,
-        blocks: outputs,
-    })
+    Ok(BackendWindowOutput { blocks: outputs })
 }
 
 /// Reject a torn canonical view instead of signing evidence whose anchor or
@@ -404,11 +402,26 @@ fn execute_block_with_state_checkpoints(
                 executor.evm_mut().db_mut().bump_bal_index();
             }
             if next_checkpoint.peek() == Some(&transaction_index) {
-                let db = executor.evm_mut().db_mut();
-                db.merge_transitions(BundleRetention::Reverts);
+                let state_root = {
+                    let db = executor.evm_mut().db_mut();
+                    db.merge_transitions(BundleRetention::Reverts);
+                    state_root(db)?
+                };
+                let block_hash = candidate_block_hash::<EezPrimitives>(
+                    block.sealed_header(),
+                    &block.body().transactions[..=transaction_index],
+                    &executor.receipts()[..=transaction_index],
+                    state_root,
+                )
+                .map_err(|error| {
+                    ValidationError::Rejected(format!(
+                        "stateful candidate block hash rejected: {error}"
+                    ))
+                })?;
                 checkpoints.push(TransactionStateCheckpoint {
                     transaction_index,
-                    state_root: state_root(db)?,
+                    state_root,
+                    block_hash,
                 });
                 next_checkpoint.next();
             }

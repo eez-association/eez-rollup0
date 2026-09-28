@@ -192,7 +192,6 @@ impl Validator {
 /// backend check rejects such a block at its own exact decode anyway.
 pub(crate) fn backend_output_for(blocks: &[AdmittedBlock]) -> BackendWindowOutput {
     BackendWindowOutput {
-        pre_state_root: B256::ZERO,
         blocks: blocks
             .iter()
             .map(|block| {
