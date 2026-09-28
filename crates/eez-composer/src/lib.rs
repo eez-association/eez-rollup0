@@ -36,6 +36,7 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+pub mod attestation_quorum;
 pub mod composer;
 pub mod held_pool;
 pub mod ingress;
@@ -44,6 +45,10 @@ pub mod optimistic;
 mod prover_retry;
 pub mod rollup;
 
+#[doc(inline)]
+pub use attestation_quorum::{
+    Attestation, AttestationQuorum, DEFAULT_ATTESTATION_GRACE, QuorumConfigError, QuorumMember,
+};
 #[doc(inline)]
 pub use composer::{Composer, ComposerConfigError, CrossChainExecCtx};
 #[doc(inline)]
