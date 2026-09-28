@@ -197,7 +197,12 @@ async fn attest_with(
     registration: &QuorumRegistration,
 ) -> Result<Vec<Attestation>, ProverError> {
     quorum
-        .attest(&context(), registration, timing(), BundleTarget::NextBlock)
+        .attest(
+            &context(),
+            Some(registration),
+            timing(),
+            BundleTarget::NextBlock,
+        )
         .await
 }
 
@@ -593,7 +598,7 @@ async fn registration_reads_the_threshold_vkeys_and_signers() {
     let provider = ProviderBuilder::default().connect_mocked_client(asserter);
 
     let registration = quorum
-        .registration(&provider, Address::repeat_byte(0x99))
+        .registration_at(&provider, Address::repeat_byte(0x99))
         .await
         .unwrap();
 
@@ -612,7 +617,7 @@ async fn a_member_whose_proof_system_changed_signer_sits_out() {
     let provider = ProviderBuilder::default().connect_mocked_client(asserter);
 
     let registration = quorum
-        .registration(&provider, Address::repeat_byte(0x99))
+        .registration_at(&provider, Address::repeat_byte(0x99))
         .await
         .unwrap();
 
@@ -631,7 +636,7 @@ async fn a_failed_registration_read_is_reported() {
     let provider = ProviderBuilder::default().connect_mocked_client(asserter);
 
     let error = quorum
-        .registration(&provider, Address::repeat_byte(0x99))
+        .registration_at(&provider, Address::repeat_byte(0x99))
         .await
         .unwrap_err();
 
@@ -649,43 +654,35 @@ async fn a_threshold_the_registered_attesters_cannot_meet_is_reported() {
     let provider = ProviderBuilder::default().connect_mocked_client(asserter);
 
     let error = quorum
-        .registration(&provider, Address::repeat_byte(0x99))
+        .registration_at(&provider, Address::repeat_byte(0x99))
         .await
         .unwrap_err();
 
     assert!(error.contains("registers 1 of the 2"), "{error}");
 }
 
-#[tokio::test]
-async fn startup_tolerates_an_inactive_member_while_the_threshold_is_reachable() {
-    let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN)], 0);
-    let asserter = Asserter::new();
-    asserter.push_success(&word(1));
-    asserter.push_success(&vkey_of(provers[0].key.address()));
-    asserter.push_success(&Address::repeat_byte(0xee).into_word());
-    asserter.push_success(&vkey_of(provers[1].key.address()));
-    asserter.push_success(&provers[1].key.address().into_word());
-    let provider = ProviderBuilder::default().connect_mocked_client(asserter);
+/// One attester keeps the pre-quorum flow: L1 judges its proof, so the
+/// composer neither reads the registration nor checks the proof itself.
+#[tokio::test(start_paused = true)]
+async fn a_lone_attester_proof_goes_to_l1_unchecked() {
+    let (quorum, _) = quorum(&[(0, Answer::SignElsewhere)], 0);
 
-    quorum
-        .ensure_registered(&provider, Address::repeat_byte(0x99))
+    let attestations = quorum
+        .attest(&context(), None, timing(), BundleTarget::NextBlock)
         .await
         .unwrap();
+
+    assert_eq!(systems(&attestations), vec![proof_system(1)]);
 }
 
-#[tokio::test]
-async fn startup_refuses_a_set_that_cannot_meet_the_threshold() {
-    let (quorum, provers) = quorum(&[(0, SIGN)], 0);
-    let asserter = Asserter::new();
-    asserter.push_success(&word(1));
-    asserter.push_success(&vkey_of(provers[0].key.address()));
-    asserter.push_success(&Address::repeat_byte(0xee).into_word());
-    let provider = ProviderBuilder::default().connect_mocked_client(asserter);
+#[tokio::test(start_paused = true)]
+async fn several_attesters_need_a_registration() {
+    let (quorum, _) = quorum(&[(0, SIGN), (0, SIGN)], 0);
 
     let error = quorum
-        .ensure_registered(&provider, Address::repeat_byte(0x99))
+        .attest(&context(), None, timing(), BundleTarget::NextBlock)
         .await
         .unwrap_err();
 
-    assert!(error.contains("registers 0 of the 1"), "{error}");
+    assert!(matches!(error, ProverError::Backend(_)), "{error:?}");
 }

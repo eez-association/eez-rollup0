@@ -587,14 +587,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             .map_err(|_| eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing"))?;
         let l1_poster_signer =
             PrivateKeySigner::from_bytes(&B256::from_str(l1_poster_key.trim_start_matches("0x"))?)?;
-        let rollup_manager =
-            eez_composer::attestation_quorum::rollup_manager(&l1_provider, eez_registry, rollup_id)
-                .await
-                .map_err(|e| eyre::eyre!("rollup manager lookup: {e}"))?;
-        quorum
-            .ensure_registered(&l1_provider, rollup_manager)
-            .await
-            .map_err(|e| eyre::eyre!("attester registration: {e}"))?;
         // 10 gwei comfortably exceeds the smoke user_tx's
         // 2-gwei priority fee, so dev-reth's payload builder
         // orders postBatch ahead of the user_tx within the
@@ -617,7 +609,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             l1_poster_signer,
             l1_chain_id: l1_submission_chain_id,
             l1_post_batch_priority_fee,
-            rollup_manager,
+            eez_registry,
         });
         event!(
             name: "eez.node.evm_composer.ready",

@@ -89,10 +89,10 @@ pub struct CrossChainExecCtx {
     /// the L1 block. Default: 10 gwei (well above the smoke's
     /// `cast mktx --gas-price 2 gwei` user_tx).
     pub l1_post_batch_priority_fee: u128,
-    /// The settled rollup's manager contract (`Rollup.sol`), whose
-    /// `threshold()` is the number of distinct proof systems a batch must
-    /// carry proofs from. Read for every batch, since the owner may change it.
-    pub rollup_manager: Address,
+    /// The EEZ registry, which names the settled rollup's manager contract
+    /// (`Rollup.sol`). Several attesters read its `threshold()` and their
+    /// registration for every batch, since the owner may change them.
+    pub eez_registry: Address,
 }
 
 impl std::fmt::Debug for CrossChainExecCtx {
@@ -4189,12 +4189,18 @@ where
                 None => Vec::new(),
             })
         };
-        let (block_witnesses, registration) = tokio::join!(
-            witnesses,
+        // A lone attester keeps the pre-quorum flow and needs no registration.
+        let registration = async {
+            if self.inner.quorum.len() == 1 {
+                return Ok(None);
+            }
             self.inner
                 .quorum
-                .registration(&ctx.l1_provider, ctx.rollup_manager),
-        );
+                .registration(&ctx.l1_provider, ctx.eez_registry, rollup_id)
+                .await
+                .map(Some)
+        };
+        let (block_witnesses, registration) = tokio::join!(witnesses, registration);
         let block_witnesses = block_witnesses?;
         // An unreadable or unreachable registration is not a candidate's
         // fault: requeue without charging.
@@ -4212,7 +4218,7 @@ where
             .quorum
             .attest(
                 &proving_ctx,
-                &registration,
+                registration.as_ref(),
                 self.inner.emission.timing,
                 bundle_target,
             )

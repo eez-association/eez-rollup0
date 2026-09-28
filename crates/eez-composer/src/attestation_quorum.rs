@@ -19,7 +19,7 @@
 //! counted: one faulty or hostile attester must not be able to stall
 //! settlement for the others.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256, Bytes, Signature};
@@ -112,6 +112,8 @@ pub struct AttestationQuorum {
     /// requires for `batch.proofSystems`.
     members: Vec<QuorumMember>,
     grace: Duration,
+    /// The rollup's manager contract, looked up once it is registered.
+    manager: OnceLock<Address>,
 }
 
 impl AttestationQuorum {
@@ -146,7 +148,11 @@ impl AttestationQuorum {
                 proof_system: pair[0].proof_system,
             });
         }
-        Ok(Self { members, grace })
+        Ok(Self {
+            members,
+            grace,
+            manager: OnceLock::new(),
+        })
     }
 
     /// The configured proof systems, strictly ascending.
@@ -182,6 +188,22 @@ impl AttestationQuorum {
     pub(crate) async fn registration(
         &self,
         provider: &RootProvider,
+        registry: Address,
+        rollup_id: u64,
+    ) -> Result<QuorumRegistration, String> {
+        let manager = match self.manager.get() {
+            Some(manager) => *manager,
+            None => {
+                let manager = rollup_manager(provider, registry, rollup_id).await?;
+                *self.manager.get_or_init(|| manager)
+            }
+        };
+        self.registration_at(provider, manager).await
+    }
+
+    async fn registration_at(
+        &self,
+        provider: &RootProvider,
         manager: Address,
     ) -> Result<QuorumRegistration, String> {
         let mut reads = JoinSet::new();
@@ -214,7 +236,18 @@ impl AttestationQuorum {
                 let (index, vkey, signer) =
                     read.map_err(|error| format!("registration read task: {error}"))??;
                 let member = &self.members[index];
-                if !vkey.is_zero() && signer != member.attester {
+                if vkey.is_zero() {
+                    event!(
+                        name: "eez.composer.attestation.member_unregistered",
+                        Level::WARN,
+                        event_name = "eez.composer.attestation.member_unregistered",
+                        proof_system = %member.proof_system,
+                        %manager,
+                        "proof system is not registered on the rollup manager; its attester is not asked",
+                    );
+                    continue;
+                }
+                if signer != member.attester {
                     // A proof from the configured key would revert the batch
                     // on-chain, so the member sits out until its config matches.
                     event!(
@@ -265,10 +298,13 @@ impl AttestationQuorum {
     pub(crate) async fn attest(
         &self,
         ctx: &ProvingContext,
-        registration: &QuorumRegistration,
+        registration: Option<&QuorumRegistration>,
         timing: RollupTiming,
         target: BundleTarget,
     ) -> Result<Vec<Attestation>, ProverError> {
+        let Some(registration) = registration else {
+            return self.attest_alone(ctx, timing, target).await;
+        };
         registration
             .ensure_reachable(self.members.len())
             .map_err(ProverError::Backend)?;
@@ -374,36 +410,27 @@ impl AttestationQuorum {
         Ok(attestations)
     }
 
-    /// Check at startup that the attesters the manager registers, with the
-    /// signer their proof system accepts, can meet its threshold, so a
-    /// misconfigured set fails before the first batch. A member that cannot
-    /// attest yet is only warned about: the owner may register it later, and
-    /// every batch reads the registration again.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message if the manager cannot be read or the threshold is out
-    /// of reach.
-    pub async fn ensure_registered(
+    /// A lone attester's proof, as before quorums: the composer has no other
+    /// attester to protect from it, so the proof goes to L1 unchecked and L1
+    /// is the judge.
+    async fn attest_alone(
         &self,
-        provider: &RootProvider,
-        manager: Address,
-    ) -> Result<(), String> {
-        let registration = self.registration(provider, manager).await?;
-        for (member, vkey) in self.members.iter().zip(&registration.vkeys) {
-            if vkey.is_zero() {
-                event!(
-                    name: "eez.composer.attestation.member_inactive",
-                    Level::WARN,
-                    event_name = "eez.composer.attestation.member_inactive",
-                    proof_system = %member.proof_system,
-                    attester = %member.attester,
-                    %manager,
-                    "configured attester is not registered with this signer on the rollup manager; it is not asked until it is",
-                );
-            }
-        }
-        Ok(())
+        ctx: &ProvingContext,
+        timing: RollupTiming,
+        target: BundleTarget,
+    ) -> Result<Vec<Attestation>, ProverError> {
+        let [member] = self.members.as_slice() else {
+            return Err(ProverError::Backend(format!(
+                "{} attesters are configured, so a registration is required",
+                self.members.len()
+            )));
+        };
+        let request = single_attester_context(ctx, member.proof_system);
+        let proof = prove_with_retry(member.prover.as_ref(), request, timing, target).await?;
+        Ok(vec![Attestation {
+            proof_system: member.proof_system,
+            proof,
+        }])
     }
 }
 
@@ -450,11 +477,7 @@ alloy_sol_types::sol! {
 }
 
 /// The rollup manager contract registered for `rollup_id` in the EEZ registry.
-///
-/// # Errors
-///
-/// Returns a message if the registry cannot be read or names no manager.
-pub async fn rollup_manager(
+async fn rollup_manager(
     provider: &RootProvider,
     registry: Address,
     rollup_id: u64,
