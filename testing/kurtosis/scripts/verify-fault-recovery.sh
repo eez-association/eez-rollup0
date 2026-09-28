@@ -86,15 +86,19 @@ wait_receipt_ok() {
     return 1
 }
 
-wait_value() {
+safe_value() {
+    cast call "$TARGET" 'value()(uint256)' --block safe --rpc-url "$L2"
+}
+
+wait_safe_value() {
     local expected="$1" deadline value
     deadline=$((SECONDS + WAIT_SECS))
     while (( SECONDS < deadline )); do
-        value=$(cast call "$TARGET" 'value()(uint256)' --rpc-url "$L2" 2>/dev/null || true)
+        value=$(safe_value 2>/dev/null || true)
         [[ "$value" == "$expected" ]] && return 0
         sleep 3
     done
-    echo "destination value did not reach $expected (last=$value)" >&2
+    echo "safe destination value did not reach $expected (last=$value)" >&2
     return 1
 }
 
@@ -163,14 +167,14 @@ send_front "$L1F" "$raw" "$hash"
 wait_l1_blocks 2
 [[ "$(receipt_status "$hash" "$L1")" == "missing" ]] \
     || { echo "transaction settled without an available proof signer" >&2; exit 1; }
-[[ "$(cast call "$TARGET" 'value()(uint256)' --rpc-url "$L2")" == "0" ]] \
+[[ "$(safe_value)" == "0" ]] \
     || { echo "unattested transaction changed destination state" >&2; exit 1; }
 
 echo "==> restarting proof signer and requiring pending plus fresh progress"
 kurtosis service start "$ENCLAVE" eez-proof-signer
 SIGNER_STOPPED=0
 wait_receipt_ok "$hash"
-wait_value 41
+wait_safe_value 41
 wait_commitment_convergence
 
 echo "==> stopping the MEV relay with an inbound transaction pending"
@@ -186,12 +190,14 @@ wait_l1_blocks 2
     || { echo "canonical L1 stalled during the relay outage" >&2; exit 1; }
 [[ "$(receipt_status "$relay_hash" "$L1")" == "missing" ]] \
     || { echo "transaction settled while the MEV relay was unavailable" >&2; exit 1; }
-[[ "$(cast call "$TARGET" 'value()(uint256)' --rpc-url "$L2")" == "41" ]] \
+# `latest` can include the optimistic Sync block while its L1 bundle is pending.
+# Safety is defined by the settled `safe` view, which must remain unchanged.
+[[ "$(safe_value)" == "41" ]] \
     || { echo "relay-outage transaction changed destination state before settlement" >&2; exit 1; }
 kurtosis service start "$ENCLAVE" mev-relay-api
 RELAY_STOPPED=0
 wait_receipt_ok "$relay_hash"
-wait_value 42
+wait_safe_value 42
 wait_commitment_convergence
 
 echo "==> stopping the builder while canonical L1 continues proposing blocks"
@@ -207,12 +213,12 @@ wait_l1_blocks 2
     || { echo "canonical L1 stalled during the builder outage" >&2; exit 1; }
 [[ "$(receipt_status "$builder_hash" "$L1")" == "missing" ]] \
     || { echo "transaction settled while the bundle builder was unavailable" >&2; exit 1; }
-[[ "$(cast call "$TARGET" 'value()(uint256)' --rpc-url "$L2")" == "42" ]] \
+[[ "$(safe_value)" == "42" ]] \
     || { echo "builder-outage transaction changed destination state before settlement" >&2; exit 1; }
 kurtosis service start "$ENCLAVE" "$BUILDER_SERVICE"
 BUILDER_STOPPED=0
 wait_receipt_ok "$builder_hash"
-wait_value 43
+wait_safe_value 43
 wait_commitment_convergence
 pre_restart_height="$SAFE_HEIGHT"
 pre_restart_hash="$SAFE_HASH"
@@ -245,7 +251,7 @@ fresh_raw=$(build_inbound "$nonce" 47)
 fresh_hash=$(cast keccak "$fresh_raw")
 send_front "$L1F" "$fresh_raw" "$fresh_hash"
 wait_receipt_ok "$fresh_hash"
-wait_value 47
+wait_safe_value 47
 wait_commitment_convergence
 (( SAFE_HEIGHT > pre_restart_height )) \
     || { echo "fresh transaction did not advance the safe chain after restart" >&2; exit 1; }
