@@ -65,8 +65,18 @@ WRAPPED_TOPIC=$(cast keccak 'Wrapped(uint256,bool,bool,uint256)')
 FUNDING_KEY="${EEZ_FUND_FROM_KEY:-$L2_DEPLOY_KEY}"
 L1_DEPLOY_KEY="${EEZ_L1_SETUP_KEY:-$FUNDING_KEY}"
 
-refresh_node_log() { kurtosis service logs -a "$ENCLAVE" eez-node >"$NODE_LOG" 2>&1 || true; }
-refresh_signer_log() { kurtosis service logs -a "$ENCLAVE" eez-proof-signer >"$SIGNER_LOG" 2>&1 || true; }
+_container() { docker ps --format "{{.Names}}" | grep -m1 -E "^$1(--|-)" || true; }
+# The node is a host container on the split rig and an enclave service in CI.
+# Reading only the enclave leaves the log EMPTY on the rig, and every log-driven
+# wait then times out with nothing to show for it.
+_logs_into() {
+    local svc="$1" dest="$2" c
+    c=$(_container "$svc")
+    if [[ -n "$c" ]]; then docker logs "$c" >"$dest" 2>&1 || true
+    else kurtosis service logs -a "$ENCLAVE" "$svc" >"$dest" 2>&1 || true; fi
+}
+refresh_node_log() { _logs_into eez-node "$NODE_LOG"; }
+refresh_signer_log() { _logs_into eez-proof-signer "$SIGNER_LOG"; }
 
 wait_for_sync_boundary() {
     # These scenarios assert that all prepared calls share one composed Sync
