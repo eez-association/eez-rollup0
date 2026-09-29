@@ -15,10 +15,10 @@ use tracing::{Level, event};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ComposerInfo {
-    /// EEZ contracts used by this composer, ordered to match `supported_networks`.
-    pub eez_contracts: Vec<Address>,
-    /// EVM chain IDs supported by this composer, ordered to match `eez_contracts`.
-    pub supported_networks: Vec<u64>,
+    /// EEZ contracts configured for this composer.
+    pub eez_contracts: ComposerContracts,
+    /// Chain IDs supported by this composer.
+    pub supported_networks: SupportedNetworks,
     /// Composer implementation version.
     pub version: &'static str,
 }
@@ -26,14 +26,42 @@ pub struct ComposerInfo {
 impl ComposerInfo {
     /// Build the discovery response for the composer's supported networks.
     #[must_use]
-    pub fn new(eez_contracts: Vec<Address>, supported_networks: Vec<u64>) -> Self {
-        debug_assert_eq!(eez_contracts.len(), supported_networks.len());
+    pub fn new(eez_contracts: ComposerContracts, supported_networks: SupportedNetworks) -> Self {
         Self {
             eez_contracts,
             supported_networks,
             version: env!("CARGO_PKG_VERSION"),
         }
     }
+}
+
+/// EVM chain IDs supported by the composer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupportedNetworks {
+    /// EEZ L1 chain ID.
+    pub eez_l1: u64,
+    /// EEZ L2 chain ID.
+    pub eez_l2: u64,
+}
+
+/// Contract addresses advertised by the composer discovery endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposerContracts {
+    /// L1 EEZ registry contract.
+    pub eez_registry_address: Address,
+    /// L1 rollup manager, when configured by the deployment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eez_rollup_manager_address: Option<Address>,
+    /// L1 bridge sender, when the bridge deployment is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eez_l1_bridge_sender: Option<Address>,
+    /// L2 EEZ predeploy.
+    pub eez_l2_address: Address,
+    /// L2 bridge receiver, when the bridge deployment is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eez_l2_bridge_receiver: Option<Address>,
 }
 
 /// Install the composer discovery method on every configured L2 RPC transport.
@@ -90,22 +118,69 @@ mod tests {
     fn composer_info_uses_stable_camel_case_schema() {
         let l1_address = Address::repeat_byte(0x11);
         let l2_address = Address::repeat_byte(0x22);
+        let rollup_manager = Address::repeat_byte(0x33);
+        let bridge_sender = Address::repeat_byte(0x44);
+        let bridge_receiver = Address::repeat_byte(0x55);
         let value = serde_json::to_value(ComposerInfo::new(
-            vec![l1_address, l2_address],
-            vec![10_200, 10_201],
+            ComposerContracts {
+                eez_registry_address: l1_address,
+                eez_rollup_manager_address: Some(rollup_manager),
+                eez_l1_bridge_sender: Some(bridge_sender),
+                eez_l2_address: l2_address,
+                eez_l2_bridge_receiver: Some(bridge_receiver),
+            },
+            SupportedNetworks {
+                eez_l1: 10_200,
+                eez_l2: 10_201,
+            },
         ))
         .unwrap();
 
         assert_eq!(
             value["eezContracts"],
-            serde_json::json!([format!("{l1_address:#x}"), format!("{l2_address:#x}")])
+            serde_json::json!({
+                "eezRegistryAddress": format!("{l1_address:#x}"),
+                "eezRollupManagerAddress": format!("{rollup_manager:#x}"),
+                "eezL1BridgeSender": format!("{bridge_sender:#x}"),
+                "eezL2Address": format!("{l2_address:#x}"),
+                "eezL2BridgeReceiver": format!("{bridge_receiver:#x}"),
+            })
         );
         assert_eq!(
             value["supportedNetworks"],
-            serde_json::json!([10_200, 10_201])
+            serde_json::json!({
+                "eezL1": 10_200,
+                "eezL2": 10_201,
+            })
         );
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert!(value.get("eez_contracts").is_none());
+    }
+
+    #[test]
+    fn composer_info_omits_unconfigured_optional_contracts() {
+        let value = serde_json::to_value(ComposerInfo::new(
+            ComposerContracts {
+                eez_registry_address: Address::repeat_byte(0x11),
+                eez_rollup_manager_address: None,
+                eez_l1_bridge_sender: None,
+                eez_l2_address: Address::repeat_byte(0x22),
+                eez_l2_bridge_receiver: None,
+            },
+            SupportedNetworks {
+                eez_l1: 10_200,
+                eez_l2: 10_201,
+            },
+        ))
+        .unwrap();
+
+        assert!(
+            value["eezContracts"]
+                .get("eezRollupManagerAddress")
+                .is_none()
+        );
+        assert!(value["eezContracts"].get("eezL1BridgeSender").is_none());
+        assert!(value["eezContracts"].get("eezL2BridgeReceiver").is_none());
     }
 
     #[tokio::test]
@@ -113,8 +188,17 @@ mod tests {
         let l1_address = Address::repeat_byte(0x22);
         let l2_address = Address::repeat_byte(0x33);
         let module = composer_rpc_module(ComposerInfo::new(
-            vec![l1_address, l2_address],
-            vec![10_200, 10_201],
+            ComposerContracts {
+                eez_registry_address: l1_address,
+                eez_rollup_manager_address: None,
+                eez_l1_bridge_sender: None,
+                eez_l2_address: l2_address,
+                eez_l2_bridge_receiver: None,
+            },
+            SupportedNetworks {
+                eez_l1: 10_200,
+                eez_l2: 10_201,
+            },
         ))
         .unwrap();
         let (response, _) = module
@@ -127,11 +211,17 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(response.get()).unwrap();
         assert_eq!(
             response["result"]["eezContracts"],
-            serde_json::json!([format!("{l1_address:#x}"), format!("{l2_address:#x}")])
+            serde_json::json!({
+                "eezRegistryAddress": format!("{l1_address:#x}"),
+                "eezL2Address": format!("{l2_address:#x}"),
+            })
         );
         assert_eq!(
             response["result"]["supportedNetworks"],
-            serde_json::json!([10_200, 10_201])
+            serde_json::json!({
+                "eezL1": 10_200,
+                "eezL2": 10_201,
+            })
         );
 
         let (response, _) = module
