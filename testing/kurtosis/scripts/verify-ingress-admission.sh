@@ -56,15 +56,19 @@ wait_receipt_ok() {
     return 1
 }
 
-wait_value() {
+safe_value() {
+    cast call "$TARGET" 'value()(uint256)' --block safe --rpc-url "$L2"
+}
+
+wait_safe_value() {
     local expected="$1" deadline value
     deadline=$((SECONDS + WAIT_SECS))
     while (( SECONDS < deadline )); do
-        value=$(cast call "$TARGET" 'value()(uint256)' --rpc-url "$L2" 2>/dev/null || true)
+        value=$(safe_value 2>/dev/null || true)
         [[ "$value" == "$expected" ]] && return 0
         sleep 3
     done
-    echo "destination value did not reach $expected (last=$value)" >&2
+    echo "safe destination value did not reach $expected (last=$value)" >&2
     return 1
 }
 
@@ -151,7 +155,7 @@ second_hash=$(cast keccak "$second_raw")
 send_front "$L1F" "$second_raw" "$second_hash"
 wait_receipt_ok "$first_hash"
 wait_receipt_ok "$second_hash"
-wait_value 92
+wait_safe_value 92
 wait_commitment_convergence
 
 jq -n \

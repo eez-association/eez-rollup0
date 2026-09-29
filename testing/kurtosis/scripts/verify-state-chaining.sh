@@ -304,18 +304,6 @@ run_scenario() {
     [[ $(wc -l <<<"$source_blocks" | tr -d ' ') == 1 ]] \
         || { echo "$direction source transactions landed in different blocks: $source_blocks" >&2; return 1; }
 
-    for hash in "${hashes[@]}"; do
-        actual_results+=("$(wrapped_result "$hash" "$source_rpc" "$wrapper")")
-    done
-    for index in 0 1 2; do
-        result="${actual_results[$index]}"
-        [[ "$result" == "${expected_results[$index]}" ]] || {
-            echo "$direction $scenario transaction $((index + 1)) returned $result; expected ${expected_results[$index]}" >&2
-            return 1
-        }
-    done
-    echo "    ✓ ordered returns exactly match ${expected_results[*]}"
-
     target_event_deadline=$((SECONDS + RECEIPT_WAIT_SECS))
     while (( SECONDS < target_event_deadline )); do
         all_target_logs=$(retry cast logs --address "$target" --from-block 0 --to-block latest \
@@ -330,6 +318,26 @@ run_scenario() {
     target_blocks=$(jq -r '[.[].blockNumber] | unique | .[]' <<<"$target_logs")
     [[ $(wc -l <<<"$target_blocks" | tr -d ' ') == 1 ]] \
         || { echo "$direction destination calls landed in different blocks: $target_blocks" >&2; return 1; }
+
+    # The first receipts can belong to an optimistic Sync block that is later
+    # replaced if its L1 bundle is dropped. Refresh them after destination
+    # effects appear so proof matching uses the canonical retry height.
+    wait_for_receipts "$source_rpc" "${hashes[@]}"
+    source_blocks=$(unique_receipt_block "$source_rpc" "${hashes[@]}")
+    [[ $(wc -l <<<"$source_blocks" | tr -d ' ') == 1 ]] \
+        || { echo "$direction source transactions landed in different canonical blocks: $source_blocks" >&2; return 1; }
+
+    for hash in "${hashes[@]}"; do
+        actual_results+=("$(wrapped_result "$hash" "$source_rpc" "$wrapper")")
+    done
+    for index in 0 1 2; do
+        result="${actual_results[$index]}"
+        [[ "$result" == "${expected_results[$index]}" ]] || {
+            echo "$direction $scenario transaction $((index + 1)) returned $result; expected ${expected_results[$index]}" >&2
+            return 1
+        }
+    done
+    echo "    ✓ ordered returns exactly match ${expected_results[*]}"
 
     if [[ "$direction" == "inbound" ]]; then
         sync_height=$(cast to-dec "$target_blocks")

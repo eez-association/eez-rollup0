@@ -441,10 +441,13 @@ bash testing/kurtosis/scripts/verify-fault-recovery.sh
 This stops the real proof signer with an inbound transaction pending and
 proves that the transaction neither settles nor changes destination state
 without an attestation. After restarting the signer, it requires that pending
-transaction to settle. It then restarts `eez-node`, verifies that the exact
-pre-restart safe block hash remains canonical, and requires a fresh
-cross-chain transaction and L1/L2 block-hash commitment convergence. Cleanup restarts either
-service if the scenario exits while a fault is active.
+transaction to settle. It separately stops the MEV relay and bundle builder,
+requires canonical L1 to remain live without premature settlement, and checks
+that each pending transaction recovers after its service returns. Finally, it
+restarts `eez-node`, verifies that the exact pre-restart safe block hash remains
+canonical, and requires a fresh cross-chain transaction plus L1/L2 block-hash
+commitment convergence. Cleanup restarts any service left stopped by a failed
+scenario.
 
 ### Run ingress nonce-gap admission
 

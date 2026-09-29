@@ -155,6 +155,9 @@ PROXY=$(forge_deploy "$L1" "$DEPLOY_KEY" CreateValueProxy.s.sol:CreateValueProxy
     'run(address,address,uint64)' "$EEZ_REGISTRY_ADDRESS" "$TARGET" "$EEZ_ROLLUP_ID" \
     | grab_address EEZ_VALUE_PROXY)
 [[ -n "$TARGET" && -n "$PROXY" ]] || { echo "fault fixture deployment failed" >&2; exit 1; }
+# Establish a settled baseline before fault injection so later safe-state
+# assertions cannot be confused with a still-speculative fixture deployment.
+wait_safe_value 0
 
 nonce=$(cast nonce "$USER" --rpc-url "$L1")
 raw=$(build_inbound "$nonce" 41)
