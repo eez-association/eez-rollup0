@@ -50,7 +50,8 @@ mod tests {
         prove_failure,
     };
     use super::v2::{
-        Begin, ClientFrame, Ready, Rewind, ServerFrame, Validated, client_frame, server_frame,
+        Begin, Cancel, Cancelled, ClientFrame, Ready, Rejected, Rewind, ServerFrame, Validated,
+        client_frame, server_frame,
     };
     use super::{MAX_MESSAGE_BYTES, decode_prove_failure, encode_prove_failure};
 
@@ -148,9 +149,26 @@ mod tests {
             acknowledged
         );
 
-        let rewind = ClientFrame {
+        let rejected = ServerFrame {
             session_id: session_id.clone(),
             request_id: 19,
+            epoch: 1,
+            kind: Some(server_frame::Kind::Rejected(Rejected {
+                code: 14,
+                message: "retry from the validated cursor".to_owned(),
+                details: Vec::new(),
+                validated_through: 101,
+                validated_hash: vec![0x44; 32],
+            })),
+        };
+        assert_eq!(
+            ServerFrame::decode(rejected.encode_to_vec().as_slice()).unwrap(),
+            rejected
+        );
+
+        let rewind = ClientFrame {
+            session_id: session_id.clone(),
+            request_id: 20,
             epoch: 1,
             kind: Some(client_frame::Kind::Rewind(Rewind {
                 ancestor_hash: vec![0x11; 32],
@@ -173,6 +191,28 @@ mod tests {
         assert_eq!(
             ServerFrame::decode(rewound.encode_to_vec().as_slice()).unwrap(),
             rewound
+        );
+
+        let cancel = ClientFrame {
+            session_id: vec![0x33; 32],
+            request_id: 21,
+            epoch: 2,
+            kind: Some(client_frame::Kind::Cancel(Cancel {})),
+        };
+        assert_eq!(
+            ClientFrame::decode(cancel.encode_to_vec().as_slice()).unwrap(),
+            cancel
+        );
+
+        let cancelled = ServerFrame {
+            session_id: cancel.session_id.clone(),
+            request_id: cancel.request_id,
+            epoch: cancel.epoch,
+            kind: Some(server_frame::Kind::Cancelled(Cancelled {})),
+        };
+        assert_eq!(
+            ServerFrame::decode(cancelled.encode_to_vec().as_slice()).unwrap(),
+            cancelled
         );
     }
 

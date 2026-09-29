@@ -19,14 +19,14 @@ message ClientFrame {
   uint64 request_id = 2;
   // Zero on Begin and Resume. Ready issues a new fencing epoch; every other
   // frame must carry the latest epoch returned for this session.
-  uint64 epoch = 8;
+  uint64 epoch = 3;
   oneof kind {
-    Begin begin = 3;
-    Resume resume = 4;
-    Block block = 5;
-    Finalize finalize = 6;
-    Abort abort = 7;
-    Rewind rewind = 9;
+    Begin begin = 4;
+    Resume resume = 5;
+    Rewind rewind = 6;
+    Block block = 7;
+    Finalize finalize = 8;
+    Cancel cancel = 9;
   }
 }
 
@@ -54,17 +54,19 @@ message Block {
 }
 
 message Finalize {
+  // First block of the selected validated range. Its predecessor becomes this
+  // finalization's settlement anchor and must also belong to the session.
   uint64 from_block = 1;
   uint64 to_block = 2;
   bytes terminal_hash = 3;
   // Exact proofless postAndVerifyBatch calldata. No proof may be returned until
   // it has been checked against this session's ordered validated prefix. A
-  // Proof closes this transport stream but leaves the session resumable while
-  // the safe anchor is unchanged.
+  // Proof closes this transport stream but leaves the session resumable from
+  // the selected predecessor anchor.
   prove.v1.PostBatch post_batch = 4;
 }
 
-message Abort {}
+message Cancel {}
 
 message ServerFrame {
   // A successful Begin carries the new nonempty ID; a rejected Begin carries
@@ -72,15 +74,16 @@ message ServerFrame {
   bytes session_id = 1;
   // Echoes the request_id of the ClientFrame this response addresses.
   uint64 request_id = 2;
-  // The authoritative fencing epoch when the response refers to an authorized
-  // retained session; otherwise zero. Ready returns a newly issued epoch after
-  // Begin, Resume, or Rewind.
-  uint64 epoch = 7;
+  // The authoritative fencing epoch for this operation. Ready returns a newly
+  // issued epoch after Begin, Resume, or Rewind; Cancelled echoes the epoch it
+  // retired. A response not referring to an authorized session carries zero.
+  uint64 epoch = 3;
   oneof kind {
-    Ready ready = 3;
-    Validated validated = 4;
-    Proof proof = 5;
-    Rejected rejected = 6;
+    Ready ready = 4;
+    Validated validated = 5;
+    Proof proof = 6;
+    Cancelled cancelled = 7;
+    Rejected rejected = 8;
   }
 }
 
@@ -103,6 +106,8 @@ message Proof {
   bytes proof = 2;
 }
 
+message Cancelled {}
+
 message Rejected {
   // The numeric tonic::Code value. A rejection applies only to the named
   // session/request; it must not terminate unrelated Composer sessions.
@@ -110,4 +115,9 @@ message Rejected {
   string message = 2;
   // Encoded prove.v1.ProveFailure when an actionable candidate is known.
   bytes details = 3;
+  // Authoritative fully validated cursor when this is a session-bound
+  // rejection. Both fields are zero/empty when the response cannot refer to an
+  // authorized session.
+  uint64 validated_through = 4;
+  bytes validated_hash = 5;
 }
