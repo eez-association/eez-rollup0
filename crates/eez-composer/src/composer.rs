@@ -774,11 +774,12 @@ async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -
         .map(|r| r.etherBalance)
 }
 
-/// Read canonical L1 nonces for inbound senders.
+/// Read L1 nonces for inbound senders at `at`.
 async fn inbound_source_nonces_for_drain(
     ctx: &CrossChainExecCtx,
     rollup_id: u64,
     drained: &[HeldTx],
+    at: alloy_eips::BlockId,
 ) -> HashMap<(Address, Direction), u64> {
     let mut source_nonces = HashMap::new();
     for tx in drained {
@@ -786,7 +787,12 @@ async fn inbound_source_nonces_for_drain(
         if tx.direction != Direction::Inbound || source_nonces.contains_key(&key) {
             continue;
         }
-        match ctx.l1_provider.get_transaction_count(tx.sender).await {
+        match ctx
+            .l1_provider
+            .get_transaction_count(tx.sender)
+            .block_id(at)
+            .await
+        {
             Ok(nonce) => {
                 source_nonces.insert(key, nonce);
             }
@@ -1693,6 +1699,28 @@ where
             return;
         };
         let (spent, culprit) = partial_disposition(&partial.txs, &nonces);
+        // Only spent txs can be stranded by a reorg; the re-queued ones are the
+        // pool's again.
+        let stranded: Vec<crate::HeldTx> = partial
+            .txs
+            .iter()
+            .filter(|tx| spent.contains(&tx.hash))
+            .cloned()
+            .collect();
+        // A reorg during the reads may have taken the batch and re-queued its
+        // txs. Claim it before touching the pool.
+        if !rollup
+            .optimistic
+            .claim_partial(sync_height, partial.post_batch_hash, stranded)
+        {
+            event!(
+                Level::INFO,
+                rollup_id,
+                sync_height,
+                "partial settlement left the ledger during disposition; leaving its txs alone",
+            );
+            return;
+        }
         event!(
             name: "eez.composer.recovery.settled_partial",
             Level::INFO,
@@ -1704,14 +1732,6 @@ where
             culprit = ?culprit,
             "partial settlement: spent txs are released, the rest re-queue",
         );
-        // Only spent txs can be stranded by a reorg; the re-queued ones are the
-        // pool's again.
-        let stranded: Vec<crate::HeldTx> = partial
-            .txs
-            .iter()
-            .filter(|tx| spent.contains(&tx.hash))
-            .cloned()
-            .collect();
         let (charged, rest): (Vec<_>, Vec<_>) = partial
             .txs
             .into_iter()
@@ -1719,20 +1739,18 @@ where
         let pool = rollup.held_pool.as_ref();
         dispose_recovered_txs(rollup_id, pool, sync_height, rest, &spent, false);
         dispose_recovered_txs(rollup_id, pool, sync_height, charged, &[], true);
-        rollup
-            .optimistic
-            .finish_partial(sync_height, partial.post_batch_hash, stranded);
     }
 
-    /// Each sender's canonical nonce: L1 for inbound txs, and for outbound ones
-    /// the committed L2 head by hash, since a read by number can still see a
-    /// block the Deriver just replaced. `None` unless every sender was read.
+    /// Each sender's nonce, read at fixed blocks so a reorg mid-read can't mix
+    /// in another fork's answer: L1 at the last block the Deriver confirmed, L2
+    /// at the committed head. `None` unless every sender was read.
     async fn source_nonces(
         &self,
         rollup_id: u64,
         rollup: &RollupState<L2>,
         txs: &[HeldTx],
     ) -> Option<HashMap<(Address, Direction), u64>> {
+        let l1_block = rollup.l1_head.last_indexed()?.l1_block_hash;
         let head = self.inner.committer.last_header().hash();
         let mut nonces = match rollup.l2_provider.state_by_block_hash(head) {
             Ok(state) => outbound_source_nonces_for_drain(state.as_ref(), rollup_id, txs),
@@ -1749,7 +1767,13 @@ where
             }
         };
         nonces.extend(
-            inbound_source_nonces_for_drain(&self.inner.cross_chain.exec_ctx, rollup_id, txs).await,
+            inbound_source_nonces_for_drain(
+                &self.inner.cross_chain.exec_ctx,
+                rollup_id,
+                txs,
+                alloy_eips::BlockId::hash(l1_block),
+            )
+            .await,
         );
         txs.iter()
             .all(|tx| nonces.contains_key(&(tx.sender, tx.direction)))
@@ -2001,7 +2025,13 @@ where
         let outbound_source_nonces =
             outbound_source_nonces_for_drain(state.as_ref(), rollup_id, &drained);
         drop(state);
-        let mut source_nonces = inbound_source_nonces_for_drain(ctx, rollup_id, &drained).await;
+        let mut source_nonces = inbound_source_nonces_for_drain(
+            ctx,
+            rollup_id,
+            &drained,
+            alloy_eips::BlockId::latest(),
+        )
+        .await;
         source_nonces.extend(outbound_source_nonces);
         let (drained, stale) = partition_stale(drained, &source_nonces);
         for tx in &stale {
@@ -4498,15 +4528,9 @@ async fn observe_bundle_outcome(
         // slot_skipped = the drop was NOT attributable to the bundled txs →
         // requeue without counting an attempt toward poison-eviction.
         let slot_skipped = match &outcome {
-            // Never reached the relay, or landed but could not be read back:
-            // either way it says nothing about the txs. A relay-side REJECTION
-            // is L1Error::Submission and still counts.
-            Err(err)
-                if err.is_transport()
-                    || matches!(err, eez_l1::L1Error::SourceIncomplete { .. }) =>
-            {
-                true
-            }
+            // Never reached the relay, so it says nothing about the txs. A
+            // relay-side REJECTION is L1Error::Submission and still counts.
+            Err(err) if err.is_transport() => true,
             // Pin unsatisfiable (block ts != pin, or unreadable), not the txs.
             _ => match target {
                 BundleTarget::Exact { block, timestamp } => {

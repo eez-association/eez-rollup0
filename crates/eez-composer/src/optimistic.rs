@@ -191,7 +191,7 @@ impl OptimisticallyIncluded {
     /// has then rebuilt the block, so L2 nonces show which outbound txs it kept. The caller must NOT reorg: the height is
     /// canonical.
     ///
-    /// The entry stays until [`Self::finish_partial`], so a disposition that
+    /// The entry stays until [`Self::claim_partial`], so a disposition that
     /// cannot read nonces yet simply retries on the next tick.
     #[must_use]
     pub fn partial_to_dispose(&self, cursor: u64) -> Option<FailedBatch> {
@@ -212,20 +212,29 @@ impl OptimisticallyIncluded {
         })
     }
 
-    /// Settle a disposed entry, keeping only its spent txs: only those can be
-    /// stranded by a reorg, and the re-queued ones now belong to the pool.
+    /// Claim a partial settlement for disposal, keeping only its spent txs: only
+    /// those can be stranded by a reorg, and the rest go back to the pool.
     ///
-    /// `post_batch_hash` names the bundle disposed: a rebuild can replace the
-    /// entry at this height meanwhile, and must keep its own txs.
-    pub fn finish_partial(&self, sync_height: u64, post_batch_hash: TxHash, spent: Vec<HeldTx>) {
+    /// `false` when a reorg or a rebuild took the batch first. Its txs are then
+    /// already handled, so the caller must leave them alone.
+    #[must_use]
+    pub fn claim_partial(
+        &self,
+        sync_height: u64,
+        post_batch_hash: TxHash,
+        spent: Vec<HeldTx>,
+    ) -> bool {
         let mut map = self.by_sync_height.lock().unwrap();
-        if let Some(entry) = map.get_mut(&sync_height)
-            && entry.post_batch_hash == post_batch_hash
-        {
-            entry.txs = spent;
-            entry.resolution = Resolution::Settled;
-            entry.cursor_confirmed = true;
-        }
+        let Some(entry) = map
+            .get_mut(&sync_height)
+            .filter(|entry| entry.post_batch_hash == post_batch_hash)
+        else {
+            return false;
+        };
+        entry.txs = spent;
+        entry.resolution = Resolution::Settled;
+        entry.cursor_confirmed = true;
+        true
     }
 
     /// Observer verdict: the bundle settled on L1. Entry is retained
@@ -418,7 +427,7 @@ mod tests {
         assert_eq!(disposed.txs.len(), 2, "disposition sees the whole bundle");
 
         // Disposition found tx(3)'s nonce spent and re-queued tx(4).
-        ledger.finish_partial(20, pb_hash(0xB2), vec![burned.clone()]);
+        assert!(ledger.claim_partial(20, pb_hash(0xB2), vec![burned.clone()]));
 
         let rolled = ledger.take_rolled_out(19);
         assert_eq!(
@@ -429,10 +438,27 @@ mod tests {
         assert_eq!(rolled[0].hash, burned.hash);
     }
 
+    /// A reorg during the nonce reads re-queues the whole batch, so the
+    /// disposition that started before it must find nothing to claim.
+    #[test]
+    fn a_batch_rolled_out_during_disposition_cannot_be_claimed() {
+        let ledger = OptimisticallyIncluded::new();
+        ledger.begin(20, pb_hash(0xB3), hdr(), vec![tx(7), tx(8)]);
+        ledger.mark_settled_partial(20, pb_hash(0xB3));
+        let disposed = ledger.partial_to_dispose(20).expect("partial settlement");
+
+        assert_eq!(
+            ledger.take_rolled_out(19).len(),
+            2,
+            "the reorg takes every tx"
+        );
+        assert!(!ledger.claim_partial(20, disposed.post_batch_hash, vec![tx(7)]));
+    }
+
     /// A slot can rebuild at the same height; a disposition still running for
     /// the old bundle must not overwrite the new bundle's txs.
     #[test]
-    fn finish_partial_ignores_a_rebuilt_height() {
+    fn claim_partial_ignores_a_rebuilt_height() {
         let ledger = OptimisticallyIncluded::new();
         ledger.begin(30, pb_hash(0xC1), hdr(), vec![tx(5)]);
         ledger.mark_settled_partial(30, pb_hash(0xC1));
@@ -440,7 +466,10 @@ mod tests {
 
         // The slot rebuilds at the same height with a different bundle.
         ledger.begin(30, pb_hash(0xC2), hdr(), vec![tx(6)]);
-        ledger.finish_partial(30, old.post_batch_hash, vec![tx(5)]);
+        assert!(
+            !ledger.claim_partial(30, old.post_batch_hash, vec![tx(5)]),
+            "the new bundle is not the one disposed"
+        );
 
         ledger.mark_settled(30, pb_hash(0xC2));
         let rolled = ledger.take_rolled_out(29);
@@ -500,7 +529,7 @@ mod tests {
                                 for tx in &batch.txs {
                                     prop_assert!(released.insert(tx.hash), "tx released twice");
                                 }
-                                ledger.finish_partial(batch.sync_height, batch.post_batch_hash, batch.txs);
+                                prop_assert!(ledger.claim_partial(batch.sync_height, batch.post_batch_hash, batch.txs));
                             }
                         }
                     }
@@ -576,7 +605,7 @@ mod tests {
             pool.partial_to_dispose(10).is_some(),
             "a read that fails leaves it for the next tick"
         );
-        pool.finish_partial(10, pb_hash(0xa), Vec::new());
+        assert!(pool.claim_partial(10, pb_hash(0xa), Vec::new()));
         assert!(pool.partial_to_dispose(10).is_none(), "swept exactly once");
     }
 
