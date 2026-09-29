@@ -9,8 +9,8 @@
 
 use alloy_primitives::{Address, Bytes, U256};
 
+use crate::{OverlayChannelHandle, SessionInspector, SessionInspectorFactory};
 use eez_evm::EezEvmConfig;
-use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory};
 use reth_evm::{ConfigureEvm, Evm as _};
 use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::{BlockNumReader, StateProviderFactory};
@@ -204,14 +204,14 @@ impl LocalExecutionSession {
     }
 
     /// Inspected direct-call path. Runs the target-chain tx under the
-    /// supplied [`eez_evm_inspector::SessionInspector`] so proxy CALLs detected
+    /// supplied [`SessionInspector`] so proxy CALLs detected
     /// during execution dispatch through the composition builder.
     ///
     /// The session takes the inspector by value because reth owns it for the
     /// EVM pass. The caller reads `take_error` before returning the outcome.
     fn execute_internal_with_inspector(
         &mut self,
-        inspector: eez_evm_inspector::SessionInspector<'_>,
+        inspector: SessionInspector<'_>,
         destination: &Address,
         calldata: &Bytes,
         value: &U256,
