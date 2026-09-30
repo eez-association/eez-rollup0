@@ -8,7 +8,7 @@ EEZ protocol.
 
 The protocol source used by this profile is the `eez-core-protocol`
 submodule at commit
-`6fcc90b65063831cb7797e9fa361004064d28f9f`. The stateless backend uses
+`8d458919a8165341489f06d6adbc4c42a77e6ca2`. The stateless backend uses
 `AdityaSripal/stateless` branch `aditya/generic-recovered-validation`,
 with the exact commit pinned in `Cargo.lock`.
 

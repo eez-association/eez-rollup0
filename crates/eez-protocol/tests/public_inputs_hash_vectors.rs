@@ -7,10 +7,10 @@
 
 use std::{fs, path::PathBuf};
 
-use alloy_primitives::{Address, B256, Bytes, I256, U256, hex, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256, hex, keccak256};
 use alloy_sol_types::{SolValue, sol};
 use eez_protocol::abi::{
-    ExecutionEntrySol, ExpectedStateRootPerRollupSol, StateUpdateSol, StaticExecutionEntrySol,
+    ExecutionEntrySol, ExpectedRootPerRollupSol, RollupUpdateSol, StaticExecutionEntrySol,
 };
 use eez_protocol::public_inputs::{
     all_per_ps_hashes, entry_hash, shared_public_input, static_entry_hash,
@@ -18,7 +18,7 @@ use eez_protocol::public_inputs::{
 use eez_protocol::{ProofPlan, RollupId, RollupProofAssignment};
 use serde::Deserialize;
 
-const EXPECTED_PROTOCOL_COMMIT: &str = "6fcc90b65063831cb7797e9fa361004064d28f9f";
+const EXPECTED_PROTOCOL_COMMIT: &str = "8d458919a8165341489f06d6adbc4c42a77e6ca2";
 const EXPECTED_SOLIDITY_ORACLE: &str = "contracts/test/PublicInputsHashVectors.t.sol";
 
 sol! {
@@ -142,11 +142,11 @@ fn build_plan(vector: &Vector) -> ProofPlan {
 #[test]
 fn execution_entry_encoding_matches_pinned_solidity() {
     let entry = ExecutionEntrySol {
-        stateUpdates: vec![StateUpdateSol {
+        rollupUpdates: vec![RollupUpdateSol {
             rollupId: 1,
-            currentState: B256::from(U256::from(0x1111)),
-            newState: B256::from(U256::from(0x2222)),
-            etherDelta: I256::ZERO,
+            currentRoot: B256::from(U256::from(0x1111)),
+            newRoot: B256::from(U256::from(0x2222)),
+            etherDelta: alloy_primitives::aliases::I192::ZERO,
         }],
         proxyEntryHash: B256::from(U256::from(0x3333)),
         l2ToL1Calls: Vec::new(),
@@ -166,9 +166,9 @@ fn execution_entry_encoding_matches_pinned_solidity() {
 #[test]
 fn static_execution_entry_encoding_matches_pinned_solidity() {
     let entry = StaticExecutionEntrySol {
-        expectedStateRoots: vec![ExpectedStateRootPerRollupSol {
+        expectedRoots: vec![ExpectedRootPerRollupSol {
             rollupId: 1,
-            stateRoot: B256::from(U256::from(0x1111)),
+            root: B256::from(U256::from(0x1111)),
         }],
         proxyEntryHash: B256::from(U256::from(0x5555)),
         l2ToL1Calls: Vec::new(),

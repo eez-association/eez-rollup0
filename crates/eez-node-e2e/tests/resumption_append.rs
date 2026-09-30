@@ -7,7 +7,7 @@
 //! suffix runs. That suffix carries system transactions the deriver must append
 //! to the Sync block the prefix built.
 //!
-//! The prefix cannot be synthesised from nothing. Its `newState` has to be a
+//! The prefix cannot be synthesised from nothing. Its `newRoot` has to be a
 //! candidate block hash the composer actually computed for that transaction
 //! prefix; any other value names a block the deriver cannot build, so it would
 //! diverge instead of appending. So the prefix is cut from a real batch while

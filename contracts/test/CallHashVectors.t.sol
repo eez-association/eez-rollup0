@@ -12,7 +12,7 @@ contract CallHashVectorsTest is Test {
 
     function setUp() external {
         eez = new EEZ(address(0xDEAD));
-        eezL2 = new EEZL2(1, address(0xBEEF), false);
+        eezL2 = new EEZL2(1, address(0xBEEF), false, address(0xBEEF));
     }
 
     function testCallHashVectors() external view {

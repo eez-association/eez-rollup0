@@ -35,7 +35,7 @@ fn target_batch_round_trips_through_the_canonical_abi() {
     let decoded = decode_canonical_post_batch(encode_postbatch(&expected)).unwrap();
 
     assert_eq!(decoded.entries.len(), 1);
-    assert_eq!(decoded.entries[0].stateUpdates.len(), 1);
+    assert_eq!(decoded.entries[0].rollupUpdates.len(), 1);
     assert_eq!(
         decoded.entries[0].abi_encode(),
         expected.entries[0].abi_encode()
@@ -125,7 +125,7 @@ fn state_update_endpoints_are_committed_and_bound_to_reexecution() {
     .unwrap();
 
     let mut wrong_parent = batch.clone();
-    wrong_parent.entries[0].stateUpdates[0].currentState = wrong;
+    wrong_parent.entries[0].rollupUpdates[0].currentRoot = wrong;
     assert_ne!(
         recompute_public_input_hash(
             &wrong_parent,
@@ -139,14 +139,14 @@ fn state_update_endpoints_are_committed_and_bound_to_reexecution() {
     assert_eq!(
         verify_state_update_chain(&wrong_parent, expected_rollup_id(), parent, final_root)
             .map(|_| ()),
-        Err(StateUpdateChainError::InitialBlockMismatch {
+        Err(RollupUpdateChainError::InitialBlockMismatch {
             validated: parent,
             claimed: wrong,
         })
     );
 
     let mut wrong_final = batch;
-    wrong_final.entries[0].stateUpdates[0].newState = wrong;
+    wrong_final.entries[0].rollupUpdates[0].newRoot = wrong;
     assert_ne!(
         recompute_public_input_hash(
             &wrong_final,
@@ -160,7 +160,7 @@ fn state_update_endpoints_are_committed_and_bound_to_reexecution() {
     assert_eq!(
         verify_state_update_chain(&wrong_final, expected_rollup_id(), parent, final_root)
             .map(|_| ()),
-        Err(StateUpdateChainError::FinalMismatch {
+        Err(RollupUpdateChainError::FinalMismatch {
             validated: final_root,
             claimed: wrong,
         })
@@ -262,9 +262,9 @@ fn rejects_every_public_input_structural_violation() {
     }
 
     let mut batch = valid.clone();
-    batch.expectedStateRootPerRollup = vec![ExpectedStateRootPerRollupSol {
+    batch.expectedRootPerRollup = vec![ExpectedRootPerRollupSol {
         rollupId: 1,
-        stateRoot: B256::ZERO,
+        root: B256::ZERO,
     }];
     cases.push(("expected state-root pin", batch));
 

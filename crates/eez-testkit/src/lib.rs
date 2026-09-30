@@ -953,8 +953,8 @@ sol! {
     interface IEEZ {
         error InvalidProof();
         error InvalidProofSystemConfig();
-        event BatchPosted(uint256 rollupCount);
-        event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newState);
+        event BatchPosted(bytes32 sharedPublicInput, uint64[] rollupIds);
+        event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newRoot, uint256 etherBalance);
         event L2TxSkipped(uint256 indexed transientIdx, bytes revertData);
         function rollups(uint64 rollupId) external view returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
         function rollupCounter() external view returns (uint256);
@@ -2367,7 +2367,7 @@ async fn latest_l2_execution_state_at(
         return Ok(None);
     };
     let decoded = IEEZ::L2ExecutionPerformed::decode_log(&last.inner)?;
-    Ok(Some(decoded.newState))
+    Ok(Some(decoded.newRoot))
 }
 
 pub async fn all_l2_execution_states(
@@ -2420,7 +2420,7 @@ async fn all_l2_execution_events(
                 .ok_or_else(|| anyhow!("L2ExecutionPerformed log is missing log_index"))?;
             let decoded = IEEZ::L2ExecutionPerformed::decode_log(&log.inner)?;
             Ok(L2ExecutionEvent {
-                state: decoded.newState,
+                state: decoded.newRoot,
                 block_number,
                 transaction_hash,
                 log_index,
@@ -2433,7 +2433,7 @@ async fn all_l2_execution_events(
 /// Using the full history avoids racing an advancing on-chain head.
 /// Waits until the node's safe block is one L1 attested, and is past genesis.
 ///
-/// Compares BLOCK HASHES: `executed_states` are the `newState` values L1
+/// Compares BLOCK HASHES: `executed_states` are the `newRoot` values L1
 /// emitted, which are candidate block hashes, so a state root could never
 /// appear in that set.
 pub async fn wait_for_safe_state(
@@ -2467,7 +2467,7 @@ pub async fn wait_for_safe_state(
 /// Waits for a safe block L1 attested after `previous_states`.
 ///
 /// `previous_states` and `executed_states` are both `L2ExecutionPerformed`
-/// `newState` values — candidate block hashes — so the safe block is matched by
+/// `newRoot` values — candidate block hashes — so the safe block is matched by
 /// its hash. Its state root is not a commitment and would never appear there.
 pub async fn wait_for_new_attested_safe_block(
     node: &NodeHandle,

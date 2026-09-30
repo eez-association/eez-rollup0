@@ -190,7 +190,7 @@ async fn a_noncanonical_anchor_is_rejected_by_the_effect_prefix_gate() {
 async fn a_nonzero_anchor_ether_delta_is_rejected() {
     let server = TestServer::new(one_accepting_validator()).await;
     let mut batch = anchor_batch_spanning(5, 7);
-    batch.entries[0].stateUpdates[0].etherDelta = I256::ONE;
+    batch.entries[0].rollupUpdates[0].etherDelta = alloy_primitives::aliases::I192::ONE;
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 
@@ -316,7 +316,7 @@ async fn a_state_update_rollup_mismatch_is_rejected() {
     let inner = one_accepting_validator();
     let server = TestServer::new(Arc::clone(&inner)).await;
     let mut batch = anchor_batch();
-    batch.entries[0].stateUpdates[0].rollupId = 2;
+    batch.entries[0].rollupUpdates[0].rollupId = 2;
     let mut window = happy_window();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
 

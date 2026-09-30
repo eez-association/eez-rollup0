@@ -143,7 +143,7 @@ where
     /// Builds a deriver. Cursor + per-batch index are populated lazily
     /// by `catch_up_to`, which walks historical `BatchPosted` events
     /// applying the same linearity check live events get — so losers
-    /// (competing batches whose `currentState` no longer matches the
+    /// (competing batches whose `currentRoot` no longer matches the
     /// cursor) don't pollute the index.
     ///
     /// `system_tx_cfg = Some(_)` enables the cross-chain STF path: the
@@ -1112,7 +1112,7 @@ where
         );
 
         // `state_applied` only catches the IMMEDIATE-entry path, where
-        // `_applyStateUpdates` fires in the postBatch tx itself. In the
+        // `_applyRollupUpdates` fires in the postBatch tx itself. In the
         // DEFERRED-entry path (our setter / deposit flow) it fires later
         // inside the user_tx calling `executeCrossChainCall` — a
         // different tx hash in the same L1 block — so the batch-log scanner
@@ -1960,9 +1960,9 @@ where
     /// Loud-fail if the batch's claimed state-root chain disagrees with
     /// our STF's actual L2 roots at the batch boundaries:
     ///
-    /// - `claimed_current_state` (first state update's `currentState`) vs the
+    /// - `claimed_current_state` (first state update's `currentRoot`) vs the
     ///   local root at `from_block - 1`.
-    /// - `claimed_new_state` (last state update's `newState`) vs the local
+    /// - `claimed_new_state` (last state update's `newRoot`) vs the local
     ///   root at `to_block`.
     ///
     /// Both ends are checked — the composer chains deltas across entries, so
@@ -2074,7 +2074,7 @@ where
                     to_block,
                     local_root = %local_post,
                     claimed = %claimed_new,
-                    "local L2 state root at to_block differs from batch's claimed newState",
+                    "local L2 state root at to_block differs from batch's claimed newRoot",
                 );
                 return Err(DeriverError::local_diverged(to_block));
             }
@@ -2785,7 +2785,7 @@ mod outbound_wiring_tests {
 
     fn outbound_entry(call: L2ToL1CallSol) -> ExecutionEntrySol {
         ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: B256::ZERO, // outbound immediate
             l2ToL1Calls: vec![call],
             expectedL1ToL2Calls: Vec::new(),

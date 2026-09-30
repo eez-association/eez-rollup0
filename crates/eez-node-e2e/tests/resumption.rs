@@ -13,7 +13,7 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::SolCall;
 use eez_protocol::abi::{
-    ExecutionEntrySol, ProofSystemBatchPerVerificationEntriesSol as EvmBatch, StateUpdateSol,
+    ExecutionEntrySol, ProofSystemBatchPerVerificationEntriesSol as EvmBatch, RollupUpdateSol,
     postAndVerifyBatchCall,
 };
 use eez_protocol::signer::EcdsaProofSigner;
@@ -82,11 +82,11 @@ async fn post_batch(
 /// value. EEZ.sol accepts it whenever `from` is the live stored root.
 fn transition_immediate(rollup_id: u64, from: B256, to: B256) -> ExecutionEntrySol {
     ExecutionEntrySol {
-        stateUpdates: vec![StateUpdateSol {
+        rollupUpdates: vec![RollupUpdateSol {
             rollupId: rollup_id,
-            currentState: from,
-            newState: to,
-            etherDelta: alloy_primitives::I256::ZERO,
+            currentRoot: from,
+            newRoot: to,
+            etherDelta: alloy_primitives::aliases::I192::ZERO,
         }],
         proxyEntryHash: B256::ZERO,
         l2ToL1Calls: Vec::new(),
@@ -133,7 +133,7 @@ async fn resumed_batch_settles_only_its_new_suffix() {
     let live_commitment = chain.commitment().await.unwrap();
 
     // A round trip `live -> probe -> live`: both apply and the root ends where
-    // it started. A single no-op would not do — its `newState` equals the
+    // it started. A single no-op would not do — its `newRoot` equals the
     // composer's own final root, so the claimed chain reads `[live, live]` and
     // the positional match lands on index 0, never entering the resumed branch.
     // `immediateEntryCount` must cover the whole leading zero-hash run.

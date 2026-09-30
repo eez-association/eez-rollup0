@@ -230,7 +230,7 @@ mod tests {
 
     fn entry(calls: Vec<L2ToL1CallSol>) -> ExecutionEntrySol {
         ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: B256::ZERO, // outbound immediate
             l2ToL1Calls: calls,
             expectedL1ToL2Calls: Vec::new(),
