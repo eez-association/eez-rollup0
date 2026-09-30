@@ -50,18 +50,26 @@ pub struct SupportedNetworks {
 #[serde(rename_all = "camelCase")]
 pub struct ComposerContracts {
     /// L1 EEZ registry contract.
-    pub eez_registry_address: Address,
+    #[serde(rename = "eezRegistryAddress")]
+    pub registry: Address,
     /// L1 rollup manager, when configured by the deployment.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub eez_rollup_manager_address: Option<Address>,
+    #[serde(
+        rename = "eezRollupManagerAddress",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rollup_manager: Option<Address>,
     /// L1 bridge sender, when the bridge deployment is configured.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub eez_l1_bridge_sender: Option<Address>,
+    #[serde(rename = "eezL1BridgeSender", skip_serializing_if = "Option::is_none")]
+    pub l1_bridge_sender: Option<Address>,
     /// L2 EEZ predeploy.
-    pub eez_l2_address: Address,
+    #[serde(rename = "eezL2Address")]
+    pub l2_predeploy: Address,
     /// L2 bridge receiver, when the bridge deployment is configured.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub eez_l2_bridge_receiver: Option<Address>,
+    #[serde(
+        rename = "eezL2BridgeReceiver",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub l2_bridge_receiver: Option<Address>,
 }
 
 /// Install the composer discovery method on every configured L2 RPC transport.
@@ -123,11 +131,11 @@ mod tests {
         let bridge_receiver = Address::repeat_byte(0x55);
         let value = serde_json::to_value(ComposerInfo::new(
             ComposerContracts {
-                eez_registry_address: l1_address,
-                eez_rollup_manager_address: Some(rollup_manager),
-                eez_l1_bridge_sender: Some(bridge_sender),
-                eez_l2_address: l2_address,
-                eez_l2_bridge_receiver: Some(bridge_receiver),
+                registry: l1_address,
+                rollup_manager: Some(rollup_manager),
+                l1_bridge_sender: Some(bridge_sender),
+                l2_predeploy: l2_address,
+                l2_bridge_receiver: Some(bridge_receiver),
             },
             SupportedNetworks {
                 eez_l1: 10_200,
@@ -161,11 +169,11 @@ mod tests {
     fn composer_info_omits_unconfigured_optional_contracts() {
         let value = serde_json::to_value(ComposerInfo::new(
             ComposerContracts {
-                eez_registry_address: Address::repeat_byte(0x11),
-                eez_rollup_manager_address: None,
-                eez_l1_bridge_sender: None,
-                eez_l2_address: Address::repeat_byte(0x22),
-                eez_l2_bridge_receiver: None,
+                registry: Address::repeat_byte(0x11),
+                rollup_manager: None,
+                l1_bridge_sender: None,
+                l2_predeploy: Address::repeat_byte(0x22),
+                l2_bridge_receiver: None,
             },
             SupportedNetworks {
                 eez_l1: 10_200,
@@ -189,11 +197,11 @@ mod tests {
         let l2_address = Address::repeat_byte(0x33);
         let module = composer_rpc_module(ComposerInfo::new(
             ComposerContracts {
-                eez_registry_address: l1_address,
-                eez_rollup_manager_address: None,
-                eez_l1_bridge_sender: None,
-                eez_l2_address: l2_address,
-                eez_l2_bridge_receiver: None,
+                registry: l1_address,
+                rollup_manager: None,
+                l1_bridge_sender: None,
+                l2_predeploy: l2_address,
+                l2_bridge_receiver: None,
             },
             SupportedNetworks {
                 eez_l1: 10_200,

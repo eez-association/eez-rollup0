@@ -275,11 +275,11 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     let l2_chain_id = builder.config().chain.chain().id();
     let composer_info = composer_rpc::ComposerInfo::new(
         composer_rpc::ComposerContracts {
-            eez_registry_address: eez_registry,
-            eez_rollup_manager_address: optional_address_from_env("EEZ_ROLLUP_MANAGER_ADDRESS")?,
-            eez_l1_bridge_sender: optional_address_from_env("EEZ_L1_BRIDGE_SENDER")?,
-            eez_l2_address: eezl2_address,
-            eez_l2_bridge_receiver: optional_address_from_env("EEZ_L2_BRIDGE_RECEIVER")?,
+            registry: eez_registry,
+            rollup_manager: optional_address_from_env("EEZ_ROLLUP_MANAGER_ADDRESS")?,
+            l1_bridge_sender: optional_address_from_env("EEZ_L1_BRIDGE_SENDER")?,
+            l2_predeploy: eezl2_address,
+            l2_bridge_receiver: optional_address_from_env("EEZ_L2_BRIDGE_RECEIVER")?,
         },
         composer_rpc::SupportedNetworks {
             eez_l1: l1_source_chain_id,
