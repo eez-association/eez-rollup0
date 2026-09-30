@@ -101,9 +101,11 @@ entries[last].stateUpdates[0].newState = terminal Sync-block hash
 ```
 
 The anchor is `entries[0]` and is not counted as a cross-chain effect. Effect
-`i` is `entries[i + 1]`. Let `P` be the terminal Sync block's parent hash, and
-let `R[i]` be the hash of the candidate block holding the transaction prefix
-through effect `i`'s effect-ending transaction:
+`i` is `entries[i + 1]`. Let `E` be the hash of the candidate block holding no
+transactions: the terminal Sync block sealed after its pre-block system calls
+(EIP-2935 / EIP-4788). It is not the parent's hash, because an empty block still
+changes state. Let `R[i]` be the hash of the candidate block holding the
+transaction prefix through effect `i`'s effect-ending transaction:
 
 - for an outbound effect, the effect-ending transaction is the user
   transaction in its `[system load, user]` pair; the system load alone is not a
@@ -125,9 +127,9 @@ state updates MUST be:
 
 ```text
 U[0].currentState = hash of block posted       // anchor
-U[0].newState = P
+U[0].newState = E
 
-U[1].currentState = P                          // effect 0
+U[1].currentState = E                          // effect 0
 U[i + 1].currentState = R[i - 1]               for every 0 < i < E
 U[i + 1].newState = R[i]                       for every 0 <= i < E
 

@@ -590,11 +590,15 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
             .with_bundle_update()
             .build();
         let result = if with_checkpoints {
-            let (result, checkpoints, _) =
-                execute_block_with_state_checkpoints(&evm_config, &mut state, &block, &[0])
-                    .unwrap();
+            let (result, checkpoints, _) = execute_block_with_state_checkpoints(
+                &evm_config,
+                &mut state,
+                &block,
+                &[CheckpointAt::Transaction(0)],
+            )
+            .unwrap();
             assert_eq!(checkpoints.len(), 1);
-            assert_eq!(checkpoints[0].transaction_index, 0);
+            assert_eq!(checkpoints[0].at, CheckpointAt::Transaction(0));
             result
         } else {
             execute_block(&evm_config, &mut state, &block).unwrap()
