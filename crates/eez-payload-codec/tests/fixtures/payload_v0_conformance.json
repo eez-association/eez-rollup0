@@ -48,7 +48,7 @@
     { "name": "adjacent-beneficiary-runs-repeat", "operations": "0x0002000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "error": "NON_MAXIMAL_RUN" },
     { "name": "extra-data-over-32-bytes", "operations": "0x00010001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0121", "error": "EXTRA_DATA_TOO_LONG" },
     { "name": "adjacent-empty-extra-data-runs-repeat", "operations": "0x0002000002aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01000100", "error": "NON_MAXIMAL_RUN" },
-    { "name": "zero-length-transaction", "operations": "0x00010101aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa010000", "error": "EMPTY_TRANSACTION" },
+    { "name": "zero-length-transaction", "operations": "0x00010101aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa010000ff", "error": "EMPTY_TRANSACTION" },
     { "name": "transaction-body-shorter-than-length", "operations": "0x00010101aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa010002ff", "error": "TRANSACTION_BYTES_MISMATCH" }
   ]
 }

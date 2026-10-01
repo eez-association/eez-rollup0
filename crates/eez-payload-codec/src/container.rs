@@ -97,6 +97,13 @@ pub fn encode_container(
 ) -> CodecResult<Vec<u8>> {
     let operations = crate::encode(blocks)?;
 
+    for (index, action) in actions.iter().enumerate() {
+        validate_target_rollup(rollup_id, action.target_rollup_id)?;
+        if !action.success && index + 1 != actions.len() {
+            return Err(CodecError::ActionAfterFailure);
+        }
+    }
+
     let mut out = vec![STREAM_VERSION];
     out.push(MSG_CHAIN_OPERATION);
     out.extend_from_slice(&rollup_id.to_le_bytes());
@@ -156,7 +163,13 @@ pub fn decode_container(payload: &[u8]) -> CodecResult<DecodedContainer> {
 
     let mut actions = Vec::new();
     while cur.remaining() != 0 {
-        actions.push(decode_action(&mut cur)?);
+        if actions
+            .last()
+            .is_some_and(|action: &Action| !action.success)
+        {
+            return Err(CodecError::ActionAfterFailure);
+        }
+        actions.push(decode_action(&mut cur, rollup_id)?);
     }
     Ok(DecodedContainer {
         rollup_id,
@@ -165,7 +178,7 @@ pub fn decode_container(payload: &[u8]) -> CodecResult<DecodedContainer> {
     })
 }
 
-fn decode_action(cur: &mut Cursor<'_>) -> CodecResult<Action> {
+fn decode_action(cur: &mut Cursor<'_>, rollup_id: u64) -> CodecResult<Action> {
     expect_message(cur, MSG_INITIATE)?;
     let source_rollup_id = u64::from_le_bytes(cur.take_array::<8>("initiate chain_id")?);
     // Generic EEZ leaves `tx_data` chain-defined; Rollup0 V1 requires empty.
@@ -175,6 +188,7 @@ fn decode_action(cur: &mut Cursor<'_>) -> CodecResult<Action> {
 
     expect_message(cur, MSG_CALL)?;
     let target_rollup_id = u64::from_le_bytes(cur.take_array::<8>("to_chain")?);
+    validate_target_rollup(rollup_id, target_rollup_id)?;
     let source_address = cur.take_array::<20>("from_address")?;
     let target_address = cur.take_array::<20>("to_address")?;
     let value = reversed(&cur.take_array::<VALUE_BYTES>("value")?);
@@ -200,6 +214,16 @@ fn decode_action(cur: &mut Cursor<'_>) -> CodecResult<Action> {
         success,
         return_data,
     })
+}
+
+fn validate_target_rollup(rollup_id: u64, target_rollup_id: u64) -> CodecResult<()> {
+    if target_rollup_id != 0 && target_rollup_id != rollup_id {
+        return Err(CodecError::InvalidTargetRollup {
+            rollup_id,
+            actual: target_rollup_id,
+        });
+    }
+    Ok(())
 }
 
 fn expect_message(cur: &mut Cursor<'_>, expected: u8) -> CodecResult<()> {
@@ -379,6 +403,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_padded_empty_tx_data_length_is_accepted() {
+        let encoded = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();
+        let at = first_bracket_offset() + 9;
+        assert_eq!(encoded[at], 0x00, "canonical empty tx_data length");
+
+        let mut padded = encoded.clone();
+        padded.splice(at..=at, [0x80, 0x00]);
+
+        assert_eq!(
+            decode_container(&padded).unwrap().actions,
+            decode_container(&encoded).unwrap().actions,
+        );
+    }
+
     /// A stream whose first byte is not a known protocol version is rejected
     /// whole, never parsed under this format.
     #[test]
@@ -490,6 +529,48 @@ mod tests {
     }
 
     #[test]
+    fn an_action_after_a_failed_return_is_rejected() {
+        let failed = action(false);
+        let succeeding = action(true);
+        assert_eq!(
+            encode_container(ROLLUP, &span(), &[failed.clone(), succeeding.clone()]).unwrap_err(),
+            CodecError::ActionAfterFailure,
+        );
+
+        let mut forged = encode_container(ROLLUP, &span(), &[failed]).unwrap();
+        let second = encode_container(ROLLUP, &span(), &[succeeding]).unwrap();
+        forged.extend_from_slice(&second[first_bracket_offset()..]);
+        assert_eq!(
+            decode_container(&forged).unwrap_err(),
+            CodecError::ActionAfterFailure,
+        );
+    }
+
+    #[test]
+    fn a_call_to_an_unrelated_rollup_is_rejected() {
+        let mut invalid = action(true);
+        invalid.target_rollup_id = ROLLUP + 1;
+        assert_eq!(
+            encode_container(ROLLUP, &span(), std::slice::from_ref(&invalid)).unwrap_err(),
+            CodecError::InvalidTargetRollup {
+                rollup_id: ROLLUP,
+                actual: ROLLUP + 1,
+            },
+        );
+
+        let mut forged = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();
+        let to_chain_at = first_bracket_offset() + 11;
+        forged[to_chain_at..to_chain_at + 8].copy_from_slice(&(ROLLUP + 1).to_le_bytes());
+        assert_eq!(
+            decode_container(&forged).unwrap_err(),
+            CodecError::InvalidTargetRollup {
+                rollup_id: ROLLUP,
+                actual: ROLLUP + 1,
+            },
+        );
+    }
+
+    #[test]
     fn every_truncated_action_prefix_is_rejected() {
         let encoded = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();
         let action_at = first_bracket_offset();
@@ -505,7 +586,7 @@ mod tests {
     fn action_field_boundaries_and_extremes_round_trip() {
         let action = Action {
             source_rollup_id: u64::MAX,
-            target_rollup_id: u64::MAX,
+            target_rollup_id: ROLLUP,
             source_address: [0x00; 20],
             target_address: [0xff; 20],
             value: [0xff; VALUE_BYTES],
@@ -537,7 +618,7 @@ mod tests {
         fn action_strategy() -> impl Strategy<Value = Action> {
             (
                 any::<u64>(),
-                any::<u64>(),
+                any::<bool>(),
                 any::<[u8; 20]>(),
                 any::<[u8; 20]>(),
                 any::<[u8; VALUE_BYTES]>(),
@@ -549,7 +630,7 @@ mod tests {
                 .prop_map(
                     |(
                         source_rollup_id,
-                        target_rollup_id,
+                        targets_l1,
                         source_address,
                         target_address,
                         value,
@@ -559,7 +640,7 @@ mod tests {
                         return_data,
                     )| Action {
                         source_rollup_id,
-                        target_rollup_id,
+                        target_rollup_id: if targets_l1 { 0 } else { ROLLUP },
                         source_address,
                         target_address,
                         value,
@@ -577,8 +658,17 @@ mod tests {
             #[test]
             fn arbitrary_valid_action_manifests_round_trip_exactly(
                 rollup_id in any::<u64>(),
-                actions in proptest::collection::vec(action_strategy(), 0..8),
+                mut actions in proptest::collection::vec(action_strategy(), 0..8),
             ) {
+                for action in &mut actions {
+                    if action.target_rollup_id != 0 {
+                        action.target_rollup_id = rollup_id;
+                    }
+                }
+                let non_terminal = actions.len().saturating_sub(1);
+                for action in actions.iter_mut().take(non_terminal) {
+                    action.success = true;
+                }
                 let encoded = encode_container(rollup_id, &span(), &actions)
                     .expect("bounded generated manifest encodes");
                 let decoded = decode_container(&encoded)

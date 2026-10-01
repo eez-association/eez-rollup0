@@ -85,6 +85,8 @@ fn error_class(error: &CodecError) -> &'static str {
         CodecError::UnexpectedMessage { .. } => "UNEXPECTED_MESSAGE",
         CodecError::UnknownMessage(_) => "UNKNOWN_MESSAGE",
         CodecError::NonEmptyTransactionData => "NON_EMPTY_TRANSACTION_DATA",
+        CodecError::InvalidTargetRollup { .. } => "INVALID_TARGET_ROLLUP",
+        CodecError::ActionAfterFailure => "ACTION_AFTER_FAILURE",
         CodecError::ValueTooLarge { .. } => "VALUE_TOO_LARGE",
     }
 }

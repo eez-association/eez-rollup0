@@ -144,6 +144,17 @@ pub enum CodecError {
     /// An initiating bracket's `tx_data` was non-empty.
     #[error("action bracket has non-empty tx_data")]
     NonEmptyTransactionData,
+    /// A `Call` targeted neither L1 nor the rollup whose operations carry it.
+    #[error("action targets rollup {actual}, expected 0 or {rollup_id}")]
+    InvalidTargetRollup {
+        /// Rollup named by the enclosing `ChainOperation`.
+        rollup_id: u64,
+        /// Rollup named by the action's `Call.to_chain`.
+        actual: u64,
+    },
+    /// A bracket followed a failed return, which terminates the manifest.
+    #[error("an action bracket follows a failed return")]
+    ActionAfterFailure,
     /// A value did not fit the `uvarint32` domain on encode.
     #[error("{what} = {value} exceeds u32")]
     ValueTooLarge {
@@ -278,9 +289,9 @@ pub fn decode(payload: &[u8]) -> CodecResult<DecodedSpan> {
         Ok(cur.take("extra_data", usize::from(len))?.to_vec())
     })?;
 
-    // Each transaction needs at least one length byte. Validate the lengths
-    // themselves below so an explicit zero receives the precise typed error.
-    cur.check_plausible("pure_transaction_counts", total_txs, 1)?;
+    // Each transaction needs at least one length byte and, since zero length is
+    // invalid, at least one content byte.
+    cur.check_plausible("pure_transaction_counts", total_txs, 2)?;
     let mut lengths = Vec::with_capacity(total_txs as usize);
     let mut total_bytes: u64 = 0;
     for i in 0..total_txs {
