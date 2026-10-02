@@ -2,17 +2,18 @@
 
 use std::time::Duration;
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 
 use eez_testkit::signals;
 use eez_testkit::{
-    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
-    ANVIL_KEY_6, Harness, INVALID_PROOF_SELECTOR, INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary,
-    NodeConfig, NodeHandle, STAGING_USER_KEY, block_number_and_hash_at, override_env,
-    safe_block_hash, send_l2_value_transfer, send_l2_value_transfer_confirmed, wait_for,
-    wait_for_latest_height, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
+    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_ATTESTER_KEY, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3,
+    ANVIL_KEY_4, ANVIL_KEY_6, Harness, INVALID_PROOF_SELECTOR,
+    INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary, NodeConfig, NodeHandle, STAGING_USER_KEY,
+    block_number_and_hash_at, override_env, posted_batches, safe_block_hash,
+    send_l2_value_transfer, send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
+    wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
@@ -392,6 +393,95 @@ async fn failure_prover_signer_mismatch() {
     assert_eq!(snapshot.batches_posted, 0);
     assert_eq!(snapshot.executions_performed, 0);
     assert_eq!(snapshot.rollup_commitment, chain.initial_commitment());
+    node.assert_no_process_death();
+}
+
+/// Two attesters and a threshold of two: every batch carries a proof from
+/// each, so neither signer alone can settle the rollup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn happy_case_quorum_two_of_two() {
+    let attesters = [ANVIL_ATTESTER_KEY, ANVIL_KEY_4];
+    let harness = Harness::with_attesters(&attesters, 2).await.unwrap();
+    let chain = harness.chain();
+    let env = harness.env_with_attesters(&attesters).await.unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-two-of-two",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+
+    chain
+        .wait_for_batches(2, DEFAULT_TIMEOUT)
+        .await
+        .expect("the quorum never settled a batch");
+
+    let mut both: Vec<Address> = harness.attesters().iter().map(|(ps, _)| *ps).collect();
+    both.sort_unstable();
+    let posted = posted_batches(chain.rpc_url(), &harness.dep).await.unwrap();
+    assert!(!posted.is_empty(), "settled batches must be visible on L1");
+    for batch in &posted {
+        assert!(batch.succeeded, "no batch may revert: {batch:?}");
+        assert_eq!(batch.proof_systems, both, "every batch carries both proofs");
+    }
+    assert_ne!(
+        chain.snapshot().await.unwrap().rollup_commitment,
+        chain.initial_commitment(),
+        "the commitment must have moved off genesis",
+    );
+    node.assert_no_process_death();
+}
+
+/// Two of three attesters, one of which signs with a key its proof system does
+/// not accept: the composer drops that proof and settles with the other two,
+/// so L1 never sees a batch that would revert on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quorum_settles_without_an_attester_signing_with_another_key() {
+    let registered = [ANVIL_ATTESTER_KEY, ANVIL_KEY_4, ANVIL_KEY_6];
+    let harness = Harness::with_attesters(&registered, 2).await.unwrap();
+    let chain = harness.chain();
+    let env = harness
+        .env_with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4, ANVIL_KEY_3])
+        .await
+        .unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-rogue-attester",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+
+    chain
+        .wait_for_batches(2, DEFAULT_TIMEOUT)
+        .await
+        .expect("the honest attesters never settled a batch");
+    wait_for(DEFAULT_TIMEOUT, || async {
+        Ok((harness.attestations_of(2)? > 0).then_some(()))
+    })
+    .await
+    .expect("the rogue signer never answered, so its proof was never rejected");
+
+    let rogue = harness.attesters()[2].0;
+    let posted = posted_batches(chain.rpc_url(), &harness.dep).await.unwrap();
+    assert!(!posted.is_empty(), "settled batches must be visible on L1");
+    for batch in &posted {
+        assert!(batch.succeeded, "no batch may revert: {batch:?}");
+        assert_eq!(
+            batch.proof_systems.len(),
+            2,
+            "the two honest proofs settle each batch"
+        );
+        assert!(
+            !batch.proof_systems.contains(&rogue),
+            "the rogue proof must never reach L1: {batch:?}",
+        );
+    }
     node.assert_no_process_death();
 }
 
