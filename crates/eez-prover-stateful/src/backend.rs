@@ -35,8 +35,8 @@ use reth_primitives_traits::{RecoveredBlock, SealedHeader};
 use reth_revm::State;
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::{
-    BlockHashReader, BlockNumReader, HashedPostStateProvider, HeaderProvider, StateProvider,
-    StateProviderFactory, StateRootProvider,
+    BlockHashReader, BlockNumReader, EvmStateProviderAdapter, HashedPostStateProvider,
+    HeaderProvider, StateProvider, StateProviderFactory, StateRootProvider,
 };
 use revm::database::states::bundle_state::BundleRetention;
 use revm::state::bal::Bal;
@@ -192,7 +192,9 @@ where
             ))
         })?;
     let mut state = State::builder()
-        .with_database(StateProviderDatabase::new(anchor_state))
+        .with_database(StateProviderDatabase::new(
+            anchor_state.into_evm_state_provider(),
+        ))
         .with_bundle_update()
         .build();
     let mut previous_header = SealedHeader::new(anchor_header, claimed_anchor_hash);
@@ -344,7 +346,9 @@ where
 /// Use Reth's normal block flow when no checkpoints or BAL output are needed.
 fn execute_block(
     evm_config: &EezEvmConfig,
-    state: &mut State<StateProviderDatabase<Box<dyn StateProvider + Send>>>,
+    state: &mut State<
+        StateProviderDatabase<EvmStateProviderAdapter<Box<dyn StateProvider + Send>>>,
+    >,
     block: &RecoveredBlock<Block>,
 ) -> Result<BlockExecutionResult<EthereumReceipt>, ValidationError> {
     state.bal_state.bal_builder = None;
@@ -363,7 +367,9 @@ fn execute_block(
 /// Execute transactions individually to capture checkpoints and BAL indices.
 fn execute_block_with_state_checkpoints(
     evm_config: &EezEvmConfig,
-    state: &mut State<StateProviderDatabase<Box<dyn StateProvider + Send>>>,
+    state: &mut State<
+        StateProviderDatabase<EvmStateProviderAdapter<Box<dyn StateProvider + Send>>>,
+    >,
     block: &RecoveredBlock<Block>,
     checkpoint_positions: &[CheckpointAt],
 ) -> Result<
@@ -463,10 +469,12 @@ fn execute_block_with_state_checkpoints(
 }
 
 fn state_root(
-    state: &State<StateProviderDatabase<Box<dyn StateProvider + Send>>>,
+    state: &State<StateProviderDatabase<EvmStateProviderAdapter<Box<dyn StateProvider + Send>>>>,
 ) -> Result<B256, ValidationError> {
     let provider = &state.database.0;
-    let hashed_state = provider.hashed_post_state(&state.bundle_state);
+    let hashed_state = provider
+        .hashed_post_state(&state.bundle_state)
+        .map_err(provider_error)?;
     provider.state_root(hashed_state).map_err(provider_error)
 }
 

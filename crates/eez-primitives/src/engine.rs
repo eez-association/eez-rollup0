@@ -3,8 +3,8 @@
 //! L2 has no blob transactions, so the required Engine blob bundles are empty.
 //!
 //! Adapted from reth's Engine types and payload conversions at the pinned revision:
-//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/engine-primitives/src/lib.rs>
-//! and <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/engine-primitives/src/payload.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/engine-primitives/src/lib.rs>
+//! and <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/engine-primitives/src/payload.rs>.
 
 use crate::{Block, EezPrimitives};
 use alloy_eips::eip7685::Requests;
@@ -19,7 +19,7 @@ use alloy_rpc_types_engine::{
 use reth_engine_primitives::EngineTypes;
 use reth_ethereum_engine_primitives::{BuiltPayloadConversionError, EthBuiltPayload};
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
-use reth_primitives_traits::SealedBlock;
+use reth_primitives_traits::{RecoveredBlock, SealedBlock};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -27,7 +27,7 @@ pub struct EezBuiltPayload(EthBuiltPayload<EezPrimitives>);
 
 impl EezBuiltPayload {
     pub fn new(
-        block: Arc<SealedBlock<Block>>,
+        block: Arc<RecoveredBlock<Block>>,
         fees: U256,
         requests: Option<Requests>,
         bal: Option<Bytes>,
@@ -39,7 +39,7 @@ impl EezBuiltPayload {
         self.0.block()
     }
 
-    pub fn block_arc(&self) -> &Arc<SealedBlock<Block>> {
+    pub fn block_arc(&self) -> &Arc<RecoveredBlock<Block>> {
         self.0.block_arc()
     }
 

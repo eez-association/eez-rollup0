@@ -37,4 +37,5 @@ workspace = true
 [dev-dependencies]
 eez-proof-signer = { workspace = true, features = ["test-utils"] }
 alloy-rlp.workspace = true
+reth-chain-state.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }

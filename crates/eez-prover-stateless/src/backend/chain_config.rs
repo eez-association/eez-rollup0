@@ -28,10 +28,11 @@ const GENESIS_FIELDS: &[&str] = &[
 ];
 const CONSENSUS_CONFIG_FIELDS: &[&str] = &["epoch", "period"];
 const BLOB_PARAMETER_FIELDS: &[&str] = &["baseFeeUpdateFraction", "max", "target"];
-// Exact keys consumed by Alloy 2.1's `blob_schedule_blob_params`. Amsterdam is
-// intentionally capitalized in that pinned implementation.
+// Exact keys consumed by Alloy 2.5's `blob_schedule_blob_params`. Amsterdam and
+// Bogota are intentionally capitalized in that pinned implementation.
 const BLOB_SCHEDULE_FORKS: &[&str] = &[
     "Amsterdam",
+    "Bogota",
     "bpo1",
     "bpo2",
     "bpo3",

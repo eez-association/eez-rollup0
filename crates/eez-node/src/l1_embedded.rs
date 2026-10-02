@@ -97,7 +97,12 @@ pub fn build_testing_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<Ch
         .dev();
     node_cfg.dev.block_time = Some(TESTING_L1_BLOCK_TIME);
     // Synchronous state-root path for dev determinism.
-    node_cfg.engine.legacy_state_root_task_enabled = true;
+    node_cfg.engine.state_root_fallback = true;
+    // This miner is the only copy of its chain: persist every block promptly
+    // so a killed node restarts at its tip instead of dozens of blocks back.
+    node_cfg.engine.persistence_threshold = 2;
+    node_cfg.engine.num_state_masking_blocks = 0;
+    node_cfg.engine.memory_block_buffer_target = Some(0);
     Ok(node_cfg)
 }
 
@@ -125,10 +130,10 @@ pub fn build_chiado_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<Gno
         })
         .with_network(network_args)
         .with_rpc(rpc_args);
-    // Reth's async StateRootTask computes wrong roots for gnosis chains
-    // in this reth pin (→ "incorrect state root" / SIGABRT on chiado
-    // newPayload); force the legacy synchronous path (as the Testing L1 does).
-    node_cfg.engine.legacy_state_root_task_enabled = true;
+    // Reth's async StateRootTask has computed wrong roots for gnosis chains
+    // (→ "incorrect state root" / SIGABRT on chiado newPayload); force the
+    // synchronous state-root path (as the Testing L1 does).
+    node_cfg.engine.state_root_fallback = true;
     Ok(node_cfg)
 }
 
@@ -144,7 +149,7 @@ pub fn build_devnet_node_config(cfg: &EmbeddedL1Config) -> Result<NodeConfig<Cha
         })
         .with_network(network_args)
         .with_rpc(rpc_args);
-    node_cfg.engine.legacy_state_root_task_enabled = true;
+    node_cfg.engine.state_root_fallback = true;
     Ok(node_cfg)
 }
 
