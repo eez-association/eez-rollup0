@@ -1,7 +1,7 @@
 //! Native deposit minting around the unmodified Ethereum EVM.
 //!
-//! Delegates execution and inspector dispatch to Alloy 0.34.0's [`EthEvm`]:
-//! <https://github.com/alloy-rs/alloy-evm/blob/6022e02ee1ab669f7c1ee59b58fc7a6b3f5f15d5/crates/evm/src/eth/mod.rs>.
+//! Delegates execution and inspector dispatch to Alloy 0.39.0's [`EthEvm`]:
+//! <https://github.com/alloy-rs/alloy-evm/blob/ba6f83b80aba8cf005175f4d776d8b90796c72d9/crates/evm/src/eth/mod.rs>.
 
 use alloy_evm::{
     Database, EthEvm, EthEvmFactory, Evm, EvmEnv, EvmFactory, eth::EthEvmContext,
@@ -147,7 +147,7 @@ impl EvmFactory for EezEvmFactory {
     type Evm<DB: Database, I: Inspector<EthEvmContext<DB>>> = EezEvm<DB, I>;
     type Context<DB: Database> = EthEvmContext<DB>;
     type Tx = TxEnv;
-    type Error<DBError: std::error::Error + Send + Sync + 'static> = EVMError<DBError>;
+    type Error<DBError: revm::database_interface::DBErrorMarker> = EVMError<DBError>;
     type HaltReason = HaltReason;
     type Spec = SpecId;
     type BlockEnv = BlockEnv;

@@ -10,11 +10,16 @@
 # scripts/deploy.sh + README).
 
 # ── chef base: toolchain + system deps reth/mdbx/secp256k1 need ───────
-FROM rust:1.94-bookworm AS chef
+FROM rust:1.95-bookworm AS chef
 RUN apt-get update && apt-get install -y --no-install-recommends \
         clang libclang-dev pkg-config cmake libssl-dev git ca-certificates protobuf-compiler mold \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install cargo-chef --locked
+# reth_gnosis turns on reth's `jit` (revmc → LLVM 22) and `gmp` (m4).
+COPY scripts/ci/install-llvm.sh /usr/local/lib/eez/install-llvm.sh
+RUN bash /usr/local/lib/eez/install-llvm.sh && rm -rf /var/lib/apt/lists/*
+ENV LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
+ENV PATH="/usr/lib/llvm-22/bin:${PATH}"
 # mold cuts the final link from tens of seconds (single-threaded bfd on a
 # reth-sized symbol table) to a few. Set here so cook and build see the
 # SAME flags — RUSTFLAGS is part of cargo's fingerprint, and a mismatch

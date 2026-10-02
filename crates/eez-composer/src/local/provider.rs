@@ -4,7 +4,7 @@
 //! [`ChainProvider`] bundles the three reth handles every EVM
 //! simulation needs:
 //!
-//! - type-erased `StateProviderFactory` (for opening a state snapshot)
+//! - type-erased [`StateSnapshotProvider`] (for opening a state snapshot)
 //! - type-erased [`HeaderReader`] (dyn-compatible wrapper around
 //!   `HeaderProvider`, which has generic methods that block direct
 //!   `dyn` use)
@@ -15,8 +15,36 @@
 
 use std::sync::Arc;
 
+use alloy_primitives::B256;
 use eez_evm::EezEvmConfig;
-use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderFactory};
+use reth_storage_api::{
+    BlockNumReader, HeaderProvider, StateProviderBox, StateProviderFactory,
+    errors::provider::ProviderResult,
+};
+
+/// Dyn-compatible state-snapshot opener.
+///
+/// reth's `StateProviderFactory` names the chain's `Primitives`, so one
+/// `dyn` type cannot cover both L2 and L1 (Ethereum or Gnosis) providers.
+/// Simulation only opens snapshots, which is chain-agnostic.
+pub trait StateSnapshotProvider: Send + Sync {
+    /// Open a snapshot of the latest state.
+    fn latest(&self) -> ProviderResult<StateProviderBox>;
+
+    /// Open a snapshot of the state after block `hash`, including an
+    /// in-memory (not yet persisted) block.
+    fn state_by_block_hash(&self, hash: B256) -> ProviderResult<StateProviderBox>;
+}
+
+impl<T: StateProviderFactory + Sync> StateSnapshotProvider for T {
+    fn latest(&self) -> ProviderResult<StateProviderBox> {
+        StateProviderFactory::latest(self)
+    }
+
+    fn state_by_block_hash(&self, hash: B256) -> ProviderResult<StateProviderBox> {
+        StateProviderFactory::state_by_block_hash(self, hash)
+    }
+}
 
 /// Dyn-compatible header reader (`HeaderProvider` has generic methods
 /// that prevent `dyn HeaderProvider`).
@@ -50,8 +78,8 @@ where
 
 /// Everything needed to simulate calls on a chain.
 pub struct ChainProvider {
-    /// State provider factory — `.latest()` opens a fresh state snapshot.
-    pub provider: Arc<dyn StateProviderFactory>,
+    /// State snapshot opener — `.latest()` opens a fresh state snapshot.
+    pub provider: Arc<dyn StateSnapshotProvider>,
     /// Header reader — dyn-compatible wrapper around `HeaderProvider`.
     pub headers: Arc<dyn HeaderReader>,
     /// EVM config for building envs from headers.

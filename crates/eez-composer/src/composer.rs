@@ -2054,7 +2054,8 @@ where
         // is transient: nothing has been consumed, so the whole drain goes
         // back to the pool untouched.
         let local = &cc.local;
-        let l2_dyn: Arc<dyn StateProviderFactory> = rollup.l2_provider.clone();
+        let l2_dyn: Arc<dyn crate::local::provider::StateSnapshotProvider> =
+            rollup.l2_provider.clone();
         // Rebuilding from the accepted list — not restoring a cache — is what
         // keeps the prefix provably equal to the block the canonical rebuild
         // produces.
