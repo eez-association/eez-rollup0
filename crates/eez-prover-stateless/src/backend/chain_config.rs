@@ -194,7 +194,7 @@ fn ensure_no_unsupported_fields<'a>(
     eyre::bail!(
         "{context} contains unsupported fields: `{}`",
         fields.join("`, `"),
-    );
+    )
 }
 
 #[cfg(test)]
