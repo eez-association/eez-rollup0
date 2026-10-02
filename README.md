@@ -209,7 +209,12 @@ cargo run -p eez-follower -- node \
 
 ## Build, test, teardown
 
+Building needs LLVM 22, clang, Polly and m4: reth_gnosis turns on reth's
+`jit` and `gmp` features for the whole graph.
+
 ```bash
+sudo bash scripts/ci/install-llvm.sh    # no-op when already installed
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                  # Rust; `cd contracts && forge test` for Solidity

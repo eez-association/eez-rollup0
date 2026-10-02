@@ -192,10 +192,10 @@ fn ensure_no_unsupported_fields<'a>(
         return Ok(());
     }
     fields.sort_unstable();
-    eyre::bail!(
+    Err(eyre::eyre!(
         "{context} contains unsupported fields: `{}`",
         fields.join("`, `"),
-    )
+    ))
 }
 
 #[cfg(test)]
