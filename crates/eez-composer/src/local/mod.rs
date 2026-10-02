@@ -52,6 +52,6 @@ pub(crate) fn reset_frame_caller_nonce(
     addr: Address,
 ) {
     if let Some(account) = changes.get_mut(&addr) {
-        account.info.nonce = account.original_info.nonce;
+        account.info.nonce = account.original_info().nonce;
     }
 }
