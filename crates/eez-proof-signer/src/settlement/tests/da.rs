@@ -4,9 +4,9 @@ use super::*;
 fn refresh_l1_rolling_hash(entry: &mut ExecutionEntrySol) {
     let mut rolling_hash = EntryRollingHash::seed_for_l1(
         entry
-            .stateUpdates
+            .rollupUpdates
             .iter()
-            .map(|update| (update.rollupId, update.currentState)),
+            .map(|update| (update.rollupId, update.currentRoot)),
         entry.proxyEntryHash,
     );
     match entry.l2ToL1Calls.as_slice() {
@@ -465,7 +465,7 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     let mut batch = effect_batch(&[B256::ZERO; 3], &[ClaimedEntryShape::Outbound]);
     let value = U256::from(7);
     batch.entries[1].l2ToL1Calls[0].value = value;
-    batch.entries[1].stateUpdates[0].etherDelta = -I256::try_from(value).unwrap();
+    batch.entries[1].rollupUpdates[0].etherDelta = -eez_protocol::abi::u256_to_i192(value).unwrap();
     refresh_l1_rolling_hash(&mut batch.entries[1]);
     let mut settling = settling_with_outbound_pairs(1);
     settling
@@ -478,7 +478,7 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     let plan = effect_plan(&batch, &settling);
     let outbound = authorize_outbound_effects(&plan).unwrap();
     let mut sidecar = batch.entries[1].clone();
-    sidecar.stateUpdates.clear();
+    sidecar.rollupUpdates.clear();
     sidecar.rollingHash = B256::ZERO;
 
     let (_, mut user_payload) = block_and_payload_transactions(vec![user_transaction(7)]);
@@ -635,7 +635,7 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
         .skip(1)
         .cloned()
         .map(|mut entry| {
-            entry.stateUpdates.clear();
+            entry.rollupUpdates.clear();
             entry.rollingHash = B256::ZERO;
             entry
         })
@@ -747,8 +747,8 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
         .unwrap();
     batch.entries[2].proxyEntryHash = inbound_observation.recomputed_call_hash;
     batch.entries[2].returnData = inbound_observation.return_data.clone();
-    batch.entries[2].stateUpdates[0].etherDelta =
-        I256::try_from(inbound_observation.value).unwrap();
+    batch.entries[2].rollupUpdates[0].etherDelta =
+        eez_protocol::abi::u256_to_i192(inbound_observation.value).unwrap();
     refresh_l1_rolling_hash(&mut batch.entries[2]);
     settling
         .outbound_event_candidates_mut_for_test()
@@ -762,7 +762,7 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
     let outbound = authorize_outbound_effects(&plan).unwrap();
     let inbound = verify_inbound_effect_entries(&plan).unwrap();
     let mut outbound_sidecar = batch.entries[1].clone();
-    outbound_sidecar.stateUpdates.clear();
+    outbound_sidecar.rollupUpdates.clear();
     outbound_sidecar.rollingHash = B256::ZERO;
     let inbound_sidecar = settling.inbound_candidates()[0]
         .inspection

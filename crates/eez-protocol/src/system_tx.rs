@@ -412,7 +412,7 @@ mod tests {
     /// lowers to a `loadExecutionTable` system tx.
     fn outbound_entry() -> ExecutionEntrySol {
         ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: B256::ZERO, // outbound immediate
             l2ToL1Calls: vec![L2ToL1CallSol {
                 revertNextNCalls: 0,

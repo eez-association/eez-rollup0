@@ -1,12 +1,12 @@
 //! Binding Composer-claimed effects to locally validated execution evidence.
 
-use alloy_primitives::{B256, I256};
-use eez_protocol::abi::{ExecutionEntrySol, StateUpdateSol};
+use alloy_primitives::B256;
+use eez_protocol::abi::{ExecutionEntrySol, RollupUpdateSol};
 use eez_protocol::rolling_hash::EntryRollingHash;
 use thiserror::Error;
 
 use super::blocks::SettlingBlockObservations;
-use super::state_chain::VerifiedStateUpdateChain;
+use super::state_chain::VerifiedRollupUpdateChain;
 use crate::validate::{CheckpointAt, StateCheckpoint};
 
 /// Shape classification of one claimed batch entry; every unsupported shape
@@ -51,7 +51,7 @@ pub(super) struct BoundEffect<'batch> {
     transaction_index: usize,
     kind: EffectKind,
     claimed_entry: &'batch ExecutionEntrySol,
-    claimed_state_update: &'batch StateUpdateSol,
+    claimed_state_update: &'batch RollupUpdateSol,
 }
 
 impl<'batch> BoundEffect<'batch> {
@@ -71,7 +71,7 @@ impl<'batch> BoundEffect<'batch> {
         self.claimed_entry
     }
 
-    pub(super) const fn claimed_state_update(&self) -> &'batch StateUpdateSol {
+    pub(super) const fn claimed_state_update(&self) -> &'batch RollupUpdateSol {
         self.claimed_state_update
     }
 }
@@ -163,19 +163,21 @@ pub(crate) enum EffectPrefixError {
         claimed_candidate: B256,
     },
     #[error("anchor ether delta is {claimed}; expected zero")]
-    NonZeroAnchorEtherDelta { claimed: I256 },
+    NonZeroAnchorEtherDelta {
+        claimed: alloy_primitives::aliases::I192,
+    },
 }
 
 /// Bind each verified state-update-chain entry to its settling-block candidate and
 /// transaction state checkpoint.
 ///
-/// [`VerifiedStateUpdateChain`] already guarantees a nonempty batch with exactly
+/// [`VerifiedRollupUpdateChain`] already guarantees a nonempty batch with exactly
 /// one continuous, expected-rollup update per entry. This gate adds effect-shape,
-/// candidate, and checkpoint bindings. The anchor's `newState` must equal the
+/// candidate, and checkpoint bindings. The anchor's `newRoot` must equal the
 /// leading checkpoint's candidate — the settling block sealed over no
 /// transactions — so every entry commits to a block at the settling height.
 pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
-    verified_state_chain: &VerifiedStateUpdateChain<'batch>,
+    verified_state_chain: &VerifiedRollupUpdateChain<'batch>,
     computed_transaction_state_checkpoints: &[StateCheckpoint],
     settling_observations: &'settling SettlingBlockObservations,
 ) -> Result<BoundEffectSequence<'batch, 'settling>, EffectPrefixError> {
@@ -214,7 +216,7 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
     }
     // A canonical anchor carries no cross-chain value. Check this only after
     // the leading Composer entry has actually been classified as an anchor.
-    if anchor_update.etherDelta != I256::ZERO {
+    if anchor_update.etherDelta != alloy_primitives::aliases::I192::ZERO {
         return Err(EffectPrefixError::NonZeroAnchorEtherDelta {
             claimed: anchor_update.etherDelta,
         });
@@ -254,10 +256,10 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
             actual: anchor_checkpoint.at,
         });
     }
-    if anchor_update.newState != anchor_checkpoint.block_hash {
+    if anchor_update.newRoot != anchor_checkpoint.block_hash {
         return Err(EffectPrefixError::AnchorRootMismatch {
             empty_prefix_hash: anchor_checkpoint.block_hash,
-            claimed_anchor_post_state: anchor_update.newState,
+            claimed_anchor_post_state: anchor_update.newRoot,
         });
     }
 
@@ -299,7 +301,7 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
         // holding. Compare it to the candidate the backend sealed over the same
         // transaction prefix.
         let recomputed_candidate = checkpoint.block_hash;
-        let claimed_candidate = update.newState;
+        let claimed_candidate = update.newRoot;
         if claimed_candidate != recomputed_candidate {
             return Err(EffectPrefixError::EffectCandidateMismatch {
                 entry_index,
@@ -327,7 +329,7 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
 /// kind; the per-kind gates bind that shape to locally recovered evidence.
 fn classify_claimed_entry(
     entry: &ExecutionEntrySol,
-    update: &StateUpdateSol,
+    update: &RollupUpdateSol,
     settled_rollup: u64,
 ) -> ClaimedEntryShape {
     if !entry.success || !entry.expectedL1ToL2Calls.is_empty() {
@@ -354,7 +356,7 @@ fn classify_claimed_entry(
     }
 
     let expected_anchor_hash =
-        EntryRollingHash::seed_for_l1([(update.rollupId, update.currentState)], B256::ZERO)
+        EntryRollingHash::seed_for_l1([(update.rollupId, update.currentRoot)], B256::ZERO)
             .current();
     if entry.destinationRollupId == settled_rollup
         && entry.returnData.is_empty()

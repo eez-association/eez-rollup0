@@ -5,21 +5,35 @@
 
 use alloy_sol_types::sol;
 
+/// Converts an unsigned EVM value to the protocol's signed `int192` balance
+/// delta without truncation or accepting values above `int192::MAX`.
+pub fn u256_to_i192(value: alloy_primitives::U256) -> Option<alloy_primitives::aliases::I192> {
+    let [low, middle, high, overflow] = value.into_limbs();
+    if overflow != 0 {
+        return None;
+    }
+    let magnitude = alloy_primitives::aliases::U192::from_limbs([low, middle, high]);
+    alloy_primitives::aliases::I192::checked_from_sign_and_abs(
+        alloy_primitives::Sign::Positive,
+        magnitude,
+    )
+}
+
 sol! {
     /// One rollup state transition carried by an L1 entry.
     #[derive(Debug)]
-    struct StateUpdateSol {
+    struct RollupUpdateSol {
         uint64 rollupId;
-        bytes32 currentState;
-        bytes32 newState;
-        int256 etherDelta;
+        bytes32 currentRoot;
+        bytes32 newRoot;
+        int192 etherDelta;
     }
 
     /// A composer assertion about a rollup's live state root.
     #[derive(Debug)]
-    struct ExpectedStateRootPerRollupSol {
+    struct ExpectedRootPerRollupSol {
         uint64 rollupId;
-        bytes32 stateRoot;
+        bytes32 root;
     }
 
     /// One cross-chain call executed on L1.
@@ -48,7 +62,7 @@ sol! {
     /// One mutable top-level L1 execution entry.
     #[derive(Debug, Default)]
     struct ExecutionEntrySol {
-        StateUpdateSol[] stateUpdates;
+        RollupUpdateSol[] rollupUpdates;
         bytes32 proxyEntryHash;
         L2ToL1CallSol[] l2ToL1Calls;
         ExpectedL1ToL2CallSol[] expectedL1ToL2Calls;
@@ -61,7 +75,7 @@ sol! {
     /// One read-only top-level L1 execution entry.
     #[derive(Debug, Default)]
     struct StaticExecutionEntrySol {
-        ExpectedStateRootPerRollupSol[] expectedStateRoots;
+        ExpectedRootPerRollupSol[] expectedRoots;
         bytes32 proxyEntryHash;
         L2ToL1CallSol[] l2ToL1Calls;
         bytes32 rollingHash;
@@ -80,7 +94,7 @@ sol! {
     /// The single argument to `EEZ.postAndVerifyBatch`.
     #[derive(Debug, Default)]
     struct ProofSystemBatchPerVerificationEntriesSol {
-        ExpectedStateRootPerRollupSol[] expectedStateRootPerRollup;
+        ExpectedRootPerRollupSol[] expectedRootPerRollup;
         ExecutionEntrySol[] entries;
         StaticExecutionEntrySol[] staticEntries;
         uint256 immediateEntryCount;
@@ -102,9 +116,9 @@ sol! {
 
     function staticCrossChainCall(address sourceAddress, bytes callData) external view returns (bytes);
 
-    event BatchPosted(uint256 indexed rollupCount);
+    event BatchPosted(bytes32 sharedPublicInput, uint64[] rollupIds);
 
-    event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newState);
+    event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newRoot, uint256 etherBalance);
 
     event ExecutionConsumed(
         bytes32 indexed crossChainCallHash, uint64 indexed rollupId, uint256 indexed entryQueueIndex
@@ -241,7 +255,7 @@ sol! {
 
 #[cfg(test)]
 mod selector_locks {
-    //! ABI pins from `eez-core-protocol` commit 6fcc90b.
+    //! ABI pins from `eez-core-protocol` commit 8d45891.
     use super::*;
     use alloy_sol_types::SolCall;
 
@@ -287,7 +301,7 @@ mod selector_locks {
     fn l1_selectors_match_upstream() {
         assert_eq!(
             postAndVerifyBatchCall::SELECTOR,
-            [0xca, 0xfe, 0xf1, 0x25],
+            [0x12, 0x27, 0x02, 0x5c],
             "postAndVerifyBatch selector drifted from pinned protocol"
         );
         assert_eq!(
@@ -310,7 +324,7 @@ mod selector_locks {
         assert_eq!(
             L2ExecutionPerformed::SIGNATURE_HASH,
             alloy_primitives::b256!(
-                "c0b8d01bb696973c75a58d377245b23ce450af0ed8c4cf808cd0a3d85c6f3da1"
+                "8945ae7d1ab7f670bc04e5b87613a2ac6904a559769517d220308f4f22cd1b66"
             ),
             "L2ExecutionPerformed topic0 drifted; settlement endpoints would read empty"
         );

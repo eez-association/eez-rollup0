@@ -87,7 +87,7 @@ impl BatchLogChunks {
 }
 
 /// One decoded `BatchPosted` log: winner flag plus the claimed state
-/// roots from our rollup's `StateUpdate`. The Deriver's catch-up scan and
+/// roots from our rollup's `RollupUpdate`. The Deriver's catch-up scan and
 /// the live [`L1Watcher`](crate::L1Watcher) poll consume the same shape.
 #[derive(Debug, Clone)]
 pub struct ScannedBatch {
@@ -191,7 +191,7 @@ fn transient_prefix_index(run_end: usize, immediate: usize, slot: usize) -> Opti
 /// What L1 emitted inside one batch's window, before it is matched to entries.
 #[derive(Debug, Default)]
 struct ConsumptionEvidence {
-    /// `L2ExecutionPerformed.newState`, in emission order.
+    /// `L2ExecutionPerformed.newRoot`, in emission order.
     observed: Vec<B256>,
     /// `(slot, crossChainCallHash, consuming log index)`.
     consumed: Vec<(u64, B256, u64)>,
@@ -208,7 +208,7 @@ pub struct Settlement {
     /// then the transient prefix, then the queue, which this batch does not even
     /// populate until after its own meta-hook has returned.
     applied: Vec<AppliedEntry>,
-    /// `newState` of the last entry that applied — L1's actual commitment, and
+    /// `newRoot` of the last entry that applied — L1's actual commitment, and
     /// the only valid reconciliation endpoint under partial consumption.
     pub final_state: Option<B256>,
     /// The stored commitment the applied run STARTED from. On a mid-chain
@@ -444,7 +444,7 @@ pub(crate) async fn scan_batch_logs_range(
                     tx_index,
                     log_index: l.log_index.unwrap_or_default(),
                     block_hash,
-                    payload: decoded.newState,
+                    payload: decoded.newRoot,
                 });
             }
             Some(t) if *t == ExecutionConsumed::SIGNATURE_HASH => {
@@ -523,8 +523,7 @@ pub(crate) async fn scan_batch_logs_range(
             .await?;
         let submitter = tx.inner.signer();
         let input = tx.inner.input();
-        // `BatchPosted` carries rollupCount, not rollupId, so we decode every
-        // rollup's batch — and a peer posting via a router yields undecodable
+        // A peer posting via a router can yield undecodable input. Skip it
         // input. Skip unless it settled OUR rollup (invariant 8).
         let decoded = match postAndVerifyBatchCall::abi_decode(input) {
             Ok(decoded) => decoded,
@@ -732,13 +731,13 @@ fn attribute_settlement(
         .into_iter()
         .filter(|&index| {
             batch.entries[index]
-                .stateUpdates
+                .rollupUpdates
                 .iter()
                 .any(|update| update.rollupId == rollup_id)
         })
         .collect();
-    // EEZ.sol rejects duplicate rollups within an entry's `stateUpdates`
-    // (`StateUpdatesNotStrictlyIncreasing`), so one applied entry emits exactly
+    // EEZ.sol rejects duplicate rollups within an entry's `rollupUpdates`
+    // (`RollupUpdatesNotStrictlyIncreasing`), so one applied entry emits exactly
     // one root for us — a disagreement means the window was mis-attributed.
     //
     // Terminal like the other two evidence disagreements: the Deriver stops
@@ -765,10 +764,10 @@ fn attribute_settlement(
     // `ours` only holds entries carrying an update for us, so this always finds.
     let entry_state = applied.first().and_then(|first| {
         batch.entries[first.entry_index]
-            .stateUpdates
+            .rollupUpdates
             .iter()
             .find(|update| update.rollupId == rollup_id)
-            .map(|update| update.currentState)
+            .map(|update| update.currentRoot)
     });
     Ok(Settlement::new(
         applied,
@@ -824,13 +823,13 @@ mod tests {
     };
     use crate::error::L1Error;
     use alloy_consensus::transaction::TxHashRef;
-    use alloy_primitives::{Address, B256, Bytes, I256, U256};
+    use alloy_primitives::{Address, B256, Bytes, U256};
     use alloy_provider::ProviderBuilder;
     use alloy_sol_types::{SolCall, SolEvent};
     use alloy_transport::mock::Asserter;
     use eez_protocol::abi::{
         BatchPosted, ExecutionEntrySol, L2ExecutionPerformed, L2TxSkipped,
-        ProofSystemBatchPerVerificationEntriesSol, RollupIdWithProofSystemsSol, StateUpdateSol,
+        ProofSystemBatchPerVerificationEntriesSol, RollupIdWithProofSystemsSol, RollupUpdateSol,
         postAndVerifyBatchCall,
     };
 
@@ -941,11 +940,11 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &new_state)| ExecutionEntrySol {
-                stateUpdates: vec![StateUpdateSol {
+                rollupUpdates: vec![RollupUpdateSol {
                     rollupId: TEST_ROLLUP,
-                    currentState: if i == 0 { pre } else { roots[i - 1] },
-                    newState: new_state,
-                    etherDelta: I256::ZERO,
+                    currentRoot: if i == 0 { pre } else { roots[i - 1] },
+                    newRoot: new_state,
+                    etherDelta: alloy_primitives::aliases::I192::ZERO,
                 }],
                 proxyEntryHash: if i < immediate_count {
                     B256::ZERO
@@ -981,7 +980,7 @@ mod tests {
         super::ConsumptionEvidence {
             observed: applied
                 .iter()
-                .map(|&i| batch.entries[i].stateUpdates[0].newState)
+                .map(|&i| batch.entries[i].rollupUpdates[0].newRoot)
                 .collect(),
             consumed: applied
                 .iter()
@@ -1276,11 +1275,11 @@ mod tests {
             entries: step
                 .map(|(current, new)| {
                     vec![ExecutionEntrySol {
-                        stateUpdates: vec![StateUpdateSol {
+                        rollupUpdates: vec![RollupUpdateSol {
                             rollupId: rollup_id,
-                            currentState: current,
-                            newState: new,
-                            etherDelta: I256::ZERO,
+                            currentRoot: current,
+                            newRoot: new,
+                            etherDelta: alloy_primitives::aliases::I192::ZERO,
                         }],
                         destinationRollupId: rollup_id,
                         ..Default::default()
@@ -1327,7 +1326,8 @@ mod tests {
             inner: alloy_primitives::Log {
                 address: Address::ZERO,
                 data: BatchPosted {
-                    rollupCount: U256::from(1),
+                    sharedPublicInput: B256::ZERO,
+                    rollupIds: vec![1],
                 }
                 .encode_log_data(),
             },
@@ -1357,7 +1357,8 @@ mod tests {
                 address: Address::ZERO,
                 data: L2ExecutionPerformed {
                     rollupId: rollup_id,
-                    newState: root,
+                    newRoot: root,
+                    etherBalance: U256::ZERO,
                 }
                 .encode_log_data(),
             },

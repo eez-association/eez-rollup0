@@ -132,7 +132,7 @@ pub fn entry_from_action(action: &Action, local: RollupId) -> ProtocolResult<Exe
     };
 
     Ok(ExecutionEntrySol {
-        stateUpdates: Vec::new(),
+        rollupUpdates: Vec::new(),
         proxyEntryHash: proxy_entry_hash,
         l2ToL1Calls: vec![call],
         expectedL1ToL2Calls: Vec::new(),

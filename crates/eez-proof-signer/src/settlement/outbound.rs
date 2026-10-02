@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU64;
 
-use alloy_primitives::{Address, B256, I256, U256};
+use alloy_primitives::{Address, B256, U256};
 use eez_protocol::abi::ExecutionEntrySol;
 use eez_protocol::rolling_hash::EntryRollingHash;
 use eez_protocol::{CallHashInput, CallMode, RollupId, l2_outbound_call_hash};
@@ -96,8 +96,8 @@ pub(crate) enum OutboundEffectError {
     )]
     EtherDeltaMismatch {
         entry_index: usize,
-        expected: I256,
-        actual: I256,
+        expected: alloy_primitives::aliases::I192,
+        actual: alloy_primitives::aliases::I192,
     },
 }
 
@@ -258,7 +258,7 @@ pub(crate) fn authorize_outbound_effects(
                     expected_l2_system_address,
                 )?;
                 let mut derived_da_entry = effect.claimed_entry().clone();
-                derived_da_entry.stateUpdates.clear();
+                derived_da_entry.rollupUpdates.clear();
                 derived_da_entry.rollingHash = B256::ZERO;
                 authorized_bindings.push(AuthorizedOutboundEffect {
                     load_transaction_index,
@@ -352,7 +352,7 @@ fn authorize_outbound_effect(
     // call identity committed by the L1 entry rolling hash.
     let update = effect.claimed_state_update();
     let mut rolling_hash = EntryRollingHash::seed_for_l1(
-        [(update.rollupId, update.currentState)],
+        [(update.rollupId, update.currentRoot)],
         entry.proxyEntryHash,
     );
     rolling_hash.call_begin(recomputed_call_hash);
@@ -371,11 +371,12 @@ fn authorize_outbound_effect(
     }
     // Available L1 funding is outside this claim; bind the ledger delta to
     // `-value`.
-    let expected_delta =
-        -I256::try_from(call.value).map_err(|_| OutboundEffectError::ValueOutOfRange {
+    let expected_delta = -eez_protocol::abi::u256_to_i192(call.value).ok_or(
+        OutboundEffectError::ValueOutOfRange {
             entry_index,
             value: call.value,
-        })?;
+        },
+    )?;
     if update.etherDelta != expected_delta {
         return Err(OutboundEffectError::EtherDeltaMismatch {
             entry_index,

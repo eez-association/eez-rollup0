@@ -5,7 +5,7 @@
 //! `abi.encodePacked` encoding:
 //!
 //! ```text
-//! L1 state fold  : keccak256(prev[32] || rollupId[8] || currentState[32])
+//! L1 state fold  : keccak256(prev[32] || rollupId[8] || currentRoot[32])
 //! L1 entry seed  : keccak256(statesHash[32] || proxyEntryHash[32])
 //! L2 entry seed  : keccak256(bytes32(0) || proxyEntryHash[32])
 //! CALL_BEGIN     : keccak256(prev[32] || 0x01 || callHash[32])

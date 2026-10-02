@@ -13,7 +13,7 @@
 //!   into the entry's `proxyEntryHash` and whose result is bound into the
 //!   `rollingHash` (see [`entries::decode_inbound`] / [`entries::DecodedInbound`]).
 //! - **COMMIT OUTBOUND.** `proxyEntryHash` and `rollingHash` bind the outbound
-//!   call chain. The settlement `StateUpdate` carries the L2 post-state root,
+//!   call chain. The settlement `RollupUpdate` carries the L2 post-state root,
 //!   which the proof signer verifies rather than re-executing the call on L1.
 //! - **Canonical public inputs.** [`public_inputs::public_inputs_hashes`] is the
 //!   reconstruction used by the proof signer; another encoding changes the
@@ -21,7 +21,7 @@
 //!   key, block number zero, no blobs, and no sender binding; other profiles are
 //!   rejected.
 //! - **Settlement root.** Before signing, the proof signer checks
-//!   `StateUpdate.newState` against the root reth produced for the block.
+//!   `RollupUpdate.newRoot` against the root reth produced for the block.
 //!
 //! # Where to start reading
 //!

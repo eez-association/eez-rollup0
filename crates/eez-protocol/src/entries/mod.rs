@@ -56,7 +56,7 @@ pub(crate) fn ensure_source_side_calls<'a>(
 ///
 /// L2 source entries are seed-only: the user transaction performs the outer
 /// call, so the table stores its precomputed result without re-executing it.
-/// L1 entries remain unfinalized until their `StateUpdate`s are attached and
+/// L1 entries remain unfinalized until their `RollupUpdate`s are attached and
 /// [`finalize_l1_rolling_hashes`] is called.
 ///
 /// # Errors
@@ -84,14 +84,14 @@ pub fn build_batch(
             let return_data = Bytes::copy_from_slice(supported_return_data(call)?);
             let proxy_entry_hash = source_side_call_hash(call);
             let rolling_hash = if source_rollup_id.is_mainnet() {
-                // The L1 seed depends on StateUpdates that are attached later.
+                // The L1 seed depends on RollupUpdates that are attached later.
                 B256::ZERO
             } else {
                 EntryRollingHash::seed_for_l2(proxy_entry_hash).current()
             };
 
             Ok(ExecutionEntrySol {
-                stateUpdates: Vec::new(),
+                rollupUpdates: Vec::new(),
                 proxyEntryHash: proxy_entry_hash,
                 l2ToL1Calls: Vec::new(),
                 expectedL1ToL2Calls: Vec::new(),
@@ -118,7 +118,7 @@ pub fn build_batch(
 ///
 /// The entries intentionally carry an unfinished zero `rollingHash`: their L1
 /// seed cannot be computed until the Composer attaches the final ordered
-/// `StateUpdate`s and calls [`finalize_l1_rolling_hashes`].
+/// `RollupUpdate`s and calls [`finalize_l1_rolling_hashes`].
 pub(crate) fn build_l1_postbatch(
     calls: &[ExecutedAction],
     source_rollup_id: RollupId,
@@ -134,11 +134,11 @@ pub(crate) fn build_l1_postbatch(
         }
 
         entries.push(ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: B256::ZERO,
             l2ToL1Calls: vec![l1_call_from_action(call)],
             expectedL1ToL2Calls: Vec::new(),
-            // Finalized only after StateUpdates are stitched by the Composer.
+            // Finalized only after RollupUpdates are stitched by the Composer.
             rollingHash: B256::ZERO,
             destinationRollupId: source_rollup_id.0,
             success: true,
@@ -159,7 +159,7 @@ pub(crate) fn build_l1_postbatch(
 /// Finalize every mutable L1 entry after the Composer has attached its ordered
 /// state updates.
 ///
-/// Every entry must be successful, have at least one `StateUpdate`, contain no
+/// Every entry must be successful, have at least one `RollupUpdate`, contain no
 /// reentrant expected calls, and contain at most one flat mutable call with no
 /// gas limit or revert span.
 ///
@@ -172,9 +172,9 @@ pub fn finalize_l1_rolling_hashes(batch: &mut EvmBatch) -> ProtocolResult<()> {
     }
 
     for (entry_index, entry) in batch.entries.iter_mut().enumerate() {
-        if entry.stateUpdates.is_empty() {
+        if entry.rollupUpdates.is_empty() {
             return Err(crate::ProtocolErrorKind::InvalidEncoding(format!(
-                "L1 entry {entry_index} has no StateUpdates"
+                "L1 entry {entry_index} has no RollupUpdates"
             ))
             .into());
         }
@@ -193,9 +193,9 @@ pub fn finalize_l1_rolling_hashes(batch: &mut EvmBatch) -> ProtocolResult<()> {
 
         let mut rolling_hash = EntryRollingHash::seed_for_l1(
             entry
-                .stateUpdates
+                .rollupUpdates
                 .iter()
-                .map(|update| (update.rollupId, update.currentState)),
+                .map(|update| (update.rollupId, update.currentRoot)),
             entry.proxyEntryHash,
         );
 
@@ -285,7 +285,7 @@ impl InboundSidecar {
         let l2_entry = build_l2_incoming_entry(entry)?;
         let call = &l2_entry.incomingCalls[0];
         Ok(Self(ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: l2_entry.proxyEntryHash,
             l2ToL1Calls: vec![L2ToL1CallSol {
                 revertNextNCalls: 0,
@@ -510,7 +510,7 @@ pub fn build_l1_inbound_entry(
 
     batch_with_entries(
         vec![ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: proxy_entry_hash,
             l2ToL1Calls: Vec::new(),
             expectedL1ToL2Calls: Vec::new(),
@@ -566,7 +566,7 @@ pub(crate) fn build_inbound_target_entries(
 pub fn build_l1_settlement_only(rollup_id: RollupId) -> EvmBatch {
     batch_with_entries(
         vec![ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: B256::ZERO,
             l2ToL1Calls: Vec::new(),
             expectedL1ToL2Calls: Vec::new(),
@@ -779,11 +779,11 @@ fn batch_with_entries(entries: Vec<ExecutionEntrySol>, immediate_count: usize) -
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{I256, address};
+    use alloy_primitives::address;
 
     use super::*;
     use crate::ExecutionOutcome;
-    use crate::abi::StateUpdateSol;
+    use crate::abi::RollupUpdateSol;
 
     fn record(target: RollupId, source: RollupId) -> ExecutedAction {
         ExecutedAction {
@@ -803,12 +803,12 @@ mod tests {
         }
     }
 
-    fn state_update(rollup_id: u64, current_state: B256) -> StateUpdateSol {
-        StateUpdateSol {
+    fn state_update(rollup_id: u64, current_state: B256) -> RollupUpdateSol {
+        RollupUpdateSol {
             rollupId: rollup_id,
-            currentState: current_state,
-            newState: B256::with_last_byte(0xff),
-            etherDelta: I256::ZERO,
+            currentRoot: current_state,
+            newRoot: B256::with_last_byte(0xff),
+            etherDelta: alloy_primitives::aliases::I192::ZERO,
         }
     }
 
@@ -822,7 +822,7 @@ mod tests {
         rolling.call_end(true, &return_data);
         // The original entry representation, independent of InboundSidecar's encoder.
         let wire = ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: hash,
             l2ToL1Calls: vec![l1_call_from_action(&call)],
             expectedL1ToL2Calls: Vec::new(),
@@ -841,7 +841,7 @@ mod tests {
         );
 
         let mutations: [fn(&mut ExecutionEntrySol); 11] = [
-            |e| e.stateUpdates.push(state_update(7, B256::ZERO)),
+            |e| e.rollupUpdates.push(state_update(7, B256::ZERO)),
             |e| e.l2ToL1Calls.clear(),
             |e| e.l2ToL1Calls.push(e.l2ToL1Calls[0].clone()),
             |e| e.l2ToL1Calls[0].isStatic = true,
@@ -939,7 +939,7 @@ mod tests {
         let entry = &batch.entries[0];
 
         assert_eq!(batch.immediateEntryCount, U256::from(1));
-        assert!(entry.stateUpdates.is_empty());
+        assert!(entry.rollupUpdates.is_empty());
         assert_eq!(entry.rollingHash, B256::ZERO);
         assert_eq!(entry.destinationRollupId, 7);
         assert!(entry.success);
@@ -955,7 +955,7 @@ mod tests {
         let action = record(RollupId::MAINNET, RollupId(7));
         let mut batch = build_l1_postbatch(&[action], RollupId(7)).unwrap();
         batch.entries[0]
-            .stateUpdates
+            .rollupUpdates
             .push(state_update(7, B256::with_last_byte(0x11)));
 
         finalize_l1_rolling_hashes(&mut batch).unwrap();
@@ -987,7 +987,7 @@ mod tests {
 
         let mut multi_call = build_l1_postbatch(&[action], RollupId(7)).unwrap();
         multi_call.entries[0]
-            .stateUpdates
+            .rollupUpdates
             .push(state_update(7, B256::ZERO));
         let extra_call = multi_call.entries[0].l2ToL1Calls[0].clone();
         multi_call.entries[0].l2ToL1Calls.push(extra_call);

@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU64;
 
-use alloy_primitives::{B256, Bytes, I256, U256};
+use alloy_primitives::{B256, Bytes, U256};
 use alloy_sol_types::SolCall as _;
 use eez_protocol::abi::executeIncomingCrossChainCallCall;
 use eez_protocol::entries::{InboundSidecar, IncomingEntry};
@@ -240,8 +240,8 @@ pub(crate) enum InboundEffectError {
     )]
     EtherDeltaMismatch {
         entry_index: usize,
-        expected: I256,
-        actual: I256,
+        expected: alloy_primitives::aliases::I192,
+        actual: alloy_primitives::aliases::I192,
     },
 }
 
@@ -396,7 +396,7 @@ fn authorize_inbound_effect(
     }
     let update = effect.claimed_state_update();
     let expected_rolling_hash = EntryRollingHash::seed_for_l1(
-        [(update.rollupId, update.currentState)],
+        [(update.rollupId, update.currentRoot)],
         entry.proxyEntryHash,
     )
     .current();
@@ -406,12 +406,13 @@ fn authorize_inbound_effect(
             field: "rollingHash",
         });
     }
-    let expected =
-        I256::try_from(observation.value).map_err(|_| InboundEffectError::ValueOutOfRange {
+    let expected = eez_protocol::abi::u256_to_i192(observation.value).ok_or(
+        InboundEffectError::ValueOutOfRange {
             entry_index,
             transaction_index: effect.transaction_index(),
             value: observation.value,
-        })?;
+        },
+    )?;
     if update.etherDelta != expected {
         return Err(InboundEffectError::EtherDeltaMismatch {
             entry_index,

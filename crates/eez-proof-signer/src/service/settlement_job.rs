@@ -153,7 +153,7 @@ pub(super) enum SettlementPipelineError {
     #[error(transparent)]
     BlockInspection(#[from] settlement::BlockInspectionError),
     #[error(transparent)]
-    StateUpdateChain(#[from] settlement::StateUpdateChainError),
+    RollupUpdateChain(#[from] settlement::RollupUpdateChainError),
     #[error(transparent)]
     EffectPrefix(#[from] settlement::EffectPrefixError),
     #[error(transparent)]
@@ -173,7 +173,7 @@ impl SettlementPipelineError {
             Self::PostBatchCalldata(_) => "post_batch_calldata",
             Self::PublicInputs(_) => "public_inputs",
             Self::BlockInspection(_) => "block_inspection",
-            Self::StateUpdateChain(_) => "state_update_chain",
+            Self::RollupUpdateChain(_) => "state_update_chain",
             Self::EffectPrefix(_) => "effect_prefix",
             Self::InboundEffects(_) => "inbound_effects",
             Self::OutboundEffects(_) => "outbound_effects",
@@ -245,7 +245,7 @@ impl SettlementPipelineError {
                 ),
             },
             Self::PublicInputs(settlement::PublicInputError::InvalidStructure(_))
-            | Self::StateUpdateChain(_)
+            | Self::RollupUpdateChain(_)
             | Self::InboundEffects(_)
             | Self::OutboundEffects(_) => (
                 tonic::Code::FailedPrecondition,
