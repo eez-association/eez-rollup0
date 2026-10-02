@@ -5,20 +5,108 @@
 //! cross-check binds every backend result to its admitted block; only then does
 //! the validated window expose the evidence used by settlement.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use alloy_primitives::B256;
 use alloy_rpc_types_debug::ExecutionWitness;
+use eez_control_rpc::v1::ExecutionWitness as WireExecutionWitness;
 use thiserror::Error;
 
 use crate::cancel::CancellationToken;
-use crate::window::{AdmittedBlock, AdmittedBlocks};
+use crate::window::AdmittedBlocks;
 
 pub mod support;
 
 type EthereumBlock = eez_primitives::Block;
 
+/// Untrusted block input shared by v1 window and v2 session validation.
+///
+/// Transport parsing checks hash widths and witness presence. Validation must
+/// bind the number and hash claims to the RLP, check the parent, and execute it.
+#[derive(Debug, Clone)]
+pub struct AdmittedBlock {
+    pub(crate) declared_number: u64,
+    pub(crate) claimed_hash: B256,
+    pub(crate) claimed_parent_hash: B256,
+    pub(crate) rlp: Vec<u8>,
+    pub(crate) witness: ExecutionWitness,
+}
+
+impl AdmittedBlock {
+    /// Composer-declared block number admitted from the stream.
+    pub const fn declared_number(&self) -> u64 {
+        self.declared_number
+    }
+
+    /// Composer-claimed block hash admitted from the stream.
+    pub const fn claimed_hash(&self) -> B256 {
+        self.claimed_hash
+    }
+
+    /// Composer-claimed parent hash admitted from the stream.
+    pub const fn claimed_parent_hash(&self) -> B256 {
+        self.claimed_parent_hash
+    }
+
+    /// Exact consensus RLP admitted from the stream.
+    pub fn rlp(&self) -> &[u8] {
+        &self.rlp
+    }
+
+    /// Move the admitted execution witness into a consuming backend.
+    #[doc(hidden)]
+    pub(crate) fn take_witness(&mut self) -> ExecutionWitness {
+        std::mem::take(&mut self.witness)
+    }
+
+    /// Construct the minimal admitted block used by unit tests.
+    #[cfg(test)]
+    pub(crate) fn test(
+        declared_number: u64,
+        claimed_parent_hash_byte: u8,
+        claimed_hash_byte: u8,
+    ) -> Self {
+        Self {
+            declared_number,
+            claimed_hash: B256::repeat_byte(claimed_hash_byte),
+            claimed_parent_hash: B256::repeat_byte(claimed_parent_hash_byte),
+            rlp: Vec::new(),
+            witness: ExecutionWitness::default(),
+        }
+    }
+}
+
+/// Convert the protobuf witness into the Alloy type consumed by backends.
+/// Converting each payload into `Bytes` reuses its source allocation.
+pub(crate) fn into_execution_witness(witness: WireExecutionWitness) -> ExecutionWitness {
+    let WireExecutionWitness {
+        state,
+        codes,
+        keys,
+        headers,
+    } = witness;
+    ExecutionWitness {
+        state: state.into_iter().map(Into::into).collect(),
+        codes: codes.into_iter().map(Into::into).collect(),
+        keys: keys.into_iter().map(Into::into).collect(),
+        headers: headers.into_iter().map(Into::into).collect(),
+    }
+}
+
+/// Count protobuf witness items before allocating the retained representation.
+pub(crate) fn wire_witness_item_count(witness: &WireExecutionWitness) -> usize {
+    witness
+        .state
+        .len()
+        .saturating_add(witness.codes.len())
+        .saturating_add(witness.keys.len())
+        .saturating_add(witness.headers.len())
+}
+
 /// One transaction boundary's replay outputs: the cumulative state root and
 /// the hash of the candidate block sealed over that prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionStateCheckpoint {
     /// Zero-based position of the transaction within its block.
     pub transaction_index: usize,
@@ -30,7 +118,7 @@ pub struct TransactionStateCheckpoint {
 }
 
 /// Successful backend output for one block before the shared consuming check.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendBlockOutput {
     /// Block number exact-decoded by the backend from consensus RLP.
     pub decoded_number: u64,
@@ -55,7 +143,7 @@ pub struct BackendBlockOutput {
 ///
 /// This is not settlement-ready until the consuming cross-check binds each
 /// computed hash and transaction count to its corresponding admitted block.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendWindowOutput {
     /// One associated output per replayed block, oldest first.
     pub blocks: Vec<BackendBlockOutput>,
@@ -154,7 +242,7 @@ impl OutboundEventObservation {
 /// Facts derived locally from the same block and receipts accepted by replay.
 /// Production construction is restricted to validation backends; settlement
 /// receives only immutable views.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettlementBlockEvidence {
     /// Whether each transaction's fork-aware recovered signer is the reserved
     /// system address, in exact block order.
@@ -327,6 +415,66 @@ impl ValidatedWindow {
         &self.settling_block
     }
 
+    /// Build one settlement view from immutable, already cross-checked
+    /// incremental artifacts. Only the selected terminal retains checkpoints.
+    pub(crate) fn from_incremental(
+        anchor: IncrementalAnchor,
+        artifacts: &[Arc<ValidatedBlockArtifact>],
+    ) -> Result<Self, ValidationError> {
+        let (terminal, preceding) = artifacts.split_last().ok_or_else(|| {
+            ValidationError::Rejected("refusing to finalize an empty window".to_owned())
+        })?;
+        if artifacts[0].number
+            != anchor.number.checked_add(1).ok_or_else(|| {
+                ValidationError::Rejected("incremental anchor block number overflows".to_owned())
+            })?
+            || artifacts[0].parent_hash != anchor.hash
+        {
+            return Err(ValidationError::InternalInvariant(
+                "incremental artifacts do not extend the exact session anchor".to_owned(),
+            ));
+        }
+        if artifacts[0].pre_state_root != anchor.state_root {
+            return Err(ValidationError::Rejected(format!(
+                "incremental window starts at {}, declared anchor root is {}",
+                artifacts[0].pre_state_root, anchor.state_root,
+            )));
+        }
+        for pair in artifacts.windows(2) {
+            if pair[1].number != pair[0].number + 1
+                || pair[1].parent_hash != pair[0].hash
+                || pair[1].pre_state_root != pair[0].post_state_root
+            {
+                return Err(ValidationError::InternalInvariant(format!(
+                    "cached incremental artifacts do not form a contiguous transition at block {}",
+                    pair[1].number,
+                )));
+            }
+        }
+        Ok(Self {
+            window_pre_block_hash: anchor.hash,
+            settling_pre_block_hash: terminal.parent_hash,
+            window_post_block_hash: terminal.hash,
+            preceding_blocks: preceding
+                .iter()
+                .map(|artifact| ValidatedBlock {
+                    number: artifact.number,
+                    rlp: artifact.rlp.clone(),
+                    settlement_evidence: artifact.settlement_evidence.clone(),
+                })
+                .collect(),
+            settling_block: ValidatedSettlingBlock {
+                block: ValidatedBlock {
+                    number: terminal.number,
+                    rlp: terminal.rlp.clone(),
+                    settlement_evidence: terminal.settlement_evidence.clone(),
+                },
+                receipt_successes: terminal.receipt_successes.clone(),
+                transaction_state_checkpoints: terminal.transaction_state_checkpoints.clone(),
+            },
+        })
+    }
+
     /// Construct an explicitly synthetic validated window for unit tests.
     #[cfg(test)]
     pub(crate) fn for_test(
@@ -362,6 +510,9 @@ struct CheckedBackendWindowOutput {
 /// A validation failure classified for the RPC boundary.
 #[derive(Debug, Error)]
 pub enum ValidationError {
+    /// Incremental execution did not complete within its configured deadline.
+    #[error("incremental block validation deadline exceeded")]
+    DeadlineExceeded,
     /// The backend cannot currently acquire the required validation state.
     #[error("{0}")]
     Unavailable(String),
@@ -382,8 +533,25 @@ pub enum ValidationError {
     Cancelled,
 }
 
+/// Exact block identity and state root at an incremental execution boundary.
+/// Used for the session anchor and the validated parent of a new block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncrementalAnchor {
+    pub number: u64,
+    pub hash: B256,
+    pub state_root: B256,
+}
+
+/// One block's backend output and the state root from which it was executed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncrementalBlockOutput {
+    pub pre_state_root: B256,
+    pub block: BackendBlockOutput,
+}
+
 /// Execution-evidence source used by the shared settlement and signing pipeline.
 /// Implementations are trusted to derive all evidence from replay.
+#[async_trait::async_trait]
 pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
     /// Static identifier used only in diagnostics.
     fn label(&self) -> &'static str;
@@ -402,6 +570,41 @@ pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
         witnesses: &mut [ExecutionWitness],
         cancellation: &CancellationToken,
     ) -> Result<BackendWindowOutput, ValidationError>;
+
+    /// Check an incremental session's anchor without allocating a backend cursor.
+    /// Legacy-only backends reject v2 admission until they are migrated.
+    fn begin_incremental(&self, _anchor: IncrementalAnchor) -> Result<(), ValidationError> {
+        Err(ValidationError::Unavailable(format!(
+            "{} backend does not support incremental validation",
+            self.label()
+        )))
+    }
+
+    /// Validate or reuse one block against its exact parent, returning whether execution was reused.
+    /// Backends own their caches (including checkpoints), execution limits and deadlines.
+    /// Cache hits must bind the submitted bytes and parent; only successful results may be cached.
+    async fn validate_next(
+        &self,
+        _anchor: IncrementalAnchor,
+        _parent: IncrementalAnchor,
+        _block: &AdmittedBlock,
+        _witness: ExecutionWitness,
+        _request_timeout: Duration,
+    ) -> Result<(IncrementalBlockOutput, bool), ValidationError> {
+        Err(ValidationError::Unavailable(format!(
+            "{} backend does not support incremental validation",
+            self.label()
+        )))
+    }
+
+    /// Recheck backend-specific freshness immediately before final attestation.
+    async fn recheck_incremental(
+        &self,
+        _anchor: IncrementalAnchor,
+        _blocks: &[Arc<ValidatedBlockArtifact>],
+    ) -> Result<(), ValidationError> {
+        Ok(())
+    }
 
     /// Number of queued actions exposed only by the canned unit-test backend.
     #[cfg(test)]
@@ -486,6 +689,110 @@ impl Validator {
         self.backend
             .validate_blocks(blocks, witnesses, cancellation)
     }
+
+    pub(crate) fn begin_incremental(
+        &self,
+        anchor: IncrementalAnchor,
+    ) -> Result<(), ValidationError> {
+        self.backend.begin_incremental(anchor)
+    }
+
+    pub(crate) async fn validate_next(
+        &self,
+        anchor: IncrementalAnchor,
+        parent: IncrementalAnchor,
+        mut admitted: AdmittedBlock,
+        request_timeout: Duration,
+    ) -> Result<(Arc<ValidatedBlockArtifact>, bool), ValidationError> {
+        if parent.number.checked_add(1) != Some(admitted.declared_number())
+            || parent.hash != admitted.claimed_parent_hash()
+        {
+            return Err(ValidationError::Rejected(
+                "incremental block does not extend its validated parent".to_owned(),
+            ));
+        }
+        let witness = admitted.take_witness();
+        let (incremental, reused) = self
+            .backend
+            .validate_next(anchor, parent, &admitted, witness, request_timeout)
+            .await?;
+        if incremental.pre_state_root != parent.state_root {
+            return Err(ValidationError::InvalidBackendOutput(format!(
+                "incremental block {} started at {}, validated parent ended at {}",
+                admitted.declared_number, incremental.pre_state_root, parent.state_root,
+            )));
+        }
+        let CheckedBlock { admitted, output } =
+            check_backend_block_output(admitted, incremental.block, true)
+                .map_err(|error| ValidationError::InvalidBackendOutput(error.to_string()))?;
+        Ok((
+            Arc::new(ValidatedBlockArtifact {
+                number: output.decoded_number,
+                hash: output.computed_hash,
+                parent_hash: output.decoded_parent_hash,
+                pre_state_root: incremental.pre_state_root,
+                post_state_root: output.post_state_root,
+                rlp: admitted.rlp,
+                receipt_successes: output.receipt_successes,
+                transaction_state_checkpoints: output.transaction_state_checkpoints,
+                settlement_evidence: output.settlement_evidence,
+            }),
+            reused,
+        ))
+    }
+
+    pub(crate) async fn recheck_incremental(
+        &self,
+        anchor: IncrementalAnchor,
+        blocks: &[Arc<ValidatedBlockArtifact>],
+    ) -> Result<(), ValidationError> {
+        self.backend.recheck_incremental(anchor, blocks).await
+    }
+}
+
+/// Immutable execution evidence shared by Composer sessions after the backend
+/// result has been consumed by the common cross-check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedBlockArtifact {
+    pub(crate) number: u64,
+    pub(crate) hash: B256,
+    pub(crate) parent_hash: B256,
+    pub(crate) pre_state_root: B256,
+    pub(crate) post_state_root: B256,
+    pub(crate) rlp: Vec<u8>,
+    pub(crate) receipt_successes: Vec<bool>,
+    pub(crate) transaction_state_checkpoints: Vec<TransactionStateCheckpoint>,
+    pub(crate) settlement_evidence: SettlementBlockEvidence,
+}
+
+impl ValidatedBlockArtifact {
+    pub(crate) fn as_anchor(&self) -> IncrementalAnchor {
+        IncrementalAnchor {
+            number: self.number,
+            hash: self.hash,
+            state_root: self.post_state_root,
+        }
+    }
+
+    /// Checked block number exposed to backend freshness checks.
+    pub const fn number(&self) -> u64 {
+        self.number
+    }
+
+    /// Checked block hash exposed to backend freshness checks.
+    pub const fn hash(&self) -> B256 {
+        self.hash
+    }
+
+    /// Checked parent hash exposed to backend freshness checks.
+    pub const fn parent_hash(&self) -> B256 {
+        self.parent_hash
+    }
+
+    /// Exact validated bytes, borrowed without making a second block representation.
+    pub fn rlp(&self) -> &[u8] {
+        &self.rlp
+    }
 }
 
 /// Consume the backend result while binding every computed value to the
@@ -509,100 +816,11 @@ fn check_backend_window_output(
         .zip(backend_output.blocks)
         .enumerate()
     {
-        eyre::ensure!(
-            output.decoded_number == admitted.declared_number,
-            "backend decoded block number {} for Composer-declared block {}",
-            output.decoded_number,
-            admitted.declared_number,
-        );
-        eyre::ensure!(
-            output.decoded_parent_hash == admitted.claimed_parent_hash,
-            "backend decoded parent hash {} for block {} but Composer claimed {}",
-            output.decoded_parent_hash,
-            admitted.declared_number,
-            admitted.claimed_parent_hash,
-        );
-        eyre::ensure!(
-            output.computed_hash == admitted.claimed_hash,
-            "computed hash {} for block {} does not match Composer-claimed hash {}",
-            output.computed_hash,
-            admitted.declared_number,
-            admitted.claimed_hash,
-        );
-        let rlp_transaction_count = decode_transaction_count(&admitted)?;
-        eyre::ensure!(
-            output.decoded_transaction_count == rlp_transaction_count,
-            "backend decoded {} transactions for block {}, exact RLP contains {}",
-            output.decoded_transaction_count,
-            admitted.declared_number,
-            rlp_transaction_count,
-        );
-        let transaction_count = output.decoded_transaction_count;
-        eyre::ensure!(
-            output.receipt_successes.len() == transaction_count,
-            "receipt statuses for block {} cover {} transactions, expected {}",
-            admitted.declared_number,
-            output.receipt_successes.len(),
-            transaction_count,
-        );
-        let settlement_evidence = &output.settlement_evidence;
-        eyre::ensure!(
-            settlement_evidence.system_sender_flags.len() == transaction_count,
-            "system-sender flags for block {} cover {} transactions, expected {}",
-            admitted.declared_number,
-            settlement_evidence.system_sender_flags.len(),
-            transaction_count,
-        );
-        for observation in &settlement_evidence.observed_outbound_events {
-            eyre::ensure!(
-                observation.transaction_index < transaction_count,
-                "outbound event observation targets transaction {} in block {} with {} \
-                 transactions",
-                observation.transaction_index,
-                admitted.declared_number,
-                transaction_count,
-            );
-        }
-        for pair in settlement_evidence.observed_outbound_events.windows(2) {
-            let previous = (pair[0].transaction_index, pair[0].receipt_log_index);
-            let current = (pair[1].transaction_index, pair[1].receipt_log_index);
-            eyre::ensure!(
-                previous < current,
-                "outbound event observations for block {} are not strictly ordered: {:?} is \
-                 followed by {:?}",
-                admitted.declared_number,
-                previous,
-                current,
-            );
-        }
-        let checkpoints = &output.transaction_state_checkpoints;
-        eyre::ensure!(
-            position + 1 == total_blocks || checkpoints.is_empty(),
-            "backend output supplied transaction state checkpoints for preceding block {}",
-            admitted.declared_number,
-        );
-        for pair in checkpoints.windows(2) {
-            eyre::ensure!(
-                pair[0].transaction_index < pair[1].transaction_index,
-                "transaction state checkpoints for block {} are not strictly ordered: index \
-                 {} is followed by {}",
-                admitted.declared_number,
-                pair[0].transaction_index,
-                pair[1].transaction_index,
-            );
-        }
-        for checkpoint in checkpoints {
-            eyre::ensure!(
-                checkpoint.transaction_index < transaction_count,
-                "transaction state checkpoint index {} is out of bounds for block {} with {} \
-                 transactions",
-                checkpoint.transaction_index,
-                admitted.declared_number,
-                transaction_count,
-            );
-        }
-
-        checked_blocks.push(CheckedBlock { admitted, output });
+        checked_blocks.push(check_backend_block_output(
+            admitted,
+            output,
+            position + 1 == total_blocks,
+        )?);
     }
 
     let settling_block = checked_blocks
@@ -612,6 +830,107 @@ fn check_backend_window_output(
         preceding_blocks: checked_blocks,
         settling_block,
     })
+}
+
+fn check_backend_block_output(
+    admitted: AdmittedBlock,
+    output: BackendBlockOutput,
+    allow_checkpoints: bool,
+) -> eyre::Result<CheckedBlock> {
+    eyre::ensure!(
+        output.decoded_number == admitted.declared_number,
+        "backend decoded block number {} for Composer-declared block {}",
+        output.decoded_number,
+        admitted.declared_number,
+    );
+    eyre::ensure!(
+        output.decoded_parent_hash == admitted.claimed_parent_hash,
+        "backend decoded parent hash {} for block {} but Composer claimed {}",
+        output.decoded_parent_hash,
+        admitted.declared_number,
+        admitted.claimed_parent_hash,
+    );
+    eyre::ensure!(
+        output.computed_hash == admitted.claimed_hash,
+        "computed hash {} for block {} does not match Composer-claimed hash {}",
+        output.computed_hash,
+        admitted.declared_number,
+        admitted.claimed_hash,
+    );
+    let rlp_transaction_count = decode_transaction_count(&admitted)?;
+    eyre::ensure!(
+        output.decoded_transaction_count == rlp_transaction_count,
+        "backend decoded {} transactions for block {}, exact RLP contains {}",
+        output.decoded_transaction_count,
+        admitted.declared_number,
+        rlp_transaction_count,
+    );
+    let transaction_count = output.decoded_transaction_count;
+    eyre::ensure!(
+        output.receipt_successes.len() == transaction_count,
+        "receipt statuses for block {} cover {} transactions, expected {}",
+        admitted.declared_number,
+        output.receipt_successes.len(),
+        transaction_count,
+    );
+    let settlement_evidence = &output.settlement_evidence;
+    eyre::ensure!(
+        settlement_evidence.system_sender_flags.len() == transaction_count,
+        "system-sender flags for block {} cover {} transactions, expected {}",
+        admitted.declared_number,
+        settlement_evidence.system_sender_flags.len(),
+        transaction_count,
+    );
+    for observation in &settlement_evidence.observed_outbound_events {
+        eyre::ensure!(
+            observation.transaction_index < transaction_count,
+            "outbound event observation targets transaction {} in block {} with {} \
+                 transactions",
+            observation.transaction_index,
+            admitted.declared_number,
+            transaction_count,
+        );
+    }
+    for pair in settlement_evidence.observed_outbound_events.windows(2) {
+        let previous = (pair[0].transaction_index, pair[0].receipt_log_index);
+        let current = (pair[1].transaction_index, pair[1].receipt_log_index);
+        eyre::ensure!(
+            previous < current,
+            "outbound event observations for block {} are not strictly ordered: {:?} is \
+                 followed by {:?}",
+            admitted.declared_number,
+            previous,
+            current,
+        );
+    }
+    let checkpoints = &output.transaction_state_checkpoints;
+    eyre::ensure!(
+        allow_checkpoints || checkpoints.is_empty(),
+        "backend output supplied transaction state checkpoints for preceding block {}",
+        admitted.declared_number,
+    );
+    for pair in checkpoints.windows(2) {
+        eyre::ensure!(
+            pair[0].transaction_index < pair[1].transaction_index,
+            "transaction state checkpoints for block {} are not strictly ordered: index \
+                 {} is followed by {}",
+            admitted.declared_number,
+            pair[0].transaction_index,
+            pair[1].transaction_index,
+        );
+    }
+    for checkpoint in checkpoints {
+        eyre::ensure!(
+            checkpoint.transaction_index < transaction_count,
+            "transaction state checkpoint index {} is out of bounds for block {} with {} \
+                 transactions",
+            checkpoint.transaction_index,
+            admitted.declared_number,
+            transaction_count,
+        );
+    }
+
+    Ok(CheckedBlock { admitted, output })
 }
 
 impl CheckedBackendWindowOutput {

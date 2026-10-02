@@ -94,6 +94,7 @@ impl StubBackend {
     }
 }
 
+#[async_trait::async_trait]
 impl ValidationBackend for StubBackend {
     fn label(&self) -> &'static str {
         "stub"
@@ -121,6 +122,35 @@ impl ValidationBackend for StubBackend {
 
     fn remaining_test_actions(&self) -> Option<usize> {
         Some(self.actions.lock().unwrap().len())
+    }
+
+    async fn validate_next(
+        &self,
+        _anchor: IncrementalAnchor,
+        _parent: IncrementalAnchor,
+        block: &AdmittedBlock,
+        mut witness: ExecutionWitness,
+        _request_timeout: std::time::Duration,
+    ) -> Result<(IncrementalBlockOutput, bool), ValidationError> {
+        let mut output = self.validate_blocks(
+            std::slice::from_ref(block),
+            std::slice::from_mut(&mut witness),
+            &CancellationToken::default(),
+        )?;
+        assert_eq!(
+            output.blocks.len(),
+            1,
+            "incremental stub requires one block"
+        );
+        Ok((
+            IncrementalBlockOutput {
+                // A fixed replay result, deliberately independent of the supplied
+                // parent, so tests can detect a missing pre-state continuity check.
+                pre_state_root: B256::ZERO,
+                block: output.blocks.pop().unwrap(),
+            },
+            false,
+        ))
     }
 }
 

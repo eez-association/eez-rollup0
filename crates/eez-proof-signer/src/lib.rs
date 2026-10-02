@@ -70,7 +70,8 @@ pub async fn serve(
     }
     let shutdown_service = svc.clone();
     let serve_result = tonic::transport::Server::builder()
-        .add_service(svc.into_server())
+        .add_service(svc.clone().into_server())
+        .add_service(svc.into_streaming_server())
         .serve_with_shutdown(listen_addr, shutdown)
         .await;
     shutdown_service.wait_until_idle().await;

@@ -3888,7 +3888,7 @@ where
             .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
             .l1_head
             .cursor();
-        let pre_block_hash: B256 = {
+        let (pre_block_hash, pre_state_root): (B256, B256) = {
             let h = self
                 .inner
                 .rollups
@@ -3898,7 +3898,7 @@ where
                 .sealed_header(posted)
                 .map_err(|e| format!("sealed_header({posted}): {e}"))?
                 .ok_or_else(|| format!("local L2 header at {posted} missing"))?;
-            h.hash()
+            (h.hash(), h.state_root())
         };
         let pre_sync_block_hash = parent_header.hash();
         let immediate_entry = eez_protocol::abi::ExecutionEntrySol {
@@ -4323,6 +4323,11 @@ where
             rollup_id,
             from_block: from,
             to_block: sync_block_number,
+            anchor: Some(eez_prover::ProvingAnchor {
+                number: posted,
+                hash: pre_block_hash,
+                state_root: pre_state_root,
+            }),
             batch: batch.clone(),
             blocks: block_witnesses,
             l1_block_hash: None, // timeless batch (blockNumber 0)

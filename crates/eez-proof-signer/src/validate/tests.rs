@@ -2,6 +2,35 @@ use super::testing::backend_output_for;
 use super::*;
 use alloy_consensus::{SignableTransaction as _, TxLegacy};
 
+#[test]
+fn execution_witness_conversion_preserves_every_field() {
+    let witness = into_execution_witness(WireExecutionWitness {
+        state: vec![vec![0x00, 0xff], vec![0x01]],
+        codes: vec![vec![0x02]],
+        keys: vec![vec![], vec![0x03]],
+        headers: vec![vec![0x04, 0x05]],
+    });
+    let bytes = |items: &[alloy_primitives::Bytes]| {
+        items.iter().map(|item| item.to_vec()).collect::<Vec<_>>()
+    };
+    assert_eq!(bytes(&witness.state), [vec![0x00, 0xff], vec![0x01]]);
+    assert_eq!(bytes(&witness.codes), [vec![0x02]]);
+    assert_eq!(bytes(&witness.keys), [vec![], vec![0x03]]);
+    assert_eq!(bytes(&witness.headers), [vec![0x04, 0x05]]);
+}
+
+#[test]
+fn wire_witness_item_count_includes_every_collection() {
+    let witness = WireExecutionWitness {
+        state: vec![Vec::new(); 2],
+        codes: vec![Vec::new()],
+        keys: vec![Vec::new(); 2],
+        headers: vec![Vec::new()],
+    };
+
+    assert_eq!(wire_witness_item_count(&witness), 6);
+}
+
 fn admitted_block(number: u64, hash: u8) -> AdmittedBlock {
     let mut input = AdmittedBlock::test(number, 0, hash);
     input.rlp = alloy_rlp::encode(EthereumBlock::default());
@@ -45,6 +74,62 @@ fn accepts_backend_output_consistent_with_the_window() {
     let validated = validator.validate(&window).unwrap();
     assert!(validated.settling_block().receipt_successes().is_empty());
     assert_eq!(validator.stub_remaining(), 0);
+}
+
+#[tokio::test]
+async fn incremental_validation_binds_the_parent_and_backend_output_without_a_cursor() {
+    let anchor = IncrementalAnchor {
+        number: 10,
+        hash: B256::repeat_byte(10),
+        state_root: B256::ZERO,
+    };
+    for defect in [
+        "none",
+        "parent number",
+        "parent hash",
+        "pre-state root",
+        "output hash",
+    ] {
+        let mut parent = anchor;
+        let admitted = chained_admitted_block(11);
+        let mut output = backend_output_for(std::slice::from_ref(&admitted));
+        match defect {
+            "parent number" => parent.number = 9,
+            "parent hash" => parent.hash = B256::repeat_byte(9),
+            "pre-state root" => parent.state_root = B256::repeat_byte(9),
+            "output hash" => output.blocks[0].computed_hash = B256::repeat_byte(9),
+            _ => {}
+        }
+        let validator = Validator::stub(vec![Ok(output)]);
+        let result = validator
+            .validate_next(anchor, parent, admitted, std::time::Duration::from_secs(1))
+            .await;
+        match defect {
+            "none" => {
+                let (artifact, _) = result.unwrap();
+                assert_eq!(artifact.pre_state_root, parent.state_root);
+                assert_eq!(artifact.parent_hash, parent.hash);
+                assert_eq!(artifact.number, 11);
+            }
+            "parent number" | "parent hash" => {
+                assert!(
+                    matches!(result, Err(ValidationError::Rejected(_))),
+                    "{defect}"
+                );
+                assert_eq!(
+                    validator.stub_remaining(),
+                    1,
+                    "bad parent must not reach execution"
+                );
+                continue;
+            }
+            _ => assert!(
+                matches!(result, Err(ValidationError::InvalidBackendOutput(_))),
+                "{defect}"
+            ),
+        }
+        assert_eq!(validator.stub_remaining(), 0);
+    }
 }
 
 #[test]

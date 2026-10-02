@@ -92,6 +92,12 @@ impl DriverError {
         matches!(self.kind, ErrorKind::InvalidForkchoice(_))
     }
 
+    /// Returns true if `engine_newPayload` rejected the supplied block.
+    #[must_use]
+    pub fn is_invalid_payload(&self) -> bool {
+        matches!(self.kind, ErrorKind::InvalidPayload(_))
+    }
+
     /// Returns true if the `BlockCommitter` actor task has exited and
     /// can no longer receive commands.
     #[must_use]

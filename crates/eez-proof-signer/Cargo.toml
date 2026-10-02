@@ -28,17 +28,22 @@ reth-chainspec.workspace = true
 reth-primitives-traits.workspace = true
 
 eyre.workspace = true
+async-trait.workspace = true
 prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 # Recorded calldata fixture decoding.
 hex.workspace = true
 serde_json.workspace = true
 # Client-side of the in-process Prove round-trip tests.
+eez-prover.workspace = true
+eez-prover-client.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }
 
 [lints]

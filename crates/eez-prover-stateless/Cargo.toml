@@ -32,6 +32,8 @@ stateless-reth.workspace = true
 
 clap = { workspace = true, features = ["env"] }
 eyre.workspace = true
+async-trait.workspace = true
+lru.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

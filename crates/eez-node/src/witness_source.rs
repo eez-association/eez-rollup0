@@ -25,7 +25,7 @@ use alloy_primitives::{B256, Bytes};
 use alloy_rpc_types_debug::ExecutionWitness;
 use eez_driver::witness::{ExecutionWitnessMode, block_witness};
 use eez_primitives::{Block, EezPrimitives};
-use eez_prover::{BlockWitness, ProvingWitnessSource};
+use eez_prover::{BlockWitness, Prover, ProvingAnchor, ProvingWitnessSource};
 use reth_evm::ConfigureEvm;
 use reth_libmdbx::{DatabaseFlags, Environment, Geometry, WriteFlags};
 use reth_storage_api::{BlockReader, HeaderProvider, StateProviderFactory, TransactionVariant};
@@ -289,12 +289,15 @@ where
 /// Drain committed-block hashes, capture each block's witness at commit (parent
 /// state fresh), persist it, and purge everything the L1 has FINALIZED
 /// (`settled_floor`). Runs until the channel closes.
-pub async fn run_capture<P, E, F>(
+pub async fn run_capture<P, E, F, G>(
     mut rx: mpsc::UnboundedReceiver<B256>,
     store: WitnessStore,
     provider: P,
     evm_config: E,
-    settled_floor: F,
+    prover: Arc<dyn Prover>,
+    rollup_id: u64,
+    posted_floor: F,
+    settled_floor: G,
 ) where
     P: BlockReader<Block = Block>
         + StateProviderFactory
@@ -305,16 +308,34 @@ pub async fn run_capture<P, E, F>(
         + 'static,
     E: ConfigureEvm<Primitives = EezPrimitives> + Clone + Send + Sync + 'static,
     F: Fn() -> u64 + Send + 'static,
+    G: Fn() -> u64 + Send + 'static,
 {
     while let Some(hash) = rx.recv().await {
-        let provider = provider.clone();
+        let capture_provider = provider.clone();
         let evm_config = evm_config.clone();
+        let anchor_number = posted_floor();
         let built = tokio::task::spawn_blocking(move || {
-            build_block_witness(&provider, &evm_config, BlockHashOrNumber::Hash(hash))
+            let witness = build_block_witness(
+                &capture_provider,
+                &evm_config,
+                BlockHashOrNumber::Hash(hash),
+            )?;
+            let anchor = capture_provider
+                .sealed_header(anchor_number)
+                .map_err(|error| format!("fetch proving anchor {anchor_number}: {error}"))?
+                .ok_or_else(|| format!("proving anchor {anchor_number} is missing"))?;
+            Ok::<_, String>((
+                witness,
+                ProvingAnchor {
+                    number: anchor_number,
+                    hash: anchor.hash(),
+                    state_root: anchor.state_root,
+                },
+            ))
         })
         .await;
         match built {
-            Ok(Ok(bw)) => {
+            Ok(Ok((bw, anchor))) => {
                 let number = bw.number;
                 if let Err(e) = store.put(number, &bw) {
                     event!(
@@ -323,6 +344,18 @@ pub async fn run_capture<P, E, F>(
                         number,
                         error = %e,
                         "persisting captured witness failed",
+                    );
+                }
+                if number > anchor.number
+                    && let Err(error) = prover.prevalidate(rollup_id, anchor, bw).await
+                {
+                    event!(
+                        name: "eez.node.witness_capture.prevalidate_failed",
+                        Level::WARN,
+                        number,
+                        anchor = anchor.number,
+                        error = %error,
+                        "prover did not prevalidate a captured block; Finalize will backfill it",
                     );
                 }
                 // Drop finalized witnesses; cheap when nothing is below the floor.

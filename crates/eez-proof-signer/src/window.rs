@@ -11,13 +11,13 @@
 use std::num::NonZeroU64;
 
 use alloy_primitives::B256;
-use alloy_rpc_types_debug::ExecutionWitness;
-use eez_control_rpc::v1::{
-    BlockWitness, ExecutionWitness as WireExecutionWitness, PostBatch, ProveChunk, ProveHeader,
-    prove_chunk,
-};
+use eez_control_rpc::v1::{BlockWitness, PostBatch, ProveChunk, ProveHeader, prove_chunk};
 use prost::Message;
 use thiserror::Error;
+
+// Preserve the v1 public import path; the shared backend input lives in validation.
+pub use crate::validate::AdmittedBlock;
+use crate::validate::{into_execution_witness, wire_witness_item_count};
 
 /// Resource quotas for one structurally admitted window.
 ///
@@ -34,58 +34,13 @@ pub struct WindowLimits {
     pub witness_items: usize,
 }
 
-/// One block retained after stream-level structural checks.
-///
-/// Admission checks its declared number, hash widths, witness presence, and
-/// adjacency between streamed hash claims. Backend validation binds and checks
-/// the RLP, hashes, and witness.
-#[derive(Debug)]
-#[cfg_attr(test, derive(Clone))]
-pub struct AdmittedBlock {
-    /// Composer-declared number, checked against the admitted window range.
-    pub(crate) declared_number: u64,
-    /// Composer-claimed hash; backend validation must re-derive it from RLP.
-    pub(crate) claimed_hash: B256,
-    /// Composer-claimed parent; admission compares it with the preceding
-    /// streamed hash when one exists.
-    pub(crate) claimed_parent_hash: B256,
-    pub(crate) rlp: Vec<u8>,
-    pub(crate) witness: ExecutionWitness,
-}
-
-impl AdmittedBlock {
-    /// Composer-declared block number admitted from the stream.
-    pub const fn declared_number(&self) -> u64 {
-        self.declared_number
-    }
-
-    /// Composer-claimed block hash admitted from the stream.
-    pub const fn claimed_hash(&self) -> B256 {
-        self.claimed_hash
-    }
-
-    /// Composer-claimed parent hash admitted from the stream.
-    pub const fn claimed_parent_hash(&self) -> B256 {
-        self.claimed_parent_hash
-    }
-
-    /// Exact consensus RLP admitted from the stream.
-    pub fn rlp(&self) -> &[u8] {
-        &self.rlp
-    }
-
-    /// Move the admitted execution witness into a consuming backend.
-    #[doc(hidden)]
-    pub(crate) fn take_witness(&mut self) -> ExecutionWitness {
-        std::mem::take(&mut self.witness)
-    }
-}
-
 /// Helpers used by validation-backend tests in downstream crates.
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-utils"))]
 pub mod testing {
-    use super::{AdmittedBlock, B256, ExecutionWitness};
+    use alloy_rpc_types_debug::ExecutionWitness;
+
+    use super::{AdmittedBlock, B256};
 
     /// Mutable admitted fields exposed only for downstream backend tests.
     #[derive(Debug)]
@@ -138,25 +93,6 @@ pub mod testing {
             claimed_parent_hash: &mut block.claimed_parent_hash,
             rlp: &mut block.rlp,
             witness: &mut block.witness,
-        }
-    }
-}
-
-#[cfg(test)]
-impl AdmittedBlock {
-    /// Construct the minimal admitted block used by downstream unit tests.
-    #[cfg(test)]
-    pub(crate) fn test(
-        declared_number: u64,
-        claimed_parent_hash_byte: u8,
-        claimed_hash_byte: u8,
-    ) -> Self {
-        Self {
-            declared_number,
-            claimed_hash: B256::repeat_byte(claimed_hash_byte),
-            claimed_parent_hash: B256::repeat_byte(claimed_parent_hash_byte),
-            rlp: Vec::new(),
-            witness: ExecutionWitness::default(),
         }
     }
 }
@@ -589,33 +525,6 @@ fn charge(
     }
     *current = attempted;
     Ok(())
-}
-
-/// Convert the protobuf witness into the Alloy type consumed by Stateless.
-/// Converting each payload into `Bytes` reuses its source allocation.
-fn into_execution_witness(witness: WireExecutionWitness) -> ExecutionWitness {
-    let WireExecutionWitness {
-        state,
-        codes,
-        keys,
-        headers,
-    } = witness;
-    ExecutionWitness {
-        state: state.into_iter().map(Into::into).collect(),
-        codes: codes.into_iter().map(Into::into).collect(),
-        keys: keys.into_iter().map(Into::into).collect(),
-        headers: headers.into_iter().map(Into::into).collect(),
-    }
-}
-
-/// Count protobuf witness items before allocating the retained representation.
-fn wire_witness_item_count(witness: &WireExecutionWitness) -> usize {
-    witness
-        .state
-        .len()
-        .saturating_add(witness.codes.len())
-        .saturating_add(witness.keys.len())
-        .saturating_add(witness.headers.len())
 }
 
 #[cfg(test)]

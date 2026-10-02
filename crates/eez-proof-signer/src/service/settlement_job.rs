@@ -64,6 +64,9 @@ impl PipelineError {
     pub(super) fn status(&self) -> Status {
         match self {
             Self::Validation(error) => match error {
+                validate::ValidationError::DeadlineExceeded => {
+                    Status::deadline_exceeded("incremental block validation deadline exceeded")
+                }
                 validate::ValidationError::Unavailable(_) => {
                     Status::unavailable("validation backend is temporarily unavailable")
                 }

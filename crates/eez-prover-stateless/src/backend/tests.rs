@@ -42,6 +42,245 @@ fn fixture_input() -> AdmittedBlock {
     )
 }
 
+fn incremental_input(
+    mut block: AdmittedBlock,
+) -> (AdmittedBlock, ExecutionWitness, IncrementalAnchor) {
+    let witness = std::mem::take(admitted_block_parts_mut(&mut block).witness);
+    let header = witness
+        .headers
+        .iter()
+        .filter_map(|bytes| alloy_rlp::decode_exact::<Header>(bytes).ok())
+        .find(|header| header.hash_slow() == block.claimed_parent_hash())
+        .expect("fixture includes its parent header");
+    let parent = IncrementalAnchor {
+        number: header.number,
+        hash: header.hash_slow(),
+        state_root: header.state_root,
+    };
+    (block, witness, parent)
+}
+
+#[tokio::test]
+async fn incremental_cache_reuses_execution_and_checkpoints_and_checks_hits() {
+    let (input, config, expected_checkpoints) = checkpoint_fixture();
+    let (input, witness, parent) = incremental_input(input);
+    let backend = Backend::new(config, TEST_SYSTEM_ADDRESS);
+    let deadline = Duration::from_secs(10);
+    // A real miss needs a valid witness; failure must not poison the cache.
+    assert!(
+        backend
+            .validate_next(
+                parent,
+                parent,
+                &input,
+                ExecutionWitness::default(),
+                deadline
+            )
+            .await
+            .is_err()
+    );
+    assert!(backend.blocks.lock().unwrap().is_empty());
+    let (fresh, reused) = backend
+        .validate_next(parent, parent, &input, witness, deadline)
+        .await
+        .unwrap();
+    assert!(!reused);
+    assert_eq!(
+        fresh
+            .block
+            .transaction_state_checkpoints
+            .iter()
+            .map(|checkpoint| (checkpoint.transaction_index, checkpoint.state_root))
+            .collect::<Vec<_>>(),
+        expected_checkpoints
+    );
+    // No witness is available to re-execute, so success proves backend cache reuse.
+    let (cached, reused) = backend
+        .validate_next(
+            parent,
+            parent,
+            &input,
+            ExecutionWitness::default(),
+            deadline,
+        )
+        .await
+        .unwrap();
+    assert!(reused);
+    assert_eq!(cached, fresh);
+    for defect in [
+        "number",
+        "parent hash",
+        "RLP",
+        "parent number",
+        "parent root",
+    ] {
+        let mut submitted = input.clone();
+        let mut submitted_parent = parent;
+        match defect {
+            "number" => *admitted_block_parts_mut(&mut submitted).declared_number += 1,
+            "parent hash" => {
+                *admitted_block_parts_mut(&mut submitted).claimed_parent_hash = B256::ZERO
+            }
+            "RLP" => admitted_block_parts_mut(&mut submitted).rlp.push(0),
+            "parent number" => submitted_parent.number -= 1,
+            "parent root" => submitted_parent.state_root = B256::ZERO,
+            _ => unreachable!(),
+        }
+        assert!(
+            backend
+                .validate_next(
+                    parent,
+                    submitted_parent,
+                    &submitted,
+                    ExecutionWitness::default(),
+                    deadline
+                )
+                .await
+                .is_err(),
+            "{defect}"
+        );
+    }
+    assert_eq!(backend.blocks.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_incremental_misses_publish_one_cached_result() {
+    let (input, witness, parent) = incremental_input(fixture_input());
+    let backend = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS);
+    let slots = backend
+        .validation_slots
+        .acquire_many(MAX_CONCURRENT_VALIDATIONS as u32)
+        .await
+        .unwrap();
+    let mut first = std::pin::pin!(backend.validate_next(
+        parent,
+        parent,
+        &input,
+        witness.clone(),
+        Duration::from_secs(10)
+    ));
+    let mut second = std::pin::pin!(backend.validate_next(
+        parent,
+        parent,
+        &input,
+        witness,
+        Duration::from_secs(10)
+    ));
+    // Poll each past its cache miss into the occupied semaphore, deterministically.
+    tokio::select! { biased; _ = &mut first => panic!("execution slot is held"), _ = std::future::ready(()) => {} }
+    tokio::select! { biased; _ = &mut second => panic!("execution slot is held"), _ = std::future::ready(()) => {} }
+    drop(slots);
+    let (first, second) = tokio::join!(first, second);
+    let (first, reused_first) = first.unwrap();
+    let (second, reused_second) = second.unwrap();
+    assert!(
+        !reused_first && !reused_second,
+        "both calls must exercise a cache miss"
+    );
+    assert_eq!(first, second);
+    assert_eq!(backend.blocks.lock().unwrap().len(), 1);
+    assert!(
+        backend
+            .validate_next(
+                parent,
+                parent,
+                &input,
+                ExecutionWitness::default(),
+                Duration::from_secs(1)
+            )
+            .await
+            .unwrap()
+            .1
+    );
+}
+
+#[tokio::test]
+async fn incremental_deadline_includes_waiting_for_backend_capacity() {
+    let (input, witness, parent) = incremental_input(fixture_input());
+    let backend = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS);
+    let slots = backend
+        .validation_slots
+        .acquire_many(MAX_CONCURRENT_VALIDATIONS as u32)
+        .await
+        .unwrap();
+    assert!(matches!(
+        backend
+            .validate_next(
+                parent,
+                parent,
+                &input,
+                witness.clone(),
+                Duration::from_millis(10)
+            )
+            .await,
+        Err(ValidationError::DeadlineExceeded)
+    ));
+    assert!(backend.blocks.lock().unwrap().is_empty());
+    drop(slots);
+    assert!(
+        !backend
+            .validate_next(parent, parent, &input, witness, Duration::from_secs(10))
+            .await
+            .unwrap()
+            .1
+    );
+}
+
+#[test]
+fn timed_out_incremental_worker_keeps_its_slot_and_publishes_only_after_success() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (input, witness, parent) = incremental_input(fixture_input());
+        let backend = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        ready.await.unwrap();
+        // The validation owns a backend slot but cannot enter the occupied blocking worker yet.
+        let result = backend
+            .validate_next(parent, parent, &input, witness, Duration::from_millis(10))
+            .await;
+        let available = backend.validation_slots.available_permits();
+        let cached_before_execution = backend.blocks.lock().unwrap().len();
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        let slots = tokio::time::timeout(
+            Duration::from_secs(5),
+            backend
+                .validation_slots
+                .acquire_many(MAX_CONCURRENT_VALIDATIONS as u32),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(result, Err(ValidationError::DeadlineExceeded)));
+        assert_eq!(available, MAX_CONCURRENT_VALIDATIONS - 1);
+        assert_eq!(cached_before_execution, 0);
+        // The detached job finished normally and populated the cache without needing a session token.
+        assert!(
+            backend
+                .validate_next(
+                    parent,
+                    parent,
+                    &input,
+                    ExecutionWitness::default(),
+                    Duration::from_secs(1)
+                )
+                .await
+                .unwrap()
+                .1
+        );
+        drop(slots);
+    });
+}
+
 /// The recorded fixture plus the `(transaction_index, state_root)` pairs its
 /// oracle states. The oracle records no block hashes; tests assert those
 /// against the block itself.

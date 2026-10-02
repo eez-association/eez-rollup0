@@ -664,8 +664,8 @@ fn limits_with(
 }
 
 /// One in-process server with shared client setup and drop-triggered shutdown.
-struct TestServer {
-    endpoint: String,
+pub(super) struct TestServer {
+    pub(super) endpoint: String,
     _shutdown: oneshot::Sender<()>,
 }
 
@@ -678,12 +678,13 @@ impl TestServer {
         Self::with_service(ProveSvc::new(state, limits)).await
     }
 
-    async fn with_service(svc: ProveSvc) -> Self {
+    pub(super) async fn with_service(svc: ProveSvc) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown, shutdown_rx) = oneshot::channel();
         tokio::spawn(async move {
             tonic::transport::Server::builder()
+                .add_service(svc.clone().into_streaming_server())
                 .add_service(svc.into_server())
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
@@ -702,6 +703,14 @@ impl TestServer {
 
     async fn client(&self) -> ProverClient<tonic::transport::Channel> {
         ProverClient::connect(self.endpoint.clone()).await.unwrap()
+    }
+
+    pub(super) async fn streaming_client(
+        &self,
+    ) -> eez_control_rpc::v2::prover_client::ProverClient<tonic::transport::Channel> {
+        eez_control_rpc::v2::prover_client::ProverClient::connect(self.endpoint.clone())
+            .await
+            .unwrap()
     }
 
     async fn prove(&self, chunks: Vec<ProveChunk>) -> Status {
