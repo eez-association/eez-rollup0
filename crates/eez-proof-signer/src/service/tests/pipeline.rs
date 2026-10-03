@@ -226,6 +226,11 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
 fn transient_validation_errors_have_stable_rpc_mappings() {
     let cases = [
         (
+            validate::ValidationError::DeadlineExceeded,
+            Code::DeadlineExceeded,
+            "incremental block validation deadline exceeded",
+        ),
+        (
             validate::ValidationError::Unavailable("synthetic".to_owned()),
             Code::Unavailable,
             "validation backend is temporarily unavailable",

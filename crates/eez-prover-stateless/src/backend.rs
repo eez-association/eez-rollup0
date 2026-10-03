@@ -5,9 +5,10 @@
 //! Stateless/Reth, checks window continuity, and maps validated execution facts
 //! into associated per-block output.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use alloy_genesis::ChainConfig;
@@ -22,12 +23,13 @@ use eez_proof_signer::validate::support::{
     system_sender_flags,
 };
 use eez_proof_signer::validate::{
-    BackendBlockOutput, BackendWindowOutput, SettlementBlockEvidence, StateCheckpoint,
-    ValidationBackend, ValidationError,
+    AdmittedBlock, BackendBlockOutput, BackendWindowOutput, IncrementalAnchor,
+    IncrementalBlockOutput, SettlementBlockEvidence, StateCheckpoint, ValidationBackend,
+    ValidationError,
 };
-use eez_proof_signer::window::AdmittedBlock;
 #[cfg(test)]
 use eez_proof_signer::window::testing::admitted_block_parts_mut;
+use lru::LruCache;
 use reth_chainspec::ChainSpec;
 use reth_primitives_traits::RecoveredBlock;
 use stateless_reth::validation::StatelessValidationError;
@@ -35,6 +37,7 @@ use stateless_reth::{
     StatelessValidationOutput, stateless_validation_recovered,
     stateless_validation_recovered_with_state_checkpoints,
 };
+use tokio::sync::Semaphore;
 use tracing::{debug, info, trace};
 
 mod chain_config;
@@ -42,6 +45,14 @@ mod chain_config;
 use chain_config::{ChainDocumentKind, load_chain_document};
 
 const DEBUG_PROGRESS_INTERVAL: usize = 100;
+const MAX_CACHED_BLOCKS: usize = 32_768;
+const MAX_CONCURRENT_VALIDATIONS: usize = 4;
+
+#[derive(Debug)]
+struct CachedBlock {
+    rlp: Vec<u8>,
+    output: IncrementalBlockOutput,
+}
 
 /// Signer-recovered settling block prepared before replay.
 ///
@@ -77,11 +88,13 @@ fn executes_from_previous_post_state(
 }
 
 /// In-process Stateless/Reth backend configured from operator-selected rules.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Backend {
     chain_spec: Arc<ChainSpec>,
     evm_config: EezEvmConfig,
     expected_l2_system_address: Address,
+    blocks: Arc<Mutex<LruCache<B256, CachedBlock>>>,
+    validation_slots: Arc<Semaphore>,
 }
 
 impl Backend {
@@ -131,6 +144,10 @@ impl Backend {
             chain_spec,
             evm_config,
             expected_l2_system_address,
+            blocks: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(MAX_CACHED_BLOCKS).unwrap(),
+            ))),
+            validation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_VALIDATIONS)),
         }
     }
 
@@ -152,7 +169,7 @@ impl Backend {
             .iter_mut()
             .map(|block| std::mem::take(admitted_block_parts_mut(block).witness))
             .collect::<Vec<_>>();
-        let result = self.validate_blocks_inner(blocks, &mut witnesses, cancellation);
+        let result = self.validate_blocks_inner(blocks, &mut witnesses, cancellation, None);
         if result.is_err() {
             for (block, witness) in blocks.iter_mut().zip(witnesses) {
                 *admitted_block_parts_mut(block).witness = witness;
@@ -168,6 +185,7 @@ impl Backend {
         blocks: &[AdmittedBlock],
         witnesses: &mut [ExecutionWitness],
         cancellation: &CancellationToken,
+        parent: Option<IncrementalAnchor>,
     ) -> Result<BackendWindowOutput, ValidationError> {
         let expected_l2_system_address = self.expected_l2_system_address;
         let validation_started = Instant::now();
@@ -283,6 +301,12 @@ impl Backend {
                 execution_output,
                 block_access_list: _validated_block_access_list,
             } = stateless_output;
+            if index == 0
+                && let Some(parent) = parent
+            {
+                executes_from_previous_post_state(block_number, pre_state_root, parent.state_root)
+                    .map_err(ValidationError::Rejected)?;
+            }
             if let Some(previous_post_state_root) =
                 block_outputs.last().map(|output| output.post_state_root)
             {
@@ -365,6 +389,7 @@ impl Backend {
     }
 }
 
+#[async_trait::async_trait]
 impl ValidationBackend for Backend {
     fn label(&self) -> &'static str {
         "stateless"
@@ -384,7 +409,89 @@ impl ValidationBackend for Backend {
         witnesses: &mut [ExecutionWitness],
         cancellation: &CancellationToken,
     ) -> Result<BackendWindowOutput, ValidationError> {
-        self.validate_blocks_inner(blocks, witnesses, cancellation)
+        self.validate_blocks_inner(blocks, witnesses, cancellation, None)
+    }
+
+    fn begin_incremental(&self, _anchor: IncrementalAnchor) -> Result<(), ValidationError> {
+        Ok(())
+    }
+
+    async fn validate_next(
+        &self,
+        _anchor: IncrementalAnchor,
+        parent: IncrementalAnchor,
+        block: &AdmittedBlock,
+        witness: ExecutionWitness,
+        request_timeout: Duration,
+    ) -> Result<(IncrementalBlockOutput, bool), ValidationError> {
+        tokio::time::timeout(request_timeout, async {
+            if parent.number.checked_add(1) != Some(block.declared_number())
+                || parent.hash != block.claimed_parent_hash()
+            {
+                return Err(ValidationError::Rejected(
+                    "block does not extend its exact parent".to_owned(),
+                ));
+            }
+            {
+                let mut blocks = self.blocks.lock().unwrap();
+                if let Some(cached) = blocks.get(&block.claimed_hash()) {
+                    if cached.rlp != block.rlp()
+                        || cached.output.block.decoded_number != block.declared_number()
+                        || cached.output.block.decoded_parent_hash != parent.hash
+                        || cached.output.pre_state_root != parent.state_root
+                    {
+                        return Err(ValidationError::Rejected(
+                            "cached block does not match the submitted bytes and parent".to_owned(),
+                        ));
+                    }
+                    return Ok((cached.output.clone(), true));
+                }
+            }
+            let permit = Arc::clone(&self.validation_slots)
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    ValidationError::Unavailable(
+                        "stateless validation scheduler stopped".to_owned(),
+                    )
+                })?;
+            let backend = self.clone();
+            let admitted = block.clone();
+            tokio::task::spawn_blocking(move || {
+                // The worker owns its slot until execution ends, even if its caller times out.
+                // A completed job may populate the cache for later callers; partial results never do.
+                let _permit = permit;
+                let output = backend.validate_blocks_inner(
+                    std::slice::from_ref(&admitted),
+                    &mut [witness],
+                    &CancellationToken::default(),
+                    Some(parent),
+                )?;
+                let output = IncrementalBlockOutput {
+                    pre_state_root: parent.state_root,
+                    block: output
+                        .blocks
+                        .into_iter()
+                        .next()
+                        .expect("one validated block"),
+                };
+                let mut blocks = backend.blocks.lock().unwrap();
+                // Concurrent misses may execute twice, but only the first complete result is stored.
+                let cached = blocks.get_or_insert(admitted.claimed_hash(), || CachedBlock {
+                    rlp: admitted.rlp().to_vec(),
+                    output,
+                });
+                Ok((cached.output.clone(), false))
+            })
+            .await
+            .map_err(|error| {
+                ValidationError::InternalInvariant(format!(
+                    "stateless validation worker failed: {error}"
+                ))
+            })?
+        })
+        .await
+        .map_err(|_| ValidationError::DeadlineExceeded)?
     }
 }
 

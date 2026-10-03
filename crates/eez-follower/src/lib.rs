@@ -195,6 +195,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     if let Some(config) = stateful_proof_signer {
         let signer_provider = provider.clone();
         let signer_chain_spec = handle.node.chain_spec();
+        let signer_committer = block_committer.clone();
         event!(
             name: "eez.node.stateful_proof_signer.spawned",
             Level::INFO,
@@ -209,6 +210,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
                     config,
                     signer_provider,
                     signer_chain_spec,
+                    signer_committer,
                     shutdown_signal,
                 )
                 .await;

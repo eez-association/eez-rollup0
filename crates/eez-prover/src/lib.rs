@@ -127,11 +127,20 @@ pub struct BlockWitness {
     pub witness: ExecutionWitness,
 }
 
-/// Inputs the prover needs to prove one posted settlement window.
+/// Exact L1-posted L2 block from which an incremental proving session starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvingAnchor {
+    pub number: u64,
+    pub hash: B256,
+    pub state_root: B256,
+}
+
+/// Inputs the prover needs to finalize one posted settlement window.
 ///
-/// The composer fills this and calls [`Prover::prove`]; the whole window's
-/// block data travels in-band ([`blocks`](Self::blocks)) so the prover is a
-/// stateless function of its input — no feed, no cursor, no backfill.
+/// The complete block list remains present for v1 compatibility and v2
+/// backfill. The remote prover uses the server's current cursor to skip a
+/// matching prefix; otherwise it rewinds and resubmits cached blocks before
+/// `Finalize`, without maintaining a second validated history.
 #[derive(Debug, Clone, Default)]
 pub struct ProvingContext {
     /// The L2 this window settles.
@@ -140,6 +149,9 @@ pub struct ProvingContext {
     pub from_block: u64,
     /// Last (settling) block of the window: the Sync height.
     pub to_block: u64,
+    /// Parent of `from_block`, including the state root registered on L1.
+    /// `None` keeps legacy v1-only prover implementations source-compatible.
+    pub anchor: Option<ProvingAnchor>,
     /// The authoritative postBatch payload (proof carriers filled, `proofs[]`
     /// empty). The prover recomputes the `publicInputsHash` from this.
     pub batch: EvmBatch,
@@ -167,6 +179,19 @@ pub trait ProvingWitnessSource: Send + Sync + std::fmt::Debug {
 /// `IProofSystem.verify` accepts.
 #[async_trait]
 pub trait Prover: Send + Sync + std::fmt::Debug {
+    /// Validate one newly committed block ahead of a settlement request.
+    ///
+    /// Implementations without an incremental transport may leave this as the
+    /// default no-op; `prove` remains the final trust boundary.
+    async fn prevalidate(
+        &self,
+        _rollup_id: u64,
+        _anchor: ProvingAnchor,
+        _block: BlockWitness,
+    ) -> ProverResult<()> {
+        Ok(())
+    }
+
     /// Produce a proof.
     ///
     /// # Errors

@@ -11,11 +11,11 @@ use reth_primitives_traits::RecoveredBlock;
 use tracing::debug;
 
 use super::{
-    CheckpointAt, DecodedOutboundEvent, OutboundEventObservation, StateCheckpoint, ValidationError,
+    AdmittedBlock, CheckpointAt, DecodedOutboundEvent, OutboundEventObservation, StateCheckpoint,
+    ValidationError,
 };
 use crate::EEZL2_ADDRESS;
 use crate::cancel::CancellationToken;
-use crate::window::AdmittedBlock;
 
 /// Positions at which settlement framing needs replay outputs.
 #[derive(Debug, PartialEq, Eq)]
