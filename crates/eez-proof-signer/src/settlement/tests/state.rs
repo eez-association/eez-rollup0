@@ -1,4 +1,5 @@
 use super::*;
+use crate::validate::CheckpointAt;
 
 #[test]
 fn accepts_a_single_or_multi_entry_state_update_chain() {
@@ -312,15 +313,15 @@ fn rejects_wrong_anchor_or_invalid_effect_checkpoints() {
     assert_eq!(
         verify_effect_prefix(&batch, wrong, &valid_checkpoints, &settling).err(),
         Some(EffectPrefixError::AnchorRootMismatch {
-            validated_pre_settling_hash: wrong,
+            empty_prefix_hash: wrong,
             claimed_anchor_post_state: pre_settling,
         })
     );
     assert_eq!(
         verify_effect_prefix(&batch, pre_settling, &[], &settling).err(),
         Some(EffectPrefixError::TransactionStateCheckpointCountMismatch {
-            expected: 1,
-            actual: 0,
+            expected: 2,
+            actual: 1,
         })
     );
     assert_eq!(
@@ -332,8 +333,8 @@ fn rejects_wrong_anchor_or_invalid_effect_checkpoints() {
         )
         .err(),
         Some(EffectPrefixError::TransactionStateCheckpointCountMismatch {
-            expected: 1,
-            actual: 2,
+            expected: 2,
+            actual: 3,
         })
     );
     assert_eq!(
@@ -347,7 +348,7 @@ fn rejects_wrong_anchor_or_invalid_effect_checkpoints() {
         Some(EffectPrefixError::TransactionStateCheckpointIndexMismatch {
             checkpoint_index: 0,
             expected: 0,
-            actual: 1,
+            actual: CheckpointAt::Transaction(1),
         })
     );
     assert_eq!(

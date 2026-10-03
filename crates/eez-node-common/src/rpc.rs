@@ -1,9 +1,9 @@
 //! Ethereum RPC methods with EEZ transaction and receipt response types.
 //!
 //! RPC wiring adapted from reth's Ethereum node at the pinned revision:
-//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/node/src/node.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/node/src/node.rs>.
 //! Receipt/log conversion adapted from `EthReceiptConverter`:
-//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/rpc/rpc-eth-types/src/receipt.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/rpc/rpc-eth-types/src/receipt.rs>.
 
 use crate::node::{EezEngineValidatorBuilder, EezNode};
 use alloy_consensus::{Receipt as RpcReceipt, TxReceipt};
@@ -29,6 +29,7 @@ pub struct EezRpcTypes;
 impl RpcTypes for EezRpcTypes {
     type Header = Header;
     type Receipt = TransactionReceipt<AnyReceiptEnvelope<Log>>;
+    type Log = Log;
     type TransactionResponse = Transaction<EezTxEnvelope>;
     type TransactionRequest = TransactionRequest;
 }

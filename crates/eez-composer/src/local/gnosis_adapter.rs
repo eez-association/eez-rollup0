@@ -243,6 +243,17 @@ impl<P> StateProviderFactory for GnosisL1Adapter<P>
 where
     P: StateProviderFactory + Send + Sync,
 {
+    type Primitives = P::Primitives;
+
+    fn state_with_block_appended(
+        &self,
+        parent_hash: alloy_primitives::BlockHash,
+        block: reth_chain_state::ExecutedBlock<Self::Primitives>,
+    ) -> reth_storage_api::errors::provider::ProviderResult<reth_storage_api::StateProviderBox>
+    {
+        self.inner.state_with_block_appended(parent_hash, block)
+    }
+
     fn latest(
         &self,
     ) -> reth_storage_api::errors::provider::ProviderResult<reth_storage_api::StateProviderBox>

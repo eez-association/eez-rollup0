@@ -1,9 +1,9 @@
 //! Shared L2 node configuration. L1 nodes retain their upstream Ethereum/Gnosis types.
 //!
 //! Component wiring adapted from reth's Ethereum node at the pinned revision:
-//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/node/src/node.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/node/src/node.rs>.
 //! Engine validation delegates to:
-//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/node/src/engine.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/node/src/engine.rs>.
 
 use crate::{EezPayloadBuilder, EezPoolBuilder};
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes};
@@ -83,6 +83,12 @@ impl<N: FullNodeTypes<Types = EezNode>> ExecutorBuilder<N> for EezExecutorBuilde
     type EVM = EezEvmConfig;
 
     fn build_evm(self, ctx: &BuilderContext<N>) -> impl Future<Output = eyre::Result<Self::EVM>> {
+        // EezEvmFactory has no JIT backend; refuse `--jit` rather than ignore it.
+        if ctx.config().jit.enabled {
+            return ready(Err(eyre::eyre!(
+                "--jit is not supported: the L2 EVM (EezEvmFactory) has no JIT backend"
+            )));
+        }
         ready(Ok(EezEvmConfig::new(ctx.chain_spec())))
     }
 }

@@ -59,9 +59,9 @@ fn admitted_block_with_transactions(number: u64, hash: u8, count: usize) -> Admi
     input
 }
 
-fn checkpoint(transaction_index: usize, state_root: u8) -> TransactionStateCheckpoint {
-    TransactionStateCheckpoint {
-        transaction_index,
+fn checkpoint(transaction_index: usize, state_root: u8) -> StateCheckpoint {
+    StateCheckpoint {
+        at: CheckpointAt::Transaction(transaction_index),
         state_root: B256::repeat_byte(state_root),
         block_hash: B256::with_last_byte(0xc0 ^ (transaction_index as u8)),
     }
@@ -89,15 +89,36 @@ async fn incremental_validation_binds_the_parent_and_backend_output_without_a_cu
         "parent hash",
         "pre-state root",
         "output hash",
+        "duplicate pre-execution checkpoint",
+        "misordered pre-execution checkpoint",
+        "checkpoint transaction out of bounds",
     ] {
         let mut parent = anchor;
-        let admitted = chained_admitted_block(11);
+        let mut admitted = admitted_block_with_transactions(11, 11, 1);
+        admitted.claimed_parent_hash = anchor.hash;
         let mut output = backend_output_for(std::slice::from_ref(&admitted));
+        let pre_execution = StateCheckpoint {
+            at: CheckpointAt::PreExecution,
+            state_root: anchor.state_root,
+            block_hash: B256::repeat_byte(0xaa),
+        };
+        output.blocks[0].transaction_state_checkpoints = vec![pre_execution, checkpoint(0, 0)];
         match defect {
             "parent number" => parent.number = 9,
             "parent hash" => parent.hash = B256::repeat_byte(9),
             "pre-state root" => parent.state_root = B256::repeat_byte(9),
             "output hash" => output.blocks[0].computed_hash = B256::repeat_byte(9),
+            "duplicate pre-execution checkpoint" => {
+                output.blocks[0]
+                    .transaction_state_checkpoints
+                    .insert(0, pre_execution);
+            }
+            "misordered pre-execution checkpoint" => {
+                output.blocks[0].transaction_state_checkpoints.reverse();
+            }
+            "checkpoint transaction out of bounds" => {
+                output.blocks[0].transaction_state_checkpoints[1].at = CheckpointAt::Transaction(1);
+            }
             _ => {}
         }
         let validator = Validator::stub(vec![Ok(output)]);
@@ -110,6 +131,12 @@ async fn incremental_validation_binds_the_parent_and_backend_output_without_a_cu
                 assert_eq!(artifact.pre_state_root, parent.state_root);
                 assert_eq!(artifact.parent_hash, parent.hash);
                 assert_eq!(artifact.number, 11);
+                assert_eq!(artifact.transaction_state_checkpoints[0], pre_execution);
+                let window = ValidatedWindow::from_incremental(anchor, &[artifact]).unwrap();
+                assert_eq!(
+                    window.settling_block().transaction_state_checkpoints()[0],
+                    pre_execution,
+                );
             }
             "parent number" | "parent hash" => {
                 assert!(

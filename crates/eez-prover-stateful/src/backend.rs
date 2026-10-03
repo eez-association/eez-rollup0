@@ -25,9 +25,9 @@ use eez_proof_signer::validate::support::{
     system_sender_flags,
 };
 use eez_proof_signer::validate::{
-    AdmittedBlock, BackendBlockOutput, BackendWindowOutput, IncrementalAnchor,
-    IncrementalBlockOutput, SettlementBlockEvidence, TransactionStateCheckpoint,
-    ValidatedBlockArtifact, ValidationBackend, ValidationError,
+    AdmittedBlock, BackendBlockOutput, BackendWindowOutput, CheckpointAt, IncrementalAnchor,
+    IncrementalBlockOutput, SettlementBlockEvidence, StateCheckpoint, ValidatedBlockArtifact,
+    ValidationBackend, ValidationError,
 };
 use lru::LruCache;
 use reth_chainspec::ChainSpec;
@@ -42,8 +42,9 @@ use reth_primitives_traits::{RecoveredBlock, SealedHeader};
 use reth_revm::State;
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::{
-    BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, HashedPostStateProvider,
-    HeaderProvider, StateProvider, StateProviderFactory, StateRootProvider,
+    BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, EvmStateProviderAdapter,
+    HashedPostStateProvider, HeaderProvider, StateProvider, StateProviderFactory,
+    StateRootProvider,
 };
 use revm::database::states::bundle_state::BundleRetention;
 use revm::state::bal::Bal;
@@ -61,7 +62,7 @@ pub struct Backend<P> {
     expected_l2_system_address: Address,
     committer: Option<BlockCommitterHandle<EezEngineTypes>>,
     // Reth owns blocks, state and receipts; retain only supplemental checkpoints here.
-    checkpoints: Arc<Mutex<LruCache<B256, Vec<TransactionStateCheckpoint>>>>,
+    checkpoints: Arc<Mutex<LruCache<B256, Vec<StateCheckpoint>>>>,
 }
 
 impl<P> Backend<P> {
@@ -517,7 +518,7 @@ where
                 CheckpointPlan::from_recovered_block(&block, self.expected_l2_system_address);
             let cached_checkpoints = self.checkpoints.lock().unwrap().get(&block.hash()).cloned();
             let (receipt_successes, observed_outbound_events, checkpoints) =
-                if checkpoint_plan.transaction_indices().is_empty() {
+                if checkpoint_plan.positions().is_empty() {
                     (
                         receipts.iter().map(|receipt| receipt.success).collect(),
                         observe_outbound_events(&receipts),
@@ -546,7 +547,9 @@ where
                             ))
                         })?;
                     let mut state = State::builder()
-                        .with_database(StateProviderDatabase::new(parent_state))
+                        .with_database(StateProviderDatabase::new(
+                            parent_state.into_evm_state_provider(),
+                        ))
                         .with_bundle_update()
                         .build();
                     let (result, checkpoints, block_access_list_hash) =
@@ -554,7 +557,7 @@ where
                             &evm_config,
                             &mut state,
                             &block,
-                            checkpoint_plan.transaction_indices(),
+                            checkpoint_plan.positions(),
                         )?;
                     validate_block_post_execution(
                         &block,
@@ -709,7 +712,9 @@ where
             ))
         })?;
     let mut state = State::builder()
-        .with_database(StateProviderDatabase::new(anchor_state))
+        .with_database(StateProviderDatabase::new(
+            anchor_state.into_evm_state_provider(),
+        ))
         .with_bundle_update()
         .build();
     let mut previous_header = SealedHeader::new(anchor_header, claimed_anchor_hash);
@@ -719,13 +724,13 @@ where
     for (index, admitted) in blocks.iter().enumerate() {
         check_cancellation(cancellation, index, total_blocks)?;
         let is_settling = index + 1 == total_blocks;
-        let (block, checkpoint_indices, sender_flags) = if is_settling {
+        let (block, checkpoint_positions, sender_flags) = if is_settling {
             let (block, plan, flags) = prepared_settling_block.take().ok_or_else(|| {
                 ValidationError::InternalInvariant(
                     "prepared stateful settling block unexpectedly missing".to_owned(),
                 )
             })?;
-            (block, plan.transaction_indices().to_vec(), flags)
+            (block, plan.positions().to_vec(), flags)
         } else {
             let block = decode_match_and_recover_signers(admitted, chain_spec)?;
             let flags = system_sender_flags(&block, expected_l2_system_address);
@@ -751,21 +756,22 @@ where
             transactions = block.body().transactions.len(),
             "replaying stateful proof block",
         );
-        let (result, checkpoints, block_access_list_hash) =
-            if checkpoint_indices.is_empty() && block.header().block_access_list_hash().is_none() {
-                (
-                    execute_block(evm_config, &mut state, &block)?,
-                    Vec::new(),
-                    None,
-                )
-            } else {
-                execute_block_with_state_checkpoints(
-                    evm_config,
-                    &mut state,
-                    &block,
-                    &checkpoint_indices,
-                )?
-            };
+        let (result, checkpoints, block_access_list_hash) = if checkpoint_positions.is_empty()
+            && block.header().block_access_list_hash().is_none()
+        {
+            (
+                execute_block(evm_config, &mut state, &block)?,
+                Vec::new(),
+                None,
+            )
+        } else {
+            execute_block_with_state_checkpoints(
+                evm_config,
+                &mut state,
+                &block,
+                &checkpoint_positions,
+            )?
+        };
         validate_block_post_execution(
             &block,
             chain_spec.as_ref(),
@@ -860,7 +866,9 @@ where
 /// Use Reth's normal block flow when no checkpoints or BAL output are needed.
 fn execute_block(
     evm_config: &EezEvmConfig,
-    state: &mut State<StateProviderDatabase<Box<dyn StateProvider + Send>>>,
+    state: &mut State<
+        StateProviderDatabase<EvmStateProviderAdapter<Box<dyn StateProvider + Send>>>,
+    >,
     block: &RecoveredBlock<Block>,
 ) -> Result<BlockExecutionResult<EthereumReceipt>, ValidationError> {
     state.bal_state.bal_builder = None;
@@ -879,13 +887,15 @@ fn execute_block(
 /// Execute transactions individually to capture checkpoints and BAL indices.
 fn execute_block_with_state_checkpoints(
     evm_config: &EezEvmConfig,
-    state: &mut State<StateProviderDatabase<Box<dyn StateProvider + Send>>>,
+    state: &mut State<
+        StateProviderDatabase<EvmStateProviderAdapter<Box<dyn StateProvider + Send>>>,
+    >,
     block: &RecoveredBlock<Block>,
-    checkpoint_indices: &[usize],
+    checkpoint_positions: &[CheckpointAt],
 ) -> Result<
     (
         BlockExecutionResult<EthereumReceipt>,
-        Vec<TransactionStateCheckpoint>,
+        Vec<StateCheckpoint>,
         Option<B256>,
     ),
     ValidationError,
@@ -909,8 +919,30 @@ fn execute_block_with_state_checkpoints(
             executor.evm_mut().db_mut().bump_bal_index();
         }
 
-        let mut checkpoints = Vec::with_capacity(checkpoint_indices.len());
-        let mut next_checkpoint = checkpoint_indices.iter().copied().peekable();
+        let mut checkpoints = Vec::with_capacity(checkpoint_positions.len());
+        let mut next_checkpoint = checkpoint_positions.iter().copied().peekable();
+        // Sealed before the loop: the anchor's candidate is this block holding
+        // no transactions, after the pre-block system calls have run.
+        if next_checkpoint.peek() == Some(&CheckpointAt::PreExecution) {
+            let state_root = {
+                let db = executor.evm_mut().db_mut();
+                db.merge_transitions(BundleRetention::Reverts);
+                state_root(db)?
+            };
+            let block_hash =
+                candidate_block_hash::<EezPrimitives>(block.sealed_header(), &[], &[], state_root)
+                    .map_err(|error| {
+                        ValidationError::Rejected(format!(
+                            "stateful candidate block hash rejected: {error}"
+                        ))
+                    })?;
+            checkpoints.push(StateCheckpoint {
+                at: CheckpointAt::PreExecution,
+                state_root,
+                block_hash,
+            });
+            next_checkpoint.next();
+        }
         for (transaction_index, transaction) in block.transactions_recovered().enumerate() {
             executor
                 .execute_transaction(transaction)
@@ -918,7 +950,7 @@ fn execute_block_with_state_checkpoints(
             if has_bal {
                 executor.evm_mut().db_mut().bump_bal_index();
             }
-            if next_checkpoint.peek() == Some(&transaction_index) {
+            if next_checkpoint.peek() == Some(&CheckpointAt::Transaction(transaction_index)) {
                 let state_root = {
                     let db = executor.evm_mut().db_mut();
                     db.merge_transitions(BundleRetention::Reverts);
@@ -935,8 +967,8 @@ fn execute_block_with_state_checkpoints(
                         "stateful candidate block hash rejected: {error}"
                     ))
                 })?;
-                checkpoints.push(TransactionStateCheckpoint {
-                    transaction_index,
+                checkpoints.push(StateCheckpoint {
+                    at: CheckpointAt::Transaction(transaction_index),
                     state_root,
                     block_hash,
                 });
@@ -957,10 +989,12 @@ fn execute_block_with_state_checkpoints(
 }
 
 fn state_root(
-    state: &State<StateProviderDatabase<Box<dyn StateProvider + Send>>>,
+    state: &State<StateProviderDatabase<EvmStateProviderAdapter<Box<dyn StateProvider + Send>>>>,
 ) -> Result<B256, ValidationError> {
     let provider = &state.database.0;
-    let hashed_state = provider.hashed_post_state(&state.bundle_state);
+    let hashed_state = provider
+        .hashed_post_state(&state.bundle_state)
+        .map_err(provider_error)?;
     provider.state_root(hashed_state).map_err(provider_error)
 }
 

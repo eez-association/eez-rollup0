@@ -44,8 +44,8 @@ use tracing::{Level, event};
 use crate::held_pool::{HeldPool, HeldTx};
 use crate::ingress::Direction;
 use crate::local::{
-    BuildError, InboundL2TargetSession, L1SlotState, L1TargetSession, build::SyncBlockState,
-    build_sync_block, sync_block_pair_hashes,
+    BuildError, InboundL2TargetSession, L1SlotState, L1TargetSession, SyncCandidates,
+    build::SyncBlockState, build_sync_block, sync_block_candidates,
 };
 use crate::optimistic::OptimisticallyIncluded;
 use crate::prover_retry::{
@@ -2054,7 +2054,8 @@ where
         // is transient: nothing has been consumed, so the whole drain goes
         // back to the pool untouched.
         let local = &cc.local;
-        let l2_dyn: Arc<dyn StateProviderFactory> = rollup.l2_provider.clone();
+        let l2_dyn: Arc<dyn crate::local::provider::StateSnapshotProvider> =
+            rollup.l2_provider.clone();
         // Rebuilding from the accepted list — not restoring a cache — is what
         // keeps the prefix provably equal to the block the canonical rebuild
         // produces.
@@ -3139,7 +3140,7 @@ where
         // Per-effect intermediate L2 roots: the prover requires each entry's
         // `newState` to be its own effect's root, not the final Sync-block root.
         // Failure here is systemic (like build/prepare) → degrade.
-        let pair_hashes = match sync_block_pair_hashes(
+        let candidates = match sync_block_candidates(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
             parent_header,
@@ -3154,7 +3155,7 @@ where
                     Level::WARN,
                     rollup_id,
                     error = %e,
-                    "sync_block_pair_hashes failed; re-queueing survivors, degrading to minimal postBatch",
+                    "sync_block_candidates failed; re-queueing survivors, degrading to minimal postBatch",
                 );
                 pool.push_front_batch(survivors);
                 return self
@@ -3189,7 +3190,7 @@ where
                 parent_header,
                 &built.header,
                 Some(&built.block),
-                &pair_hashes,
+                &candidates,
                 &outbound_entries,
                 &outbound_user_txs,
                 outbound_target_gas,
@@ -3514,7 +3515,7 @@ where
                 parent_header,
                 &empty_built.header,
                 Some(&empty_built.block),
-                &[], // no cross-chain effects → no per-effect roots
+                &SyncCandidates::anchor_only(),
                 &[], // no outbound entries
                 &[], // no outbound user txs
                 0,   // no inline outbound target calls
@@ -3678,7 +3679,7 @@ where
                     &boundary_parent,
                     &boundary_header,
                     None, // terminal is committed → witnesses come from the store
-                    &[],
+                    &SyncCandidates::anchor_only(),
                     &[],
                     &[],
                     0, // no inline outbound target calls
@@ -3823,7 +3824,9 @@ where
     /// entries[k-1].newState` per rollup; EEZ.sol's `_applyStateUpdates`
     /// enforces the chain on L1 (`StateRootMismatch` revert) regardless of
     /// proof system. Each effect entry's `newState` is its per-effect root from
-    /// `pair_hashes` (verified by the proof signer's effect-prefix checks); the
+    /// `candidates.per_effect` (verified by the proof signer's effect-prefix
+    /// checks); the anchor claims `candidates.anchor`, so every entry
+    /// commits to a candidate at the Sync block's height. The
     /// last is the terminal block's own hash, which is the required
     /// settlement-chain endpoint and comes from `terminal_header`.
     ///
@@ -3845,7 +3848,7 @@ where
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         terminal_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         sync_block: Option<&reth_primitives_traits::RecoveredBlock<eez_primitives::Block>>,
-        pair_hashes: &[B256],
+        candidates: &SyncCandidates,
         outbound_entries: &[eez_protocol::abi::ExecutionEntrySol],
         outbound_user_txs: &[Bytes],
         outbound_target_gas: u64,
@@ -3878,9 +3881,10 @@ where
         //
         // `currentState` = hash(posted), the L1-confirmed cursor block — must
         // equal L1.config.stateRoot at postBatch time so the deriver's
-        // check_claimed_state agrees. `newState` initially equals the pre-Sync
-        // block's hash so later effect entries chain from it; an anchor-only
-        // batch replaces it below with the empty Sync block's hash.
+        // check_claimed_state agrees. `newState` = the Sync block sealed over no
+        // transactions, so the anchor already sits at the Sync block's height
+        // and later effect entries chain from it. With no effects that block IS
+        // the Sync block, so it is also the required endpoint.
         let posted = self
             .inner
             .rollups
@@ -3900,12 +3904,17 @@ where
                 .ok_or_else(|| format!("local L2 header at {posted} missing"))?;
             (h.hash(), h.state_root())
         };
-        let pre_sync_block_hash = parent_header.hash();
         let immediate_entry = eez_protocol::abi::ExecutionEntrySol {
             stateUpdates: vec![eez_protocol::abi::StateUpdateSol {
                 rollupId: rollup_id,
                 currentState: pre_block_hash,
-                newState: pre_sync_block_hash,
+                // Alone, the anchor is the endpoint, so take it from the
+                // terminal rather than trust a caller for it.
+                newState: if candidates.per_effect.is_empty() {
+                    sync_block_hash
+                } else {
+                    candidates.anchor
+                },
                 etherDelta: alloy_primitives::I256::ZERO,
             }],
             proxyEntryHash: B256::ZERO,
@@ -3953,7 +3962,7 @@ where
         // `proxyEntryHash`: outbound (== 0) → `-V` (via `outbound_ether_out`; None =
         // multi-call-with-value, unsupported → reject); inbound (!= 0) → `+V` deposit.
         // Value-free → 0.
-        // `newState` = effect `k`'s per-effect root `pair_hashes[k]`; entries are
+        // `newState` = effect `k`'s per-effect root `candidates.per_effect[k]`; entries are
         // ordered `[outbound… | inbound…]`, matching the Sync block's pair-ends.
         // The prover requires this exact per-entry value. `currentState` is fixed
         // by the stitch below.
@@ -3984,11 +3993,11 @@ where
                     .copied()
                     .unwrap_or(alloy_primitives::I256::ZERO)
             };
-            let new_state = *pair_hashes.get(effect_k).ok_or_else(|| {
+            let new_state = *candidates.per_effect.get(effect_k).ok_or_else(|| {
                 format!(
                     "settlement stitch: effect entry {effect_k} has no per-effect root \
                      (only {} pair-end roots — pair-end/entry misalignment)",
-                    pair_hashes.len(),
+                    candidates.per_effect.len(),
                 )
             })?;
             entry.stateUpdates = vec![eez_protocol::abi::StateUpdateSol {
@@ -3999,11 +4008,11 @@ where
             }];
             effect_k += 1;
         }
-        if effect_k != pair_hashes.len() {
+        if effect_k != candidates.per_effect.len() {
             return Err(format!(
                 "settlement stitch: {effect_k} effect entries but {} per-effect roots \
                  (pair-end/entry misalignment)",
-                pair_hashes.len(),
+                candidates.per_effect.len(),
             )
             .into());
         }
@@ -4011,8 +4020,9 @@ where
         // Stitch the per-rollup state-update chain: EEZ.sol `_applyStateUpdates`
         // enforces `config.stateRoot == update.currentState` then sets it to
         // `newState`, so each entry's `currentState` must chain to the prior
-        // entry's `newState`. This chains `pre_sync → R_0 → … → R_last (final
-        // root)`, satisfying both EEZ.sol and the prover's effect-prefix gate.
+        // entry's `newState`. This chains `posted → E → R_0 → … → R_last`, with
+        // `E` the empty prefix and `R_last` the terminal, satisfying both EEZ.sol
+        // and the prover's effect-prefix gate.
         let mut running_roots: HashMap<u64, B256> = HashMap::new();
         for entry in &mut batch.entries {
             for update in &mut entry.stateUpdates {
@@ -4020,22 +4030,6 @@ where
                     update.currentState = prev_new;
                 }
                 running_roots.insert(update.rollupId, update.newState);
-            }
-        }
-
-        // Anchor-only batch (no effects): the immediate is the last entry, so it
-        // must carry the final root. An empty Sync block still mutates state
-        // (EIP-2935 / EIP-4788 system writes), so `parent.stateRoot` differs from
-        // the re-executed final root and the endpoint gate would fail. With
-        // effects, the last effect's root already is the final root.
-        if pair_hashes.is_empty()
-            && let Some(last) = batch.entries.last_mut()
-        {
-            for update in last.stateUpdates.iter_mut().rev() {
-                if update.rollupId == rollup_id {
-                    update.newState = sync_block_hash;
-                    break;
-                }
             }
         }
 
@@ -4054,7 +4048,7 @@ where
 
         // The L1 rolling seed commits the finalized ordered state updates, so
         // it can only be computed after the stitch above has set every
-        // `currentState` and the anchor-only path has set its final root.
+        // `currentState`.
         eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch)
             .map_err(|error| format!("finalize L1 rolling hashes: {error}"))?;
 
@@ -4463,20 +4457,20 @@ async fn observe_bundle_outcome(
     };
     // Settled = L1 reached the claimed endpoint. Anything less is partial.
     let settled = settlement.is_some_and(|s| s.final_state == Some(expected_final_state));
-    // The anchor claims the block BEFORE this one, so an anchor-only settlement
-    // leaves this height unratified: reorged, not kept.
-    let kept_an_effect = settlement.is_some_and(eez_l1::Settlement::applied_an_effect);
+    // The anchor names a candidate at THIS height, so any applied entry keeps
+    // the height canonical; only an empty settlement leaves it unratified.
+    let applied_any = settlement.is_some_and(|s| !s.is_empty());
     match &outcome {
         // Settled partially: the height stays canonical and the Deriver rebuilds the
         // block L1 named; only the unconsumed tail is owed a disposition.
-        Ok(o @ SendOutcome::Included { .. }) if !settled && kept_an_effect => event!(
+        Ok(o @ SendOutcome::Included { .. }) if !settled && applied_any => event!(
             name: "eez.composer.bundle.observed",
             Level::WARN,
             event_name = "eez.composer.bundle.observed",
             rollup_id,
             sync_height,
             settled,
-            kept_an_effect,
+            applied_any,
             applied = ?settlement.map(eez_l1::Settlement::applied_indices),
             outcome = ?o,
             "postBatch settled partially; L1 kept part of this batch",
@@ -4522,13 +4516,13 @@ async fn observe_bundle_outcome(
     }
     if settled {
         optimistic.mark_settled(sync_height, post_batch_hash);
-    } else if kept_an_effect {
-        // L1 kept part of the effects, so this height stays canonical and
+    } else if applied_any {
+        // L1 kept part of the batch, so this height stays canonical and
         // recovery owes only the tail disposition — no rollback.
         optimistic.mark_settled_partial(sync_height, post_batch_hash);
     } else {
-        // Includes the anchor-only case: the commitment moved but no effect ran,
-        // so the block is unratified and the reorg path is correct.
+        // L1 ran nothing of this batch, so the height is unratified and the
+        // reorg path is correct.
         //
         // slot_skipped = the drop was NOT attributable to the bundled txs →
         // requeue without counting an attempt toward poison-eviction.

@@ -230,7 +230,8 @@ impl SettlementPipelineError {
                 }
                 | settlement::EffectPrefixError::TransactionStateCheckpointIndexMismatch {
                     ..
-                } => (
+                }
+                | settlement::EffectPrefixError::AnchorCheckpointPositionMismatch { .. } => (
                     tonic::Code::Internal,
                     "validation backend returned invalid output",
                 ),
@@ -348,7 +349,6 @@ pub(super) fn run_settlement(
 
     let bound_effects = settlement::bind_effects_to_execution(
         &verified_state_chain,
-        validated_window.settling_pre_block_hash(),
         settling_block.transaction_state_checkpoints(),
         &settling_observations,
     )?;
