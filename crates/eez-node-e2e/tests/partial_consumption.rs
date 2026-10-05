@@ -1,0 +1,318 @@
+//! Partial and anchor-only settlement coverage with inclusion-time reverts.
+
+use std::time::Duration;
+
+use alloy_primitives::{B256, U256};
+use alloy_rpc_types_eth::BlockNumberOrTag;
+use alloy_sol_types::SolCall;
+use eez_testkit::{
+    DEV_CHAIN_ID, INBOUND_USER, IValue, NodeBinary, NodeConfig, NodeHandle, OUTBOUND_USER,
+    TARGET_DEPLOYER, batches_posted, block_number_and_hash_at, deploy_parity_gate, l2_value,
+    onchain_nonce, rollup_commitment, safe_block_hash, setup_cross_chain, sign_and_send, signals,
+    wait_for, wait_for_safe_chain_contains,
+};
+
+const TIMEOUT: Duration = Duration::from_mins(6);
+const ROUNDS: usize = 12;
+
+fn assert_settlements_use_dispatched_sync_heights(
+    records: &[eez_testkit::NodeSignal],
+) -> anyhow::Result<()> {
+    let dispatched: std::collections::HashSet<u64> = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.name.as_str(),
+                signals::COMPOSER_BUNDLE_DISPATCHED | signals::COMPOSER_PHASE1_BUNDLE_DISPATCHED
+            )
+        })
+        .map(|record| record.u64("sync_height"))
+        .collect::<anyhow::Result<_>>()?;
+    let settled: Vec<u64> = records
+        .iter()
+        .filter(|record| record.name == signals::DERIVER_SAFE_ADVANCED)
+        .map(|record| record.u64("to_block"))
+        .collect::<anyhow::Result<_>>()?;
+    anyhow::ensure!(
+        !settled.is_empty(),
+        "no included batch advanced the safe head"
+    );
+    for height in settled {
+        anyhow::ensure!(
+            dispatched.contains(&height),
+            "included batch settled at {height}, which was not its dispatched Sync height"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn settlement_height_oracle_rejects_a_non_sync_height() {
+    let record = |name: &str, field: &str, value: u64| eez_testkit::NodeSignal {
+        name: name.to_owned(),
+        fields: serde_json::Map::from_iter([(field.to_owned(), value.into())]),
+    };
+    let records = [
+        record(signals::COMPOSER_BUNDLE_DISPATCHED, "sync_height", 10),
+        record(signals::DERIVER_SAFE_ADVANCED, "to_block", 9),
+    ];
+    assert!(assert_settlements_use_dispatched_sync_heights(&records).is_err());
+}
+
+#[test]
+fn settlement_height_oracle_accepts_a_minimal_bundle_sync_height() {
+    let record = |name: &str, field: &str, value: u64| eez_testkit::NodeSignal {
+        name: name.to_owned(),
+        fields: serde_json::Map::from_iter([(field.to_owned(), value.into())]),
+    };
+    let records = [
+        record(
+            signals::COMPOSER_PHASE1_BUNDLE_DISPATCHED,
+            "sync_height",
+            10,
+        ),
+        record(signals::DERIVER_SAFE_ADVANCED, "to_block", 10),
+    ];
+    assert!(assert_settlements_use_dispatched_sync_heights(&records).is_ok());
+}
+
+async fn assert_follower_reaches(w: &eez_testkit::CrossChainWorld, expected: (u64, B256)) {
+    let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        genesis_path: Some(w.cfg.l2_genesis.0.as_path()),
+    };
+    let follower = NodeHandle::start(
+        "partial-settlement-follower",
+        &follower_cfg,
+        &w.follower_env(),
+    )
+    .await
+    .unwrap();
+    wait_for_safe_chain_contains(&follower, expected.0, expected.1, TIMEOUT)
+        .await
+        .expect("follower did not reproduce the settled safe block");
+    follower.assert_no_process_death();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inclusion_revert_settles_a_mixed_prefix_and_follower_converges() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let gate = deploy_parity_gate(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, w.setter_proxy)
+        .await
+        .expect("ParityGate deploys on L1");
+    let signal_cursor = w.node.signal_cursor().unwrap();
+
+    let mut observed = false;
+    for round in 0..ROUNDS {
+        let inbound_nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+        let outbound_nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+        let value = u64::try_from(round).unwrap();
+
+        let direct = sign_and_send(
+            &w.l1_xchain(),
+            INBOUND_USER,
+            DEV_CHAIN_ID,
+            inbound_nonce,
+            Some(w.setter_proxy),
+            U256::ZERO,
+            IValue::setValueCall {
+                v: U256::from(100 + value),
+            }
+            .abi_encode(),
+            600_000,
+        )
+        .await;
+        let outbound = sign_and_send(
+            &w.l2_xchain(),
+            OUTBOUND_USER,
+            w.l2_chain_id,
+            outbound_nonce,
+            Some(w.outbound_proxy),
+            U256::ZERO,
+            IValue::setValueCall {
+                v: U256::from(150 + value),
+            }
+            .abi_encode(),
+            600_000,
+        )
+        .await;
+        let gated = sign_and_send(
+            &w.l1_xchain(),
+            INBOUND_USER,
+            DEV_CHAIN_ID,
+            inbound_nonce + 1,
+            Some(gate),
+            U256::ZERO,
+            IValue::setValueCall {
+                v: U256::from(200 + value),
+            }
+            .abi_encode(),
+            600_000,
+        )
+        .await;
+        if direct.is_err() || outbound.is_err() || gated.is_err() {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+
+        observed = wait_for(Duration::from_secs(40), || async {
+            for record in w
+                .node
+                .signals_since(signal_cursor)?
+                .iter()
+                .filter(|record| record.name == signals::DERIVER_PARTIAL_CONSUMPTION)
+            {
+                let outbound = record.u64("outbound")?;
+                let inbound = record.u64("inbound")?;
+                let outbound_applied = record.u64("outbound_applied")?;
+                let inbound_applied = record.u64("inbound_applied")?;
+                if outbound_applied > 0
+                    && inbound_applied > 0
+                    && (outbound_applied < outbound || inbound_applied < inbound)
+                {
+                    return Ok(Some(true));
+                }
+            }
+            Ok(None)
+        })
+        .await
+        .unwrap_or(false);
+        if observed {
+            break;
+        }
+    }
+
+    assert!(
+        observed,
+        "no inclusion-time revert produced a prefix settlement"
+    );
+    assert!(
+        w.node
+            .count_signal(signals::COMPOSER_SETTLED_PARTIAL)
+            .unwrap_or(0)
+            > 0,
+        "composer did not classify the settlement as partial",
+    );
+    assert!(
+        w.node
+            .count_signal(signals::COMPOSER_NONCE_BURNED)
+            .unwrap_or(0)
+            > 0,
+        "the included reverting transaction nonce was not burned",
+    );
+
+    wait_for(TIMEOUT, || async {
+        let commitment = rollup_commitment(&l1_rpc, w.dep.eez_address, w.dep.rollup_id).await?;
+        let safe = safe_block_hash(&l2_rpc).await?;
+        Ok((safe == Some(commitment)).then_some(()))
+    })
+    .await
+    .expect("L1 commitment and L2 safe hash did not converge");
+    assert!(
+        l2_value(&l1_rpc, w.outbound_value).await.unwrap() >= U256::from(150),
+        "the outbound entry in the surviving prefix was not applied",
+    );
+    w.node.assert_no_divergence_failure_logs();
+    w.node.assert_no_process_death();
+    let records = w.node.signals_since(0).unwrap();
+    assert_settlements_use_dispatched_sync_heights(&records).unwrap();
+    let settled = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe)
+        .await
+        .unwrap()
+        .expect("partial settlement must produce a safe block");
+    assert_follower_reaches(&w, settled).await;
+
+    let before = batches_posted(&l1_rpc, w.dep.eez_address, w.dep.deploy_block)
+        .await
+        .unwrap();
+    wait_for(TIMEOUT, || async {
+        let now = batches_posted(&l1_rpc, w.dep.eez_address, w.dep.deploy_block).await?;
+        Ok((now > before).then_some(()))
+    })
+    .await
+    .expect("settlement did not continue after partial consumption");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inclusion_revert_can_settle_only_the_anchor() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let gate = deploy_parity_gate(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, w.setter_proxy)
+        .await
+        .expect("ParityGate deploys on L1");
+    let signal_cursor = w.node.signal_cursor().unwrap();
+
+    let mut anchor_only = None;
+    for round in 0..ROUNDS {
+        let nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+        if sign_and_send(
+            &w.l1_xchain(),
+            INBOUND_USER,
+            DEV_CHAIN_ID,
+            nonce,
+            Some(gate),
+            U256::ZERO,
+            IValue::setValueCall {
+                v: U256::from(300 + u64::try_from(round).unwrap()),
+            }
+            .abi_encode(),
+            600_000,
+        )
+        .await
+        .is_err()
+        {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+
+        anchor_only = wait_for(Duration::from_secs(40), || async {
+            let records = w.node.signals_since(signal_cursor)?;
+            for partial in records
+                .iter()
+                .filter(|record| record.name == signals::DERIVER_PARTIAL_CONSUMPTION)
+            {
+                let total = partial.u64("outbound")? + partial.u64("inbound")?;
+                if total == 0
+                    || partial.u64("outbound_applied")? != 0
+                    || partial.u64("inbound_applied")? != 0
+                {
+                    continue;
+                }
+                let tx_hash = partial.b256("tx_hash")?;
+                if let Some(advanced) = records.iter().find(|record| {
+                    record.name == signals::DERIVER_SAFE_ADVANCED
+                        && record.u64("applied_entries").ok() == Some(1)
+                        && record.b256("tx_hash").ok() == Some(tx_hash)
+                }) {
+                    return Ok(Some((
+                        advanced.u64("to_block")?,
+                        advanced.b256("new_safe_hash")?,
+                        advanced.b256("l1_settled_commitment")?,
+                    )));
+                }
+            }
+            Ok(None)
+        })
+        .await
+        .ok();
+        if anchor_only.is_some() {
+            break;
+        }
+    }
+
+    let settled = anchor_only.expect("no inclusion-time revert produced an anchor-only settlement");
+    assert_eq!(settled.1, settled.2);
+    let canonical = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(settled.0))
+        .await
+        .unwrap()
+        .expect("anchor-only settlement height must be canonical");
+    assert_eq!(canonical.1, settled.1);
+    let records = w.node.signals_since(0).unwrap();
+    assert_settlements_use_dispatched_sync_heights(&records).unwrap();
+    assert_follower_reaches(&w, (settled.0, settled.1)).await;
+    w.node.assert_no_divergence_failure_logs();
+    w.node.assert_no_process_death();
+}
