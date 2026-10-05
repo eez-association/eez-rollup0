@@ -4,7 +4,7 @@
   "systemAddress": "0xEeEEEEeeeEEeeeEeeEEeEEEeeEeeeeeeeeEe0076",
   "useGasLeft": false,
   "eezL2Address": "0x4200000000000000000000000000000000000007",
-  "runtimeCodeHash": "0x59657e1ce2e482a65a0120869bf07046f3df0ab9ef65ccb5efe561c5b2b4a9a2",
-  "genesisStateRoot": "0xf9b08f935db84c1b76954e43a67205a26cca06627e44a8f531a43137d8202e44",
+  "runtimeCodeHash": "0x03ec6a6b521e06ecdd689a961bd3d6d368807a975a9633dd6247926b8ef1d07d",
+  "genesisStateRoot": "0xfde2417b693d7fb883645e2f5773edc3de295db01086ed132482f5cc8445b39b",
   "foundryVersion": "1.7.1"
 }
