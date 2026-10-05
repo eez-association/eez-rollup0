@@ -234,10 +234,7 @@ impl Drop for Anvil {
     }
 }
 
-/// Forwards single-transaction `eth_sendBundle` payloads to Anvil.
-///
-/// Anvil has no builder API, so the stub explicitly rejects bundles containing
-/// zero or multiple transactions instead of pretending to preserve atomicity.
+/// Applies `eth_sendBundle` payloads atomically to Anvil.
 struct BundleStub {
     child: Child,
     url: String,
@@ -273,6 +270,8 @@ impl BundleStub {
         command
             .arg(script)
             .args(["--listen", &listen, "--upstream", upstream])
+            .arg("--block-time")
+            .arg(L1_BLOCK_TIME_SECS.to_string())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err_log));
         drop(port_lease);
@@ -2997,6 +2996,28 @@ async fn deploy_value(rpc_url: &str, key: &str, chain_id: u64, initial: U256) ->
         chain_id,
         &out.join("Value.sol/Value.json"),
         initial.abi_encode(),
+    )
+    .await
+}
+
+/// Deploy a `ParityGate` forwarding to `target`.
+///
+/// # Errors
+///
+/// Propagates deployment and receipt failures.
+pub async fn deploy_parity_gate(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    target: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("ParityGate.sol/ParityGate.json"),
+        target.abi_encode(),
     )
     .await
 }
