@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
+use alloy_sol_types::SolCall;
 use eez_control_rpc::v1::prover_client::ProverClient;
 use eez_control_rpc::v1::{
     BlockWitness, ExecutionWitness, PostBatch, ProveChunk, ProveHeader, prove_chunk,
@@ -93,6 +94,8 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
     let from = fixture_u64(&oracle, "from_block");
     let to = fixture_u64(&oracle, "to_block");
     let rollup_id = NonZeroU64::new(fixture_u64(&oracle, "rollup_id")).unwrap();
+    let mut post_batch_calldata = fixture_hex(&fixture("postbatch.hex"));
+    post_batch_calldata[..4].copy_from_slice(&eez_protocol::abi::postAndVerifyBatchCall::SELECTOR);
 
     let mut window = vec![ProveChunk {
         kind: Some(prove_chunk::Kind::Header(ProveHeader {
@@ -100,7 +103,7 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
             from_block: from,
             to_block: to,
             post_batch: Some(PostBatch {
-                abi_calldata: fixture_hex(&fixture("postbatch.hex")),
+                abi_calldata: post_batch_calldata,
                 public_inputs_hash: expected_hash.to_vec(),
                 l1_block_hash: Vec::new(),
             }),

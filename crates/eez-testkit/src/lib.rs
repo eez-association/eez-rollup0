@@ -960,6 +960,15 @@ sol! {
         function rollupCounter() external view returns (uint256);
         function registerRollup(address rollupContract, bytes32 initialState) external returns (uint64 rollupId);
     }
+
+    interface IRollupManager {
+        function initialize(
+            address initialOwner,
+            uint256 initialThreshold,
+            address[] proofSystems,
+            bytes32[] vkeys
+        ) external;
+    }
 }
 
 pub const INVALID_PROOF_SELECTOR: [u8; 4] = IEEZ::InvalidProof::SELECTOR;
@@ -1134,24 +1143,29 @@ async fn deploy_contracts_with_initial(
     )
     .await?;
 
-    // Rollup(address eez, address owner, uint256 threshold,
-    //        address[] proofSystems, bytes32[] vkeys)
     let proof_systems: Vec<Address> = vec![proof_system_address];
     // vkey embeds the authorized signer address; the registry treats vkey as
     // opaque but checks non-zero + membership (see DeployRollup.s.sol:60).
     let vkeys: Vec<B256> = vec![attester.into_word()];
-    let rollup_manager_address = deploy(
+    let rollup_implementation = deploy(
         &provider,
         signer_addr,
         &out.join("Rollup.sol/Rollup.json"),
-        (
-            eez_address,
-            signer_addr,
-            U256::from(1u64),
-            proof_systems,
-            vkeys,
-        )
-            .abi_encode_params(),
+        eez_address.abi_encode(),
+    )
+    .await?;
+    let initialize = IRollupManager::initializeCall {
+        initialOwner: signer_addr,
+        initialThreshold: U256::from(1u64),
+        proofSystems: proof_systems,
+        vkeys,
+    }
+    .abi_encode();
+    let rollup_manager_address = deploy(
+        &provider,
+        signer_addr,
+        &out.join("TransparentUpgradeableProxy.sol/TransparentUpgradeableProxy.json"),
+        (rollup_implementation, signer_addr, Bytes::from(initialize)).abi_encode_params(),
     )
     .await?;
 
@@ -2876,19 +2890,27 @@ pub async fn deploy_protocol_dev(
         padded[12..].copy_from_slice(attester.as_slice());
         padded
     })];
-    let rollup_manager_address = deploy_raw(
+    let rollup_implementation = deploy_raw(
         l1_rpc,
         deployer_key,
         DEV_CHAIN_ID,
         &out.join("Rollup.sol/Rollup.json"),
-        (
-            eez_address,
-            signer_addr,
-            U256::from(1u64),
-            vec![proof_system_address],
-            vkeys,
-        )
-            .abi_encode_params(),
+        eez_address.abi_encode(),
+    )
+    .await?;
+    let initialize = IRollupManager::initializeCall {
+        initialOwner: signer_addr,
+        initialThreshold: U256::from(1u64),
+        proofSystems: vec![proof_system_address],
+        vkeys,
+    }
+    .abi_encode();
+    let rollup_manager_address = deploy_raw(
+        l1_rpc,
+        deployer_key,
+        DEV_CHAIN_ID,
+        &out.join("TransparentUpgradeableProxy.sol/TransparentUpgradeableProxy.json"),
+        (rollup_implementation, signer_addr, Bytes::from(initialize)).abi_encode_params(),
     )
     .await?;
 
@@ -3296,7 +3318,7 @@ impl CrossChainConfig {
         // These CREATE nonces must match `deploy_protocol_dev`.
         let eez_address = deployer.create(0);
         let proof_system_address = deployer.create(1);
-        let rollup_manager_address = deployer.create(2);
+        let rollup_manager_address = deployer.create(3);
         let ts = now_unix_secs();
         let initial_state = l2_genesis_block_hash_at(ts)?;
         let l1_http_lease = PortLease::http_pair();
