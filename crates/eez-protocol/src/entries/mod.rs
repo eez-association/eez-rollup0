@@ -161,7 +161,9 @@ pub(crate) fn build_l1_postbatch(
 ///
 /// Every entry must be successful, have at least one `RollupUpdate`, contain no
 /// reentrant expected calls, and contain at most one flat mutable call with no
-/// gas limit or revert span.
+/// gas limit or revert span. Immediate entries retain their simulated call
+/// result only until it has been folded into the rolling hash, so finalize an
+/// entry exactly once.
 ///
 /// # Errors
 ///
@@ -215,6 +217,9 @@ pub fn finalize_l1_rolling_hashes(batch: &mut EvmBatch) -> ProtocolResult<()> {
         }
 
         entry.rollingHash = rolling_hash.current();
+        if entry.proxyEntryHash == B256::ZERO {
+            entry.returnData = Bytes::new();
+        }
     }
 
     Ok(())
@@ -933,6 +938,7 @@ mod tests {
     #[test]
     fn l1_finalizer_folds_state_seed_and_flat_call() {
         let action = record(RollupId::MAINNET, RollupId(7));
+        let return_data = Bytes::copy_from_slice(supported_return_data(&action).unwrap());
         let mut batch = build_l1_postbatch(&[action], RollupId(7)).unwrap();
         batch.entries[0]
             .rollupUpdates
@@ -954,8 +960,9 @@ mod tests {
         let mut expected =
             EntryRollingHash::seed_for_l1([(7, B256::with_last_byte(0x11))], B256::ZERO);
         expected.call_begin(call_hash);
-        expected.call_end(true, &entry.returnData);
+        expected.call_end(true, &return_data);
         assert_eq!(entry.rollingHash, expected.current());
+        assert!(entry.returnData.is_empty());
     }
 
     #[test]

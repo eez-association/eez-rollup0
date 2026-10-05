@@ -213,7 +213,7 @@ sol! {
     function loadExecutionTable(
         L2ExecutionEntrySol[] _entries,
         L2StaticExecutionEntrySol[] _staticEntries
-    ) external;
+    ) external payable;
 
     function executeIncomingCrossChainCall(
         L2ExecutionEntrySol[] _entries,

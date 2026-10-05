@@ -622,6 +622,7 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
         batch.entries[2].rollingHash,
         b256!("78f69e61b6a717b35a9ded7bd8eb7b8782e70680d1335623833272cfa66f5921")
     );
+    let return_data = std::mem::take(&mut batch.entries[2].returnData);
     let mut settling = settling_with_outbound_pairs(2);
     *settling.outbound_event_candidates_mut_for_test() = vec![
         observed_outbound_call(1, 0, &batch.entries[1].l2ToL1Calls[0]),
@@ -629,7 +630,7 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
     ];
     let plan = effect_plan(&batch, &settling);
     let outbound = authorize_outbound_effects(&plan).unwrap();
-    let sidecars = batch
+    let mut sidecars = batch
         .entries
         .iter()
         .skip(1)
@@ -640,6 +641,7 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
             entry
         })
         .collect::<Vec<_>>();
+    sidecars[1].returnData = return_data;
     let (_, users) = block_and_payload_transactions(vec![user_transaction(7), user_transaction(8)]);
     let outbound_inputs = sidecars
         .iter()
@@ -698,6 +700,18 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
             transaction_index: 1,
         })
     );
+
+    let mut wrong_return_data = sidecars.clone();
+    wrong_return_data[1].returnData = Bytes::from_static(&[0xbe, 0xef]);
+    let wrong_return_data = encode_da_payload(std::slice::from_ref(&users), &wrong_return_data);
+    assert!(matches!(
+        verify(&wrong_return_data, [(41, settling_rlp.as_slice())]),
+        Err(DaPayloadError::RollingHashMismatch {
+            entry_index: 1,
+            transaction_index: 3,
+            ..
+        })
+    ));
 
     let mut noncanonical_context = system_transaction_context();
     noncanonical_context.l2_chain_id += 1;

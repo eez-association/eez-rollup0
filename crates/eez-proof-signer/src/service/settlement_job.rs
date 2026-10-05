@@ -268,6 +268,7 @@ impl SettlementPipelineError {
                 | settlement::DaPayloadError::TransactionMismatch { .. }
                 | settlement::DaPayloadError::MissingAction { .. }
                 | settlement::DaPayloadError::ActionMismatch { .. }
+                | settlement::DaPayloadError::RollingHashMismatch { .. }
                 // The composer published a payload that contradicts the blocks
                 // it built: an action for another rollup, or header inputs the
                 // validated header does not carry. Both are the composer's

@@ -176,7 +176,7 @@ The trace supplies the same public-input hash to both verifier calls:
 | Count bounds | Counts cannot exceed their corresponding arrays | A valid in-range count is proof-authorized |
 | `ImmediateCountStrandsLeadingL2Tx` | A poster cannot under-count and queue a leading zero-hash L2Tx | A poster cannot over-count a later nonzero-hash entry |
 | Full entry hashes | Entry content cannot be replaced without invalidating the proof | The entry remains executable or queued |
-| `StateUpdate.currentState` | An executed entry must apply to the live pre-state | Every proved entry is eventually attempted |
+| `RollupUpdate.currentRoot` | An executed entry must apply to the live pre-state | Every proved entry is eventually attempted |
 | Rolling-hash and ether checks | Executed effects must match their proved effect chain and value flow | Omitted effects must be dispatched |
 | Sender binding | With binding enabled, a different address cannot reuse the proof | The authorized poster cannot change an unbound count |
 

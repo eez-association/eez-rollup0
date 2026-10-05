@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU64;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use eez_protocol::abi::ExecutionEntrySol;
 use eez_protocol::rolling_hash::EntryRollingHash;
 use eez_protocol::{CallHashInput, CallMode, RollupId, l2_outbound_call_hash};
@@ -81,15 +81,11 @@ pub(crate) enum OutboundEffectError {
         recomputed: B256,
         observed: B256,
     },
-    #[error("outbound entry {entry_index} claims rolling hash {claimed}; recomputed {recomputed}")]
-    RollingHashMismatch {
-        entry_index: usize,
-        recomputed: B256,
-        claimed: B256,
-    },
+    #[error("outbound entry {entry_index} has non-empty return data")]
+    NonCanonicalReturnData { entry_index: usize },
     #[error("outbound entry {entry_index} uses the reserved system account as its source")]
     ReservedSourceAddress { entry_index: usize },
-    #[error("outbound entry {entry_index} value {value} exceeds the non-negative int256 range")]
+    #[error("outbound entry {entry_index} value {value} exceeds the non-negative int192 range")]
     ValueOutOfRange { entry_index: usize, value: U256 },
     #[error(
         "outbound entry {entry_index} has ether delta {actual}; expected released value delta {expected}"
@@ -122,7 +118,7 @@ impl OutboundEffectError {
             | Self::DestinationRollupMismatch { .. }
             | Self::SourceRollupMismatch { .. }
             | Self::CallHashMismatch { .. }
-            | Self::RollingHashMismatch { .. }
+            | Self::NonCanonicalReturnData { .. }
             | Self::ReservedSourceAddress { .. }
             | Self::ValueOutOfRange { .. }
             | Self::EtherDeltaMismatch { .. } => None,
@@ -146,7 +142,9 @@ pub(crate) struct AuthorizedOutboundEffects {
 pub(super) struct AuthorizedOutboundEffect {
     load_transaction_index: usize,
     transaction_index: usize,
-    derived_da_entry: ExecutionEntrySol,
+    base_da_entry: ExecutionEntrySol,
+    pending_rolling_hash: EntryRollingHash,
+    claimed_rolling_hash: B256,
 }
 
 impl AuthorizedOutboundEffects {
@@ -168,8 +166,20 @@ impl AuthorizedOutboundEffect {
         self.transaction_index
     }
 
-    pub(super) const fn derived_da_entry(&self) -> &ExecutionEntrySol {
-        &self.derived_da_entry
+    pub(super) fn derived_da_entry(&self, return_data: &Bytes) -> ExecutionEntrySol {
+        let mut entry = self.base_da_entry.clone();
+        entry.returnData = return_data.clone();
+        entry
+    }
+
+    pub(super) fn bind_return_data(&self, return_data: &Bytes) -> Result<(), B256> {
+        let mut rolling_hash = self.pending_rolling_hash.clone();
+        rolling_hash.call_end(self.base_da_entry.success, return_data);
+        let recomputed = rolling_hash.current();
+        if recomputed != self.claimed_rolling_hash {
+            return Err(recomputed);
+        }
+        Ok(())
     }
 }
 
@@ -251,19 +261,21 @@ pub(crate) fn authorize_outbound_effects(
                 {
                     return Err(unexpected_outbound_observation(next));
                 }
-                authorize_outbound_effect(
+                let pending_rolling_hash = authorize_outbound_effect(
                     effect,
                     observation,
                     expected_rollup_id,
                     expected_l2_system_address,
                 )?;
-                let mut derived_da_entry = effect.claimed_entry().clone();
-                derived_da_entry.rollupUpdates.clear();
-                derived_da_entry.rollingHash = B256::ZERO;
+                let mut base_da_entry = effect.claimed_entry().clone();
+                base_da_entry.rollupUpdates.clear();
+                base_da_entry.rollingHash = B256::ZERO;
                 authorized_bindings.push(AuthorizedOutboundEffect {
                     load_transaction_index,
                     transaction_index: effect.transaction_index(),
-                    derived_da_entry,
+                    claimed_rolling_hash: effect.claimed_entry().rollingHash,
+                    base_da_entry,
+                    pending_rolling_hash,
                 });
             }
         }
@@ -289,7 +301,7 @@ fn authorize_outbound_effect(
     observation: &OutboundEventObservation,
     expected_rollup_id: NonZeroU64,
     expected_l2_system_address: Address,
-) -> Result<(), OutboundEffectError> {
+) -> Result<EntryRollingHash, OutboundEffectError> {
     let entry_index = effect.entry_index();
     let entry = effect.claimed_entry();
     let [call] = entry.l2ToL1Calls.as_slice() else {
@@ -348,6 +360,11 @@ fn authorize_outbound_effect(
         });
     }
 
+    // The contract rejects L2Tx entries carrying return data.
+    if !entry.returnData.is_empty() {
+        return Err(OutboundEffectError::NonCanonicalReturnData { entry_index });
+    }
+
     // With the supported zero-callGas profile, the event hash is also the
     // call identity committed by the L1 entry rolling hash.
     let update = effect.claimed_state_update();
@@ -356,15 +373,6 @@ fn authorize_outbound_effect(
         entry.proxyEntryHash,
     );
     rolling_hash.call_begin(recomputed_call_hash);
-    rolling_hash.call_end(entry.success, &entry.returnData);
-    let recomputed_rolling_hash = rolling_hash.current();
-    if entry.rollingHash != recomputed_rolling_hash {
-        return Err(OutboundEffectError::RollingHashMismatch {
-            entry_index,
-            recomputed: recomputed_rolling_hash,
-            claimed: entry.rollingHash,
-        });
-    }
 
     if call.sourceAddress == expected_l2_system_address {
         return Err(OutboundEffectError::ReservedSourceAddress { entry_index });
@@ -384,5 +392,5 @@ fn authorize_outbound_effect(
             actual: update.etherDelta,
         });
     }
-    Ok(())
+    Ok(rolling_hash)
 }

@@ -215,7 +215,7 @@ pub(crate) enum InboundEffectError {
     )]
     ReturnDataMismatch { entry_index: usize },
     #[error(
-        "inbound transaction {transaction_index} for entry {entry_index} has value {value}, which exceeds the int256 range"
+        "inbound transaction {transaction_index} for entry {entry_index} has value {value}, which exceeds the int192 range"
     )]
     ValueOutOfRange {
         entry_index: usize,
