@@ -554,7 +554,7 @@ fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, Exe
             sourceRollupId: 0,
             targetAddress: target,
             value,
-            data: data.clone(),
+            data,
         }],
         expectedL1ToL2Calls: Vec::new(),
         rollingHash: entry.rollingHash,
@@ -562,14 +562,7 @@ fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, Exe
         success: true,
         returnData: return_data.clone(),
     };
-    let input = eez_protocol::entries::encode_execute_incoming(
-        target,
-        value,
-        data,
-        source,
-        eez_protocol::RollupId(0),
-        entry,
-    );
+    let input = eez_protocol::entries::encode_execute_incoming(entry);
     let context = system_transaction_context();
     let inbound = eez_protocol::entries::InboundSidecar::try_from(&sidecar).unwrap();
     let raw = eez_protocol::system_tx::build_inbound_system_txs(

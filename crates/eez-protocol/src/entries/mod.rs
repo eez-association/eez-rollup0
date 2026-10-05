@@ -581,20 +581,8 @@ pub fn build_l1_settlement_only(rollup_id: RollupId) -> EvmBatch {
 
 /// Encode one L2 incoming execution call.
 #[must_use]
-pub fn encode_execute_incoming(
-    destination: Address,
-    value: U256,
-    data: Bytes,
-    source: Address,
-    source_rollup_id: RollupId,
-    entry: L2ExecutionEntrySol,
-) -> Vec<u8> {
+pub fn encode_execute_incoming(entry: L2ExecutionEntrySol) -> Vec<u8> {
     crate::abi::executeIncomingCrossChainCallCall {
-        destination,
-        value,
-        data,
-        sourceAddress: source,
-        sourceRollup: source_rollup_id.0,
         _entries: vec![entry],
         _staticEntries: Vec::new(),
     }
@@ -648,15 +636,7 @@ pub fn decode_inbound(calldata: &[u8]) -> Option<DecodedInbound> {
         return None;
     }
     let incoming = entry.incomingCalls.first()?;
-    if incoming.revertNextNCalls != 0
-        || incoming.isStatic
-        || incoming.gas != 0
-        || incoming.sourceAddress != call.sourceAddress
-        || incoming.sourceRollupId != call.sourceRollup
-        || incoming.targetAddress != call.destination
-        || incoming.value != call.value
-        || incoming.data != call.data
-    {
+    if incoming.revertNextNCalls != 0 || incoming.isStatic || incoming.gas != 0 {
         return None;
     }
 
@@ -668,10 +648,10 @@ pub fn decode_inbound(calldata: &[u8]) -> Option<DecodedInbound> {
     }
 
     Some(DecodedInbound {
-        target: call.destination,
-        value: call.value,
-        data: call.data,
-        source: call.sourceAddress,
+        target: incoming.targetAddress,
+        value: incoming.value,
+        data: incoming.data.clone(),
+        source: incoming.sourceAddress,
         return_data: entry.returnData,
         success: entry.success,
     })
@@ -1114,14 +1094,7 @@ mod tests {
             success: true,
         })
         .unwrap();
-        let calldata = encode_execute_incoming(
-            target,
-            U256::ZERO,
-            data.clone(),
-            source,
-            RollupId::MAINNET,
-            entry.clone(),
-        );
+        let calldata = encode_execute_incoming(entry.clone());
 
         assert_eq!(
             decode_inbound(&calldata),
@@ -1137,14 +1110,7 @@ mod tests {
 
         let mut failed = entry;
         failed.success = false;
-        let failed_calldata = encode_execute_incoming(
-            target,
-            U256::ZERO,
-            Bytes::from_static(&[1, 2]),
-            source,
-            RollupId::MAINNET,
-            failed,
-        );
+        let failed_calldata = encode_execute_incoming(failed);
         assert_eq!(decode_inbound(&failed_calldata), None);
     }
 

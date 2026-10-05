@@ -232,7 +232,7 @@ fn strict_inbound_calldata(value: U256, success: bool) -> Vec<u8> {
         target,
         source,
         value,
-        data: data.clone(),
+        data,
         source_rollup_id: RollupId(0),
         l2_rollup_id: RollupId(1),
         return_data: Bytes::from_static(&[0x01, 0x02]),
@@ -240,7 +240,7 @@ fn strict_inbound_calldata(value: U256, success: bool) -> Vec<u8> {
     })
     .expect("successful inbound fixture is supported");
     entry.success = success;
-    encode_execute_incoming(target, value, data, source, RollupId(0), entry)
+    encode_execute_incoming(entry)
 }
 
 fn observed_inbound_candidate(

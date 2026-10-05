@@ -40,7 +40,7 @@ pub(crate) enum InboundObservationError {
     InvalidAbi { reason: String },
     #[error("inbound calldata is not its canonical complete ABI encoding")]
     NonCanonicalAbi,
-    #[error("native transaction value is {actual}; outer inbound value is {expected}")]
+    #[error("native transaction value is {actual}; inbound call value is {expected}")]
     NativeValueMismatch { expected: U256, actual: U256 },
     #[error("inbound source rollup is {actual}; expected L1 rollup 0")]
     SourceRollup { actual: u64 },
@@ -50,8 +50,6 @@ pub(crate) enum InboundObservationError {
     StaticEntryCount { actual: usize },
     #[error("inbound execution entry has invalid {field}")]
     InvalidEntryShape { field: &'static str },
-    #[error("outer and inner inbound {field} differ")]
-    OuterInnerMismatch { field: &'static str },
     #[error("inbound claimed call hash is {claimed}; recomputed {recomputed}")]
     CallHashMismatch { recomputed: B256, claimed: B256 },
     #[error("inbound call hash is the reserved zero value")]
@@ -81,17 +79,6 @@ pub(super) fn inspect_inbound_candidate(
     if call.abi_encode().as_slice() != calldata {
         return Err(InboundObservationError::NonCanonicalAbi);
     }
-    if transaction_value != call.value {
-        return Err(InboundObservationError::NativeValueMismatch {
-            expected: call.value,
-            actual: transaction_value,
-        });
-    }
-    if call.sourceRollup != RollupId::MAINNET.0 {
-        return Err(InboundObservationError::SourceRollup {
-            actual: call.sourceRollup,
-        });
-    }
     let [entry] = call._entries.as_slice() else {
         return Err(InboundObservationError::EntryCount {
             actual: call._entries.len(),
@@ -107,6 +94,17 @@ pub(super) fn inspect_inbound_candidate(
             field: "incomingCalls",
         });
     };
+    if transaction_value != inner.value {
+        return Err(InboundObservationError::NativeValueMismatch {
+            expected: inner.value,
+            actual: transaction_value,
+        });
+    }
+    if inner.sourceRollupId != RollupId::MAINNET.0 {
+        return Err(InboundObservationError::SourceRollup {
+            actual: inner.sourceRollupId,
+        });
+    }
     if !entry.success {
         return Err(InboundObservationError::InvalidEntryShape { field: "success" });
     }
@@ -116,17 +114,6 @@ pub(super) fn inspect_inbound_candidate(
         });
     }
 
-    for (matches, field) in [
-        (call.destination == inner.targetAddress, "destination"),
-        (call.value == inner.value, "value"),
-        (call.data == inner.data, "data"),
-        (call.sourceAddress == inner.sourceAddress, "sourceAddress"),
-        (call.sourceRollup == inner.sourceRollupId, "sourceRollup"),
-    ] {
-        if !matches {
-            return Err(InboundObservationError::OuterInnerMismatch { field });
-        }
-    }
     for (valid, field) in [
         (inner.revertNextNCalls == 0, "revertNextNCalls"),
         (!inner.isStatic, "isStatic"),
@@ -139,12 +126,12 @@ pub(super) fn inspect_inbound_candidate(
 
     let recomputed_call_hash = common_cross_chain_call_hash(CallHashInput {
         call_mode: CallMode::Mutable,
-        source_address: call.sourceAddress,
+        source_address: inner.sourceAddress,
         source_rollup_id: RollupId::MAINNET,
-        target_address: call.destination,
+        target_address: inner.targetAddress,
         target_rollup_id: RollupId(expected_rollup_id.get()),
-        value: call.value,
-        data: &call.data,
+        value: inner.value,
+        data: &inner.data,
     });
     if recomputed_call_hash == B256::ZERO {
         return Err(InboundObservationError::ZeroCallHash);
@@ -177,7 +164,7 @@ pub(super) fn inspect_inbound_candidate(
     .map_err(|_| InboundObservationError::InvalidEntryShape { field: "sidecar" })?;
     Ok(InboundObservation {
         recomputed_call_hash,
-        value: call.value,
+        value: inner.value,
         return_data: entry.returnData.clone(),
         derived_da_entry,
     })

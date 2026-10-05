@@ -108,7 +108,7 @@ fn inbound_candidate_requires_the_exact_l2_shape_and_rolling_hash() {
     }
 
     let mut wrong_source_rollup = call;
-    wrong_source_rollup.sourceRollup = 2;
+    wrong_source_rollup._entries[0].incomingCalls[0].sourceRollupId = 2;
     assert_eq!(
         inspect(&wrong_source_rollup),
         Some(InboundObservationError::SourceRollup { actual: 2 })
@@ -123,15 +123,8 @@ fn inbound_candidate_requires_the_exact_l2_shape_and_rolling_hash() {
         } else {
             incoming.l2_rollup_id = RollupId(2);
         }
-        let entry = eez_protocol::entries::build_l2_incoming_entry(incoming.clone()).unwrap();
-        let calldata = eez_protocol::entries::encode_execute_incoming(
-            incoming.target,
-            incoming.value,
-            incoming.data,
-            incoming.source,
-            incoming.source_rollup_id,
-            entry,
-        );
+        let entry = eez_protocol::entries::build_l2_incoming_entry(incoming).unwrap();
+        let calldata = eez_protocol::entries::encode_execute_incoming(entry);
         let error =
             inspect_inbound_candidate(value, &calldata, true, expected_rollup_id()).unwrap_err();
         if source_changed {

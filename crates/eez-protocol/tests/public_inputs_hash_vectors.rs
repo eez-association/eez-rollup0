@@ -159,7 +159,7 @@ fn execution_entry_encoding_matches_pinned_solidity() {
 
     assert_eq!(
         entry_hash(&entry),
-        parse_b256("0x2c4c8cbc9b39743790f04a13406c6c0e3ab6ca0bf5acb3b923f5549d3aabb759")
+        parse_b256("0x752aa6c5ddc53a6bfdfec261248ee29246f6e831c59d3567d2c22d80dbf93dc1")
     );
 }
 

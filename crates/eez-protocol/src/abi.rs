@@ -24,9 +24,9 @@ sol! {
     #[derive(Debug)]
     struct RollupUpdateSol {
         uint64 rollupId;
+        int192 etherDelta;
         bytes32 currentRoot;
         bytes32 newRoot;
-        int192 etherDelta;
     }
 
     /// A composer assertion about a rollup's live state root.
@@ -202,6 +202,7 @@ sol! {
     /// One read-only top-level L2 execution entry.
     #[derive(Debug, Default)]
     struct L2StaticExecutionEntrySol {
+        uint256 expectedEntryIndex;
         bytes32 proxyEntryHash;
         CrossChainCallSol[] incomingCalls;
         bytes32 rollingHash;
@@ -215,11 +216,6 @@ sol! {
     ) external;
 
     function executeIncomingCrossChainCall(
-        address destination,
-        uint256 value,
-        bytes data,
-        address sourceAddress,
-        uint64 sourceRollup,
         L2ExecutionEntrySol[] _entries,
         L2StaticExecutionEntrySol[] _staticEntries
     ) external payable returns (bytes);

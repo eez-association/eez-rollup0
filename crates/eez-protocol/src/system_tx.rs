@@ -52,14 +52,7 @@ pub fn build_inbound_system_txs(
         }
         let l2_entry =
             build_l2_incoming_entry(incoming.clone()).map_err(|error| error.to_string())?;
-        let calldata = encode_execute_incoming(
-            incoming.target,
-            incoming.value,
-            incoming.data,
-            incoming.source,
-            incoming.source_rollup_id,
-            l2_entry,
-        );
+        let calldata = encode_execute_incoming(l2_entry);
         let raw = encode_system_tx(
             nonce,
             cfg.eezl2_address,
