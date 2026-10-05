@@ -384,6 +384,12 @@ pub(crate) async fn scan_batch_logs_range(
     // emitted. Roots lose their server-side rollup filter and are matched below.
     let filter = Filter::new()
         .address(eez)
+        .event_signature(vec![
+            BatchPosted::SIGNATURE_HASH,
+            L2ExecutionPerformed::SIGNATURE_HASH,
+            ExecutionConsumed::SIGNATURE_HASH,
+            L2TxSkipped::SIGNATURE_HASH,
+        ])
         .from_block(from_block)
         .to_block(BlockNumberOrTag::Number(to_block));
     let all_logs = provider

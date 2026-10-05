@@ -4,7 +4,7 @@ Status: reviewed with the protocol owners; intentional dispatch policy
 
 ## Executive conclusion
 
-At protocol revision `8d458919a8165341489f06d6adbc4c42a77e6ca2`,
+At protocol revision `855fe0602484750861b4c31502a1a91355d33ed6`,
 `immediateEntryCount` and `immediateStaticEntryCount` are not included in the
 public-input hash. They can therefore be changed after a proof or ECDSA
 attestation has been created without invalidating that proof or signature.

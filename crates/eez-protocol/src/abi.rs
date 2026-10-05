@@ -251,7 +251,7 @@ sol! {
 
 #[cfg(test)]
 mod selector_locks {
-    //! ABI pins from `eez-core-protocol` commit 8d45891.
+    //! ABI pins from `eez-core-protocol` commit 855fe06.
     use super::*;
     use alloy_sol_types::SolCall;
 
@@ -283,12 +283,12 @@ mod selector_locks {
     fn l2_selectors_match_upstream() {
         assert_eq!(
             loadExecutionTableCall::SELECTOR,
-            [0xb3, 0x01, 0xbc, 0x80],
+            [0xbf, 0x2e, 0xeb, 0xd3],
             "loadExecutionTable selector drifted from pinned protocol"
         );
         assert_eq!(
             executeIncomingCrossChainCallCall::SELECTOR,
-            [0x8d, 0x84, 0x61, 0xd9],
+            [0xc3, 0xfb, 0x5f, 0x3d],
             "executeIncomingCrossChainCall selector drifted from pinned protocol"
         );
     }
@@ -297,7 +297,7 @@ mod selector_locks {
     fn l1_selectors_match_upstream() {
         assert_eq!(
             postAndVerifyBatchCall::SELECTOR,
-            [0x12, 0x27, 0x02, 0x5c],
+            [0xe4, 0xa4, 0x80, 0xe4],
             "postAndVerifyBatch selector drifted from pinned protocol"
         );
         assert_eq!(
