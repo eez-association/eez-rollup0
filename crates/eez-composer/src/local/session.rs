@@ -13,7 +13,7 @@ use crate::{OverlayChannelHandle, SessionInspector, SessionInspectorFactory};
 use eez_evm::EezEvmConfig;
 use reth_evm::{ConfigureEvm, Evm as _};
 use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_storage_api::{BlockNumReader, StateProviderFactory};
+use reth_storage_api::{EvmStateProviderAdapter, StateProvider, StateProviderBox};
 use revm::DatabaseCommit;
 use revm::database::CacheState;
 
@@ -44,7 +44,7 @@ pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
 /// the full `executeIncomingCrossChainCall` path.
 pub struct LocalExecutionSession {
     evm_config: EezEvmConfig,
-    state: State<StateProviderDatabase<reth_storage_api::StateProviderBox>>,
+    state: State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>,
     evm_env: reth_evm::EvmEnvFor<EezEvmConfig>,
     chain_id: u64,
     manager_address: Address,
@@ -88,10 +88,7 @@ impl LocalExecutionSession {
         cache: Option<CacheState>,
         overlay_channel: OverlayChannelHandle,
     ) -> ExecutorResult<Self> {
-        let num = provider
-            .provider
-            .best_block_number()
-            .map_err(provider_err)?;
+        let num = provider.headers.best_block_number().map_err(provider_err)?;
         tracing::debug!(block = num, "target session: best block number");
 
         let header = provider
@@ -111,7 +108,7 @@ impl LocalExecutionSession {
         let chain_id = evm_env.cfg_env.chain_id;
         disable_checks(&mut evm_env);
 
-        let db = StateProviderDatabase::new(state_prov);
+        let db = StateProviderDatabase::new(state_prov.into_evm_state_provider());
         let mut builder = State::builder().with_database(db).with_bundle_update();
         if let Some(cache) = cache {
             builder = builder.with_cached_prestate(cache);

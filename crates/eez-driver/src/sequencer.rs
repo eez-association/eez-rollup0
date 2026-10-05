@@ -130,8 +130,9 @@ where
                 .chain_spec
                 .is_cancun_active_at_timestamp(timestamp)
                 .then_some(B256::ZERO),
-            // Amsterdam-fork addition; not active for stage-1 dev chains.
+            // Amsterdam-fork additions; not active for stage-1 dev chains.
             slot_number: None,
+            target_gas_limit: None,
         }
     }
 }

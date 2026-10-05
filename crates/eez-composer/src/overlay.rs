@@ -380,6 +380,8 @@ mod tests {
             use_preloaded_bundle: src.use_preloaded_bundle,
             block_hashes: src.block_hashes.clone(),
             bal_state: src.bal_state.clone(),
+            // A commit callback, not state; the overlay path never installs one.
+            state_hook: None,
         }
     }
 

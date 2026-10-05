@@ -2,7 +2,7 @@
 //! envelopes have no conversion into the public pooled wire format.
 //!
 //! Adapted from reth's `EthPooledTransaction` implementations at the pinned revision:
-//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/transaction-pool/src/traits.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/transaction-pool/src/traits.rs>.
 
 use alloy_consensus::{
     Typed2718,
@@ -56,11 +56,14 @@ impl PoolTransaction for EezPooledTransaction {
 
     fn from_pooled(tx: Recovered<Self::Pooled>) -> Self {
         let tx = EthPooledTransaction::from_pooled(tx);
+        let transaction = tx.transaction.map(EezTxEnvelope::Ethereum);
         Self(EthPooledTransaction {
-            transaction: tx.transaction.map(EezTxEnvelope::Ethereum),
+            in_memory_size: transaction.size(),
+            transaction,
             cost: tx.cost,
             encoded_length: tx.encoded_length,
             blob_sidecar: tx.blob_sidecar,
+            blob_cell_availability: tx.blob_cell_availability,
         })
     }
 

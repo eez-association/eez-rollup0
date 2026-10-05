@@ -26,7 +26,7 @@ use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody, SealedHeader, SignedTransaction};
 use reth_provider::StateProviderFactory;
 use reth_revm::database::StateProviderDatabase;
-use reth_storage_api::{BlockReader, ReceiptProvider, TransactionsProvider};
+use reth_storage_api::{BlockReader, ReceiptProvider, StateProvider, TransactionsProvider};
 use revm::database::State;
 use tokio::sync::broadcast;
 use tracing::{Level, event};
@@ -767,7 +767,8 @@ where
                 );
                 DeriverError::l2_provider(e)
             })?;
-        let state_db = StateProviderDatabase::new(state_provider.as_ref());
+        let state_db =
+            StateProviderDatabase::new(state_provider.as_ref().into_evm_state_provider());
         let mut db = State::builder()
             .with_database(state_db)
             .with_bundle_update()

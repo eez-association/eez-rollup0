@@ -1,12 +1,12 @@
-//! Payload construction adapted from reth-ethereum-payload-builder at fd59fd22
+//! Payload construction adapted from reth-ethereum-payload-builder at v2.7.0
 //! (MIT/Apache-2.0). The pinned upstream builder fixes Ethereum primitives; this
 //! adapter uses EEZ types and excludes blob transactions from L2 payloads.
 //!
 //! Upstream source at the pinned revision:
-//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/payload/src/lib.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/payload/src/lib.rs>.
 
 use alloy_consensus::{Transaction, transaction::TxHashRef};
-use alloy_primitives::{Bytes, U256};
+use alloy_primitives::U256;
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::PayloadAttributes as EthPayloadAttributes;
 use eez_evm::EezEvmConfig;
@@ -22,14 +22,14 @@ use reth_errors::{BlockExecutionError, BlockValidationError, ConsensusError};
 use reth_evm::{
     ConfigureEvm, Evm, NextBlockEnvAttributes,
     block::TxResult,
-    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutor},
+    execute::{BlockBuilder, BlockBuilderOutcome},
 };
 use reth_execution_cache::{CachedStateMetrics, CachedStateMetricsSource, CachedStateProvider};
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::PayloadAttributes;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
 use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_storage_api::StateProviderFactory;
+use reth_storage_api::{EvmStateProvider, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
     ValidPoolTransaction, error::InvalidPoolTransactionError,
@@ -126,8 +126,9 @@ where
 }
 
 /// Builds a Live L2 payload from the best non-blob transactions in the pool.
-/// Copied from upstream `reth-ethereum-payload-builder` at `fd59fd22`, with
-/// EEZ types substituted and blob transaction handling removed.
+/// Copied from upstream `reth-ethereum-payload-builder` at `v2.7.0`, with
+/// EEZ types substituted and the blob-transaction and skip-state-root paths
+/// removed: every L2 block carries its own computed state root.
 #[inline]
 pub fn build_payload<EvmConfig, Client, Tx, F>(
     evm_config: EvmConfig,
@@ -145,7 +146,7 @@ where
     let BuildArguments {
         mut cached_reads,
         execution_cache,
-        trie_handle,
+        mut state_root_handle,
         config,
         cancel,
         best_payload,
@@ -154,17 +155,26 @@ where
         parent_header,
         attributes,
         payload_id,
+        ..
     } = config;
 
-    let mut state_provider = client.state_by_block_hash(parent_header.hash())?;
-    if let Some(execution_cache) = execution_cache {
-        state_provider = Box::new(CachedStateProvider::new(
-            state_provider,
+    let state_provider = client.state_by_block_hash(parent_header.hash())?;
+    let evm_state_provider = (&state_provider).into_evm_state_provider();
+    let cached_state_provider = execution_cache.map(|execution_cache| {
+        CachedStateProvider::new(
+            &evm_state_provider,
             execution_cache.cache().clone(),
-            CachedStateMetrics::zeroed(CachedStateMetricsSource::Builder),
-        ));
-    }
-    let state = StateProviderDatabase::new(state_provider.as_ref());
+            Some(CachedStateMetrics::zeroed(
+                CachedStateMetricsSource::Builder,
+            )),
+        )
+    });
+    let state = StateProviderDatabase::new(
+        cached_state_provider
+            .as_ref()
+            .map(|provider| provider as &dyn EvmStateProvider)
+            .unwrap_or(&evm_state_provider),
+    );
     let chain_spec = client.chain_spec();
     let is_amsterdam = chain_spec.is_amsterdam_active_at_timestamp(attributes.timestamp());
     let mut db = State::builder()
@@ -181,10 +191,11 @@ where
                 timestamp: attributes.timestamp(),
                 suggested_fee_recipient: attributes.suggested_fee_recipient,
                 prev_randao: attributes.prev_randao,
-                gas_limit: builder_config.gas_limit(parent_header.gas_limit),
+                gas_limit: builder_config
+                    .gas_limit_with_target(parent_header.gas_limit, attributes.target_gas_limit()),
                 parent_beacon_block_root: attributes.parent_beacon_block_root(),
                 withdrawals: attributes.withdrawals.clone().map(Into::into),
-                extra_data: builder_config.extra_data,
+                extra_data: builder_config.extra_data.clone(),
                 slot_number: attributes.slot_number(),
             },
         )
@@ -202,11 +213,12 @@ where
     best_txs.skip_blobs();
     let mut total_fees = U256::ZERO;
 
-    // Stream state diffs so the trie task can compute the root alongside execution.
-    if let Some(ref handle) = trie_handle {
+    // Stream state diffs so the state-root task can compute the root alongside execution.
+    if let Some(task) = state_root_handle.as_mut() {
         builder
-            .executor_mut()
-            .set_state_hook(Some(Box::new(handle.state_hook())));
+            .evm_mut()
+            .db_mut()
+            .set_state_hook(Some(Box::new(task.take_state_hook())));
     }
 
     builder.apply_pre_execution_changes().map_err(|err| {
@@ -345,13 +357,13 @@ where
         block,
         block_access_list,
         ..
-    } = if let Some(mut handle) = trie_handle {
-        // Dropping the hook signals the trie task to finalize before we wait for its root.
-        builder.executor_mut().set_state_hook(None);
+    } = if let Some(mut task) = state_root_handle {
+        // Dropping the hook signals the state-root task to finalize before we wait for its root.
+        builder.evm_mut().db_mut().set_state_hook(None);
 
-        match handle.state_root() {
+        match task.state_root() {
             Ok(outcome) => {
-                debug!(target: "payload_builder", id=%payload_id, state_root=?outcome.state_root, "received state root from sparse trie");
+                debug!(target: "payload_builder", id=%payload_id, state_root=?outcome.state_root, job = task.name(), "received state root from state-root job");
                 builder.finish(
                     state_provider.as_ref(),
                     Some((
@@ -361,7 +373,7 @@ where
                 )?
             }
             Err(err) => {
-                warn!(target: "payload_builder", id=%payload_id, %err, "sparse trie failed, falling back to sync state root");
+                warn!(target: "payload_builder", id=%payload_id, %err, "state-root job failed, falling back to sync state root");
                 builder.finish(state_provider.as_ref(), None)?
             }
         }
@@ -373,19 +385,17 @@ where
         .is_prague_active_at_timestamp(attributes.timestamp)
         .then_some(execution_result.requests);
 
-    let sealed_block = Arc::new(block.into_sealed_block());
-    debug!(target: "payload_builder", id=%payload_id, sealed_block_header = ?sealed_block.sealed_header(), "sealed built block");
+    debug!(target: "payload_builder", id=%payload_id, sealed_block_header = ?block.sealed_header(), "sealed built block");
 
-    if is_osaka && sealed_block.rlp_length() > MAX_RLP_BLOCK_SIZE {
+    if is_osaka && block.rlp_length() > MAX_RLP_BLOCK_SIZE {
         return Err(PayloadBuilderError::other(ConsensusError::BlockTooLarge {
-            rlp_length: sealed_block.rlp_length(),
+            rlp_length: block.rlp_length(),
             max_rlp_length: MAX_RLP_BLOCK_SIZE,
         }));
     }
 
-    let block_access_list: Option<Bytes> =
-        block_access_list.map(|block_access_list| alloy_rlp::encode(&block_access_list).into());
-    let payload = EezBuiltPayload::new(sealed_block, total_fees, requests, block_access_list);
+    let block_access_list = block_access_list.map(|bal| bal.split().1);
+    let payload = EezBuiltPayload::new(Arc::new(block), total_fees, requests, block_access_list);
 
     Ok(BuildOutcome::Better {
         payload,
