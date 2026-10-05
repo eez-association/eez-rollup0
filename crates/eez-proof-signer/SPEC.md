@@ -337,6 +337,12 @@ An absent `system[i + 1]` at block end is treated as `true`. Thus an outbound
 `[system-load, user]` pair ends at the user transaction, while a standalone
 inbound system transaction ends at itself.
 
+If the terminal block holds at least one transaction, the plan first requests
+the pre-execution position: the terminal sealed after its pre-block system calls
+and before transaction 0, which is the anchor's candidate. The positions in `C`
+follow in order. An empty terminal requests nothing, since it already is that
+candidate.
+
 The Composer MUST NOT nominate checkpoint positions. The complete plan MUST be
 derived before earlier blocks are replayed. The backend MUST return exactly the
 requested positions in strict order. Preceding blocks MUST return no
@@ -359,12 +365,11 @@ The pre-state root of each block after the first MUST equal the preceding
 block's computed post-state root. This telescope is self-consistency, not proof
 that the first pre-state belongs to the canonical chain.
 
-The window exposes three settlement endpoints, each a block identity taken
-from a header rather than from a backend root:
+The window exposes two settlement endpoints, each a block identity taken from
+a header rather than from a backend root:
 
 - `window_pre_block_hash`: parent hash of the first block, which for a
-  one-block window is the terminal block's parent;
-- `settling_pre_block_hash`: parent hash of the terminal block; and
+  one-block window is the terminal block's parent; and
 - `window_post_block_hash`: computed hash of the terminal block.
 
 ### 6.4 Stateful replay guarantees
@@ -526,8 +531,10 @@ Every later entry MUST be one of:
 A second anchor or any other shape MUST be rejected.
 
 The anchor's `etherDelta` MUST be zero. If at least one effect exists, the
-anchor's `newState` MUST equal `settling_pre_block_hash`. If no effects exist,
-the anchor alone covers the complete window transition.
+anchor's `newState` MUST equal the block hash of the leading pre-execution
+checkpoint: the terminal block sealed over no transactions. Every commitment
+then names a block at the terminal's height. If no effects exist, the anchor
+alone covers the complete window transition, and no checkpoint may be returned.
 
 For every effect at candidate position `C[i]`, the backend checkpoint MUST
 target `C[i]`, and the effect's `StateUpdate.newState` MUST equal the hash of

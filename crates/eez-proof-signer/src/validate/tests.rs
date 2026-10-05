@@ -30,9 +30,9 @@ fn admitted_block_with_transactions(number: u64, hash: u8, count: usize) -> Admi
     input
 }
 
-fn checkpoint(transaction_index: usize, state_root: u8) -> TransactionStateCheckpoint {
-    TransactionStateCheckpoint {
-        transaction_index,
+fn checkpoint(transaction_index: usize, state_root: u8) -> StateCheckpoint {
+    StateCheckpoint {
+        at: CheckpointAt::Transaction(transaction_index),
         state_root: B256::repeat_byte(state_root),
         block_hash: B256::with_last_byte(0xc0 ^ (transaction_index as u8)),
     }

@@ -84,10 +84,12 @@ async fn post_ahead(
                 .to(eez)
                 .input(postAndVerifyBatchCall { batch }.abi_encode().into())
                 // Ordering within the block is by effective tip, and the
-                // composer posts at its configured priority fee.
-                .max_priority_fee_per_gas(500_000_000_000u128)
-                .max_fee_per_gas(1_000_000_000_000u128)
-                .gas_limit(8_000_000),
+                // composer posts at its configured priority fee. The L1 node
+                // rejects txs whose worst-case fee exceeds its 1 ETH
+                // `--rpc.txfeecap`; this stays under it (4M gas × 200 gwei).
+                .max_priority_fee_per_gas(100_000_000_000u128)
+                .max_fee_per_gas(200_000_000_000u128)
+                .gas_limit(4_000_000),
         )
         .await?;
     Ok(*pending.tx_hash())

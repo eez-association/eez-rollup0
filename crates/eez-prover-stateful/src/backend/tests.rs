@@ -168,6 +168,16 @@ impl HeaderProvider for ReorgingProvider {
 }
 
 impl StateProviderFactory for ReorgingProvider {
+    type Primitives = <MockEthProvider as StateProviderFactory>::Primitives;
+
+    fn state_with_block_appended(
+        &self,
+        parent_hash: B256,
+        block: reth_chain_state::ExecutedBlock<Self::Primitives>,
+    ) -> ProviderResult<StateProviderBox> {
+        self.inner.state_with_block_appended(parent_hash, block)
+    }
+
     fn latest(&self) -> ProviderResult<StateProviderBox> {
         self.inner.latest()
     }
@@ -309,9 +319,9 @@ fn empty_checkpoint_execution_retains_transaction_state() {
     let provider: MockEthProvider = MockEthProvider::new();
     provider.add_account(sender, ExtendedAccount::new(0, U256::from(u64::MAX)));
     let mut state = State::builder()
-        .with_database(StateProviderDatabase::new(
-            Box::new(provider) as Box<dyn StateProvider + Send>
-        ))
+        .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(
+            Box::new(provider) as Box<dyn StateProvider + Send>,
+        )))
         .with_bundle_update()
         .build();
 
@@ -584,17 +594,21 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
         let provider: MockEthProvider = MockEthProvider::new();
         provider.add_state_root(B256::repeat_byte(0x11));
         let mut state = State::builder()
-            .with_database(StateProviderDatabase::new(
-                Box::new(provider) as Box<dyn StateProvider + Send>
-            ))
+            .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(
+                Box::new(provider) as Box<dyn StateProvider + Send>,
+            )))
             .with_bundle_update()
             .build();
         let result = if with_checkpoints {
-            let (result, checkpoints, _) =
-                execute_block_with_state_checkpoints(&evm_config, &mut state, &block, &[0])
-                    .unwrap();
+            let (result, checkpoints, _) = execute_block_with_state_checkpoints(
+                &evm_config,
+                &mut state,
+                &block,
+                &[CheckpointAt::Transaction(0)],
+            )
+            .unwrap();
             assert_eq!(checkpoints.len(), 1);
-            assert_eq!(checkpoints[0].transaction_index, 0);
+            assert_eq!(checkpoints[0].at, CheckpointAt::Transaction(0));
             result
         } else {
             execute_block(&evm_config, &mut state, &block).unwrap()
@@ -649,9 +663,9 @@ fn beacon_withdrawals_are_rejected_in_both_stateful_replay_paths() {
     for with_checkpoints in [false, true] {
         let provider: MockEthProvider = MockEthProvider::new();
         let mut state = State::builder()
-            .with_database(StateProviderDatabase::new(
-                Box::new(provider) as Box<dyn StateProvider + Send>
-            ))
+            .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(
+                Box::new(provider) as Box<dyn StateProvider + Send>,
+            )))
             .with_bundle_update()
             .build();
         let error = if with_checkpoints {

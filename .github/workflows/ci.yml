@@ -35,6 +35,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
+      - name: Install LLVM 22
+        run: |
+          sudo bash scripts/ci/install-llvm.sh
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -58,6 +63,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
+      - name: Install LLVM 22
+        run: |
+          sudo bash scripts/ci/install-llvm.sh
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
       - name: Unit tests (lib + bins, parallel)
         run: cargo nextest run --locked --workspace --lib --bins --no-fail-fast
       - name: Protocol integration vectors
@@ -125,6 +135,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
+      - name: Install LLVM 22
+        run: |
+          sudo bash scripts/ci/install-llvm.sh
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
       - name: Archive integration test executables
         run: |
           mkdir -p artifacts/e2e-build
