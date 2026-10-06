@@ -126,6 +126,22 @@ wait_commitment_convergence() {
     return 1
 }
 
+resubmit_until_settled() {
+    local raw="$1" hash="$2" deadline status
+    deadline=$((SECONDS + WAIT_SECS))
+    while (( SECONDS < deadline )); do
+        status=$(receipt_status "$hash" "$L1")
+        [[ "$status" == "1" ]] && return 0
+        [[ "$status" != "0x0" ]] || { echo "transaction $hash reverted" >&2; return 1; }
+        # The transaction may settle between the receipt check and resubmission.
+        send_front "$L1F" "$raw" "$hash" \
+            || [[ "$(receipt_status "$hash" "$L1")" == "1" ]] || return 1
+        sleep 24
+    done
+    echo "transaction $hash did not settle after recovery" >&2
+    return 1
+}
+
 wait_l2_rpc() {
     local deadline
     deadline=$((SECONDS + WAIT_SECS))
@@ -199,7 +215,7 @@ wait_l1_blocks 2
     || { echo "relay-outage transaction changed destination state before settlement" >&2; exit 1; }
 kurtosis service start "$ENCLAVE" mev-relay-api
 RELAY_STOPPED=0
-wait_receipt_ok "$relay_hash"
+resubmit_until_settled "$relay_raw" "$relay_hash"
 wait_safe_value 42
 wait_commitment_convergence
 
@@ -277,5 +293,5 @@ jq -n \
     }' >"$RESULT_DIR/checks/fault-recovery.json"
 
 echo "    ✓ signer outage preserved safety and recovered the pending transaction"
-echo "    ✓ relay and builder outages preserved safety, L1 liveness, and pending transactions"
+echo "    ✓ relay and builder outages preserved safety and L1 liveness with transactions settling after recovery"
 echo "    ✓ node restart preserved the exact safe prefix and settled fresh traffic"
