@@ -141,7 +141,7 @@ where
             hashes.push(*envelope.tx_hash());
             requests.push(call_request(&envelope, from));
         }
-        let next_block = EthApiServer::block_number(&*eth_api).await? + U256::from(1);
+        let next_block = EthApiServer::block_number(&*eth_api)? + U256::from(1);
         let bundles = serde_json::from_value(serde_json::json!([{
             "transactions": requests,
             "blockOverride": { "number": next_block },
