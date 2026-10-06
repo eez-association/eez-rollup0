@@ -34,27 +34,10 @@ impl CheckpointPlan {
         Self { positions }
     }
 
-    /// V2 needs candidate checkpoints only for system-transaction-bearing blocks.
+    /// Derive Sync-candidate checkpoints and system-sender flags for either RPC version.
     /// A valid nonempty Sync contains native system transactions; an empty Sync
-    /// needs no checkpoints. Settlement still verifies the exact effect layout.
-    pub fn for_streamed_block(
-        block: &RecoveredBlock<Block>,
-        expected_l2_system_address: Address,
-    ) -> (Self, Vec<bool>) {
-        if block.body().transactions.iter().any(is_system_tx) {
-            Self::from_recovered_block(block, expected_l2_system_address)
-        } else {
-            (
-                Self {
-                    positions: Vec::new(),
-                },
-                system_sender_flags(block, expected_l2_system_address),
-            )
-        }
-    }
-
-    /// Derive effect-candidate boundaries and system-sender flags.
-    pub fn from_recovered_block(
+    /// or ordinary block needs none. Settlement still verifies the exact effect layout.
+    pub fn for_block(
         block: &RecoveredBlock<Block>,
         expected_l2_system_address: Address,
     ) -> (Self, Vec<bool>) {
@@ -66,18 +49,17 @@ impl CheckpointPlan {
             system_sender_flags.push(is_system_sender);
             sync_system_transaction_flags.push(is_system_tx(&transaction));
         }
-        // The anchor's candidate leads: the block sealed after the pre-block
-        // system calls, holding no transactions. With no transactions at all the
-        // block already IS that candidate, so sealing it again is redundant.
         let mut positions = Vec::new();
-        if transaction_count > 0 {
+        if sync_system_transaction_flags.contains(&true) {
+            // The anchor's candidate leads: the block sealed after the pre-block
+            // system calls, holding no transactions. Effect boundaries follow.
             positions.push(CheckpointAt::PreExecution);
+            positions.extend(
+                pair_end_positions(&sync_system_transaction_flags)
+                    .into_iter()
+                    .map(CheckpointAt::Transaction),
+            );
         }
-        positions.extend(
-            pair_end_positions(&sync_system_transaction_flags)
-                .into_iter()
-                .map(CheckpointAt::Transaction),
-        );
         (Self { positions }, system_sender_flags)
     }
 

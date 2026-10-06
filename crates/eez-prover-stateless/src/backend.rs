@@ -56,28 +56,6 @@ struct PreparedSettlingBlock {
     system_sender_flags: Vec<bool>,
 }
 
-/// Each block must execute from its predecessor's post-state.
-///
-/// This is what proves a window is one contiguous execution rather than a set
-/// of independently valid blocks. Free fn so a test can drive it directly —
-/// real replay cannot produce a discontinuous window to exercise it with.
-///
-/// The rejection message keeps the word "telescope": that is the term the
-/// signer SPEC and operator runbooks use for this property.
-fn executes_from_previous_post_state(
-    block_number: u64,
-    pre_state_root: B256,
-    previous_post_state_root: B256,
-) -> Result<(), String> {
-    if pre_state_root != previous_post_state_root {
-        return Err(format!(
-            "stateless state roots do not telescope at block {block_number}: expected \
-             pre-state root {previous_post_state_root}, got {pre_state_root}",
-        ));
-    }
-    Ok(())
-}
-
 /// In-process Stateless/Reth backend configured from operator-selected rules.
 #[derive(Debug, Clone)]
 pub struct Backend {
@@ -189,22 +167,15 @@ impl Backend {
         }
         let mut block_outputs = Vec::<Arc<ValidatedBlock>>::with_capacity(total_blocks);
 
-        // V1 nominates its terminal for checkpoints. A one-block v2 request does
-        // not: derive whether it needs Sync checkpoints from its transactions.
+        // Derive Sync checkpoints from block contents, regardless of RPC version.
         // Plan before consuming witnesses or replaying earlier v1 blocks.
         check_cancellation(cancellation, 0, total_blocks)?;
         let mut prepared_settling_block = blocks
             .last()
             .map(|admitted| {
                 let recovered_block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
-                let (checkpoint_plan, system_sender_flags) = if parent.is_some() {
-                    CheckpointPlan::for_streamed_block(&recovered_block, expected_l2_system_address)
-                } else {
-                    CheckpointPlan::from_recovered_block(
-                        &recovered_block,
-                        expected_l2_system_address,
-                    )
-                };
+                let (checkpoint_plan, system_sender_flags) =
+                    CheckpointPlan::for_block(&recovered_block, expected_l2_system_address);
                 Ok(PreparedSettlingBlock {
                     block: recovered_block,
                     checkpoint_plan,
@@ -295,22 +266,17 @@ impl Backend {
                 execution_output,
                 block_access_list: _validated_block_access_list,
             } = stateless_output;
-            if index == 0
-                && let Some(parent) = parent
-            {
-                executes_from_previous_post_state(block_number, pre_state_root, parent.state_root)
-                    .map_err(ValidationError::Rejected)?;
-            }
+            // Continue from the previous output, or the supplied parent for a v2 block.
             if let Some(previous_post_state_root) = block_outputs
                 .last()
-                .map(|output| output.as_anchor().state_root)
+                .map(|output| output.post_state_root())
+                .or_else(|| parent.map(|parent| parent.state_root))
+                && pre_state_root != previous_post_state_root
             {
-                executes_from_previous_post_state(
-                    block_number,
-                    pre_state_root,
-                    previous_post_state_root,
-                )
-                .map_err(ValidationError::Rejected)?;
+                return Err(ValidationError::Rejected(format!(
+                    "stateless state roots do not telescope at block {block_number}: expected \
+                     pre-state root {previous_post_state_root}, got {pre_state_root}",
+                )));
             }
 
             // These receipts come from successful replay. Observed outbound
@@ -415,7 +381,6 @@ impl ValidationBackend for Backend {
 
     async fn validate_next(
         &self,
-        _anchor: IncrementalAnchor,
         parent: IncrementalAnchor,
         block: &AdmittedBlock,
         witness: ExecutionWitness,

@@ -57,6 +57,7 @@ impl Session {
             .last()
             .map_or(self.anchor, |block| block.validated.as_anchor())
     }
+
     /// Select a nonempty window from the prefix whose continuity append maintains.
     fn select_window(
         &self,
@@ -636,7 +637,6 @@ impl IncrementalRuntime {
             return Ok(validated_response(existing, false));
         }
 
-        let anchor = session_guard.anchor;
         let parent = session_guard.tip();
         // Parse the wire fields; the shared validator checks the block's parent and number.
         let payload_bytes = submitted.encoded_len();
@@ -683,7 +683,7 @@ impl IncrementalRuntime {
         let (cached, reused) = self
             .state
             .validator
-            .validate_next(anchor, parent, admitted, self.limits.request_timeout())
+            .validate_next(parent, admitted, self.limits.request_timeout())
             .await
             .map_err(validation_status)?;
 
@@ -733,9 +733,7 @@ impl IncrementalRuntime {
         let state = Arc::clone(&self.state);
         match timeout(
             self.limits.request_timeout(),
-            state
-                .validator
-                .recheck_incremental(anchor, &validated_window),
+            state.validator.recheck_incremental(&validated_window),
         )
         .await
         {
@@ -1015,7 +1013,6 @@ mod tests {
 
         async fn validate_next(
             &self,
-            _anchor: IncrementalAnchor,
             parent: IncrementalAnchor,
             block: &AdmittedBlock,
             _witness: ExecutionWitness,

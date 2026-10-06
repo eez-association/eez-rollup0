@@ -111,7 +111,7 @@ fn cached_engine(
     let hash = block.header.hash_slow();
     let input = admitted_block(block.clone());
     let recovered = decode_match_and_recover_signers(&input, &chain_spec).unwrap();
-    let (plan, _) = CheckpointPlan::for_streamed_block(&recovered, SYSTEM_ADDRESS);
+    let (plan, _) = CheckpointPlan::for_block(&recovered, SYSTEM_ADDRESS);
     assert_eq!(!plan.positions().is_empty(), with_checkpoints);
     let provider = MockEthProvider::<EezPrimitives>::new();
     provider.add_header(anchor.hash, parent.clone());
@@ -172,10 +172,17 @@ async fn incremental_reuses_reth_and_backend_checkpoints_without_execution() {
         // No historical execution state is installed. The nonempty ordinal
         // case must use Reth's receipts without opening state to replay checkpoints.
         let (engine, anchor, input) = cached_engine(kind);
+        // Untrusted anchor fields are checked at admission, not on each Reth lookup.
+        let mut wrong_anchor = anchor;
+        wrong_anchor.state_root = B256::ZERO;
+        assert!(matches!(
+            engine.begin_incremental(wrong_anchor),
+            Err(ValidationError::Rejected(_))
+        ));
+        engine.begin_incremental(anchor).unwrap();
         let with_checkpoints = kind == "sync";
         let (output, reused) = engine
             .validate_next(
-                anchor,
                 anchor,
                 &input,
                 ExecutionWitness::default(),
@@ -197,20 +204,6 @@ async fn incremental_reuses_reth_and_backend_checkpoints_without_execution() {
             },
         );
         assert_eq!(output.hash(), input.claimed_hash());
-        let mut wrong_parent = anchor;
-        wrong_parent.state_root = B256::ZERO;
-        assert!(
-            engine
-                .validate_next(
-                    anchor,
-                    wrong_parent,
-                    &input,
-                    ExecutionWitness::default(),
-                    Duration::from_secs(1)
-                )
-                .await
-                .is_err()
-        );
         let changed = admitted_block_from_consensus_rlp(
             input.declared_number(),
             input.claimed_hash(),
@@ -220,7 +213,6 @@ async fn incremental_reuses_reth_and_backend_checkpoints_without_execution() {
         assert!(
             engine
                 .validate_next(
-                    anchor,
                     anchor,
                     &changed,
                     ExecutionWitness::default(),
@@ -235,7 +227,6 @@ async fn incremental_reuses_reth_and_backend_checkpoints_without_execution() {
             assert!(
                 engine
                     .validate_next(
-                        anchor,
                         anchor,
                         &input,
                         ExecutionWitness::default(),
@@ -257,7 +248,6 @@ async fn incremental_deadline_bounds_waiting_for_reconciliation() {
         engine
             .validate_next(
                 anchor,
-                anchor,
                 &input,
                 ExecutionWitness::default(),
                 Duration::from_millis(10)
@@ -269,7 +259,6 @@ async fn incremental_deadline_bounds_waiting_for_reconciliation() {
     assert!(
         engine
             .validate_next(
-                anchor,
                 anchor,
                 &input,
                 ExecutionWitness::default(),
@@ -345,7 +334,6 @@ struct ReorgingProvider {
     anchor_hash: B256,
     reorged_anchor_hash: B256,
     anchor_reads: AtomicUsize,
-    safe: Option<BlockNumHash>,
 }
 
 impl BlockHashReader for ReorgingProvider {
@@ -465,7 +453,7 @@ impl BlockIdReader for ReorgingProvider {
     }
 
     fn safe_block_num_hash(&self) -> ProviderResult<Option<BlockNumHash>> {
-        Ok(self.safe)
+        self.inner.safe_block_num_hash()
     }
 
     fn finalized_block_num_hash(&self) -> ProviderResult<Option<BlockNumHash>> {
@@ -488,9 +476,14 @@ fn backend_identity_is_fixed_at_construction() {
 #[test]
 fn checkpoint_plan_is_not_limited_before_the_provider_is_read() {
     let chain_spec = Arc::new(ChainSpec::default());
-    let transaction = TxLegacy::default()
-        .into_signed(Signature::test_signature())
-        .into();
+    let transaction = eez_primitives::SystemTransaction {
+        chain_id: 1,
+        nonce: 0,
+        to: eez_primitives::EEZL2_ADDRESS,
+        value: U256::ZERO,
+        input: Bytes::new(),
+    }
+    .into();
     let blocks = [admitted_block(Block {
         header: Header {
             number: 1,
@@ -696,7 +689,6 @@ fn anchor_reorg_is_aborted_through_the_complete_validation_path() {
         anchor_hash,
         reorged_anchor_hash: B256::repeat_byte(4),
         anchor_reads: AtomicUsize::new(0),
-        safe: None,
     };
     let blocks = [admitted(1, anchor_hash, terminal_root)];
 
@@ -712,60 +704,6 @@ fn anchor_reorg_is_aborted_through_the_complete_validation_path() {
 
     assert!(matches!(error, ValidationError::Aborted(_)));
     assert!(error.to_string().contains("canonical anchor"));
-}
-
-#[test]
-fn incremental_cursor_accepts_only_safe_heads_on_its_exact_reth_ancestry() {
-    let inner = MockEthProvider::new();
-    let anchor_root = B256::repeat_byte(0x10);
-    let anchor_header = Header {
-        number: 0,
-        state_root: anchor_root,
-        ..Default::default()
-    };
-    let anchor_hash = anchor_header.hash_slow();
-    inner.add_header(anchor_hash, anchor_header);
-    let safe_header = Header {
-        number: 1,
-        parent_hash: anchor_hash,
-        state_root: B256::repeat_byte(0x11),
-        ..Default::default()
-    };
-    let safe_hash = safe_header.hash_slow();
-    inner.add_header(safe_hash, safe_header);
-    let cursor_header = Header {
-        number: 2,
-        parent_hash: safe_hash,
-        state_root: B256::repeat_byte(0x12),
-        ..Default::default()
-    };
-    let cursor_hash = cursor_header.hash_slow();
-    let cursor = SealedHeader::new(cursor_header, cursor_hash);
-    let anchor = IncrementalAnchor {
-        number: 0,
-        hash: anchor_hash,
-        state_root: anchor_root,
-    };
-
-    let provider = ReorgingProvider {
-        inner: inner.clone(),
-        anchor_hash,
-        reorged_anchor_hash: anchor_hash,
-        anchor_reads: AtomicUsize::new(0),
-        safe: Some(BlockNumHash::new(1, safe_hash)),
-    };
-    ensure_safe_ancestor(&provider, anchor, &cursor).unwrap();
-
-    let conflicting = ReorgingProvider {
-        inner,
-        anchor_hash,
-        reorged_anchor_hash: anchor_hash,
-        anchor_reads: AtomicUsize::new(0),
-        safe: Some(BlockNumHash::new(1, B256::repeat_byte(0xff))),
-    };
-    let error = ensure_safe_ancestor(&conflicting, anchor, &cursor).unwrap_err();
-    assert!(matches!(error, ValidationError::Aborted(_)));
-    assert!(error.to_string().contains("is not an ancestor"));
 }
 
 #[test]

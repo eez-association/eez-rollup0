@@ -66,26 +66,31 @@ fn incremental_input(
 async fn incremental_ordinal_execution_skips_checkpoints_and_checks_cache_hits() {
     // A real three-user-transaction block, not an empty block that would skip
     // checkpoint work even before the v2 selection fix.
-    let (input, config, _) = checkpoint_fixture();
+    let (input, config) = checkpoint_fixture();
     let (input, witness, parent) = incremental_input(input);
     let backend = Backend::new(config, TEST_SYSTEM_ADDRESS);
     let deadline = Duration::from_secs(10);
     // A real miss needs a valid witness; failure must not poison the cache.
     assert!(
         backend
-            .validate_next(
-                parent,
-                parent,
-                &input,
-                ExecutionWitness::default(),
-                deadline
-            )
+            .validate_next(parent, &input, ExecutionWitness::default(), deadline)
             .await
             .is_err()
     );
+    // Successful replay must still bind to the supplied parent's state root.
+    let wrong_parent = IncrementalAnchor {
+        state_root: !parent.state_root,
+        ..parent
+    };
+    assert!(matches!(
+        backend
+            .validate_next(wrong_parent, &input, witness.clone(), deadline)
+            .await,
+        Err(ValidationError::Rejected(reason)) if reason.contains("do not telescope")
+    ));
     assert!(backend.blocks.lock().unwrap().is_empty());
     let (fresh, reused) = backend
-        .validate_next(parent, parent, &input, witness, deadline)
+        .validate_next(parent, &input, witness, deadline)
         .await
         .unwrap();
     assert!(!reused);
@@ -94,13 +99,7 @@ async fn incremental_ordinal_execution_skips_checkpoints_and_checks_cache_hits()
     assert!(fresh.transaction_state_checkpoints().is_empty());
     // No witness is available to re-execute, so success proves backend cache reuse.
     let (cached, reused) = backend
-        .validate_next(
-            parent,
-            parent,
-            &input,
-            ExecutionWitness::default(),
-            deadline,
-        )
+        .validate_next(parent, &input, ExecutionWitness::default(), deadline)
         .await
         .unwrap();
     assert!(reused);
@@ -127,7 +126,6 @@ async fn incremental_ordinal_execution_skips_checkpoints_and_checks_cache_hits()
         assert!(
             backend
                 .validate_next(
-                    parent,
                     submitted_parent,
                     &submitted,
                     ExecutionWitness::default(),
@@ -142,7 +140,7 @@ async fn incremental_ordinal_execution_skips_checkpoints_and_checks_cache_hits()
 }
 
 #[tokio::test]
-async fn incremental_sync_execution_generates_and_reuses_checkpoints() {
+async fn sync_execution_generates_and_reuses_checkpoints() {
     use alloy_consensus::TxReceipt as _;
     use alloy_consensus::proofs::{
         calculate_receipt_root, calculate_transaction_root, calculate_withdrawals_root,
@@ -218,17 +216,19 @@ async fn incremental_sync_execution_generates_and_reuses_checkpoints() {
             ..Default::default()
         },
     );
-    let (input, witness, parent) = incremental_input(input);
     let mut config = fixture_chain_config();
     config.prague_time = None;
     config.osaka_time = None;
     let backend = Backend::new(config, TEST_SYSTEM_ADDRESS);
+    let v1 = backend.validate(vec![input.clone()]).unwrap();
+    let (input, witness, parent) = incremental_input(input);
     let (fresh, reused) = backend
-        .validate_next(parent, parent, &input, witness, Duration::from_secs(10))
+        .validate_next(parent, &input, witness, Duration::from_secs(10))
         .await
         .unwrap();
     assert!(!reused);
     let checkpoints = fresh.transaction_state_checkpoints();
+    assert_eq!(v1.blocks[0].transaction_state_checkpoints(), checkpoints);
     assert_eq!(checkpoints.len(), 2);
     assert_eq!(checkpoints[0].at, CheckpointAt::PreExecution);
     assert_eq!(checkpoints[0].state_root, parent.state_root);
@@ -238,7 +238,6 @@ async fn incremental_sync_execution_generates_and_reuses_checkpoints() {
     assert_eq!(checkpoints[1].block_hash, fresh.hash());
     let (cached, reused) = backend
         .validate_next(
-            parent,
             parent,
             &input,
             ExecutionWitness::default(),
@@ -261,18 +260,12 @@ async fn concurrent_incremental_misses_publish_one_cached_result() {
         .unwrap();
     let mut first = std::pin::pin!(backend.validate_next(
         parent,
-        parent,
         &input,
         witness.clone(),
         Duration::from_secs(10)
     ));
-    let mut second = std::pin::pin!(backend.validate_next(
-        parent,
-        parent,
-        &input,
-        witness,
-        Duration::from_secs(10)
-    ));
+    let mut second =
+        std::pin::pin!(backend.validate_next(parent, &input, witness, Duration::from_secs(10)));
     // Poll each past its cache miss into the occupied semaphore, deterministically.
     tokio::select! { biased; _ = &mut first => panic!("execution slot is held"), _ = std::future::ready(()) => {} }
     tokio::select! { biased; _ = &mut second => panic!("execution slot is held"), _ = std::future::ready(()) => {} }
@@ -289,7 +282,6 @@ async fn concurrent_incremental_misses_publish_one_cached_result() {
     assert!(
         backend
             .validate_next(
-                parent,
                 parent,
                 &input,
                 ExecutionWitness::default(),
@@ -312,13 +304,7 @@ async fn incremental_deadline_includes_waiting_for_backend_capacity() {
         .unwrap();
     assert!(matches!(
         backend
-            .validate_next(
-                parent,
-                parent,
-                &input,
-                witness.clone(),
-                Duration::from_millis(10)
-            )
+            .validate_next(parent, &input, witness.clone(), Duration::from_millis(10))
             .await,
         Err(ValidationError::DeadlineExceeded)
     ));
@@ -326,7 +312,7 @@ async fn incremental_deadline_includes_waiting_for_backend_capacity() {
     drop(slots);
     assert!(
         !backend
-            .validate_next(parent, parent, &input, witness, Duration::from_secs(10))
+            .validate_next(parent, &input, witness, Duration::from_secs(10))
             .await
             .unwrap()
             .1
@@ -352,7 +338,7 @@ fn timed_out_incremental_worker_keeps_its_slot_and_publishes_only_after_success(
         ready.await.unwrap();
         // The validation owns a backend slot but cannot enter the occupied blocking worker yet.
         let result = backend
-            .validate_next(parent, parent, &input, witness, Duration::from_millis(10))
+            .validate_next(parent, &input, witness, Duration::from_millis(10))
             .await;
         let available = backend.validation_slots.available_permits();
         let cached_before_execution = backend.blocks.lock().unwrap().len();
@@ -375,7 +361,6 @@ fn timed_out_incremental_worker_keeps_its_slot_and_publishes_only_after_success(
             backend
                 .validate_next(
                     parent,
-                    parent,
                     &input,
                     ExecutionWitness::default(),
                     Duration::from_secs(1)
@@ -388,10 +373,8 @@ fn timed_out_incremental_worker_keeps_its_slot_and_publishes_only_after_success(
     });
 }
 
-/// The recorded fixture plus the `(transaction_index, state_root)` pairs its
-/// oracle states. The oracle records no block hashes; tests assert those
-/// against the block itself.
-fn checkpoint_fixture() -> (AdmittedBlock, ChainConfig, Vec<(usize, B256)>) {
+/// A recorded three-user-transaction block and its execution configuration.
+fn checkpoint_fixture() -> (AdmittedBlock, ChainConfig) {
     let rlp = hex::decode(
         include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -412,25 +395,6 @@ fn checkpoint_fixture() -> (AdmittedBlock, ChainConfig, Vec<(usize, B256)>) {
         "/tests/fixtures/stateless-checkpoint-2175/checkpoint-chain-config.json"
     )))
     .unwrap();
-    let oracle: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/stateless-checkpoint-2175/checkpoint-oracle-2175.json"
-    )))
-    .unwrap();
-    let indices = oracle["expected_checkpoint_indices"].as_array().unwrap();
-    let roots = oracle["transaction_state_roots"].as_array().unwrap();
-    assert_eq!(indices.len(), roots.len());
-    let checkpoints = indices
-        .iter()
-        .zip(roots)
-        .map(|(transaction_index, state_root)| {
-            (
-                usize::try_from(transaction_index.as_u64().unwrap()).unwrap(),
-                state_root.as_str().unwrap().parse::<B256>().unwrap(),
-            )
-        })
-        .collect();
-
     (
         admitted_block_with_witness(
             block.header.number,
@@ -440,7 +404,6 @@ fn checkpoint_fixture() -> (AdmittedBlock, ChainConfig, Vec<(usize, B256)>) {
             witness,
         ),
         chain_config,
-        checkpoints,
     )
 }
 
@@ -523,22 +486,6 @@ fn receipt_with_logs(logs: Vec<Log>) -> EthereumReceipt {
         logs,
         ..Default::default()
     }
-}
-
-/// A window is one contiguous execution, not a set of independently valid
-/// blocks. Nothing else covers this: real replay cannot produce a
-/// non-telescoping window, so the check is driven directly.
-#[test]
-fn a_block_not_executing_from_its_predecessors_post_state_is_rejected() {
-    let root = B256::repeat_byte(0x11);
-    assert!(super::executes_from_previous_post_state(5, root, root).is_ok());
-
-    let error = super::executes_from_previous_post_state(5, root, B256::repeat_byte(0x22))
-        .expect_err("a block not executing from its predecessor's post-state must be rejected");
-    assert!(
-        error.contains("do not telescope at block 5"),
-        "unexpected: {error}"
-    );
 }
 
 #[test]
@@ -707,8 +654,7 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
         vec![TEST_SYSTEM_ADDRESS, Address::ZERO, TEST_SYSTEM_ADDRESS],
     );
 
-    let (plan, system_sender_flags) =
-        CheckpointPlan::from_recovered_block(&recovered, TEST_SYSTEM_ADDRESS);
+    let (plan, system_sender_flags) = CheckpointPlan::for_block(&recovered, TEST_SYSTEM_ADDRESS);
 
     assert_eq!(system_sender_flags, [true, false, true]);
     // The anchor's candidate leads, then the pair ends.
@@ -722,10 +668,10 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
     );
 }
 
-/// The final transaction is ALWAYS a planned boundary. The stateless backend's
-/// post-execution-neutrality check silently stops running if that ever breaks.
+/// Every nonempty plan includes the final transaction, which activates
+/// Stateless's post-execution-neutrality check. Ordinary blocks need no plan.
 #[test]
-fn checkpoint_plan_always_ends_at_the_final_transaction() {
+fn checkpoint_plan_is_empty_or_ends_at_the_final_transaction() {
     let system = || {
         <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(
             &hex::decode(SYSTEM_TX).unwrap(),
@@ -739,7 +685,7 @@ fn checkpoint_plan_always_ends_at_the_final_transaction() {
     };
 
     // Every system/user shape up to six transactions.
-    for width in 1..=6usize {
+    for width in 0..=6usize {
         for mask in 0..(1u32 << width) {
             let shape: Vec<bool> = (0..width).map(|i| mask >> i & 1 == 1).collect();
             let block = Block::new(
@@ -753,7 +699,12 @@ fn checkpoint_plan_always_ends_at_the_final_transaction() {
                 },
             );
             let recovered = RecoveredBlock::new_unhashed(block, vec![TEST_SYSTEM_ADDRESS; width]);
-            let (plan, _) = CheckpointPlan::from_recovered_block(&recovered, TEST_SYSTEM_ADDRESS);
+            let (plan, _) = CheckpointPlan::for_block(&recovered, TEST_SYSTEM_ADDRESS);
+
+            if mask == 0 {
+                assert!(plan.positions().is_empty(), "ordinary shape {shape:?}");
+                continue;
+            }
 
             assert_eq!(
                 plan.positions().last(),
@@ -787,7 +738,7 @@ fn checkpoint_plan_includes_every_inbound_boundary() {
             RecoveredBlock::new_unhashed(block, vec![TEST_SYSTEM_ADDRESS; transaction_count]);
 
         let (plan, system_sender_flags) =
-            CheckpointPlan::from_recovered_block(&recovered, TEST_SYSTEM_ADDRESS);
+            CheckpointPlan::for_block(&recovered, TEST_SYSTEM_ADDRESS);
 
         assert_eq!(system_sender_flags, vec![true; transaction_count]);
         let mut expected = vec![CheckpointAt::PreExecution];
@@ -896,8 +847,8 @@ fn validates_the_golden_block_through_stateless() {
 }
 
 #[test]
-fn selected_checkpoints_flow_through_the_stateless_adapter() {
-    let (mut input, chain_config, expected) = checkpoint_fixture();
+fn ordinary_v1_terminal_executes_without_checkpoints() {
+    let (mut input, chain_config) = checkpoint_fixture();
     let expected_hash = input.claimed_hash();
 
     let output = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
@@ -908,6 +859,7 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
         .unwrap();
 
     let block = &output.blocks[0];
+    assert_eq!(block.decoded().body.transactions.len(), 3);
     assert_eq!(
         block.settlement_evidence().system_sender_flags,
         [false, false, false]
@@ -920,33 +872,7 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
     );
     assert_eq!(block.hash(), expected_hash);
 
-    let observed = &block.transaction_state_checkpoints();
-    assert_eq!(
-        observed
-            .iter()
-            .filter_map(|c| match c.at {
-                CheckpointAt::Transaction(index) => Some((index, c.state_root)),
-                CheckpointAt::PreExecution => None,
-            })
-            .collect::<Vec<_>>(),
-        expected,
-        "indices and state roots must match the recorded oracle",
-    );
-
-    // The oracle records no block hashes, so assert what must hold of real
-    // ones: the full-prefix candidate IS this block, and shorter prefixes are
-    // different blocks.
-    let last = observed.last().expect("the fixture selects every boundary");
-    assert_eq!(last.at, CheckpointAt::Transaction(2));
-    assert_eq!(
-        last.block_hash, expected_hash,
-        "the candidate holding every transaction must be the block itself",
-    );
-    assert!(
-        observed[..2].iter().all(|c| c.block_hash != expected_hash),
-        "a proper prefix must not seal to the block's own hash",
-    );
-    assert_ne!(observed[0].block_hash, observed[1].block_hash);
+    assert!(block.transaction_state_checkpoints().is_empty());
 }
 
 #[test]

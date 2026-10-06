@@ -522,11 +522,12 @@ pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
     }
 
     /// Validate or reuse one block against its exact parent, returning whether execution was reused.
+    /// The parent is the session's admitted anchor or a previously validated block.
+    /// The session owns prefix continuity; safe compatibility is enforced at finalization.
     /// Backends own their caches (including checkpoints), execution limits and deadlines.
     /// Cache hits must bind the submitted bytes and parent; only successful results may be cached.
     async fn validate_next(
         &self,
-        _anchor: IncrementalAnchor,
         _parent: IncrementalAnchor,
         _block: &AdmittedBlock,
         _witness: ExecutionWitness,
@@ -539,14 +540,10 @@ pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
     }
 
     /// Prepare a selected, already-validated window for attestation. Stateful
-    /// backends check current retention/safe ancestry and select forkchoice;
+    /// backends check retention and require Reth to accept the terminal forkchoice;
     /// immutable block identity and range continuity are supplied by the window.
     /// Success describes this operation's snapshot, not a lock held until signing.
-    async fn recheck_incremental(
-        &self,
-        _anchor: IncrementalAnchor,
-        _window: &ValidatedWindow,
-    ) -> Result<(), ValidationError> {
+    async fn recheck_incremental(&self, _window: &ValidatedWindow) -> Result<(), ValidationError> {
         Ok(())
     }
 
@@ -647,23 +644,21 @@ impl Validator {
 
     pub(crate) async fn validate_next(
         &self,
-        anchor: IncrementalAnchor,
         parent: IncrementalAnchor,
         mut admitted: AdmittedBlock,
         request_timeout: Duration,
     ) -> Result<(Arc<ValidatedBlock>, bool), ValidationError> {
         let witness = admitted.take_witness();
         self.backend
-            .validate_next(anchor, parent, &admitted, witness, request_timeout)
+            .validate_next(parent, &admitted, witness, request_timeout)
             .await
     }
 
     pub(crate) async fn recheck_incremental(
         &self,
-        anchor: IncrementalAnchor,
         window: &ValidatedWindow,
     ) -> Result<(), ValidationError> {
-        self.backend.recheck_incremental(anchor, window).await
+        self.backend.recheck_incremental(window).await
     }
 }
 

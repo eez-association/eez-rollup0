@@ -145,84 +145,6 @@ where
     }
 }
 
-fn ancestor_hash<P>(
-    provider: &P,
-    current: &SealedHeader<alloy_consensus::Header>,
-    target_number: u64,
-) -> Result<B256, ValidationError>
-where
-    P: HeaderProvider<Header = alloy_consensus::Header>,
-{
-    if target_number > current.number() {
-        return Err(ValidationError::Aborted(format!(
-            "local safe block {target_number} is ahead of session cursor {}",
-            current.number(),
-        )));
-    }
-    let mut cursor = current.clone();
-    while cursor.number() > target_number {
-        let parent_hash = cursor.parent_hash();
-        let parent = provider
-            .header(parent_hash)
-            .map_err(provider_error)?
-            .ok_or_else(|| {
-                ValidationError::Unavailable(format!(
-                    "Reth no longer exposes ancestor {parent_hash} of block {}",
-                    cursor.number(),
-                ))
-            })?;
-        if parent.number.checked_add(1) != Some(cursor.number()) {
-            return Err(ValidationError::InvalidBackendOutput(format!(
-                "Reth returned a non-contiguous ancestor for block {}",
-                cursor.number(),
-            )));
-        }
-        cursor = SealedHeader::new(parent, parent_hash);
-    }
-    Ok(cursor.hash())
-}
-
-/// Accept safe-head movement only when Reth proves that both the original
-/// session anchor and the fresh safe marker are exact ancestors of the current
-/// validated cursor. This lets a Composer keep streaming after L1 advances
-/// inside its retained prefix without trusting the Composer's claim.
-fn ensure_safe_ancestor<P>(
-    provider: &P,
-    minimum_anchor: IncrementalAnchor,
-    current: &SealedHeader<alloy_consensus::Header>,
-) -> Result<(), ValidationError>
-where
-    P: BlockIdReader + HeaderProvider<Header = alloy_consensus::Header>,
-{
-    if ancestor_hash(provider, current, minimum_anchor.number)? != minimum_anchor.hash {
-        return Err(ValidationError::Aborted(format!(
-            "session cursor {} is no longer descended from anchor {} ({})",
-            current.number(),
-            minimum_anchor.number,
-            minimum_anchor.hash,
-        )));
-    }
-    match provider.safe_block_num_hash().map_err(provider_error)? {
-        Some(safe) if safe.number < minimum_anchor.number => {
-            Err(ValidationError::Aborted(format!(
-                "L1-derived safe anchor moved behind session anchor {}; local safe is {safe:?}",
-                minimum_anchor.number,
-            )))
-        }
-        Some(safe) if ancestor_hash(provider, current, safe.number)? == safe.hash => Ok(()),
-        Some(safe) => Err(ValidationError::Aborted(format!(
-            "local safe block {safe:?} is not an ancestor of session cursor {} ({})",
-            current.number(),
-            current.hash(),
-        ))),
-        None if minimum_anchor.number == 0 => Ok(()),
-        None => Err(ValidationError::Aborted(format!(
-            "local safe marker disappeared for session anchor {} ({})",
-            minimum_anchor.number, minimum_anchor.hash,
-        ))),
-    }
-}
-
 #[async_trait::async_trait]
 impl<P> ValidationBackend for Backend<P>
 where
@@ -271,17 +193,13 @@ where
         ensure_safe_anchor(&self.provider, anchor)
     }
 
-    async fn recheck_incremental(
-        &self,
-        anchor: IncrementalAnchor,
-        window: &ValidatedWindow,
-    ) -> Result<(), ValidationError> {
+    async fn recheck_incremental(&self, window: &ValidatedWindow) -> Result<(), ValidationError> {
         let committer = self.committer()?;
         let _forkchoice_guard = committer.begin_reconcile().await;
         for block in window.blocks() {
-            let (number, hash, rlp) = (block.number(), block.hash(), block.rlp());
-            let known = self
-                .provider
+            let (number, hash) = (block.number(), block.hash());
+            // Identity was validated before retention; only availability can change here.
+            self.provider
                 .find_block_by_hash(hash, reth_storage_api::BlockSource::Any)
                 .map_err(provider_error)?
                 .ok_or_else(|| {
@@ -289,24 +207,12 @@ where
                         "validated block {number} ({hash}) is no longer retained by Reth",
                     ))
                 })?;
-            if known.header.number != number
-                || known.header.hash_slow() != hash
-                || alloy_rlp::encode(&known) != rlp
-            {
-                return Err(ValidationError::Aborted(format!(
-                    "Reth block identity changed at height {number}",
-                )));
-            }
         }
         let terminal = window.settling_block();
         let terminal = SealedHeader::new(terminal.decoded().header.clone(), terminal.hash());
-        // The blocks were imported and executed when their Validated frames
-        // were produced. Finalization must not replay the whole prefix through
-        // newPayload: repeatedly walking the canonical head back to block 1
-        // races Reth's persistence pipeline on large windows. Prove the exact
-        // retained ancestry above the current L1-safe marker, then select the
-        // already-known terminal block with one FCU.
-        ensure_safe_ancestor(&self.provider, anchor, &terminal)?;
+        // Blocks were imported and executed before their Validated frames.
+        // Select the known terminal with one FCU; Reth enforces safe/finalized ancestry.
+        // Replaying the prefix through newPayload would race Reth's persistence pipeline.
         match committer
             .advance_unsafe_head(terminal.clone())
             .await
@@ -345,13 +251,11 @@ where
                 terminal.number(),
             )));
         }
-        ensure_safe_ancestor(&self.provider, anchor, &terminal)?;
         Ok(())
     }
 
     async fn validate_next(
         &self,
-        anchor: IncrementalAnchor,
         parent: IncrementalAnchor,
         admitted: &AdmittedBlock,
         _witness: ExecutionWitness,
@@ -374,16 +278,7 @@ where
                         parent.number, parent.hash,
                     ))
                 })?;
-            if previous_header.number != parent.number
-                || previous_header.hash_slow() != parent.hash
-                || previous_header.state_root != parent.state_root
-            {
-                return Err(ValidationError::InvalidBackendOutput(
-                    "Reth parent does not match its validated identity and state root".to_owned(),
-                ));
-            }
             let previous_header = SealedHeader::new(previous_header, parent.hash);
-            ensure_safe_ancestor(&self.provider, anchor, &previous_header)?;
 
             let block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
             let number = block.header().number();
@@ -408,6 +303,7 @@ where
                 .find_block_by_hash(block.hash(), reth_storage_api::BlockSource::Any)
                 .map_err(provider_error)?
             {
+                // Bind this new submission to cached execution, not just its claimed header hash.
                 if alloy_rlp::encode(&stored) != admitted.rlp() {
                     return Err(ValidationError::Rejected(
                         "cached Reth block does not match submitted bytes".to_owned(),
@@ -439,8 +335,7 @@ where
                         }
                     })?;
             }
-            let stored = self
-                .provider
+            self.provider
                 .find_block_by_hash(block.hash(), reth_storage_api::BlockSource::Any)
                 .map_err(provider_error)?
                 .ok_or_else(|| {
@@ -448,13 +343,6 @@ where
                         "Reth accepted block {number} but no longer exposes its exact block"
                     ))
                 })?;
-            if stored.header.number != number || stored.header.hash_slow() != block.hash() {
-                return Err(ValidationError::Aborted(format!(
-                    "stored head changed while validating block {number}: expected {}, got {}",
-                    block.hash(),
-                    stored.header.hash_slow(),
-                )));
-            }
             let receipts = self
                 .provider
                 .receipts_by_block(block.hash().into())
@@ -466,20 +354,14 @@ where
                 })?;
 
             let (checkpoint_plan, sender_flags) =
-                CheckpointPlan::for_streamed_block(&block, self.expected_l2_system_address);
+                CheckpointPlan::for_block(&block, self.expected_l2_system_address);
             let cached_checkpoints = self.checkpoints.lock().unwrap().get(&block.hash()).cloned();
             let (receipt_successes, observed_outbound_events, checkpoints) =
-                if checkpoint_plan.positions().is_empty() {
+                if checkpoint_plan.positions().is_empty() || cached_checkpoints.is_some() {
                     (
                         receipts.iter().map(|receipt| receipt.success).collect(),
                         observe_outbound_events(&receipts),
-                        Vec::new(),
-                    )
-                } else if let Some(checkpoints) = cached_checkpoints {
-                    (
-                        receipts.iter().map(|receipt| receipt.success).collect(),
-                        observe_outbound_events(&receipts),
-                        checkpoints,
+                        cached_checkpoints.unwrap_or_default(),
                     )
                 } else {
                     let provider = self.provider.clone();
@@ -613,7 +495,7 @@ where
         .expect("the admitted stateful window was checked as nonempty");
     let recovered_settling_block = decode_match_and_recover_signers(settling_block, chain_spec)?;
     let (settling_checkpoint_plan, settling_sender_flags) =
-        CheckpointPlan::from_recovered_block(&recovered_settling_block, expected_l2_system_address);
+        CheckpointPlan::for_block(&recovered_settling_block, expected_l2_system_address);
     let mut prepared_settling_block = Some((
         recovered_settling_block,
         settling_checkpoint_plan,
