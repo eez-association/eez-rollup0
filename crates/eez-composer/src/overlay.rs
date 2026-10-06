@@ -24,11 +24,10 @@
 //!
 //! # Crate-layering invariants
 //!
-//! This module lives in `eez-evm-inspector` because that crate
-//! already depends on `revm`. It must not depend on `reth_*` or
-//! `eez-composer`. The actual nested-call execution + diff-apply path
-//! lives in this crate's `inspector.rs` (which has the necessary
-//! `&mut Context` access during the `Inspector::call` hook).
+//! This module stays independent of `reth_*`; it needs only `revm` and is
+//! colocated with its sole consumer in `eez-composer`. The actual nested-call
+//! execution and diff-apply path lives in this crate's `inspector` module,
+//! which has the necessary `&mut Context` access during `Inspector::call`.
 
 use std::sync::{Arc, Mutex};
 
@@ -381,6 +380,8 @@ mod tests {
             use_preloaded_bundle: src.use_preloaded_bundle,
             block_hashes: src.block_hashes.clone(),
             bal_state: src.bal_state.clone(),
+            // A commit callback, not state; the overlay path never installs one.
+            state_hook: None,
         }
     }
 

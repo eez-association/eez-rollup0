@@ -40,8 +40,10 @@ pub mod attestation_quorum;
 pub mod composer;
 pub mod held_pool;
 pub mod ingress;
+pub mod inspector;
 pub mod local;
 pub mod optimistic;
+pub mod overlay;
 mod prover_retry;
 pub mod rollup;
 
@@ -55,6 +57,8 @@ pub use composer::{Composer, ComposerConfigError, CrossChainExecCtx};
 pub use held_pool::{AdmissionError, HeldPool, HeldTx};
 #[doc(inline)]
 pub use ingress::Direction;
+#[doc(inline)]
+pub use inspector::{SessionInspector, SessionInspectorFactory};
 
 #[doc(inline)]
 pub use local::{
@@ -62,5 +66,9 @@ pub use local::{
     build_sync_block,
 };
 pub use optimistic::OptimisticallyIncluded;
+#[doc(inline)]
+pub use overlay::{
+    OverlayChannel, OverlayChannelHandle, OverlayError, apply_overlay_diff, new_overlay_channel,
+};
 #[doc(inline)]
 pub use rollup::{RollupConfig, RollupState};

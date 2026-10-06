@@ -5,7 +5,6 @@ members = [
     "crates/eez-control-rpc",
     "crates/eez-deriver",
     "crates/eez-driver",
-    "crates/eez-evm-inspector",
     "crates/eez-follower",
     "crates/eez-l1",
     "crates/eez-node",
@@ -27,7 +26,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.93"
+rust-version = "1.95"
 
 [workspace.dependencies]
 # async + tracing + errors
@@ -54,7 +53,7 @@ tokio-stream          = "0.1"
 # compact binary serialization for the persistent witness store's values
 postcard              = { version = "1", features = ["use-std"] }
 # reth `debug_executionWitness` result shape — mirrors the proto ExecutionWitness.
-alloy-rpc-types-debug = { version = "=2.0.5", default-features = false }
+alloy-rpc-types-debug = { version = "=2.5.0", default-features = false }
 
 # prover-port crates (composer-controlled prover, Model B)
 eez-control-rpc    = { path = "crates/eez-control-rpc" }
@@ -66,84 +65,87 @@ mimalloc           = "0.1"
 # CLI
 clap               = { version = "4", features = ["derive"] }
 
-reth-codecs = { version = "0.3.1" }
-reth-rpc-traits = "0.3.1"
-alloy-consensus-any = { version = "=2.0.5", features = ["serde"] }
-alloy-serde = "=2.0.5"
+reth-codecs = { version = "0.8.1" }
+reth-rpc-traits = "0.8.1"
+alloy-consensus-any = { version = "=2.5.0", features = ["serde"] }
+alloy-serde = "=2.5.0"
 
-# reth — pinned to mediocregopher/partial-persistence-clean tip (contains the receipts-reorg truncation fix).
-reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-cli                        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-db                         = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-engine-primitives          = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-ethereum-cli               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-ethereum-consensus         = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-ethereum-payload-builder   = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-ethereum-primitives        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-evm                        = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-evm-ethereum               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-execution-types            = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-network-peers              = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-node-api                   = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-node-builder               = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-node-core                  = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-node-ethereum              = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-payload-builder            = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-payload-primitives         = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-transaction-pool           = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-primitives-traits          = { version = "0.3.1", default-features = false }
-reth-provider                   = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-revm                       = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-rpc-eth-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-storage-api                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-tasks                      = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-trie                       = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-trie-common                = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+# reth — official v2.7.0 release. Pinned by `tag`, never `rev`: reth_gnosis,
+# gnosis-primitives and stateless use the tag too, and Cargo treats a tag and a
+# rev of the same commit as distinct sources (duplicate reth types).
+reth-chain-state                = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-cli                        = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-db                         = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-engine-primitives          = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum-cli               = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum-consensus         = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum-payload-builder   = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-ethereum-primitives        = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-evm                        = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-evm-ethereum               = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-execution-types            = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-network-peers              = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-node-api                   = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-node-builder               = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-node-core                  = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-node-ethereum              = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-payload-builder            = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-payload-primitives         = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-transaction-pool           = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-primitives-traits          = { version = "0.8.1", default-features = false }
+reth-provider                   = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-revm                       = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-rpc-eth-api                = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-storage-api                = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-tasks                      = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-trie                       = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-trie-common                = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 # libmdbx (reth's own mdbx binding) — backs the persistent witness store in a
-# DEDICATED env (never reth's node DB). Same rev so we don't link a 2nd mdbx build.
-reth-libmdbx                    = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-consensus-common = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-errors = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-execution-cache = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-engine-local = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-rpc = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
-reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", rev = "fd59fd2222b51239abebd9aa234f28b0b5f336eb" }
+# DEDICATED env (never reth's node DB). Same tag so we don't link a 2nd mdbx build.
+reth-libmdbx                    = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-consensus-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-execution-cache = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-payload-builder-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-engine-local = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 
-# Stateless execution, aligned with the same Reth revision used by the node.
-# Candidate block hashes, on a fork of the generic-primitives branch pending
-# upstream merge. Drop back to the source branch once the change lands there.
-stateless-reth = { package = "stateless", git = "https://github.com/eez-association/stateless", rev = "5727dd36b6d9eb9b0f518cb97cc57bc4b7ee35d7" }
+# Stateless execution on the same reth v2.7.0 as the node. Branch
+# feat/reth-v2.7-candidate-block-hashes: the reth-v2.7 trie port plus our
+# candidate block hashes and empty-prefix checkpoint, pending upstream merge.
+stateless-reth = { package = "stateless", git = "https://github.com/eez-association/stateless", rev = "935f25aa0c28c36c3c169e36e36b823206c5a856" }
 
 # reth_gnosis — Gnosis chain (chiado / gnosis mainnet) NodeBuilder.
-# Pinned to the rollup0-fd59fd22 branch which is the reth_gnosis
-# tree on top of the SAME reth commit as our other reth-* deps,
-# so the inner types are wire-compatible. Provides `GnosisNode`,
-# `GnosisChainSpec`, chiado genesis preset.
-reth_gnosis                     = { git = "https://github.com/gnosischain/reth_gnosis", branch = "rollup0-fd59fd22" }
-gnosis-primitives               = { git = "https://github.com/gnosischain/rust-primitives.git", tag = "v0.2.4" }
-revm                            = { version = "38", default-features = false, features = [
+# Both pin reth `tag = "v2.7.0"` like our reth-* deps, so the inner types are
+# wire-compatible. Provides `GnosisNode`, `GnosisChainSpec`, chiado genesis preset.
+# reth_gnosis depends on `reth` with default features, which turns on `jit`
+# (revmc → LLVM 22) and `gmp` (m4) for the whole graph; see scripts/ci/install-llvm.sh.
+reth_gnosis                     = { git = "https://github.com/gnosischain/reth_gnosis", tag = "v2.2.0" }
+gnosis-primitives               = { git = "https://github.com/gnosischain/rust-primitives.git", tag = "v0.2.9" }
+revm                            = { version = "43", default-features = false, features = [
     "optional_balance_check",
     "optional_block_gas_limit",
     "optional_eip3607",
     "optional_no_base_fee",
 ] }
 
-# alloy — aligned with reth v2.2.0's transitive picks:
+# alloy — aligned with reth v2.7.0's transitive picks:
 #   consensus / eips / network / rpc-types-engine / provider / contract → 2.x
 #   primitives / sol-types / signer-local                                → 1.x
 # Mismatched majors here will cause duplicate alloy types in the dep graph
 # (manifesting as "trait bound not satisfied" errors at integration sites).
-alloy-evm              = { version = "=0.34.0" }
-alloy-consensus        = { version = "=2.0.5", default-features = false }
+alloy-evm              = { version = "=0.39.0" }
+alloy-consensus        = { version = "=2.5.0", default-features = false }
 alloy-contract         = { version = "2", default-features = false }
-alloy-eips             = { version = "=2.0.5", default-features = false }
-alloy-genesis          = { version = "=2.0.5", default-features = false }
+alloy-eips             = { version = "=2.5.0", default-features = false }
+alloy-genesis          = { version = "=2.5.0", default-features = false }
 alloy-network          = { version = "2", default-features = false }
 alloy-primitives       = { version = "1", default-features = false }
 alloy-provider         = { version = "2", default-features = false, features = ["reqwest"] }
@@ -171,7 +173,6 @@ eez-primitives = { path = "crates/eez-primitives" }
 eez-composer       = { path = "crates/eez-composer" }
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }
-eez-evm-inspector  = { path = "crates/eez-evm-inspector" }
 eez-follower       = { path = "crates/eez-follower" }
 eez-l1             = { path = "crates/eez-l1" }
 eez-node           = { path = "crates/eez-node" }
@@ -183,6 +184,115 @@ eez-prover         = { path = "crates/eez-prover" }
 eez-prover-stateful  = { path = "crates/eez-prover-stateful" }
 eez-prover-stateless = { path = "crates/eez-prover-stateless" }
 eez-testkit        = { path = "crates/eez-testkit" }
+
+# Interim: reth main at the merge of paradigmxyz/reth#27622 (fa9e76a), via the
+# debjit-bw/reth fork because a patch cannot point back at its own source. Every
+# reth crate is redirected, including those reth_gnosis and stateless pull by
+# tag, so the graph keeps one reth source. Remove once a reth release carries
+# #27622; see docs/RETH-V2.7-MIGRATION.md.
+[patch."https://github.com/paradigmxyz/reth"]
+reth                            = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-basic-payload-builder      = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-chain-state                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-chainspec                  = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-cli                        = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-cli-commands               = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-cli-runner                 = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-cli-util                   = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-config                     = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-consensus                  = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-consensus-common           = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-consensus-debug-client     = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-db                         = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-db-api                     = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-db-common                  = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-db-models                  = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-discv4                     = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-discv5                     = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-dns-discovery              = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-downloaders                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-ecies                      = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-engine-local               = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-engine-primitives          = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-engine-tree                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-engine-util                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-era                        = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-era-downloader             = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-era-utils                  = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-errors                     = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-eth-wire                   = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-eth-wire-types             = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-ethereum-cli               = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-ethereum-consensus         = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-ethereum-engine-primitives = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-ethereum-forks             = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-ethereum-payload-builder   = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-ethereum-primitives        = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-etl                        = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-evm                        = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-evm-ethereum               = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-execution-cache            = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-execution-errors           = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-execution-types            = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-exex                       = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-exex-types                 = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-fs-util                    = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-invalid-block-hooks        = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-ipc                        = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-libmdbx                    = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-mdbx-sys                   = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-metrics                    = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-net-banlist                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-net-nat                    = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-network                    = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-network-api                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-network-p2p                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-network-peers              = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-network-types              = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-nippy-jar                  = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-node-api                   = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-node-builder               = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-node-core                  = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-node-ethereum              = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-node-ethstats              = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-node-events                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-node-metrics               = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-node-types                 = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-payload-builder            = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-payload-builder-primitives = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-payload-primitives         = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-payload-validator          = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-provider                   = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-prune                      = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-prune-types                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-revm                       = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-rpc                        = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-rpc-api                    = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-rpc-builder                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-rpc-convert                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-rpc-engine-api             = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-rpc-eth-api                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-rpc-eth-types              = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-rpc-layer                  = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-rpc-server-types           = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-stages                     = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-stages-api                 = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-stages-types               = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-static-file                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-static-file-types          = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-storage-api                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-storage-errors             = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-storage-overlay            = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-tasks                      = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-tokio-util                 = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-tracing                    = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-tracing-otlp               = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-transaction-pool           = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-trie                       = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-trie-common                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-trie-db                    = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-trie-parallel              = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
+reth-trie-sparse                = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
 
 # Profiles copied from reth (paradigmxyz/reth Cargo.toml), minus its
 # hivetests/reproducible CI profiles. `release` is the fast-to-build
@@ -291,6 +401,8 @@ match_single_binding             = "allow"
 single_match_else                = "allow"
 map_unwrap_or                    = "allow"
 clone_on_ref_ptr                 = "allow"
+# New in clippy 1.99; `assert!(v.is_empty())` reads better in tests than `[] as [T; 0]`.
+assert_is_empty                  = "allow"
 # constructors / handlers (Deriver::new wires 9 deps,
 # on_batch_posted 10, compose_via_evm_composer 8) need these params;
 # a refactor or dediacted crates would reduce some of this

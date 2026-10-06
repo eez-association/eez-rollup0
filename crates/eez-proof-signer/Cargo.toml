@@ -34,6 +34,8 @@ tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 
+stateless-reth.workspace = true
+
 [dev-dependencies]
 # Recorded calldata fixture decoding.
 hex.workspace = true

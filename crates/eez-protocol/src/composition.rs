@@ -298,7 +298,9 @@ impl CompositionBuilder {
     /// shapes outside the supported materialization profile.
     // Keep the structured public error type rather than boxing it.
     #[allow(clippy::result_large_err)]
-    #[tracing::instrument(level = "debug", name = "finalize", skip_all, err)]
+    // WARN, not ERROR: a reverting cross-chain call is a normal outcome. The
+    // error still propagates and the drain classifies it.
+    #[tracing::instrument(level = "debug", name = "finalize", skip_all, err(level = "warn"))]
     pub fn finalize(self) -> CompositionResult<Composition> {
         tracing::debug!(name: "composer.finalize.start", "composition finalize started");
 

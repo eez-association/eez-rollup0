@@ -25,7 +25,9 @@ use reth_evm::{
 use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::{Recovered, RecoveredBlock, SealedHeader, SignedTransaction};
 use reth_revm::database::StateProviderDatabase;
-use reth_storage_api::{StateProviderBox, StateProviderFactory};
+use reth_storage_api::{
+    EvmStateProviderAdapter, StateProvider, StateProviderBox, StateProviderFactory,
+};
 use revm::database::{CacheState, State};
 use revm::inspector::NoOpInspector;
 use revm::{
@@ -35,9 +37,11 @@ use revm::{
 use std::sync::Arc;
 use thiserror::Error;
 
+use super::provider::StateSnapshotProvider;
+
 /// The revm state a Sync block is built over: the parent state provider plus
 /// every change committed by the block's txs so far.
-pub type DraftDb = State<StateProviderDatabase<StateProviderBox>>;
+pub type DraftDb = State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>;
 
 /// Errors raised by [`build_sync_block`].
 #[derive(Debug, Error)]
@@ -138,7 +142,7 @@ fn recover_tx(raw: &Bytes, idx: usize) -> Result<Recovered<TransactionSigned>, B
 /// Open the revm state for a block built on `parent_hash`, optionally
 /// preloaded with an already-warmed cache.
 fn open_draft_db(
-    provider: &dyn StateProviderFactory,
+    provider: &dyn StateSnapshotProvider,
     parent_hash: B256,
     cache: Option<CacheState>,
 ) -> Result<DraftDb, BuildError> {
@@ -146,7 +150,9 @@ fn open_draft_db(
         .state_by_block_hash(parent_hash)
         .map_err(|e| BuildError::Provider(format!("state_by_block_hash({parent_hash}): {e}")))?;
     let mut builder = State::builder()
-        .with_database(StateProviderDatabase::new(state_provider))
+        .with_database(StateProviderDatabase::new(
+            state_provider.into_evm_state_provider(),
+        ))
         .with_bundle_update();
     if let Some(cache) = cache {
         builder = builder.with_cached_prestate(cache);
@@ -182,7 +188,7 @@ where
     let state_provider = l2_provider
         .state_by_block_hash(parent_hash)
         .map_err(|e| BuildError::Provider(format!("state_by_block_hash({parent_hash}): {e}")))?;
-    let state_db = StateProviderDatabase::new(state_provider.as_ref());
+    let state_db = StateProviderDatabase::new(state_provider.as_ref().into_evm_state_provider());
     let mut db = State::builder()
         .with_database(state_db)
         .with_bundle_update()
@@ -302,7 +308,7 @@ where
 /// (withdrawals, balance increments) are NOT applied — those belong to block
 /// close, not to mid-block state.
 pub struct SyncBlockState {
-    provider: Arc<dyn StateProviderFactory>,
+    provider: Arc<dyn StateSnapshotProvider>,
     evm_config: EezEvmConfig,
     parent_hash: B256,
     evm_env: EvmEnvFor<EezEvmConfig>,
@@ -332,7 +338,7 @@ impl SyncBlockState {
     ///
     /// See [`BuildError`].
     pub fn open(
-        provider: Arc<dyn StateProviderFactory>,
+        provider: Arc<dyn StateSnapshotProvider>,
         evm_config: &EezEvmConfig,
         parent: &SealedHeader<Header>,
         timestamp: u64,
@@ -530,32 +536,66 @@ impl SyncBlockFork {
     }
 }
 
-/// Per-effect candidate block hashes, one per effect.
+/// The Sync block's candidate commitments: the empty prefix the anchor claims,
+/// then one per pair end. Candidate `i` is the Sync block cut short right after
+/// effect `i`'s tx group, so a settlement that stops there names the exact block
+/// L2 must hold.
 ///
-/// Each candidate is the Sync block cut short right after that effect's tx
-/// group, so candidate `i` is a strict prefix of candidate `i + 1`.
-///
-/// Each settlement entry's `newState` is its effect's candidate hash, so a
-/// settlement that stops at that effect names the exact block L2 must hold.
-/// Built by rebuilding the Sync block on each pair-end prefix of `sync_txs`.
 /// Siblings at one height, not a chain: same parent, number and timestamp, with
 /// execution-derived commitments differing per prefix. One becomes canonical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncCandidates {
+    /// The candidate the anchor entry claims when there are effects: the block
+    /// holding no transactions, sealed after the pre-block system calls
+    /// (EIP-2935 / EIP-4788). An empty Sync block still mutates state, so it is
+    /// not the parent's hash. Unused without effects.
+    pub anchor: B256,
+    /// One commitment per pair end, in effect order.
+    pub per_effect: Vec<B256>,
+}
+
+impl SyncCandidates {
+    /// A batch with no effects. The anchor is then the only entry and carries
+    /// the endpoint, which `prepare_post_batch_raw` takes from the terminal.
+    #[must_use]
+    pub fn anchor_only() -> Self {
+        Self {
+            anchor: B256::ZERO,
+            per_effect: Vec::new(),
+        }
+    }
+}
+
+/// Build the Sync block's candidates by rebuilding it on the empty prefix and on
+/// each pair-end prefix of `sync_txs`.
 ///
 /// # Errors
 ///
 /// See [`BuildError`]. A sync tx that fails to decode is treated as a non-system
 /// tx (pair-end), matching the prover's fail-safe flagging.
-pub fn sync_block_pair_hashes<P>(
+pub fn sync_block_candidates<P>(
     l2_provider: &P,
     evm_config: &EezEvmConfig,
     parent: &SealedHeader<Header>,
     timestamp: u64,
     suggested_fee_recipient: Address,
     sync_txs: &[Bytes],
-) -> Result<Vec<B256>, BuildError>
+) -> Result<SyncCandidates, BuildError>
 where
     P: StateProviderFactory,
 {
+    let candidate = |txs: &[Bytes]| {
+        build_sync_block(
+            l2_provider,
+            evm_config,
+            parent,
+            timestamp,
+            suggested_fee_recipient,
+            txs,
+        )
+        .map(|prefix| prefix.header.hash())
+    };
+    let anchor = candidate(&[])?;
     // Per-tx system flags must match the proof signer's classification so
     // pair-end positions agree on both sides.
     let flags: Vec<bool> = sync_txs
@@ -568,20 +608,11 @@ where
         })
         .collect();
 
-    eez_protocol::settlement::pair_end_positions(&flags)
+    let per_effect = eez_protocol::settlement::pair_end_positions(&flags)
         .into_iter()
-        .map(|p| {
-            build_sync_block(
-                l2_provider,
-                evm_config,
-                parent,
-                timestamp,
-                suggested_fee_recipient,
-                &sync_txs[..=p],
-            )
-            .map(|prefix| prefix.header.hash())
-        })
-        .collect()
+        .map(|p| candidate(&sync_txs[..=p]))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SyncCandidates { anchor, per_effect })
 }
 
 #[cfg(test)]
@@ -815,6 +846,45 @@ mod tests {
             "prefix must chain: {} vs {}",
             outcomes[1].gas_used,
             outcomes[3].gas_used,
+        );
+    }
+
+    /// The anchor's candidate is the Sync block sealed over NO transactions —
+    /// not the parent, which an empty block still differs from because the
+    /// pre-block system calls write state.
+    #[test]
+    fn the_anchor_candidate_is_the_empty_prefix_not_the_parent() {
+        let f = fixture();
+        let candidates = sync_block_candidates(
+            &f.provider,
+            &f.evm_config,
+            &f.parent,
+            TIMESTAMP,
+            FEE_RECIPIENT,
+            &f.txs,
+        )
+        .expect("candidates");
+
+        assert_eq!(
+            candidates.anchor,
+            f.build(&[]).header.hash(),
+            "the anchor claims the block holding no transactions",
+        );
+        assert_ne!(
+            candidates.anchor,
+            f.parent.hash(),
+            "an empty Sync block is still a new block, not its parent",
+        );
+        // Every candidate is a DIFFERENT block at the same height, so the anchor
+        // is not merely a duplicate of the first pair end.
+        assert!(
+            !candidates.per_effect.contains(&candidates.anchor),
+            "the empty prefix is distinct from every transaction prefix",
+        );
+        assert_eq!(
+            candidates.per_effect.last().copied(),
+            Some(f.build(&f.txs).header.hash()),
+            "the last candidate is the full Sync block",
         );
     }
 

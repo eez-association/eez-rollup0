@@ -21,8 +21,8 @@ use eez_evm::EezEvmConfig;
 use reth_evm::{ConfigureEvm, Evm as _};
 use reth_primitives_traits::SealedHeader;
 use reth_revm::{database::StateProviderDatabase, db::State, db::bal::EvmDatabaseError};
-use reth_storage_api::StateProviderBox;
 use reth_storage_api::errors::provider::ProviderError;
+use reth_storage_api::{EvmStateProviderAdapter, StateProvider, StateProviderBox};
 use revm::context::result::{EVMError, InvalidTransaction};
 use revm::context_interface::ContextTr;
 use revm::database::CacheState;
@@ -157,7 +157,7 @@ impl L1SlotState {
         client: &LocalChainClient,
         seed: CacheState,
     ) -> ExecutorResult<(
-        State<StateProviderDatabase<StateProviderBox>>,
+        State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>,
         reth_evm::EvmEnvFor<EezEvmConfig>,
     )> {
         let provider = client.chain_provider();
@@ -170,7 +170,9 @@ impl L1SlotState {
             .evm_env(self.anchor.header())
             .map_err(evm_err)?;
         let state = State::builder()
-            .with_database(StateProviderDatabase::new(state_prov))
+            .with_database(StateProviderDatabase::new(
+                state_prov.into_evm_state_provider(),
+            ))
             .with_cached_prestate(seed)
             .with_bundle_update()
             .build();
@@ -190,7 +192,7 @@ impl L1SlotState {
         &self,
         client: &LocalChainClient,
     ) -> ExecutorResult<(
-        State<StateProviderDatabase<StateProviderBox>>,
+        State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>,
         reth_evm::EvmEnvFor<EezEvmConfig>,
     )> {
         self.open_state(client, self.cache.clone())
@@ -212,7 +214,7 @@ impl L1SlotState {
 pub struct L1TargetSession {
     client: Arc<LocalChainClient>,
     evm_config: EezEvmConfig,
-    state: State<StateProviderDatabase<StateProviderBox>>,
+    state: State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>,
     evm_env: reth_evm::EvmEnvFor<EezEvmConfig>,
     manager: Address,
     chain_id: u64,

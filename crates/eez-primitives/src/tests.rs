@@ -30,7 +30,7 @@ fn engine_payloads_keep_native_transactions_and_empty_blob_bundles() {
         },
     );
     let built = engine::EezBuiltPayload::new(
-        Arc::new(SealedBlock::seal_slow(block)),
+        Arc::new(SealedBlock::seal_slow(block).try_recover().unwrap()),
         U256::ZERO,
         None,
         Some(Bytes::from_static(&[0xc0])),

@@ -11,25 +11,23 @@ use reth_primitives_traits::RecoveredBlock;
 use tracing::debug;
 
 use super::{
-    DecodedOutboundEvent, OutboundEventObservation, TransactionStateCheckpoint, ValidationError,
+    CheckpointAt, DecodedOutboundEvent, OutboundEventObservation, StateCheckpoint, ValidationError,
 };
 use crate::EEZL2_ADDRESS;
 use crate::cancel::CancellationToken;
 use crate::window::AdmittedBlock;
 
-/// Transaction boundaries at which settlement framing needs replay outputs.
+/// Positions at which settlement framing needs replay outputs.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CheckpointPlan {
-    transaction_indices: Vec<usize>,
+    positions: Vec<CheckpointAt>,
 }
 
 impl CheckpointPlan {
-    /// Construct a plan from locally selected transaction boundaries.
+    /// Construct a plan from locally selected positions.
     #[cfg(feature = "test-utils")]
-    pub fn new(transaction_indices: Vec<usize>) -> Self {
-        Self {
-            transaction_indices,
-        }
+    pub fn new(positions: Vec<CheckpointAt>) -> Self {
+        Self { positions }
     }
 
     /// Derive effect-candidate boundaries and system-sender flags.
@@ -45,35 +43,41 @@ impl CheckpointPlan {
             system_sender_flags.push(is_system_sender);
             sync_system_transaction_flags.push(is_system_tx(&transaction));
         }
-        let plan = Self {
-            transaction_indices: pair_end_positions(&sync_system_transaction_flags),
-        };
-        (plan, system_sender_flags)
+        // The anchor's candidate leads: the block sealed after the pre-block
+        // system calls, holding no transactions. With no transactions at all the
+        // block already IS that candidate, so sealing it again is redundant.
+        let mut positions = Vec::new();
+        if transaction_count > 0 {
+            positions.push(CheckpointAt::PreExecution);
+        }
+        positions.extend(
+            pair_end_positions(&sync_system_transaction_flags)
+                .into_iter()
+                .map(CheckpointAt::Transaction),
+        );
+        (Self { positions }, system_sender_flags)
     }
 
-    /// Transaction indices selected for checkpoint root computation.
-    pub fn transaction_indices(&self) -> &[usize] {
-        &self.transaction_indices
+    /// Positions selected for checkpoint root computation.
+    pub fn positions(&self) -> &[CheckpointAt] {
+        &self.positions
     }
 
     /// Check that a checkpoint-capable backend honored the selection exactly.
-    pub fn verify_returned(
-        &self,
-        checkpoints: &[TransactionStateCheckpoint],
-    ) -> Result<(), ValidationError> {
-        let selection_matches = checkpoints.len() == self.transaction_indices.len()
+    pub fn verify_returned(&self, checkpoints: &[StateCheckpoint]) -> Result<(), ValidationError> {
+        let selection_matches = checkpoints.len() == self.positions.len()
             && checkpoints
                 .iter()
-                .zip(&self.transaction_indices)
-                .all(|(checkpoint, requested)| checkpoint.transaction_index == *requested);
+                .zip(&self.positions)
+                .all(|(checkpoint, requested)| checkpoint.at == *requested);
         if !selection_matches {
             let returned = checkpoints
                 .iter()
-                .map(|checkpoint| checkpoint.transaction_index)
+                .map(|checkpoint| checkpoint.at)
                 .collect::<Vec<_>>();
             return Err(ValidationError::InvalidBackendOutput(format!(
-                "checkpoint response targeted transaction indices {returned:?}; requested {:?}",
-                self.transaction_indices,
+                "checkpoint response targeted positions {returned:?}; requested {:?}",
+                self.positions,
             )));
         }
         Ok(())
