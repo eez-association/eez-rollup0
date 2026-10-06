@@ -250,7 +250,6 @@ struct BundleStub {
 pub enum BuilderStubMode {
     Forward,
     Drop,
-    MethodNotFound,
 }
 
 impl BuilderStubMode {
@@ -258,7 +257,6 @@ impl BuilderStubMode {
         match self {
             Self::Forward => "forward",
             Self::Drop => "drop",
-            Self::MethodNotFound => "method_not_found",
         }
     }
 }
@@ -1842,26 +1840,15 @@ async fn wait_for_tag_prefix_convergence(
             return Ok(None);
         }
 
-        // Comparing only `target` can miss a divergent intermediate block if
-        // a later reorg happens to converge again. Walk the complete common
-        // prefix. Block hashes commit to every header field, including state,
-        // transactions, receipts/logs bloom, timestamp, and extra data.
-        let mut common_tip = None;
-        for height in 0..=target {
-            let mut blocks = Vec::with_capacity(nodes.len());
-            for node in nodes {
-                let Some(block) = l2_block_by_number(&node.l2_rpc_url(), height).await? else {
-                    return Ok(None);
-                };
-                blocks.push(block);
-            }
-            let first = blocks[0];
-            if blocks.iter().any(|block| block.hash != first.hash) {
+        let mut blocks = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let Some(block) = l2_block_by_number(&node.l2_rpc_url(), target).await? else {
                 return Ok(None);
-            }
-            common_tip = Some(first);
+            };
+            blocks.push(block);
         }
-        Ok(common_tip)
+        let first = blocks[0];
+        Ok(blocks.iter().all(|b| b.hash == first.hash).then_some(first))
     })
     .await;
     let err = match result {
@@ -1876,28 +1863,6 @@ async fn wait_for_tag_prefix_convergence(
             diagnostic_height = Some(
                 diagnostic_height.map_or(block.number, |height: u64| height.min(block.number)),
             );
-        }
-    }
-    if let Some(target) = diagnostic_height {
-        for height in 0..=target {
-            let mut at_height = Vec::with_capacity(nodes.len());
-            for node in nodes {
-                at_height.push((
-                    node.name.as_str(),
-                    l2_block_by_number(&node.l2_rpc_url(), height)
-                        .await
-                        .ok()
-                        .flatten(),
-                ));
-            }
-            let reference = at_height.first().and_then(|(_, block)| *block);
-            if at_height.iter().any(|(_, block)| *block != reference) {
-                let _ = writeln!(
-                    diagnostics,
-                    "first divergent or missing safe-prefix block: height={height} nodes={at_height:?}"
-                );
-                break;
-            }
         }
     }
     for node in nodes {

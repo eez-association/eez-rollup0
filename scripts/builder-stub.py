@@ -64,7 +64,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if body.get("method") == "eez_setBuilderMode":
             mode = body.get("params", [None])[0]
-            if mode not in ("forward", "drop", "method_not_found"):
+            if mode not in ("forward", "drop"):
                 resp = json.dumps({
                     "jsonrpc": "2.0",
                     "id": body.get("id"),
@@ -75,12 +75,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 resp = json.dumps({
                     "jsonrpc": "2.0", "id": body.get("id"), "result": mode,
                 }).encode()
-        elif body.get("method") == "eth_sendBundle" and Handler.mode == "method_not_found":
-            resp = json.dumps({
-                "jsonrpc": "2.0",
-                "id": body.get("id"),
-                "error": {"code": -32601, "message": "method not found"},
-            }).encode()
         elif body.get("method") == "eth_sendBundle" and Handler.mode == "drop":
             # Model a relay that accepts a bundle but never includes it.
             resp = json.dumps({

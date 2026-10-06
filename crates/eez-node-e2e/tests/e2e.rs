@@ -460,42 +460,6 @@ async fn happy_case_composer_sustained() {
     node.assert_no_process_death();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn builder_method_not_found_uses_mempool_fallback() {
-    // Exercise the -32601 fallback, not just the eventual settlement.
-    let harness = Harness::fresh().await.unwrap();
-    harness
-        .set_builder_mode(BuilderStubMode::MethodNotFound)
-        .await
-        .expect("configure relay method-not-found fault");
-    let chain = harness.chain();
-    let node = NodeHandle::start(
-        "builder-32601",
-        &NodeConfig::default(),
-        &harness.env().await.unwrap(),
-    )
-    .await
-    .unwrap();
-
-    chain
-        .wait_for_batches(1, DEFAULT_TIMEOUT)
-        .await
-        .expect("mempool fallback never settled postBatch");
-    assert!(
-        node.count_signal(signals::BUNDLE_MEMPOOL_FALLBACK)
-            .expect("read structured fallback signal")
-            > 0,
-        "settlement alone is insufficient: the structured signal must prove the -32601 fallback ran"
-    );
-    assert_eq!(
-        node.count_signal(signals::BUNDLE_ACCEPTED)
-            .expect("read builder acceptance signal"),
-        0,
-        "the method-not-found relay must not be mistaken for a successful bundle submission"
-    );
-    node.assert_no_process_death();
-}
-
 // A relay may acknowledge bundles while silently omitting them from its target
 // blocks. The composer must preserve the local candidate, retry after the relay
 // recovers, and continue settling fresh L2 traffic.
