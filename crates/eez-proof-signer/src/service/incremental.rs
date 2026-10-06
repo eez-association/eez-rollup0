@@ -24,7 +24,7 @@ use super::settlement_job::{PipelineError, SettlementInput, run_settlement};
 use super::{ProveSvc, ServiceLimits, ServiceState};
 use crate::cancel::CancellationToken;
 use crate::validate::{
-    AdmittedBlock, IncrementalAnchor, ValidatedBlockArtifact, ValidatedWindow, ValidationError,
+    AdmittedBlock, IncrementalAnchor, ValidatedBlock, ValidatedWindow, ValidationError,
     into_execution_witness, wire_witness_item_count,
 };
 
@@ -45,7 +45,7 @@ struct Session {
 
 #[derive(Debug)]
 struct SessionBlock {
-    validated: Arc<ValidatedBlockArtifact>,
+    validated: Arc<ValidatedBlock>,
     // Charge each session for its own submission, even on a shared cache hit.
     payload_bytes: usize,
     witness_items: usize,
@@ -56,6 +56,49 @@ impl Session {
         self.blocks
             .last()
             .map_or(self.anchor, |block| block.validated.as_anchor())
+    }
+    /// Select a nonempty window from the prefix whose continuity append maintains.
+    fn select_window(
+        &self,
+        finalize: &eez_control_rpc::v2::Finalize,
+        terminal_hash: B256,
+    ) -> Result<(IncrementalAnchor, ValidatedWindow, usize), Status> {
+        let first_validated = self.anchor.number.checked_add(1).ok_or_else(|| {
+            Status::invalid_argument("session anchor block number cannot be incremented")
+        })?;
+        if finalize.from_block < first_validated || finalize.to_block < finalize.from_block {
+            return Err(Status::invalid_argument(
+                "Finalize range is outside the session's validated active prefix",
+            ));
+        }
+        let start_index = usize::try_from(finalize.from_block - first_validated)
+            .map_err(|_| Status::resource_exhausted("Finalize range is too large"))?;
+        let end_index = usize::try_from(finalize.to_block - first_validated)
+            .map_err(|_| Status::resource_exhausted("Finalize range is too large"))?;
+        if start_index > end_index || end_index >= self.blocks.len() {
+            return Err(Status::failed_precondition(
+                "Finalize terminal block has not been fully validated",
+            ));
+        }
+        let artifacts = self.blocks[start_index..=end_index]
+            .iter()
+            .map(|block| Arc::clone(&block.validated))
+            .collect::<Vec<_>>();
+        let terminal = artifacts.last().expect("non-empty checked range");
+        if terminal.number() != finalize.to_block || terminal.hash() != terminal_hash {
+            return Err(Status::failed_precondition(
+                "Finalize terminal identity does not match the validated prefix",
+            ));
+        }
+        let anchor = if start_index == 0 {
+            self.anchor
+        } else {
+            self.blocks[start_index - 1].validated.as_anchor()
+        };
+        let mut preceding = artifacts;
+        let terminal = preceding.pop().expect("range was checked nonempty");
+        let window = ValidatedWindow::from_validated_prefix(anchor.hash, preceding, terminal);
+        Ok((anchor, window, start_index))
     }
 }
 
@@ -528,7 +571,7 @@ impl IncrementalRuntime {
             session
                 .blocks
                 .iter()
-                .position(|block| block.validated.hash == ancestor_hash)
+                .position(|block| block.validated.hash() == ancestor_hash)
                 .map(|index| index + 1)
                 .ok_or_else(|| {
                     Status::failed_precondition(
@@ -579,11 +622,12 @@ impl IncrementalRuntime {
             .iter()
             .map(|block| &block.validated)
             .find(|artifact| {
-                artifact.number == submitted.number && artifact.hash.as_slice() == submitted.hash
+                artifact.number() == submitted.number
+                    && artifact.hash().as_slice() == submitted.hash
             })
         {
-            if existing.parent_hash.as_slice() != submitted.parent_hash
-                || existing.rlp != submitted.rlp
+            if existing.parent_hash().as_slice() != submitted.parent_hash
+                || existing.rlp() != submitted.rlp
             {
                 return Err(Status::invalid_argument(
                     "duplicate block number does not match its validated artifact",
@@ -645,11 +689,9 @@ impl IncrementalRuntime {
 
         let mut session_guard = session.lock().await;
         require_epoch(&session_guard, bound.epoch)?;
-        let tip = session_guard.tip();
-        if tip.number.checked_add(1) != Some(cached.number)
-            || tip.hash != cached.parent_hash
-            || tip.state_root != cached.pre_state_root
-        {
+        // The backend proved an extension of this snapshot. Only its continued
+        // ownership needs checking after the await, not the immutable block again.
+        if session_guard.tip() != parent {
             return Err(Status::aborted(
                 "session cursor changed while block validation was in flight",
             ));
@@ -666,12 +708,13 @@ impl IncrementalRuntime {
     async fn finalize(
         &self,
         bound: BoundSession,
-        finalize: eez_control_rpc::v2::Finalize,
+        mut finalize: eez_control_rpc::v2::Finalize,
     ) -> Result<Proof, Status> {
         let started = Instant::now();
         let terminal_hash = parse_b256("terminal hash", &finalize.terminal_hash)?;
         let post_batch = finalize
             .post_batch
+            .take()
             .ok_or_else(|| Status::invalid_argument("Finalize carries no PostBatch"))?;
         if !post_batch.l1_block_hash.is_empty() {
             return Err(Status::invalid_argument(
@@ -680,48 +723,19 @@ impl IncrementalRuntime {
         }
         let session = self.session(bound.id).await?;
         // Check the requested range and terminal identity, then snapshot its artifacts and anchor.
-        let (anchor, artifacts, start_index, cancellation) = {
+        let (anchor, validated_window, start_index, cancellation) = {
             let session = session.lock().await;
             require_epoch(&session, bound.epoch)?;
-            let first_validated = session.anchor.number.checked_add(1).ok_or_else(|| {
-                Status::invalid_argument("session anchor block number cannot be incremented")
-            })?;
-            if finalize.from_block < first_validated || finalize.to_block < finalize.from_block {
-                return Err(Status::invalid_argument(
-                    "Finalize range is outside the session's validated active prefix",
-                ));
-            }
-            let start_index = usize::try_from(finalize.from_block - first_validated)
-                .map_err(|_| Status::resource_exhausted("Finalize range is too large"))?;
-            let end_index = usize::try_from(finalize.to_block - first_validated)
-                .map_err(|_| Status::resource_exhausted("Finalize range is too large"))?;
-            if start_index > end_index || end_index >= session.blocks.len() {
-                return Err(Status::failed_precondition(
-                    "Finalize terminal block has not been fully validated",
-                ));
-            }
-            let artifacts = session.blocks[start_index..=end_index]
-                .iter()
-                .map(|block| Arc::clone(&block.validated))
-                .collect::<Vec<_>>();
-            let terminal = artifacts.last().expect("non-empty checked range");
-            if terminal.number != finalize.to_block || terminal.hash != terminal_hash {
-                return Err(Status::failed_precondition(
-                    "Finalize terminal identity does not match the validated prefix",
-                ));
-            }
-            let anchor = if start_index == 0 {
-                session.anchor
-            } else {
-                session.blocks[start_index - 1].validated.as_anchor()
-            };
-            (anchor, artifacts, start_index, session.cancellation.clone())
+            let (anchor, window, start_index) = session.select_window(&finalize, terminal_hash)?;
+            (anchor, window, start_index, session.cancellation.clone())
         };
 
         let state = Arc::clone(&self.state);
         match timeout(
             self.limits.request_timeout(),
-            state.validator.recheck_incremental(anchor, &artifacts),
+            state
+                .validator
+                .recheck_incremental(anchor, &validated_window),
         )
         .await
         {
@@ -746,8 +760,6 @@ impl IncrementalRuntime {
         }
         let worker_cancellation = cancellation.clone();
         let worker = tokio::task::spawn_blocking(move || {
-            let validated_window = ValidatedWindow::from_incremental(anchor, &artifacts)
-                .map_err(PipelineError::Validation)?;
             let hash = run_settlement(SettlementInput {
                 submitted_post_batch_calldata: post_batch.abi_calldata,
                 validated_window: &validated_window,
@@ -879,11 +891,11 @@ fn parse_b256(name: &'static str, bytes: &[u8]) -> Result<B256, Status> {
         .map_err(|_| Status::invalid_argument(format!("{name} must contain exactly 32 bytes")))
 }
 
-fn validated_response(artifact: &ValidatedBlockArtifact, reused: bool) -> Validated {
+fn validated_response(artifact: &ValidatedBlock, reused: bool) -> Validated {
     Validated {
-        number: artifact.number,
-        hash: artifact.hash.to_vec(),
-        post_state_root: artifact.post_state_root.to_vec(),
+        number: artifact.number(),
+        hash: artifact.hash().to_vec(),
+        post_state_root: artifact.post_state_root().to_vec(),
         reused,
     }
 }
@@ -963,8 +975,7 @@ mod tests {
     use crate::service::tests::TestServer;
     use crate::testkit::{TEST_SYSTEM_ADDRESS, test_proof_system_vkey};
     use crate::validate::{
-        BackendBlockOutput, BackendWindowOutput, IncrementalBlockOutput, SettlementBlockEvidence,
-        ValidationBackend,
+        BackendBlockOutput, BackendWindowOutput, SettlementBlockEvidence, ValidationBackend,
     };
     use tokio_stream::wrappers::ReceiverStream as TokioReceiverStream;
 
@@ -972,13 +983,7 @@ mod tests {
     struct CountingBackend {
         validations: Arc<AtomicUsize>,
         delay: Duration,
-        blocks: Arc<Mutex<HashMap<B256, TestCachedBlock>>>,
-    }
-
-    #[derive(Debug, Clone)]
-    struct TestCachedBlock {
-        rlp: Vec<u8>,
-        output: IncrementalBlockOutput,
+        blocks: Arc<Mutex<HashMap<B256, Arc<ValidatedBlock>>>>,
     }
 
     #[async_trait::async_trait]
@@ -1015,45 +1020,37 @@ mod tests {
             block: &AdmittedBlock,
             _witness: ExecutionWitness,
             request_timeout: Duration,
-        ) -> Result<(IncrementalBlockOutput, bool), ValidationError> {
+        ) -> Result<(Arc<ValidatedBlock>, bool), ValidationError> {
             if let Some(cached) = self.blocks.lock().await.get(&block.claimed_hash()).cloned() {
-                if cached.rlp != block.rlp() || cached.output.pre_state_root != parent.state_root {
-                    return Err(ValidationError::Rejected(
-                        "cached block or parent mismatch".to_owned(),
-                    ));
-                }
-                return Ok((cached.output, true));
+                cached.matches_submission(block, parent)?;
+                return Ok((cached, true));
             }
+            block.check_parent(parent)?;
             self.validations.fetch_add(1, Ordering::SeqCst);
             timeout(request_timeout, tokio::time::sleep(self.delay))
                 .await
                 .map_err(|_| ValidationError::DeadlineExceeded)?;
             let decoded = alloy_rlp::decode_exact::<eez_primitives::Block>(block.rlp()).unwrap();
             let post_root = decoded.header.state_root;
-            let output = IncrementalBlockOutput {
-                pre_state_root: parent.state_root,
-                block: BackendBlockOutput {
-                    decoded_number: block.declared_number(),
-                    decoded_parent_hash: block.claimed_parent_hash(),
-                    computed_hash: block.claimed_hash(),
-                    decoded_transaction_count: 0,
-                    receipt_successes: Vec::new(),
-                    transaction_state_checkpoints: Vec::new(),
-                    post_state_root: post_root,
-                    settlement_evidence: SettlementBlockEvidence {
-                        system_sender_flags: Vec::new(),
-                        observed_outbound_events: Vec::new(),
-                    },
+            let output = BackendBlockOutput {
+                computed_hash: block.claimed_hash(),
+                receipt_successes: Vec::new(),
+                transaction_state_checkpoints: Vec::new(),
+                post_state_root: post_root,
+                settlement_evidence: SettlementBlockEvidence {
+                    system_sender_flags: Vec::new(),
+                    observed_outbound_events: Vec::new(),
                 },
             };
+            let output = crate::validate::testing::check_test_output(
+                block,
+                output,
+                parent.state_root,
+                true,
+            )?;
             let mut blocks = self.blocks.lock().await;
-            let cached = blocks
-                .entry(block.claimed_hash())
-                .or_insert_with(|| TestCachedBlock {
-                    rlp: block.rlp().to_vec(),
-                    output,
-                });
-            Ok((cached.output.clone(), false))
+            let cached = blocks.entry(block.claimed_hash()).or_insert(output);
+            Ok((Arc::clone(cached), false))
         }
     }
 
@@ -1467,71 +1464,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_sessions_allow_duplicate_misses_without_cross_wiring() {
-        let validations = Arc::new(AtomicUsize::new(0));
-        let runtime = IncrementalRuntime::new(state(Arc::clone(&validations)), limits());
-        let begin = begin();
-        let (session_a, _) = runtime.begin(begin.clone()).await.unwrap();
-        let (session_b, _) = runtime.begin(begin.clone()).await.unwrap();
-        assert_ne!(session_a, session_b);
-
-        let (a, b) = tokio::join!(
-            runtime.validate_block(session_a, block()),
-            runtime.validate_block(session_b, block()),
+    async fn session_selects_only_retained_ranges() {
+        let runtime = IncrementalRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
+        let (bound, _) = runtime.begin(begin()).await.unwrap();
+        let first = block_after(11, B256::repeat_byte(0x11), 0x11);
+        let first_hash = B256::from_slice(&first.data.as_ref().unwrap().hash);
+        let second = block_after(12, first_hash, 0x12);
+        let second_hash = B256::from_slice(&second.data.as_ref().unwrap().hash);
+        runtime.validate_block(bound, first).await.unwrap();
+        runtime.validate_block(bound, second).await.unwrap();
+        let session = runtime.session(bound.id).await.unwrap();
+        let session = session.lock().await;
+        for (from, to, terminal, expected) in [
+            (11, 12, second_hash, None),
+            (12, 12, second_hash, None),
+            (11, 11, first_hash, None),
+            (10, 12, second_hash, Some(tonic::Code::InvalidArgument)),
+            (12, 11, first_hash, Some(tonic::Code::InvalidArgument)),
+            (11, 13, second_hash, Some(tonic::Code::FailedPrecondition)),
+            (11, 12, first_hash, Some(tonic::Code::FailedPrecondition)),
+        ] {
+            let request = eez_control_rpc::v2::Finalize {
+                from_block: from,
+                to_block: to,
+                terminal_hash: terminal.to_vec(),
+                post_batch: None,
+            };
+            let result = session.select_window(&request, terminal);
+            if let Some(code) = expected {
+                assert_eq!(result.unwrap_err().code(), code, "{from}..={to}");
+            } else {
+                let (anchor, window, start) = result.unwrap();
+                assert_eq!(anchor.number + 1, from);
+                assert_eq!(window.window_pre_block_hash(), anchor.hash);
+                assert_eq!(window.blocks().count() as u64, to - from + 1);
+                assert_eq!(start as u64, from - 11);
+                assert_eq!(
+                    window.settling_block(),
+                    session.blocks[(to - 11) as usize].validated.as_ref()
+                );
+                for (offset, block) in window.preceding_blocks().iter().enumerate() {
+                    assert_eq!(block, &session.blocks[start + offset].validated);
+                }
+            }
+        }
+        assert_eq!(
+            session.blocks.len(),
+            2,
+            "selection does not mutate the prefix"
         );
-        let a = a.unwrap();
-        let b = b.unwrap();
-        assert_eq!(a.number, 11);
-        assert_eq!(b.number, 11);
-        assert!(!a.reused);
-        assert!(!b.reused);
-        assert_eq!(validations.load(Ordering::SeqCst), 2);
-
-        let (later, _) = runtime.begin(begin).await.unwrap();
-        assert!(runtime.validate_block(later, block()).await.unwrap().reused);
-        assert_eq!(validations.load(Ordering::SeqCst), 2);
-
-        let a = runtime.session(session_a.id).await.unwrap();
-        let b = runtime.session(session_b.id).await.unwrap();
-        let a = a.lock().await;
-        let b = b.lock().await;
-        assert_eq!(a.blocks[0].validated, b.blocks[0].validated);
-        assert_eq!(a.tip().hash, B256::repeat_byte(0x22));
-        assert_eq!(b.tip().hash, B256::repeat_byte(0x22));
     }
 
     #[tokio::test]
-    async fn finalize_selects_a_validated_suffix_and_promotes_its_predecessor() {
-        let runtime = IncrementalRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
-        let anchor_hash = B256::repeat_byte(0x11);
+    async fn rewind_during_execution_prevents_the_old_append() {
+        let validations = Arc::new(AtomicUsize::new(0));
+        let runtime = IncrementalRuntime::new(
+            state_with_delay(Arc::clone(&validations), Duration::from_millis(100)),
+            limits(),
+        );
         let (bound, _) = runtime.begin(begin()).await.unwrap();
-        let block_11 = block_after(11, anchor_hash, 0x11);
-        let hash_11 = B256::from_slice(&block_11.data.as_ref().unwrap().hash);
-        runtime.validate_block(bound, block_11).await.unwrap();
-        let block_12 = block_after(12, hash_11, 0x12);
-        let hash_12 = B256::from_slice(&block_12.data.as_ref().unwrap().hash);
-        runtime.validate_block(bound, block_12).await.unwrap();
-
-        let proof = runtime
-            .finalize(
-                bound,
-                eez_control_rpc::v2::Finalize {
-                    from_block: 12,
-                    to_block: 12,
-                    terminal_hash: hash_12.to_vec(),
-                    post_batch: Some(post_batch(hash_11, hash_12, 1)),
-                },
-            )
+        let work = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move { runtime.validate_block(bound, block()).await })
+        };
+        timeout(Duration::from_secs(1), async {
+            while validations.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let (rewound, _) = runtime
+            .rewind(bound, B256::repeat_byte(0x11))
             .await
             .unwrap();
-
-        assert_eq!(proof.proof.len(), 65);
-        let session = runtime.session(bound.id).await.unwrap();
-        let session = session.lock().await;
-        assert_eq!(session.anchor.number, 11);
-        assert_eq!(session.anchor.hash, hash_11);
-        assert_eq!(session.blocks.len(), 1);
-        assert_eq!(session.blocks[0].validated.number, 12);
+        assert_eq!(
+            work.await.unwrap().unwrap_err().code(),
+            tonic::Code::Aborted
+        );
+        assert!(
+            runtime
+                .session(bound.id)
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .blocks
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .validate_block(rewound, block())
+                .await
+                .unwrap()
+                .reused
+        );
+        assert_eq!(validations.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1624,7 +1652,7 @@ mod tests {
             let session = session.lock().await;
             assert_eq!(session.anchor.state_root, B256::repeat_byte(0x11));
             assert_eq!(
-                session.blocks[0].validated.pre_state_root,
+                session.blocks[0].validated.pre_state_root(),
                 session.anchor.state_root
             );
             assert_eq!(session.tip().state_root, B256::repeat_byte(0x99));
@@ -1633,12 +1661,8 @@ mod tests {
 
     #[tokio::test]
     async fn backend_cache_hits_keep_each_sessions_own_submission_charges() {
-        let runtime = IncrementalRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
-        let begin = begin();
-        let (a, _) = runtime.begin(begin.clone()).await.unwrap();
-        let (b, _) = runtime.begin(begin).await.unwrap();
         let small = block();
-        let small_bytes = small.data.as_ref().unwrap().encoded_len();
+        let next = block_after(12, B256::repeat_byte(0x22), 0x12);
         let mut large = small.clone();
         large
             .data
@@ -1649,25 +1673,42 @@ mod tests {
             .unwrap()
             .codes
             .push(vec![0x77; 100]);
-        let large_bytes = large.data.as_ref().unwrap().encoded_len();
-        runtime.validate_block(a, small.clone()).await.unwrap();
-        assert!(runtime.validate_block(b, large).await.unwrap().reused);
-        runtime.validate_block(a, small).await.unwrap(); // Duplicate adds no charge.
-        let a = runtime.session(a.id).await.unwrap();
-        let b = runtime.session(b.id).await.unwrap();
-        let a = a.lock().await;
-        let b = b.lock().await;
-        assert_eq!(a.blocks.len(), 1);
-        assert_eq!(a.blocks[0].validated, b.blocks[0].validated);
-        assert_eq!(
-            (a.blocks[0].payload_bytes, a.blocks[0].witness_items),
-            (small_bytes, 1)
-        );
-        assert_eq!(
-            (b.blocks[0].payload_bytes, b.blocks[0].witness_items),
-            (large_bytes, 2)
-        );
-        assert!(large_bytes > small_bytes);
+        for quota in ["payload", "witness"] {
+            let mut limits = limits();
+            limits.max_blocks = 2;
+            match quota {
+                "payload" => {
+                    limits.max_payload_bytes = small.data.as_ref().unwrap().encoded_len()
+                        + next.data.as_ref().unwrap().encoded_len();
+                }
+                "witness" => limits.max_witness_items = 2,
+                _ => unreachable!(),
+            }
+            let runtime = IncrementalRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits);
+            let (a, _) = runtime.begin(begin()).await.unwrap();
+            let (b, _) = runtime.begin(begin()).await.unwrap();
+            runtime.validate_block(a, small.clone()).await.unwrap();
+            assert!(
+                runtime
+                    .validate_block(b, large.clone())
+                    .await
+                    .unwrap()
+                    .reused
+            );
+            runtime.validate_block(a, small.clone()).await.unwrap();
+
+            // The duplicate costs nothing; the cache hit still charges B's larger witness.
+            runtime.validate_block(a, next.clone()).await.unwrap();
+            assert_eq!(
+                runtime
+                    .validate_block(b, next.clone())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::ResourceExhausted,
+                "{quota}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1868,35 +1909,6 @@ mod tests {
             );
         }
         drop(server);
-    }
-
-    #[tokio::test]
-    async fn cancel_is_acknowledged_and_retires_only_its_session() {
-        let runtime = IncrementalRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
-        let begin = begin();
-        let (cancelled, _) = runtime.begin(begin.clone()).await.unwrap();
-        let (survivor, _) = runtime.begin(begin).await.unwrap();
-        let mut bound = Some(cancelled);
-        let (response, close) = runtime
-            .handle_frame(
-                &mut bound,
-                ClientFrame {
-                    session_id: cancelled.id.to_vec(),
-                    request_id: 9,
-                    epoch: cancelled.epoch,
-                    kind: Some(client_frame::Kind::Cancel(eez_control_rpc::v2::Cancel {})),
-                },
-            )
-            .await
-            .unwrap();
-
-        assert!(close);
-        assert!(matches!(
-            response.kind,
-            Some(server_frame::Kind::Cancelled(_))
-        ));
-        assert!(runtime.session(cancelled.id).await.is_err());
-        assert!(runtime.session(survivor.id).await.is_ok());
     }
 
     #[tokio::test]

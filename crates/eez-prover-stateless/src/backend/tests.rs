@@ -12,6 +12,8 @@ use reth_primitives_traits::SignerRecoverable as _;
 
 use super::*;
 use crate::testkit::{SYSTEM_TX, TEST_SYSTEM_ADDRESS};
+use eez_primitives::Block;
+use reth_primitives_traits::RecoveredBlock;
 
 fn fixture_chain_config() -> ChainConfig {
     serde_json::from_str(include_str!(concat!(
@@ -61,8 +63,10 @@ fn incremental_input(
 }
 
 #[tokio::test]
-async fn incremental_cache_reuses_execution_and_checkpoints_and_checks_hits() {
-    let (input, config, expected_checkpoints) = checkpoint_fixture();
+async fn incremental_ordinal_execution_skips_checkpoints_and_checks_cache_hits() {
+    // A real three-user-transaction block, not an empty block that would skip
+    // checkpoint work even before the v2 selection fix.
+    let (input, config, _) = checkpoint_fixture();
     let (input, witness, parent) = incremental_input(input);
     let backend = Backend::new(config, TEST_SYSTEM_ADDRESS);
     let deadline = Duration::from_secs(10);
@@ -85,26 +89,9 @@ async fn incremental_cache_reuses_execution_and_checkpoints_and_checks_hits() {
         .await
         .unwrap();
     assert!(!reused);
-    assert_eq!(
-        fresh.block.transaction_state_checkpoints.len(),
-        expected_checkpoints.len() + 1,
-    );
-    assert_eq!(
-        fresh.block.transaction_state_checkpoints[0].at,
-        CheckpointAt::PreExecution,
-    );
-    assert_eq!(
-        fresh
-            .block
-            .transaction_state_checkpoints
-            .iter()
-            .filter_map(|checkpoint| match checkpoint.at {
-                CheckpointAt::Transaction(index) => Some((index, checkpoint.state_root)),
-                CheckpointAt::PreExecution => None,
-            })
-            .collect::<Vec<_>>(),
-        expected_checkpoints
-    );
+    assert_eq!(fresh.decoded().body.transactions.len(), 3);
+    assert_eq!(fresh.settlement_evidence().system_sender_flags, [false; 3]);
+    assert!(fresh.transaction_state_checkpoints().is_empty());
     // No witness is available to re-execute, so success proves backend cache reuse.
     let (cached, reused) = backend
         .validate_next(
@@ -152,6 +139,115 @@ async fn incremental_cache_reuses_execution_and_checkpoints_and_checks_hits() {
         );
     }
     assert_eq!(backend.blocks.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn incremental_sync_execution_generates_and_reuses_checkpoints() {
+    use alloy_consensus::TxReceipt as _;
+    use alloy_consensus::proofs::{
+        calculate_receipt_root, calculate_transaction_root, calculate_withdrawals_root,
+    };
+    use alloy_primitives::{KECCAK256_EMPTY, keccak256};
+    use eez_primitives::{EezTxType, SystemTransaction};
+
+    // Execute a native call from an empty state. Its only persistent change is
+    // SYSTEM_ADDRESS's nonce becoming one; independently seal that account's
+    // single-leaf MPT to supply the expected post-state, not a mocked backend root.
+    let account = alloy_rlp::encode(vec![
+        Bytes::from_static(&[1]),
+        Bytes::new(),
+        Bytes::copy_from_slice(alloy_consensus::constants::EMPTY_ROOT_HASH.as_slice()),
+        Bytes::copy_from_slice(KECCAK256_EMPTY.as_slice()),
+    ]);
+    let mut path = vec![0x20]; // Hex-prefix encoding of a leaf with an even, full-length key.
+    path.extend_from_slice(keccak256(TEST_SYSTEM_ADDRESS).as_slice());
+    let post_root = keccak256(alloy_rlp::encode(vec![
+        Bytes::from(path),
+        Bytes::from(account),
+    ]));
+    let parent = Header {
+        gas_limit: 30_000_000,
+        base_fee_per_gas: Some(1),
+        withdrawals_root: Some(calculate_withdrawals_root(&[])),
+        blob_gas_used: Some(0),
+        excess_blob_gas: Some(0),
+        parent_beacon_block_root: Some(B256::ZERO),
+        ..Default::default()
+    };
+    let transactions = vec![
+        SystemTransaction {
+            chain_id: 1,
+            nonce: 0,
+            to: EEZL2_ADDRESS,
+            value: U256::ZERO,
+            input: Bytes::new(),
+        }
+        .into(),
+    ];
+    let receipt = EthereumReceipt {
+        tx_type: EezTxType::System,
+        success: true,
+        cumulative_gas_used: 21_000,
+        logs: Vec::new(),
+    };
+    let block = Block::new(
+        Header {
+            parent_hash: parent.hash_slow(),
+            number: 1,
+            timestamp: 1,
+            state_root: post_root,
+            transactions_root: calculate_transaction_root(&transactions),
+            receipts_root: calculate_receipt_root(&[receipt.with_bloom_ref()]),
+            gas_used: 21_000,
+            ..parent.clone()
+        },
+        eez_primitives::BlockBody {
+            transactions,
+            withdrawals: Some(Default::default()),
+            ..Default::default()
+        },
+    );
+    let input = admitted_block_with_witness(
+        1,
+        block.header.hash_slow(),
+        parent.hash_slow(),
+        alloy_rlp::encode(block),
+        ExecutionWitness {
+            state: vec![Bytes::from_static(&[0x80])],
+            headers: vec![alloy_rlp::encode(&parent).into()],
+            ..Default::default()
+        },
+    );
+    let (input, witness, parent) = incremental_input(input);
+    let mut config = fixture_chain_config();
+    config.prague_time = None;
+    config.osaka_time = None;
+    let backend = Backend::new(config, TEST_SYSTEM_ADDRESS);
+    let (fresh, reused) = backend
+        .validate_next(parent, parent, &input, witness, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert!(!reused);
+    let checkpoints = fresh.transaction_state_checkpoints();
+    assert_eq!(checkpoints.len(), 2);
+    assert_eq!(checkpoints[0].at, CheckpointAt::PreExecution);
+    assert_eq!(checkpoints[0].state_root, parent.state_root);
+    assert_ne!(checkpoints[0].block_hash, fresh.hash());
+    assert_eq!(checkpoints[1].at, CheckpointAt::Transaction(0));
+    assert_eq!(checkpoints[1].state_root, post_root);
+    assert_eq!(checkpoints[1].block_hash, fresh.hash());
+    let (cached, reused) = backend
+        .validate_next(
+            parent,
+            parent,
+            &input,
+            ExecutionWitness::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(reused);
+    assert_eq!(cached, fresh);
 }
 
 #[tokio::test]
@@ -779,21 +875,21 @@ fn validates_the_golden_block_through_stateless() {
     assert_eq!(output.blocks.len(), 1);
     let block = &output.blocks[0];
     assert_eq!(
-        block.computed_hash,
+        block.hash(),
         b256!("16b64a78e9b3e0d533cafe81f9121735f6a2c8122c69b0bb5994ee75fe7bface")
     );
     // Still asserted: `post_state_root` feeds the continuity check that proves
     // each block executed from its predecessor's post-state.
     assert_eq!(
-        block.post_state_root,
+        block.as_anchor().state_root,
         b256!("f09d8f7da5bc5036f8dd9536c953e2212390a46fb3e553ece2b7d419131537b1")
     );
-    assert!(block.receipt_successes.is_empty());
-    assert!(block.transaction_state_checkpoints.is_empty());
-    assert!(block.settlement_evidence.system_sender_flags.is_empty());
+    assert!(block.receipt_successes().is_empty());
+    assert!(block.transaction_state_checkpoints().is_empty());
+    assert!(block.settlement_evidence().system_sender_flags.is_empty());
     assert!(
         block
-            .settlement_evidence
+            .settlement_evidence()
             .observed_outbound_events
             .is_empty()
     );
@@ -813,18 +909,18 @@ fn selected_checkpoints_flow_through_the_stateless_adapter() {
 
     let block = &output.blocks[0];
     assert_eq!(
-        block.settlement_evidence.system_sender_flags,
+        block.settlement_evidence().system_sender_flags,
         [false, false, false]
     );
     assert!(
         block
-            .settlement_evidence
+            .settlement_evidence()
             .observed_outbound_events
             .is_empty()
     );
-    assert_eq!(block.computed_hash, expected_hash);
+    assert_eq!(block.hash(), expected_hash);
 
-    let observed = &block.transaction_state_checkpoints;
+    let observed = &block.transaction_state_checkpoints();
     assert_eq!(
         observed
             .iter()
@@ -889,7 +985,7 @@ fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
     // The window no longer carries a pre-state root; per-block post-state roots
     // are what the continuity check chains, and that check has its own test.
     assert_eq!(
-        output.blocks.last().unwrap().post_state_root,
+        output.blocks.last().unwrap().as_anchor().state_root,
         oracle["final_state_root"]
             .as_str()
             .unwrap()
@@ -901,14 +997,14 @@ fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
             .blocks
             .last()
             .unwrap()
-            .settlement_evidence
+            .settlement_evidence()
             .observed_outbound_events
             .is_empty()
     );
     // Historical signed calls have no native system authority.
     assert!(output.blocks.iter().all(|block| {
         block
-            .settlement_evidence
+            .settlement_evidence()
             .system_sender_flags
             .iter()
             .all(|is_system| !is_system)

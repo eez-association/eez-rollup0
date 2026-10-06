@@ -210,8 +210,8 @@ impl SettlementPipelineError {
                 "public-input hash computation violated its contract",
             ),
             Self::BlockInspection(error) => match error {
+                #[cfg(test)]
                 settlement::BlockInspectionError::InvalidRlp { .. }
-                | settlement::BlockInspectionError::SystemSenderCount { .. }
                 | settlement::BlockInspectionError::StatusCount { .. } => (
                     tonic::Code::Internal,
                     "validation backend returned invalid output",
@@ -259,8 +259,11 @@ impl SettlementPipelineError {
                 | settlement::DaPayloadError::TrailingBytes { .. } => {
                     (tonic::Code::InvalidArgument, "invalid batch callData")
                 }
-                settlement::DaPayloadError::InvalidBlockRlp { .. }
-                | settlement::DaPayloadError::SystemTransactionReconstruction { .. }
+                #[cfg(test)]
+                settlement::DaPayloadError::InvalidBlockRlp { .. } => (
+                    tonic::Code::Internal, "validation backend returned invalid output",
+                ),
+                settlement::DaPayloadError::SystemTransactionReconstruction { .. }
                 | settlement::DaPayloadError::InvalidEffectTransactionLayout => (
                     tonic::Code::Internal,
                     "validation backend returned invalid output",
@@ -336,16 +339,19 @@ pub(super) fn run_settlement(
 
     // If an outbound load reverted, report its paired user transaction.
     // Reverted inbound deliveries are handled by the inbound gate below.
-    let settling_observations = settlement::inspect_validated_settling_block(
-        settling_block.block(),
-        settling_block.receipt_successes(),
-        expected_rollup_id,
-    )
-    .map_err(|error| {
-        let failure = actionable_block_inspection_failure(&error, settling_block.block());
-        SettlementPipelineError::BlockInspection(error).with_actionable(failure)
-    })?;
-    settlement::verify_validated_intermediate_blocks(validated_window.preceding_blocks())?;
+    let settling_observations =
+        settlement::inspect_validated_settling_block(settling_block, expected_rollup_id).map_err(
+            |error| {
+                let failure = actionable_block_inspection_failure(&error, settling_block);
+                SettlementPipelineError::BlockInspection(error).with_actionable(failure)
+            },
+        )?;
+    settlement::verify_validated_intermediate_blocks(
+        validated_window
+            .preceding_blocks()
+            .iter()
+            .map(AsRef::as_ref),
+    )?;
 
     let bound_effects = settlement::bind_effects_to_execution(
         &verified_state_chain,
@@ -368,7 +374,7 @@ pub(super) fn run_settlement(
         expected_l2_system_address,
     )
     .map_err(|error| {
-        let failure = actionable_outbound_failure(&error, settling_block.block());
+        let failure = actionable_outbound_failure(&error, settling_block);
         SettlementPipelineError::OutboundEffects(error).with_actionable(failure)
     })?;
 

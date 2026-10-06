@@ -8,6 +8,16 @@ use tokio::sync::oneshot;
 
 use super::*;
 
+pub(crate) fn settling_block_for_test(
+    mut block: ValidatedBlock,
+    receipt_successes: Vec<bool>,
+    checkpoints: Vec<StateCheckpoint>,
+) -> ValidatedBlock {
+    block.receipt_successes = receipt_successes;
+    block.transaction_state_checkpoints = checkpoints;
+    block
+}
+
 impl SettlementBlockEvidence {
     /// Derive minimal evidence for tests that use a canned backend result.
     ///
@@ -37,21 +47,61 @@ impl SettlementBlockEvidence {
 }
 
 impl BackendBlockOutput {
-    /// Replace the synthetic transaction results while keeping the backend's
-    /// decoded transaction count associated with them.
+    /// Replace synthetic receipts to exercise checked-block coverage validation.
     pub(crate) fn set_transaction_results_for_test(&mut self, receipt_successes: Vec<bool>) {
-        self.decoded_transaction_count = receipt_successes.len();
         self.receipt_successes = receipt_successes;
     }
 }
 
+/// Raw canned output deliberately kept outside production's checked backend API.
+#[derive(Debug)]
+pub(crate) struct TestBackendWindowOutput {
+    pub blocks: Vec<BackendBlockOutput>,
+}
+
+/// Synthetic test metadata need not match the header (many fixtures use a
+/// byte-grid identity). Evidence still crosses the production shape checker.
+pub(crate) fn check_test_output(
+    admitted: &AdmittedBlock,
+    output: BackendBlockOutput,
+    pre_state_root: B256,
+    allow_checkpoints: bool,
+) -> Result<Arc<ValidatedBlock>, ValidationError> {
+    let decoded = alloy_rlp::decode_exact::<EthereumBlock>(admitted.rlp()).map_err(|error| {
+        ValidationError::InvalidBackendOutput(format!(
+            "block {} RLP does not decode exactly: {error}",
+            admitted.declared_number
+        ))
+    })?;
+    check_backend_block_output(
+        admitted.declared_number,
+        admitted.claimed_hash,
+        &decoded,
+        &output,
+        allow_checkpoints,
+    )
+    .map_err(|error| ValidationError::InvalidBackendOutput(error.to_string()))?;
+    Ok(Arc::new(ValidatedBlock {
+        number: admitted.declared_number,
+        hash: output.computed_hash,
+        parent_hash: admitted.claimed_parent_hash,
+        pre_state_root,
+        post_state_root: output.post_state_root,
+        rlp: admitted.rlp.clone(),
+        decoded,
+        receipt_successes: output.receipt_successes,
+        transaction_state_checkpoints: output.transaction_state_checkpoints,
+        settlement_evidence: output.settlement_evidence,
+    }))
+}
+
 #[derive(Debug)]
 enum StubAction {
-    Respond(Result<BackendWindowOutput, String>),
+    Respond(Result<TestBackendWindowOutput, String>),
     Block {
         started: oneshot::Sender<()>,
         release: mpsc::Receiver<()>,
-        response: Result<BackendWindowOutput, String>,
+        response: Result<TestBackendWindowOutput, String>,
     },
     Panic,
 }
@@ -64,7 +114,7 @@ struct StubBackend {
 }
 
 impl StubBackend {
-    fn next_response(&self) -> Result<BackendWindowOutput, ValidationError> {
+    fn next_response(&self) -> Result<TestBackendWindowOutput, ValidationError> {
         let action = self.actions.lock().unwrap().pop_front().ok_or_else(|| {
             ValidationError::InternalInvariant(
                 "stub validator ran out of canned actions".to_owned(),
@@ -110,53 +160,40 @@ impl ValidationBackend for StubBackend {
 
     fn validate_blocks(
         &self,
-        _blocks: &[AdmittedBlock],
+        blocks: &[AdmittedBlock],
         _witnesses: &mut [ExecutionWitness],
         cancellation: &CancellationToken,
     ) -> Result<BackendWindowOutput, ValidationError> {
         if cancellation.is_cancelled() {
             return Err(ValidationError::Cancelled);
         }
-        self.next_response()
+        let output = self.next_response()?;
+        if output.blocks.len() != blocks.len() {
+            return Err(ValidationError::InvalidBackendOutput(format!(
+                "backend returned {} blocks for {} admitted blocks",
+                output.blocks.len(),
+                blocks.len()
+            )));
+        }
+        let checked = blocks
+            .iter()
+            .zip(output.blocks)
+            .enumerate()
+            .map(|(index, (admitted, output))| {
+                check_test_output(admitted, output, B256::ZERO, index + 1 == blocks.len())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(BackendWindowOutput { blocks: checked })
     }
 
     fn remaining_test_actions(&self) -> Option<usize> {
         Some(self.actions.lock().unwrap().len())
     }
-
-    async fn validate_next(
-        &self,
-        _anchor: IncrementalAnchor,
-        _parent: IncrementalAnchor,
-        block: &AdmittedBlock,
-        mut witness: ExecutionWitness,
-        _request_timeout: std::time::Duration,
-    ) -> Result<(IncrementalBlockOutput, bool), ValidationError> {
-        let mut output = self.validate_blocks(
-            std::slice::from_ref(block),
-            std::slice::from_mut(&mut witness),
-            &CancellationToken::default(),
-        )?;
-        assert_eq!(
-            output.blocks.len(),
-            1,
-            "incremental stub requires one block"
-        );
-        Ok((
-            IncrementalBlockOutput {
-                // A fixed replay result, deliberately independent of the supplied
-                // parent, so tests can detect a missing pre-state continuity check.
-                pre_state_root: B256::ZERO,
-                block: output.blocks.pop().unwrap(),
-            },
-            false,
-        ))
-    }
 }
 
 impl Validator {
     /// A stub backend serving `responses` in order.
-    pub(crate) fn stub(responses: Vec<Result<BackendWindowOutput, String>>) -> Self {
+    pub(crate) fn stub(responses: Vec<Result<TestBackendWindowOutput, String>>) -> Self {
         Self::from_backend(StubBackend {
             actions: Mutex::new(responses.into_iter().map(StubAction::Respond).collect()),
             expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
@@ -165,7 +202,7 @@ impl Validator {
 
     /// A one-shot stub with caller-supplied settlement evidence for each block.
     pub(crate) fn stub_with_settlement_evidence(
-        mut output: BackendWindowOutput,
+        mut output: TestBackendWindowOutput,
         evidence: Vec<SettlementBlockEvidence>,
     ) -> Self {
         assert_eq!(
@@ -181,7 +218,7 @@ impl Validator {
 
     /// A stub that blocks one validation until `release` is signalled.
     pub(crate) fn blocking_stub(
-        response: Result<BackendWindowOutput, String>,
+        response: Result<TestBackendWindowOutput, String>,
     ) -> (Self, oneshot::Receiver<()>, mpsc::Sender<()>) {
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -218,19 +255,19 @@ impl Validator {
 /// Minimal backend output matching the admitted hashes and transaction counts.
 ///
 /// Valid block RLP receives one successful status per transaction. Malformed
-/// RLP receives an empty status list rather than a fabricated count; the shared
-/// backend check rejects such a block at its own exact decode anyway.
-pub(crate) fn backend_output_for(blocks: &[AdmittedBlock]) -> BackendWindowOutput {
-    BackendWindowOutput {
+/// RLP receives an empty status list rather than a fabricated count; the test
+/// backend rejects such a block when it constructs checked evidence.
+pub(crate) fn backend_output_for(blocks: &[AdmittedBlock]) -> TestBackendWindowOutput {
+    TestBackendWindowOutput {
         blocks: blocks
             .iter()
             .map(|block| {
-                let decoded_transaction_count = decode_transaction_count(block).unwrap_or_default();
+                let decoded_transaction_count =
+                    alloy_rlp::decode_exact::<EthereumBlock>(block.rlp())
+                        .map(|block| block.body.transactions.len())
+                        .unwrap_or_default();
                 BackendBlockOutput {
-                    decoded_number: block.declared_number,
-                    decoded_parent_hash: block.claimed_parent_hash,
                     computed_hash: block.claimed_hash,
-                    decoded_transaction_count,
                     receipt_successes: vec![true; decoded_transaction_count],
                     transaction_state_checkpoints: Vec::new(),
                     post_state_root: B256::ZERO,

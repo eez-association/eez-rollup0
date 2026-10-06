@@ -16,22 +16,19 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_debug::ExecutionWitness;
 use eez_evm::EezEvmConfig;
-use eez_primitives::Block;
 use eez_proof_signer::cancel::CancellationToken;
 use eez_proof_signer::validate::support::{
-    CheckpointPlan, check_cancellation, decode_match_and_recover_signers, observe_outbound_events,
-    system_sender_flags,
+    CheckpointPlan, DecodedBlock, check_cancellation, decode_match_and_recover_signers,
+    observe_outbound_events, system_sender_flags,
 };
 use eez_proof_signer::validate::{
     AdmittedBlock, BackendBlockOutput, BackendWindowOutput, IncrementalAnchor,
-    IncrementalBlockOutput, SettlementBlockEvidence, StateCheckpoint, ValidationBackend,
-    ValidationError,
+    SettlementBlockEvidence, StateCheckpoint, ValidatedBlock, ValidationBackend, ValidationError,
 };
 #[cfg(test)]
 use eez_proof_signer::window::testing::admitted_block_parts_mut;
 use lru::LruCache;
 use reth_chainspec::ChainSpec;
-use reth_primitives_traits::RecoveredBlock;
 use stateless_reth::validation::StatelessValidationError;
 use stateless_reth::{
     StatelessValidationOutput, stateless_validation_recovered,
@@ -48,19 +45,13 @@ const DEBUG_PROGRESS_INTERVAL: usize = 100;
 const MAX_CACHED_BLOCKS: usize = 32_768;
 const MAX_CONCURRENT_VALIDATIONS: usize = 4;
 
-#[derive(Debug)]
-struct CachedBlock {
-    rlp: Vec<u8>,
-    output: IncrementalBlockOutput,
-}
-
 /// Signer-recovered settling block prepared before replay.
 ///
 /// This block is exact-decoded and its signers are recovered, but it remains
 /// untrusted until Stateless accepts the same `RecoveredBlock`. Preparing it
 /// early keeps checkpoint selection independent from execution side effects.
 struct PreparedSettlingBlock {
-    block: RecoveredBlock<Block>,
+    block: DecodedBlock,
     checkpoint_plan: CheckpointPlan,
     system_sender_flags: Vec<bool>,
 }
@@ -93,7 +84,7 @@ pub struct Backend {
     chain_spec: Arc<ChainSpec>,
     evm_config: EezEvmConfig,
     expected_l2_system_address: Address,
-    blocks: Arc<Mutex<LruCache<B256, CachedBlock>>>,
+    blocks: Arc<Mutex<LruCache<B256, Arc<ValidatedBlock>>>>,
     validation_slots: Arc<Semaphore>,
 }
 
@@ -178,8 +169,7 @@ impl Backend {
         result
     }
 
-    /// Replay every admitted block and return associated per-block output. The
-    /// caller still consumes and checks that output before exposing settlement evidence.
+    /// Replay a v1 window or one v2 block (with its parent), returning checked evidence.
     fn validate_blocks_inner(
         &self,
         blocks: &[AdmittedBlock],
@@ -197,19 +187,24 @@ impl Backend {
                 witnesses.len(),
             )));
         }
-        let mut block_outputs = Vec::<BackendBlockOutput>::with_capacity(total_blocks);
+        let mut block_outputs = Vec::<Arc<ValidatedBlock>>::with_capacity(total_blocks);
 
-        // Derive the final block's complete checkpoint plan before any witness
-        // is consumed or earlier block is replayed.
+        // V1 nominates its terminal for checkpoints. A one-block v2 request does
+        // not: derive whether it needs Sync checkpoints from its transactions.
+        // Plan before consuming witnesses or replaying earlier v1 blocks.
         check_cancellation(cancellation, 0, total_blocks)?;
         let mut prepared_settling_block = blocks
             .last()
             .map(|admitted| {
                 let recovered_block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
-                let (checkpoint_plan, system_sender_flags) = CheckpointPlan::from_recovered_block(
-                    &recovered_block,
-                    expected_l2_system_address,
-                );
+                let (checkpoint_plan, system_sender_flags) = if parent.is_some() {
+                    CheckpointPlan::for_streamed_block(&recovered_block, expected_l2_system_address)
+                } else {
+                    CheckpointPlan::from_recovered_block(
+                        &recovered_block,
+                        expected_l2_system_address,
+                    )
+                };
                 Ok(PreparedSettlingBlock {
                     block: recovered_block,
                     checkpoint_plan,
@@ -242,7 +237,6 @@ impl Backend {
                 (recovered_block, None, system_sender_flags)
             };
             let block_number = recovered_block.header().number;
-            let decoded_parent_hash = recovered_block.header().parent_hash;
             let timestamp = recovered_block.header().timestamp;
             let transaction_count = recovered_block.body().transactions.len();
             trace!(
@@ -262,7 +256,7 @@ impl Backend {
             let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
                 Some(plan) if !plan.positions().is_empty() => {
                     let output = stateless_validation_recovered_with_state_checkpoints(
-                        recovered_block,
+                        recovered_block.execution_input(),
                         witness,
                         Arc::clone(&self.chain_spec),
                         self.evm_config.clone(),
@@ -284,7 +278,7 @@ impl Backend {
                 }
                 _ => {
                     let output = stateless_validation_recovered(
-                        recovered_block,
+                        recovered_block.execution_input(),
                         witness,
                         Arc::clone(&self.chain_spec),
                         self.evm_config.clone(),
@@ -307,8 +301,9 @@ impl Backend {
                 executes_from_previous_post_state(block_number, pre_state_root, parent.state_root)
                     .map_err(ValidationError::Rejected)?;
             }
-            if let Some(previous_post_state_root) =
-                block_outputs.last().map(|output| output.post_state_root)
+            if let Some(previous_post_state_root) = block_outputs
+                .last()
+                .map(|output| output.as_anchor().state_root)
             {
                 executes_from_previous_post_state(
                     block_number,
@@ -352,11 +347,8 @@ impl Backend {
                     "stateless block validated",
                 );
             }
-            block_outputs.push(BackendBlockOutput {
-                decoded_number: block_number,
-                decoded_parent_hash,
+            let output = BackendBlockOutput {
                 computed_hash,
-                decoded_transaction_count: transaction_count,
                 receipt_successes,
                 transaction_state_checkpoints,
                 post_state_root,
@@ -364,7 +356,12 @@ impl Backend {
                     system_sender_flags,
                     observed_outbound_events,
                 },
-            });
+            };
+            block_outputs.push(recovered_block.finish(
+                output,
+                pre_state_root,
+                block_ordinal == total_blocks,
+            )?);
 
             if block_ordinal.is_multiple_of(DEBUG_PROGRESS_INTERVAL) {
                 debug!(
@@ -423,30 +420,16 @@ impl ValidationBackend for Backend {
         block: &AdmittedBlock,
         witness: ExecutionWitness,
         request_timeout: Duration,
-    ) -> Result<(IncrementalBlockOutput, bool), ValidationError> {
+    ) -> Result<(Arc<ValidatedBlock>, bool), ValidationError> {
         tokio::time::timeout(request_timeout, async {
-            if parent.number.checked_add(1) != Some(block.declared_number())
-                || parent.hash != block.claimed_parent_hash()
-            {
-                return Err(ValidationError::Rejected(
-                    "block does not extend its exact parent".to_owned(),
-                ));
-            }
             {
                 let mut blocks = self.blocks.lock().unwrap();
                 if let Some(cached) = blocks.get(&block.claimed_hash()) {
-                    if cached.rlp != block.rlp()
-                        || cached.output.block.decoded_number != block.declared_number()
-                        || cached.output.block.decoded_parent_hash != parent.hash
-                        || cached.output.pre_state_root != parent.state_root
-                    {
-                        return Err(ValidationError::Rejected(
-                            "cached block does not match the submitted bytes and parent".to_owned(),
-                        ));
-                    }
-                    return Ok((cached.output.clone(), true));
+                    cached.matches_submission(block, parent)?;
+                    return Ok((Arc::clone(cached), true));
                 }
             }
+            block.check_parent(parent)?;
             let permit = Arc::clone(&self.validation_slots)
                 .acquire_owned()
                 .await
@@ -467,21 +450,15 @@ impl ValidationBackend for Backend {
                     &CancellationToken::default(),
                     Some(parent),
                 )?;
-                let output = IncrementalBlockOutput {
-                    pre_state_root: parent.state_root,
-                    block: output
-                        .blocks
-                        .into_iter()
-                        .next()
-                        .expect("one validated block"),
-                };
+                let output = output
+                    .blocks
+                    .into_iter()
+                    .next()
+                    .expect("one validated block");
                 let mut blocks = backend.blocks.lock().unwrap();
-                // Concurrent misses may execute twice, but only the first complete result is stored.
-                let cached = blocks.get_or_insert(admitted.claimed_hash(), || CachedBlock {
-                    rlp: admitted.rlp().to_vec(),
-                    output,
-                });
-                Ok((cached.output.clone(), false))
+                // Concurrent misses may execute twice; only fully checked evidence is published.
+                let cached = blocks.get_or_insert(admitted.claimed_hash(), || output);
+                Ok((Arc::clone(cached), false))
             })
             .await
             .map_err(|error| {

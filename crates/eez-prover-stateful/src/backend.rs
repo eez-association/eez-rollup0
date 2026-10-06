@@ -26,8 +26,8 @@ use eez_proof_signer::validate::support::{
 };
 use eez_proof_signer::validate::{
     AdmittedBlock, BackendBlockOutput, BackendWindowOutput, CheckpointAt, IncrementalAnchor,
-    IncrementalBlockOutput, SettlementBlockEvidence, StateCheckpoint, ValidatedBlockArtifact,
-    ValidationBackend, ValidationError,
+    SettlementBlockEvidence, StateCheckpoint, ValidatedBlock, ValidatedWindow, ValidationBackend,
+    ValidationError,
 };
 use lru::LruCache;
 use reth_chainspec::ChainSpec;
@@ -274,42 +274,12 @@ where
     async fn recheck_incremental(
         &self,
         anchor: IncrementalAnchor,
-        blocks: &[Arc<ValidatedBlockArtifact>],
+        window: &ValidatedWindow,
     ) -> Result<(), ValidationError> {
         let committer = self.committer()?;
         let _forkchoice_guard = committer.begin_reconcile().await;
-        let mut expected_number = anchor.number.checked_add(1).ok_or_else(|| {
-            ValidationError::Rejected("incremental anchor block number overflow".to_owned())
-        })?;
-        let mut expected_parent = anchor.hash;
-        let mut terminal = None;
-        for block in blocks {
-            let (number, hash, parent_hash, rlp) = (
-                block.number(),
-                block.hash(),
-                block.parent_hash(),
-                block.rlp(),
-            );
-            if number != expected_number || parent_hash != expected_parent {
-                return Err(ValidationError::InvalidBackendOutput(format!(
-                    "validated stateful range is not contiguous at block {number}",
-                )));
-            }
-            let decoded = alloy_rlp::decode_exact::<Block>(rlp).map_err(|error| {
-                ValidationError::InvalidBackendOutput(format!(
-                    "validated block {number} no longer exact-decodes: {error}",
-                ))
-            })?;
-            let computed_hash = decoded.header.hash_slow();
-            if decoded.header.number != number
-                || decoded.header.parent_hash != parent_hash
-                || computed_hash != hash
-            {
-                return Err(ValidationError::InvalidBackendOutput(format!(
-                    "validated block {number} identity changed before finalization",
-                )));
-            }
-            let header = SealedHeader::new(decoded.header.clone(), hash);
+        for block in window.blocks() {
+            let (number, hash, rlp) = (block.number(), block.hash(), block.rlp());
             let known = self
                 .provider
                 .find_block_by_hash(hash, reth_storage_api::BlockSource::Any)
@@ -327,16 +297,9 @@ where
                     "Reth block identity changed at height {number}",
                 )));
             }
-            terminal = Some(header);
-            expected_number = expected_number.checked_add(1).ok_or_else(|| {
-                ValidationError::Rejected("incremental block number overflow".to_owned())
-            })?;
-            expected_parent = hash;
         }
-
-        let terminal = terminal.ok_or_else(|| {
-            ValidationError::Rejected("incremental finalization range is empty".to_owned())
-        })?;
+        let terminal = window.settling_block();
+        let terminal = SealedHeader::new(terminal.decoded().header.clone(), terminal.hash());
         // The blocks were imported and executed when their Validated frames
         // were produced. Finalization must not replay the whole prefix through
         // newPayload: repeatedly walking the canonical head back to block 1
@@ -393,21 +356,9 @@ where
         admitted: &AdmittedBlock,
         _witness: ExecutionWitness,
         request_timeout: Duration,
-    ) -> Result<(IncrementalBlockOutput, bool), ValidationError> {
+    ) -> Result<(Arc<ValidatedBlock>, bool), ValidationError> {
         tokio::time::timeout(request_timeout, async {
-            let expected_number = parent.number.checked_add(1).ok_or_else(|| {
-                ValidationError::Rejected("incremental block number overflow".to_owned())
-            })?;
-            if admitted.declared_number() != expected_number
-                || admitted.claimed_parent_hash() != parent.hash
-            {
-                return Err(ValidationError::Rejected(format!(
-                    "incremental block {} does not extend {} ({})",
-                    admitted.declared_number(),
-                    parent.number,
-                    parent.hash,
-                )));
-            }
+            admitted.check_parent(parent)?;
 
             // Reth owns every branch's state. Serialize parent lookup, unsafe-head
             // selection and outcome reads with L1 reconciliation and other sessions.
@@ -452,7 +403,7 @@ where
                     ))
                 })?;
 
-            let mut reused = if let Some(stored) = self
+            let reused = if let Some(stored) = self
                 .provider
                 .find_block_by_hash(block.hash(), reth_storage_api::BlockSource::Any)
                 .map_err(provider_error)?
@@ -515,7 +466,7 @@ where
                 })?;
 
             let (checkpoint_plan, sender_flags) =
-                CheckpointPlan::from_recovered_block(&block, self.expected_l2_system_address);
+                CheckpointPlan::for_streamed_block(&block, self.expected_l2_system_address);
             let cached_checkpoints = self.checkpoints.lock().unwrap().get(&block.hash()).cloned();
             let (receipt_successes, observed_outbound_events, checkpoints) =
                 if checkpoint_plan.positions().is_empty() {
@@ -531,13 +482,12 @@ where
                         checkpoints,
                     )
                 } else {
-                    reused = false;
                     let provider = self.provider.clone();
                     let evm_config = self.evm_config.clone();
                     let chain_spec = Arc::clone(&self.chain_spec);
                     let checkpoint_cache = Arc::clone(&self.checkpoints);
                     let block = block.clone();
-                    tokio::task::spawn_blocking(move || {
+                    let checked = tokio::task::spawn_blocking(move || {
                     // Keep reconciliation serialized until replay really finishes, including on timeout.
                     let _forkchoice_guard = _forkchoice_guard;
                     let parent_state =
@@ -580,34 +530,40 @@ where
                         )));
                     }
                     checkpoint_plan.verify_returned(&checkpoints)?;
-                    let checkpoints = checkpoint_cache
-                        .lock()
-                        .unwrap()
-                        .get_or_insert(block.hash(), || checkpoints)
-                        .clone();
-                    Ok::<_, ValidationError>((
-                        result
+                    let output = BackendBlockOutput {
+                        computed_hash: block.hash(),
+                        receipt_successes: result
                             .receipts
                             .iter()
                             .map(|receipt| receipt.success)
                             .collect(),
-                        observe_outbound_events(&result.receipts),
-                        checkpoints,
-                    ))
+                        transaction_state_checkpoints: checkpoints,
+                        post_state_root: computed_root,
+                        settlement_evidence: SettlementBlockEvidence {
+                            system_sender_flags: sender_flags,
+                            observed_outbound_events: observe_outbound_events(&result.receipts),
+                        },
+                    };
+                    let checked = block.finish(output, parent.state_root, true)?;
+                    checkpoint_cache
+                        .lock()
+                        .unwrap()
+                        .get_or_insert(checked.hash(), || {
+                            checked.transaction_state_checkpoints().to_vec()
+                        });
+                    Ok::<_, ValidationError>(checked)
                 })
                 .await
                 .map_err(|error| {
                     ValidationError::InternalInvariant(format!(
                         "stateful checkpoint worker failed: {error}"
                     ))
-                })??
+                })??;
+                    return Ok((checked, false));
                 };
 
             let output = BackendBlockOutput {
-                decoded_number: number,
-                decoded_parent_hash: block.header().parent_hash(),
                 computed_hash: block.hash(),
-                decoded_transaction_count: block.body().transactions.len(),
                 receipt_successes,
                 transaction_state_checkpoints: checkpoints,
                 post_state_root: block.header().state_root(),
@@ -617,10 +573,7 @@ where
                 },
             };
             Ok((
-                IncrementalBlockOutput {
-                    pre_state_root: previous_header.state_root(),
-                    block: output,
-                },
+                block.finish(output, previous_header.state_root(), true)?,
                 reused,
             ))
         })
@@ -792,6 +745,7 @@ where
                 block.header().state_root(),
             )));
         }
+        let pre_state_root = previous_header.state_root();
         state.block_hashes.insert(number, block.hash());
         previous_header = block.sealed_block().clone_sealed_header();
 
@@ -801,11 +755,8 @@ where
             .map(|receipt| receipt.success)
             .collect();
         let observed_outbound_events = observe_outbound_events(&result.receipts);
-        outputs.push(BackendBlockOutput {
-            decoded_number: number,
-            decoded_parent_hash: block.header().parent_hash(),
+        let output = BackendBlockOutput {
             computed_hash: block.hash(),
-            decoded_transaction_count: block.body().transactions.len(),
             receipt_successes,
             transaction_state_checkpoints: checkpoints,
             post_state_root,
@@ -813,7 +764,8 @@ where
                 system_sender_flags: sender_flags,
                 observed_outbound_events,
             },
-        });
+        };
+        outputs.push(block.finish(output, pre_state_root, is_settling)?);
         debug!(block_number = number, %post_state_root, "stateful proof block validated");
     }
 

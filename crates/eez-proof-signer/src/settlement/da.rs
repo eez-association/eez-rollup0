@@ -29,6 +29,7 @@ pub(crate) enum DaPayloadError {
         field: &'static str,
         expected: usize,
     },
+    #[cfg(test)]
     #[error("validated block {block_number} RLP does not decode exactly: {reason}")]
     InvalidBlockRlp { block_number: u64, reason: String },
     #[error(
@@ -198,14 +199,14 @@ pub(crate) fn verify_da_payload(
     system_transaction_reconstructor: &SystemTransactionReconstructor,
     expected_rollup_id: u64,
 ) -> Result<(), DaPayloadError> {
-    let settling = validated_window.settling_block().block();
+    let settling = validated_window.settling_block();
     verify_encoded_da_payload(
         batch.as_batch().callData.as_ref(),
         validated_window
             .preceding_blocks()
             .iter()
-            .map(|block| (block.number(), block.rlp())),
-        (settling.number(), settling.rlp()),
+            .map(|block| (block.number(), block.decoded())),
+        (settling.number(), settling.decoded()),
         outbound_effects,
         inbound_effects,
         system_transaction_reconstructor,
@@ -227,10 +228,16 @@ pub(crate) fn verify_da_payload_for_test<'a, I>(
 where
     I: ExactSizeIterator<Item = (u64, &'a [u8])>,
 {
+    let intermediate_blocks = intermediate_blocks
+        .map(|(number, rlp)| decode_validated_block(number, rlp).map(|block| (number, block)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let settling = decode_validated_block(settling_block.0, settling_block.1)?;
     verify_encoded_da_payload(
         encoded_payload,
-        intermediate_blocks,
-        settling_block,
+        intermediate_blocks
+            .iter()
+            .map(|(number, block)| (*number, block)),
+        (settling_block.0, &settling),
         outbound_effects,
         inbound_effects,
         system_transaction_reconstructor,
@@ -241,14 +248,14 @@ where
 fn verify_encoded_da_payload<'a, I>(
     encoded_payload: &[u8],
     intermediate_blocks: I,
-    settling_block: (u64, &'a [u8]),
+    settling_block: (u64, &'a EthereumBlock),
     outbound_effects: &AuthorizedOutboundEffects,
     inbound_effects: &AuthorizedInboundEffects<'_>,
     system_transaction_reconstructor: &SystemTransactionReconstructor,
     expected_rollup_id: u64,
 ) -> Result<(), DaPayloadError>
 where
-    I: ExactSizeIterator<Item = (u64, &'a [u8])>,
+    I: ExactSizeIterator<Item = (u64, &'a EthereumBlock)>,
 {
     let mut payload_cursor = DaPayload::decode(encoded_payload, expected_rollup_id)?;
     let expected_blocks = intermediate_blocks.len() + 1;
@@ -285,7 +292,7 @@ where
     )?;
     if settling.requires_sync_reconstruction {
         verify_reconstructed_sync_block(
-            &settling.block,
+            settling.block,
             &settling.encoded_transactions,
             outbound_effects,
             inbound_effects,
@@ -302,13 +309,12 @@ fn verify_preceding_block_transactions<'a, I>(
     expected_blocks: usize,
 ) -> Result<usize, DaPayloadError>
 where
-    I: Iterator<Item = (u64, &'a [u8])>,
+    I: Iterator<Item = (u64, &'a EthereumBlock)>,
 {
     let mut retained_transaction_count = 0usize;
-    for (block_index, (block_number, block_rlp)) in preceding_blocks.enumerate() {
-        let block = decode_validated_block(block_number, block_rlp)?;
+    for (block_index, (block_number, block)) in preceding_blocks.enumerate() {
         let submitted_count = payload_cursor.block_count(expected_blocks, block_index)?;
-        verify_header_inputs(payload_cursor, block_index, block_number, &block)?;
+        verify_header_inputs(payload_cursor, block_index, block_number, block)?;
         let validated_count = block.body.transactions.len();
         if submitted_count != validated_count {
             return Err(DaPayloadError::ProjectedTransactionCount {
@@ -327,8 +333,8 @@ where
     Ok(retained_transaction_count)
 }
 
-struct SettlingBlockDaVerification {
-    block: EthereumBlock,
+struct SettlingBlockDaVerification<'a> {
+    block: &'a EthereumBlock,
     encoded_transactions: Vec<Bytes>,
     retained_transaction_count: usize,
     requires_sync_reconstruction: bool,
@@ -336,17 +342,16 @@ struct SettlingBlockDaVerification {
 
 /// Verify the settling-block transaction projection and retain exact bytes only
 /// when the canonical Sync sequence must be reconstructed.
-fn verify_settling_block_transactions(
+fn verify_settling_block_transactions<'a>(
     payload_cursor: &mut DaPayload,
-    (block_number, block_rlp): (u64, &[u8]),
+    (block_number, block): (u64, &'a EthereumBlock),
     expected_blocks: usize,
     outbound_effects: &AuthorizedOutboundEffects,
     inbound_effects: &AuthorizedInboundEffects<'_>,
     omitted_transaction_count: usize,
-) -> Result<SettlingBlockDaVerification, DaPayloadError> {
-    let block = decode_validated_block(block_number, block_rlp)?;
+) -> Result<SettlingBlockDaVerification<'a>, DaPayloadError> {
     let submitted_count = payload_cursor.block_count(expected_blocks, expected_blocks - 1)?;
-    verify_header_inputs(payload_cursor, expected_blocks - 1, block_number, &block)?;
+    verify_header_inputs(payload_cursor, expected_blocks - 1, block_number, block)?;
     let validated_count = block.body.transactions.len();
     let retained_transaction_count = validated_count
         .checked_sub(omitted_transaction_count)
@@ -512,6 +517,7 @@ fn verify_header_inputs(
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_validated_block(
     block_number: u64,
     block_rlp: &[u8],

@@ -1,6 +1,9 @@
 //! Replay helpers shared by validation backends.
 
-use alloy_primitives::Address;
+use std::ops::Deref;
+use std::sync::Arc;
+
+use alloy_primitives::{Address, B256};
 use alloy_sol_types::SolEvent as _;
 use eez_primitives::Block;
 use eez_primitives::Receipt as EthereumReceipt;
@@ -11,8 +14,9 @@ use reth_primitives_traits::RecoveredBlock;
 use tracing::debug;
 
 use super::{
-    AdmittedBlock, CheckpointAt, DecodedOutboundEvent, OutboundEventObservation, StateCheckpoint,
-    ValidationError,
+    AdmittedBlock, BackendBlockOutput, CheckpointAt, DecodedOutboundEvent,
+    OutboundEventObservation, StateCheckpoint, ValidatedBlock, ValidationError,
+    check_backend_block_output,
 };
 use crate::EEZL2_ADDRESS;
 use crate::cancel::CancellationToken;
@@ -28,6 +32,25 @@ impl CheckpointPlan {
     #[cfg(feature = "test-utils")]
     pub fn new(positions: Vec<CheckpointAt>) -> Self {
         Self { positions }
+    }
+
+    /// V2 needs candidate checkpoints only for system-transaction-bearing blocks.
+    /// A valid nonempty Sync contains native system transactions; an empty Sync
+    /// needs no checkpoints. Settlement still verifies the exact effect layout.
+    pub fn for_streamed_block(
+        block: &RecoveredBlock<Block>,
+        expected_l2_system_address: Address,
+    ) -> (Self, Vec<bool>) {
+        if block.body().transactions.iter().any(is_system_tx) {
+            Self::from_recovered_block(block, expected_l2_system_address)
+        } else {
+            (
+                Self {
+                    positions: Vec::new(),
+                },
+                system_sender_flags(block, expected_l2_system_address),
+            )
+        }
     }
 
     /// Derive effect-candidate boundaries and system-sender flags.
@@ -112,17 +135,76 @@ pub fn check_cancellation(
     }
 }
 
+/// Identity-bound input retained through execution, so finishing validation
+/// need not decode the submitted bytes or bind their identity a second time.
+#[derive(Debug, Clone)]
+pub struct DecodedBlock {
+    rlp: Vec<u8>,
+    block: RecoveredBlock<Block>,
+}
+
+impl Deref for DecodedBlock {
+    type Target = RecoveredBlock<Block>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.block
+    }
+}
+
+impl DecodedBlock {
+    /// An owned execution input for engines that consume their recovered block.
+    pub fn execution_input(&self) -> RecoveredBlock<Block> {
+        self.block.clone()
+    }
+
+    /// Publish checked execution evidence. Backends call this before inserting
+    /// a reusable result; callers cannot construct a validated block directly.
+    pub fn finish(
+        self,
+        output: BackendBlockOutput,
+        pre_state_root: B256,
+        allow_checkpoints: bool,
+    ) -> Result<Arc<ValidatedBlock>, ValidationError> {
+        let hash = self.block.hash();
+        let decoded = self.block.into_block();
+        check_backend_block_output(
+            decoded.header.number,
+            hash,
+            &decoded,
+            &output,
+            allow_checkpoints,
+        )
+        .map_err(|error| ValidationError::InvalidBackendOutput(error.to_string()))?;
+        Ok(Arc::new(ValidatedBlock {
+            number: decoded.header.number,
+            hash: output.computed_hash,
+            parent_hash: decoded.header.parent_hash,
+            pre_state_root,
+            post_state_root: output.post_state_root,
+            rlp: self.rlp,
+            decoded,
+            receipt_successes: output.receipt_successes,
+            transaction_state_checkpoints: output.transaction_state_checkpoints,
+            settlement_evidence: output.settlement_evidence,
+        }))
+    }
+}
+
 /// Exact-decode, match stream metadata, and recover transaction signers.
 pub fn decode_match_and_recover_signers(
     admitted: &AdmittedBlock,
     chain_spec: &ChainSpec,
-) -> Result<RecoveredBlock<Block>, ValidationError> {
+) -> Result<DecodedBlock, ValidationError> {
     let block = decode_and_match_stream_metadata(admitted)?;
     let number = block.header.number;
-    recover_block(block, chain_spec).map_err(|error| {
+    let block = recover_block(block, chain_spec).map_err(|error| {
         ValidationError::Rejected(format!(
             "block {number} transaction recovery failed: {error}",
         ))
+    })?;
+    Ok(DecodedBlock {
+        rlp: admitted.rlp().to_vec(),
+        block,
     })
 }
 

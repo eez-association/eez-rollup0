@@ -29,26 +29,12 @@ fn validated_settling_block_uses_backend_recovered_sender_facts() {
         SettlementBlockEvidence::for_test(vec![true, false, false], vec![observation]),
     );
 
-    let facts = inspect_validated_settling_block(&block, &[true; 3], expected_rollup_id()).unwrap();
+    let facts = inspect_validated_settling_block(&block, expected_rollup_id()).unwrap();
 
     assert_eq!(facts.system_sender_flags(), [true, false, false]);
     assert_eq!(facts.effect_candidate_positions(), [1, 2]);
     assert!(facts.inbound_candidates().is_empty());
     assert_eq!(facts.outbound_event_candidates(), [observation]);
-}
-
-#[test]
-fn validated_settling_block_rejects_unbound_sender_fact_count() {
-    let block = validated_block(42, block_rlp(vec![transaction(SYSTEM_TX)]), Vec::new());
-
-    assert_eq!(
-        inspect_validated_settling_block(&block, &[true], expected_rollup_id()),
-        Err(BlockInspectionError::SystemSenderCount {
-            block_number: 42,
-            required: 1,
-            actual: 0,
-        })
-    );
 }
 
 #[test]
@@ -440,24 +426,6 @@ fn validated_intermediate_blocks_use_backend_recovered_sender_facts() {
         Err(BlockInspectionError::IntermediateSystemTransaction {
             block_number: 41,
             transaction_index: 0,
-        })
-    );
-}
-
-#[test]
-fn validated_intermediate_blocks_reject_unbound_sender_fact_count() {
-    let block = validated_block(
-        41,
-        block_rlp(vec![transaction(USER_INBOUND_SELECTOR_TX)]),
-        Vec::new(),
-    );
-
-    assert_eq!(
-        verify_validated_intermediate_blocks(&[block]),
-        Err(BlockInspectionError::SystemSenderCount {
-            block_number: 41,
-            required: 1,
-            actual: 0,
         })
     );
 }

@@ -76,89 +76,6 @@ fn accepts_backend_output_consistent_with_the_window() {
     assert_eq!(validator.stub_remaining(), 0);
 }
 
-#[tokio::test]
-async fn incremental_validation_binds_the_parent_and_backend_output_without_a_cursor() {
-    let anchor = IncrementalAnchor {
-        number: 10,
-        hash: B256::repeat_byte(10),
-        state_root: B256::ZERO,
-    };
-    for defect in [
-        "none",
-        "parent number",
-        "parent hash",
-        "pre-state root",
-        "output hash",
-        "duplicate pre-execution checkpoint",
-        "misordered pre-execution checkpoint",
-        "checkpoint transaction out of bounds",
-    ] {
-        let mut parent = anchor;
-        let mut admitted = admitted_block_with_transactions(11, 11, 1);
-        admitted.claimed_parent_hash = anchor.hash;
-        let mut output = backend_output_for(std::slice::from_ref(&admitted));
-        let pre_execution = StateCheckpoint {
-            at: CheckpointAt::PreExecution,
-            state_root: anchor.state_root,
-            block_hash: B256::repeat_byte(0xaa),
-        };
-        output.blocks[0].transaction_state_checkpoints = vec![pre_execution, checkpoint(0, 0)];
-        match defect {
-            "parent number" => parent.number = 9,
-            "parent hash" => parent.hash = B256::repeat_byte(9),
-            "pre-state root" => parent.state_root = B256::repeat_byte(9),
-            "output hash" => output.blocks[0].computed_hash = B256::repeat_byte(9),
-            "duplicate pre-execution checkpoint" => {
-                output.blocks[0]
-                    .transaction_state_checkpoints
-                    .insert(0, pre_execution);
-            }
-            "misordered pre-execution checkpoint" => {
-                output.blocks[0].transaction_state_checkpoints.reverse();
-            }
-            "checkpoint transaction out of bounds" => {
-                output.blocks[0].transaction_state_checkpoints[1].at = CheckpointAt::Transaction(1);
-            }
-            _ => {}
-        }
-        let validator = Validator::stub(vec![Ok(output)]);
-        let result = validator
-            .validate_next(anchor, parent, admitted, std::time::Duration::from_secs(1))
-            .await;
-        match defect {
-            "none" => {
-                let (artifact, _) = result.unwrap();
-                assert_eq!(artifact.pre_state_root, parent.state_root);
-                assert_eq!(artifact.parent_hash, parent.hash);
-                assert_eq!(artifact.number, 11);
-                assert_eq!(artifact.transaction_state_checkpoints[0], pre_execution);
-                let window = ValidatedWindow::from_incremental(anchor, &[artifact]).unwrap();
-                assert_eq!(
-                    window.settling_block().transaction_state_checkpoints()[0],
-                    pre_execution,
-                );
-            }
-            "parent number" | "parent hash" => {
-                assert!(
-                    matches!(result, Err(ValidationError::Rejected(_))),
-                    "{defect}"
-                );
-                assert_eq!(
-                    validator.stub_remaining(),
-                    1,
-                    "bad parent must not reach execution"
-                );
-                continue;
-            }
-            _ => assert!(
-                matches!(result, Err(ValidationError::InvalidBackendOutput(_))),
-                "{defect}"
-            ),
-        }
-        assert_eq!(validator.stub_remaining(), 0);
-    }
-}
-
 #[test]
 fn rejects_an_empty_window() {
     let validator = Validator::stub(vec![Ok(backend_output_for(&[]))]);
@@ -192,45 +109,6 @@ fn rejects_backend_output_with_a_mismatched_hash() {
 }
 
 #[test]
-fn rejects_backend_output_with_a_mismatched_decoded_number() {
-    let window = [admitted_block(5, 0x05)];
-    let mut output = backend_output_for(&window);
-    output.blocks[0].decoded_number = 6;
-    let validator = Validator::stub(vec![Ok(output)]);
-
-    assert!(matches!(
-        validator.validate(&window),
-        Err(ValidationError::InvalidBackendOutput(_))
-    ));
-}
-
-#[test]
-fn rejects_backend_output_with_a_mismatched_decoded_parent() {
-    let window = [admitted_block(5, 0x05)];
-    let mut output = backend_output_for(&window);
-    output.blocks[0].decoded_parent_hash = B256::repeat_byte(0xee);
-    let validator = Validator::stub(vec![Ok(output)]);
-
-    assert!(matches!(
-        validator.validate(&window),
-        Err(ValidationError::InvalidBackendOutput(_))
-    ));
-}
-
-#[test]
-fn rejects_backend_output_with_a_mismatched_decoded_transaction_count() {
-    let window = [admitted_block(5, 0x05)];
-    let mut output = backend_output_for(&window);
-    output.blocks[0].decoded_transaction_count = 1;
-    let validator = Validator::stub(vec![Ok(output)]);
-
-    assert!(matches!(
-        validator.validate(&window),
-        Err(ValidationError::InvalidBackendOutput(_))
-    ));
-}
-
-#[test]
 fn rejects_system_sender_flags_that_do_not_cover_the_block() {
     let window = [admitted_block(5, 0x05)];
     let mut output = backend_output_for(&window);
@@ -241,6 +119,66 @@ fn rejects_system_sender_flags_that_do_not_cover_the_block() {
         validator.validate(&window),
         Err(ValidationError::InvalidBackendOutput(_))
     ));
+}
+
+#[test]
+fn decoded_block_checks_execution_evidence_before_it_can_be_shared() {
+    let block = EthereumBlock::new(
+        alloy_consensus::Header {
+            number: 11,
+            parent_hash: B256::repeat_byte(10),
+            ..Default::default()
+        },
+        Default::default(),
+    );
+    let admitted = AdmittedBlock {
+        declared_number: 11,
+        claimed_hash: block.header.hash_slow(),
+        claimed_parent_hash: block.header.parent_hash,
+        rlp: alloy_rlp::encode(block),
+        witness: Default::default(),
+    };
+    for defect in [
+        "none",
+        "execution hash",
+        "receipts",
+        "senders",
+        "event",
+        "checkpoint",
+    ] {
+        let decoded = support::decode_match_and_recover_signers(
+            &admitted,
+            &reth_chainspec::ChainSpec::default(),
+        )
+        .unwrap();
+        let mut output = backend_output_for(std::slice::from_ref(&admitted))
+            .blocks
+            .pop()
+            .unwrap();
+        match defect {
+            "execution hash" => output.computed_hash = B256::ZERO,
+            "receipts" => output.receipt_successes.push(true),
+            "senders" => output.settlement_evidence.system_sender_flags.push(false),
+            "event" => output.settlement_evidence.observed_outbound_events.push(
+                OutboundEventObservation::decoded_for_test(0, 0, B256::ZERO, 0),
+            ),
+            "checkpoint" => output.transaction_state_checkpoints.push(checkpoint(0, 0)),
+            _ => {}
+        }
+        let checked = decoded.finish(output, B256::repeat_byte(9), true);
+        if defect == "none" {
+            let checked = checked.unwrap();
+            assert_eq!(checked.number(), admitted.declared_number());
+            assert_eq!(checked.hash(), admitted.claimed_hash());
+            assert_eq!(alloy_rlp::encode(checked.decoded()), admitted.rlp());
+            assert_eq!(checked.pre_state_root, B256::repeat_byte(9));
+        } else {
+            assert!(
+                matches!(checked, Err(ValidationError::InvalidBackendOutput(_))),
+                "{defect}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -277,10 +215,19 @@ fn rejects_unordered_outbound_observations() {
 #[test]
 fn accepts_sparse_ordered_transaction_state_checkpoints() {
     let window = [admitted_block_with_transactions(5, 0x05, 3)];
-    let mut output = backend_output_for(&window);
-    output.blocks[0].transaction_state_checkpoints = vec![checkpoint(0, 0xaa), checkpoint(2, 0xcc)];
-    let validator = Validator::stub(vec![Ok(output)]);
-    assert!(validator.validate(&window).is_ok());
+    let pre_execution = StateCheckpoint {
+        at: CheckpointAt::PreExecution,
+        ..checkpoint(0, 0x99)
+    };
+    for checkpoints in [
+        vec![checkpoint(0, 0xaa), checkpoint(2, 0xcc)],
+        vec![pre_execution, checkpoint(0, 0xaa), checkpoint(2, 0xcc)],
+    ] {
+        let mut output = backend_output_for(&window);
+        output.blocks[0].transaction_state_checkpoints = checkpoints;
+        let validator = Validator::stub(vec![Ok(output)]);
+        assert!(validator.validate(&window).is_ok());
+    }
 }
 
 #[test]
@@ -305,29 +252,26 @@ fn rejects_incomplete_or_surplus_transaction_statuses() {
 }
 
 #[test]
-fn rejects_duplicate_transaction_state_checkpoint_indices() {
+fn rejects_duplicate_or_descending_state_checkpoints() {
     let window = [admitted_block_with_transactions(5, 0x05, 2)];
-    let mut output = backend_output_for(&window);
-    output.blocks[0].transaction_state_checkpoints = vec![checkpoint(0, 0xaa), checkpoint(0, 0xbb)];
-
-    let validator = Validator::stub(vec![Ok(output)]);
-    assert!(matches!(
-        validator.validate(&window),
-        Err(ValidationError::InvalidBackendOutput(_))
-    ));
-}
-
-#[test]
-fn rejects_descending_transaction_state_checkpoint_indices() {
-    let window = [admitted_block_with_transactions(5, 0x05, 2)];
-    let mut output = backend_output_for(&window);
-    output.blocks[0].transaction_state_checkpoints = vec![checkpoint(1, 0xbb), checkpoint(0, 0xaa)];
-
-    let validator = Validator::stub(vec![Ok(output)]);
-    assert!(matches!(
-        validator.validate(&window),
-        Err(ValidationError::InvalidBackendOutput(_))
-    ));
+    let pre_execution = StateCheckpoint {
+        at: CheckpointAt::PreExecution,
+        ..checkpoint(0, 0x99)
+    };
+    for checkpoints in [
+        vec![checkpoint(0, 0xaa), checkpoint(0, 0xbb)],
+        vec![pre_execution, pre_execution],
+        vec![checkpoint(1, 0xbb), checkpoint(0, 0xaa)],
+        vec![checkpoint(0, 0xaa), pre_execution],
+    ] {
+        let mut output = backend_output_for(&window);
+        output.blocks[0].transaction_state_checkpoints = checkpoints;
+        let validator = Validator::stub(vec![Ok(output)]);
+        assert!(matches!(
+            validator.validate(&window),
+            Err(ValidationError::InvalidBackendOutput(_))
+        ));
+    }
 }
 
 #[test]
@@ -440,11 +384,11 @@ fn normalizes_validated_output_for_settlement() {
         validated
             .preceding_blocks()
             .iter()
-            .map(ValidatedBlock::number)
+            .map(|block| block.number())
             .collect::<Vec<_>>(),
         [5, 6]
     );
-    assert_eq!(validated.settling_block().block().number(), 7);
+    assert_eq!(validated.settling_block().number(), 7);
 }
 
 #[test]

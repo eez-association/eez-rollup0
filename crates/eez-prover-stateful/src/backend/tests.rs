@@ -38,7 +38,7 @@ fn admitted_block(block: Block) -> AdmittedBlock {
 }
 
 fn cached_engine(
-    with_checkpoints: bool,
+    kind: &str,
 ) -> (
     Backend<MockEthProvider<EezPrimitives>>,
     IncrementalAnchor,
@@ -67,8 +67,9 @@ fn cached_engine(
         hash: parent.hash_slow(),
         state_root: parent.state_root,
     };
-    let transactions = if with_checkpoints {
-        vec![
+    let with_checkpoints = kind == "sync";
+    let transactions = match kind {
+        "sync" => vec![
             SystemTransaction {
                 chain_id: 1,
                 nonce: 0,
@@ -77,10 +78,22 @@ fn cached_engine(
                 input: Bytes::new(),
             }
             .into(),
-        ]
-    } else {
-        Vec::new()
+        ],
+        "ordinal" => vec![
+            TxLegacy {
+                chain_id: Some(1),
+                gas_limit: 21_000,
+                gas_price: 1,
+                to: TxKind::Call(EEZL2_ADDRESS),
+                ..Default::default()
+            }
+            .into_signed(Signature::test_signature())
+            .into(),
+        ],
+        "empty" => Vec::new(),
+        _ => unreachable!(),
     };
+    let transaction_count = transactions.len();
     let block = Block {
         header: Header {
             parent_hash: anchor.hash,
@@ -98,21 +111,19 @@ fn cached_engine(
     let hash = block.header.hash_slow();
     let input = admitted_block(block.clone());
     let recovered = decode_match_and_recover_signers(&input, &chain_spec).unwrap();
-    let (plan, _) = CheckpointPlan::from_recovered_block(&recovered, SYSTEM_ADDRESS);
+    let (plan, _) = CheckpointPlan::for_streamed_block(&recovered, SYSTEM_ADDRESS);
     assert_eq!(!plan.positions().is_empty(), with_checkpoints);
     let provider = MockEthProvider::<EezPrimitives>::new();
     provider.add_header(anchor.hash, parent.clone());
     provider.add_block(hash, block);
     provider.add_receipts(
         1,
-        if with_checkpoints {
-            vec![EthereumReceipt {
+        (0..transaction_count)
+            .map(|_| EthereumReceipt {
                 success: true,
                 ..Default::default()
-            }]
-        } else {
-            Vec::new()
-        },
+            })
+            .collect(),
     );
     // Engine receivers are closed: any attempted reimport must fail, not silently pass this test.
     let (engine_sender, engine_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -157,8 +168,11 @@ fn cached_engine(
 
 #[tokio::test]
 async fn incremental_reuses_reth_and_backend_checkpoints_without_execution() {
-    for with_checkpoints in [false, true] {
-        let (engine, anchor, input) = cached_engine(with_checkpoints);
+    for kind in ["empty", "ordinal", "sync"] {
+        // No historical execution state is installed. The nonempty ordinal
+        // case must use Reth's receipts without opening state to replay checkpoints.
+        let (engine, anchor, input) = cached_engine(kind);
+        let with_checkpoints = kind == "sync";
         let (output, reused) = engine
             .validate_next(
                 anchor,
@@ -172,8 +186,7 @@ async fn incremental_reuses_reth_and_backend_checkpoints_without_execution() {
         assert!(reused);
         assert_eq!(
             output
-                .block
-                .transaction_state_checkpoints
+                .transaction_state_checkpoints()
                 .iter()
                 .map(|checkpoint| checkpoint.at)
                 .collect::<Vec<_>>(),
@@ -183,7 +196,7 @@ async fn incremental_reuses_reth_and_backend_checkpoints_without_execution() {
                 Vec::new()
             },
         );
-        assert_eq!(output.block.computed_hash, input.claimed_hash());
+        assert_eq!(output.hash(), input.claimed_hash());
         let mut wrong_parent = anchor;
         wrong_parent.state_root = B256::ZERO;
         assert!(
@@ -238,7 +251,7 @@ async fn incremental_reuses_reth_and_backend_checkpoints_without_execution() {
 
 #[tokio::test]
 async fn incremental_deadline_bounds_waiting_for_reconciliation() {
-    let (engine, anchor, input) = cached_engine(false);
+    let (engine, anchor, input) = cached_engine("empty");
     let guard = engine.committer.as_ref().unwrap().begin_reconcile().await;
     assert!(matches!(
         engine
@@ -812,7 +825,7 @@ fn replays_an_empty_terminal_block_from_local_anchor_state() {
     .unwrap();
 
     assert_eq!(output.blocks.len(), 1);
-    assert_eq!(output.blocks[0].post_state_root, terminal_root);
+    assert_eq!(output.blocks[0].as_anchor().state_root, terminal_root);
 }
 
 #[test]

@@ -249,7 +249,7 @@ fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256
     (batch, alloy_rlp::encode(block), user, call_hash)
 }
 
-fn outbound_backend_output() -> validate::BackendWindowOutput {
+fn outbound_backend_output() -> validate::testing::TestBackendWindowOutput {
     let inputs = [AdmittedBlock::test(5, 0x04, 0x05)];
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[0].set_transaction_results_for_test(vec![true, true]);
@@ -327,7 +327,7 @@ fn mixed_outbound_inbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, B256) {
     (batch, alloy_rlp::encode(block), outbound_call_hash)
 }
 
-fn mixed_backend_output() -> validate::BackendWindowOutput {
+fn mixed_backend_output() -> validate::testing::TestBackendWindowOutput {
     let inputs = [AdmittedBlock::test(5, 0x04, 0x05)];
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[0].set_transaction_results_for_test(vec![true, true, true]);

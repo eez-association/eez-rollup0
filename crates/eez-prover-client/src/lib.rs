@@ -848,7 +848,7 @@ mod tests {
         prover_server::{Prover as ProverService, ProverServer},
     };
     use eez_control_rpc::v2::{
-        Cancelled as StreamCancelled, Proof as StreamProof, Ready, Validated as StreamValidated,
+        Proof as StreamProof, Ready, Validated as StreamValidated,
         prover_server::{Prover as StreamingProverService, ProverServer as StreamingProverServer},
     };
     use std::pin::Pin;
@@ -895,7 +895,6 @@ mod tests {
         blocks: Arc<AtomicUsize>,
         cursor: Arc<Mutex<(u64, B256)>>,
         cross_wire_block_response: bool,
-        cancels: Arc<AtomicUsize>,
     }
 
     #[tonic::async_trait]
@@ -952,10 +951,6 @@ mod tests {
                                 public_inputs_hash: this.hash.to_vec(),
                                 proof: sign_65(&this.signer, this.hash),
                             })
-                        }
-                        Some(client_frame::Kind::Cancel(_)) => {
-                            this.cancels.fetch_add(1, Ordering::SeqCst);
-                            server_frame::Kind::Cancelled(StreamCancelled {})
                         }
                         _ => break,
                     };
@@ -1297,7 +1292,6 @@ mod tests {
             blocks: Arc::clone(&block_count),
             cursor: Arc::new(Mutex::new((0, B256::ZERO))),
             cross_wire_block_response: false,
-            cancels: Arc::new(AtomicUsize::new(0)),
         })
         .await;
         let prover = RemoteProver::new(url, attester);
@@ -1388,30 +1382,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_session_waits_for_cancelled_and_is_idempotent() {
-        let key = test_key();
-        let cancels = Arc::new(AtomicUsize::new(0));
-        let anchor = test_anchor();
-        let block = test_block(11, anchor.hash, 0x22);
-        let url = spawn_streaming_stub(StreamingStub {
-            signer: key.clone(),
-            hash: B256::repeat_byte(0x7c),
-            blocks: Arc::new(AtomicUsize::new(0)),
-            cursor: Arc::new(Mutex::new((0, B256::ZERO))),
-            cross_wire_block_response: false,
-            cancels: Arc::clone(&cancels),
-        })
-        .await;
-        let prover = RemoteProver::new(url, key.address());
-        prover.prevalidate(1, anchor, block).await.unwrap();
-
-        prover.cancel_session().await.unwrap();
-        prover.cancel_session().await.unwrap();
-
-        assert_eq!(cancels.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
     async fn a_block_response_from_another_session_is_rejected() {
         let key = test_key();
         let anchor = test_anchor();
@@ -1422,7 +1392,6 @@ mod tests {
             blocks: Arc::new(AtomicUsize::new(0)),
             cursor: Arc::new(Mutex::new((0, B256::ZERO))),
             cross_wire_block_response: true,
-            cancels: Arc::new(AtomicUsize::new(0)),
         })
         .await;
         let prover = RemoteProver::new(url, key.address());
