@@ -1,6 +1,6 @@
 //! Partial and anchor-only settlement coverage with inclusion-time reverts.
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use alloy_primitives::{B256, U256};
 use alloy_rpc_types_eth::BlockNumberOrTag;
@@ -104,7 +104,8 @@ async fn inclusion_revert_settles_a_mixed_prefix_and_follower_converges() {
         .expect("ParityGate deploys on L1");
     let signal_cursor = w.node.signal_cursor().unwrap();
 
-    let mut observed = false;
+    let mut partial_sync_height = None;
+    let mut gated_hashes = HashSet::new();
     for round in 0..ROUNDS {
         let inbound_nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
         let outbound_nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
@@ -152,15 +153,15 @@ async fn inclusion_revert_settles_a_mixed_prefix_and_follower_converges() {
             600_000,
         )
         .await;
-        if direct.is_err() || outbound.is_err() || gated.is_err() {
+        let (Ok(_), Ok(_), Ok(gated_hash)) = (direct, outbound, gated) else {
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
-        }
+        };
+        gated_hashes.insert(gated_hash);
 
-        observed = wait_for(Duration::from_secs(40), || async {
-            for record in w
-                .node
-                .signals_since(signal_cursor)?
+        partial_sync_height = wait_for(Duration::from_secs(40), || async {
+            let records = w.node.signals_since(signal_cursor)?;
+            for record in records
                 .iter()
                 .filter(|record| record.name == signals::DERIVER_PARTIAL_CONSUMPTION)
             {
@@ -172,36 +173,42 @@ async fn inclusion_revert_settles_a_mixed_prefix_and_follower_converges() {
                     && inbound_applied > 0
                     && (outbound_applied < outbound || inbound_applied < inbound)
                 {
-                    return Ok(Some(true));
+                    let tx_hash = record.b256("tx_hash")?;
+                    if let Some(advanced) = records.iter().find(|candidate| {
+                        candidate.name == signals::DERIVER_SAFE_ADVANCED
+                            && candidate.b256("tx_hash").ok() == Some(tx_hash)
+                    }) {
+                        return Ok(Some(advanced.u64("to_block")?));
+                    }
                 }
             }
             Ok(None)
         })
         .await
-        .unwrap_or(false);
-        if observed {
+        .ok();
+        if partial_sync_height.is_some() {
             break;
         }
     }
 
-    assert!(
-        observed,
-        "no inclusion-time revert produced a prefix settlement"
-    );
-    assert!(
-        w.node
-            .count_signal(signals::COMPOSER_SETTLED_PARTIAL)
-            .unwrap_or(0)
-            > 0,
-        "composer did not classify the settlement as partial",
-    );
-    assert!(
-        w.node
-            .count_signal(signals::COMPOSER_NONCE_BURNED)
-            .unwrap_or(0)
-            > 0,
-        "the included reverting transaction nonce was not burned",
-    );
+    let partial_sync_height =
+        partial_sync_height.expect("no inclusion-time revert produced a prefix settlement");
+    wait_for(Duration::from_secs(40), || async {
+        let records = w.node.signals_since(signal_cursor)?;
+        let classified = records.iter().any(|record| {
+            record.name == signals::COMPOSER_SETTLED_PARTIAL
+                && record.u64("sync_height").ok() == Some(partial_sync_height)
+        });
+        let nonce_burned = records.iter().any(|record| {
+            record.name == signals::COMPOSER_NONCE_BURNED
+                && record
+                    .b256("tx_hash")
+                    .is_ok_and(|tx_hash| gated_hashes.contains(&tx_hash))
+        });
+        Ok((classified && nonce_burned).then_some(()))
+    })
+    .await
+    .expect("composer did not finish recovering the partial settlement");
 
     wait_for(TIMEOUT, || async {
         let commitment = rollup_commitment(&l1_rpc, w.dep.eez_address, w.dep.rollup_id).await?;

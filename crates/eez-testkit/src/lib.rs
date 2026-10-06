@@ -126,7 +126,6 @@ pub struct Anvil {
 }
 
 struct AnvilConfig {
-    block_time_secs: u64,
     gas_limit: u64,
     genesis_timestamp: u64,
 }
@@ -134,7 +133,6 @@ struct AnvilConfig {
 impl AnvilConfig {
     fn standard(genesis_timestamp: u64) -> Self {
         Self {
-            block_time_secs: L1_BLOCK_TIME_SECS,
             gas_limit: 30_000_000,
             genesis_timestamp,
         }
@@ -153,8 +151,11 @@ impl Anvil {
             &port.to_string(),
             "--chain-id",
             &DEV_CHAIN_ID.to_string(),
-            "--block-time",
-            &cfg.block_time_secs.to_string(),
+            // The builder stub mines every block on the L1 slot cadence; FIFO
+            // keeps each bundle's transactions in submission order.
+            "--no-mining",
+            "--order",
+            "fifo",
             "--silent",
         ]);
         cmd.args(["--gas-limit", &cfg.gas_limit.to_string()]);
@@ -234,7 +235,7 @@ impl Drop for Anvil {
     }
 }
 
-/// Applies `eth_sendBundle` payloads atomically to Anvil.
+/// Mines Anvil's blocks and applies `eth_sendBundle` payloads atomically.
 struct BundleStub {
     child: Child,
     url: String,
@@ -805,8 +806,11 @@ impl Harness {
         initial_state: B256,
         l2_genesis: (PathBuf, tempfile::TempDir),
     ) -> Result<Self> {
-        let anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
+        let mut anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
         let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url).await?;
+        // Route every harness client through the builder so its snapshot-based
+        // block assembly cannot race direct mutations of the backing Anvil.
+        anvil.rpc_url.clone_from(&stub.url);
         let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
         Ok(Self {
             anvil,
@@ -818,7 +822,7 @@ impl Harness {
     }
 
     pub fn chain(&self) -> Chain<'_> {
-        Chain::new(&self.anvil, &self.dep)
+        Chain::new(&self.anvil, &self.stub, &self.dep)
     }
 
     /// Select deterministic relay behavior for the next submissions.
@@ -1945,6 +1949,7 @@ pub struct ChainSnapshot {
 
 pub struct Chain<'a> {
     rpc_url: &'a str,
+    stub_url: &'a str,
     eez_address: Address,
     deploy_block: u64,
     rollup_id: u64,
@@ -1952,10 +1957,11 @@ pub struct Chain<'a> {
 }
 
 impl<'a> Chain<'a> {
-    fn new(anvil: &'a Anvil, dep: &Deployment) -> Self {
+    fn new(anvil: &'a Anvil, stub: &'a BundleStub, dep: &Deployment) -> Self {
         Self {
             initial_commitment: dep.initial_commitment,
             rpc_url: &anvil.rpc_url,
+            stub_url: &stub.url,
             eez_address: dep.eez_address,
             deploy_block: dep.deploy_block,
             rollup_id: dep.rollup_id,
@@ -1981,26 +1987,27 @@ impl<'a> Chain<'a> {
         self.rollup_id
     }
 
-    /// Anvil uses `--block-time`, so `evm_setAutomine` does not stop it.
-    /// Interval 0 pauses block production; restore with `L1_BLOCK_TIME_SECS`.
+    /// The builder stub produces L1 blocks, so it is paused there rather than
+    /// in Anvil. Interval 0 pauses block production; any other value resumes
+    /// it on the `L1_BLOCK_TIME_SECS` cadence.
     pub async fn set_interval_mining(&self, secs: u64) -> Result<()> {
-        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        let provider = ProviderBuilder::new().connect_http(self.stub_url.parse()?);
         let _: serde_json::Value = provider
             .client()
-            .request("anvil_setIntervalMining", (secs,))
+            .request("eez_setMining", (secs != 0,))
             .await
-            .context("anvil_setIntervalMining")?;
+            .context("eez_setMining")?;
         Ok(())
     }
 
     /// Mine exactly one block.
     pub async fn mine(&self) -> Result<()> {
-        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
+        let provider = ProviderBuilder::new().connect_http(self.stub_url.parse()?);
         let _: serde_json::Value = provider
             .client()
-            .request("evm_mine", ())
+            .request("eez_mine", ())
             .await
-            .context("evm_mine")?;
+            .context("eez_mine")?;
         Ok(())
     }
 
