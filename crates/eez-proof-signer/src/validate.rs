@@ -554,112 +554,36 @@ pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
     }
 }
 
-/// Fully configured execution backend used by the shared validation pipeline.
-#[derive(Debug)]
-pub struct Validator {
-    backend: Box<dyn ValidationBackend>,
-}
-
-impl Validator {
-    /// Erase one fully configured backend behind the shared runtime boundary.
-    pub fn from_backend(backend: impl ValidationBackend) -> Self {
-        Self {
-            backend: Box::new(backend),
-        }
+/// Execute an admitted v1 window and package its checked blocks for settlement.
+/// Move witnesses into the backend without cloning their outer collections.
+pub(crate) fn validate_window(
+    backend: &dyn ValidationBackend,
+    blocks: AdmittedBlocks,
+    cancellation: &CancellationToken,
+) -> Result<ValidatedWindow, ValidationError> {
+    let mut blocks = blocks.into_vec();
+    let mut witnesses = blocks
+        .iter_mut()
+        .map(AdmittedBlock::take_witness)
+        .collect::<Vec<_>>();
+    let output = backend.validate_blocks(&blocks, &mut witnesses, cancellation)?;
+    if output.blocks.len() != blocks.len() {
+        return Err(ValidationError::InvalidBackendOutput(
+            "backend block count does not match admitted window".to_owned(),
+        ));
     }
-
-    /// Static, non-sensitive identifier for startup logs.
-    pub fn label(&self) -> &'static str {
-        self.backend.label()
-    }
-
-    /// EIP-155 chain id from the operator-configured replay specification.
-    pub fn chain_id(&self) -> u64 {
-        self.backend.chain_id()
-    }
-
-    /// Deployment address used by this backend to classify system transactions.
-    pub fn expected_l2_system_address(&self) -> alloy_primitives::Address {
-        self.backend.expected_l2_system_address()
-    }
-
-    /// Validate admitted blocks through the same checked boundary as production.
-    #[cfg(test)]
-    pub(crate) fn validate(
-        &self,
-        blocks: &[AdmittedBlock],
-    ) -> Result<ValidatedWindow, ValidationError> {
-        if blocks.is_empty() {
-            return Err(ValidationError::Rejected(
-                "refusing to validate an empty window".to_owned(),
-            ));
-        }
-        self.validate_window(
-            AdmittedBlocks::for_test(blocks.to_vec()),
-            &CancellationToken::default(),
-        )
-    }
-
-    /// Consume and validate a window with cooperative cancellation between
-    /// non-interruptible backend work units. Ownership lets re-executing
-    /// backends move witnesses without cloning their outer collections.
-    pub(crate) fn validate_window(
-        &self,
-        blocks: AdmittedBlocks,
-        cancellation: &CancellationToken,
-    ) -> Result<ValidatedWindow, ValidationError> {
-        let mut blocks = blocks.into_vec();
-        let mut witnesses = blocks
-            .iter_mut()
-            .map(AdmittedBlock::take_witness)
-            .collect::<Vec<_>>();
-        let output = self
-            .backend
-            .validate_blocks(&blocks, &mut witnesses, cancellation)?;
-        if output.blocks.len() != blocks.len() {
-            return Err(ValidationError::InvalidBackendOutput(
-                "backend block count does not match admitted window".to_owned(),
-            ));
-        }
-        // V1 admission checked the claimed sequence; each backend binds those
-        // claims and verifies execution continuity while replaying in order.
-        let mut preceding = output.blocks;
-        let terminal = preceding.pop().ok_or_else(|| {
-            ValidationError::Rejected("refusing to validate an empty window".to_owned())
-        })?;
-        let anchor = preceding
-            .first()
-            .map_or(terminal.parent_hash, |block| block.parent_hash);
-        Ok(ValidatedWindow::from_validated_prefix(
-            anchor, preceding, terminal,
-        ))
-    }
-
-    pub(crate) fn begin_incremental(
-        &self,
-        anchor: IncrementalAnchor,
-    ) -> Result<(), ValidationError> {
-        self.backend.begin_incremental(anchor)
-    }
-
-    pub(crate) async fn validate_next(
-        &self,
-        parent: IncrementalAnchor,
-        mut admitted: AdmittedBlock,
-        request_timeout: Duration,
-    ) -> Result<(Arc<ValidatedBlock>, bool), ValidationError> {
-        let witness = admitted.take_witness();
-        self.backend
-            .validate_next(parent, &admitted, witness, request_timeout)
-            .await
-    }
-
-    pub(crate) async fn recheck_incremental(
-        &self,
-        window: &ValidatedWindow,
-    ) -> Result<(), ValidationError> {
-        self.backend.recheck_incremental(window).await
-    }
+    // V1 admission checked the claimed sequence; each backend binds those
+    // claims and verifies execution continuity while replaying in order.
+    let mut preceding = output.blocks;
+    let terminal = preceding.pop().ok_or_else(|| {
+        ValidationError::Rejected("refusing to validate an empty window".to_owned())
+    })?;
+    let anchor = preceding
+        .first()
+        .map_or(terminal.parent_hash, |block| block.parent_hash);
+    Ok(ValidatedWindow::from_validated_prefix(
+        anchor, preceding, terminal,
+    ))
 }
 
 /// Check backend evidence once, before a result becomes cacheable or visible to

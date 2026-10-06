@@ -275,7 +275,7 @@ fn an_elapsed_deadline_stops_the_pipeline_between_validation_and_settlement() {
     let empty_body: eez_primitives::BlockBody = Default::default();
     input.rlp = alloy_rlp::encode(eez_primitives::Block::new(Default::default(), empty_body));
     let inputs = vec![input];
-    let state = inner(Validator::stub(vec![Ok(backend_output_for(&inputs))]));
+    let state = inner(StubBackend::new(vec![Ok(backend_output_for(&inputs))]));
     // A deadline captured now is already past when the boundary between
     // execution validation and settlement runs.
     let deadline = tokio::time::Instant::now();

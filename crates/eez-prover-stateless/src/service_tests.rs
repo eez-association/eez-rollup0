@@ -11,7 +11,6 @@ use eez_control_rpc::v1::{
 };
 use eez_proof_signer::{
     Attester, NonZeroProofSystemVkey, ProveSvc, ServiceLimits, ServiceLimitsParams, ServiceState,
-    Validator,
 };
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -132,7 +131,6 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
     let backend = Backend::from_chain_document_file(chain_path.as_ref(), system_address).unwrap();
     let chain_id = backend.chain_id();
     assert_eq!(chain_id, fixture_u64(&oracle, "l2_chain_id"));
-    let validator = Validator::from_backend(backend);
     let attester = Attester::new(
         ATTESTER_KEY.parse().unwrap(),
         proof_system_vkey,
@@ -149,7 +147,7 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
     })
     .unwrap();
     let service = ProveSvc::new(
-        Arc::new(ServiceState::new(validator, rollup_id, attester).unwrap()),
+        Arc::new(ServiceState::new(backend, rollup_id, attester).unwrap()),
         limits,
     );
 

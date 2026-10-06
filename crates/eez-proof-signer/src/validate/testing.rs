@@ -108,7 +108,7 @@ enum StubAction {
 
 /// Canned per-call actions, served in order; a call past the end fails loudly.
 #[derive(Debug)]
-struct StubBackend {
+pub(crate) struct StubBackend {
     actions: Mutex<VecDeque<StubAction>>,
     expected_l2_system_address: alloy_primitives::Address,
 }
@@ -191,17 +191,17 @@ impl ValidationBackend for StubBackend {
     }
 }
 
-impl Validator {
+impl StubBackend {
     /// A stub backend serving `responses` in order.
-    pub(crate) fn stub(responses: Vec<Result<TestBackendWindowOutput, String>>) -> Self {
-        Self::from_backend(StubBackend {
+    pub(crate) fn new(responses: Vec<Result<TestBackendWindowOutput, String>>) -> Self {
+        Self {
             actions: Mutex::new(responses.into_iter().map(StubAction::Respond).collect()),
             expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
-        })
+        }
     }
 
     /// A one-shot stub with caller-supplied settlement evidence for each block.
-    pub(crate) fn stub_with_settlement_evidence(
+    pub(crate) fn with_settlement_evidence(
         mut output: TestBackendWindowOutput,
         evidence: Vec<SettlementBlockEvidence>,
     ) -> Self {
@@ -213,16 +213,16 @@ impl Validator {
         for (block, settlement_evidence) in output.blocks.iter_mut().zip(evidence) {
             block.settlement_evidence = settlement_evidence;
         }
-        Self::stub(vec![Ok(output)])
+        Self::new(vec![Ok(output)])
     }
 
     /// A stub that blocks one validation until `release` is signalled.
-    pub(crate) fn blocking_stub(
+    pub(crate) fn blocking(
         response: Result<TestBackendWindowOutput, String>,
     ) -> (Self, oneshot::Receiver<()>, mpsc::Sender<()>) {
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = mpsc::channel();
-        let validator = Self::from_backend(StubBackend {
+        let backend = Self {
             actions: Mutex::new(
                 [StubAction::Block {
                     started: started_tx,
@@ -232,23 +232,33 @@ impl Validator {
                 .into(),
             ),
             expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
-        });
-        (validator, started_rx, release_tx)
+        };
+        (backend, started_rx, release_tx)
     }
 
     /// A stub whose next validation panics.
-    pub(crate) fn panicking_stub() -> Self {
-        Self::from_backend(StubBackend {
+    pub(crate) fn panicking() -> Self {
+        Self {
             actions: Mutex::new([StubAction::Panic].into()),
             expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
-        })
+        }
     }
 
-    /// Number of canned actions remaining.
-    pub(crate) fn stub_remaining(&self) -> usize {
-        self.backend
-            .remaining_test_actions()
-            .expect("stub_remaining called on a production backend")
+    /// Exercise the shared v1 adapter with a synthetic admitted window.
+    pub(crate) fn validate(
+        &self,
+        blocks: &[AdmittedBlock],
+    ) -> Result<ValidatedWindow, ValidationError> {
+        if blocks.is_empty() {
+            return Err(ValidationError::Rejected(
+                "refusing to validate an empty window".to_owned(),
+            ));
+        }
+        validate_window(
+            self,
+            AdmittedBlocks::for_test(blocks.to_vec()),
+            &CancellationToken::default(),
+        )
     }
 }
 

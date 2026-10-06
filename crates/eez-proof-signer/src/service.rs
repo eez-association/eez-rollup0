@@ -104,7 +104,7 @@ impl ServiceLimits {
 /// Immutable dependencies shared by all service clones.
 #[derive(Debug)]
 pub struct ServiceState {
-    validator: validate::Validator,
+    backend: Box<dyn validate::ValidationBackend>,
     expected_rollup_id: NonZeroU64,
     expected_l2_system_address: Address,
     attester: Attester,
@@ -115,25 +115,23 @@ impl ServiceState {
     /// Bind system-transaction reconstruction to the same configured L2 chain
     /// and expected rollup identities used by validation and settlement.
     pub fn new(
-        validator: validate::Validator,
+        backend: impl validate::ValidationBackend,
         expected_rollup_id: NonZeroU64,
         attester: Attester,
     ) -> eyre::Result<Self> {
         let expected_l2_system_address = eez_primitives::SYSTEM_ADDRESS;
         eyre::ensure!(
-            validator.expected_l2_system_address() == expected_l2_system_address,
+            backend.expected_l2_system_address() == expected_l2_system_address,
             "validator and native system transactions use different L2 system addresses"
         );
         eyre::ensure!(
             attester.expected_l2_system_address() == expected_l2_system_address,
             "attester and native system transactions use different L2 system addresses"
         );
-        let system_transaction_reconstructor = settlement::SystemTransactionReconstructor::new(
-            validator.chain_id(),
-            expected_rollup_id,
-        );
+        let system_transaction_reconstructor =
+            settlement::SystemTransactionReconstructor::new(backend.chain_id(), expected_rollup_id);
         Ok(Self {
-            validator,
+            backend: Box::new(backend),
             expected_rollup_id,
             expected_l2_system_address,
             attester,

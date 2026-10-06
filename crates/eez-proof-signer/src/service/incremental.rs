@@ -472,7 +472,7 @@ impl IncrementalRuntime {
             state_root: parse_b256("anchor state root", &begin.anchor_state_root)?,
         };
         self.state
-            .validator
+            .backend
             .begin_incremental(anchor)
             .map_err(validation_status)?;
 
@@ -672,18 +672,19 @@ impl IncrementalRuntime {
         }
 
         drop(session_guard);
-        let admitted = AdmittedBlock {
+        let mut admitted = AdmittedBlock {
             declared_number: submitted.number,
             claimed_hash,
             claimed_parent_hash,
             rlp: submitted.rlp,
             witness: into_execution_witness(wire_witness),
         };
-        // Delegate block validation to the backend through the shared validator.
+        let witness = admitted.take_witness();
+        // Backends return checked evidence directly, including on cache hits.
         let (cached, reused) = self
             .state
-            .validator
-            .validate_next(parent, admitted, self.limits.request_timeout())
+            .backend
+            .validate_next(parent, &admitted, witness, self.limits.request_timeout())
             .await
             .map_err(validation_status)?;
 
@@ -733,7 +734,7 @@ impl IncrementalRuntime {
         let state = Arc::clone(&self.state);
         match timeout(
             self.limits.request_timeout(),
-            state.validator.recheck_incremental(&validated_window),
+            state.backend.recheck_incremental(&validated_window),
         )
         .await
         {
@@ -1106,11 +1107,11 @@ mod tests {
         .unwrap();
         Arc::new(
             ServiceState::new(
-                crate::validate::Validator::from_backend(CountingBackend {
+                CountingBackend {
                     validations,
                     delay,
                     blocks: Arc::default(),
-                }),
+                },
                 NonZeroU64::new(1).unwrap(),
                 attester,
             )

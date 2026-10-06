@@ -30,8 +30,7 @@ use crate::testkit::{
     TEST_SYSTEM_ADDRESS, checkpoint, empty_prefix_candidate, pre_execution_checkpoint,
     system_transaction_context, test_proof_system_vkey,
 };
-use crate::validate::Validator;
-use crate::validate::testing::backend_output_for;
+use crate::validate::testing::{StubBackend, backend_output_for};
 use crate::window::AdmittedBlock;
 
 fn nz(value: usize) -> NonZeroUsize {
@@ -81,8 +80,12 @@ fn service_state_rejects_an_attester_bound_to_another_system_identity() {
     )
     .unwrap();
 
-    let error = ServiceState::new(Validator::stub(Vec::new()), expected_rollup_id(1), attester)
-        .unwrap_err();
+    let error = ServiceState::new(
+        StubBackend::new(Vec::new()),
+        expected_rollup_id(1),
+        attester,
+    )
+    .unwrap_err();
 
     assert_eq!(
         error.to_string(),
@@ -733,17 +736,17 @@ impl TestServer {
 }
 
 fn unused_validator() -> Arc<ServiceState> {
-    inner(Validator::stub(Vec::new()))
+    inner(StubBackend::new(Vec::new()))
 }
 
 fn one_accepting_validator() -> Arc<ServiceState> {
-    inner(Validator::stub(vec![Ok(backend_output_for(
+    inner(StubBackend::new(vec![Ok(backend_output_for(
         &happy_block_inputs(),
     ))]))
 }
 
 fn one_accepting_single_block_validator() -> Arc<ServiceState> {
-    inner(Validator::stub(vec![Ok(backend_output_for(&[
+    inner(StubBackend::new(vec![Ok(backend_output_for(&[
         AdmittedBlock::test(5, 0x04, 0x05),
     ]))]))
 }
@@ -757,7 +760,7 @@ fn single_block_validator_with_execution_evidence(
     backend_output.blocks[0]
         .settlement_evidence
         .set_system_sender_flags_for_test(system_sender_flags);
-    inner(Validator::stub(vec![Ok(backend_output)]))
+    inner(StubBackend::new(vec![Ok(backend_output)]))
 }
 
 fn two_block_validator_with_execution_evidence(
@@ -778,13 +781,13 @@ fn two_block_validator_with_execution_evidence(
     backend_output.blocks[1]
         .settlement_evidence
         .set_system_sender_flags_for_test(settling_system_sender_flags);
-    inner(Validator::stub(vec![Ok(backend_output)]))
+    inner(StubBackend::new(vec![Ok(backend_output)]))
 }
 
-fn inner(validator: Validator) -> Arc<ServiceState> {
+fn inner(validator: StubBackend) -> Arc<ServiceState> {
     inner_with_rollup(validator, expected_rollup_id(1))
 }
 
-fn inner_with_rollup(validator: Validator, expected_rollup_id: NonZeroU64) -> Arc<ServiceState> {
+fn inner_with_rollup(validator: StubBackend, expected_rollup_id: NonZeroU64) -> Arc<ServiceState> {
     Arc::new(ServiceState::new(validator, expected_rollup_id, test_attester()).unwrap())
 }

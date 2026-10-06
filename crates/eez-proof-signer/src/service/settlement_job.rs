@@ -105,7 +105,7 @@ pub(super) fn validate_and_settle(
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<AttestationMaterial, PipelineError> {
-    let validated_window = state.validator.validate_window(blocks, cancellation)?;
+    let validated_window = validate::validate_window(state.backend.as_ref(), blocks, cancellation)?;
     if Instant::now() >= deadline {
         return Err(PipelineError::DeadlineBeforeSettlement);
     }
