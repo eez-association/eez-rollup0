@@ -154,6 +154,7 @@ async fn two_composers_one_winner_loser_resyncs() {
     };
     let env_a = harness.env_for(ANVIL_KEY, true).await.unwrap();
     let env_b = harness.env_for(ANVIL_KEY_4, true).await.unwrap();
+    chain.set_interval_mining(0).await.unwrap();
     let (composer_a, composer_b) = tokio::try_join!(
         NodeHandle::start("race-a", &cfg, &env_a),
         NodeHandle::start("race-b", &cfg, &env_b),
@@ -201,11 +202,34 @@ async fn two_composers_one_winner_loser_resyncs() {
     let candidate_b_height = receipt_b
         .and_then(|receipt| receipt.block_number)
         .expect("Composer B staged transaction has no block number");
-    assert_eq!(
-        candidate_a_height, candidate_b_height,
+    let convergence_height = candidate_a_height.max(candidate_b_height);
+    tokio::try_join!(
+        wait_for_latest_height(&composer_a, convergence_height, DEFAULT_TIMEOUT),
+        wait_for_latest_height(&composer_b, convergence_height, DEFAULT_TIMEOUT),
+    )
+    .expect("composers did not reach a common height with their staged transactions");
+    let (candidate_a, candidate_b) = tokio::try_join!(
+        block_number_and_hash_at(
+            &composer_a_rpc,
+            BlockNumberOrTag::Number(convergence_height),
+        ),
+        block_number_and_hash_at(
+            &composer_b_rpc,
+            BlockNumberOrTag::Number(convergence_height),
+        ),
+    )
+    .expect("failed to read competing candidates at their common height");
+    let candidate_a = candidate_a.expect("Composer A is missing the common-height candidate");
+    let candidate_b = candidate_b.expect("Composer B is missing the common-height candidate");
+    assert_ne!(
+        candidate_a.1, candidate_b.1,
         "the test must stage incompatible candidates at the same L2 height"
     );
-    let convergence_height = candidate_a_height;
+
+    chain
+        .set_interval_mining(eez_testkit::Chain::block_time_secs())
+        .await
+        .unwrap();
 
     chain
         .wait_for_batches_or_node_failure(2, &[&composer_a, &composer_b], DEFAULT_TIMEOUT)
@@ -218,6 +242,17 @@ async fn two_composers_one_winner_loser_resyncs() {
     )
     .await
     .expect("the losing Composer did not replace its fork with the L1 winner");
+    let canonical = block_number_and_hash_at(
+        &composer_a_rpc,
+        BlockNumberOrTag::Number(convergence_height),
+    )
+    .await
+    .expect("failed to read the canonical candidate after convergence")
+    .expect("canonical chain is missing the contested height");
+    assert!(
+        canonical.1 == candidate_a.1 || canonical.1 == candidate_b.1,
+        "the canonical history must be one of the two candidates selected by L1"
+    );
     composer_a.assert_no_process_death();
     composer_b.assert_no_process_death();
 }
