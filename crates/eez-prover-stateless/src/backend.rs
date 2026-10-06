@@ -22,8 +22,8 @@ use eez_proof_signer::validate::support::{
     observe_outbound_events, system_sender_flags,
 };
 use eez_proof_signer::validate::{
-    AdmittedBlock, BackendBlockOutput, BackendWindowOutput, IncrementalAnchor,
-    SettlementBlockEvidence, StateCheckpoint, ValidatedBlock, ValidationBackend, ValidationError,
+    AdmittedBlock, BackendBlockOutput, BackendWindowOutput, BlockAnchor, SettlementBlockEvidence,
+    StateCheckpoint, ValidatedBlock, ValidationBackend, ValidationError,
 };
 #[cfg(test)]
 use eez_proof_signer::window::testing::admitted_block_parts_mut;
@@ -153,7 +153,7 @@ impl Backend {
         blocks: &[AdmittedBlock],
         witnesses: &mut [ExecutionWitness],
         cancellation: &CancellationToken,
-        parent: Option<IncrementalAnchor>,
+        parent: Option<BlockAnchor>,
     ) -> Result<BackendWindowOutput, ValidationError> {
         let expected_l2_system_address = self.expected_l2_system_address;
         let validation_started = Instant::now();
@@ -375,13 +375,13 @@ impl ValidationBackend for Backend {
         self.validate_blocks_inner(blocks, witnesses, cancellation, None)
     }
 
-    fn begin_incremental(&self, _anchor: IncrementalAnchor) -> Result<(), ValidationError> {
+    fn validate_anchor(&self, _anchor: BlockAnchor) -> Result<(), ValidationError> {
         Ok(())
     }
 
     async fn validate_next(
         &self,
-        parent: IncrementalAnchor,
+        parent: BlockAnchor,
         block: &AdmittedBlock,
         witness: ExecutionWitness,
         request_timeout: Duration,

@@ -12,7 +12,7 @@ use crate::window;
 
 /// Drain one stream into a complete, structurally admitted [`window::AdmittedWindow`].
 ///
-/// Chunks are checked incrementally for ordering, quotas, adjacency between
+/// Chunks are checked as they arrive for ordering, quotas, adjacency between
 /// streamed hash claims, and expected rollup identity. This phase does not execute
 /// blocks or validate settlement calldata. `idle_timeout` bounds every wait for
 /// a message or stream EOF; the caller enforces the end-to-end deadline. EOF is

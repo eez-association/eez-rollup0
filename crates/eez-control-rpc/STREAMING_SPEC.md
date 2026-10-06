@@ -1,4 +1,4 @@
-# Incremental Composer-to-prover RPC (v2)
+# Streaming Composer-to-prover RPC (v2)
 
 Status: protocol proposal for staged implementation. `prove.v1.Prover/Prove`
 remains the only active runtime endpoint in this PR. The wire schema is

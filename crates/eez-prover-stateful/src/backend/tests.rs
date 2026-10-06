@@ -41,7 +41,7 @@ fn cached_engine(
     kind: &str,
 ) -> (
     Backend<MockEthProvider<EezPrimitives>>,
-    IncrementalAnchor,
+    BlockAnchor,
     AdmittedBlock,
 ) {
     use alloy_consensus::proofs::{calculate_transaction_root, calculate_withdrawals_root};
@@ -62,7 +62,7 @@ fn cached_engine(
         parent_beacon_block_root: Some(B256::ZERO),
         ..Default::default()
     };
-    let anchor = IncrementalAnchor {
+    let anchor = BlockAnchor {
         number: 0,
         hash: parent.hash_slow(),
         state_root: parent.state_root,
@@ -167,7 +167,7 @@ fn cached_engine(
 }
 
 #[tokio::test]
-async fn incremental_reuses_reth_and_backend_checkpoints_without_execution() {
+async fn block_validation_reuses_reth_and_backend_checkpoints_without_execution() {
     for kind in ["empty", "ordinal", "sync"] {
         // No historical execution state is installed. The nonempty ordinal
         // case must use Reth's receipts without opening state to replay checkpoints.
@@ -176,10 +176,10 @@ async fn incremental_reuses_reth_and_backend_checkpoints_without_execution() {
         let mut wrong_anchor = anchor;
         wrong_anchor.state_root = B256::ZERO;
         assert!(matches!(
-            engine.begin_incremental(wrong_anchor),
+            engine.validate_anchor(wrong_anchor),
             Err(ValidationError::Rejected(_))
         ));
-        engine.begin_incremental(anchor).unwrap();
+        engine.validate_anchor(anchor).unwrap();
         let with_checkpoints = kind == "sync";
         let (output, reused) = engine
             .validate_next(
@@ -241,7 +241,7 @@ async fn incremental_reuses_reth_and_backend_checkpoints_without_execution() {
 }
 
 #[tokio::test]
-async fn incremental_deadline_bounds_waiting_for_reconciliation() {
+async fn block_validation_deadline_bounds_waiting_for_reconciliation() {
     let (engine, anchor, input) = cached_engine("empty");
     let guard = engine.committer.as_ref().unwrap().begin_reconcile().await;
     assert!(matches!(

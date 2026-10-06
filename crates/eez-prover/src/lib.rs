@@ -127,7 +127,7 @@ pub struct BlockWitness {
     pub witness: ExecutionWitness,
 }
 
-/// Exact L1-posted L2 block from which an incremental proving session starts.
+/// Exact L1-posted L2 block from which a proving session starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProvingAnchor {
     pub number: u64,
@@ -181,7 +181,7 @@ pub trait ProvingWitnessSource: Send + Sync + std::fmt::Debug {
 pub trait Prover: Send + Sync + std::fmt::Debug {
     /// Validate one newly committed block ahead of a settlement request.
     ///
-    /// Implementations without an incremental transport may leave this as the
+    /// Implementations without a streaming session transport may leave this as the
     /// default no-op; `prove` remains the final trust boundary.
     async fn prevalidate(
         &self,

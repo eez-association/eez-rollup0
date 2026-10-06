@@ -16,8 +16,8 @@ use tokio::sync::Semaphore;
 
 use crate::{attest::Attester, settlement, validate, window};
 
-mod incremental;
 mod rpc;
+mod sessions;
 mod settlement_job;
 mod stream;
 
@@ -146,17 +146,17 @@ pub struct ProveSvc {
     state: Arc<ServiceState>,
     limits: ServiceLimits,
     active_request_slot: Arc<Semaphore>,
-    incremental: Arc<incremental::IncrementalRuntime>,
+    sessions: Arc<sessions::SessionRuntime>,
 }
 
 impl ProveSvc {
     pub fn new(state: Arc<ServiceState>, limits: ServiceLimits) -> Self {
-        let incremental = incremental::IncrementalRuntime::new(Arc::clone(&state), limits);
+        let sessions = sessions::SessionRuntime::new(Arc::clone(&state), limits);
         Self {
             state,
             limits,
             active_request_slot: Arc::new(Semaphore::new(1)),
-            incremental,
+            sessions,
         }
     }
 
@@ -172,7 +172,7 @@ impl ProveSvc {
                 .await
                 .expect("the active-request semaphore is never closed"),
         );
-        self.incremental.wait_until_idle().await;
+        self.sessions.wait_until_idle().await;
     }
 
     /// Build the gRPC server with the configured request and response size limits.
@@ -183,7 +183,7 @@ impl ProveSvc {
             .max_encoding_message_size(MAX_ENCODING_MESSAGE_BYTES)
     }
 
-    /// Build the incremental v2 gRPC server with the same message limits.
+    /// Build the streaming v2 gRPC server with the same message limits.
     pub fn into_streaming_server(self) -> StreamingProverServer<Self> {
         let message_bytes = self.limits.max_decoding_message_bytes();
         StreamingProverServer::new(self)

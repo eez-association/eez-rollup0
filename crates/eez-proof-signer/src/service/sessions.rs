@@ -1,4 +1,4 @@
-//! Incremental `prove.v2` session runtime.
+//! Resumable `prove.v2` session runtime.
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
@@ -24,7 +24,7 @@ use super::settlement_job::{PipelineError, SettlementInput, run_settlement};
 use super::{ProveSvc, ServiceLimits, ServiceState};
 use crate::cancel::CancellationToken;
 use crate::validate::{
-    AdmittedBlock, IncrementalAnchor, ValidatedBlock, ValidatedWindow, ValidationError,
+    AdmittedBlock, BlockAnchor, ValidatedBlock, ValidatedWindow, ValidationError,
     into_execution_witness, wire_witness_item_count,
 };
 
@@ -36,7 +36,7 @@ type FrameResult = Result<(ServerFrame, bool), FrameError>;
 
 #[derive(Debug)]
 struct Session {
-    anchor: IncrementalAnchor,
+    anchor: BlockAnchor,
     blocks: Vec<SessionBlock>,
     epoch: u64,
     connected: bool,
@@ -52,7 +52,7 @@ struct SessionBlock {
 }
 
 impl Session {
-    fn tip(&self) -> IncrementalAnchor {
+    fn tip(&self) -> BlockAnchor {
         self.blocks
             .last()
             .map_or(self.anchor, |block| block.validated.as_anchor())
@@ -63,7 +63,7 @@ impl Session {
         &self,
         finalize: &eez_control_rpc::v2::Finalize,
         terminal_hash: B256,
-    ) -> Result<(IncrementalAnchor, ValidatedWindow, usize), Status> {
+    ) -> Result<(BlockAnchor, ValidatedWindow, usize), Status> {
         let first_validated = self.anchor.number.checked_add(1).ok_or_else(|| {
             Status::invalid_argument("session anchor block number cannot be incremented")
         })?;
@@ -121,7 +121,7 @@ type FrameError = (Option<BoundSession>, Status);
 /// Shared by every v2 service clone. Session state is private; only immutable,
 /// completely checked block artifacts cross session bounds.
 #[derive(Debug)]
-pub(super) struct IncrementalRuntime {
+pub(super) struct SessionRuntime {
     state: Arc<ServiceState>,
     limits: ServiceLimits,
     registry: Mutex<Registry>,
@@ -129,7 +129,7 @@ pub(super) struct IncrementalRuntime {
     idle: Notify,
 }
 
-impl IncrementalRuntime {
+impl SessionRuntime {
     pub(super) fn new(state: Arc<ServiceState>, limits: ServiceLimits) -> Arc<Self> {
         Arc::new(Self {
             state,
@@ -290,9 +290,9 @@ impl IncrementalRuntime {
                 // A task panic or unexpected cancellation makes the stream unusable.
                 Event::Completed(Err(error)) => {
                     operation = None;
-                    warn!(?error, "incremental stream operation task failed");
+                    warn!(?error, "prover session operation task failed");
                     let _ = output
-                        .send(Err(Status::internal("incremental stream operation failed")))
+                        .send(Err(Status::internal("prover session operation failed")))
                         .await;
                     break;
                 }
@@ -402,7 +402,7 @@ impl IncrementalRuntime {
                     number = validated.number,
                     reused = validated.reused,
                     elapsed_us = started.elapsed().as_micros(),
-                    "incremental block validated",
+                    "streamed block validated",
                 );
                 Ok((
                     server_frame(bound, request_id, server_frame::Kind::Validated(validated)),
@@ -466,14 +466,14 @@ impl IncrementalRuntime {
             .anchor_number
             .checked_add(1)
             .ok_or_else(|| Status::invalid_argument("anchor block number cannot be incremented"))?;
-        let anchor = IncrementalAnchor {
+        let anchor = BlockAnchor {
             number: begin.anchor_number,
             hash: parse_b256("anchor hash", &begin.anchor_hash)?,
             state_root: parse_b256("anchor state root", &begin.anchor_state_root)?,
         };
         self.state
             .backend
-            .begin_incremental(anchor)
+            .validate_anchor(anchor)
             .map_err(validation_status)?;
 
         let mut registry = self.registry.lock().await;
@@ -734,7 +734,7 @@ impl IncrementalRuntime {
         let state = Arc::clone(&self.state);
         match timeout(
             self.limits.request_timeout(),
-            state.backend.recheck_incremental(&validated_window),
+            state.backend.prepare_attestation(&validated_window),
         )
         .await
         {
@@ -743,7 +743,7 @@ impl IncrementalRuntime {
             Err(_) => {
                 cancellation.cancel();
                 return Err(Status::deadline_exceeded(
-                    "ProveStream Finalize backend recheck deadline exceeded",
+                    "ProveStream Finalize attestation preparation deadline exceeded",
                 ));
             }
         }
@@ -777,8 +777,8 @@ impl IncrementalRuntime {
             Ok(Ok(Ok(hash))) => hash,
             Ok(Ok(Err(error))) => return Err(error.status()),
             Ok(Err(error)) => {
-                warn!(?error, "incremental finalization worker failed");
-                return Err(Status::internal("incremental finalization worker failed"));
+                warn!(?error, "session finalization worker failed");
+                return Err(Status::internal("session finalization worker failed"));
             }
             Err(_) => {
                 cancellation.cancel();
@@ -810,7 +810,7 @@ impl IncrementalRuntime {
             from = finalize.from_block,
             to = finalize.to_block,
             elapsed_us = started.elapsed().as_micros(),
-            "incremental window signed",
+            "session window signed",
         );
         Ok(Proof {
             public_inputs_hash: hash.into_inner().to_vec(),
@@ -823,16 +823,14 @@ impl IncrementalRuntime {
 impl Prover for ProveSvc {
     type ProveStreamStream = ResponseStream;
 
-    /// Start the incremental RPC handler and return its server-frame response stream.
+    /// Start the v2 RPC handler and return its server-frame response stream.
     async fn prove_stream(
         &self,
         request: Request<Streaming<ClientFrame>>,
     ) -> Result<Response<Self::ProveStreamStream>, Status> {
         let (sender, receiver) = mpsc::channel(8);
-        self.incremental
-            .active_streams
-            .fetch_add(1, Ordering::AcqRel);
-        let runtime = Arc::clone(&self.incremental);
+        self.sessions.active_streams.fetch_add(1, Ordering::AcqRel);
+        let runtime = Arc::clone(&self.sessions);
         tokio::spawn(runtime.serve_stream(request.into_inner(), sender));
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
@@ -912,7 +910,7 @@ fn server_frame(bound: BoundSession, request_id: u64, kind: server_frame::Kind) 
     }
 }
 
-impl IncrementalRuntime {
+impl SessionRuntime {
     async fn rejected_frame(
         &self,
         authorized: Option<BoundSession>,
@@ -1008,13 +1006,13 @@ mod tests {
             unreachable!("v1 is not used by this test")
         }
 
-        fn begin_incremental(&self, _anchor: IncrementalAnchor) -> Result<(), ValidationError> {
+        fn validate_anchor(&self, _anchor: BlockAnchor) -> Result<(), ValidationError> {
             Ok(())
         }
 
         async fn validate_next(
             &self,
-            parent: IncrementalAnchor,
+            parent: BlockAnchor,
             block: &AdmittedBlock,
             _witness: ExecutionWitness,
             request_timeout: Duration,
@@ -1237,7 +1235,7 @@ mod tests {
         let state = state(Arc::clone(&validations));
         let attester = state.attester.address();
         let service = ProveSvc::new(state, limits());
-        let runtime = Arc::clone(&service.incremental);
+        let runtime = Arc::clone(&service.sessions);
         let server = TestServer::with_service(service).await;
         let prover = RemoteProver::new(&server.endpoint, attester);
         let anchor = ProvingAnchor {
@@ -1306,7 +1304,7 @@ mod tests {
         let state = state(Arc::clone(&validations));
         let attester = state.attester.address();
         let service = ProveSvc::new(state, limits());
-        let runtime = Arc::clone(&service.incremental);
+        let runtime = Arc::clone(&service.sessions);
         let server = TestServer::with_service(service).await;
         let prover = RemoteProver::new(&server.endpoint, attester);
         let anchor = ProvingAnchor {
@@ -1388,7 +1386,7 @@ mod tests {
             "wrong parent",
         ] {
             let validations = Arc::new(AtomicUsize::new(0));
-            let runtime = IncrementalRuntime::new(state(Arc::clone(&validations)), limits());
+            let runtime = SessionRuntime::new(state(Arc::clone(&validations)), limits());
             let (bound, _) = runtime.begin(begin()).await.unwrap();
             let mut submitted = block();
             let data = submitted.data.as_mut().unwrap();
@@ -1427,7 +1425,7 @@ mod tests {
     #[tokio::test]
     async fn cached_blocks_must_extend_the_receiving_sessions_exact_parent() {
         let validations = Arc::new(AtomicUsize::new(0));
-        let runtime = IncrementalRuntime::new(state(Arc::clone(&validations)), limits());
+        let runtime = SessionRuntime::new(state(Arc::clone(&validations)), limits());
         let begin = begin();
         let (source, _) = runtime.begin(begin.clone()).await.unwrap();
         runtime.validate_block(source, block()).await.unwrap();
@@ -1463,7 +1461,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_selects_only_retained_ranges() {
-        let runtime = IncrementalRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
+        let runtime = SessionRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
         let (bound, _) = runtime.begin(begin()).await.unwrap();
         let first = block_after(11, B256::repeat_byte(0x11), 0x11);
         let first_hash = B256::from_slice(&first.data.as_ref().unwrap().hash);
@@ -1516,7 +1514,7 @@ mod tests {
     #[tokio::test]
     async fn rewind_during_execution_prevents_the_old_append() {
         let validations = Arc::new(AtomicUsize::new(0));
-        let runtime = IncrementalRuntime::new(
+        let runtime = SessionRuntime::new(
             state_with_delay(Arc::clone(&validations), Duration::from_millis(100)),
             limits(),
         );
@@ -1580,7 +1578,7 @@ mod tests {
                 "witness" => limits.max_witness_items = 2,
                 _ => unreachable!(),
             }
-            let runtime = IncrementalRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits);
+            let runtime = SessionRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits);
             let (bound, _) = runtime.begin(begin()).await.unwrap();
             runtime.validate_block(bound, first.clone()).await.unwrap();
             runtime.validate_block(bound, second.clone()).await.unwrap();
@@ -1682,7 +1680,7 @@ mod tests {
                 "witness" => limits.max_witness_items = 2,
                 _ => unreachable!(),
             }
-            let runtime = IncrementalRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits);
+            let runtime = SessionRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits);
             let (a, _) = runtime.begin(begin()).await.unwrap();
             let (b, _) = runtime.begin(begin()).await.unwrap();
             runtime.validate_block(a, small.clone()).await.unwrap();
@@ -1711,7 +1709,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_carries_the_authoritative_validated_cursor() {
-        let runtime = IncrementalRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
+        let runtime = SessionRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
         let (bound, _) = runtime.begin(begin()).await.unwrap();
         runtime.validate_block(bound, block()).await.unwrap();
 
@@ -1733,7 +1731,7 @@ mod tests {
 
     #[tokio::test]
     async fn rewind_fences_the_old_epoch_and_accepts_a_replacement_suffix() {
-        let runtime = IncrementalRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
+        let runtime = SessionRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
         let anchor_hash = B256::repeat_byte(0x11);
         let (bound, _) = runtime.begin(begin()).await.unwrap();
         let block_11 = block_after(11, anchor_hash, 0x11);
@@ -1759,7 +1757,7 @@ mod tests {
 
     #[tokio::test]
     async fn eviction_skips_connected_sessions_and_preserves_creation_order() {
-        let runtime = IncrementalRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
+        let runtime = SessionRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
         let begin = begin();
         let mut sessions = Vec::new();
         for _ in 0..MAX_RETAINED_SESSIONS {
@@ -1822,7 +1820,7 @@ mod tests {
             state(Arc::new(AtomicUsize::new(0))),
             limits_with_timeouts(Duration::from_secs(5), Duration::from_secs(1)),
         );
-        let runtime = Arc::clone(&service.incremental);
+        let runtime = Arc::clone(&service.sessions);
         let server = TestServer::with_service(service).await;
         let mut client = server.streaming_client().await;
         let (old_requests, mut old_responses) = open_stream(
@@ -1912,7 +1910,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_one_session_does_not_prevent_backend_cache_reuse() {
         let validations = Arc::new(AtomicUsize::new(0));
-        let runtime = IncrementalRuntime::new(state(Arc::clone(&validations)), limits());
+        let runtime = SessionRuntime::new(state(Arc::clone(&validations)), limits());
         let begin = begin();
         let (a, _) = runtime.begin(begin.clone()).await.unwrap();
         let (b, _) = runtime.begin(begin).await.unwrap();

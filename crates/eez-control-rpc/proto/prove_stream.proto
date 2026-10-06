@@ -1,4 +1,4 @@
-// Incremental Composer-to-prover protocol. prove.v1.Prover/Prove remains available
+// Streaming Composer-to-prover protocol. prove.v1.Prover/Prove remains available
 // during migration. A stream carries one logical Composer session; reconnecting
 // uses Resume, while Rewind replaces an unsafe suffix after an L2 reorg.
 syntax = "proto3";

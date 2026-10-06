@@ -221,7 +221,7 @@ fn transient_validation_errors_have_stable_rpc_mappings() {
         (
             validate::ValidationError::DeadlineExceeded,
             Code::DeadlineExceeded,
-            "incremental block validation deadline exceeded",
+            "block validation deadline exceeded",
         ),
         (
             validate::ValidationError::Unavailable("synthetic".to_owned()),

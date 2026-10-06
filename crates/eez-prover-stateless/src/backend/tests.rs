@@ -44,9 +44,7 @@ fn fixture_input() -> AdmittedBlock {
     )
 }
 
-fn incremental_input(
-    mut block: AdmittedBlock,
-) -> (AdmittedBlock, ExecutionWitness, IncrementalAnchor) {
+fn block_input(mut block: AdmittedBlock) -> (AdmittedBlock, ExecutionWitness, BlockAnchor) {
     let witness = std::mem::take(admitted_block_parts_mut(&mut block).witness);
     let header = witness
         .headers
@@ -54,7 +52,7 @@ fn incremental_input(
         .filter_map(|bytes| alloy_rlp::decode_exact::<Header>(bytes).ok())
         .find(|header| header.hash_slow() == block.claimed_parent_hash())
         .expect("fixture includes its parent header");
-    let parent = IncrementalAnchor {
+    let parent = BlockAnchor {
         number: header.number,
         hash: header.hash_slow(),
         state_root: header.state_root,
@@ -63,11 +61,11 @@ fn incremental_input(
 }
 
 #[tokio::test]
-async fn incremental_ordinal_execution_skips_checkpoints_and_checks_cache_hits() {
+async fn block_validation_ordinal_execution_skips_checkpoints_and_checks_cache_hits() {
     // A real three-user-transaction block, not an empty block that would skip
     // checkpoint work even before the v2 selection fix.
     let (input, config) = checkpoint_fixture();
-    let (input, witness, parent) = incremental_input(input);
+    let (input, witness, parent) = block_input(input);
     let backend = Backend::new(config, TEST_SYSTEM_ADDRESS);
     let deadline = Duration::from_secs(10);
     // A real miss needs a valid witness; failure must not poison the cache.
@@ -78,7 +76,7 @@ async fn incremental_ordinal_execution_skips_checkpoints_and_checks_cache_hits()
             .is_err()
     );
     // Successful replay must still bind to the supplied parent's state root.
-    let wrong_parent = IncrementalAnchor {
+    let wrong_parent = BlockAnchor {
         state_root: !parent.state_root,
         ..parent
     };
@@ -221,7 +219,7 @@ async fn sync_execution_generates_and_reuses_checkpoints() {
     config.osaka_time = None;
     let backend = Backend::new(config, TEST_SYSTEM_ADDRESS);
     let v1 = backend.validate(vec![input.clone()]).unwrap();
-    let (input, witness, parent) = incremental_input(input);
+    let (input, witness, parent) = block_input(input);
     let (fresh, reused) = backend
         .validate_next(parent, &input, witness, Duration::from_secs(10))
         .await
@@ -250,8 +248,8 @@ async fn sync_execution_generates_and_reuses_checkpoints() {
 }
 
 #[tokio::test]
-async fn concurrent_incremental_misses_publish_one_cached_result() {
-    let (input, witness, parent) = incremental_input(fixture_input());
+async fn concurrent_block_validation_misses_publish_one_cached_result() {
+    let (input, witness, parent) = block_input(fixture_input());
     let backend = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS);
     let slots = backend
         .validation_slots
@@ -294,8 +292,8 @@ async fn concurrent_incremental_misses_publish_one_cached_result() {
 }
 
 #[tokio::test]
-async fn incremental_deadline_includes_waiting_for_backend_capacity() {
-    let (input, witness, parent) = incremental_input(fixture_input());
+async fn block_validation_deadline_includes_waiting_for_backend_capacity() {
+    let (input, witness, parent) = block_input(fixture_input());
     let backend = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS);
     let slots = backend
         .validation_slots
@@ -320,14 +318,14 @@ async fn incremental_deadline_includes_waiting_for_backend_capacity() {
 }
 
 #[test]
-fn timed_out_incremental_worker_keeps_its_slot_and_publishes_only_after_success() {
+fn timed_out_block_validation_worker_keeps_its_slot_and_publishes_only_after_success() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(1)
         .build()
         .unwrap();
     runtime.block_on(async {
-        let (input, witness, parent) = incremental_input(fixture_input());
+        let (input, witness, parent) = block_input(fixture_input());
         let backend = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS);
         let (started, ready) = tokio::sync::oneshot::channel();
         let (release, wait) = std::sync::mpsc::channel();

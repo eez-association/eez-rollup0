@@ -1,7 +1,7 @@
 //! Node-backed execution evidence.
 //!
 //! Legacy v1 requests open historical state and replay a complete window into
-//! a disposable revm overlay. Incremental v2 requests import candidate unsafe
+//! a disposable revm overlay. Streaming v2 requests import candidate unsafe
 //! blocks through the follower's existing Reth engine and retain only checked
 //! identities/evidence; Reth remains the owner of blocks and execution state.
 
@@ -25,7 +25,7 @@ use eez_proof_signer::validate::support::{
     system_sender_flags,
 };
 use eez_proof_signer::validate::{
-    AdmittedBlock, BackendBlockOutput, BackendWindowOutput, CheckpointAt, IncrementalAnchor,
+    AdmittedBlock, BackendBlockOutput, BackendWindowOutput, BlockAnchor, CheckpointAt,
     SettlementBlockEvidence, StateCheckpoint, ValidatedBlock, ValidatedWindow, ValidationBackend,
     ValidationError,
 };
@@ -107,7 +107,7 @@ impl<P> Backend<P> {
     }
 }
 
-fn ensure_safe_anchor<P>(provider: &P, anchor: IncrementalAnchor) -> Result<(), ValidationError>
+fn ensure_safe_anchor<P>(provider: &P, anchor: BlockAnchor) -> Result<(), ValidationError>
 where
     P: BlockHashReader + BlockIdReader + HeaderProvider<Header = alloy_consensus::Header>,
 {
@@ -188,12 +188,12 @@ where
         )
     }
 
-    fn begin_incremental(&self, anchor: IncrementalAnchor) -> Result<(), ValidationError> {
+    fn validate_anchor(&self, anchor: BlockAnchor) -> Result<(), ValidationError> {
         self.committer()?;
         ensure_safe_anchor(&self.provider, anchor)
     }
 
-    async fn recheck_incremental(&self, window: &ValidatedWindow) -> Result<(), ValidationError> {
+    async fn prepare_attestation(&self, window: &ValidatedWindow) -> Result<(), ValidationError> {
         let committer = self.committer()?;
         let _forkchoice_guard = committer.begin_reconcile().await;
         for block in window.blocks() {
@@ -256,7 +256,7 @@ where
 
     async fn validate_next(
         &self,
-        parent: IncrementalAnchor,
+        parent: BlockAnchor,
         admitted: &AdmittedBlock,
         _witness: ExecutionWitness,
         request_timeout: Duration,
@@ -326,11 +326,11 @@ where
                     .map_err(|error| {
                         if error.is_invalid_payload() || error.is_invalid_forkchoice() {
                             ValidationError::Rejected(format!(
-                                "Reth rejected incremental block {number}: {error}"
+                                "Reth rejected streamed block {number}: {error}"
                             ))
                         } else {
                             ValidationError::Unavailable(format!(
-                                "Reth could not import incremental block {number}: {error}"
+                                "Reth could not import streamed block {number}: {error}"
                             ))
                         }
                     })?;

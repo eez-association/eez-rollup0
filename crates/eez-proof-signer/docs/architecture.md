@@ -24,7 +24,7 @@ flowchart LR
     JOB --> ST[ValidationBackend]
     ST --> CHECK[shared checked-block construction inside backend]
     CHECK -->|ValidatedBlock| VAL[v1 assembly or v2 session selection]
-    C -->|ProveStream frames| SESSION[service/incremental]
+    C -->|ProveStream frames| SESSION[service/sessions]
     SESSION --> ST
     VAL -->|ValidatedWindow| SET[settlement binding and authorization]
     SET --> HASH[RecomputedPublicInputsHash]
@@ -44,9 +44,9 @@ flowchart LR
 | [`service.rs`](../src/service.rs) | Shared immutable dependencies, limits, and the v1 active-request slot |
 | [`service/stream.rs`](../src/service/stream.rs) | Stream draining and transport-timeout normalization |
 | [`service/rpc.rs`](../src/service/rpc.rs) | Async orchestration, absolute deadline, worker lifetime, signing, response |
-| [`service/incremental.rs`](../src/service/incremental.rs) | V2 session binding, quotas, prefix ownership, range selection, and epoch/cancellation fencing |
+| [`service/sessions.rs`](../src/service/sessions.rs) | V2 session binding, quotas, prefix ownership, range selection, and epoch/cancellation fencing |
 | [`service/settlement_job.rs`](../src/service/settlement_job.rs) | The synchronous validation-to-settlement handoff and error provenance |
-| [`window.rs`](../src/window.rs) | Incremental structural admission and aggregate resource accounting |
+| [`window.rs`](../src/window.rs) | Streamed structural admission and aggregate resource accounting |
 | [`validate.rs`](../src/validate.rs) | Checked-block evidence contract and shared evidence-shape checks; v1 window assembly |
 | [`validate/support.rs`](../src/validate/support.rs) | Identity-bound decoding/recovery, checkpoint planning, and checked-block construction |
 | [`eez-prover-stateless`](../../eez-prover-stateless/src/backend.rs) | Witness-backed execution, checked-block cache, scheduling and execution deadlines |

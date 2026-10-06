@@ -35,7 +35,7 @@ pub struct AdmittedBlock {
 
 impl AdmittedBlock {
     /// Reject a submission that cannot extend the supplied parent before execution.
-    pub fn check_parent(&self, parent: IncrementalAnchor) -> Result<(), ValidationError> {
+    pub fn check_parent(&self, parent: BlockAnchor) -> Result<(), ValidationError> {
         if parent.number.checked_add(1) != Some(self.declared_number)
             || parent.hash != self.claimed_parent_hash
         {
@@ -340,8 +340,8 @@ impl ValidatedBlock {
     pub fn settlement_evidence(&self) -> &SettlementBlockEvidence {
         &self.settlement_evidence
     }
-    pub fn as_anchor(&self) -> IncrementalAnchor {
-        IncrementalAnchor {
+    pub fn as_anchor(&self) -> BlockAnchor {
+        BlockAnchor {
             number: self.number,
             hash: self.hash,
             state_root: self.post_state_root,
@@ -352,7 +352,7 @@ impl ValidatedBlock {
     pub fn matches_submission(
         &self,
         admitted: &AdmittedBlock,
-        parent: IncrementalAnchor,
+        parent: BlockAnchor,
     ) -> Result<(), ValidationError> {
         admitted.check_parent(parent)?;
         if self.number != admitted.declared_number
@@ -457,8 +457,8 @@ impl ValidatedWindow {
 /// A validation failure classified for the RPC boundary.
 #[derive(Debug, Error)]
 pub enum ValidationError {
-    /// Incremental execution did not complete within its configured deadline.
-    #[error("incremental block validation deadline exceeded")]
+    /// Block validation did not complete within its configured deadline.
+    #[error("block validation deadline exceeded")]
     DeadlineExceeded,
     /// The backend cannot currently acquire the required validation state.
     #[error("{0}")]
@@ -480,10 +480,10 @@ pub enum ValidationError {
     Cancelled,
 }
 
-/// Exact block identity and state root at an incremental execution boundary.
+/// Exact block identity and state root at an execution boundary.
 /// Used for the session anchor and the validated parent of a new block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IncrementalAnchor {
+pub struct BlockAnchor {
     pub number: u64,
     pub hash: B256,
     pub state_root: B256,
@@ -512,11 +512,11 @@ pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
         cancellation: &CancellationToken,
     ) -> Result<BackendWindowOutput, ValidationError>;
 
-    /// Check an incremental session's anchor without allocating a backend cursor.
+    /// Check a proving session's starting anchor without allocating a backend cursor.
     /// Legacy-only backends reject v2 admission until they are migrated.
-    fn begin_incremental(&self, _anchor: IncrementalAnchor) -> Result<(), ValidationError> {
+    fn validate_anchor(&self, _anchor: BlockAnchor) -> Result<(), ValidationError> {
         Err(ValidationError::Unavailable(format!(
-            "{} backend does not support incremental validation",
+            "{} backend does not support per-block validation",
             self.label()
         )))
     }
@@ -528,13 +528,13 @@ pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
     /// Cache hits must bind the submitted bytes and parent; only successful results may be cached.
     async fn validate_next(
         &self,
-        _parent: IncrementalAnchor,
+        _parent: BlockAnchor,
         _block: &AdmittedBlock,
         _witness: ExecutionWitness,
         _request_timeout: Duration,
     ) -> Result<(Arc<ValidatedBlock>, bool), ValidationError> {
         Err(ValidationError::Unavailable(format!(
-            "{} backend does not support incremental validation",
+            "{} backend does not support per-block validation",
             self.label()
         )))
     }
@@ -543,7 +543,7 @@ pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
     /// backends check retention and require Reth to accept the terminal forkchoice;
     /// immutable block identity and range continuity are supplied by the window.
     /// Success describes this operation's snapshot, not a lock held until signing.
-    async fn recheck_incremental(&self, _window: &ValidatedWindow) -> Result<(), ValidationError> {
+    async fn prepare_attestation(&self, _window: &ValidatedWindow) -> Result<(), ValidationError> {
         Ok(())
     }
 

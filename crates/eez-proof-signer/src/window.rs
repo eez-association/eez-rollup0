@@ -1,4 +1,4 @@
-//! Incremental structural admission of one `Prove` stream.
+//! Structural admission of one `Prove` stream.
 //!
 //! One header must be followed by exactly its declared `from_block..=to_block`
 //! span, in ascending order and with adjacent claimed hashes linked. The

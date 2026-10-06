@@ -29,7 +29,7 @@ use tokio::sync::Mutex;
 use tonic::{Code, Status};
 use tracing::{Level, event};
 
-/// A [`Prover`] backed by the v2 incremental service, with v1 fallback.
+/// A [`Prover`] backed by the v2 streaming service, with v1 fallback.
 /// Cheap to clone (`Arc<Inner>`).
 #[derive(Debug, Clone)]
 pub struct RemoteProver {
@@ -82,7 +82,7 @@ impl RemoteProver {
         self.inner.attester
     }
 
-    /// Ask the prover to retire the retained incremental session and wait for
+    /// Ask the prover to retire the retained proving session and wait for
     /// its correlated `Cancelled` acknowledgement. A missing session is an
     /// idempotent no-op.
     pub async fn cancel_session(&self) -> ProverResult<()> {
