@@ -1,13 +1,13 @@
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use alloy_primitives::{U256, keccak256};
-use alloy_provider::ProviderBuilder;
-use alloy_signer::SignerSync;
-use alloy_signer_local::PrivateKeySigner;
-use alloy_transport::mock::Asserter;
+use alloy_provider::{ProviderBuilder, mock::Asserter};
 use async_trait::async_trait;
-use eez_prover::RetryableProverError;
+use eez_protocol::EcdsaProofSigner;
+use eez_prover::{ActionableProverFailure, RetryableProverError};
 
 use super::*;
 
@@ -33,7 +33,7 @@ enum Answer {
 /// A prover that answers once after `delay`, recording the request it saw.
 #[derive(Debug)]
 struct ScriptedAttester {
-    key: PrivateKeySigner,
+    key: EcdsaProofSigner,
     delay: Duration,
     answer: Answer,
     seen: Mutex<Option<ProvingContext>>,
@@ -43,7 +43,7 @@ struct ScriptedAttester {
 impl ScriptedAttester {
     fn new(key_byte: u8, delay_ms: u64, answer: Answer) -> Arc<Self> {
         Arc::new(Self {
-            key: PrivateKeySigner::from_bytes(&B256::repeat_byte(key_byte)).unwrap(),
+            key: EcdsaProofSigner::from_private_key(B256::repeat_byte(key_byte)).unwrap(),
             delay: Duration::from_millis(delay_ms),
             answer,
             seen: Mutex::new(None),
@@ -51,10 +51,8 @@ impl ScriptedAttester {
         })
     }
 
-    fn sign(&self, digest: B256) -> [u8; 65] {
-        let mut proof = self.key.sign_hash_sync(&digest).unwrap().as_bytes();
-        proof[64] = 27 + u8::from(proof[64] == 28);
-        proof
+    fn sign(&self, digest: B256) -> Bytes {
+        self.key.sign_prehash(digest).unwrap()
     }
 }
 
@@ -66,20 +64,20 @@ impl Prover for ScriptedAttester {
         tokio::time::sleep(self.delay).await;
         self.finished.store(true, Ordering::SeqCst);
         match self.answer {
-            Answer::Sign => Ok(Bytes::copy_from_slice(&self.sign(digest))),
-            Answer::SignElsewhere => Ok(Bytes::copy_from_slice(&self.sign(keccak256(digest)))),
+            Answer::Sign => Ok(self.sign(digest)),
+            Answer::SignElsewhere => Ok(self.sign(keccak256(digest))),
             Answer::SignHighS => {
-                let signature = Signature::try_from(&self.sign(digest)[..]).unwrap();
+                let signature = Signature::try_from(self.sign(digest).as_ref()).unwrap();
                 let high =
                     Signature::new(signature.r(), SECP256K1N - signature.s(), !signature.v());
                 Ok(Bytes::copy_from_slice(&high.as_bytes()))
             }
             Answer::SignRawRecovery => {
-                let mut proof = self.sign(digest);
+                let mut proof = self.sign(digest).to_vec();
                 proof[64] -= 27;
-                Ok(Bytes::copy_from_slice(&proof))
+                Ok(Bytes::from(proof))
             }
-            Answer::Truncated => Ok(Bytes::copy_from_slice(&self.sign(digest)[..64])),
+            Answer::Truncated => Ok(self.sign(digest).slice(..64)),
             Answer::Fail(error) => Err(error()),
             Answer::Panic => panic!("attester crashed"),
         }
@@ -173,10 +171,14 @@ fn quorum(
 
 /// Every member registered, with `threshold`.
 fn registered(provers: &[Arc<ScriptedAttester>], threshold: usize) -> QuorumRegistration {
-    QuorumRegistration {
+    QuorumRegistration::new(
         threshold,
-        vkeys: provers.iter().map(|p| vkey_of(p.key.address())).collect(),
-    }
+        provers
+            .iter()
+            .map(|p| Some(vkey_of(p.key.address())))
+            .collect(),
+    )
+    .unwrap()
 }
 
 fn context() -> ProvingContext {
@@ -194,16 +196,14 @@ fn timing() -> RollupTiming {
 
 async fn attest_with(
     quorum: &AttestationQuorum,
-    registration: &QuorumRegistration,
+    registration: QuorumRegistration,
 ) -> Result<Vec<Attestation>, ProverError> {
-    quorum
-        .attest(
-            &context(),
-            Some(registration),
-            timing(),
-            BundleTarget::NextBlock,
-        )
-        .await
+    AttestationRound::Quorum {
+        quorum,
+        registration,
+    }
+    .attest(&context(), timing(), BundleTarget::NextBlock)
+    .await
 }
 
 async fn attest(
@@ -211,7 +211,7 @@ async fn attest(
     provers: &[Arc<ScriptedAttester>],
     threshold: usize,
 ) -> Result<Vec<Attestation>, ProverError> {
-    attest_with(quorum, &registered(provers, threshold)).await
+    attest_with(quorum, registered(provers, threshold)).await
 }
 
 fn systems(attestations: &[Attestation]) -> Vec<Address> {
@@ -356,7 +356,9 @@ async fn the_grace_period_runs_from_the_threshold_not_from_each_arrival() {
 
 #[tokio::test(start_paused = true)]
 async fn attesters_still_running_after_the_grace_period_are_cancelled() {
-    let (quorum, provers) = quorum(&[(10, SIGN), (5_000, SIGN)], 50);
+    // The slow attester answers well within the 2 s proof budget, so only
+    // cancellation keeps it from finishing.
+    let (quorum, provers) = quorum(&[(10, SIGN), (1_000, SIGN)], 50);
 
     let attestations = attest(&quorum, &provers, 1).await.unwrap();
     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -418,43 +420,39 @@ async fn invalid_proofs_are_not_counted() {
 #[tokio::test(start_paused = true)]
 async fn a_proof_from_another_key_is_not_counted() {
     let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN)], 0);
-    let mut registration = registered(&provers, 1);
     let mut members = quorum.members.clone();
     members[1].attester = Address::repeat_byte(0xee);
     let quorum = AttestationQuorum::new(members, Duration::ZERO).unwrap();
-    registration.vkeys[1] = vkey_of(provers[1].key.address());
 
-    let attestations = attest_with(&quorum, &registration).await.unwrap();
+    let attestations = attest_with(&quorum, registered(&provers, 1)).await.unwrap();
 
     assert_eq!(systems(&attestations), vec![proof_system(1)]);
 }
 
 #[tokio::test(start_paused = true)]
-async fn unregistered_attesters_are_not_asked_and_do_not_count_towards_blocking() {
+async fn attesters_sitting_out_are_not_asked_and_do_not_count_towards_blocking() {
     let (quorum, provers) = quorum(&[(0, POISONED), (0, SIGN), (0, SIGN)], 0);
-    let mut registration = registered(&provers, 2);
-    registration.vkeys[2] = B256::ZERO;
+    let mut vkeys = registered(&provers, 2).vkeys;
+    vkeys[2] = None;
+    let registration = QuorumRegistration::new(2, vkeys).unwrap();
 
-    // Two registered, both needed: one report is enough to block, so it evicts.
-    let error = attest_with(&quorum, &registration).await.unwrap_err();
+    // Two usable, both needed: one report is enough to block, so it evicts.
+    let error = attest_with(&quorum, registration).await.unwrap_err();
 
     assert!(error.actionable_failure().is_some(), "{error:?}");
     assert!(provers[2].seen.lock().unwrap().is_none());
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_threshold_beyond_the_registered_attesters_is_refused() {
-    let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN)], 0);
-    let mut registration = registered(&provers, 2);
-    registration.vkeys[0] = B256::ZERO;
-
-    let error = attest_with(&quorum, &registration).await.unwrap_err();
-
-    let ProverError::Backend(message) = error else {
-        panic!("expected a backend error, got {error:?}");
-    };
-    assert!(message.contains("registers 1 of the 2"), "{message}");
-    assert!(provers.iter().all(|p| p.seen.lock().unwrap().is_none()));
+#[test]
+fn a_threshold_beyond_the_usable_attesters_is_refused() {
+    assert_eq!(
+        QuorumRegistration::new(2, vec![None, Some(B256::repeat_byte(1))]).unwrap_err(),
+        RegistrationError::Unreachable {
+            threshold: 2,
+            usable: 1,
+            configured: 2,
+        }
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -514,7 +512,7 @@ async fn a_panicking_attester_counts_as_that_attesters_failure() {
     };
     assert!(
         message.contains(&format!(
-            "{}: prover backend: attester task failed",
+            "{}: prover backend: the attester panicked",
             proof_system(1)
         )),
         "{message}"
@@ -571,9 +569,9 @@ async fn the_verdict_waits_for_attesters_that_could_still_confirm_an_eviction() 
 
 #[tokio::test(start_paused = true)]
 async fn the_verdict_waits_for_a_first_report_when_the_first_failure_is_not_one() {
-    // 2 of 2: one report blocks, so the unavailable first answer must not
+    // 2 of 2: one report blocks, so the refusal that loses the quorum must not
     // settle the verdict while 0x02 may still name the candidate.
-    let (quorum, provers) = quorum(&[(0, UNAVAILABLE), (100, POISONED)], 0);
+    let (quorum, provers) = quorum(&[(0, REJECTED), (100, POISONED)], 0);
 
     let error = attest(&quorum, &provers, 2).await.unwrap_err();
 
@@ -584,23 +582,45 @@ fn word(value: u64) -> String {
     format!("{:#066x}", U256::from(value))
 }
 
-/// A current-thread runtime runs the reads in order: `threshold()` first,
-/// then each member's `verificationKey()` and `signer()`.
+fn manager() -> Address {
+    Address::repeat_byte(0x99)
+}
+
+/// Answers the batched reads in their order: `threshold()`, then each member's
+/// `verificationKey()` and `signer()`.
+fn answering(threshold: u64, members: &[(Answered, Answered)]) -> RootProvider {
+    let asserter = Asserter::new();
+    asserter.push_success(&word(threshold));
+    for (vkey, signer) in members {
+        for answer in [vkey, signer] {
+            match answer {
+                Answered::Word(value) => asserter.push_success(value),
+                Answered::Revert => asserter.push_failure_msg("execution reverted"),
+            }
+        }
+    }
+    ProviderBuilder::default().connect_mocked_client(asserter)
+}
+
+enum Answered {
+    Word(B256),
+    Revert,
+}
+
+/// `prover`'s registration as the manager and its proof system report it.
+fn answers_for(prover: &ScriptedAttester) -> (Answered, Answered) {
+    (
+        Answered::Word(vkey_of(prover.key.address())),
+        Answered::Word(prover.key.address().into_word()),
+    )
+}
+
 #[tokio::test]
 async fn registration_reads_the_threshold_vkeys_and_signers() {
     let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN)], 0);
-    let asserter = Asserter::new();
-    asserter.push_success(&word(2));
-    for prover in &provers {
-        asserter.push_success(&vkey_of(prover.key.address()));
-        asserter.push_success(&prover.key.address().into_word());
-    }
-    let provider = ProviderBuilder::default().connect_mocked_client(asserter);
+    let provider = answering(2, &[answers_for(&provers[0]), answers_for(&provers[1])]);
 
-    let registration = quorum
-        .registration_at(&provider, Address::repeat_byte(0x99))
-        .await
-        .unwrap();
+    let registration = quorum.registration_at(&provider, manager()).await.unwrap();
 
     assert_eq!(registration, registered(&provers, 2));
 }
@@ -608,57 +628,112 @@ async fn registration_reads_the_threshold_vkeys_and_signers() {
 #[tokio::test]
 async fn a_member_whose_proof_system_changed_signer_sits_out() {
     let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN)], 0);
-    let asserter = Asserter::new();
-    asserter.push_success(&word(1));
-    asserter.push_success(&vkey_of(provers[0].key.address()));
-    asserter.push_success(&Address::repeat_byte(0xee).into_word());
-    asserter.push_success(&vkey_of(provers[1].key.address()));
-    asserter.push_success(&provers[1].key.address().into_word());
-    let provider = ProviderBuilder::default().connect_mocked_client(asserter);
+    let provider = answering(
+        1,
+        &[
+            (
+                Answered::Word(vkey_of(provers[0].key.address())),
+                Answered::Word(Address::repeat_byte(0xee).into_word()),
+            ),
+            answers_for(&provers[1]),
+        ],
+    );
 
-    let registration = quorum
-        .registration_at(&provider, Address::repeat_byte(0x99))
-        .await
-        .unwrap();
+    let registration = quorum.registration_at(&provider, manager()).await.unwrap();
 
-    let mut expected = registered(&provers, 1);
-    expected.vkeys[0] = B256::ZERO;
-    assert_eq!(registration, expected);
+    let mut expected = registered(&provers, 1).vkeys;
+    expected[0] = None;
+    assert_eq!(registration, QuorumRegistration::new(1, expected).unwrap());
 }
 
+/// A proof system the manager registers but whose `signer()` cannot be read,
+/// such as one that is not an `ECDSAProofSystem`, costs the batch only that
+/// member.
 #[tokio::test]
-async fn a_failed_registration_read_is_reported() {
-    let (quorum, provers) = quorum(&[(0, SIGN)], 0);
-    let asserter = Asserter::new();
-    asserter.push_failure_msg("connection reset");
-    asserter.push_success(&vkey_of(provers[0].key.address()));
-    asserter.push_success(&provers[0].key.address().into_word());
-    let provider = ProviderBuilder::default().connect_mocked_client(asserter);
+async fn a_member_whose_registration_cannot_be_read_sits_out() {
+    let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN), (0, SIGN)], 0);
+    let provider = answering(
+        2,
+        &[
+            (
+                Answered::Word(vkey_of(provers[0].key.address())),
+                Answered::Revert,
+            ),
+            (Answered::Revert, Answered::Revert),
+            answers_for(&provers[2]),
+        ],
+    );
 
     let error = quorum
-        .registration_at(&provider, Address::repeat_byte(0x99))
+        .registration_at(&provider, manager())
         .await
         .unwrap_err();
 
-    assert!(error.contains("read threshold()"), "{error}");
+    assert_eq!(
+        error,
+        RegistrationError::Unreachable {
+            threshold: 2,
+            usable: 1,
+            configured: 3,
+        }
+    );
+
+    let provider = answering(
+        1,
+        &[
+            (
+                Answered::Word(vkey_of(provers[0].key.address())),
+                Answered::Revert,
+            ),
+            (Answered::Revert, Answered::Revert),
+            answers_for(&provers[2]),
+        ],
+    );
+    let registration = quorum.registration_at(&provider, manager()).await.unwrap();
+    let mut expected = registered(&provers, 1).vkeys;
+    expected[0] = None;
+    expected[1] = None;
+    assert_eq!(registration, QuorumRegistration::new(1, expected).unwrap());
 }
 
 #[tokio::test]
-async fn a_threshold_the_registered_attesters_cannot_meet_is_reported() {
+async fn an_unregistered_member_sits_out() {
+    let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN)], 0);
+    let provider = answering(
+        1,
+        &[
+            answers_for(&provers[0]),
+            (Answered::Word(B256::ZERO), Answered::Revert),
+        ],
+    );
+
+    let registration = quorum.registration_at(&provider, manager()).await.unwrap();
+
+    let mut expected = registered(&provers, 1).vkeys;
+    expected[1] = None;
+    assert_eq!(registration, QuorumRegistration::new(1, expected).unwrap());
+}
+
+#[tokio::test]
+async fn a_failed_threshold_read_is_reported() {
     let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN)], 0);
     let asserter = Asserter::new();
-    asserter.push_success(&word(2));
-    asserter.push_success(&vkey_of(provers[0].key.address()));
-    asserter.push_success(&provers[0].key.address().into_word());
-    asserter.push_success(&B256::ZERO);
+    asserter.push_failure_msg("connection reset");
+    for prover in &provers {
+        asserter.push_success(&vkey_of(prover.key.address()));
+        asserter.push_success(&prover.key.address().into_word());
+    }
     let provider = ProviderBuilder::default().connect_mocked_client(asserter);
 
     let error = quorum
-        .registration_at(&provider, Address::repeat_byte(0x99))
+        .registration_at(&provider, manager())
         .await
         .unwrap_err();
 
-    assert!(error.contains("registers 1 of the 2"), "{error}");
+    let RegistrationError::Read { contract, call, .. } = error else {
+        panic!("expected a read error, got {error:?}");
+    };
+    assert_eq!((contract, call.as_str()), (manager(), "threshold()"));
 }
 
 /// One attester keeps the pre-quorum flow: L1 judges its proof, so the
@@ -666,23 +741,17 @@ async fn a_threshold_the_registered_attesters_cannot_meet_is_reported() {
 #[tokio::test(start_paused = true)]
 async fn a_lone_attester_proof_goes_to_l1_unchecked() {
     let (quorum, _) = quorum(&[(0, Answer::SignElsewhere)], 0);
+    // Any read would fail on the empty mock.
+    let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
 
-    let attestations = quorum
-        .attest(&context(), None, timing(), BundleTarget::NextBlock)
+    let round = quorum
+        .round(&provider, Address::repeat_byte(0x98), 7)
+        .await
+        .unwrap();
+    let attestations = round
+        .attest(&context(), timing(), BundleTarget::NextBlock)
         .await
         .unwrap();
 
     assert_eq!(systems(&attestations), vec![proof_system(1)]);
-}
-
-#[tokio::test(start_paused = true)]
-async fn several_attesters_need_a_registration() {
-    let (quorum, _) = quorum(&[(0, SIGN), (0, SIGN)], 0);
-
-    let error = quorum
-        .attest(&context(), None, timing(), BundleTarget::NextBlock)
-        .await
-        .unwrap_err();
-
-    assert!(matches!(error, ProverError::Backend(_)), "{error:?}");
 }

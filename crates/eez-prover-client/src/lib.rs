@@ -25,10 +25,6 @@ use eez_prover::{
 use tonic::{Code, Status};
 use tracing::{Level, event};
 
-/// Largest `ProveResponse` accepted: a 32-byte hash and a 65-byte signature,
-/// with room for framing.
-const MAX_RESPONSE_BYTES: usize = 4 * 1024;
-
 /// A [`Prover`] that proves a window on a remote `eez-proof-signer` over the
 /// `prove.v1.Prover` gRPC service. Cheap to clone (`Arc<Inner>`).
 #[derive(Debug, Clone)]
@@ -127,7 +123,7 @@ impl Prover for RemoteProver {
                 message: format!("connect {}: {error}", self.inner.url),
             })?
             .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
-            .max_decoding_message_size(MAX_RESPONSE_BYTES);
+            .max_decoding_message_size(eez_control_rpc::MAX_PROVE_RESPONSE_BYTES);
         let resp = client
             .prove(tokio_stream::iter(chunks))
             .await

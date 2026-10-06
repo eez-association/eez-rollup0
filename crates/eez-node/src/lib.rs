@@ -152,12 +152,11 @@ impl AttesterSpec {
             ));
         };
         let field = |name: &str| format!("EEZ_PROVERS entry `{entry}`: {name}");
-        Self::new(
-            url,
-            attester,
-            proof_system,
-            [field("url"), field("attester"), field("proof system")],
-        )
+        Ok(Self {
+            url: parse_prover_url(url, &field("url"))?,
+            attester: parse_address(attester, &field("attester"))?,
+            proof_system: parse_address(proof_system, &field("proof system"))?,
+        })
     }
 
     fn legacy(var: &impl Fn(&str) -> Option<String>) -> eyre::Result<Self> {
@@ -166,41 +165,30 @@ impl AttesterSpec {
                 eyre::eyre!("{name} is required for composer proving when EEZ_PROVERS is unset")
             })
         };
-        Self::new(
-            &read("EEZ_PROVER_URL")?,
-            &read("EEZ_ATTESTER_ADDRESS")?,
-            &read("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS")?,
-            [
-                "EEZ_PROVER_URL".to_owned(),
-                "EEZ_ATTESTER_ADDRESS".to_owned(),
-                "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS".to_owned(),
-            ],
-        )
-    }
-
-    /// `names` label the url, attester and proof system in error messages.
-    fn new(
-        url: &str,
-        attester: &str,
-        proof_system: &str,
-        names: [String; 3],
-    ) -> eyre::Result<Self> {
-        let [url_name, attester_name, proof_system_name] = names;
-        let url = url.trim();
-        if url.is_empty() {
-            return Err(eyre::eyre!("{url_name}: prover URL must not be empty"));
-        }
-        let attester = Address::from_str(attester.trim())
-            .map_err(|e| eyre::eyre!("{attester_name}: `{attester}` is not an address: {e}"))?;
-        let proof_system = Address::from_str(proof_system.trim()).map_err(|e| {
-            eyre::eyre!("{proof_system_name}: `{proof_system}` is not an address: {e}")
-        })?;
         Ok(Self {
-            url: url.to_owned(),
-            attester,
-            proof_system,
+            url: parse_prover_url(&read("EEZ_PROVER_URL")?, "EEZ_PROVER_URL")?,
+            attester: parse_address(&read("EEZ_ATTESTER_ADDRESS")?, "EEZ_ATTESTER_ADDRESS")?,
+            proof_system: parse_address(
+                &read("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS")?,
+                "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS",
+            )?,
         })
     }
+}
+
+/// `name` labels the value in the error.
+fn parse_prover_url(url: &str, name: &str) -> eyre::Result<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(eyre::eyre!("{name}: prover URL must not be empty"));
+    }
+    Ok(url.to_owned())
+}
+
+/// `name` labels the value in the error.
+fn parse_address(value: &str, name: &str) -> eyre::Result<Address> {
+    Address::from_str(value.trim())
+        .map_err(|e| eyre::eyre!("{name}: `{value}` is not an address: {e}"))
 }
 
 /// Embedded L1 reth handle — owned by `main` for the node lifetime so

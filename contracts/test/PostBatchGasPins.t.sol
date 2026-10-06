@@ -60,8 +60,8 @@ contract PostBatchGasPinsTest is Test {
     uint256 private constant POSTBATCH_ENTRY_GAS_PIN = 370_000;
 
     /// Mirrors `POSTBATCH_PROOF_SYSTEM_GAS_PIN` in `crates/eez-composer/src/composer.rs`:
-    /// what each proof system beyond the first adds. Measured 11_988 (seven proof
-    /// systems); pinned at measured x 1.10 rounded up.
+    /// what each proof system beyond the first adds. Measured 12_264 (sixteen proof
+    /// systems, four entries); pinned at measured x 1.10 rounded up.
     uint256 private constant POSTBATCH_PROOF_SYSTEM_GAS_PIN = 14_000;
 
     uint64 private constant ROLLUP_ID = 1;
@@ -116,18 +116,23 @@ contract PostBatchGasPinsTest is Test {
     }
 
     /// A batch attested by M of N attesters carries one proof per proof system,
-    /// and each adds a manager vkey read, a verify call and its calldata.
+    /// and each adds a manager vkey read, a verify call and its calldata. Swept
+    /// up to `MAX_ATTESTERS` (16), on an empty batch and on one carrying entries.
     function testPostBatchGasPinCoversEveryProofSystem() external {
-        uint256[4] memory counts = [uint256(1), 2, 4, 7];
-        uint256 single = _rung(0, true, 1);
+        uint256[5] memory counts = [uint256(1), 2, 4, 8, 16];
+        uint256[2] memory entries = [uint256(0), 4];
         uint256 worstMarginal;
-        for (uint256 i = 1; i < counts.length; i++) {
-            uint256 gasUsed = _rung(0, true, counts[i]);
-            uint256 marginal = (gasUsed - single) / (counts[i] - 1);
-            console.log("proof systems:", counts[i]);
-            console.log("  gas:", gasUsed);
-            console.log("  marginal per proof system:", marginal);
-            if (marginal > worstMarginal) worstMarginal = marginal;
+        for (uint256 e = 0; e < entries.length; e++) {
+            uint256 single = _rung(entries[e], true, 1);
+            for (uint256 i = 1; i < counts.length; i++) {
+                uint256 gasUsed = _rung(entries[e], true, counts[i]);
+                uint256 marginal = (gasUsed - single) / (counts[i] - 1);
+                console.log("outbound entries:", entries[e]);
+                console.log("  proof systems:", counts[i]);
+                console.log("  gas:", gasUsed);
+                console.log("  marginal per proof system:", marginal);
+                if (marginal > worstMarginal) worstMarginal = marginal;
+            }
         }
 
         console.log("worst marginal per proof system:", worstMarginal);

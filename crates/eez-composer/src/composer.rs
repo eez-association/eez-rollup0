@@ -289,7 +289,7 @@ const POSTBATCH_BASE_GAS_PIN: u64 = 160_000;
 const POSTBATCH_ENTRY_GAS_PIN: u64 = 370_000;
 
 /// Each proof system past the first costs a manager vkey read and a verify
-/// call. Same pin test; measured 12k worst case (seven), 10% slack.
+/// call. Same pin test; measured 12,264 worst case (sixteen), 10% slack.
 const POSTBATCH_PROOF_SYSTEM_GAS_PIN: u64 = 14_000;
 
 /// Execution the extra proofs of a batch carrying `proof_systems` add, calldata
@@ -451,6 +451,8 @@ struct EmissionLimits {
     max_blocks: u64,
     /// Gas limit every postBatch is signed with, and the cap the drain uses.
     max_gas: u64,
+    /// Configured attesters: a batch may carry a proof from each.
+    attesters: u64,
 }
 
 impl EmissionLimits {
@@ -485,6 +487,7 @@ impl EmissionLimits {
             timing,
             max_blocks,
             max_gas,
+            attesters,
         }
     }
 }
@@ -780,12 +783,12 @@ alloy_sol_types::sol! {
 /// L1-confirmed escrow (`rollups(rid).etherBalance`) an outbound withdrawal draws
 /// down. `None` on any read failure, so the caller skips this early rejection;
 /// the on-chain escrow check remains authoritative.
-async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -> Option<U256> {
-    let eez = std::env::var("EEZ_REGISTRY_ADDRESS")
-        .ok()?
-        .parse::<Address>()
-        .ok()?;
-    IEEZReader::new(eez, provider)
+async fn read_rollup_escrow(
+    provider: &alloy_provider::RootProvider,
+    registry: Address,
+    rid: u64,
+) -> Option<U256> {
+    IEEZReader::new(registry, provider)
         .rollups(rid)
         .call()
         .await
@@ -2178,7 +2181,7 @@ where
         // Gas, not the tx cap, is what really bounds this bundle; overflow stays
         // held for later slots.
         let mut budget =
-            PostBatchGasBudget::new(self.inner.emission.max_gas, self.inner.quorum.len() as u64);
+            PostBatchGasBudget::new(self.inner.emission.max_gas, self.inner.emission.attesters);
         // Set by a budget cut: the tx that did not fit plus everything after it,
         // owed back to the pool unpenalized.
         let mut deferred: Vec<(usize, HeldTx)> = Vec::new();
@@ -2326,7 +2329,8 @@ where
                     if need > U256::ZERO {
                         if escrow_remaining.is_none() {
                             escrow_remaining =
-                                read_rollup_escrow(&ctx.l1_provider, rollup_id).await;
+                                read_rollup_escrow(&ctx.l1_provider, ctx.eez_registry, rollup_id)
+                                    .await;
                         }
                         if let Some(avail) = escrow_remaining
                             && need > avail
@@ -2393,11 +2397,14 @@ where
                     let cost =
                         projected_tx_l1_gas(&l1_entries, &l1_entries, &held.raw_tx, target_gas);
                     if !budget.try_accept(cost) {
-                        rejected_cost = Some(projected_postbatch_gas(
-                            cost.entries,
-                            cost.calldata_gas,
-                            cost.target_gas,
-                        ));
+                        rejected_cost = Some(
+                            projected_postbatch_gas(
+                                cost.entries,
+                                cost.calldata_gas,
+                                cost.target_gas,
+                            )
+                            .saturating_add(attestation_gas(self.inner.emission.attesters)),
+                        );
                         deferred = abort_rest(
                             Some((idx, held)),
                             &mut out_iter,
@@ -2744,11 +2751,14 @@ where
                         0,
                     );
                     if !budget.try_accept(cost) {
-                        rejected_cost = Some(projected_postbatch_gas(
-                            cost.entries,
-                            cost.calldata_gas,
-                            cost.target_gas,
-                        ));
+                        rejected_cost = Some(
+                            projected_postbatch_gas(
+                                cost.entries,
+                                cost.calldata_gas,
+                                cost.target_gas,
+                            )
+                            .saturating_add(attestation_gas(self.inner.emission.attesters)),
+                        );
                         deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
                         break;
                     }
@@ -4262,7 +4272,7 @@ where
             calldata_gas(&projected),
             outbound_target_gas,
         )
-        .saturating_add(attestation_gas(self.inner.quorum.len() as u64))
+        .saturating_add(attestation_gas(self.inner.emission.attesters))
         .max(calldata_floor_gas(&projected));
         if projected_gas > ceiling {
             event!(
@@ -4283,81 +4293,16 @@ where
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
         // `blocks`. Settlement path, off block production.
         // The manager's attestation settings are read while the witnesses build.
-        let witnesses = async {
-            Ok::<_, PreparePostBatchError>(match self.inner.witness_source.as_ref() {
-                // Remote-prover mode. Intermediate blocks `[from..sync)` are committed
-                // (served by the witness store); a freshly-built endpoint isn't, so
-                // capture it here from the in-memory block.
-                Some(src) => {
-                    // Witness generation is a CPU-heavy trie walk / re-exec. Run it on
-                    // the blocking pool so it can't stall async worker threads on the
-                    // settlement path. (Store hits are cheap; the rare store miss and
-                    // the endpoint capture are the heavy parts.)
-                    let src = Arc::clone(src);
-                    let l2_provider = Arc::clone(
-                        &self
-                            .inner
-                            .rollups
-                            .get(&rollup_id)
-                            .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
-                            .l2_provider,
-                    );
-                    let evm_config = self.inner.evm_config.clone();
-                    let terminal_block = sync_block.cloned();
-                    tokio::task::spawn_blocking(move || -> Result<Vec<BlockWitness>, String> {
-                        let mut ws = (from..sync_block_number)
-                            .map(|n| src.block_witness(n))
-                            .collect::<Result<Vec<_>, String>>()
-                            .map_err(|e| format!("witness_source: {e}"))?;
-                        match terminal_block {
-                            // Just-built: nothing can serve an uncommitted block, and
-                            // its parent state is hot, so re-execute in-memory.
-                            Some(block) => ws.push(
-                                block_witness(
-                                    l2_provider.as_ref(),
-                                    &evm_config,
-                                    &block,
-                                    ExecutionWitnessMode::Legacy,
-                                )
-                                .map_err(|e| {
-                                    format!(
-                                        "terminal-block witness (block {}): {e}",
-                                        block.header().number()
-                                    )
-                                })?,
-                            ),
-                            // Committed (historical chunk): from the store — an
-                            // in-memory capture needs a possibly-pruned parent state.
-                            None => ws.push(
-                                src.block_witness(sync_block_number)
-                                    .map_err(|e| format!("witness_source: {e}"))?,
-                            ),
-                        }
-                        Ok(ws)
-                    })
-                    .await
-                    .map_err(|e| format!("witness spawn_blocking join: {e}"))??
-                }
-                // Tests may use a lightweight prover without a witness source.
-                None => Vec::new(),
-            })
-        };
-        // A lone attester keeps the pre-quorum flow and needs no registration.
-        let registration = async {
-            if self.inner.quorum.len() == 1 {
-                return Ok(None);
-            }
+        let (block_witnesses, round) = tokio::join!(
+            self.window_witnesses(rollup_id, from, sync_block_number, sync_block),
             self.inner
                 .quorum
-                .registration(&ctx.l1_provider, ctx.eez_registry, rollup_id)
-                .await
-                .map(Some)
-        };
-        let (block_witnesses, registration) = tokio::join!(witnesses, registration);
+                .round(&ctx.l1_provider, ctx.eez_registry, rollup_id),
+        );
         let block_witnesses = block_witnesses?;
-        // An unreadable or unreachable registration is not a candidate's
+        // Unreadable or unreachable attestation settings are not a candidate's
         // fault: requeue without charging.
-        let registration = registration?;
+        let round = round.map_err(|error| error.to_string())?;
         let proving_ctx = ProvingContext {
             rollup_id,
             from_block: from,
@@ -4366,15 +4311,8 @@ where
             blocks: block_witnesses,
             l1_block_hash: None, // timeless batch (blockNumber 0)
         };
-        let attestations = match self
-            .inner
-            .quorum
-            .attest(
-                &proving_ctx,
-                registration.as_ref(),
-                self.inner.emission.timing,
-                bundle_target,
-            )
+        let attestations = match round
+            .attest(&proving_ctx, self.inner.emission.timing, bundle_target)
             .await
         {
             Ok(attestations) => attestations,
@@ -4428,17 +4366,10 @@ where
             "postBatch anchors: cursor block hash, claimed final Sync block hash",
         );
 
-        // Read the deployment-specific EEZ registry address from the
-        // environment and reject missing or malformed values.
-        let eez_address = std::env::var("EEZ_REGISTRY_ADDRESS")
-            .ok()
-            .and_then(|s| s.parse::<Address>().ok())
-            .ok_or("EEZ_REGISTRY_ADDRESS missing or not a valid address")?;
-
         Ok(sign_post_batch_tx(
             &ctx.l1_poster_signer,
             &ctx.l1_provider,
-            eez_address,
+            ctx.eez_registry,
             calldata,
             ctx.l1_chain_id,
             ctx.l1_post_batch_priority_fee,
@@ -4446,6 +4377,73 @@ where
         )
         .await
         .map(Some)?)
+    }
+
+    /// The witnesses of blocks `from..=to` the attesters re-execute.
+    async fn window_witnesses(
+        &self,
+        rollup_id: u64,
+        from: u64,
+        to: u64,
+        sync_block: Option<&reth_primitives_traits::RecoveredBlock<eez_primitives::Block>>,
+    ) -> Result<Vec<BlockWitness>, PreparePostBatchError> {
+        // Tests may use a lightweight prover without a witness source.
+        let Some(src) = self.inner.witness_source.as_ref() else {
+            return Ok(Vec::new());
+        };
+        // Remote-prover mode. Intermediate blocks `[from..to)` are committed
+        // (served by the witness store); a freshly-built endpoint isn't, so
+        // capture it here from the in-memory block.
+        // Witness generation is a CPU-heavy trie walk / re-exec. Run it on
+        // the blocking pool so it can't stall async worker threads on the
+        // settlement path. (Store hits are cheap; the rare store miss and
+        // the endpoint capture are the heavy parts.)
+        let src = Arc::clone(src);
+        let l2_provider = Arc::clone(
+            &self
+                .inner
+                .rollups
+                .get(&rollup_id)
+                .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
+                .l2_provider,
+        );
+        let evm_config = self.inner.evm_config.clone();
+        let terminal_block = sync_block.cloned();
+        let witnesses =
+            tokio::task::spawn_blocking(move || -> Result<Vec<BlockWitness>, String> {
+                let mut ws = (from..to)
+                    .map(|n| src.block_witness(n))
+                    .collect::<Result<Vec<_>, String>>()
+                    .map_err(|e| format!("witness_source: {e}"))?;
+                match terminal_block {
+                    // Just-built: nothing can serve an uncommitted block, and
+                    // its parent state is hot, so re-execute in-memory.
+                    Some(block) => ws.push(
+                        block_witness(
+                            l2_provider.as_ref(),
+                            &evm_config,
+                            &block,
+                            ExecutionWitnessMode::Legacy,
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "terminal-block witness (block {}): {e}",
+                                block.header().number()
+                            )
+                        })?,
+                    ),
+                    // Committed (historical chunk): from the store — an
+                    // in-memory capture needs a possibly-pruned parent state.
+                    None => ws.push(
+                        src.block_witness(to)
+                            .map_err(|e| format!("witness_source: {e}"))?,
+                    ),
+                }
+                Ok(ws)
+            })
+            .await
+            .map_err(|e| format!("witness spawn_blocking join: {e}"))??;
+        Ok(witnesses)
     }
 }
 
