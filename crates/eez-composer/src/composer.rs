@@ -754,7 +754,7 @@ alloy_sol_types::sol! {
         function rollups(uint64 rollupId)
             external
             view
-            returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
+            returns (address rollupContract, bytes32 root, uint256 etherBalance);
     }
 }
 
@@ -3880,7 +3880,7 @@ where
         // against L1's recorded root.
         //
         // `currentRoot` = hash(posted), the L1-confirmed cursor block — must
-        // equal L1.config.stateRoot at postBatch time so the deriver's
+        // equal L1.config.root at postBatch time so the deriver's
         // check_claimed_state agrees. `newRoot` = the Sync block sealed over no
         // transactions, so the anchor already sits at the Sync block's height
         // and later effect entries chain from it. With no effects that block IS
@@ -4016,7 +4016,7 @@ where
         }
 
         // Stitch the per-rollup state-update chain: EEZ.sol `_applyRollupUpdates`
-        // enforces `config.stateRoot == update.currentRoot` then sets it to
+        // enforces `config.root == update.currentRoot` then sets it to
         // `newRoot`, so each entry's `currentRoot` must chain to the prior
         // entry's `newRoot`. This chains `posted → E → R_0 → … → R_last`, with
         // `E` the empty prefix and `R_last` the terminal, satisfying both EEZ.sol

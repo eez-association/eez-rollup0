@@ -189,7 +189,7 @@ impl AuthorizedOutboundEffect {
 /// Each outbound effect must occupy a user transaction immediately after a
 /// system load. The function enforces outbound-before-inbound ordering, one
 /// matching event and call, matching rollup IDs and call hash, a successful
-/// single-call rolling hash, a non-system source, and an ether delta of
+/// single call with empty return data, a non-system source, and an ether delta of
 /// `-value`. Stored entries omit state updates and their unfinished L1 rolling
 /// hash for DA reconstruction.
 pub(crate) fn authorize_outbound_effects(

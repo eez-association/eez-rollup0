@@ -16,7 +16,7 @@
   "window_pre_block_hash": "0x5f62964e4debc83590b2a717b27ae1b2583bf0ad5d165feee8d3d24d15e8f29c",
   "window_post_block_hash": "0x776de0ca48213074c90bf203d968d01611d6abba6b1e232a960a689fd0f288e7",
   "postbatch_calldata_bytes": 1636,
-  "postbatch_calldata_sha256": "0xd29058b447d8ebeabfb789d3a4b9355c5c31693dd93bd2bdc4cfeef4340cb352",
+  "postbatch_calldata_sha256": "0xe1fced0d5eab0fbf2dbcd72d85231ec2c7f6cf8c54d9671625e9d6e8a69906e8",
   "expected_test_signature": "0x3e1c40a6078a319874deab4957b6b7d8c36dd0ee2ed5ac2c60164b91929762923140f874d9cda9493f157b32557008a6a245943599ec706e3fb3697b24a9299a1b",
   "captured_at": "2026-09-18T08:40:02Z"
 }

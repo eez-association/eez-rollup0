@@ -956,7 +956,7 @@ sol! {
         event BatchPosted(bytes32 sharedPublicInput, uint64[] rollupIds);
         event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newRoot, uint256 etherBalance);
         event L2TxSkipped(uint256 indexed transientIdx, bytes revertData);
-        function rollups(uint64 rollupId) external view returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
+        function rollups(uint64 rollupId) external view returns (address rollupContract, bytes32 root, uint256 etherBalance);
         function rollupCounter() external view returns (uint256);
         function registerRollup(address rollupContract, bytes32 initialState) external returns (uint64 rollupId);
     }
@@ -1143,6 +1143,8 @@ async fn deploy_contracts_with_initial(
     )
     .await?;
 
+    // Rollup(address eez) behind a proxy; initialize(address owner, uint256 threshold,
+    //        address[] proofSystems, bytes32[] vkeys)
     let proof_systems: Vec<Address> = vec![proof_system_address];
     // vkey embeds the authorized signer address; the registry treats vkey as
     // opaque but checks non-zero + membership (see DeployRollup.s.sol:60).
@@ -2200,7 +2202,7 @@ async fn state_root_at(
     if let Some(block) = block {
         call = call.block(BlockNumberOrTag::Number(block).into());
     }
-    Ok(call.call().await?.stateRoot)
+    Ok(call.call().await?.root)
 }
 
 pub async fn rollup_ether_balance(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<U256> {

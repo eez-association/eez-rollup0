@@ -523,7 +523,8 @@ pub(crate) async fn scan_batch_logs_range(
             .await?;
         let submitter = tx.inner.signer();
         let input = tx.inner.input();
-        // A peer posting via a router can yield undecodable input. Skip it
+        // `BatchPosted` does not index rollupIds, so we decode every
+        // rollup's batch — and a peer posting via a router yields undecodable
         // input. Skip unless it settled OUR rollup (invariant 8).
         let decoded = match postAndVerifyBatchCall::abi_decode(input) {
             Ok(decoded) => decoded,
@@ -1771,7 +1772,7 @@ mod tests {
         assert!(err.is_source_incomplete(), "unexpected error: {err}");
     }
 
-    /// `BatchPosted` carries rollupCount, not rollupId, so a peer posting via a
+    /// `BatchPosted` does not index rollupIds, so a peer posting via a
     /// router yields an input we cannot decode. That must not halt us — unless
     /// the same tx settled OUR rollup, which we then genuinely cannot derive.
     #[tokio::test]
