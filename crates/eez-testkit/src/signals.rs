@@ -2,6 +2,7 @@ use alloy_primitives::B256;
 use anyhow::{Context, Result, anyhow};
 
 pub const BUNDLE_ACCEPTED: &str = "eez.node.l1_embedded.bundle.accepted";
+pub const BUNDLE_DROPPED: &str = "eez.submitter.bundle.dropped";
 pub const BUNDLE_MEMPOOL_FALLBACK: &str = "eez.submitter.bundle.mempool_fallback";
 pub const DERIVER_REORG_NOOP: &str = "eez.deriver.l1.reorg.noop";
 pub const DERIVER_REORG_RETREATED: &str = "eez.deriver.l1.reorg.retreated";
@@ -14,6 +15,7 @@ pub const DERIVER_SAFE_ADVANCED: &str = "eez.deriver.safe.advanced";
 pub const DERIVER_FINALIZED_ADVANCED: &str = "eez.deriver.finalized.advanced";
 pub const DERIVER_SYNC_BLOCK_BUILT: &str = "eez.deriver.reconcile.sync_block_built";
 pub const DERIVER_RESYNC_FAILED: &str = "eez.deriver.resync.failed";
+pub const DERIVER_RESYNC_RECOVERED: &str = "eez.deriver.resync.recovered";
 pub const DERIVER_COMMITTER_CLOSED: &str = "eez.deriver.committer.closed";
 pub const NODE_BOOT_CATCH_UP_FAILED: &str = "eez.node.deriver.boot_catch_up.failed";
 pub const COMPOSER_BUNDLE_DISPATCHED: &str = "eez.composer.bundle.dispatched";
