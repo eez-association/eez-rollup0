@@ -1,5 +1,8 @@
 //! End-to-end composer, follower, restart, outage, and reorg scenarios.
 
+#[path = "e2e/streaming.rs"]
+mod streaming;
+
 use std::time::Duration;
 
 use alloy_primitives::U256;

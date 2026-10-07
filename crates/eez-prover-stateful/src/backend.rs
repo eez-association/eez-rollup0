@@ -196,18 +196,6 @@ where
     async fn prepare_attestation(&self, window: &ValidatedWindow) -> Result<(), ValidationError> {
         let committer = self.committer()?;
         let _forkchoice_guard = committer.begin_reconcile().await;
-        for block in window.blocks() {
-            let (number, hash) = (block.number(), block.hash());
-            // Identity was validated before retention; only availability can change here.
-            self.provider
-                .find_block_by_hash(hash, reth_storage_api::BlockSource::Any)
-                .map_err(provider_error)?
-                .ok_or_else(|| {
-                    ValidationError::Aborted(format!(
-                        "validated block {number} ({hash}) is no longer retained by Reth",
-                    ))
-                })?;
-        }
         let terminal = window.settling_block();
         let terminal = SealedHeader::new(terminal.decoded().header.clone(), terminal.hash());
         // Blocks were imported and executed before their Validated frames.
@@ -264,33 +252,17 @@ where
         tokio::time::timeout(request_timeout, async {
             admitted.check_parent(parent)?;
 
-            // Reth owns every branch's state. Serialize parent lookup, unsafe-head
-            // selection and outcome reads with L1 reconciliation and other sessions.
+            // The engine sees retained forks; the provider only sees the selected
+            // branch. On a miss, select the child before reading its parent/evidence.
+            // Hold selection and reads together against other sessions/L1 reconciliation.
             let committer = self.committer()?;
             let _forkchoice_guard = committer.begin_reconcile().await;
-            let previous_header = self
-                .provider
-                .header(parent.hash)
-                .map_err(provider_error)?
-                .ok_or_else(|| {
-                    ValidationError::Aborted(format!(
-                        "validated parent {} ({}) is no longer retained by Reth",
-                        parent.number, parent.hash,
-                    ))
-                })?;
-            let previous_header = SealedHeader::new(previous_header, parent.hash);
 
             let block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
             let number = block.header().number();
             let consensus = EthBeaconConsensus::new(Arc::clone(&self.chain_spec));
             consensus
                 .validate_header(block.sealed_block().sealed_header())
-                .and_then(|()| {
-                    consensus.validate_header_against_parent(
-                        block.sealed_block().sealed_header(),
-                        &previous_header,
-                    )
-                })
                 .and_then(|()| consensus.validate_block_pre_execution(block.sealed_block()))
                 .map_err(|error| {
                     ValidationError::Rejected(format!(
@@ -298,17 +270,12 @@ where
                     ))
                 })?;
 
-            let reused = if let Some(stored) = self
+            let reused = if self
                 .provider
                 .find_block_by_hash(block.hash(), reth_storage_api::BlockSource::Any)
                 .map_err(provider_error)?
+                .is_some()
             {
-                // Bind this new submission to cached execution, not just its claimed header hash.
-                if alloy_rlp::encode(&stored) != admitted.rlp() {
-                    return Err(ValidationError::Rejected(
-                        "cached Reth block does not match submitted bytes".to_owned(),
-                    ));
-                }
                 self.provider
                     .receipts_by_block(block.hash().into())
                     .map_err(provider_error)?
@@ -316,6 +283,8 @@ where
             } else {
                 false
             };
+            // Visible cached evidence needs no head change. On a miss, the engine
+            // imports or reuses its retained payload and selects that branch for reads.
             if !reused {
                 let sealed_block = block.sealed_block().clone();
                 let header = sealed_block.clone_sealed_header();
@@ -335,7 +304,8 @@ where
                         }
                     })?;
             }
-            self.provider
+            let stored = self
+                .provider
                 .find_block_by_hash(block.hash(), reth_storage_api::BlockSource::Any)
                 .map_err(provider_error)?
                 .ok_or_else(|| {
@@ -343,6 +313,28 @@ where
                         "Reth accepted block {number} but no longer exposes its exact block"
                     ))
                 })?;
+            if alloy_rlp::encode(&stored) != admitted.rlp() {
+                return Err(ValidationError::Rejected(
+                    "cached Reth block does not match submitted bytes".to_owned(),
+                ));
+            }
+            // Reth checked header/parent consensus during import. This read supplies
+            // the actual execution root, not another ancestry walk or consensus check.
+            let previous_header = self
+                .provider
+                .header(parent.hash)
+                .map_err(provider_error)?
+                .ok_or_else(|| {
+                    ValidationError::Unavailable(format!(
+                        "Reth cannot expose selected parent {} ({})",
+                        parent.number, parent.hash,
+                    ))
+                })?;
+            if previous_header.state_root != parent.state_root {
+                return Err(ValidationError::Rejected(
+                    "streamed parent state root does not match Reth".to_owned(),
+                ));
+            }
             let receipts = self
                 .provider
                 .receipts_by_block(block.hash().into())

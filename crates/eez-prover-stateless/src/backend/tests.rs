@@ -86,7 +86,7 @@ async fn block_validation_ordinal_execution_skips_checkpoints_and_checks_cache_h
             .await,
         Err(ValidationError::Rejected(reason)) if reason.contains("do not telescope")
     ));
-    assert!(backend.blocks.lock().unwrap().is_empty());
+    assert!(backend.blocks.lock().unwrap().entries.is_empty());
     let (fresh, reused) = backend
         .validate_next(parent, &input, witness, deadline)
         .await
@@ -134,7 +134,57 @@ async fn block_validation_ordinal_execution_skips_checkpoints_and_checks_cache_h
             "{defect}"
         );
     }
-    assert_eq!(backend.blocks.lock().unwrap().len(), 1);
+    assert_eq!(backend.blocks.lock().unwrap().entries.len(), 1);
+}
+
+#[test]
+fn cache_evicts_by_bytes_without_invalidating_session_evidence() {
+    let first = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
+        .validate(vec![fixture_input()])
+        .unwrap()
+        .blocks
+        .pop()
+        .unwrap();
+    let (input, config) = checkpoint_fixture();
+    let second = Backend::new(config, TEST_SYSTEM_ADDRESS)
+        .validate(vec![input])
+        .unwrap()
+        .blocks
+        .pop()
+        .unwrap();
+    for (count, bytes) in [(8, first.size() + second.size() - 1), (1, usize::MAX)] {
+        let mut cache = BlockCache {
+            entries: LruCache::new(NonZeroUsize::new(count).unwrap()),
+            bytes: 0,
+            max_bytes: bytes,
+        };
+        let retained = cache.insert(Arc::clone(&first));
+        cache.insert(Arc::clone(&second));
+        assert!(!cache.entries.contains(&first.hash()));
+        assert!(cache.entries.contains(&second.hash()));
+        assert_eq!(cache.bytes, second.size());
+        assert!(
+            Arc::ptr_eq(&retained, &first),
+            "eviction leaves session evidence alive"
+        );
+        assert!(Arc::ptr_eq(&cache.insert(Arc::clone(&second)), &second));
+        assert_eq!(
+            cache.bytes,
+            second.size(),
+            "duplicate publication is charged once"
+        );
+    }
+    let mut cache = BlockCache {
+        entries: LruCache::new(NonZeroUsize::new(8).unwrap()),
+        bytes: 0,
+        max_bytes: first.size() - 1,
+    };
+    assert!(Arc::ptr_eq(&cache.insert(Arc::clone(&first)), &first));
+    assert!(
+        cache.entries.is_empty(),
+        "oversized evidence is returned but not cached"
+    );
+    assert_eq!(cache.bytes, 0);
 }
 
 #[tokio::test]
@@ -276,7 +326,7 @@ async fn concurrent_block_validation_misses_publish_one_cached_result() {
         "both calls must exercise a cache miss"
     );
     assert_eq!(first, second);
-    assert_eq!(backend.blocks.lock().unwrap().len(), 1);
+    assert_eq!(backend.blocks.lock().unwrap().entries.len(), 1);
     assert!(
         backend
             .validate_next(
@@ -306,7 +356,7 @@ async fn block_validation_deadline_includes_waiting_for_backend_capacity() {
             .await,
         Err(ValidationError::DeadlineExceeded)
     ));
-    assert!(backend.blocks.lock().unwrap().is_empty());
+    assert!(backend.blocks.lock().unwrap().entries.is_empty());
     drop(slots);
     assert!(
         !backend
@@ -339,7 +389,7 @@ fn timed_out_block_validation_worker_keeps_its_slot_and_publishes_only_after_suc
             .validate_next(parent, &input, witness, Duration::from_millis(10))
             .await;
         let available = backend.validation_slots.available_permits();
-        let cached_before_execution = backend.blocks.lock().unwrap().len();
+        let cached_before_execution = backend.blocks.lock().unwrap().entries.len();
         release.send(()).unwrap();
         blocker.await.unwrap();
         let slots = tokio::time::timeout(

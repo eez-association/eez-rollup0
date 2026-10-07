@@ -310,6 +310,10 @@ pub async fn run_capture<P, E, F, G>(
     F: Fn() -> u64 + Send + 'static,
     G: Fn() -> u64 + Send + 'static,
 {
+    // Best-effort network work must never hold up durable witness capture.
+    // At most one request owns a witness; excess blocks remain on disk for Finalize.
+    // JoinSet also aborts the request when capture shuts down or is cancelled.
+    let mut prevalidation = tokio::task::JoinSet::new();
     while let Some(hash) = rx.recv().await {
         let capture_provider = provider.clone();
         let evm_config = evm_config.clone();
@@ -322,16 +326,16 @@ pub async fn run_capture<P, E, F, G>(
             )?;
             let anchor = capture_provider
                 .sealed_header(anchor_number)
-                .map_err(|error| format!("fetch proving anchor {anchor_number}: {error}"))?
-                .ok_or_else(|| format!("proving anchor {anchor_number} is missing"))?;
-            Ok::<_, String>((
-                witness,
-                ProvingAnchor {
+                .map_err(|error| format!("fetch proving anchor {anchor_number}: {error}"))
+                .and_then(|header| {
+                    header.ok_or_else(|| format!("proving anchor {anchor_number} is missing"))
+                })
+                .map(|anchor| ProvingAnchor {
                     number: anchor_number,
                     hash: anchor.hash(),
                     state_root: anchor.state_root,
-                },
-            ))
+                });
+            Ok::<_, String>((witness, anchor))
         })
         .await;
         match built {
@@ -346,17 +350,31 @@ pub async fn run_capture<P, E, F, G>(
                         "persisting captured witness failed",
                     );
                 }
-                if number > anchor.number
-                    && let Err(error) = prover.prevalidate(rollup_id, anchor, bw).await
-                {
-                    event!(
-                        name: "eez.node.witness_capture.prevalidate_failed",
+                while prevalidation.try_join_next().is_some() {}
+                match anchor {
+                    Ok(anchor) if number > anchor.number && prevalidation.is_empty() => {
+                        let prover = Arc::clone(&prover);
+                        prevalidation.spawn(async move {
+                            if let Err(error) = prover.prevalidate(rollup_id, anchor, bw).await {
+                                event!(
+                                    name: "eez.node.witness_capture.prevalidate_failed",
+                                    Level::WARN,
+                                    number,
+                                    anchor = anchor.number,
+                                    error = %error,
+                                    "prover did not prevalidate a captured block; Finalize will backfill it",
+                                );
+                            }
+                        });
+                    }
+                    Err(error) => event!(
+                        name: "eez.node.witness_capture.anchor_unavailable",
                         Level::WARN,
                         number,
-                        anchor = anchor.number,
                         error = %error,
-                        "prover did not prevalidate a captured block; Finalize will backfill it",
-                    );
+                        "witness persisted without prevalidation; Finalize will backfill it",
+                    ),
+                    Ok(_) => {}
                 }
                 // Drop finalized witnesses; cheap when nothing is below the floor.
                 match store.purge_settled(settled_floor()) {

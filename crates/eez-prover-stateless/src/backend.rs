@@ -43,7 +43,36 @@ use chain_config::{ChainDocumentKind, load_chain_document};
 
 const DEBUG_PROGRESS_INTERVAL: usize = 100;
 const MAX_CACHED_BLOCKS: usize = 32_768;
+const MAX_CACHED_BYTES: usize = 512 * 1024 * 1024;
 const MAX_CONCURRENT_VALIDATIONS: usize = 4;
+
+#[derive(Debug)]
+struct BlockCache {
+    entries: LruCache<B256, (Arc<ValidatedBlock>, usize)>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl BlockCache {
+    fn insert(&mut self, block: Arc<ValidatedBlock>) -> Arc<ValidatedBlock> {
+        if let Some((cached, _)) = self.entries.get(&block.hash()) {
+            return Arc::clone(cached);
+        }
+        let bytes = block.size();
+        // Oversized results remain usable by their session without displacing the cache.
+        if bytes <= self.max_bytes {
+            while self.bytes > self.max_bytes - bytes
+                || self.entries.len() == self.entries.cap().get()
+            {
+                let (_, (_, removed_bytes)) = self.entries.pop_lru().expect("nonempty cache");
+                self.bytes -= removed_bytes;
+            }
+            self.entries.put(block.hash(), (Arc::clone(&block), bytes));
+            self.bytes += bytes;
+        }
+        block
+    }
+}
 
 /// Signer-recovered settling block prepared before replay.
 ///
@@ -62,7 +91,7 @@ pub struct Backend {
     chain_spec: Arc<ChainSpec>,
     evm_config: EezEvmConfig,
     expected_l2_system_address: Address,
-    blocks: Arc<Mutex<LruCache<B256, Arc<ValidatedBlock>>>>,
+    blocks: Arc<Mutex<BlockCache>>,
     validation_slots: Arc<Semaphore>,
 }
 
@@ -113,9 +142,11 @@ impl Backend {
             chain_spec,
             evm_config,
             expected_l2_system_address,
-            blocks: Arc::new(Mutex::new(LruCache::new(
-                NonZeroUsize::new(MAX_CACHED_BLOCKS).unwrap(),
-            ))),
+            blocks: Arc::new(Mutex::new(BlockCache {
+                entries: LruCache::new(NonZeroUsize::new(MAX_CACHED_BLOCKS).unwrap()),
+                bytes: 0,
+                max_bytes: MAX_CACHED_BYTES,
+            })),
             validation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_VALIDATIONS)),
         }
     }
@@ -389,7 +420,7 @@ impl ValidationBackend for Backend {
         tokio::time::timeout(request_timeout, async {
             {
                 let mut blocks = self.blocks.lock().unwrap();
-                if let Some(cached) = blocks.get(&block.claimed_hash()) {
+                if let Some((cached, _)) = blocks.entries.get(&block.claimed_hash()) {
                     cached.matches_submission(block, parent)?;
                     return Ok((Arc::clone(cached), true));
                 }
@@ -422,8 +453,7 @@ impl ValidationBackend for Backend {
                     .expect("one validated block");
                 let mut blocks = backend.blocks.lock().unwrap();
                 // Concurrent misses may execute twice; only fully checked evidence is published.
-                let cached = blocks.get_or_insert(admitted.claimed_hash(), || output);
-                Ok((Arc::clone(cached), false))
+                Ok((blocks.insert(output), false))
             })
             .await
             .map_err(|error| {

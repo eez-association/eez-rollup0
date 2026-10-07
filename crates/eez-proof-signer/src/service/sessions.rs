@@ -162,14 +162,18 @@ impl SessionRuntime {
         }
 
         let mut bound_session = None;
-        let mut pending: VecDeque<ClientFrame> = VecDeque::new();
+        let mut pending: VecDeque<(ClientFrame, usize, usize)> = VecDeque::new();
+        let mut pending_bytes = 0usize;
+        let mut pending_items = 0usize;
         let mut operation: Option<tokio::task::JoinHandle<(u64, FrameResult)>> = None;
         let mut input_closed = false;
         loop {
             // Start one queued operation at a time to preserve block and Finalize ordering.
             if operation.is_none()
-                && let Some(frame) = pending.pop_front()
+                && let Some((frame, bytes, items)) = pending.pop_front()
             {
+                pending_bytes -= bytes;
+                pending_items -= items;
                 let runtime = Arc::clone(&self);
                 let request_id = frame.request_id;
                 let mut local_bound = bound_session;
@@ -217,7 +221,37 @@ impl SessionRuntime {
                         Some(client_frame::Kind::Block(_) | client_frame::Kind::Finalize(_))
                     ) =>
                 {
-                    pending.push_back(message);
+                    // Bound decoded requests before they reach per-session admission.
+                    // Allow one window plus its Finalize calldata; keep reading controls
+                    // while work runs, but close an overflowing stream explicitly.
+                    let bytes = message.encoded_len();
+                    let items = match &message.kind {
+                        Some(client_frame::Kind::Block(block)) => block
+                            .data
+                            .as_ref()
+                            .and_then(|data| data.witness.as_ref())
+                            .map_or(0, wire_witness_item_count),
+                        _ => 0,
+                    };
+                    if pending.len() >= self.limits.max_blocks.saturating_add(1)
+                        || items > self.limits.max_witness_items.saturating_sub(pending_items)
+                        || bytes
+                            > self
+                                .limits
+                                .max_payload_bytes
+                                .saturating_mul(2)
+                                .saturating_sub(pending_bytes)
+                    {
+                        let _ = output
+                            .send(Err(Status::resource_exhausted(
+                                "ProveStream pending request quota exceeded",
+                            )))
+                            .await;
+                        break;
+                    }
+                    pending_bytes += bytes;
+                    pending_items += items;
+                    pending.push_back((message, bytes, items));
                 }
                 // Handle control frames directly so Rewind and Cancel can fence active work.
                 Event::Input(Ok(Some(message))) => {
@@ -237,6 +271,8 @@ impl SessionRuntime {
                     // Discard queued requests targeting the pre-rewind prefix.
                     if is_rewind {
                         pending.clear();
+                        pending_bytes = 0;
+                        pending_items = 0;
                     }
                     if should_close {
                         break;
@@ -725,9 +761,13 @@ impl SessionRuntime {
         let session = self.session(bound.id).await?;
         // Check the requested range and terminal identity, then snapshot its artifacts and anchor.
         let (anchor, validated_window, start_index, cancellation) = {
-            let session = session.lock().await;
+            let mut session = session.lock().await;
             require_epoch(&session, bound.epoch)?;
             let (anchor, window, start_index) = session.select_window(&finalize, terminal_hash)?;
+            // A deadline cancels this attempt, not every later Finalize in the epoch.
+            // Controls still cancel the currently installed token under this same lock.
+            session.cancellation.cancel();
+            session.cancellation = CancellationToken::default();
             (anchor, window, start_index, session.cancellation.clone())
         };
 
@@ -790,7 +830,7 @@ impl SessionRuntime {
         let signature = {
             let mut session = session.lock().await;
             require_epoch(&session, bound.epoch)?;
-            if session.cancellation.is_cancelled() {
+            if cancellation.is_cancelled() {
                 return Err(Status::cancelled("ProveStream Finalize was cancelled"));
             }
             let signature = self
@@ -898,6 +938,7 @@ fn validated_response(artifact: &ValidatedBlock, reused: bool) -> Validated {
 }
 
 fn validation_status(error: ValidationError) -> Status {
+    warn!(%error, "stream validation failed");
     PipelineError::Validation(error).status()
 }
 
@@ -981,6 +1022,7 @@ mod tests {
         validations: Arc<AtomicUsize>,
         delay: Duration,
         blocks: Arc<Mutex<HashMap<B256, Arc<ValidatedBlock>>>>,
+        prepare_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     }
 
     #[async_trait::async_trait]
@@ -1007,6 +1049,15 @@ mod tests {
         }
 
         fn validate_anchor(&self, _anchor: BlockAnchor) -> Result<(), ValidationError> {
+            Ok(())
+        }
+
+        async fn prepare_attestation(
+            &self,
+            _window: &ValidatedWindow,
+        ) -> Result<(), ValidationError> {
+            let delay = self.prepare_delay_ms.swap(0, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
             Ok(())
         }
 
@@ -1096,6 +1147,14 @@ mod tests {
     }
 
     fn state_with_delay(validations: Arc<AtomicUsize>, delay: Duration) -> Arc<ServiceState> {
+        state_with_delays(validations, delay, 0)
+    }
+
+    fn state_with_delays(
+        validations: Arc<AtomicUsize>,
+        delay: Duration,
+        prepare_delay_ms: u64,
+    ) -> Arc<ServiceState> {
         let attester = Attester::new(
             b256!("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"),
             test_proof_system_vkey(),
@@ -1109,6 +1168,7 @@ mod tests {
                     validations,
                     delay,
                     blocks: Arc::default(),
+                    prepare_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(prepare_delay_ms)),
                 },
                 NonZeroU64::new(1).unwrap(),
                 attester,
@@ -1949,6 +2009,108 @@ mod tests {
             runtime.session(b.id).await.unwrap().lock().await.tip().hash,
             B256::repeat_byte(0x22)
         );
+    }
+
+    #[tokio::test]
+    async fn finalize_deadline_allows_retry_in_the_same_epoch() {
+        let runtime = SessionRuntime::new(
+            state_with_delays(Arc::new(AtomicUsize::new(0)), Duration::ZERO, 100),
+            limits_with_timeouts(Duration::from_secs(1), Duration::from_millis(30)),
+        );
+        let (bound, _) = runtime.begin(begin()).await.unwrap();
+        let input = block_after(11, B256::repeat_byte(0x11), 0x33);
+        let hash = B256::from_slice(&input.data.as_ref().unwrap().hash);
+        runtime.validate_block(bound, input).await.unwrap();
+        let finalize = eez_control_rpc::v2::Finalize {
+            from_block: 11,
+            to_block: 11,
+            terminal_hash: hash.to_vec(),
+            post_batch: Some(post_batch(B256::repeat_byte(0x11), hash, 1)),
+        };
+        assert_eq!(
+            runtime
+                .finalize(bound, finalize.clone())
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::DeadlineExceeded
+        );
+        // No Resume/Rewind: the rejected attempt must not poison this binding.
+        assert_eq!(
+            runtime.finalize(bound, finalize).await.unwrap().proof.len(),
+            65
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_requests_are_bounded_before_validation() {
+        for quota in ["count", "bytes", "witness items"] {
+            let validations = Arc::new(AtomicUsize::new(0));
+            let mut limits = limits_with_timeouts(Duration::from_secs(5), Duration::from_secs(5));
+            limits.max_blocks = if quota == "count" { 1 } else { 100 };
+            limits.max_payload_bytes = 4096;
+            if quota == "witness items" {
+                limits.max_witness_items = 2;
+            }
+            let server = TestServer::with_service(ProveSvc::new(
+                state_with_delay(Arc::clone(&validations), Duration::from_secs(4)),
+                limits,
+            ))
+            .await;
+            let mut client = server.streaming_client().await;
+            let (requests, mut responses) = open_stream(
+                &mut client,
+                ClientFrame {
+                    request_id: 1,
+                    kind: Some(client_frame::Kind::Begin(begin())),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let ready = responses.message().await.unwrap().unwrap();
+            let mut frame = ClientFrame {
+                session_id: ready.session_id,
+                epoch: ready.epoch,
+                request_id: 2,
+                kind: Some(client_frame::Kind::Block(block())),
+            };
+            requests.send(frame.clone()).await.unwrap();
+            timeout(Duration::from_secs(1), async {
+                while validations.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if quota == "bytes" {
+                let Some(client_frame::Kind::Block(block)) = frame.kind.as_mut() else {
+                    unreachable!()
+                };
+                block
+                    .data
+                    .as_mut()
+                    .unwrap()
+                    .witness
+                    .as_mut()
+                    .unwrap()
+                    .codes
+                    .push(vec![0; 3000]);
+            }
+            for id in 3..=5 {
+                frame.request_id = id;
+                requests.send(frame.clone()).await.unwrap();
+            }
+            let error = timeout(Duration::from_secs(1), responses.message())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::ResourceExhausted, "{quota}");
+            assert_eq!(
+                validations.load(Ordering::SeqCst),
+                1,
+                "queued frames never execute"
+            );
+        }
     }
 
     #[tokio::test]

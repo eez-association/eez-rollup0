@@ -310,6 +310,20 @@ pub struct ValidatedBlock {
 }
 
 impl ValidatedBlock {
+    /// Estimated retained bytes for cache admission, including decoded data and evidence.
+    /// Shared allocations are charged in full; allocator bookkeeping is not included.
+    pub fn size(&self) -> usize {
+        use reth_primitives_traits::InMemorySize as _;
+        std::mem::size_of::<Self>()
+            + self.rlp.capacity()
+            + self.decoded.size()
+            + self.receipt_successes.capacity()
+            + self.transaction_state_checkpoints.capacity() * std::mem::size_of::<StateCheckpoint>()
+            + self.settlement_evidence.system_sender_flags.capacity()
+            + self.settlement_evidence.observed_outbound_events.capacity()
+                * std::mem::size_of::<OutboundEventObservation>()
+    }
+
     pub const fn number(&self) -> u64 {
         self.number
     }
