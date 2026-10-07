@@ -309,8 +309,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
 
     let timing = RollupTiming::from_env()?;
 
-    let attributes = EthAttributesBuilder::new(chain_spec.clone());
-
     let block_committer = BlockCommitterHandle::spawn_from_provider(
         &provider,
         beacon_engine_handle,
@@ -325,6 +323,8 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     let submitter_config = SubmitterConfig::from_env()?;
     let deploy_block = submitter_config.reader.deploy_block;
     let rollup_config = RollupConfig::from_env()?;
+    let attributes = EthAttributesBuilder::new(chain_spec.clone())
+        .with_fee_recipient(rollup_config.fee_recipient);
     let l1_watcher_config = L1WatcherConfig::from_env()?;
 
     let submitter = Submitter::new(submitter_config);

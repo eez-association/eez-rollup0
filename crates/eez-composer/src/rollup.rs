@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use alloy_primitives::Address;
 use eez_l1::{L1CanonicalHead, L1Error, L1Result};
 
 use crate::held_pool::HeldPool;
@@ -25,11 +26,14 @@ pub struct RollupConfig {
     /// rollup is sequenced, no one else should be posting). Same code
     /// path either way; only log level differs.
     pub expect_external_batches: bool,
+    /// Address receiving priority fees from locally composed L2 blocks.
+    pub fee_recipient: Address,
 }
 
 impl RollupConfig {
     /// Read from `EEZ_*` env vars: `EEZ_ROLLUP_ID` and
-    /// `EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES` (defaults to `false`).
+    /// `EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES` (defaults to `false`), and
+    /// `EEZ_L2_FEE_RECIPIENT` (defaults to the zero address).
     ///
     /// # Errors
     ///
@@ -59,10 +63,22 @@ impl RollupConfig {
                 ));
             }
         };
+        let fee_recipient = match env::var("EEZ_L2_FEE_RECIPIENT") {
+            Ok(value) => value.trim().parse::<Address>().map_err(|e| {
+                L1Error::Config(format!("EEZ_L2_FEE_RECIPIENT: expected address: {e}"))
+            })?,
+            Err(env::VarError::NotPresent) => Address::ZERO,
+            Err(_) => {
+                return Err(L1Error::Config(
+                    "EEZ_L2_FEE_RECIPIENT contains non-UTF-8 bytes".into(),
+                ));
+            }
+        };
 
         Ok(Self {
             rollup_id,
             expect_external_batches,
+            fee_recipient,
         })
     }
 }

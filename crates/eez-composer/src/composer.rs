@@ -1416,7 +1416,7 @@ where
         // on a stale parent (see [`eez_driver::ParentContext`]).
         let parent_header = parent.header;
         let parent_number = parent_header.number();
-        let suggested_fee_recipient: Address = Address::ZERO;
+        let suggested_fee_recipient = rollup.config.fee_recipient;
 
         // ── One-in-flight gate ───────────────────────────────────────
         // Emit a postBatch only once the previous resolves — FAILED
@@ -1890,7 +1890,7 @@ where
                     &self.inner.evm_config,
                     &failed.parent,
                     timestamp,
-                    Address::ZERO,
+                    rollup.config.fee_recipient,
                     &[],
                 ) {
                     // feed_witness=true: a PRODUCED block — later historical
@@ -3611,7 +3611,7 @@ where
             &self.inner.evm_config,
             parent_header,
             timestamp,
-            Address::ZERO,
+            rollup.config.fee_recipient,
             &[],
         ) {
             Ok(built) => Some(SyncSlotBlock {
