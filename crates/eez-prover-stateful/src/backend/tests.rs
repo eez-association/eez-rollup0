@@ -265,7 +265,7 @@ fn checkpoint_plan_is_not_limited_before_the_provider_is_read() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -289,7 +289,7 @@ fn execution_errors_preserve_retryability() {
 #[test]
 fn empty_checkpoint_execution_retains_transaction_state() {
     let chain_spec = Arc::new(ChainSpec::default());
-    let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec));
+    let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap();
     let recipient = Address::repeat_byte(0x22);
     let signed = TxLegacy {
         nonce: 0,
@@ -347,7 +347,7 @@ fn follower_behind_the_required_anchor_is_retryable() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -366,7 +366,7 @@ fn conflicting_local_anchor_is_fatal() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -395,7 +395,7 @@ fn conflicting_known_block_is_fatal() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -457,7 +457,7 @@ fn anchor_reorg_is_aborted_through_the_complete_validation_path() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -493,7 +493,7 @@ fn invalid_standalone_header_is_fatal() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -517,7 +517,7 @@ fn replays_an_empty_terminal_block_from_local_anchor_state() {
     let output = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -542,7 +542,7 @@ fn replayed_state_root_must_match_the_block_header() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -562,7 +562,7 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
             .cancun_activated()
             .build(),
     );
-    let evm_config = EezEvmConfig::new(chain_spec);
+    let evm_config = EezEvmConfig::new(chain_spec).unwrap();
     let block = RecoveredBlock::try_recover(Block {
         header: Header {
             number: 1,
@@ -641,7 +641,7 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
 
 #[test]
 fn beacon_withdrawals_are_rejected_in_both_stateful_replay_paths() {
-    let evm_config = EezEvmConfig::new(Arc::new(ChainSpec::default()));
+    let evm_config = EezEvmConfig::new(Arc::new(ChainSpec::default())).unwrap();
     let block = RecoveredBlock::new_unhashed(
         Block {
             header: Header::default(),

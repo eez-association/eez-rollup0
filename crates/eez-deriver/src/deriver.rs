@@ -162,7 +162,8 @@ where
         system_tx_cfg: Option<eez_protocol::system_tx::SystemTxContext>,
         checkpoint_dir: Option<PathBuf>,
     ) -> Self {
-        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec));
+        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec))
+            .expect("execution chain configuration was validated at startup");
         Self {
             inner: Arc::new(Inner {
                 committer,
