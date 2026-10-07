@@ -49,6 +49,8 @@ jobs:
     name: Unit Tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -69,10 +71,10 @@ jobs:
           echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
           echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
       - name: Unit tests (lib + bins, parallel)
-        run: cargo nextest run --locked --workspace --lib --bins --no-fail-fast
+        run: cargo nextest run --locked --cargo-profile ci-e2e --workspace --lib --bins --no-fail-fast
       - name: Protocol integration vectors
         run: >-
-          cargo nextest run --locked -p eez-protocol
+          cargo nextest run --locked --cargo-profile ci-e2e -p eez-protocol
           --test public_inputs_hash_vectors
           --test rolling_hash_vectors
           --no-fail-fast
