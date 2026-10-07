@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Drive a GENUINE partial consumption against the kurtosis rig.
+# Drive a genuine partial consumption against the Kurtosis rig.
 #
 # Prefix mode queues a direct inbound call followed by a call through
 # ParityGate; anchor-only mode queues only the gated call. The composer simulates
@@ -55,14 +55,14 @@ echo "════════════════════════�
 echo " PARITY GATE — $MODE settlement (rounds=$ROUNDS)"
 echo "════════════════════════════════════════════════════════════"
 
-# The rig runs a prebuilt image. A stale one silently tests the PARENT branch:
+# The rig runs a prebuilt image. A stale one silently tests the parent branch:
 # without `revertingTxHashes` on the wire the builder drops every bundle holding
 # a reverting tx, so no prefix can ever form and the run fails for the wrong
 # reason. Refuse to start unless the binary carries this branch's markers.
 BIN=/tmp/eez-composer-under-test
 docker cp eez-node-kurtosis:/usr/local/bin/eez-composer "$BIN" >/dev/null 2>&1 \
     || { echo "cannot read the running composer binary"; exit 1; }
-# Extract once, then grep the FILE: `strings | grep -q` makes strings die of
+# Extract once, then grep the file: `strings | grep -q` makes strings die of
 # SIGPIPE on a match, and under `pipefail` that reads as failure.
 strings "$BIN" > "$BIN.syms"
 missing=""
@@ -77,13 +77,13 @@ rm -f "$BIN" "$BIN.syms"
 }
 echo "==> image carries the partial-consumption code"
 
-# Two persistent senders, one per call. A gated call composed on an ODD anchor
+# Two persistent senders, one per call. A gated call composed on an odd anchor
 # is evicted at compose time along with its nonce chain, so the on-chain nonce
 # does not move and the next round reuses it — no permanent gap. Separate
 # senders keep a gated eviction from taking the direct call down with it.
 DKEY="0x$(openssl rand -hex 32)"; DADDR=$(cast wallet address --private-key "$DKEY")
 GKEY="0x$(openssl rand -hex 32)"; GADDR=$(cast wallet address --private-key "$GKEY")
-# Fund through the BUILDER's own RPC: el-1 holds txs that never reach el-2, and
+# Fund through the builder's own RPC: el-1 holds txs that never reach el-2, and
 # el-2 is the node that builds blocks.
 FN=$(cast nonce "$(cast wallet address --private-key "$FUND_KEY")" --rpc-url "$L1_FUND_RPC")
 cast send --rpc-url "$L1_FUND_RPC" --private-key "$FUND_KEY" --nonce "$FN"       --gas-price "$GAS" --async --value 20ether "$DADDR" >/dev/null
@@ -136,7 +136,7 @@ for r in $(seq 1 "$ROUNDS"); do
     GATED=$(cast mktx --rpc-url "$L1" --chain-id "$L1_CHAIN_ID" --private-key "$GKEY" \
         --nonce "$(cast nonce "$GADDR" --rpc-url "$L1")" \
         --gas-limit 900000 --gas-price "$GAS" "$GATE" 'setValue(uint256)' "$((200 + r))")
-    # `send_front` waits out the front's startup backoff and fails LOUDLY on a
+    # `send_front` waits out the front's startup backoff and fails loudly on a
     # rejection; swallowing the response would report "no prefix" for a tx that
     # was never accepted.
     send_front "$L1F" "$GATED" "$(cast keccak "$GATED")" || exit 1

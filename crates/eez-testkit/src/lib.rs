@@ -25,6 +25,8 @@ use std::{
 };
 
 use alloy_consensus::Transaction as _;
+use alloy_consensus::transaction::SignerRecoverable as _;
+use alloy_eips::eip2718::Decodable2718 as _;
 use alloy_primitives::{Address, B256, Bytes, Signature, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionReceipt, TransactionRequest};
@@ -822,7 +824,7 @@ impl Harness {
     }
 
     pub fn chain(&self) -> Chain<'_> {
-        Chain::new(&self.anvil, &self.stub, &self.dep)
+        Chain::new(&self.anvil, &self.dep)
     }
 
     /// Select deterministic relay behavior for the next submissions.
@@ -1949,7 +1951,6 @@ pub struct ChainSnapshot {
 
 pub struct Chain<'a> {
     rpc_url: &'a str,
-    stub_url: &'a str,
     eez_address: Address,
     deploy_block: u64,
     rollup_id: u64,
@@ -1957,11 +1958,10 @@ pub struct Chain<'a> {
 }
 
 impl<'a> Chain<'a> {
-    fn new(anvil: &'a Anvil, stub: &'a BundleStub, dep: &Deployment) -> Self {
+    fn new(anvil: &'a Anvil, dep: &Deployment) -> Self {
         Self {
             initial_commitment: dep.initial_commitment,
             rpc_url: &anvil.rpc_url,
-            stub_url: &stub.url,
             eez_address: dep.eez_address,
             deploy_block: dep.deploy_block,
             rollup_id: dep.rollup_id,
@@ -1991,7 +1991,7 @@ impl<'a> Chain<'a> {
     /// in Anvil. Interval 0 pauses block production; any other value resumes
     /// it on the `L1_BLOCK_TIME_SECS` cadence.
     pub async fn set_interval_mining(&self, secs: u64) -> Result<()> {
-        let provider = ProviderBuilder::new().connect_http(self.stub_url.parse()?);
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
         let _: serde_json::Value = provider
             .client()
             .request("eez_setMining", (secs != 0,))
@@ -2002,7 +2002,7 @@ impl<'a> Chain<'a> {
 
     /// Mine exactly one block.
     pub async fn mine(&self) -> Result<()> {
-        let provider = ProviderBuilder::new().connect_http(self.stub_url.parse()?);
+        let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
         let _: serde_json::Value = provider
             .client()
             .request("eez_mine", ())
@@ -2148,7 +2148,7 @@ impl<'a> Chain<'a> {
     }
 
     /// Assert that a submitted `postAndVerifyBatch` for `expected_rollup_id`
-    /// was mined, reverted, and reproduces `expected_revert_selector` via
+    /// was rejected atomically and reproduces `expected_revert_selector` via
     /// `eth_call` against the resulting chain state.
     pub async fn assert_failed_post_and_verify_batch(
         &self,
@@ -2156,74 +2156,56 @@ impl<'a> Chain<'a> {
         expected_revert_selector: [u8; 4],
     ) -> Result<()> {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
-        let latest = provider.get_block_number().await?;
+        let rejected: Vec<Bytes> = provider
+            .client()
+            .request("eez_getRejectedTransactions", ())
+            .await
+            .context("eez_getRejectedTransactions")?;
 
-        for block_number in self.deploy_block..=latest {
-            let Some(block) = provider
-                .get_block_by_number(BlockNumberOrTag::Number(block_number))
-                .full()
-                .await?
-            else {
+        for raw in rejected {
+            let transaction = TxEnvelope::decode_2718(&mut raw.as_ref())?;
+            if transaction.to() != Some(self.eez_address)
+                || !transaction
+                    .input()
+                    .starts_with(&eez_protocol::abi::postAndVerifyBatchCall::SELECTOR)
+            {
                 continue;
-            };
-            for transaction in block.transactions.txns() {
-                if transaction.inner.to() != Some(self.eez_address)
-                    || !transaction
-                        .inner
-                        .input()
-                        .starts_with(&eez_protocol::abi::postAndVerifyBatchCall::SELECTOR)
-                {
-                    continue;
-                }
-                let call = eez_protocol::abi::postAndVerifyBatchCall::abi_decode(
-                    transaction.inner.input(),
-                )?;
-                if !call
-                    .batch
-                    .rollupIdsWithProofSystems
-                    .iter()
-                    .any(|rollup| rollup.rollupId == expected_rollup_id)
-                {
-                    continue;
-                }
-
-                let tx_hash = *transaction.inner.tx_hash();
-                let receipt = provider
-                    .get_transaction_receipt(tx_hash)
-                    .await?
-                    .ok_or_else(|| anyhow!("postAndVerifyBatch receipt {tx_hash} is missing"))?;
-                if receipt.status() {
-                    bail!(
-                        "postAndVerifyBatch transaction {tx_hash} for rollup {expected_rollup_id} succeeded"
-                    );
-                }
-
-                let replay = TransactionRequest::default()
-                    .from(transaction.inner.signer())
-                    .to(self.eez_address)
-                    .input(transaction.inner.input().clone().into());
-                let err = provider
-                    .call(replay)
-                    .await
-                    .expect_err("failed postAndVerifyBatch replay unexpectedly succeeded");
-                let expected = format!("0x{}", hex::encode(expected_revert_selector));
-                let error_response = err.as_error_resp().ok_or_else(|| {
-                    anyhow!("postAndVerifyBatch replay returned non-RPC error: {err}")
-                })?;
-                let observed = error_response.data.as_ref().map_or_else(
-                    || error_response.message.to_string(),
-                    |data| format!("{} {}", error_response.message, data.get()),
-                );
-                if !observed.contains(&expected) {
-                    bail!(
-                        "postAndVerifyBatch replay returned {observed}, expected selector {expected}"
-                    );
-                }
-                return Ok(());
             }
+            let call = eez_protocol::abi::postAndVerifyBatchCall::abi_decode(transaction.input())?;
+            if !call
+                .batch
+                .rollupIdsWithProofSystems
+                .iter()
+                .any(|rollup| rollup.rollupId == expected_rollup_id)
+            {
+                continue;
+            }
+
+            let replay = TransactionRequest::default()
+                .from(transaction.recover_signer()?)
+                .to(self.eez_address)
+                .input(transaction.input().clone().into());
+            let err = provider
+                .call(replay)
+                .await
+                .expect_err("failed postAndVerifyBatch replay unexpectedly succeeded");
+            let expected = format!("0x{}", hex::encode(expected_revert_selector));
+            let error_response = err.as_error_resp().ok_or_else(|| {
+                anyhow!("postAndVerifyBatch replay returned non-RPC error: {err}")
+            })?;
+            let observed = error_response.data.as_ref().map_or_else(
+                || error_response.message.to_string(),
+                |data| format!("{} {}", error_response.message, data.get()),
+            );
+            if !observed.contains(&expected) {
+                bail!(
+                    "postAndVerifyBatch replay returned {observed}, expected selector {expected}"
+                );
+            }
+            return Ok(());
         }
 
-        bail!("no mined postAndVerifyBatch transaction found for rollup {expected_rollup_id}")
+        bail!("no rejected postAndVerifyBatch transaction found for rollup {expected_rollup_id}")
     }
 }
 

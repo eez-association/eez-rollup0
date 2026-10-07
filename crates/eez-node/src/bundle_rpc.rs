@@ -17,18 +17,17 @@
 //! in the next block, postBatch first. The `Submitter` then takes its
 //! primary bundle path and never falls back to `eth_sendRawTransaction`.
 //!
-//! This is deliberately not a real block builder: it simulates the bundle in
-//! order and rejects a known non-whitelisted revert before forwarding, but
-//! build-time atomic inclusion would require a bundle-aware payload builder.
+//! This is deliberately NOT a real block builder: there is no competing
+//! builder on a single-node dev chain, so ordered mempool insertion is a
+//! faithful `eth_sendBundle` endpoint. True build-time atomic inclusion
+//! (all-or-nothing on EVM revert) would require a bundle-aware payload
+//! builder — a follow-up.
 //!
 //! The function is generic over the node + eth-api types; the dev L1 it
 //! serves is a vanilla `EthereumNode` (it would equally serve a
 //! `reth_gnosis::GnosisNode`).
 
-use alloy_consensus::transaction::SignerRecoverable as _;
-use alloy_consensus::{Transaction, TxEnvelope};
-use alloy_eips::eip2718::Decodable2718 as _;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::B256;
 use jsonrpsee::core::server::RpcModule;
 use jsonrpsee::types::{ErrorObject, ErrorObjectOwned};
 use reth_node_api::FullNodeComponents;
@@ -38,9 +37,9 @@ use serde::Deserialize;
 use tracing::{Level, event};
 
 /// Subset of the Flashbots `eth_sendBundle` request we honor. Extra
-/// fields (`minTimestamp`, `maxTimestamp`, …) are accepted and ignored —
-/// a single-node dev chain has no proposer auction or block-pinning to
-/// enforce them against.
+/// fields (`minTimestamp`, `maxTimestamp`, `revertingTxHashes`, …) are
+/// accepted and ignored — a single-node dev chain has no proposer
+/// auction or block-pinning to enforce them against.
 ///
 /// Matches the body produced by `eez_l1::submitter::post_bundle`:
 /// `{ "txs": ["0x…", …], "blockNumber": "0x…" }`.
@@ -55,42 +54,6 @@ pub struct BundleParams {
     /// the field deserializes; surfaced for logging.
     #[serde(default)]
     pub block_number: Option<String>,
-    /// Transactions allowed to revert without failing the bundle.
-    #[serde(default)]
-    pub reverting_tx_hashes: Vec<B256>,
-}
-
-/// An `eth_call` request for `envelope` as sent by `from`.
-fn call_request(envelope: &TxEnvelope, from: Address) -> serde_json::Value {
-    let mut request = serde_json::json!({
-        "from": from,
-        "gas": format!("{:#x}", Transaction::gas_limit(envelope)),
-        "value": Transaction::value(envelope),
-        "input": Transaction::input(envelope),
-    });
-    if let Some(to) = Transaction::to(envelope) {
-        request["to"] = serde_json::json!(to);
-    }
-    if let Some(chain_id) = Transaction::chain_id(envelope) {
-        request["chainId"] = serde_json::json!(format!("{chain_id:#x}"));
-    }
-    if Transaction::is_dynamic_fee(envelope) {
-        request["maxFeePerGas"] =
-            serde_json::json!(format!("{:#x}", Transaction::max_fee_per_gas(envelope)));
-        if let Some(tip) = Transaction::max_priority_fee_per_gas(envelope) {
-            request["maxPriorityFeePerGas"] = serde_json::json!(format!("{tip:#x}"));
-        }
-    } else if let Some(price) = Transaction::gas_price(envelope) {
-        request["gasPrice"] = serde_json::json!(format!("{price:#x}"));
-    }
-    if let Some(access_list) = Transaction::access_list(envelope) {
-        request["accessList"] = serde_json::json!(access_list);
-    }
-    request
-}
-
-fn bundle_error(message: String) -> ErrorObjectOwned {
-    ErrorObject::owned(-32000, message, None::<()>)
 }
 
 /// `extend_rpc_modules` hook: register `eth_sendBundle` on the embedded
@@ -128,54 +91,12 @@ where
             ));
         }
 
-        // Simulate the bundle in order at the next block to reject known
-        // inclusion-time reverts before forwarding anything to the pool.
-        let mut hashes = Vec::with_capacity(bundle.txs.len());
-        let mut requests = Vec::with_capacity(bundle.txs.len());
-        for raw in &bundle.txs {
-            let envelope = TxEnvelope::decode_2718(&mut raw.as_ref())
-                .map_err(|e| bundle_error(format!("eth_sendBundle: undecodable tx: {e}")))?;
-            let from = envelope
-                .recover_signer()
-                .map_err(|e| bundle_error(format!("eth_sendBundle: bad signature: {e}")))?;
-            hashes.push(*envelope.tx_hash());
-            requests.push(call_request(&envelope, from));
-        }
-        let next_block = EthApiServer::block_number(&*eth_api)? + U256::from(1);
-        let bundles = serde_json::from_value(serde_json::json!([{
-            "transactions": requests,
-            "blockOverride": { "number": next_block },
-        }]))
-        .map_err(|e| bundle_error(format!("eth_sendBundle: simulation request: {e}")))?;
-        let state_context = serde_json::from_value(serde_json::json!({ "blockNumber": "latest" }))
-            .map_err(|e| bundle_error(format!("eth_sendBundle: simulation context: {e}")))?;
-        let results = EthApiServer::call_many(&*eth_api, bundles, Some(state_context), None)
-            .await
-            .map_err(|e| bundle_error(format!("eth_sendBundle: bundle not includable: {e}")))?;
-        let outcomes = results.into_iter().next().unwrap_or_default();
-        for (index, tx_hash) in hashes.iter().enumerate() {
-            let reverted = outcomes
-                .get(index)
-                .is_none_or(|outcome| outcome.error.is_some());
-            if reverted && !bundle.reverting_tx_hashes.contains(tx_hash) {
-                event!(
-                    name: "eez.node.l1_embedded.bundle.rejected",
-                    Level::WARN,
-                    event_name = "eez.node.l1_embedded.bundle.rejected",
-                    tx_hash = %tx_hash,
-                    tx_count = bundle.txs.len(),
-                    "embedded dev L1 eth_sendBundle: tx reverts outside revertingTxHashes; bundle not included",
-                );
-                return Err(bundle_error(format!(
-                    "eth_sendBundle: transaction {tx_hash} reverts and is not in \
-                     revertingTxHashes; bundle not included"
-                )));
-            }
-        }
-
         // Forward in submitted order. On a single-node dev chain with
         // no competing builder this yields postBatch-first inclusion
-        // in the next block.
+        // in the next block. A rejected tx fails the whole call (the
+        // caller treats a non-`result` reply as a bundle failure and
+        // retries), which is the strictest honest behavior we can
+        // offer without build-time atomicity.
         let mut last_hash = B256::ZERO;
         for raw in &bundle.txs {
             // Disambiguate from the `EthTransactions` helper of the

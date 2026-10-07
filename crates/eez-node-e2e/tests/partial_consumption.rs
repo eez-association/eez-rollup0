@@ -1,6 +1,9 @@
 //! Partial and anchor-only settlement coverage with inclusion-time reverts.
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use alloy_primitives::{B256, U256};
 use alloy_rpc_types_eth::BlockNumberOrTag;
@@ -14,33 +17,36 @@ use eez_testkit::{
 
 const TIMEOUT: Duration = Duration::from_mins(6);
 const ROUNDS: usize = 12;
-
 fn assert_settlements_use_dispatched_sync_heights(
     records: &[eez_testkit::NodeSignal],
 ) -> anyhow::Result<()> {
-    let dispatched: std::collections::HashSet<u64> = records
-        .iter()
-        .filter(|record| {
-            matches!(
-                record.name.as_str(),
-                signals::COMPOSER_BUNDLE_DISPATCHED | signals::COMPOSER_PHASE1_BUNDLE_DISPATCHED
-            )
-        })
-        .map(|record| record.u64("sync_height"))
-        .collect::<anyhow::Result<_>>()?;
-    let settled: Vec<u64> = records
-        .iter()
-        .filter(|record| record.name == signals::DERIVER_SAFE_ADVANCED)
-        .map(|record| record.u64("to_block"))
-        .collect::<anyhow::Result<_>>()?;
+    let mut dispatched = HashMap::new();
+    let mut settled = Vec::new();
+    for record in records {
+        match record.name.as_str() {
+            signals::COMPOSER_BUNDLE_DISPATCHED | signals::COMPOSER_PHASE1_BUNDLE_DISPATCHED => {
+                dispatched.insert(record.b256("post_batch_hash")?, record.u64("sync_height")?);
+            }
+            signals::COMPOSER_HISTORICAL_CHUNK => {
+                dispatched.insert(record.b256("post_batch_hash")?, record.u64("boundary")?);
+            }
+            signals::DERIVER_SAFE_ADVANCED => {
+                settled.push((record.b256("tx_hash")?, record.u64("to_block")?));
+            }
+            _ => {}
+        }
+    }
     anyhow::ensure!(
         !settled.is_empty(),
         "no included batch advanced the safe head"
     );
-    for height in settled {
+    for (tx_hash, height) in settled {
+        let dispatched_height = dispatched.get(&tx_hash).ok_or_else(|| {
+            anyhow::anyhow!("included batch {tx_hash} has no correlated dispatch")
+        })?;
         anyhow::ensure!(
-            dispatched.contains(&height),
-            "included batch settled at {height}, which was not its dispatched Sync height"
+            *dispatched_height == height,
+            "included batch {tx_hash} settled at {height}, not its dispatched Sync height {dispatched_height}"
         );
     }
     Ok(())
@@ -48,32 +54,138 @@ fn assert_settlements_use_dispatched_sync_heights(
 
 #[test]
 fn settlement_height_oracle_rejects_a_non_sync_height() {
-    let record = |name: &str, field: &str, value: u64| eez_testkit::NodeSignal {
+    let tx_hash = B256::repeat_byte(0x11);
+    let record = |name: &str, fields: &[(&str, serde_json::Value)]| eez_testkit::NodeSignal {
         name: name.to_owned(),
-        fields: serde_json::Map::from_iter([(field.to_owned(), value.into())]),
+        fields: serde_json::Map::from_iter(
+            fields
+                .iter()
+                .map(|(field, value)| ((*field).to_owned(), value.clone())),
+        ),
     };
     let records = [
-        record(signals::COMPOSER_BUNDLE_DISPATCHED, "sync_height", 10),
-        record(signals::DERIVER_SAFE_ADVANCED, "to_block", 9),
+        record(
+            signals::COMPOSER_BUNDLE_DISPATCHED,
+            &[
+                ("sync_height", 10.into()),
+                ("post_batch_hash", tx_hash.to_string().into()),
+            ],
+        ),
+        record(
+            signals::DERIVER_SAFE_ADVANCED,
+            &[
+                ("tx_hash", tx_hash.to_string().into()),
+                ("to_block", 9.into()),
+            ],
+        ),
     ];
     assert!(assert_settlements_use_dispatched_sync_heights(&records).is_err());
 }
 
 #[test]
 fn settlement_height_oracle_accepts_a_minimal_bundle_sync_height() {
-    let record = |name: &str, field: &str, value: u64| eez_testkit::NodeSignal {
+    let tx_hash = B256::repeat_byte(0x22);
+    let record = |name: &str, fields: &[(&str, serde_json::Value)]| eez_testkit::NodeSignal {
         name: name.to_owned(),
-        fields: serde_json::Map::from_iter([(field.to_owned(), value.into())]),
+        fields: serde_json::Map::from_iter(
+            fields
+                .iter()
+                .map(|(field, value)| ((*field).to_owned(), value.clone())),
+        ),
     };
     let records = [
         record(
             signals::COMPOSER_PHASE1_BUNDLE_DISPATCHED,
-            "sync_height",
-            10,
+            &[
+                ("sync_height", 10.into()),
+                ("post_batch_hash", tx_hash.to_string().into()),
+            ],
         ),
-        record(signals::DERIVER_SAFE_ADVANCED, "to_block", 10),
+        record(
+            signals::DERIVER_SAFE_ADVANCED,
+            &[
+                ("tx_hash", tx_hash.to_string().into()),
+                ("to_block", 10.into()),
+            ],
+        ),
     ];
     assert!(assert_settlements_use_dispatched_sync_heights(&records).is_ok());
+}
+
+#[test]
+fn settlement_height_oracle_uses_a_historical_chunk_boundary() {
+    let tx_hash = B256::repeat_byte(0x23);
+    let record = |name: &str, fields: &[(&str, serde_json::Value)]| eez_testkit::NodeSignal {
+        name: name.to_owned(),
+        fields: serde_json::Map::from_iter(
+            fields
+                .iter()
+                .map(|(field, value)| ((*field).to_owned(), value.clone())),
+        ),
+    };
+    let records = [
+        record(
+            signals::COMPOSER_HISTORICAL_CHUNK,
+            &[
+                ("sync_height", 20.into()),
+                ("boundary", 12.into()),
+                ("post_batch_hash", tx_hash.to_string().into()),
+            ],
+        ),
+        record(
+            signals::DERIVER_SAFE_ADVANCED,
+            &[
+                ("tx_hash", tx_hash.to_string().into()),
+                ("to_block", 12.into()),
+            ],
+        ),
+    ];
+    assert!(assert_settlements_use_dispatched_sync_heights(&records).is_ok());
+}
+
+#[test]
+fn settlement_height_oracle_rejects_swapped_batch_heights() {
+    let first = B256::repeat_byte(0x33);
+    let second = B256::repeat_byte(0x44);
+    let record = |name: &str, fields: &[(&str, serde_json::Value)]| eez_testkit::NodeSignal {
+        name: name.to_owned(),
+        fields: serde_json::Map::from_iter(
+            fields
+                .iter()
+                .map(|(field, value)| ((*field).to_owned(), value.clone())),
+        ),
+    };
+    let records = [
+        record(
+            signals::COMPOSER_BUNDLE_DISPATCHED,
+            &[
+                ("sync_height", 10.into()),
+                ("post_batch_hash", first.to_string().into()),
+            ],
+        ),
+        record(
+            signals::COMPOSER_BUNDLE_DISPATCHED,
+            &[
+                ("sync_height", 12.into()),
+                ("post_batch_hash", second.to_string().into()),
+            ],
+        ),
+        record(
+            signals::DERIVER_SAFE_ADVANCED,
+            &[
+                ("tx_hash", first.to_string().into()),
+                ("to_block", 12.into()),
+            ],
+        ),
+        record(
+            signals::DERIVER_SAFE_ADVANCED,
+            &[
+                ("tx_hash", second.to_string().into()),
+                ("to_block", 10.into()),
+            ],
+        ),
+    ];
+    assert!(assert_settlements_use_dispatched_sync_heights(&records).is_err());
 }
 
 async fn assert_follower_reaches(w: &eez_testkit::CrossChainWorld, expected: (u64, B256)) {

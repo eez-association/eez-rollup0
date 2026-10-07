@@ -3440,6 +3440,7 @@ where
             event_name = "eez.composer.bundle.dispatched",
             rollup_id,
             sync_height,
+            post_batch_hash = %post_batch_hash,
             tx_count = bundle.len(),
             entry_count = total_entries,
             evicted_poison = poison.len(),
@@ -3574,6 +3575,7 @@ where
             event_name = "eez.composer.phase1.bundle.dispatched",
             rollup_id,
             sync_height,
+            post_batch_hash = %post_batch_hash,
             "minimal postBatch dispatched to background observer (leading immediate only)",
         );
         rollup.optimistic.begin(
@@ -3692,6 +3694,7 @@ where
                 continue;
             };
 
+            let post_batch_hash = alloy_primitives::keccak256(&raw);
             event!(
                 name: "eez.composer.emission.historical_chunk",
                 Level::INFO,
@@ -3702,10 +3705,10 @@ where
                 span = boundary - cursor,
                 backlog = sync_height - cursor,
                 over_budget,
+                post_batch_hash = %post_batch_hash,
                 "settlement backlog exceeds the batch cap; settling a bounded historical chunk",
             );
 
-            let post_batch_hash = alloy_primitives::keccak256(&raw);
             rollup
                 .optimistic
                 .begin(boundary, post_batch_hash, boundary_parent, Vec::new());
