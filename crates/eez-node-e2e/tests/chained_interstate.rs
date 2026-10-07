@@ -598,6 +598,7 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
     .await
     .expect("first increment must be admitted");
     nonce += 1;
+    let poison_cursor = w.node.signal_cursor().unwrap();
     let poison = sign_and_send(
         &w.l1_xchain(),
         ANVIL_KEY_6,
@@ -649,10 +650,21 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
         None,
         "the poison tx must be dropped, not bundled",
     );
-    assert!(
-        w.node.log_count_matching(&["evicting", "evicted"]).unwrap() > 0,
-        "the poison tx must be evicted loudly",
-    );
+    let poison_hash = poison.to_string();
+    wait_for(SETTLE_TIMEOUT, || async {
+        let evicted = w
+            .node
+            .signals_since(poison_cursor)?
+            .into_iter()
+            .any(|record| {
+                record.name == signals::COMPOSER_POISON_EVICTION_COMPLETED
+                    && record.fields.get("tx_hash").and_then(|v| v.as_str())
+                        == Some(poison_hash.as_str())
+            });
+        Ok(evicted.then_some(()))
+    })
+    .await
+    .expect("the poison tx must emit a poison-eviction signal");
 
     // The window is not frozen: a later slot still settles.
     open_drain_window(&w).await;

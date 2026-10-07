@@ -967,6 +967,7 @@ where
                 event!(
                     name: "eez.deriver.resync.recovered",
                     Level::INFO,
+                    event_name = "eez.deriver.resync.recovered",
                     cursor = self.cursor(),
                     "resync complete; cursor re-anchored to L1",
                 );
