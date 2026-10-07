@@ -1890,7 +1890,7 @@ where
                     &self.inner.evm_config,
                     &failed.parent,
                     timestamp,
-                    Address::ZERO,
+                    rollup.config.fee_recipient,
                     &[],
                 ) {
                     // feed_witness=true: a PRODUCED block — later historical
@@ -3611,7 +3611,7 @@ where
             &self.inner.evm_config,
             parent_header,
             timestamp,
-            Address::ZERO,
+            rollup.config.fee_recipient,
             &[],
         ) {
             Ok(built) => Some(SyncSlotBlock {
