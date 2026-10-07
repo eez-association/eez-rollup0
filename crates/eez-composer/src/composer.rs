@@ -1416,7 +1416,7 @@ where
         // on a stale parent (see [`eez_driver::ParentContext`]).
         let parent_header = parent.header;
         let parent_number = parent_header.number();
-        let suggested_fee_recipient: Address = Address::ZERO;
+        let suggested_fee_recipient = rollup.config.fee_recipient;
 
         // ── One-in-flight gate ───────────────────────────────────────
         // Emit a postBatch only once the previous resolves — FAILED
