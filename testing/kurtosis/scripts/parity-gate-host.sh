@@ -40,15 +40,61 @@ GAS=$(gas_price_for "$L1")
 
 refresh_log() { docker logs eez-node-kurtosis >"$NODE_LOG" 2>&1 || true; }
 count() { refresh_log; grep -c "$1" "$NODE_LOG" 2>/dev/null || true; }
+wait_for_even_l1_head() {
+    local initial head deadline
+    initial=$(cast block-number --rpc-url "$L1")
+    deadline=$((SECONDS + ${EEZ_PARITY_WAIT_SECS:-40}))
+    while (( SECONDS < deadline )); do
+        head=$(cast block-number --rpc-url "$L1")
+        if (( head > initial && head % 2 == 0 )); then
+            echo "==> fresh even L1 anchor=$head; expected target=$((head + 1))"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "L1 did not produce a fresh even block within the parity wait" >&2
+    return 1
+}
 anchor_count() {
     refresh_log
-    jq -Rrc 'fromjson? | select(
-        .fields.event_name == "eez.deriver.reconcile.partial_consumption"
-        and (((.fields.outbound | tonumber) + (.fields.inbound | tonumber)) > 0)
-        and (.fields.outbound_applied | tonumber) == 0
-        and (.fields.inbound_applied | tonumber) == 0
-    )' \
-        "$NODE_LOG" | wc -l | tr -d '[:space:]'
+    jq -Rsc '
+        [split("\n")[] | fromjson? | .fields] as $events
+        | [$events[] as $partial
+            | select(
+                $partial.event_name == "eez.deriver.reconcile.partial_consumption"
+                and ((($partial.outbound | tonumber) + ($partial.inbound | tonumber)) > 0)
+                and ($partial.outbound_applied | tonumber) == 0
+                and ($partial.inbound_applied | tonumber) == 0
+            )
+            | select(any($events[];
+                .event_name == "eez.deriver.safe.advanced"
+                and .tx_hash == $partial.tx_hash
+                and ((.l1_block_number | tonumber) % 2) == 1
+            ))
+        ] | length
+    ' "$NODE_LOG"
+}
+prefix_count() {
+    refresh_log
+    jq -Rsc '
+        [split("\n")[] | fromjson? | .fields] as $events
+        | [$events[] as $partial
+            | select(
+                $partial.event_name == "eez.deriver.reconcile.partial_consumption"
+                and ($partial.outbound_applied | tonumber) > 0
+                and ($partial.inbound_applied | tonumber) > 0
+                and (
+                    ($partial.outbound_applied | tonumber) < ($partial.outbound | tonumber)
+                    or ($partial.inbound_applied | tonumber) < ($partial.inbound | tonumber)
+                )
+            )
+            | select(any($events[];
+                .event_name == "eez.deriver.safe.advanced"
+                and .tx_hash == $partial.tx_hash
+                and ((.l1_block_number | tonumber) % 2) == 1
+            ))
+        ] | length
+    ' "$NODE_LOG"
 }
 
 echo "════════════════════════════════════════════════════════════"
@@ -116,7 +162,7 @@ GATE=$(cast send --rpc-url "$L1_FUND_RPC" --private-key "$FUND_KEY" --gas-price 
 echo "==> ParityGate=$GATE (reverts on odd L1 blocks, forwards to $PROXY)"
 
 BASE_SETTLED=$(count 'eez.composer.recovery.settled_partial')
-BASE_PARTIAL=$(count 'eez.deriver.reconcile.partial_consumption')
+BASE_PARTIAL=$(prefix_count)
 BASE_BURNED=$(count 'eez.composer.recovery.nonce_burned')
 BASE_ANCHOR=$(anchor_count)
 BASE_DIVERGED=$(refresh_log; grep -cE 'eez\.deriver\.state\.diverged_(pre|post)' "$NODE_LOG" || true)
@@ -124,6 +170,9 @@ echo "==> baselines settled=$BASE_SETTLED partial=$BASE_PARTIAL anchor=$BASE_ANC
 echo
 
 for r in $(seq 1 "$ROUNDS"); do
+    # ParityGate must pass source simulation against an even anchor and revert
+    # only when the exact-next-block bundle lands in the following odd block.
+    wait_for_even_l1_head
     # Direct first: it survives every parity, so the surviving prefix is
     # non-empty — a gated-first order strands the direct entry too and yields an
     # anchor-only settlement, which is the reorg path rather than the prefix one.
@@ -142,7 +191,7 @@ for r in $(seq 1 "$ROUNDS"); do
     send_front "$L1F" "$GATED" "$(cast keccak "$GATED")" || exit 1
     sleep 18
     S=$(count 'eez.composer.recovery.settled_partial')
-    P=$(count 'eez.deriver.reconcile.partial_consumption')
+    P=$(prefix_count)
     A=$(anchor_count)
     B=$(count 'eez.composer.recovery.nonce_burned')
     printf '  round %2d/%s  settled=%s partial=%s anchor=%s burned=%s  L1=%s\n' \
@@ -154,7 +203,7 @@ done
 echo
 sleep 20
 SETTLED=$(( $(count 'eez.composer.recovery.settled_partial') - BASE_SETTLED ))
-PARTIAL=$(( $(count 'eez.deriver.reconcile.partial_consumption') - BASE_PARTIAL ))
+PARTIAL=$(( $(prefix_count) - BASE_PARTIAL ))
 BURNED=$(( $(count 'eez.composer.recovery.nonce_burned') - BASE_BURNED ))
 ANCHOR=$(( $(anchor_count) - BASE_ANCHOR ))
 refresh_log
