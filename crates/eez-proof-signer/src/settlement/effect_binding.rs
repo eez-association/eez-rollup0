@@ -122,11 +122,11 @@ pub(crate) enum EffectPrefixError {
     )]
     EffectCountMismatch { claimed: usize, observed: usize },
     #[error(
-        "anchor claims post-state {claimed_anchor_post_state}; the settling block's empty prefix is {empty_prefix_hash}"
+        "anchor claims root {claimed_anchor_root}; the settling block's empty prefix is {empty_prefix_hash}"
     )]
     AnchorRootMismatch {
         empty_prefix_hash: B256,
-        claimed_anchor_post_state: B256,
+        claimed_anchor_root: B256,
     },
     #[error(
         "the leading state checkpoint is at {actual}; the anchor's candidate is sealed before transaction 0"
@@ -259,7 +259,7 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
     if anchor_update.newRoot != anchor_checkpoint.block_hash {
         return Err(EffectPrefixError::AnchorRootMismatch {
             empty_prefix_hash: anchor_checkpoint.block_hash,
-            claimed_anchor_post_state: anchor_update.newRoot,
+            claimed_anchor_root: anchor_update.newRoot,
         });
     }
 

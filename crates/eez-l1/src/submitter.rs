@@ -510,7 +510,7 @@ impl Inner {
         }
     }
 
-    /// Did L1's stored stateRoot for our rollup reach the claimed state
+    /// Did L1's stored root for our rollup reach the claimed state
     /// in `l1_block`?
     ///
     /// - `Some(root)`: true iff some `L2ExecutionPerformed(rollupId,

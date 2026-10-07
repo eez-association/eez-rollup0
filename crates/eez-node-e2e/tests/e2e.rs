@@ -193,7 +193,7 @@ async fn happy_case_composer_sustained() {
             "the commitment must have moved off genesis",
         );
         assert_eq!(
-            before.latest_execution_state.unwrap(),
+            before.latest_execution_root.unwrap(),
             before.rollup_commitment,
             "latest event's newRoot == on-chain root",
         );
@@ -229,7 +229,7 @@ async fn happy_case_composer_sustained() {
     assert_eq!(after.executions_performed, n_after, "no replay");
     assert_eq!(after.entries_skipped, 0, "no skipped entries after restart");
     assert_eq!(
-        after.latest_execution_state.unwrap(),
+        after.latest_execution_root.unwrap(),
         after.rollup_commitment,
         "event-state consistency holds across restart",
     );
@@ -844,7 +844,7 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         DEFAULT_TIMEOUT,
     )
     .await
-    .expect("follower safe head did not reach a non-genesis attested stateRoot while on the rogue");
+    .expect("follower safe head did not reach a non-genesis attested root while on the rogue");
 
     // Stop canonical batch production and let any already-submitted batch land
     // before fixing the safe anchor used by this assertion.
@@ -857,7 +857,7 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         .snapshot()
         .await
         .unwrap()
-        .latest_execution_state
+        .latest_execution_root
         .expect("composer settled a batch before stopping");
     // An arbitrary historical attestation is insufficient here: a final batch
     // may have landed while the composer was shutting down.
@@ -933,7 +933,7 @@ async fn happy_case_follower_deep_backfill_late_join() {
         DEFAULT_TIMEOUT,
     )
     .await
-    .expect("late-joining follower did not backfill into an attested stateRoot");
+    .expect("late-joining follower did not backfill into an attested root");
 
     wait_for_safe_chain_contains(&follower, backlog_depth, backlog_hash, DEFAULT_TIMEOUT)
         .await

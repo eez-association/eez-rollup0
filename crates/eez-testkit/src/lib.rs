@@ -1891,7 +1891,7 @@ pub struct ChainSnapshot {
     pub entries_skipped: usize,
     /// What L1 stores for the rollup: a candidate block hash.
     pub rollup_commitment: B256,
-    pub latest_execution_state: Option<B256>,
+    pub latest_execution_root: Option<B256>,
 }
 
 pub struct Chain<'a> {
@@ -2023,14 +2023,14 @@ impl<'a> Chain<'a> {
                 Some(block),
             )
             .await?,
-            rollup_commitment: state_root_at(
+            rollup_commitment: rollup_root_at(
                 self.rpc_url,
                 self.eez_address,
                 self.rollup_id,
                 Some(block),
             )
             .await?,
-            latest_execution_state: latest_l2_execution_state_at(
+            latest_execution_root: latest_l2_execution_root_at(
                 self.rpc_url,
                 self.eez_address,
                 self.rollup_id,
@@ -2184,13 +2184,13 @@ pub async fn wait_for_l1_blocks(rpc_url: &str, target: u64, timeout: Duration) -
     .await
 }
 
-/// The commitment L1 stores for `rollup_id`. A candidate block hash, not a
-/// state root — the ABI field is still named `stateRoot`.
+/// The commitment L1 stores for `rollup_id`. A candidate block hash, not an
+/// EVM state root.
 pub async fn rollup_commitment(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<B256> {
-    state_root_at(rpc_url, eez, rollup_id, None).await
+    rollup_root_at(rpc_url, eez, rollup_id, None).await
 }
 
-async fn state_root_at(
+async fn rollup_root_at(
     rpc_url: &str,
     eez: Address,
     rollup_id: u64,
@@ -2361,7 +2361,7 @@ pub async fn assert_latest_batch_signature(
     Ok(())
 }
 
-async fn latest_l2_execution_state_at(
+async fn latest_l2_execution_root_at(
     rpc_url: &str,
     contract: Address,
     rollup_id: u64,
@@ -2396,14 +2396,14 @@ pub async fn all_l2_execution_states(
         all_l2_execution_events(rpc_url, contract, rollup_id, from_block)
             .await?
             .into_iter()
-            .map(|event| event.state)
+            .map(|event| event.root)
             .collect(),
     )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct L2ExecutionEvent {
-    state: B256,
+    root: B256,
     block_number: u64,
     transaction_hash: B256,
     log_index: u64,
@@ -2436,7 +2436,7 @@ async fn all_l2_execution_events(
                 .ok_or_else(|| anyhow!("L2ExecutionPerformed log is missing log_index"))?;
             let decoded = IEEZ::L2ExecutionPerformed::decode_log(&log.inner)?;
             Ok(L2ExecutionEvent {
-                state: decoded.newRoot,
+                root: decoded.newRoot,
                 block_number,
                 transaction_hash,
                 log_index,
@@ -3973,7 +3973,7 @@ impl StandardOracleSnapshot {
             let endpoint = execution_events
                 .iter()
                 .rfind(|event| {
-                    event.block_number == l1_block_number && event.state == l1_settled
+                    event.block_number == l1_block_number && event.root == l1_settled
                 })
                 .ok_or_else(|| {
                     anyhow!(

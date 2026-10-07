@@ -1961,9 +1961,9 @@ where
     /// Loud-fail if the batch's claimed state-root chain disagrees with
     /// our STF's actual L2 roots at the batch boundaries:
     ///
-    /// - `claimed_current_state` (first state update's `currentRoot`) vs the
+    /// - `entry_root` (first state update's `currentRoot`) vs the
     ///   local root at `from_block - 1`.
-    /// - `claimed_new_state` (last state update's `newRoot`) vs the local
+    /// - `claimed_new_root` (last state update's `newRoot`) vs the local
     ///   root at `to_block`.
     ///
     /// Both ends are checked — the composer chains deltas across entries, so
@@ -1976,7 +1976,7 @@ where
     fn check_claimed_state(
         &self,
         entry_root: Option<B256>,
-        claimed_new_state: Option<B256>,
+        claimed_new_root: Option<B256>,
         // Block the applied run started from. The endpoint is in
         // `[anchor, to_block]`, anchor included.
         anchor: u64,
@@ -2016,7 +2016,7 @@ where
         }
         // A partial settlement stops early, so find the block carrying the
         // settled root rather than assuming `to_block`. It becomes the cursor.
-        if let Some(claimed_new) = claimed_new_state {
+        if let Some(claimed_new) = claimed_new_root {
             // L1 can only apply a PREFIX of the claimed chain, so the settled
             // endpoint is at or below the range end — never above our tip.
             let tip = self.inner.committer.last_header().number();

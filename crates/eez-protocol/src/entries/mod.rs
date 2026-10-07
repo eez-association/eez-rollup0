@@ -788,10 +788,10 @@ mod tests {
         }
     }
 
-    fn state_update(rollup_id: u64, current_state: B256) -> RollupUpdateSol {
+    fn state_update(rollup_id: u64, current_root: B256) -> RollupUpdateSol {
         RollupUpdateSol {
             rollupId: rollup_id,
-            currentRoot: current_state,
+            currentRoot: current_root,
             newRoot: B256::with_last_byte(0xff),
             etherDelta: alloy_primitives::aliases::I192::ZERO,
         }

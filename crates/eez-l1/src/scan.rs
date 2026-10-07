@@ -940,11 +940,11 @@ mod tests {
         let entries = roots
             .iter()
             .enumerate()
-            .map(|(i, &new_state)| ExecutionEntrySol {
+            .map(|(i, &new_root)| ExecutionEntrySol {
                 rollupUpdates: vec![RollupUpdateSol {
                     rollupId: TEST_ROLLUP,
                     currentRoot: if i == 0 { pre } else { roots[i - 1] },
-                    newRoot: new_state,
+                    newRoot: new_root,
                     etherDelta: alloy_primitives::aliases::I192::ZERO,
                 }],
                 proxyEntryHash: if i < immediate_count {

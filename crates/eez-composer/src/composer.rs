@@ -3790,7 +3790,7 @@ where
         sync_height: u64,
         bundle: Vec<Bytes>,
         post_batch_hash: alloy_primitives::TxHash,
-        expected_final_state: B256,
+        expected_final_root: B256,
         optimistic: Arc<OptimisticallyIncluded>,
         target: BundleTarget,
     ) {
@@ -3800,7 +3800,7 @@ where
             sync_height,
             bundle,
             post_batch_hash,
-            expected_final_state,
+            expected_final_root,
             optimistic,
             submitter,
             target,
@@ -3991,7 +3991,7 @@ where
                     .copied()
                     .unwrap_or(alloy_primitives::aliases::I192::ZERO)
             };
-            let new_state = *candidates.per_effect.get(effect_k).ok_or_else(|| {
+            let new_root = *candidates.per_effect.get(effect_k).ok_or_else(|| {
                 format!(
                     "settlement stitch: effect entry {effect_k} has no per-effect root \
                      (only {} pair-end roots — pair-end/entry misalignment)",
@@ -4001,7 +4001,7 @@ where
             entry.rollupUpdates = vec![eez_protocol::abi::RollupUpdateSol {
                 rollupId: rollup_id,
                 currentRoot: B256::ZERO,
-                newRoot: new_state,
+                newRoot: new_root,
                 etherDelta: ether_delta,
             }];
             effect_k += 1;
@@ -4356,7 +4356,7 @@ where
         .abi_encode();
 
         // Log both settlement anchors. `StateRootMismatch` means
-        // `current_state` disagreed with L1's registered root at submission;
+        // `current_root` disagreed with L1's registered root at submission;
         // an over-budget `floor_gas` names the too-fat case.
         event!(
             name: "eez.composer.postbatch.anchors",
@@ -4368,7 +4368,7 @@ where
             span,
             calldata_bytes = calldata.len(),
             floor_gas = calldata_floor_gas(&calldata),
-            current_state = %pre_block_hash,
+            current_root = %pre_block_hash,
             claimed_final = %sync_block_hash,
             "postBatch anchors: cursor block hash, claimed final Sync block hash",
         );
@@ -4428,7 +4428,7 @@ fn ensure_batch_registry_native(
 /// `Composer::recover_failed_batch`, serialized with Sequencer commits.
 ///
 /// "Settled" requires an `L2ExecutionPerformed` in the inclusion block
-/// whose `newRoot` equals `expected_final_state` (the built Sync block's
+/// whose `newRoot` equals `expected_final_root` (the built Sync block's
 /// root) — the leading immediate advancing L1 partway doesn't count.
 async fn observe_bundle_outcome(
     rollup_id: u64,
@@ -4437,7 +4437,7 @@ async fn observe_bundle_outcome(
     // The verdict names this bundle, so it cannot land on a batch rebuilt at
     // the same height.
     post_batch_hash: alloy_primitives::TxHash,
-    expected_final_state: B256,
+    expected_final_root: B256,
     optimistic: Arc<OptimisticallyIncluded>,
     submitter: Submitter,
     target: BundleTarget,
@@ -4449,7 +4449,7 @@ async fn observe_bundle_outcome(
         _ => None,
     };
     // Settled = L1 reached the claimed endpoint. Anything less is partial.
-    let settled = settlement.is_some_and(|s| s.final_state == Some(expected_final_state));
+    let settled = settlement.is_some_and(|s| s.final_state == Some(expected_final_root));
     // The anchor names a candidate at THIS height, so any applied entry keeps
     // the height canonical; only an empty settlement leaves it unratified.
     let applied_any = settlement.is_some_and(|s| !s.is_empty());

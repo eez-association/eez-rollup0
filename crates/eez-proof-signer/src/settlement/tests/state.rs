@@ -317,7 +317,7 @@ fn rejects_wrong_anchor_or_invalid_effect_checkpoints() {
         verify_effect_prefix(&batch, wrong, &valid_checkpoints, &settling).err(),
         Some(EffectPrefixError::AnchorRootMismatch {
             empty_prefix_hash: wrong,
-            claimed_anchor_post_state: pre_settling,
+            claimed_anchor_root: pre_settling,
         })
     );
     assert_eq!(
