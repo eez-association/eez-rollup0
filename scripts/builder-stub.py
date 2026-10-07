@@ -79,6 +79,8 @@ class Builder:
     lock = threading.Lock()
     # Target block number -> queued bundle params, in arrival order.
     pending = {}
+    # Raw txs of bundles rolled back for a non-whitelisted revert.
+    rejected = []
 
     @classmethod
     def latest(cls):
@@ -129,6 +131,7 @@ class Builder:
                 failed = cls.try_bundles(bundles, timestamp)
                 if failed is None:
                     return
+                cls.rejected.extend(bundles[failed]["txs"])
                 bundles.pop(failed)
         except RuntimeError:
             # The candidate was rolled back after an infrastructure failure.
@@ -269,6 +272,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # Like evm_mine: now, or just after the tip if that is later.
                 Builder.mine_slot(max(latest_ts + 1, int(time.time())))
             return self._result(body, True)
+        if method == "eez_getRejectedTransactions":
+            with Builder.lock:
+                return self._result(body, list(Builder.rejected))
         if method == "eth_sendBundle":
             try:
                 return self._result(body, Builder.queue(params[0]))
