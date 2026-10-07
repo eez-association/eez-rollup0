@@ -91,16 +91,9 @@ impl SettlingBlockObservations {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum BlockInspectionError {
+    #[cfg(test)]
     #[error("block {block_number} RLP does not decode exactly: {reason}")]
     InvalidRlp { block_number: u64, reason: String },
-    #[error(
-        "recovered system-sender facts cover {actual} transactions, but block {block_number} has {required}"
-    )]
-    SystemSenderCount {
-        block_number: u64,
-        required: usize,
-        actual: usize,
-    },
     #[error(
         "intermediate block {block_number} transaction {transaction_index} is a system transaction"
     )]
@@ -115,6 +108,7 @@ pub(crate) enum BlockInspectionError {
         block_number: u64,
         transaction_index: usize,
     },
+    #[cfg(test)]
     #[error(
         "transaction statuses cover {actual} transactions, but the settling block has {required}"
     )]
@@ -132,19 +126,17 @@ pub(crate) enum BlockInspectionError {
 /// other system transaction requires a successful receipt.
 pub(crate) fn inspect_validated_settling_block(
     block: &ValidatedBlock,
-    receipt_successes: &[bool],
     expected_rollup_id: NonZeroU64,
 ) -> Result<SettlingBlockObservations, BlockInspectionError> {
-    let decoded = decode_block(block.number(), block.rlp())?;
     inspect_decoded_settling_block(
-        block.number(),
-        &decoded,
+        block.decoded(),
         block.settlement_evidence(),
-        receipt_successes,
+        block.receipt_successes(),
         expected_rollup_id,
     )
 }
 
+#[cfg(test)]
 fn decode_block(
     block_number: u64,
     block_rlp: &[u8],
@@ -162,8 +154,8 @@ fn decode_block(
 /// Returning `None` keeps malformed or out-of-range attribution fail-closed
 /// instead of turning it into an eviction hint.
 pub(crate) fn transaction_hash_at(block: &ValidatedBlock, index: usize) -> Option<B256> {
-    decode_block(block.number(), block.rlp())
-        .ok()?
+    block
+        .decoded()
         .body
         .transactions
         .get(index)
@@ -186,7 +178,7 @@ pub(crate) fn paired_outbound_transaction(
         return None;
     }
 
-    let decoded = decode_block(block.number(), block.rlp()).ok()?;
+    let decoded = block.decoded();
     let load = decoded.body.transactions.get(load_index)?;
     let load_call = loadExecutionTableCall::abi_decode(load.input()).ok()?;
     if load_call.abi_encode().as_slice() != load.input()
@@ -205,27 +197,12 @@ pub(crate) fn paired_outbound_transaction(
 }
 
 fn inspect_decoded_settling_block(
-    block_number: u64,
     block: &EthereumBlock,
     settlement_evidence: &SettlementBlockEvidence,
     receipt_successes: &[bool],
     expected_rollup_id: NonZeroU64,
 ) -> Result<SettlingBlockObservations, BlockInspectionError> {
     let transactions = &block.body.transactions;
-    if settlement_evidence.system_sender_flags().len() != transactions.len() {
-        return Err(BlockInspectionError::SystemSenderCount {
-            block_number,
-            required: transactions.len(),
-            actual: settlement_evidence.system_sender_flags().len(),
-        });
-    }
-    if receipt_successes.len() != transactions.len() {
-        return Err(BlockInspectionError::StatusCount {
-            required: transactions.len(),
-            actual: receipt_successes.len(),
-        });
-    }
-
     let mut inbound_candidates = Vec::new();
     for (transaction_index, ((transaction, &is_system_sender), &succeeded)) in transactions
         .iter()
@@ -269,8 +246,8 @@ fn inspect_decoded_settling_block(
         }
     }
 
-    // The length checks above guarantee the retained flags cover every
-    // settling transaction just inspected.
+    // The checked-block boundary guarantees the retained flags and receipts
+    // cover every settling transaction just inspected.
     Ok(SettlingBlockObservations {
         system_sender_flags: settlement_evidence.system_sender_flags().to_vec(),
         inbound_candidates,
@@ -286,8 +263,13 @@ pub(crate) fn inspect_settling_block(
     expected_rollup_id: NonZeroU64,
 ) -> Result<SettlingBlockObservations, BlockInspectionError> {
     let block = decode_block(0, block_rlp)?;
+    if receipt_successes.len() != block.body.transactions.len() {
+        return Err(BlockInspectionError::StatusCount {
+            required: block.body.transactions.len(),
+            actual: receipt_successes.len(),
+        });
+    }
     inspect_decoded_settling_block(
-        0,
         &block,
         &SettlementBlockEvidence::from_rlp_for_test(block_rlp),
         receipt_successes,
@@ -298,20 +280,19 @@ pub(crate) fn inspect_settling_block(
 /// Reject privileged transactions and outbound-effect observations in every
 /// intermediate block.
 ///
-/// Each block is consensus-RLP decoded exactly, and recovered signer flags
-/// must cover every transaction. A transaction is privileged if it uses the
+/// Validation supplies the decoded block and complete recovered signer flags.
+/// A transaction is privileged if it uses the
 /// reserved system type or was classified by validation as coming from the
 /// deployment-configured system address, regardless of its recipient.
 /// Outbound observations are rejected because effects are bound only in the
 /// settling block.
-pub(crate) fn verify_validated_intermediate_blocks(
-    blocks: &[ValidatedBlock],
+pub(crate) fn verify_validated_intermediate_blocks<'a>(
+    blocks: impl IntoIterator<Item = &'a ValidatedBlock>,
 ) -> Result<(), BlockInspectionError> {
     for block in blocks {
-        let decoded = decode_block(block.number(), block.rlp())?;
         verify_decoded_intermediate_block(
             block.number(),
-            &decoded,
+            block.decoded(),
             block.settlement_evidence().system_sender_flags(),
         )?;
         if let Some(observation) = block
@@ -334,13 +315,6 @@ fn verify_decoded_intermediate_block(
     system_sender_flags: &[bool],
 ) -> Result<(), BlockInspectionError> {
     let transactions = &block.body.transactions;
-    if system_sender_flags.len() != transactions.len() {
-        return Err(BlockInspectionError::SystemSenderCount {
-            block_number,
-            required: transactions.len(),
-            actual: system_sender_flags.len(),
-        });
-    }
     if let Some(transaction_index) = transactions
         .iter()
         .zip(system_sender_flags)

@@ -26,23 +26,22 @@ the spec are appropriate in repository documentation.
 
 - Production backends live in `eez-prover-stateless` and
   `eez-prover-stateful`; both inherit this crate's service pipeline.
-- Exactly one request may be active across all connections. An overlap is
+- For v1, exactly one request may be active across all connections. An overlap is
   rejected, not queued. The request permit covers ingestion through response
   construction and remains with a running detached worker until it exits.
-- Validation and settlement run in one blocking task. Cancellation is
+- V1 validation and settlement run in one blocking task. Cancellation is
   cooperative between non-interruptible units; graceful shutdown waits for
   detached work rather than terminating it halfway through execution.
 - The active settlement profile accepts an anchor followed by zero or more
   supported outbound effects and then zero or more supported successful inbound
   effects. Richer or ambiguous shapes fail closed.
-- Every successful `BackendWindowOutput` associates each block's computed hash,
-  post-state root, receipt coverage, selected checkpoints, and settlement
-  evidence in one `BackendBlockOutput`. Preceding-block checkpoint vectors are
-  empty; the settling vector is the exact locally derived selection and may
-  also be empty.
-- Shared checks consume the backend output and admitted Composer input to
-  produce one `ValidatedWindow`. Settlement receives that normalized value
-  rather than parallel, unchecked block/output vectors.
+- Backends bind/decode inputs, execute them, and construct immutable checked
+  blocks before publishing reusable evidence. V1 prepares terminal checkpoints;
+  v2 prepares each potential terminal and keeps caches/limits in the backend.
+- V2 sessions own prefix append/rewind and select `ValidatedWindow` from that
+  prefix. V1 assembles its admitted replay sequence. Both share checked blocks
+  with settlement, which verifies new batch claims without rechecking block
+  identity or evidence coverage.
 
 See [architecture](docs/architecture.md),
 [data provenance](docs/data-provenance.md),

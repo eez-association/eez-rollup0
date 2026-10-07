@@ -5,9 +5,10 @@
 //! Stateless/Reth, checks window continuity, and maps validated execution facts
 //! into associated per-block output.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use alloy_genesis::ChainConfig;
@@ -15,26 +16,25 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_debug::ExecutionWitness;
 use eez_evm::EezEvmConfig;
-use eez_primitives::Block;
 use eez_proof_signer::cancel::CancellationToken;
 use eez_proof_signer::validate::support::{
-    CheckpointPlan, check_cancellation, decode_match_and_recover_signers, observe_outbound_events,
-    system_sender_flags,
+    CheckpointPlan, DecodedBlock, check_cancellation, decode_match_and_recover_signers,
+    observe_outbound_events, system_sender_flags,
 };
 use eez_proof_signer::validate::{
-    BackendBlockOutput, BackendWindowOutput, SettlementBlockEvidence, StateCheckpoint,
-    ValidationBackend, ValidationError,
+    AdmittedBlock, BackendBlockOutput, BackendWindowOutput, BlockAnchor, SettlementBlockEvidence,
+    StateCheckpoint, ValidatedBlock, ValidationBackend, ValidationError,
 };
-use eez_proof_signer::window::AdmittedBlock;
 #[cfg(test)]
 use eez_proof_signer::window::testing::admitted_block_parts_mut;
+use lru::LruCache;
 use reth_chainspec::ChainSpec;
-use reth_primitives_traits::RecoveredBlock;
 use stateless_reth::validation::StatelessValidationError;
 use stateless_reth::{
     StatelessValidationOutput, stateless_validation_recovered,
     stateless_validation_recovered_with_state_checkpoints,
 };
+use tokio::sync::Semaphore;
 use tracing::{debug, info, trace};
 
 mod chain_config;
@@ -42,6 +42,37 @@ mod chain_config;
 use chain_config::{ChainDocumentKind, load_chain_document};
 
 const DEBUG_PROGRESS_INTERVAL: usize = 100;
+const MAX_CACHED_BLOCKS: usize = 32_768;
+const MAX_CACHED_BYTES: usize = 512 * 1024 * 1024;
+const MAX_CONCURRENT_VALIDATIONS: usize = 4;
+
+#[derive(Debug)]
+struct BlockCache {
+    entries: LruCache<B256, (Arc<ValidatedBlock>, usize)>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl BlockCache {
+    fn insert(&mut self, block: Arc<ValidatedBlock>) -> Arc<ValidatedBlock> {
+        if let Some((cached, _)) = self.entries.get(&block.hash()) {
+            return Arc::clone(cached);
+        }
+        let bytes = block.size();
+        // Oversized results remain usable by their session without displacing the cache.
+        if bytes <= self.max_bytes {
+            while self.bytes > self.max_bytes - bytes
+                || self.entries.len() == self.entries.cap().get()
+            {
+                let (_, (_, removed_bytes)) = self.entries.pop_lru().expect("nonempty cache");
+                self.bytes -= removed_bytes;
+            }
+            self.entries.put(block.hash(), (Arc::clone(&block), bytes));
+            self.bytes += bytes;
+        }
+        block
+    }
+}
 
 /// Signer-recovered settling block prepared before replay.
 ///
@@ -49,39 +80,19 @@ const DEBUG_PROGRESS_INTERVAL: usize = 100;
 /// untrusted until Stateless accepts the same `RecoveredBlock`. Preparing it
 /// early keeps checkpoint selection independent from execution side effects.
 struct PreparedSettlingBlock {
-    block: RecoveredBlock<Block>,
+    block: DecodedBlock,
     checkpoint_plan: CheckpointPlan,
     system_sender_flags: Vec<bool>,
 }
 
-/// Each block must execute from its predecessor's post-state.
-///
-/// This is what proves a window is one contiguous execution rather than a set
-/// of independently valid blocks. Free fn so a test can drive it directly —
-/// real replay cannot produce a discontinuous window to exercise it with.
-///
-/// The rejection message keeps the word "telescope": that is the term the
-/// signer SPEC and operator runbooks use for this property.
-fn executes_from_previous_post_state(
-    block_number: u64,
-    pre_state_root: B256,
-    previous_post_state_root: B256,
-) -> Result<(), String> {
-    if pre_state_root != previous_post_state_root {
-        return Err(format!(
-            "stateless state roots do not telescope at block {block_number}: expected \
-             pre-state root {previous_post_state_root}, got {pre_state_root}",
-        ));
-    }
-    Ok(())
-}
-
 /// In-process Stateless/Reth backend configured from operator-selected rules.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Backend {
     chain_spec: Arc<ChainSpec>,
     evm_config: EezEvmConfig,
     expected_l2_system_address: Address,
+    blocks: Arc<Mutex<BlockCache>>,
+    validation_slots: Arc<Semaphore>,
 }
 
 impl Backend {
@@ -131,6 +142,12 @@ impl Backend {
             chain_spec,
             evm_config,
             expected_l2_system_address,
+            blocks: Arc::new(Mutex::new(BlockCache {
+                entries: LruCache::new(NonZeroUsize::new(MAX_CACHED_BLOCKS).unwrap()),
+                bytes: 0,
+                max_bytes: MAX_CACHED_BYTES,
+            })),
+            validation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_VALIDATIONS)),
         }
     }
 
@@ -152,7 +169,7 @@ impl Backend {
             .iter_mut()
             .map(|block| std::mem::take(admitted_block_parts_mut(block).witness))
             .collect::<Vec<_>>();
-        let result = self.validate_blocks_inner(blocks, &mut witnesses, cancellation);
+        let result = self.validate_blocks_inner(blocks, &mut witnesses, cancellation, None);
         if result.is_err() {
             for (block, witness) in blocks.iter_mut().zip(witnesses) {
                 *admitted_block_parts_mut(block).witness = witness;
@@ -161,13 +178,13 @@ impl Backend {
         result
     }
 
-    /// Replay every admitted block and return associated per-block output. The
-    /// caller still consumes and checks that output before exposing settlement evidence.
+    /// Replay a v1 window or one v2 block (with its parent), returning checked evidence.
     fn validate_blocks_inner(
         &self,
         blocks: &[AdmittedBlock],
         witnesses: &mut [ExecutionWitness],
         cancellation: &CancellationToken,
+        parent: Option<BlockAnchor>,
     ) -> Result<BackendWindowOutput, ValidationError> {
         let expected_l2_system_address = self.expected_l2_system_address;
         let validation_started = Instant::now();
@@ -179,19 +196,17 @@ impl Backend {
                 witnesses.len(),
             )));
         }
-        let mut block_outputs = Vec::<BackendBlockOutput>::with_capacity(total_blocks);
+        let mut block_outputs = Vec::<Arc<ValidatedBlock>>::with_capacity(total_blocks);
 
-        // Derive the final block's complete checkpoint plan before any witness
-        // is consumed or earlier block is replayed.
+        // Derive Sync checkpoints from block contents, regardless of RPC version.
+        // Plan before consuming witnesses or replaying earlier v1 blocks.
         check_cancellation(cancellation, 0, total_blocks)?;
         let mut prepared_settling_block = blocks
             .last()
             .map(|admitted| {
                 let recovered_block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
-                let (checkpoint_plan, system_sender_flags) = CheckpointPlan::from_recovered_block(
-                    &recovered_block,
-                    expected_l2_system_address,
-                );
+                let (checkpoint_plan, system_sender_flags) =
+                    CheckpointPlan::for_block(&recovered_block, expected_l2_system_address);
                 Ok(PreparedSettlingBlock {
                     block: recovered_block,
                     checkpoint_plan,
@@ -224,7 +239,6 @@ impl Backend {
                 (recovered_block, None, system_sender_flags)
             };
             let block_number = recovered_block.header().number;
-            let decoded_parent_hash = recovered_block.header().parent_hash;
             let timestamp = recovered_block.header().timestamp;
             let transaction_count = recovered_block.body().transactions.len();
             trace!(
@@ -244,7 +258,7 @@ impl Backend {
             let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
                 Some(plan) if !plan.positions().is_empty() => {
                     let output = stateless_validation_recovered_with_state_checkpoints(
-                        recovered_block,
+                        recovered_block.execution_input(),
                         witness,
                         Arc::clone(&self.chain_spec),
                         self.evm_config.clone(),
@@ -266,7 +280,7 @@ impl Backend {
                 }
                 _ => {
                     let output = stateless_validation_recovered(
-                        recovered_block,
+                        recovered_block.execution_input(),
                         witness,
                         Arc::clone(&self.chain_spec),
                         self.evm_config.clone(),
@@ -283,15 +297,17 @@ impl Backend {
                 execution_output,
                 block_access_list: _validated_block_access_list,
             } = stateless_output;
-            if let Some(previous_post_state_root) =
-                block_outputs.last().map(|output| output.post_state_root)
+            // Continue from the previous output, or the supplied parent for a v2 block.
+            if let Some(previous_post_state_root) = block_outputs
+                .last()
+                .map(|output| output.post_state_root())
+                .or_else(|| parent.map(|parent| parent.state_root))
+                && pre_state_root != previous_post_state_root
             {
-                executes_from_previous_post_state(
-                    block_number,
-                    pre_state_root,
-                    previous_post_state_root,
-                )
-                .map_err(ValidationError::Rejected)?;
+                return Err(ValidationError::Rejected(format!(
+                    "stateless state roots do not telescope at block {block_number}: expected \
+                     pre-state root {previous_post_state_root}, got {pre_state_root}",
+                )));
             }
 
             // These receipts come from successful replay. Observed outbound
@@ -328,11 +344,8 @@ impl Backend {
                     "stateless block validated",
                 );
             }
-            block_outputs.push(BackendBlockOutput {
-                decoded_number: block_number,
-                decoded_parent_hash,
+            let output = BackendBlockOutput {
                 computed_hash,
-                decoded_transaction_count: transaction_count,
                 receipt_successes,
                 transaction_state_checkpoints,
                 post_state_root,
@@ -340,7 +353,12 @@ impl Backend {
                     system_sender_flags,
                     observed_outbound_events,
                 },
-            });
+            };
+            block_outputs.push(recovered_block.finish(
+                output,
+                pre_state_root,
+                block_ordinal == total_blocks,
+            )?);
 
             if block_ordinal.is_multiple_of(DEBUG_PROGRESS_INTERVAL) {
                 debug!(
@@ -365,6 +383,7 @@ impl Backend {
     }
 }
 
+#[async_trait::async_trait]
 impl ValidationBackend for Backend {
     fn label(&self) -> &'static str {
         "stateless"
@@ -384,7 +403,67 @@ impl ValidationBackend for Backend {
         witnesses: &mut [ExecutionWitness],
         cancellation: &CancellationToken,
     ) -> Result<BackendWindowOutput, ValidationError> {
-        self.validate_blocks_inner(blocks, witnesses, cancellation)
+        self.validate_blocks_inner(blocks, witnesses, cancellation, None)
+    }
+
+    fn validate_anchor(&self, _anchor: BlockAnchor) -> Result<(), ValidationError> {
+        Ok(())
+    }
+
+    async fn validate_next(
+        &self,
+        parent: BlockAnchor,
+        block: &AdmittedBlock,
+        witness: ExecutionWitness,
+        request_timeout: Duration,
+    ) -> Result<(Arc<ValidatedBlock>, bool), ValidationError> {
+        tokio::time::timeout(request_timeout, async {
+            {
+                let mut blocks = self.blocks.lock().unwrap();
+                if let Some((cached, _)) = blocks.entries.get(&block.claimed_hash()) {
+                    cached.matches_submission(block, parent)?;
+                    return Ok((Arc::clone(cached), true));
+                }
+            }
+            block.check_parent(parent)?;
+            let permit = Arc::clone(&self.validation_slots)
+                .acquire_owned()
+                .await
+                .map_err(|_| {
+                    ValidationError::Unavailable(
+                        "stateless validation scheduler stopped".to_owned(),
+                    )
+                })?;
+            let backend = self.clone();
+            let admitted = block.clone();
+            tokio::task::spawn_blocking(move || {
+                // The worker owns its slot until execution ends, even if its caller times out.
+                // A completed job may populate the cache for later callers; partial results never do.
+                let _permit = permit;
+                let output = backend.validate_blocks_inner(
+                    std::slice::from_ref(&admitted),
+                    &mut [witness],
+                    &CancellationToken::default(),
+                    Some(parent),
+                )?;
+                let output = output
+                    .blocks
+                    .into_iter()
+                    .next()
+                    .expect("one validated block");
+                let mut blocks = backend.blocks.lock().unwrap();
+                // Concurrent misses may execute twice; only fully checked evidence is published.
+                Ok((blocks.insert(output), false))
+            })
+            .await
+            .map_err(|error| {
+                ValidationError::InternalInvariant(format!(
+                    "stateless validation worker failed: {error}"
+                ))
+            })?
+        })
+        .await
+        .map_err(|_| ValidationError::DeadlineExceeded)?
     }
 }
 

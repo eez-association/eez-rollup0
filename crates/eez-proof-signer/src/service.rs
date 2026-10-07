@@ -11,11 +11,13 @@ use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 use eez_control_rpc::v1::prover_server::ProverServer;
+use eez_control_rpc::v2::prover_server::ProverServer as StreamingProverServer;
 use tokio::sync::Semaphore;
 
 use crate::{attest::Attester, settlement, validate, window};
 
 mod rpc;
+mod sessions;
 mod settlement_job;
 mod stream;
 
@@ -44,7 +46,9 @@ pub struct ServiceLimitsParams {
 /// applies to each streamed-message wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServiceLimits {
-    window_limits: window::WindowLimits,
+    max_blocks: usize,
+    max_payload_bytes: usize,
+    max_witness_items: usize,
     stream_idle_timeout: Duration,
     request_timeout: Duration,
 }
@@ -67,19 +71,21 @@ impl ServiceLimits {
             eyre::ensure!(now.checked_add(timeout).is_some(), "{name} is out of range");
         }
         Ok(Self {
-            window_limits: window::WindowLimits {
-                blocks: max_window_blocks.get(),
-                payload_bytes: max_window_bytes.get(),
-                witness_items: max_window_witness_items.get(),
-            },
+            max_blocks: max_window_blocks.get(),
+            max_payload_bytes: max_window_bytes.get(),
+            max_witness_items: max_window_witness_items.get(),
             stream_idle_timeout,
             request_timeout,
         })
     }
 
-    /// Aggregate window quotas enforced during stream admission.
+    /// Adapt the shared service quotas for v1 window admission.
     pub fn window_limits(self) -> window::WindowLimits {
-        self.window_limits
+        window::WindowLimits {
+            blocks: self.max_blocks,
+            payload_bytes: self.max_payload_bytes,
+            witness_items: self.max_witness_items,
+        }
     }
 
     pub const fn stream_idle_timeout(self) -> Duration {
@@ -91,16 +97,14 @@ impl ServiceLimits {
     }
 
     pub fn max_decoding_message_bytes(self) -> usize {
-        self.window_limits
-            .payload_bytes
-            .min(MAX_DECODING_MESSAGE_BYTES)
+        self.max_payload_bytes.min(MAX_DECODING_MESSAGE_BYTES)
     }
 }
 
 /// Immutable dependencies shared by all service clones.
 #[derive(Debug)]
 pub struct ServiceState {
-    validator: validate::Validator,
+    backend: Box<dyn validate::ValidationBackend>,
     expected_rollup_id: NonZeroU64,
     expected_l2_system_address: Address,
     attester: Attester,
@@ -111,25 +115,23 @@ impl ServiceState {
     /// Bind system-transaction reconstruction to the same configured L2 chain
     /// and expected rollup identities used by validation and settlement.
     pub fn new(
-        validator: validate::Validator,
+        backend: impl validate::ValidationBackend,
         expected_rollup_id: NonZeroU64,
         attester: Attester,
     ) -> eyre::Result<Self> {
         let expected_l2_system_address = eez_primitives::SYSTEM_ADDRESS;
         eyre::ensure!(
-            validator.expected_l2_system_address() == expected_l2_system_address,
+            backend.expected_l2_system_address() == expected_l2_system_address,
             "validator and native system transactions use different L2 system addresses"
         );
         eyre::ensure!(
             attester.expected_l2_system_address() == expected_l2_system_address,
             "attester and native system transactions use different L2 system addresses"
         );
-        let system_transaction_reconstructor = settlement::SystemTransactionReconstructor::new(
-            validator.chain_id(),
-            expected_rollup_id,
-        );
+        let system_transaction_reconstructor =
+            settlement::SystemTransactionReconstructor::new(backend.chain_id(), expected_rollup_id);
         Ok(Self {
-            validator,
+            backend: Box::new(backend),
             expected_rollup_id,
             expected_l2_system_address,
             attester,
@@ -144,14 +146,17 @@ pub struct ProveSvc {
     state: Arc<ServiceState>,
     limits: ServiceLimits,
     active_request_slot: Arc<Semaphore>,
+    sessions: Arc<sessions::SessionRuntime>,
 }
 
 impl ProveSvc {
     pub fn new(state: Arc<ServiceState>, limits: ServiceLimits) -> Self {
+        let sessions = sessions::SessionRuntime::new(Arc::clone(&state), limits);
         Self {
             state,
             limits,
             active_request_slot: Arc::new(Semaphore::new(1)),
+            sessions,
         }
     }
 
@@ -167,12 +172,21 @@ impl ProveSvc {
                 .await
                 .expect("the active-request semaphore is never closed"),
         );
+        self.sessions.wait_until_idle().await;
     }
 
     /// Build the gRPC server with the configured request and response size limits.
     pub fn into_server(self) -> ProverServer<Self> {
         let message_bytes = self.limits.max_decoding_message_bytes();
         ProverServer::new(self)
+            .max_decoding_message_size(message_bytes)
+            .max_encoding_message_size(MAX_ENCODING_MESSAGE_BYTES)
+    }
+
+    /// Build the streaming v2 gRPC server with the same message limits.
+    pub fn into_streaming_server(self) -> StreamingProverServer<Self> {
+        let message_bytes = self.limits.max_decoding_message_bytes();
+        StreamingProverServer::new(self)
             .max_decoding_message_size(message_bytes)
             .max_encoding_message_size(MAX_ENCODING_MESSAGE_BYTES)
     }

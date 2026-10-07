@@ -8,8 +8,8 @@ use alloy_primitives::{Bytes, Signature, TxKind, U256};
 use eez_proof_signer::window::testing::admitted_block_from_consensus_rlp;
 use reth_chainspec::ChainInfo;
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+use reth_storage_api::StateProviderBox;
 use reth_storage_api::errors::provider::ProviderResult;
-use reth_storage_api::{BlockIdReader, StateProviderBox};
 
 use super::*;
 
@@ -35,6 +35,239 @@ fn admitted_block(block: Block) -> AdmittedBlock {
     let parent_hash = block.header.parent_hash;
     let hash = block.header.hash_slow();
     admitted_block_from_consensus_rlp(number, hash, parent_hash, alloy_rlp::encode(block))
+}
+
+fn cached_engine(
+    kind: &str,
+) -> (
+    Backend<MockEthProvider<EezPrimitives>>,
+    BlockAnchor,
+    AdmittedBlock,
+) {
+    use alloy_consensus::proofs::{calculate_transaction_root, calculate_withdrawals_root};
+    use eez_primitives::{EEZL2_ADDRESS, SYSTEM_ADDRESS, SystemTransaction};
+    let chain_spec = Arc::new(
+        reth_chainspec::ChainSpecBuilder::mainnet()
+            .cancun_activated()
+            .build(),
+    );
+    let parent = Header {
+        ommers_hash: EMPTY_OMMER_ROOT_HASH,
+        state_root: B256::repeat_byte(0x11),
+        gas_limit: 30_000_000,
+        base_fee_per_gas: Some(1),
+        withdrawals_root: Some(calculate_withdrawals_root(&[])),
+        blob_gas_used: Some(0),
+        excess_blob_gas: Some(0),
+        parent_beacon_block_root: Some(B256::ZERO),
+        ..Default::default()
+    };
+    let anchor = BlockAnchor {
+        number: 0,
+        hash: parent.hash_slow(),
+        state_root: parent.state_root,
+    };
+    let with_checkpoints = kind == "sync";
+    let transactions = match kind {
+        "sync" => vec![
+            SystemTransaction {
+                chain_id: 1,
+                nonce: 0,
+                to: EEZL2_ADDRESS,
+                value: U256::ZERO,
+                input: Bytes::new(),
+            }
+            .into(),
+        ],
+        "ordinal" => vec![
+            TxLegacy {
+                chain_id: Some(1),
+                gas_limit: 21_000,
+                gas_price: 1,
+                to: TxKind::Call(EEZL2_ADDRESS),
+                ..Default::default()
+            }
+            .into_signed(Signature::test_signature())
+            .into(),
+        ],
+        "empty" => Vec::new(),
+        _ => unreachable!(),
+    };
+    let transaction_count = transactions.len();
+    let block = Block {
+        header: Header {
+            parent_hash: anchor.hash,
+            number: 1,
+            timestamp: 1,
+            transactions_root: calculate_transaction_root(&transactions),
+            ..parent.clone()
+        },
+        body: BlockBody {
+            transactions,
+            withdrawals: Some(Default::default()),
+            ..Default::default()
+        },
+    };
+    let hash = block.header.hash_slow();
+    let input = admitted_block(block.clone());
+    let recovered = decode_match_and_recover_signers(&input, &chain_spec).unwrap();
+    let (plan, _) = CheckpointPlan::for_block(&recovered, SYSTEM_ADDRESS);
+    assert_eq!(!plan.positions().is_empty(), with_checkpoints);
+    let provider = MockEthProvider::<EezPrimitives>::new();
+    provider.add_header(anchor.hash, parent.clone());
+    provider.add_block(hash, block);
+    provider.add_receipts(
+        1,
+        (0..transaction_count)
+            .map(|_| EthereumReceipt {
+                success: true,
+                ..Default::default()
+            })
+            .collect(),
+    );
+    // Engine receivers are closed: any attempted reimport must fail, not silently pass this test.
+    let (engine_sender, engine_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (payload_sender, payload_receiver) = tokio::sync::mpsc::unbounded_channel();
+    drop((engine_receiver, payload_receiver));
+    let parent = SealedHeader::new(parent, anchor.hash);
+    let committer = BlockCommitterHandle::spawn(
+        parent.clone(),
+        parent,
+        B256::ZERO,
+        reth_engine_primitives::ConsensusEngineHandle::new(engine_sender),
+        reth_payload_builder::PayloadBuilderHandle::new(payload_sender),
+        None,
+    );
+    let mut checkpoints = LruCache::new(NonZeroUsize::new(1).unwrap());
+    if with_checkpoints {
+        checkpoints.put(
+            hash,
+            plan.positions()
+                .iter()
+                .map(|&at| StateCheckpoint {
+                    at,
+                    state_root: anchor.state_root,
+                    block_hash: hash,
+                })
+                .collect(),
+        );
+    }
+    (
+        Backend {
+            provider,
+            evm_config: EezEvmConfig::new(Arc::clone(&chain_spec)),
+            chain_spec,
+            expected_l2_system_address: SYSTEM_ADDRESS,
+            committer: Some(committer),
+            checkpoints: Arc::new(Mutex::new(checkpoints)),
+        },
+        anchor,
+        input,
+    )
+}
+
+#[tokio::test]
+async fn block_validation_reuses_reth_and_backend_checkpoints_without_execution() {
+    for kind in ["empty", "ordinal", "sync"] {
+        // No historical execution state is installed. The nonempty ordinal
+        // case must use Reth's receipts without opening state to replay checkpoints.
+        let (engine, anchor, input) = cached_engine(kind);
+        // Untrusted anchor fields are checked at admission, not on each Reth lookup.
+        let mut wrong_anchor = anchor;
+        wrong_anchor.state_root = B256::ZERO;
+        assert!(matches!(
+            engine.validate_anchor(wrong_anchor),
+            Err(ValidationError::Rejected(_))
+        ));
+        engine.validate_anchor(anchor).unwrap();
+        let with_checkpoints = kind == "sync";
+        let (output, reused) = engine
+            .validate_next(
+                anchor,
+                &input,
+                ExecutionWitness::default(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert!(reused);
+        assert_eq!(
+            output
+                .transaction_state_checkpoints()
+                .iter()
+                .map(|checkpoint| checkpoint.at)
+                .collect::<Vec<_>>(),
+            if with_checkpoints {
+                vec![CheckpointAt::PreExecution, CheckpointAt::Transaction(0)]
+            } else {
+                Vec::new()
+            },
+        );
+        assert_eq!(output.hash(), input.claimed_hash());
+        let changed = admitted_block_from_consensus_rlp(
+            input.declared_number(),
+            input.claimed_hash(),
+            input.claimed_parent_hash(),
+            [input.rlp(), &[0]].concat(),
+        );
+        assert!(
+            engine
+                .validate_next(
+                    anchor,
+                    &changed,
+                    ExecutionWitness::default(),
+                    Duration::from_secs(1)
+                )
+                .await
+                .is_err()
+        );
+        if with_checkpoints {
+            // The mock has no execution state. Without supplemental checkpoints, reuse alone is insufficient.
+            engine.checkpoints.lock().unwrap().clear();
+            assert!(
+                engine
+                    .validate_next(
+                        anchor,
+                        &input,
+                        ExecutionWitness::default(),
+                        Duration::from_secs(1)
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(engine.checkpoints.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn block_validation_deadline_bounds_waiting_for_reconciliation() {
+    let (engine, anchor, input) = cached_engine("empty");
+    let guard = engine.committer.as_ref().unwrap().begin_reconcile().await;
+    assert!(matches!(
+        engine
+            .validate_next(
+                anchor,
+                &input,
+                ExecutionWitness::default(),
+                Duration::from_millis(10)
+            )
+            .await,
+        Err(ValidationError::DeadlineExceeded)
+    ));
+    drop(guard);
+    assert!(
+        engine
+            .validate_next(
+                anchor,
+                &input,
+                ExecutionWitness::default(),
+                Duration::from_secs(1)
+            )
+            .await
+            .unwrap()
+            .1
+    );
 }
 
 fn provider_with_anchor(number: u64, hash: B256, state_root: B256) -> MockEthProvider {
@@ -233,7 +466,7 @@ fn backend_identity_is_fixed_at_construction() {
     let chain_spec = Arc::new(ChainSpec::default());
     let chain_id = chain_spec.chain().id();
     let l2_address = Address::repeat_byte(9);
-    let provider: MockEthProvider = MockEthProvider::new();
+    let provider: MockEthProvider<EezPrimitives> = MockEthProvider::new();
     let backend = Backend::new(provider, chain_spec, l2_address);
 
     assert_eq!(backend.chain_id(), chain_id);
@@ -243,9 +476,14 @@ fn backend_identity_is_fixed_at_construction() {
 #[test]
 fn checkpoint_plan_is_not_limited_before_the_provider_is_read() {
     let chain_spec = Arc::new(ChainSpec::default());
-    let transaction = TxLegacy::default()
-        .into_signed(Signature::test_signature())
-        .into();
+    let transaction = eez_primitives::SystemTransaction {
+        chain_id: 1,
+        nonce: 0,
+        to: eez_primitives::EEZL2_ADDRESS,
+        value: U256::ZERO,
+        input: Bytes::new(),
+    }
+    .into();
     let blocks = [admitted_block(Block {
         header: Header {
             number: 1,
@@ -525,7 +763,7 @@ fn replays_an_empty_terminal_block_from_local_anchor_state() {
     .unwrap();
 
     assert_eq!(output.blocks.len(), 1);
-    assert_eq!(output.blocks[0].post_state_root, terminal_root);
+    assert_eq!(output.blocks[0].as_anchor().state_root, terminal_root);
 }
 
 #[test]

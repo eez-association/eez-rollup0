@@ -73,7 +73,7 @@ async fn a_mismatched_header_rollup_is_rejected_without_waiting_for_eof() {
 
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert_eq!(status.message(), "window rollup identity rejected");
-    assert_eq!(inner.validator.stub_remaining(), 1);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 1);
     drop(sender);
 }
 
@@ -90,10 +90,10 @@ async fn malformed_windows_never_reach_the_validator() {
         ])
         .await;
     assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
-    assert_eq!(inner.validator.stub_remaining(), 1);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 1);
 
     let _response = server.attest(happy_window()).await;
-    assert_eq!(inner.validator.stub_remaining(), 0);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -199,7 +199,7 @@ async fn an_over_quota_header_is_rejected_without_waiting_for_eof() {
     .expect("over-quota header must be rejected before EOF")
     .expect_err("over-quota header must be rejected");
     assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
-    assert_eq!(inner.validator.stub_remaining(), 1);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 1);
     drop(sender);
 }
 
@@ -269,7 +269,7 @@ async fn a_complete_prefix_requires_eof_and_hits_the_idle_timeout() {
     .expect("idle timeout must terminate an open complete prefix")
     .expect_err("a stream without EOF must not validate");
     assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
-    assert_eq!(inner.validator.stub_remaining(), 1);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 1);
     drop(sender);
 }
 
@@ -299,14 +299,14 @@ async fn the_request_deadline_is_independent_of_the_idle_timeout() {
     .expect_err("a stream beyond the request deadline must not validate");
     assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
     assert_eq!(status.message(), "Prove request deadline exceeded");
-    assert_eq!(inner.validator.stub_remaining(), 1);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 1);
     drop(sender);
 }
 
 #[tokio::test]
 async fn a_validation_deadline_retains_the_request_slot_until_the_worker_finishes() {
     let (validator, started, release) =
-        Validator::blocking_stub(Ok(backend_output_for(&happy_block_inputs())));
+        StubBackend::blocking(Ok(backend_output_for(&happy_block_inputs())));
     let svc = ProveSvc::new(
         inner(validator),
         limits_with(
@@ -349,7 +349,7 @@ async fn a_validation_deadline_retains_the_request_slot_until_the_worker_finishe
 
 #[tokio::test]
 async fn a_panicking_validation_worker_returns_a_redacted_internal_error() {
-    let svc = ProveSvc::new(inner(Validator::panicking_stub()), limits());
+    let svc = ProveSvc::new(inner(StubBackend::panicking()), limits());
     let observer = svc.clone();
     let server = TestServer::with_service(svc).await;
 

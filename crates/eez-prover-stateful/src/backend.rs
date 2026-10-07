@@ -1,29 +1,35 @@
 //! Node-backed execution evidence.
 //!
-//! The follower database is never mutated. Each request opens historical state
-//! at the proposed window's parent and replays the complete window into a
-//! disposable revm overlay.
+//! Legacy v1 requests open historical state and replay a complete window into
+//! a disposable revm overlay. Streaming v2 requests import candidate unsafe
+//! blocks through the follower's existing Reth engine and retain only checked
+//! identities/evidence; Reth remains the owner of blocks and execution state.
 
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use alloy_consensus::BlockHeader as _;
 use alloy_eips::eip7928::compute_block_access_list_hash;
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_debug::ExecutionWitness;
+use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome};
 use eez_evm::EezEvmConfig;
 use eez_primitives::Block;
 use eez_primitives::EezPrimitives;
 use eez_primitives::Receipt as EthereumReceipt;
+use eez_primitives::engine::EezEngineTypes;
 use eez_proof_signer::cancel::CancellationToken;
 use eez_proof_signer::validate::support::{
     CheckpointPlan, check_cancellation, decode_match_and_recover_signers, observe_outbound_events,
     system_sender_flags,
 };
 use eez_proof_signer::validate::{
-    BackendBlockOutput, BackendWindowOutput, CheckpointAt, SettlementBlockEvidence,
-    StateCheckpoint, ValidationBackend, ValidationError,
+    AdmittedBlock, BackendBlockOutput, BackendWindowOutput, BlockAnchor, CheckpointAt,
+    SettlementBlockEvidence, StateCheckpoint, ValidatedBlock, ValidatedWindow, ValidationBackend,
+    ValidationError,
 };
-use eez_proof_signer::window::AdmittedBlock;
+use lru::LruCache;
 use reth_chainspec::ChainSpec;
 use reth_consensus::{Consensus as _, HeaderValidator as _};
 use reth_ethereum_consensus::{EthBeaconConsensus, validate_block_post_execution};
@@ -31,17 +37,21 @@ use reth_evm::block::BlockExecutionError;
 use reth_evm::execute::BlockExecutor as _;
 use reth_evm::{ConfigureEvm as _, Evm as _};
 use reth_execution_types::BlockExecutionResult;
+use reth_payload_primitives::PayloadTypes as _;
 use reth_primitives_traits::{RecoveredBlock, SealedHeader};
 use reth_revm::State;
 use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::{
-    BlockHashReader, BlockNumReader, EvmStateProviderAdapter, HashedPostStateProvider,
-    HeaderProvider, StateProvider, StateProviderFactory, StateRootProvider,
+    BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, EvmStateProviderAdapter,
+    HashedPostStateProvider, HeaderProvider, StateProvider, StateProviderFactory,
+    StateRootProvider,
 };
 use revm::database::states::bundle_state::BundleRetention;
 use revm::state::bal::Bal;
 use stateless_reth::candidate_block_hash;
 use tracing::{debug, trace};
+
+const MAX_CACHED_CHECKPOINT_BLOCKS: usize = 32_768;
 
 /// Stateful validation over one live Ethereum node provider.
 #[derive(Debug)]
@@ -50,6 +60,9 @@ pub struct Backend<P> {
     chain_spec: Arc<ChainSpec>,
     evm_config: EezEvmConfig,
     expected_l2_system_address: Address,
+    committer: Option<BlockCommitterHandle<EezEngineTypes>>,
+    // Reth owns blocks, state and receipts; retain only supplemental checkpoints here.
+    checkpoints: Arc<Mutex<LruCache<B256, Vec<StateCheckpoint>>>>,
 }
 
 impl<P> Backend<P> {
@@ -65,16 +78,83 @@ impl<P> Backend<P> {
             chain_spec,
             evm_config,
             expected_l2_system_address,
+            committer: None,
+            checkpoints: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(MAX_CACHED_CHECKPOINT_BLOCKS).unwrap(),
+            ))),
         }
+    }
+
+    /// Enable v2 ingestion through the follower's existing Reth block tree.
+    pub fn with_committer(
+        provider: P,
+        chain_spec: Arc<ChainSpec>,
+        expected_l2_system_address: Address,
+        committer: BlockCommitterHandle<EezEngineTypes>,
+    ) -> Self {
+        Self {
+            committer: Some(committer),
+            ..Self::new(provider, chain_spec, expected_l2_system_address)
+        }
+    }
+
+    fn committer(&self) -> Result<&BlockCommitterHandle<EezEngineTypes>, ValidationError> {
+        self.committer.as_ref().ok_or_else(|| {
+            ValidationError::Unavailable(
+                "stateful backend was started without a Reth block committer".to_owned(),
+            )
+        })
     }
 }
 
+fn ensure_safe_anchor<P>(provider: &P, anchor: BlockAnchor) -> Result<(), ValidationError>
+where
+    P: BlockHashReader + BlockIdReader + HeaderProvider<Header = alloy_consensus::Header>,
+{
+    let local_hash = canonical_hash(provider, anchor.number)?;
+    if local_hash != anchor.hash {
+        return Err(ValidationError::Aborted(format!(
+            "canonical anchor {} is {local_hash}, session anchors to {}",
+            anchor.number, anchor.hash,
+        )));
+    }
+    let header = provider
+        .header(anchor.hash)
+        .map_err(provider_error)?
+        .ok_or_else(|| {
+            ValidationError::Unavailable(format!(
+                "local anchor header {} ({}) is unavailable",
+                anchor.number, anchor.hash,
+            ))
+        })?;
+    if header.number != anchor.number || header.state_root != anchor.state_root {
+        return Err(ValidationError::Rejected(format!(
+            "session anchor fields do not match local block {}",
+            anchor.number,
+        )));
+    }
+    match provider.safe_block_num_hash().map_err(provider_error)? {
+        Some(safe) if safe.number == anchor.number && safe.hash == anchor.hash => Ok(()),
+        // Fresh databases do not persist a safe marker before the first L1
+        // advance. Genesis is nevertheless the only valid initial anchor.
+        None if anchor.number == 0 => Ok(()),
+        safe => Err(ValidationError::Aborted(format!(
+            "L1-derived safe anchor moved; session has {} {}, local safe is {safe:?}",
+            anchor.number, anchor.hash,
+        ))),
+    }
+}
+
+#[async_trait::async_trait]
 impl<P> ValidationBackend for Backend<P>
 where
     P: BlockHashReader
+        + BlockIdReader
         + BlockNumReader
+        + BlockReader<Block = Block, Receipt = EthereumReceipt>
         + HeaderProvider<Header = alloy_consensus::Header>
         + StateProviderFactory
+        + Clone
         + std::fmt::Debug
         + Send
         + Sync
@@ -106,6 +186,273 @@ where
             blocks,
             cancellation,
         )
+    }
+
+    fn validate_anchor(&self, anchor: BlockAnchor) -> Result<(), ValidationError> {
+        self.committer()?;
+        ensure_safe_anchor(&self.provider, anchor)
+    }
+
+    async fn prepare_attestation(&self, window: &ValidatedWindow) -> Result<(), ValidationError> {
+        let committer = self.committer()?;
+        let _forkchoice_guard = committer.begin_reconcile().await;
+        let terminal = window.settling_block();
+        let terminal = SealedHeader::new(terminal.decoded().header.clone(), terminal.hash());
+        // Blocks were imported and executed before their Validated frames.
+        // Select the known terminal with one FCU; Reth enforces safe/finalized ancestry.
+        // Replaying the prefix through newPayload would race Reth's persistence pipeline.
+        match committer
+            .advance_unsafe_head(terminal.clone())
+            .await
+            .map_err(|error| {
+                if error.is_invalid_forkchoice() {
+                    ValidationError::Aborted(format!(
+                        "Reth rejected validated terminal block {}: {error}",
+                        terminal.number(),
+                    ))
+                } else {
+                    ValidationError::Unavailable(format!(
+                        "Reth could not select validated terminal block {}: {error}",
+                        terminal.number(),
+                    ))
+                }
+            })? {
+            ForkchoiceOutcome::Valid => {}
+            ForkchoiceOutcome::Syncing => {
+                return Err(ValidationError::Unavailable(format!(
+                    "Reth is still syncing validated terminal block {} ({})",
+                    terminal.number(),
+                    terminal.hash(),
+                )));
+            }
+            ForkchoiceOutcome::InvalidState => {
+                return Err(ValidationError::Aborted(format!(
+                    "Reth rejected validated terminal block {} ({}) against its safe anchor",
+                    terminal.number(),
+                    terminal.hash(),
+                )));
+            }
+        }
+        if canonical_hash(&self.provider, terminal.number())? != terminal.hash() {
+            return Err(ValidationError::Aborted(format!(
+                "Reth selected a different canonical block at finalized height {}",
+                terminal.number(),
+            )));
+        }
+        Ok(())
+    }
+
+    async fn validate_next(
+        &self,
+        parent: BlockAnchor,
+        admitted: &AdmittedBlock,
+        _witness: ExecutionWitness,
+        request_timeout: Duration,
+    ) -> Result<(Arc<ValidatedBlock>, bool), ValidationError> {
+        tokio::time::timeout(request_timeout, async {
+            admitted.check_parent(parent)?;
+
+            // The engine sees retained forks; the provider only sees the selected
+            // branch. On a miss, select the child before reading its parent/evidence.
+            // Hold selection and reads together against other sessions/L1 reconciliation.
+            let committer = self.committer()?;
+            let _forkchoice_guard = committer.begin_reconcile().await;
+
+            let block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
+            let number = block.header().number();
+            let consensus = EthBeaconConsensus::new(Arc::clone(&self.chain_spec));
+            consensus
+                .validate_header(block.sealed_block().sealed_header())
+                .and_then(|()| consensus.validate_block_pre_execution(block.sealed_block()))
+                .map_err(|error| {
+                    ValidationError::Rejected(format!(
+                        "stateful consensus validation rejected block {number}: {error}"
+                    ))
+                })?;
+
+            let reused = if self
+                .provider
+                .find_block_by_hash(block.hash(), reth_storage_api::BlockSource::Any)
+                .map_err(provider_error)?
+                .is_some()
+            {
+                self.provider
+                    .receipts_by_block(block.hash().into())
+                    .map_err(provider_error)?
+                    .is_some()
+            } else {
+                false
+            };
+            // Visible cached evidence needs no head change. On a miss, the engine
+            // imports or reuses its retained payload and selects that branch for reads.
+            if !reused {
+                let sealed_block = block.sealed_block().clone();
+                let header = sealed_block.clone_sealed_header();
+                let payload = EezEngineTypes::block_to_payload(sealed_block, None);
+                committer
+                    .commit_derived(payload, header, false)
+                    .await
+                    .map_err(|error| {
+                        if error.is_invalid_payload() || error.is_invalid_forkchoice() {
+                            ValidationError::Rejected(format!(
+                                "Reth rejected streamed block {number}: {error}"
+                            ))
+                        } else {
+                            ValidationError::Unavailable(format!(
+                                "Reth could not import streamed block {number}: {error}"
+                            ))
+                        }
+                    })?;
+            }
+            let stored = self
+                .provider
+                .find_block_by_hash(block.hash(), reth_storage_api::BlockSource::Any)
+                .map_err(provider_error)?
+                .ok_or_else(|| {
+                    ValidationError::Unavailable(format!(
+                        "Reth accepted block {number} but no longer exposes its exact block"
+                    ))
+                })?;
+            if alloy_rlp::encode(&stored) != admitted.rlp() {
+                return Err(ValidationError::Rejected(
+                    "cached Reth block does not match submitted bytes".to_owned(),
+                ));
+            }
+            // Reth checked header/parent consensus during import. This read supplies
+            // the actual execution root, not another ancestry walk or consensus check.
+            let previous_header = self
+                .provider
+                .header(parent.hash)
+                .map_err(provider_error)?
+                .ok_or_else(|| {
+                    ValidationError::Unavailable(format!(
+                        "Reth cannot expose selected parent {} ({})",
+                        parent.number, parent.hash,
+                    ))
+                })?;
+            if previous_header.state_root != parent.state_root {
+                return Err(ValidationError::Rejected(
+                    "streamed parent state root does not match Reth".to_owned(),
+                ));
+            }
+            let receipts = self
+                .provider
+                .receipts_by_block(block.hash().into())
+                .map_err(provider_error)?
+                .ok_or_else(|| {
+                    ValidationError::Unavailable(format!(
+                        "Reth accepted block {number} but no longer exposes its receipts"
+                    ))
+                })?;
+
+            let (checkpoint_plan, sender_flags) =
+                CheckpointPlan::for_block(&block, self.expected_l2_system_address);
+            let cached_checkpoints = self.checkpoints.lock().unwrap().get(&block.hash()).cloned();
+            let (receipt_successes, observed_outbound_events, checkpoints) =
+                if checkpoint_plan.positions().is_empty() || cached_checkpoints.is_some() {
+                    (
+                        receipts.iter().map(|receipt| receipt.success).collect(),
+                        observe_outbound_events(&receipts),
+                        cached_checkpoints.unwrap_or_default(),
+                    )
+                } else {
+                    let provider = self.provider.clone();
+                    let evm_config = self.evm_config.clone();
+                    let chain_spec = Arc::clone(&self.chain_spec);
+                    let checkpoint_cache = Arc::clone(&self.checkpoints);
+                    let block = block.clone();
+                    let checked = tokio::task::spawn_blocking(move || {
+                    // Keep reconciliation serialized until replay really finishes, including on timeout.
+                    let _forkchoice_guard = _forkchoice_guard;
+                    let parent_state =
+                        provider.state_by_block_hash(parent.hash).map_err(|error| {
+                            ValidationError::Unavailable(format!(
+                                "Reth cannot open pending parent state for block {number}: {error}"
+                            ))
+                        })?;
+                    let mut state = State::builder()
+                        .with_database(StateProviderDatabase::new(
+                            parent_state.into_evm_state_provider(),
+                        ))
+                        .with_bundle_update()
+                        .build();
+                    let (result, checkpoints, block_access_list_hash) =
+                        execute_block_with_state_checkpoints(
+                            &evm_config,
+                            &mut state,
+                            &block,
+                            checkpoint_plan.positions(),
+                        )?;
+                    validate_block_post_execution(
+                        &block,
+                        chain_spec.as_ref(),
+                        &result,
+                        None,
+                        block_access_list_hash,
+                    )
+                    .map_err(|error| {
+                        ValidationError::Rejected(format!(
+                            "stateful terminal-candidate replay rejected block {number}: {error}"
+                        ))
+                    })?;
+                    let computed_root = state_root(&state)?;
+                    if computed_root != block.header().state_root() {
+                        return Err(ValidationError::Rejected(format!(
+                            "stateful terminal-candidate replay of block {number} produced root \
+                         {computed_root}, header claims {}",
+                            block.header().state_root(),
+                        )));
+                    }
+                    checkpoint_plan.verify_returned(&checkpoints)?;
+                    let output = BackendBlockOutput {
+                        computed_hash: block.hash(),
+                        receipt_successes: result
+                            .receipts
+                            .iter()
+                            .map(|receipt| receipt.success)
+                            .collect(),
+                        transaction_state_checkpoints: checkpoints,
+                        post_state_root: computed_root,
+                        settlement_evidence: SettlementBlockEvidence {
+                            system_sender_flags: sender_flags,
+                            observed_outbound_events: observe_outbound_events(&result.receipts),
+                        },
+                    };
+                    let checked = block.finish(output, parent.state_root, true)?;
+                    checkpoint_cache
+                        .lock()
+                        .unwrap()
+                        .get_or_insert(checked.hash(), || {
+                            checked.transaction_state_checkpoints().to_vec()
+                        });
+                    Ok::<_, ValidationError>(checked)
+                })
+                .await
+                .map_err(|error| {
+                    ValidationError::InternalInvariant(format!(
+                        "stateful checkpoint worker failed: {error}"
+                    ))
+                })??;
+                    return Ok((checked, false));
+                };
+
+            let output = BackendBlockOutput {
+                computed_hash: block.hash(),
+                receipt_successes,
+                transaction_state_checkpoints: checkpoints,
+                post_state_root: block.header().state_root(),
+                settlement_evidence: SettlementBlockEvidence {
+                    system_sender_flags: sender_flags,
+                    observed_outbound_events,
+                },
+            };
+            Ok((
+                block.finish(output, previous_header.state_root(), true)?,
+                reused,
+            ))
+        })
+        .await
+        .map_err(|_| ValidationError::DeadlineExceeded)?
     }
 }
 
@@ -140,7 +487,7 @@ where
         .expect("the admitted stateful window was checked as nonempty");
     let recovered_settling_block = decode_match_and_recover_signers(settling_block, chain_spec)?;
     let (settling_checkpoint_plan, settling_sender_flags) =
-        CheckpointPlan::from_recovered_block(&recovered_settling_block, expected_l2_system_address);
+        CheckpointPlan::for_block(&recovered_settling_block, expected_l2_system_address);
     let mut prepared_settling_block = Some((
         recovered_settling_block,
         settling_checkpoint_plan,
@@ -272,6 +619,7 @@ where
                 block.header().state_root(),
             )));
         }
+        let pre_state_root = previous_header.state_root();
         state.block_hashes.insert(number, block.hash());
         previous_header = block.sealed_block().clone_sealed_header();
 
@@ -281,11 +629,8 @@ where
             .map(|receipt| receipt.success)
             .collect();
         let observed_outbound_events = observe_outbound_events(&result.receipts);
-        outputs.push(BackendBlockOutput {
-            decoded_number: number,
-            decoded_parent_hash: block.header().parent_hash(),
+        let output = BackendBlockOutput {
             computed_hash: block.hash(),
-            decoded_transaction_count: block.body().transactions.len(),
             receipt_successes,
             transaction_state_checkpoints: checkpoints,
             post_state_root,
@@ -293,7 +638,8 @@ where
                 system_sender_flags: sender_flags,
                 observed_outbound_events,
             },
-        });
+        };
+        outputs.push(block.finish(output, pre_state_root, is_settling)?);
         debug!(block_number = number, %post_state_root, "stateful proof block validated");
     }
 

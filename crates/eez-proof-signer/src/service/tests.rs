@@ -30,8 +30,7 @@ use crate::testkit::{
     TEST_SYSTEM_ADDRESS, checkpoint, empty_prefix_candidate, pre_execution_checkpoint,
     system_transaction_context, test_proof_system_vkey,
 };
-use crate::validate::Validator;
-use crate::validate::testing::backend_output_for;
+use crate::validate::testing::{StubBackend, backend_output_for};
 use crate::window::AdmittedBlock;
 
 fn nz(value: usize) -> NonZeroUsize {
@@ -81,8 +80,12 @@ fn service_state_rejects_an_attester_bound_to_another_system_identity() {
     )
     .unwrap();
 
-    let error = ServiceState::new(Validator::stub(Vec::new()), expected_rollup_id(1), attester)
-        .unwrap_err();
+    let error = ServiceState::new(
+        StubBackend::new(Vec::new()),
+        expected_rollup_id(1),
+        attester,
+    )
+    .unwrap_err();
 
     assert_eq!(
         error.to_string(),
@@ -249,7 +252,7 @@ fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256
     (batch, alloy_rlp::encode(block), user, call_hash)
 }
 
-fn outbound_backend_output() -> validate::BackendWindowOutput {
+fn outbound_backend_output() -> validate::testing::TestBackendWindowOutput {
     let inputs = [AdmittedBlock::test(5, 0x04, 0x05)];
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[0].set_transaction_results_for_test(vec![true, true]);
@@ -327,7 +330,7 @@ fn mixed_outbound_inbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, B256) {
     (batch, alloy_rlp::encode(block), outbound_call_hash)
 }
 
-fn mixed_backend_output() -> validate::BackendWindowOutput {
+fn mixed_backend_output() -> validate::testing::TestBackendWindowOutput {
     let inputs = [AdmittedBlock::test(5, 0x04, 0x05)];
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[0].set_transaction_results_for_test(vec![true, true, true]);
@@ -665,8 +668,8 @@ fn limits_with(
 }
 
 /// One in-process server with shared client setup and drop-triggered shutdown.
-struct TestServer {
-    endpoint: String,
+pub(super) struct TestServer {
+    pub(super) endpoint: String,
     _shutdown: oneshot::Sender<()>,
 }
 
@@ -679,12 +682,13 @@ impl TestServer {
         Self::with_service(ProveSvc::new(state, limits)).await
     }
 
-    async fn with_service(svc: ProveSvc) -> Self {
+    pub(super) async fn with_service(svc: ProveSvc) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown, shutdown_rx) = oneshot::channel();
         tokio::spawn(async move {
             tonic::transport::Server::builder()
+                .add_service(svc.clone().into_streaming_server())
                 .add_service(svc.into_server())
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
@@ -703,6 +707,14 @@ impl TestServer {
 
     async fn client(&self) -> ProverClient<tonic::transport::Channel> {
         ProverClient::connect(self.endpoint.clone()).await.unwrap()
+    }
+
+    pub(super) async fn streaming_client(
+        &self,
+    ) -> eez_control_rpc::v2::prover_client::ProverClient<tonic::transport::Channel> {
+        eez_control_rpc::v2::prover_client::ProverClient::connect(self.endpoint.clone())
+            .await
+            .unwrap()
     }
 
     async fn prove(&self, chunks: Vec<ProveChunk>) -> Status {
@@ -724,17 +736,17 @@ impl TestServer {
 }
 
 fn unused_validator() -> Arc<ServiceState> {
-    inner(Validator::stub(Vec::new()))
+    inner(StubBackend::new(Vec::new()))
 }
 
 fn one_accepting_validator() -> Arc<ServiceState> {
-    inner(Validator::stub(vec![Ok(backend_output_for(
+    inner(StubBackend::new(vec![Ok(backend_output_for(
         &happy_block_inputs(),
     ))]))
 }
 
 fn one_accepting_single_block_validator() -> Arc<ServiceState> {
-    inner(Validator::stub(vec![Ok(backend_output_for(&[
+    inner(StubBackend::new(vec![Ok(backend_output_for(&[
         AdmittedBlock::test(5, 0x04, 0x05),
     ]))]))
 }
@@ -748,7 +760,7 @@ fn single_block_validator_with_execution_evidence(
     backend_output.blocks[0]
         .settlement_evidence
         .set_system_sender_flags_for_test(system_sender_flags);
-    inner(Validator::stub(vec![Ok(backend_output)]))
+    inner(StubBackend::new(vec![Ok(backend_output)]))
 }
 
 fn two_block_validator_with_execution_evidence(
@@ -769,13 +781,13 @@ fn two_block_validator_with_execution_evidence(
     backend_output.blocks[1]
         .settlement_evidence
         .set_system_sender_flags_for_test(settling_system_sender_flags);
-    inner(Validator::stub(vec![Ok(backend_output)]))
+    inner(StubBackend::new(vec![Ok(backend_output)]))
 }
 
-fn inner(validator: Validator) -> Arc<ServiceState> {
+fn inner(validator: StubBackend) -> Arc<ServiceState> {
     inner_with_rollup(validator, expected_rollup_id(1))
 }
 
-fn inner_with_rollup(validator: Validator, expected_rollup_id: NonZeroU64) -> Arc<ServiceState> {
+fn inner_with_rollup(validator: StubBackend, expected_rollup_id: NonZeroU64) -> Arc<ServiceState> {
     Arc::new(ServiceState::new(validator, expected_rollup_id, test_attester()).unwrap())
 }

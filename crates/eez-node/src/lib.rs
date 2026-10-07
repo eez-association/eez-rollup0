@@ -560,10 +560,19 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 let cap_store = Arc::clone(&store);
                 // Purge floor = L1-FINALIZED height (a reorg could un-settle a posted batch).
                 let cap_l1_head = Arc::clone(&l1_head);
+                let cap_finalized_head = Arc::clone(&l1_head);
+                let cap_prover = Arc::clone(&prover);
                 task_executor.spawn_critical_task("eez-witness-capture", async move {
-                    witness_source::run_capture(rx, cap_store, cap_provider, cap_evm, move || {
-                        cap_l1_head.finalized_l2()
-                    })
+                    witness_source::run_capture(
+                        rx,
+                        cap_store,
+                        cap_provider,
+                        cap_evm,
+                        cap_prover,
+                        rollup_id,
+                        move || cap_l1_head.cursor(),
+                        move || cap_finalized_head.finalized_l2(),
+                    )
                     .await;
                 });
                 // Hybrid: read the store, else re-exec on demand the newest block

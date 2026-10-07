@@ -15,6 +15,9 @@ L1_XCHAIN_PORT = 18999
 L2_XCHAIN_PORT = 18998
 BUILDER_FLASHBOTS_RPC_PORT = 8645
 PROOF_SIGNER_GRPC_PORT = 50061
+STATEFUL_L2_RPC_PORT = 19688
+STATEFUL_L2_ENGINE_PORT = 19684
+STATEFUL_L2_P2P_PORT = 31640
 L2_CHAIN_ID = "6290"
 
 
@@ -22,6 +25,9 @@ def run(plan, args):
     eth_args = args["ethereum_package"]
     eez = args.get("eez", {})
     enable_explorers = eez.get("enable_explorers", False)
+    prover_backend = eez.get("prover_backend", "stateless")
+    if prover_backend not in ["stateless", "stateful"]:
+        fail("eez.prover_backend must be 'stateless' or 'stateful'")
 
     poster_key = eez.get("poster_key", "")
     proof_signer_key = eez.get("proof_signer_key", "")
@@ -101,28 +107,89 @@ def run(plan, args):
         ]
     )
 
-    plan.add_service(
-        name="eez-proof-signer",
-        config=ServiceConfig(
-            image=eez.get("proof_signer_image", "eez-proof-signer:dev"),
-            ports={
-                "grpc": PortSpec(
-                    number=PROOF_SIGNER_GRPC_PORT,
-                    transport_protocol="TCP",
-                    wait="2m",
-                ),
-            },
-            files={
-                "/out": deploy.files_artifacts[0],
-            },
-            env_vars={
-                "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
-                "RUST_LOG": eez.get("proof_signer_rust_log", "info"),
-            },
-            entrypoint=["/bin/sh", "-c"],
-            cmd=[signer_cmd],
-        ),
-    )
+    prover_service = "eez-proof-signer"
+    if prover_backend == "stateless":
+        plan.add_service(
+            name=prover_service,
+            config=ServiceConfig(
+                image=eez.get("proof_signer_image", "eez-proof-signer:dev"),
+                ports={
+                    "grpc": PortSpec(
+                        number=PROOF_SIGNER_GRPC_PORT,
+                        transport_protocol="TCP",
+                        wait="2m",
+                    ),
+                },
+                files={
+                    "/out": deploy.files_artifacts[0],
+                },
+                env_vars={
+                    "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+                    "RUST_LOG": eez.get("proof_signer_rust_log", "info"),
+                },
+                entrypoint=["/bin/sh", "-c"],
+                cmd=[signer_cmd],
+            ),
+        )
+    else:
+        prover_service = "eez-stateful-prover"
+        stateful_cmd = " ".join(
+            [
+                "set -eu;",
+                "test -f /out/deployments.env;",
+                "set -a; . /out/deployments.env; set +a;",
+                "exec eez-follower node",
+                "--chain=/out/l2-genesis.json",
+                "--datadir=$EEZ_L2_DATADIR",
+                "--log.stdout.format=json",
+                "--log.file.max-files=0",
+                "--http --http.addr=0.0.0.0 --http.port=$EEZ_L2_HTTP_PORT --http.api=eth,net,web3,debug,trace",
+                "--authrpc.addr=127.0.0.1 --authrpc.port=$EEZ_L2_AUTH_PORT",
+                "--port=$EEZ_L2_P2P_PORT --discovery.port=$EEZ_L2_P2P_PORT",
+                "--discovery.v5.port=$((EEZ_L2_P2P_PORT+1))",
+                "--ipcdisable --disable-discovery",
+            ]
+        )
+        plan.add_service(
+            name=prover_service,
+            config=ServiceConfig(
+                image=eez.get("eez_node_image", "eez-node:dev"),
+                ports={
+                    "grpc": PortSpec(
+                        number=PROOF_SIGNER_GRPC_PORT,
+                        transport_protocol="TCP",
+                        wait="2m",
+                    ),
+                    "l2-rpc": PortSpec(
+                        number=STATEFUL_L2_RPC_PORT,
+                        transport_protocol="TCP",
+                        application_protocol="http",
+                    ),
+                },
+                files={
+                    "/out": deploy.files_artifacts[0],
+                },
+                env_vars={
+                    "EEZ_L1_RPC_URL": l1_el.rpc_http_url,
+                    "EEZ_L1_CHAIN_ID": chain_id,
+                    "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
+                    "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 2000)),
+                    "EEZ_PROOF_TIME_MS": str(eez.get("proof_time_ms", 5000)),
+                    "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 2500)),
+                    "EEZ_L2_DATADIR": "/data/l2",
+                    "EEZ_L2_HTTP_PORT": str(STATEFUL_L2_RPC_PORT),
+                    "EEZ_L2_RPC_URL": "http://127.0.0.1:{}".format(STATEFUL_L2_RPC_PORT),
+                    "EEZ_L2_AUTH_PORT": str(STATEFUL_L2_ENGINE_PORT),
+                    "EEZ_L2_P2P_PORT": str(STATEFUL_L2_P2P_PORT),
+                    "EEZ_STATEFUL_PROOF_SIGNER_ADDR": "0.0.0.0:{}".format(PROOF_SIGNER_GRPC_PORT),
+                    "EEZ_STATEFUL_PROOF_SIGNER_KEY": proof_signer_key,
+                    "EEZL2_ADDRESS": "0x4200000000000000000000000000000000000007",
+                    "RUST_LOG": eez.get("proof_signer_rust_log", "info"),
+                },
+                entrypoint=["/bin/sh", "-c"],
+                cmd=[stateful_cmd],
+            ),
+        )
 
     # eez-node: embedded L1, composer, L2, and cross-chain fronts.
     eez_env = {
@@ -143,7 +210,7 @@ def run(plan, args):
         "EEZ_MAX_SPECULATIVE_DEPTH": str(eez.get("max_speculative_depth", 0)),
         "EEZ_MAX_USER_TXS_PER_BUNDLE": str(eez.get("max_user_txs_per_bundle", 3)),
         "EEZ_L1_POSTER_KEY": poster_key,
-        "EEZ_PROVER_URL": "http://eez-proof-signer:{}".format(PROOF_SIGNER_GRPC_PORT),
+        "EEZ_PROVER_URL": "http://{}:{}".format(prover_service, PROOF_SIGNER_GRPC_PORT),
         "EEZ_WITNESS_DB_PATH": "/data/witnesses",
         "EEZ_L2_DATADIR": "/data/l2",
         "EEZ_L2_HTTP_PORT": str(L2_RPC_PORT),

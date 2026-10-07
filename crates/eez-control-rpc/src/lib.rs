@@ -15,7 +15,7 @@ mod generated;
 
 /// Tonic-generated protobuf module for the `prove.v1` package.
 pub use generated::v1;
-/// Tonic-generated protobuf module for the incremental `prove.v2` package.
+/// Tonic-generated protobuf module for the streaming `prove.v2` package.
 pub use generated::v2;
 
 use prost::Message;
@@ -101,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_frames_round_trip_with_correlated_session_and_request() {
+    fn streaming_frames_round_trip_with_correlated_session_and_request() {
         let begin = ClientFrame {
             session_id: Vec::new(),
             request_id: 17,

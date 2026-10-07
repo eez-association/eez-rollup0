@@ -1,15 +1,14 @@
-//! `RemoteProver` — the composer-side [`Prover`] backed by one `Prove` RPC.
+//! `RemoteProver` — the composer-side streaming prover client.
 //!
-//! The composer holds `Arc<dyn Prover>` and calls `prove(ctx)`; when that
-//! `Arc` is a [`RemoteProver`], the call maps [`ProvingContext`] to a
-//! `prove.v1` client-stream (a header then one chunk per window block), dials
-//! the configured `eez-proof-signer`, awaits the attestation, verifies it recovers
-//! to the registered attester, and returns the 65-byte signature. Stateless:
-//! one round-trip, no feed/cursor/sink.
+//! Committed blocks are prevalidated through resumable `prove.v2` sessions.
+//! Finalization backfills any missing suffix, binds the exact settlement
+//! calldata, verifies the returned attestation, and returns its 65-byte
+//! signature. `prove.v1` remains the compatibility fallback.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy_primitives::{Address, B256, Bytes, Signature};
 use alloy_sol_types::SolCall;
@@ -18,15 +17,21 @@ use eez_control_rpc::v1::{
     BlockWitness as WireBlockWitness, ExecutionWitness as WireWitness, PostBatch, ProveChunk,
     ProveHeader, prove_chunk, prove_failure, prover_client::ProverClient,
 };
-use eez_prover::{
-    ActionableProverFailure, Prover, ProverError, ProverResult, ProvingContext,
-    RetryableProverError,
+use eez_control_rpc::v2::{
+    Begin as StreamBegin, Block as StreamBlock, Cancel as StreamCancel, ClientFrame,
+    Finalize as StreamFinalize, Resume as StreamResume, Rewind as StreamRewind, ServerFrame,
+    client_frame, prover_client::ProverClient as StreamingProverClient, server_frame,
 };
+use eez_prover::{
+    ActionableProverFailure, BlockWitness, Prover, ProverError, ProverResult, ProvingAnchor,
+    ProvingContext, RetryableProverError,
+};
+use tokio::sync::Mutex;
 use tonic::{Code, Status};
 use tracing::{Level, event};
 
-/// A [`Prover`] that proves a window on a remote `eez-proof-signer` over the
-/// `prove.v1.Prover` gRPC service. Cheap to clone (`Arc<Inner>`).
+/// A [`Prover`] backed by the v2 streaming service, with v1 fallback.
+/// Cheap to clone (`Arc<Inner>`).
 #[derive(Debug, Clone)]
 pub struct RemoteProver {
     inner: Arc<Inner>,
@@ -40,6 +45,23 @@ struct Inner {
     /// recover to this over the returned `publicInputsHash`, or the proof is
     /// rejected (a wrong/malicious prover cannot forge an attestation).
     attester: Address,
+    streaming: Mutex<StreamingState>,
+    exchange_timeout: Duration,
+}
+
+#[derive(Debug, Default)]
+struct StreamingState {
+    supported: Option<bool>,
+    session: Option<StreamingSession>,
+    next_request_id: u64,
+}
+
+#[derive(Debug)]
+struct StreamingSession {
+    // Transport binding only; the server owns the anchor and validated history.
+    rollup_id: u64,
+    id: Vec<u8>,
+    epoch: u64,
 }
 
 impl RemoteProver {
@@ -51,6 +73,9 @@ impl RemoteProver {
             inner: Arc::new(Inner {
                 url: url.into(),
                 attester,
+                streaming: Mutex::new(StreamingState::default()),
+                // Bound a stalled transport even outside Composer's shorter proof budget.
+                exchange_timeout: Duration::from_secs(5),
             }),
         }
     }
@@ -59,6 +84,71 @@ impl RemoteProver {
     #[must_use]
     pub fn attester(&self) -> Address {
         self.inner.attester
+    }
+
+    /// Ask the prover to retire the retained proving session and wait for
+    /// its correlated `Cancelled` acknowledgement. A missing session is an
+    /// idempotent no-op.
+    pub async fn cancel_session(&self) -> ProverResult<()> {
+        tokio::time::timeout(self.inner.exchange_timeout, async {
+            let mut state = self.inner.streaming.lock().await;
+            let Some(session_id) = state.session.as_ref().map(|session| session.id.clone()) else {
+                return Ok(());
+            };
+            let (requests, mut responses, ready) = self.open_stream(&mut state, None, 0, 0).await?;
+            if let Some(error) = rejection_error(&ready, 0, 0) {
+                if matches!(
+                    error,
+                    ProverError::Retryable {
+                        kind: RetryableProverError::Aborted,
+                        ..
+                    }
+                ) {
+                    state.session = None;
+                    return Ok(());
+                }
+                return Err(error);
+            }
+            if !matches!(ready.kind, Some(server_frame::Kind::Ready(_))) || ready.epoch == 0 {
+                return Err(ProverError::Backend(
+                    "ProveStream did not acknowledge Resume before Cancel".into(),
+                ));
+            }
+            let cancel_id = state.next_id();
+            requests
+                .send(ClientFrame {
+                    session_id: session_id.clone(),
+                    request_id: cancel_id,
+                    epoch: ready.epoch,
+                    kind: Some(client_frame::Kind::Cancel(StreamCancel {})),
+                })
+                .await
+                .map_err(|_| ProverError::Backend("ProveStream closed before Cancel".into()))?;
+            let cancelled = next_stream_response(
+                &mut responses,
+                cancel_id,
+                Some(session_id.as_slice()),
+                Some(ready.epoch),
+                0,
+                0,
+            )
+            .await?;
+            if let Some(error) = rejection_error(&cancelled, 0, 0) {
+                return Err(error);
+            }
+            if !matches!(cancelled.kind, Some(server_frame::Kind::Cancelled(_))) {
+                return Err(ProverError::Backend(
+                    "ProveStream did not acknowledge Cancel".into(),
+                ));
+            }
+            state.session = None;
+            Ok(())
+        })
+        .await
+        .map_err(|_| ProverError::Retryable {
+            kind: RetryableProverError::DeadlineExceeded,
+            message: "ProveStream Cancel deadline exceeded".into(),
+        })?
     }
 }
 
@@ -89,31 +179,196 @@ fn chunks_for(ctx: &ProvingContext) -> Vec<ProveChunk> {
     });
     for bw in &ctx.blocks {
         chunks.push(ProveChunk {
-            kind: Some(prove_chunk::Kind::Block(WireBlockWitness {
-                number: bw.number,
-                hash: bw.hash.to_vec(),
-                parent_hash: bw.parent_hash.to_vec(),
-                rlp: bw.rlp.to_vec(),
-                witness: Some(WireWitness {
-                    state: bw.witness.state.iter().map(|b| b.to_vec()).collect(),
-                    codes: bw.witness.codes.iter().map(|b| b.to_vec()).collect(),
-                    keys: bw.witness.keys.iter().map(|b| b.to_vec()).collect(),
-                    headers: bw.witness.headers.iter().map(|b| b.to_vec()).collect(),
-                }),
-            })),
+            kind: Some(prove_chunk::Kind::Block(wire_block(bw))),
         });
     }
     chunks
 }
 
-#[async_trait]
-impl Prover for RemoteProver {
-    async fn prove(&self, ctx: ProvingContext) -> ProverResult<Bytes> {
-        let chunks = chunks_for(&ctx);
-        let n_blocks = chunks.len().saturating_sub(1);
+fn wire_block(block: &BlockWitness) -> WireBlockWitness {
+    WireBlockWitness {
+        number: block.number,
+        hash: block.hash.to_vec(),
+        parent_hash: block.parent_hash.to_vec(),
+        rlp: block.rlp.to_vec(),
+        witness: Some(WireWitness {
+            state: block
+                .witness
+                .state
+                .iter()
+                .map(|bytes| bytes.to_vec())
+                .collect(),
+            codes: block
+                .witness
+                .codes
+                .iter()
+                .map(|bytes| bytes.to_vec())
+                .collect(),
+            keys: block
+                .witness
+                .keys
+                .iter()
+                .map(|bytes| bytes.to_vec())
+                .collect(),
+            headers: block
+                .witness
+                .headers
+                .iter()
+                .map(|bytes| bytes.to_vec())
+                .collect(),
+        }),
+    }
+}
 
-        // Raise the message-size cap on both directions: a single block's witness
-        // can exceed tonic's 4 MiB default → `ResourceExhausted`. Server matches.
+#[derive(Debug)]
+enum StreamingError {
+    Unsupported,
+    Prover(ProverError),
+}
+
+impl From<ProverError> for StreamingError {
+    fn from(error: ProverError) -> Self {
+        Self::Prover(error)
+    }
+}
+
+impl From<StreamingError> for ProverError {
+    fn from(error: StreamingError) -> Self {
+        match error {
+            StreamingError::Unsupported => {
+                Self::Backend("ProveStream unexpectedly unavailable".into())
+            }
+            StreamingError::Prover(error) => error,
+        }
+    }
+}
+
+impl StreamingState {
+    async fn send(
+        &mut self,
+        requests: &tokio::sync::mpsc::Sender<ClientFrame>,
+        kind: client_frame::Kind,
+    ) -> ProverResult<u64> {
+        let message = match &kind {
+            client_frame::Kind::Rewind(_) => "ProveStream closed while sending Rewind",
+            client_frame::Kind::Block(_) => "ProveStream closed while sending a block",
+            client_frame::Kind::Finalize(_) => "ProveStream closed while sending Finalize",
+            _ => unreachable!("only bound block, rewind and finalize requests use this path"),
+        };
+        let request_id = self.next_id();
+        let session = self.session.as_ref().expect("ready session exists");
+        requests
+            .send(ClientFrame {
+                session_id: session.id.clone(),
+                request_id,
+                epoch: session.epoch,
+                kind: Some(kind),
+            })
+            .await
+            .map_err(|_| ProverError::Retryable {
+                kind: RetryableProverError::Unavailable,
+                message: message.into(),
+            })?;
+        Ok(request_id)
+    }
+    async fn response(
+        &mut self,
+        responses: &mut tonic::Streaming<ServerFrame>,
+        request_id: u64,
+        range: (u64, u64),
+    ) -> Result<ServerFrame, StreamingError> {
+        let session = self.session.as_ref().expect("ready session exists");
+        let response = next_stream_response(
+            responses,
+            request_id,
+            Some(&session.id),
+            Some(session.epoch),
+            range.0,
+            range.1,
+        )
+        .await?;
+        if let Some(error) = rejection_error(&response, range.0, range.1) {
+            if response.session_id.is_empty()
+                || error.retryable_kind() == Some(RetryableProverError::Aborted)
+            {
+                self.session = None;
+            }
+            return Err(error.into());
+        }
+        Ok(response)
+    }
+    fn next_id(&mut self) -> u64 {
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        self.next_request_id
+    }
+}
+
+async fn next_stream_response(
+    responses: &mut tonic::Streaming<ServerFrame>,
+    request_id: u64,
+    expected_session_id: Option<&[u8]>,
+    expected_epoch: Option<u64>,
+    from_block: u64,
+    to_block: u64,
+) -> Result<ServerFrame, StreamingError> {
+    let response = responses
+        .message()
+        .await
+        .map_err(|status| map_rpc_status(from_block, to_block, status))?
+        .ok_or_else(|| ProverError::Backend("ProveStream ended before its response".into()))?;
+    if response.request_id != request_id {
+        return Err(ProverError::Backend(format!(
+            "ProveStream response {} crossed request {}",
+            response.request_id, request_id,
+        ))
+        .into());
+    }
+    // An unknown or stale session has no authorized binding to echo.
+    let unbound_rejection = matches!(response.kind, Some(server_frame::Kind::Rejected(_)))
+        && response.session_id.is_empty()
+        && response.epoch == 0;
+    if !unbound_rejection
+        && expected_session_id.is_some_and(|expected| response.session_id != expected)
+    {
+        return Err(
+            ProverError::Backend("ProveStream response crossed Composer sessions".into()).into(),
+        );
+    }
+    if !unbound_rejection && expected_epoch.is_some_and(|expected| response.epoch != expected) {
+        return Err(ProverError::Backend(format!(
+            "ProveStream response epoch {} crossed epoch {}",
+            response.epoch,
+            expected_epoch.expect("checked above"),
+        ))
+        .into());
+    }
+    Ok(response)
+}
+
+fn rejection_error(response: &ServerFrame, from_block: u64, to_block: u64) -> Option<ProverError> {
+    let server_frame::Kind::Rejected(rejected) = response.kind.as_ref()? else {
+        return None;
+    };
+    let status = Status::with_details(
+        Code::from_i32(rejected.code),
+        rejected.message.clone(),
+        rejected.details.clone().into(),
+    );
+    if status.code() == Code::NotFound {
+        Some(ProverError::Retryable {
+            kind: RetryableProverError::Aborted,
+            message: format!(
+                "ProveStream session {from_block}-{to_block} is no longer retained: {status}"
+            ),
+        })
+    } else {
+        Some(map_rpc_status(from_block, to_block, status))
+    }
+}
+
+impl RemoteProver {
+    async fn prove_v1(&self, ctx: ProvingContext) -> ProverResult<Bytes> {
+        let chunks = chunks_for(&ctx);
         let mut client = ProverClient::connect(self.inner.url.clone())
             .await
             .map_err(|error| ProverError::Retryable {
@@ -122,30 +377,386 @@ impl Prover for RemoteProver {
             })?
             .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
             .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES);
-        let resp = client
+        let response = client
             .prove(tokio_stream::iter(chunks))
             .await
             .map_err(|status| map_rpc_status(ctx.from_block, ctx.to_block, status))?
             .into_inner();
+        self.verify_proof(
+            ctx.from_block,
+            ctx.to_block,
+            response.public_inputs_hash,
+            response.signature,
+        )
+    }
 
-        // Fail-closed: the attestation must recover to the REGISTERED attester
-        // over the hash the prover signed. A wrong prover cannot forge it.
-        let hash = verify_attestation(
-            &resp.signature,
-            &resp.public_inputs_hash,
-            self.inner.attester,
-        )?;
+    fn verify_proof(
+        &self,
+        from_block: u64,
+        to_block: u64,
+        public_inputs_hash: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> ProverResult<Bytes> {
+        let hash = verify_attestation(&signature, &public_inputs_hash, self.inner.attester)?;
         event!(
             name: "eez.prover_client.attested",
             Level::INFO,
             event_name = "eez.prover_client.attested",
-            from = ctx.from_block,
-            to = ctx.to_block,
-            blocks = n_blocks,
+            from = from_block,
+            to = to_block,
             %hash,
             "remote prover attested the window",
         );
-        Ok(Bytes::copy_from_slice(&resp.signature))
+        Ok(Bytes::from(signature))
+    }
+
+    /// Open a stream with Begin/Resume and correlate its first response.
+    async fn open_stream(
+        &self,
+        state: &mut StreamingState,
+        begin: Option<StreamBegin>,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Sender<ClientFrame>,
+            tonic::Streaming<ServerFrame>,
+            ServerFrame,
+        ),
+        StreamingError,
+    > {
+        let mut client = StreamingProverClient::connect(self.inner.url.clone())
+            .await
+            .map_err(|error| ProverError::Retryable {
+                kind: RetryableProverError::Unavailable,
+                message: format!("connect {}: {error}", self.inner.url),
+            })?
+            .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
+            .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES);
+        let request_id = state.next_id();
+        let expected_session = state.session.as_ref().map(|session| session.id.clone());
+        let initial = ClientFrame {
+            session_id: expected_session.clone().unwrap_or_default(),
+            request_id,
+            epoch: 0,
+            kind: Some(begin.map_or(
+                client_frame::Kind::Resume(StreamResume {}),
+                client_frame::Kind::Begin,
+            )),
+        };
+        let (requests, request_stream) = tokio::sync::mpsc::channel(1);
+        requests
+            .send(initial)
+            .await
+            .map_err(|_| ProverError::Backend("unable to open ProveStream".into()))?;
+        let mut responses = client
+            .prove_stream(tokio_stream::wrappers::ReceiverStream::new(request_stream))
+            .await
+            .map_err(|status| {
+                if status.code() == Code::Unimplemented {
+                    StreamingError::Unsupported
+                } else {
+                    map_rpc_status(from_block, to_block, status).into()
+                }
+            })?
+            .into_inner();
+        let ready = next_stream_response(
+            &mut responses,
+            request_id,
+            expected_session.as_deref(),
+            None,
+            from_block,
+            to_block,
+        )
+        .await?;
+        Ok((requests, responses, ready))
+    }
+
+    async fn stream_exchange(
+        &self,
+        rollup_id: u64,
+        anchor: ProvingAnchor,
+        blocks: &[BlockWitness],
+        finalize: Option<(u64, u64, PostBatch)>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, StreamingError> {
+        // One deadline covers lock acquisition, connect, both stream directions and EOF.
+        // Dropping the exchange releases its lock; a later Resume recovers accepted work.
+        tokio::time::timeout(self.inner.exchange_timeout, async {
+        let mut state = self.inner.streaming.lock().await;
+        if state.supported == Some(false) {
+            return Err(StreamingError::Unsupported);
+        }
+        if state
+            .session
+            .as_ref()
+            .is_some_and(|session| session.rollup_id != rollup_id)
+        {
+            state.session = None;
+        }
+        let range = finalize.as_ref().map_or_else(
+            || {
+                (
+                    blocks.first().map_or(anchor.number, |block| block.number),
+                    blocks.last().map_or(anchor.number, |block| block.number),
+                )
+            },
+            |(from, to, _)| (*from, *to),
+        );
+        let finalize = finalize
+            .map(|(from_block, to_block, post_batch)| {
+                let terminal = blocks
+                    .iter()
+                    .find(|block| block.number == to_block)
+                    .ok_or_else(|| {
+                        ProverError::Backend("Finalize terminal block was not supplied".into())
+                    })?;
+                Ok::<_, ProverError>(StreamFinalize {
+                    from_block,
+                    to_block,
+                    terminal_hash: terminal.hash.to_vec(),
+                    post_batch: Some(post_batch),
+                })
+            })
+            .transpose()?;
+
+        // Only the server retains the validated prefix. A fresh Ready determines
+        // what to send, including work completed after a previous response was lost.
+        let (requests, mut responses, blocks) = loop {
+            let creating = state.session.is_none();
+            let begin = creating.then(|| StreamBegin {
+                rollup_id,
+                anchor_number: anchor.number,
+                anchor_hash: anchor.hash.to_vec(),
+                anchor_state_root: anchor.state_root.to_vec(),
+            });
+            let (requests, mut responses, response) =
+                match self.open_stream(&mut state, begin, range.0, range.1).await {
+                    Ok(opened) => opened,
+                    Err(StreamingError::Unsupported) => {
+                        state.supported = Some(false);
+                        state.session = None;
+                        return Err(StreamingError::Unsupported);
+                    }
+                    Err(error) => return Err(error),
+                };
+            state.supported = Some(true);
+            if !creating
+                && matches!(&response.kind,
+                    Some(server_frame::Kind::Rejected(rejected)) if Code::from_i32(rejected.code) == Code::NotFound
+                )
+            {
+                state.session = None;
+                continue; // The server evicted the session or restarted; begin at the supplied anchor.
+            }
+            if let Some(error) = rejection_error(&response, range.0, range.1) {
+                return Err(error.into());
+            }
+            let Some(server_frame::Kind::Ready(ready)) = response.kind else {
+                return Err(ProverError::Backend("ProveStream expected Ready".into()).into());
+            };
+            if response.session_id.len() != 32
+                || response.epoch == 0
+                || ready.validated_hash.len() != 32
+            {
+                return Err(ProverError::Backend(
+                    "ProveStream returned an invalid Ready binding".into(),
+                )
+                .into());
+            }
+            if creating
+                && (ready.validated_through != anchor.number
+                    || ready.validated_hash != anchor.hash.as_slice())
+            {
+                return Err(ProverError::Backend(
+                    "ProveStream Begin acknowledged another anchor".into(),
+                )
+                .into());
+            }
+            state.session = Some(StreamingSession {
+                rollup_id,
+                id: response.session_id,
+                epoch: response.epoch,
+            });
+
+            let skip = blocks
+                .iter()
+                .position(|block| {
+                    block.number == ready.validated_through
+                        && block.hash.as_slice() == ready.validated_hash
+                })
+                .map_or(0, |index| index + 1);
+            let remaining = &blocks[skip..];
+            if let Some(first) = remaining.first()
+                && (ready.validated_through.checked_add(1) != Some(first.number)
+                    || ready.validated_hash != first.parent_hash.as_slice())
+            {
+                // Without a matching cursor, let the server resolve the requested
+                // parent. Any resent blocks reuse the backend's validation cache.
+                let request_id = state
+                    .send(
+                        &requests,
+                        client_frame::Kind::Rewind(StreamRewind {
+                            ancestor_hash: first.parent_hash.to_vec(),
+                        }),
+                    )
+                    .await?;
+                let session = state.session.as_ref().expect("ready session exists");
+                let response = next_stream_response(
+                    &mut responses,
+                    request_id,
+                    Some(&session.id),
+                    None,
+                    range.0,
+                    range.1,
+                )
+                .await?;
+                if !creating
+                    && matches!(&response.kind,
+                        Some(server_frame::Kind::Rejected(rejected)) if Code::from_i32(rejected.code) == Code::FailedPrecondition
+                    )
+                {
+                    state.session = None;
+                    continue; // The requested parent is no longer retained; backfill a new session.
+                }
+                if let Some(error) = rejection_error(&response, range.0, range.1) {
+                    return Err(error.into());
+                }
+                let Some(server_frame::Kind::Ready(ready)) = response.kind else {
+                    return Err(ProverError::Backend(
+                        "ProveStream expected Ready after Rewind".into(),
+                    )
+                    .into());
+                };
+                if response.epoch == 0
+                    || ready.validated_through.checked_add(1) != Some(first.number)
+                    || ready.validated_hash != first.parent_hash.as_slice()
+                {
+                    state.session = None;
+                    return Err(ProverError::Backend(
+                        "ProveStream Rewind acknowledged another parent".into(),
+                    )
+                    .into());
+                }
+                state.session.as_mut().expect("ready session exists").epoch = response.epoch;
+            }
+            break (requests, responses, remaining);
+        };
+
+        // Pipeline the offered suffix and Finalize; correlation is transport state,
+        // not a second copy of the server's validated block history.
+        let mut pending_blocks = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let request_id = state
+                .send(
+                    &requests,
+                    client_frame::Kind::Block(StreamBlock {
+                        data: Some(wire_block(block)),
+                    }),
+                )
+                .await?;
+            pending_blocks.push((request_id, block.number, block.hash));
+        }
+        let pending_finalize = if let Some(finalize) = finalize {
+            Some(
+                state
+                    .send(&requests, client_frame::Kind::Finalize(finalize))
+                    .await?,
+            )
+        } else {
+            None
+        };
+        for (request_id, number, hash) in pending_blocks {
+            let response = state.response(&mut responses, request_id, range).await?;
+            if !matches!(response.kind, Some(server_frame::Kind::Validated(validated))
+                if validated.number == number && validated.hash == hash.as_slice()
+                    && validated.post_state_root.len() == 32)
+            {
+                return Err(ProverError::Backend(
+                    "ProveStream Validated response identity mismatch".into(),
+                )
+                .into());
+            }
+        }
+        let proof = if let Some(request_id) = pending_finalize {
+            let response = state.response(&mut responses, request_id, range).await?;
+            let Some(server_frame::Kind::Proof(proof)) = response.kind else {
+                return Err(ProverError::Backend(
+                    "ProveStream did not answer Finalize with Proof".into(),
+                )
+                .into());
+            };
+            Some((proof.public_inputs_hash, proof.proof))
+        } else {
+            None
+        };
+        drop(requests);
+        match responses.message().await {
+            Ok(None) => Ok(proof),
+            Ok(Some(_)) => Err(ProverError::Backend(
+                "ProveStream returned an unsolicited response".into(),
+            )
+            .into()),
+            Err(status) => Err(map_rpc_status(range.0, range.1, status).into()),
+        }
+        }).await.map_err(|_| ProverError::Retryable {
+            kind: RetryableProverError::DeadlineExceeded,
+            message: "ProveStream exchange deadline exceeded".into(),
+        })?
+    }
+}
+
+#[async_trait]
+impl Prover for RemoteProver {
+    async fn prevalidate(
+        &self,
+        rollup_id: u64,
+        anchor: ProvingAnchor,
+        block: BlockWitness,
+    ) -> ProverResult<()> {
+        match self
+            .stream_exchange(rollup_id, anchor, &[block], None)
+            .await
+        {
+            Ok(None) | Err(StreamingError::Unsupported) => Ok(()),
+            Ok(Some(_)) => Err(ProverError::Backend(
+                "ProveStream returned a proof without Finalize".into(),
+            )),
+            Err(StreamingError::Prover(error)) => Err(error),
+        }
+    }
+
+    async fn prove(&self, ctx: ProvingContext) -> ProverResult<Bytes> {
+        let Some(anchor) = ctx.anchor else {
+            return self.prove_v1(ctx).await;
+        };
+        let abi_calldata = eez_protocol::abi::postAndVerifyBatchCall {
+            batch: ctx.batch.clone(),
+        }
+        .abi_encode();
+        let post_batch = PostBatch {
+            abi_calldata,
+            public_inputs_hash: Vec::new(),
+            l1_block_hash: ctx
+                .l1_block_hash
+                .map(|hash| hash.to_vec())
+                .unwrap_or_default(),
+        };
+        match self
+            .stream_exchange(
+                ctx.rollup_id,
+                anchor,
+                &ctx.blocks,
+                Some((ctx.from_block, ctx.to_block, post_batch)),
+            )
+            .await
+        {
+            Ok(Some((hash, proof))) => self.verify_proof(ctx.from_block, ctx.to_block, hash, proof),
+            Ok(None) => Err(ProverError::Backend(
+                "ProveStream Finalize returned no proof".into(),
+            )),
+            Err(StreamingError::Unsupported) => self.prove_v1(ctx).await,
+            Err(StreamingError::Prover(error)) => Err(error),
+        }
     }
 
     fn vkey(&self) -> B256 {
@@ -254,7 +865,14 @@ mod tests {
         InboundFailure, OutboundFailure, ProveFailure, ProveResponse,
         prover_server::{Prover as ProverService, ProverServer},
     };
+    use eez_control_rpc::v2::{
+        Proof as StreamProof, Ready, Validated as StreamValidated,
+        prover_server::{Prover as StreamingProverService, ProverServer as StreamingProverServer},
+    };
+    use std::pin::Pin;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_stream::Stream;
     use tonic::{Request, Response, Streaming, transport::Server};
 
     /// Stub `Prove` server: drains the window stream and returns a fixed
@@ -287,6 +905,330 @@ mod tests {
 
     #[derive(Debug, Clone, Copy)]
     struct UnavailableProver;
+
+    #[derive(Clone)]
+    struct StalledStream {
+        phase: usize,
+        reached: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl StreamingProverService for StalledStream {
+        type ProveStreamStream = Pin<Box<dyn Stream<Item = Result<ServerFrame, Status>> + Send>>;
+
+        async fn prove_stream(
+            &self,
+            request: Request<Streaming<ClientFrame>>,
+        ) -> Result<Response<Self::ProveStreamStream>, Status> {
+            let phase = self.phase;
+            let reached = Arc::clone(&self.reached);
+            let mut input = request.into_inner();
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                while let Ok(Some(frame)) = input.message().await {
+                    let kind = match frame.kind {
+                        Some(client_frame::Kind::Begin(begin)) if phase != 1 => {
+                            server_frame::Kind::Ready(Ready {
+                                validated_through: begin.anchor_number,
+                                validated_hash: begin.anchor_hash,
+                            })
+                        }
+                        Some(client_frame::Kind::Block(block)) if phase != 2 => {
+                            let block = block.data.unwrap();
+                            server_frame::Kind::Validated(StreamValidated {
+                                number: block.number,
+                                hash: block.hash,
+                                post_state_root: vec![0; 32],
+                                reused: false,
+                            })
+                        }
+                        _ => {
+                            reached.store(phase, Ordering::SeqCst);
+                            sender.closed().await;
+                            return;
+                        }
+                    };
+                    if sender
+                        .send(Ok(ServerFrame {
+                            session_id: vec![0x77; 32],
+                            epoch: 1,
+                            request_id: frame.request_id,
+                            kind: Some(kind),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                // Also exercise a peer that acknowledges everything but never sends EOF.
+                reached.store(3, Ordering::SeqCst);
+                sender.closed().await;
+            });
+            Ok(Response::new(Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(receiver),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_deadline_covers_ready_block_eof_and_lock_waits() {
+        for phase in 1..=3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let reached = Arc::new(AtomicUsize::new(0));
+            let service = StalledStream {
+                phase,
+                reached: Arc::clone(&reached),
+            };
+            let server = tokio::spawn(async move {
+                Server::builder()
+                    .add_service(StreamingProverServer::new(service))
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                    .await
+                    .unwrap();
+            });
+            let mut prover = RemoteProver::new(format!("http://{addr}"), Address::ZERO);
+            Arc::get_mut(&mut prover.inner).unwrap().exchange_timeout = Duration::from_millis(150);
+            let input = test_block(11, test_anchor().hash, 0x22);
+            let error = prover
+                .prevalidate(1, test_anchor(), input.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.retryable_kind(),
+                Some(RetryableProverError::DeadlineExceeded),
+                "phase {phase}"
+            );
+            assert_eq!(
+                reached.load(Ordering::SeqCst),
+                phase,
+                "peer reached the intended stall"
+            );
+            let guard = prover
+                .inner
+                .streaming
+                .try_lock()
+                .expect("timeout releases the session lock");
+            let error = prover
+                .prevalidate(1, test_anchor(), input)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.retryable_kind(),
+                Some(RetryableProverError::DeadlineExceeded)
+            );
+            drop(guard);
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[derive(Clone)]
+    struct StreamingStub {
+        signer: PrivateKeySigner,
+        hash: B256,
+        blocks: Arc<AtomicUsize>,
+        cursor: Arc<Mutex<(u64, B256)>>,
+        cross_wire_block_response: bool,
+    }
+
+    #[tonic::async_trait]
+    impl StreamingProverService for StreamingStub {
+        type ProveStreamStream =
+            Pin<Box<dyn Stream<Item = Result<ServerFrame, Status>> + Send + 'static>>;
+
+        async fn prove_stream(
+            &self,
+            request: Request<Streaming<ClientFrame>>,
+        ) -> Result<Response<Self::ProveStreamStream>, Status> {
+            let mut input = request.into_inner();
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            let this = self.clone();
+            tokio::spawn(async move {
+                while let Ok(Some(frame)) = input.message().await {
+                    let request_id = frame.request_id;
+                    let mut epoch = frame.epoch;
+                    let mut session_id = frame.session_id;
+                    let kind = match frame.kind {
+                        Some(client_frame::Kind::Begin(begin)) => {
+                            session_id = vec![0x77; 32];
+                            epoch = 1;
+                            *this.cursor.lock().await =
+                                (begin.anchor_number, B256::from_slice(&begin.anchor_hash));
+                            let cursor = *this.cursor.lock().await;
+                            server_frame::Kind::Ready(Ready {
+                                validated_through: cursor.0,
+                                validated_hash: cursor.1.to_vec(),
+                            })
+                        }
+                        Some(client_frame::Kind::Resume(_)) => {
+                            epoch = epoch.saturating_add(1).max(1);
+                            let cursor = *this.cursor.lock().await;
+                            server_frame::Kind::Ready(Ready {
+                                validated_through: cursor.0,
+                                validated_hash: cursor.1.to_vec(),
+                            })
+                        }
+                        Some(client_frame::Kind::Block(block)) => {
+                            let block = block.data.unwrap();
+                            this.blocks.fetch_add(1, Ordering::SeqCst);
+                            let hash = B256::from_slice(&block.hash);
+                            *this.cursor.lock().await = (block.number, hash);
+                            server_frame::Kind::Validated(StreamValidated {
+                                number: block.number,
+                                hash: block.hash,
+                                post_state_root: vec![0x99; 32],
+                                reused: false,
+                            })
+                        }
+                        Some(client_frame::Kind::Finalize(_)) => {
+                            server_frame::Kind::Proof(StreamProof {
+                                public_inputs_hash: this.hash.to_vec(),
+                                proof: sign_65(&this.signer, this.hash),
+                            })
+                        }
+                        _ => break,
+                    };
+                    if sender
+                        .send(Ok(ServerFrame {
+                            session_id: if this.cross_wire_block_response
+                                && matches!(&kind, server_frame::Kind::Validated(_))
+                            {
+                                vec![0x88; 32]
+                            } else {
+                                session_id
+                            },
+                            request_id,
+                            epoch,
+                            kind: Some(kind),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            Ok(Response::new(Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(receiver),
+            )))
+        }
+    }
+
+    #[derive(Clone)]
+    struct PipeliningStub {
+        signer: PrivateKeySigner,
+        hash: B256,
+    }
+
+    #[tonic::async_trait]
+    impl StreamingProverService for PipeliningStub {
+        type ProveStreamStream =
+            Pin<Box<dyn Stream<Item = Result<ServerFrame, Status>> + Send + 'static>>;
+
+        async fn prove_stream(
+            &self,
+            request: Request<Streaming<ClientFrame>>,
+        ) -> Result<Response<Self::ProveStreamStream>, Status> {
+            let mut input = request.into_inner();
+            let (sender, receiver) = tokio::sync::mpsc::channel(4);
+            let this = self.clone();
+            tokio::spawn(async move {
+                let Some(begin) = input.message().await.ok().flatten() else {
+                    return;
+                };
+                let Some(client_frame::Kind::Begin(begin_data)) = begin.kind else {
+                    let _ = sender
+                        .send(Err(Status::invalid_argument("expected Begin")))
+                        .await;
+                    return;
+                };
+                let session_id = vec![0x71; 32];
+                let epoch = 1;
+                if sender
+                    .send(Ok(ServerFrame {
+                        session_id: session_id.clone(),
+                        request_id: begin.request_id,
+                        epoch,
+                        kind: Some(server_frame::Kind::Ready(Ready {
+                            validated_through: begin_data.anchor_number,
+                            validated_hash: begin_data.anchor_hash,
+                        })),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                let Some(first) = input.message().await.ok().flatten() else {
+                    return;
+                };
+                let Ok(Ok(Some(second))) =
+                    tokio::time::timeout(std::time::Duration::from_millis(250), input.message())
+                        .await
+                else {
+                    let _ = sender
+                        .send(Err(Status::deadline_exceeded(
+                            "client waited for the first Validated response",
+                        )))
+                        .await;
+                    return;
+                };
+                let Some(finalize) = input.message().await.ok().flatten() else {
+                    return;
+                };
+                let blocks = [first, second];
+                for frame in blocks {
+                    let Some(client_frame::Kind::Block(block)) = frame.kind else {
+                        let _ = sender
+                            .send(Err(Status::invalid_argument("expected Block")))
+                            .await;
+                        return;
+                    };
+                    let block = block.data.expect("test block carries data");
+                    if sender
+                        .send(Ok(ServerFrame {
+                            session_id: session_id.clone(),
+                            request_id: frame.request_id,
+                            epoch,
+                            kind: Some(server_frame::Kind::Validated(StreamValidated {
+                                number: block.number,
+                                hash: block.hash,
+                                post_state_root: vec![0x99; 32],
+                                reused: false,
+                            })),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                if !matches!(finalize.kind, Some(client_frame::Kind::Finalize(_))) {
+                    let _ = sender
+                        .send(Err(Status::invalid_argument("expected Finalize")))
+                        .await;
+                    return;
+                }
+                let _ = sender
+                    .send(Ok(ServerFrame {
+                        session_id,
+                        request_id: finalize.request_id,
+                        epoch,
+                        kind: Some(server_frame::Kind::Proof(StreamProof {
+                            public_inputs_hash: this.hash.to_vec(),
+                            proof: sign_65(&this.signer, this.hash),
+                        })),
+                    }))
+                    .await;
+            });
+            Ok(Response::new(Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(receiver),
+            )))
+        }
+    }
 
     #[tonic::async_trait]
     impl ProverService for UnavailableProver {
@@ -331,6 +1273,37 @@ mod tests {
                 .unwrap();
         });
         format!("http://{addr}")
+    }
+
+    async fn spawn_streaming_stub(stub: StreamingStub) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(StreamingProverServer::new(stub))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    fn test_anchor() -> ProvingAnchor {
+        ProvingAnchor {
+            number: 10,
+            hash: B256::repeat_byte(0x11),
+            state_root: B256::repeat_byte(0x55),
+        }
+    }
+
+    fn test_block(number: u64, parent_hash: B256, hash: u8) -> BlockWitness {
+        BlockWitness {
+            number,
+            parent_hash,
+            hash: B256::repeat_byte(hash),
+            rlp: Bytes::from_static(&[0xc0]),
+            witness: Default::default(),
+        }
     }
 
     fn test_key() -> PrivateKeySigner {
@@ -438,6 +1411,132 @@ mod tests {
             .await
             .expect("client must reconnect to the replacement signer");
         replacement_server.abort();
+    }
+
+    #[tokio::test]
+    async fn finalized_session_is_resumed_and_validated_blocks_are_not_resent() {
+        let key = test_key();
+        let attester = key.address();
+        let signed_hash = B256::repeat_byte(0x7c);
+        let block_count = Arc::new(AtomicUsize::new(0));
+        let anchor = test_anchor();
+        let block_11 = test_block(11, anchor.hash, 0x22);
+        let block_12 = test_block(12, block_11.hash, 0x23);
+        let url = spawn_streaming_stub(StreamingStub {
+            signer: key,
+            hash: signed_hash,
+            blocks: Arc::clone(&block_count),
+            cursor: Arc::new(Mutex::new((0, B256::ZERO))),
+            cross_wire_block_response: false,
+        })
+        .await;
+        let prover = RemoteProver::new(url, attester);
+
+        prover
+            .prevalidate(1, anchor, block_11.clone())
+            .await
+            .unwrap();
+        let proof = prover
+            .prove(ProvingContext {
+                rollup_id: 1,
+                from_block: 11,
+                to_block: 11,
+                anchor: Some(anchor),
+                batch: Default::default(),
+                blocks: vec![block_11.clone()],
+                l1_block_hash: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(proof.len(), 65);
+        assert_eq!(block_count.load(Ordering::SeqCst), 1);
+
+        // Witness capture can race Finalize. Re-observing the exact block that
+        // Finalize already backfilled is idempotent rather than a false gap.
+        prover
+            .prevalidate(1, anchor, block_11.clone())
+            .await
+            .unwrap();
+        prover
+            .prevalidate(1, anchor, block_12.clone())
+            .await
+            .unwrap();
+        let proof = prover
+            .prove(ProvingContext {
+                rollup_id: 1,
+                from_block: 11,
+                to_block: 12,
+                anchor: Some(anchor),
+                batch: Default::default(),
+                blocks: vec![block_11, block_12],
+                l1_block_hash: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(proof.len(), 65);
+        assert_eq!(block_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn contiguous_blocks_and_finalize_are_pipelined_before_the_first_ack() {
+        let key = test_key();
+        let attester = key.address();
+        let signed_hash = B256::repeat_byte(0x7c);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(StreamingProverServer::new(PipeliningStub {
+                    signer: key,
+                    hash: signed_hash,
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let anchor = test_anchor();
+        let block_11 = test_block(11, anchor.hash, 0x22);
+        let block_12 = test_block(12, block_11.hash, 0x23);
+        let prover = RemoteProver::new(format!("http://{addr}"), attester);
+
+        let proof = prover
+            .prove(ProvingContext {
+                rollup_id: 1,
+                from_block: 11,
+                to_block: 12,
+                anchor: Some(anchor),
+                batch: Default::default(),
+                blocks: vec![block_11, block_12],
+                l1_block_hash: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(proof.len(), 65);
+    }
+
+    #[tokio::test]
+    async fn a_block_response_from_another_session_is_rejected() {
+        let key = test_key();
+        let anchor = test_anchor();
+        let block = test_block(11, anchor.hash, 0x22);
+        let url = spawn_streaming_stub(StreamingStub {
+            signer: key.clone(),
+            hash: B256::repeat_byte(0x7c),
+            blocks: Arc::new(AtomicUsize::new(0)),
+            cursor: Arc::new(Mutex::new((0, B256::ZERO))),
+            cross_wire_block_response: true,
+        })
+        .await;
+        let prover = RemoteProver::new(url, key.address());
+
+        let error = prover.prevalidate(1, anchor, block).await.unwrap_err();
+
+        assert!(
+            matches!(error, ProverError::Backend(message) if message.contains("crossed Composer sessions"))
+        );
     }
 
     /// Pack a signature the way the prover does (r||s||v, v+27).
