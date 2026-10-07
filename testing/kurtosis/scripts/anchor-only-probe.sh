@@ -11,26 +11,26 @@ EEZ_PARITY_ROUNDS="${EEZ_PARITY_ROUNDS:-10}" \
     "$K/scripts/parity-gate-host.sh"
 
 deadline=$((SECONDS + EEZ_ANCHOR_ONLY_WAIT_SECS))
-partial=""
 record=""
 while (( SECONDS < deadline )); do
-    partial=$(docker logs "$EEZ_NODE_CONTAINER" 2>&1 | jq -Rrc \
-        'fromjson? | select(
-            .fields.event_name == "eez.deriver.reconcile.partial_consumption"
-            and (((.fields.outbound | tonumber) + (.fields.inbound | tonumber)) > 0)
-            and (.fields.outbound_applied | tonumber) == 0
-            and (.fields.inbound_applied | tonumber) == 0
-        ) | .fields' \
-        | tail -1)
-    if [[ -n "$partial" ]]; then
-        tx_hash=$(jq -r '.tx_hash' <<<"$partial")
-        record=$(docker logs "$EEZ_NODE_CONTAINER" 2>&1 | jq -Rrc --arg tx_hash "$tx_hash" \
-            'fromjson? | select(
-                .fields.event_name == "eez.deriver.safe.advanced"
-                and (.fields.applied_entries | tonumber) == 1
-                and .fields.tx_hash == $tx_hash
-            ) | .fields' | tail -1)
-    fi
+    record=$(docker logs "$EEZ_NODE_CONTAINER" 2>&1 | jq -Rsc '
+        [split("\n")[] | fromjson? | .fields] as $events
+        | [$events[] as $partial
+            | select(
+                $partial.event_name == "eez.deriver.reconcile.partial_consumption"
+                and ((($partial.outbound | tonumber) + ($partial.inbound | tonumber)) > 0)
+                and ($partial.outbound_applied | tonumber) == 0
+                and ($partial.inbound_applied | tonumber) == 0
+            )
+            | $events[]
+            | select(
+                .event_name == "eez.deriver.safe.advanced"
+                and (.applied_entries | tonumber) == 1
+                and ((.l1_block_number | tonumber) % 2) == 1
+                and .tx_hash == $partial.tx_hash
+            )
+        ] | last // empty
+    ')
     [[ -n "$record" ]] && break
     sleep 3
 done

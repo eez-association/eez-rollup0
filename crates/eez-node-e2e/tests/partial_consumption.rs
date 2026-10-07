@@ -16,7 +16,28 @@ use eez_testkit::{
 };
 
 const TIMEOUT: Duration = Duration::from_mins(6);
-const ROUNDS: usize = 12;
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+const ATTEMPTS: usize = 3;
+
+/// Wait for a fresh even L1 head so `ParityGate` passes source simulation and
+/// reverts only when the exact-next-block bundle lands on the odd target.
+async fn wait_for_even_l1_head(l1_rpc: &str) {
+    let initial = block_number_and_hash_at(l1_rpc, BlockNumberOrTag::Latest)
+        .await
+        .unwrap()
+        .expect("L1 must have a latest block")
+        .0;
+    wait_for(ATTEMPT_TIMEOUT, || async {
+        let head = block_number_and_hash_at(l1_rpc, BlockNumberOrTag::Latest)
+            .await?
+            .map(|block| block.0)
+            .unwrap_or_default();
+        Ok((head > initial && head % 2 == 0).then_some(()))
+    })
+    .await
+    .expect("L1 did not produce a fresh even block");
+}
+
 fn assert_settlements_use_dispatched_sync_heights(
     records: &[eez_testkit::NodeSignal],
 ) -> anyhow::Result<()> {
@@ -218,7 +239,8 @@ async fn inclusion_revert_settles_a_mixed_prefix_and_follower_converges() {
 
     let mut partial_sync_height = None;
     let mut gated_hashes = HashSet::new();
-    for round in 0..ROUNDS {
+    for round in 0..ATTEMPTS {
+        wait_for_even_l1_head(&l1_rpc).await;
         let inbound_nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
         let outbound_nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
         let value = u64::try_from(round).unwrap();
@@ -271,7 +293,7 @@ async fn inclusion_revert_settles_a_mixed_prefix_and_follower_converges() {
         };
         gated_hashes.insert(gated_hash);
 
-        partial_sync_height = wait_for(Duration::from_secs(40), || async {
+        partial_sync_height = wait_for(ATTEMPT_TIMEOUT, || async {
             let records = w.node.signals_since(signal_cursor)?;
             for record in records
                 .iter()
@@ -289,6 +311,9 @@ async fn inclusion_revert_settles_a_mixed_prefix_and_follower_converges() {
                     if let Some(advanced) = records.iter().find(|candidate| {
                         candidate.name == signals::DERIVER_SAFE_ADVANCED
                             && candidate.b256("tx_hash").ok() == Some(tx_hash)
+                            && candidate
+                                .u64("l1_block_number")
+                                .is_ok_and(|block| block % 2 == 1)
                     }) {
                         return Ok(Some(advanced.u64("to_block")?));
                     }
@@ -365,7 +390,8 @@ async fn inclusion_revert_can_settle_only_the_anchor() {
     let signal_cursor = w.node.signal_cursor().unwrap();
 
     let mut anchor_only = None;
-    for round in 0..ROUNDS {
+    for round in 0..ATTEMPTS {
+        wait_for_even_l1_head(&l1_rpc).await;
         let nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
         if sign_and_send(
             &w.l1_xchain(),
@@ -387,7 +413,7 @@ async fn inclusion_revert_can_settle_only_the_anchor() {
             continue;
         }
 
-        anchor_only = wait_for(Duration::from_secs(40), || async {
+        anchor_only = wait_for(ATTEMPT_TIMEOUT, || async {
             let records = w.node.signals_since(signal_cursor)?;
             for partial in records
                 .iter()
@@ -405,6 +431,9 @@ async fn inclusion_revert_can_settle_only_the_anchor() {
                     record.name == signals::DERIVER_SAFE_ADVANCED
                         && record.u64("applied_entries").ok() == Some(1)
                         && record.b256("tx_hash").ok() == Some(tx_hash)
+                        && record
+                            .u64("l1_block_number")
+                            .is_ok_and(|block| block % 2 == 1)
                 }) {
                     return Ok(Some((
                         advanced.u64("to_block")?,
