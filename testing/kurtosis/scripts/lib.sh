@@ -67,7 +67,9 @@ forge_deploy() { # <rpc> <key> <script:contract> <sig> <args...> → echoes forg
     printf '%s\n' "$output"
 }
 
-grab_address() { grep -m1 -oE "$1=0x[0-9a-fA-F]{40}" | cut -d= -f2; }
+grab_address() {
+    grep -oE "$1=0x[0-9a-fA-F]{40}" | cut -d= -f2 | sed -n '1p'
+}
 strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 
 receipt_json() { # <hash> <rpc>
