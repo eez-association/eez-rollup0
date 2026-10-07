@@ -3698,6 +3698,7 @@ where
             event!(
                 name: "eez.composer.emission.historical_chunk",
                 Level::INFO,
+                event_name = "eez.composer.emission.historical_chunk",
                 rollup_id,
                 cursor,
                 boundary,
