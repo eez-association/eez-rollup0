@@ -322,7 +322,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
 
     let submitter_config = SubmitterConfig::from_env()?;
     let deploy_block = submitter_config.reader.deploy_block;
-    let rollup_config = RollupConfig::from_env()?;
+    let rollup_config = RollupConfig::from_env(
+        eez_evm::fee_collector(&chain_spec.genesis.config)?.unwrap_or_default(),
+    )?;
     let attributes = EthAttributesBuilder::new(chain_spec.clone())
         .with_fee_recipient(rollup_config.fee_recipient);
     let l1_watcher_config = L1WatcherConfig::from_env()?;
@@ -353,7 +355,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         // (build_sync_block → reth-evm BlockBuilder). Same chain spec
         // the engine uses, so blocks produced here pass validation
         // when reth ingests them via newPayload.
-        let evm_config = eez_evm::EezEvmConfig::new(chain_spec.clone());
+        let evm_config = eez_evm::EezEvmConfig::new(chain_spec.clone())?;
 
         // Build the cross-chain composer over the mandatory embedded L1.
         // Inlined because the `FullNode` AddOns type resists a typed helper
@@ -372,7 +374,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         let l1_entry_client: Arc<LocalChainClient> = match l1_variant {
             EmbeddedL1::Ethereum(l1_handle) => {
                 let l1_provider = l1_handle.node.provider.clone();
-                let l1_evm_config = eez_evm::EezEvmConfig::new(l1_handle.node.chain_spec());
+                let l1_evm_config = eez_evm::EezEvmConfig::new(l1_handle.node.chain_spec())?;
                 LocalChainClient::new_entry(
                     l1_provider,
                     l1_evm_config,
@@ -390,7 +392,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 let l1_chain_spec: Arc<reth_chainspec::ChainSpec> =
                     Arc::new(gnosis_chain_spec.inner.clone());
                 let l1_provider = GnosisL1Adapter::new(chiado_handle.node.provider.clone());
-                let l1_evm_config = eez_evm::EezEvmConfig::new(Arc::clone(&l1_chain_spec));
+                let l1_evm_config = eez_evm::EezEvmConfig::new(Arc::clone(&l1_chain_spec))?;
                 LocalChainClient::new_entry(
                     l1_provider,
                     l1_evm_config,

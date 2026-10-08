@@ -3213,6 +3213,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-evm",
+ "alloy-genesis",
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "eez-primitives",
@@ -3222,6 +3223,7 @@ dependencies = [
  "reth-primitives-traits",
  "reth-storage-errors",
  "revm",
+ "serde_json",
 ]
 
 [[package]]
@@ -3579,6 +3581,7 @@ dependencies = [
  "reth-chainspec",
  "reth-ethereum-primitives",
  "reth-primitives-traits",
+ "reth-trie-common",
  "serde_json",
  "stateless",
  "tokio",

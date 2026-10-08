@@ -1,3 +1,4 @@
+mod fees;
 mod native_security;
 
 use alloy_consensus::{Header, SignableTransaction as _, TxLegacy};

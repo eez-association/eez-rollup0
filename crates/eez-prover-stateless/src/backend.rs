@@ -110,7 +110,7 @@ impl Backend {
             ?genesis_timestamp,
             "stateless chain configuration details",
         );
-        Ok(Self::from_genesis(genesis, expected_l2_system_address))
+        Self::from_genesis(genesis, expected_l2_system_address)
     }
 
     #[cfg(test)]
@@ -122,16 +122,17 @@ impl Backend {
             },
             expected_l2_system_address,
         )
+        .unwrap()
     }
 
-    fn from_genesis(genesis: Genesis, expected_l2_system_address: Address) -> Self {
+    fn from_genesis(genesis: Genesis, expected_l2_system_address: Address) -> eyre::Result<Self> {
         let chain_spec = Arc::new(ChainSpec::from_genesis(genesis));
-        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec));
-        Self {
+        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec))?;
+        Ok(Self {
             chain_spec,
             evm_config,
             expected_l2_system_address,
-        }
+        })
     }
 
     #[cfg(test)]

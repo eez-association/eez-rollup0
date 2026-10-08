@@ -670,7 +670,8 @@ mod tests {
     fn fixture() -> Fixture {
         let evm_config = EezEvmConfig::new(Arc::new(
             ChainSpecBuilder::mainnet().cancun_activated().build(),
-        ));
+        ))
+        .unwrap();
 
         let provider: MockEthProvider = MockEthProvider::new();
         provider.add_account(

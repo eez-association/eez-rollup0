@@ -2734,6 +2734,8 @@ fn write_fixture_genesis(
     genesis.timestamp = ts;
     if let Some(id) = chain_id {
         genesis.config.chain_id = id;
+        // The shared fixture is L2; the Ethereum dev L1 burns its own base fees.
+        genesis.config.extra_fields.remove("feeCollector");
     }
     let dir = tempfile::tempdir().context("genesis tempdir")?;
     let path = dir.path().join(filename);

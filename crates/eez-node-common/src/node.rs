@@ -89,7 +89,7 @@ impl<N: FullNodeTypes<Types = EezNode>> ExecutorBuilder<N> for EezExecutorBuilde
                 "--jit is not supported: the L2 EVM (EezEvmFactory) has no JIT backend"
             )));
         }
-        ready(Ok(EezEvmConfig::new(ctx.chain_spec())))
+        ready(EezEvmConfig::new(ctx.chain_spec()).map_err(Into::into))
     }
 }
 
