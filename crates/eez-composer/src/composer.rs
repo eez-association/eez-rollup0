@@ -15,7 +15,7 @@
 //!   L1-confirmed cursor + batch index are advanced by the Deriver (sole
 //!   writer of [`L1CanonicalHead`](eez_l1::L1CanonicalHead)).
 //!
-//! Each batch is proved by the shared [`Prover`] and sent via the shared
+//! Each batch is attested by the shared [`AttestationQuorum`] and sent via the shared
 //! [`Submitter`] bundle relay.
 
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ use eez_driver::{
 use eez_evm::EezEvmConfig;
 use eez_l1::{BundleTarget, L1Event, SendOutcome, Submitter};
 use eez_primitives::engine::EezEngineTypes;
-use eez_prover::{ActionableProverFailure, BlockWitness, Prover, ProverError, ProvingContext};
+use eez_prover::{ActionableProverFailure, BlockWitness, ProverError, ProvingContext};
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
 use reth_storage_api::{
     BlockReader, BlockSource, StateProvider, StateProviderFactory, TransactionsProvider,
@@ -41,6 +41,7 @@ use reth_storage_api::{
 use tokio::sync::broadcast;
 use tracing::{Level, event};
 
+use crate::attestation_quorum::{AttestationQuorum, assign_proof_systems};
 use crate::held_pool::{HeldPool, HeldTx};
 use crate::ingress::Direction;
 use crate::local::{
@@ -49,7 +50,7 @@ use crate::local::{
 };
 use crate::optimistic::OptimisticallyIncluded;
 use crate::prover_retry::{
-    actionable_held_tx, partition_retryable, prove_with_retry, validate_actionable_prover_failure,
+    actionable_held_tx, partition_retryable, validate_actionable_prover_failure,
 };
 use crate::rollup::RollupState;
 
@@ -88,13 +89,10 @@ pub struct CrossChainExecCtx {
     /// the L1 block. Default: 10 gwei (well above the smoke's
     /// `cast mktx --gas-price 2 gwei` user_tx).
     pub l1_post_batch_priority_fee: u128,
-    /// Address of the rollup's on-chain proof-system contract, embedded
-    /// in `batch.proofSystems[0]`; `EEZ.postAndVerifyBatch` iterates
-    /// `proofSystems[]` and calls `verify` on each. Deployment registers
-    /// `ECDSAProofSystem`, which requires
-    /// `ECDSA.recover(publicInputsHash, proof) == signer`; the remote proof
-    /// signer signs that exact hash after validating the batch.
-    pub ecdsa_proof_system_address: Address,
+    /// The EEZ registry, which names the settled rollup's manager contract
+    /// (`Rollup.sol`). Several attesters read its `threshold()` and their
+    /// registration for every batch, since the owner may change them.
+    pub eez_registry: Address,
 }
 
 impl std::fmt::Debug for CrossChainExecCtx {
@@ -271,7 +269,7 @@ impl std::fmt::Debug for CrossChainWiring {
 /// bundle's inclusion block.
 pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 
-/// Stand-in for `proofs[0]` when sizing before the prover runs (ECDSA is 65 B).
+/// Stand-in for each proof when sizing before the attesters run (ECDSA is 65 B).
 const MAX_PROOF_BYTES: usize = 128;
 
 /// Ceiling on a postBatch's gas limit (`EEZ_MAX_POSTBATCH_GAS` overrides): the
@@ -290,9 +288,23 @@ const POSTBATCH_BASE_GAS_PIN: u64 = 160_000;
 /// deploy for a new sender. Same pin test; measured 334k worst case, 10% slack.
 const POSTBATCH_ENTRY_GAS_PIN: u64 = 370_000;
 
-/// Below this the drain admits nothing and evicts the first held tx as poison.
-const MIN_VIABLE_POSTBATCH_GAS: u64 =
-    projected_postbatch_gas(2, 0, 0).saturating_add(POSTBATCH_DRAIN_MARGIN);
+/// Each proof system past the first costs a manager vkey read and a verify
+/// call. Same pin test; measured 12,264 worst case (sixteen), 10% slack.
+const POSTBATCH_PROOF_SYSTEM_GAS_PIN: u64 = 14_000;
+
+/// Execution the extra proofs of a batch carrying `proof_systems` add, calldata
+/// aside.
+const fn attestation_gas(proof_systems: u64) -> u64 {
+    POSTBATCH_PROOF_SYSTEM_GAS_PIN.saturating_mul(proof_systems.saturating_sub(1))
+}
+
+/// Below this the drain of a batch carrying `proof_systems` proofs admits
+/// nothing and evicts the first held tx as poison.
+const fn min_viable_postbatch_gas(proof_systems: u64) -> u64 {
+    projected_postbatch_gas(2, 0, 0)
+        .saturating_add(attestation_gas(proof_systems))
+        .saturating_add(POSTBATCH_DRAIN_MARGIN)
+}
 
 /// EIP-7623 calldata floor — below it the tx is invalid and dies at simulation.
 fn calldata_floor_gas(calldata: &[u8]) -> u64 {
@@ -364,10 +376,13 @@ struct PostBatchGasBudget {
 }
 
 impl PostBatchGasBudget {
-    fn new(max_gas: u64) -> Self {
+    /// A budget for a batch that may carry a proof from each of
+    /// `proof_systems` attesters.
+    fn new(max_gas: u64, proof_systems: u64) -> Self {
         Self {
             cap: max_gas.saturating_sub(POSTBATCH_DRAIN_MARGIN),
-            projected: projected_postbatch_gas(1, 0, 0),
+            projected: projected_postbatch_gas(1, 0, 0)
+                .saturating_add(attestation_gas(proof_systems)),
         }
     }
 
@@ -436,10 +451,12 @@ struct EmissionLimits {
     max_blocks: u64,
     /// Gas limit every postBatch is signed with, and the cap the drain uses.
     max_gas: u64,
+    /// Configured attesters: a batch may carry a proof from each.
+    attesters: u64,
 }
 
 impl EmissionLimits {
-    fn from_env(timing: RollupTiming) -> Self {
+    fn from_env(timing: RollupTiming, attesters: u64) -> Self {
         // Absent, malformed, and zero all mean "unset" — fall back to the default.
         let read_var = |var: &str| {
             std::env::var(var)
@@ -451,7 +468,10 @@ impl EmissionLimits {
         let requested_blocks = read_var("EEZ_MAX_BLOCKS_PER_BATCH");
         let requested_gas = read_var("EEZ_MAX_POSTBATCH_GAS");
         let max_blocks = grid_aligned_cap(requested_blocks.unwrap_or(MAX_BLOCKS_PER_BATCH), k);
-        let max_gas = clamp_max_postbatch_gas(requested_gas.unwrap_or(DEFAULT_MAX_POSTBATCH_GAS));
+        let max_gas = clamp_max_postbatch_gas(
+            requested_gas.unwrap_or(DEFAULT_MAX_POSTBATCH_GAS),
+            attesters,
+        );
         // The one place the effective bounds are visible, adjusted or not.
         event!(
             name: "eez.composer.emission.limits",
@@ -467,6 +487,7 @@ impl EmissionLimits {
             timing,
             max_blocks,
             max_gas,
+            attesters,
         }
     }
 }
@@ -690,10 +711,11 @@ impl From<&str> for PreparePostBatchError {
 }
 
 /// Both ends are unusable and clamp to the default: above it no tx is valid
-/// (EIP-7825), and below [`MIN_VIABLE_POSTBATCH_GAS`] every emission path
-/// refuses forever.
-fn clamp_max_postbatch_gas(requested: u64) -> u64 {
-    if (MIN_VIABLE_POSTBATCH_GAS..=DEFAULT_MAX_POSTBATCH_GAS).contains(&requested) {
+/// (EIP-7825), and below [`min_viable_postbatch_gas`] for `attesters` proofs
+/// every emission path refuses forever.
+fn clamp_max_postbatch_gas(requested: u64, attesters: u64) -> u64 {
+    let min_viable = min_viable_postbatch_gas(attesters);
+    if (min_viable..=DEFAULT_MAX_POSTBATCH_GAS).contains(&requested) {
         return requested;
     }
     event!(
@@ -701,7 +723,7 @@ fn clamp_max_postbatch_gas(requested: u64) -> u64 {
         Level::ERROR,
         requested,
         clamped_to = DEFAULT_MAX_POSTBATCH_GAS,
-        min_viable = MIN_VIABLE_POSTBATCH_GAS,
+        min_viable,
         "EEZ_MAX_POSTBATCH_GAS is out of range (must leave room for the drain margin plus one held tx, and stay within the EIP-7825 tx gas cap) — clamping to the default",
     );
     DEFAULT_MAX_POSTBATCH_GAS
@@ -761,12 +783,12 @@ alloy_sol_types::sol! {
 /// L1-confirmed escrow (`rollups(rid).etherBalance`) an outbound withdrawal draws
 /// down. `None` on any read failure, so the caller skips this early rejection;
 /// the on-chain escrow check remains authoritative.
-async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -> Option<U256> {
-    let eez = std::env::var("EEZ_REGISTRY_ADDRESS")
-        .ok()?
-        .parse::<Address>()
-        .ok()?;
-    IEEZReader::new(eez, provider)
+async fn read_rollup_escrow(
+    provider: &alloy_provider::RootProvider,
+    registry: Address,
+    rid: u64,
+) -> Option<U256> {
+    IEEZReader::new(registry, provider)
         .rollups(rid)
         .call()
         .await
@@ -1068,8 +1090,8 @@ fn ensure_submission_identity(
 struct Inner<L2: BlockReader> {
     /// Per-rollup state keyed by rollup ID.
     rollups: HashMap<u64, RollupState<L2>>,
-    /// Shared across rollups: one prover, one submitter.
-    prover: Arc<dyn Prover>,
+    /// Shared across rollups: one attester set, one submitter.
+    quorum: AttestationQuorum,
     submitter: Submitter,
     /// EVM config — used by [`build_sync_block`] to construct the
     /// per-Sync-slot block via reth-evm `BlockBuilder`.
@@ -1095,7 +1117,7 @@ impl<L2: BlockReader> std::fmt::Debug for Composer<L2> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Composer")
             .field("rollup_ids", &self.inner.rollups.keys().collect::<Vec<_>>())
-            .field("prover", &self.inner.prover)
+            .field("quorum", &self.inner.quorum)
             .field("submitter", &self.inner.submitter)
             .finish()
     }
@@ -1114,7 +1136,7 @@ where
     /// cross-chain postBatch signer does not match the Submitter's poster.
     pub fn new(
         rollups: HashMap<u64, RollupState<L2>>,
-        prover: Arc<dyn Prover>,
+        quorum: AttestationQuorum,
         evm_config: EezEvmConfig,
         cross_chain: CrossChainWiring,
         committer: BlockCommitterHandle<EezEngineTypes>,
@@ -1126,16 +1148,17 @@ where
         let post_batch_signer = cross_chain.exec_ctx.l1_poster_signer.address();
         ensure_submission_identity(submitter_poster, post_batch_signer)?;
 
+        let emission = EmissionLimits::from_env(timing, quorum.len() as u64);
         Ok(Self {
             inner: Arc::new(Inner {
                 rollups,
-                prover,
+                quorum,
                 submitter,
                 evm_config,
                 cross_chain,
                 committer,
                 witness_source,
-                emission: EmissionLimits::from_env(timing),
+                emission,
             }),
         })
     }
@@ -2157,7 +2180,8 @@ where
         let mut transient: Option<(String, Vec<(usize, HeldTx)>)> = None;
         // Gas, not the tx cap, is what really bounds this bundle; overflow stays
         // held for later slots.
-        let mut budget = PostBatchGasBudget::new(self.inner.emission.max_gas);
+        let mut budget =
+            PostBatchGasBudget::new(self.inner.emission.max_gas, self.inner.emission.attesters);
         // Set by a budget cut: the tx that did not fit plus everything after it,
         // owed back to the pool unpenalized.
         let mut deferred: Vec<(usize, HeldTx)> = Vec::new();
@@ -2305,7 +2329,8 @@ where
                     if need > U256::ZERO {
                         if escrow_remaining.is_none() {
                             escrow_remaining =
-                                read_rollup_escrow(&ctx.l1_provider, rollup_id).await;
+                                read_rollup_escrow(&ctx.l1_provider, ctx.eez_registry, rollup_id)
+                                    .await;
                         }
                         if let Some(avail) = escrow_remaining
                             && need > avail
@@ -2372,11 +2397,14 @@ where
                     let cost =
                         projected_tx_l1_gas(&l1_entries, &l1_entries, &held.raw_tx, target_gas);
                     if !budget.try_accept(cost) {
-                        rejected_cost = Some(projected_postbatch_gas(
-                            cost.entries,
-                            cost.calldata_gas,
-                            cost.target_gas,
-                        ));
+                        rejected_cost = Some(
+                            projected_postbatch_gas(
+                                cost.entries,
+                                cost.calldata_gas,
+                                cost.target_gas,
+                            )
+                            .saturating_add(attestation_gas(self.inner.emission.attesters)),
+                        );
                         deferred = abort_rest(
                             Some((idx, held)),
                             &mut out_iter,
@@ -2723,11 +2751,14 @@ where
                         0,
                     );
                     if !budget.try_accept(cost) {
-                        rejected_cost = Some(projected_postbatch_gas(
-                            cost.entries,
-                            cost.calldata_gas,
-                            cost.target_gas,
-                        ));
+                        rejected_cost = Some(
+                            projected_postbatch_gas(
+                                cost.entries,
+                                cost.calldata_gas,
+                                cost.target_gas,
+                            )
+                            .saturating_add(attestation_gas(self.inner.emission.attesters)),
+                        );
                         deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
                         break;
                     }
@@ -3855,7 +3886,7 @@ where
         bundle_target: BundleTarget,
     ) -> Result<Option<Bytes>, PreparePostBatchError> {
         use alloy_sol_types::SolCall;
-        use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
+        use eez_protocol::abi::postAndVerifyBatchCall;
 
         let sync_block_hash = terminal_header.hash();
 
@@ -4061,11 +4092,13 @@ where
         // Registry-id settlement gate: refuse a batch carrying any non-registry
         // destinationRollupId (e.g. an un-rewritten MAINNET(0) outbound entry).
         ensure_batch_registry_native(&batch, rollup_id)?;
-        batch.proofSystems = vec![ctx.ecdsa_proof_system_address];
-        batch.rollupIdsWithProofSystems = vec![RollupIdWithProofSystemsSol {
-            rollupId: rollup_id,
-            proofSystemIndexes: vec![0u64],
-        }];
+        // Every configured attester until the quorum answers; the settled
+        // batch then names exactly the proof systems whose proofs it carries.
+        assign_proof_systems(
+            &mut batch,
+            rollup_id,
+            self.inner.quorum.proof_systems().collect(),
+        );
         // Encode the full L2 block range this batch covers, not just the
         // Sync block: the composer accumulates intermediate live blocks between
         // Sync slots and the deriver must replay all of them. Range:
@@ -4227,8 +4260,10 @@ where
         // Priced on the encoded candidate before witnesses and proving; `Ok(None)`
         // is over-budget, not an error, and the caller chooses what to do.
         let ceiling = self.inner.emission.max_gas;
+        // Sized for every configured attester: the grace window can collect a
+        // proof from each of them.
         let mut sized = batch.clone();
-        sized.proofs = vec![Bytes::from(vec![0xffu8; MAX_PROOF_BYTES])];
+        sized.proofs = vec![Bytes::from(vec![0xffu8; MAX_PROOF_BYTES]); self.inner.quorum.len()];
         let projected = postAndVerifyBatchCall { batch: sized }.abi_encode();
         // EIP-7623 charges max(standard, floor). Standard now covers the bytes the
         // drain could not see; floor is what a fat, entry-light batch hits.
@@ -4237,6 +4272,7 @@ where
             calldata_gas(&projected),
             outbound_target_gas,
         )
+        .saturating_add(attestation_gas(self.inner.emission.attesters))
         .max(calldata_floor_gas(&projected));
         if projected_gas > ceiling {
             event!(
@@ -4256,63 +4292,17 @@ where
         // Prove the assembled window (proofs[] empty — not part of the
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
         // `blocks`. Settlement path, off block production.
-        let block_witnesses = match self.inner.witness_source.as_ref() {
-            // Remote-prover mode. Intermediate blocks `[from..sync)` are committed
-            // (served by the witness store); a freshly-built endpoint isn't, so
-            // capture it here from the in-memory block.
-            Some(src) => {
-                // Witness generation is a CPU-heavy trie walk / re-exec. Run it on
-                // the blocking pool so it can't stall async worker threads on the
-                // settlement path. (Store hits are cheap; the rare store miss and
-                // the endpoint capture are the heavy parts.)
-                let src = Arc::clone(src);
-                let l2_provider = Arc::clone(
-                    &self
-                        .inner
-                        .rollups
-                        .get(&rollup_id)
-                        .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
-                        .l2_provider,
-                );
-                let evm_config = self.inner.evm_config.clone();
-                let terminal_block = sync_block.cloned();
-                tokio::task::spawn_blocking(move || -> Result<Vec<BlockWitness>, String> {
-                    let mut ws = (from..sync_block_number)
-                        .map(|n| src.block_witness(n))
-                        .collect::<Result<Vec<_>, String>>()
-                        .map_err(|e| format!("witness_source: {e}"))?;
-                    match terminal_block {
-                        // Just-built: nothing can serve an uncommitted block, and
-                        // its parent state is hot, so re-execute in-memory.
-                        Some(block) => ws.push(
-                            block_witness(
-                                l2_provider.as_ref(),
-                                &evm_config,
-                                &block,
-                                ExecutionWitnessMode::Legacy,
-                            )
-                            .map_err(|e| {
-                                format!(
-                                    "terminal-block witness (block {}): {e}",
-                                    block.header().number()
-                                )
-                            })?,
-                        ),
-                        // Committed (historical chunk): from the store — an
-                        // in-memory capture needs a possibly-pruned parent state.
-                        None => ws.push(
-                            src.block_witness(sync_block_number)
-                                .map_err(|e| format!("witness_source: {e}"))?,
-                        ),
-                    }
-                    Ok(ws)
-                })
-                .await
-                .map_err(|e| format!("witness spawn_blocking join: {e}"))??
-            }
-            // Tests may use a lightweight prover without a witness source.
-            None => Vec::new(),
-        };
+        // The manager's attestation settings are read while the witnesses build.
+        let (block_witnesses, round) = tokio::join!(
+            self.window_witnesses(rollup_id, from, sync_block_number, sync_block),
+            self.inner
+                .quorum
+                .round(&ctx.l1_provider, ctx.eez_registry, rollup_id),
+        );
+        let block_witnesses = block_witnesses?;
+        // Unreadable or unreachable attestation settings are not a candidate's
+        // fault: requeue without charging.
+        let round = round.map_err(|error| error.to_string())?;
         let proving_ctx = ProvingContext {
             rollup_id,
             from_block: from,
@@ -4321,15 +4311,11 @@ where
             blocks: block_witnesses,
             l1_block_hash: None, // timeless batch (blockNumber 0)
         };
-        let proof = match prove_with_retry(
-            self.inner.prover.as_ref(),
-            proving_ctx,
-            self.inner.emission.timing,
-            bundle_target,
-        )
-        .await
+        let attestations = match round
+            .attest(&proving_ctx, self.inner.emission.timing, bundle_target)
+            .await
         {
-            Ok(proof) => proof,
+            Ok(attestations) => attestations,
             Err(error) => {
                 let Some(failure) = error.actionable_failure() else {
                     return Err(PreparePostBatchError::Prover(error));
@@ -4350,7 +4336,12 @@ where
                 return Err(PreparePostBatchError::Actionable(failure));
             }
         };
-        batch.proofs = vec![proof];
+        assign_proof_systems(
+            &mut batch,
+            rollup_id,
+            attestations.iter().map(|a| a.proof_system).collect(),
+        );
+        batch.proofs = attestations.into_iter().map(|a| a.proof).collect();
 
         let calldata = postAndVerifyBatchCall {
             batch: batch.clone(),
@@ -4375,17 +4366,10 @@ where
             "postBatch anchors: cursor block hash, claimed final Sync block hash",
         );
 
-        // Read the deployment-specific EEZ registry address from the
-        // environment and reject missing or malformed values.
-        let eez_address = std::env::var("EEZ_REGISTRY_ADDRESS")
-            .ok()
-            .and_then(|s| s.parse::<Address>().ok())
-            .ok_or("EEZ_REGISTRY_ADDRESS missing or not a valid address")?;
-
         Ok(sign_post_batch_tx(
             &ctx.l1_poster_signer,
             &ctx.l1_provider,
-            eez_address,
+            ctx.eez_registry,
             calldata,
             ctx.l1_chain_id,
             ctx.l1_post_batch_priority_fee,
@@ -4393,6 +4377,73 @@ where
         )
         .await
         .map(Some)?)
+    }
+
+    /// The witnesses of blocks `from..=to` the attesters re-execute.
+    async fn window_witnesses(
+        &self,
+        rollup_id: u64,
+        from: u64,
+        to: u64,
+        sync_block: Option<&reth_primitives_traits::RecoveredBlock<eez_primitives::Block>>,
+    ) -> Result<Vec<BlockWitness>, PreparePostBatchError> {
+        // Tests may use a lightweight prover without a witness source.
+        let Some(src) = self.inner.witness_source.as_ref() else {
+            return Ok(Vec::new());
+        };
+        // Remote-prover mode. Intermediate blocks `[from..to)` are committed
+        // (served by the witness store); a freshly-built endpoint isn't, so
+        // capture it here from the in-memory block.
+        // Witness generation is a CPU-heavy trie walk / re-exec. Run it on
+        // the blocking pool so it can't stall async worker threads on the
+        // settlement path. (Store hits are cheap; the rare store miss and
+        // the endpoint capture are the heavy parts.)
+        let src = Arc::clone(src);
+        let l2_provider = Arc::clone(
+            &self
+                .inner
+                .rollups
+                .get(&rollup_id)
+                .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
+                .l2_provider,
+        );
+        let evm_config = self.inner.evm_config.clone();
+        let terminal_block = sync_block.cloned();
+        let witnesses =
+            tokio::task::spawn_blocking(move || -> Result<Vec<BlockWitness>, String> {
+                let mut ws = (from..to)
+                    .map(|n| src.block_witness(n))
+                    .collect::<Result<Vec<_>, String>>()
+                    .map_err(|e| format!("witness_source: {e}"))?;
+                match terminal_block {
+                    // Just-built: nothing can serve an uncommitted block, and
+                    // its parent state is hot, so re-execute in-memory.
+                    Some(block) => ws.push(
+                        block_witness(
+                            l2_provider.as_ref(),
+                            &evm_config,
+                            &block,
+                            ExecutionWitnessMode::Legacy,
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "terminal-block witness (block {}): {e}",
+                                block.header().number()
+                            )
+                        })?,
+                    ),
+                    // Committed (historical chunk): from the store — an
+                    // in-memory capture needs a possibly-pruned parent state.
+                    None => ws.push(
+                        src.block_witness(to)
+                            .map_err(|e| format!("witness_source: {e}"))?,
+                    ),
+                }
+                Ok(ws)
+            })
+            .await
+            .map_err(|e| format!("witness spawn_blocking join: {e}"))??;
+        Ok(witnesses)
     }
 }
 
@@ -4635,6 +4686,7 @@ async fn sign_post_batch_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attestation_quorum::MAX_ATTESTERS;
     use alloy_primitives::TxHash;
     use alloy_sol_types::SolValue as _;
 
@@ -5151,28 +5203,28 @@ mod tests {
     #[test]
     fn gas_budget_out_of_range_clamps_to_default() {
         // In range → honoured.
-        assert_eq!(clamp_max_postbatch_gas(12_000_000), 12_000_000);
+        assert_eq!(clamp_max_postbatch_gas(12_000_000, 1), 12_000_000);
         assert_eq!(
-            clamp_max_postbatch_gas(MIN_VIABLE_POSTBATCH_GAS),
-            MIN_VIABLE_POSTBATCH_GAS
+            clamp_max_postbatch_gas(min_viable_postbatch_gas(1), 1),
+            min_viable_postbatch_gas(1)
         );
         assert_eq!(
-            clamp_max_postbatch_gas(MIN_VIABLE_POSTBATCH_GAS - 1),
+            clamp_max_postbatch_gas(min_viable_postbatch_gas(1) - 1, 1),
             DEFAULT_MAX_POSTBATCH_GAS
         );
         assert_eq!(
-            clamp_max_postbatch_gas(DEFAULT_MAX_POSTBATCH_GAS),
+            clamp_max_postbatch_gas(DEFAULT_MAX_POSTBATCH_GAS, 1),
             DEFAULT_MAX_POSTBATCH_GAS
         );
-        assert_eq!(clamp_max_postbatch_gas(1), DEFAULT_MAX_POSTBATCH_GAS);
+        assert_eq!(clamp_max_postbatch_gas(1, 1), DEFAULT_MAX_POSTBATCH_GAS);
         // Above the EIP-7825 tx gas cap no tx is valid at any block limit.
         assert_eq!(
-            clamp_max_postbatch_gas(DEFAULT_MAX_POSTBATCH_GAS + 1),
+            clamp_max_postbatch_gas(DEFAULT_MAX_POSTBATCH_GAS + 1, 1),
             DEFAULT_MAX_POSTBATCH_GAS
         );
     }
 
-    /// The forge pin test re-declares both constants as literals, so a change
+    /// The forge pin test re-declares the constants as literals, so a change
     /// here would leave it measuring the old value in silence. Bind them.
     #[test]
     fn solidity_pin_test_mirrors_the_rust_gas_pins() {
@@ -5180,6 +5232,10 @@ mod tests {
         for (name, rust) in [
             ("POSTBATCH_BASE_GAS_PIN", POSTBATCH_BASE_GAS_PIN),
             ("POSTBATCH_ENTRY_GAS_PIN", POSTBATCH_ENTRY_GAS_PIN),
+            (
+                "POSTBATCH_PROOF_SYSTEM_GAS_PIN",
+                POSTBATCH_PROOF_SYSTEM_GAS_PIN,
+            ),
         ] {
             let decl = format!("uint256 private constant {name} = ");
             let rest = sol
@@ -5204,16 +5260,30 @@ mod tests {
     /// Any ceiling the clamp accepts must let the drain take at least one tx.
     #[test]
     fn the_lowest_accepted_ceiling_still_admits_one_held_tx() {
-        let mut budget = PostBatchGasBudget::new(MIN_VIABLE_POSTBATCH_GAS);
-        assert!(
-            budget.try_accept(TxL1Gas {
-                entries: 1,
-                calldata_gas: 0,
-                target_gas: 0,
-            }),
-            "the lowest accepted ceiling admits no tx — every drain would evict \
-             its first held tx as poison",
+        for attesters in 1..=MAX_ATTESTERS as u64 {
+            let lowest = min_viable_postbatch_gas(attesters);
+            assert_eq!(clamp_max_postbatch_gas(lowest, attesters), lowest);
+            let mut budget = PostBatchGasBudget::new(lowest, attesters);
+            assert!(
+                budget.try_accept(TxL1Gas {
+                    entries: 1,
+                    calldata_gas: 0,
+                    target_gas: 0,
+                }),
+                "with {attesters} attesters the lowest accepted ceiling admits no tx — every \
+                 drain would evict its first held tx as poison",
+            );
+        }
+    }
+
+    /// One attester keeps the floor it had before attestation quorums.
+    #[test]
+    fn a_single_attester_keeps_the_single_proof_floor() {
+        assert_eq!(
+            min_viable_postbatch_gas(1),
+            projected_postbatch_gas(2, 0, 0) + POSTBATCH_DRAIN_MARGIN
         );
+        assert!(min_viable_postbatch_gas(7) > min_viable_postbatch_gas(1));
     }
 
     /// The pre-prove gate sizes the batch with a `MAX_PROOF_BYTES` stand-in for
@@ -5324,6 +5394,20 @@ mod tests {
         );
     }
 
+    /// Every proof past the first is a verify call the batch pays for, so the
+    /// drain starts that much further into its budget.
+    #[test]
+    fn drain_budget_charges_every_attester_past_the_first() {
+        let single = PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1);
+        let seven = PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 7);
+        assert_eq!(
+            seven.projected - single.projected,
+            6 * POSTBATCH_PROOF_SYSTEM_GAS_PIN
+        );
+        assert_eq!(attestation_gas(0), 0);
+        assert_eq!(attestation_gas(1), 0);
+    }
+
     #[test]
     fn drain_budget_cuts_the_accepted_prefix_below_the_cap() {
         let entries = [outbound_entry()];
@@ -5339,7 +5423,7 @@ mod tests {
         };
         assert_eq!(cost.calldata_gas, 2 * encoded + calldata_gas(&raw_tx));
 
-        let mut budget = PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS);
+        let mut budget = PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1);
         // The drain leaves the belt's margin below the cap, or the belt refuses
         // what the drain accepted and the same set requeues forever.
         assert_eq!(

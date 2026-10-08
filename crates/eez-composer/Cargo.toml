@@ -26,6 +26,7 @@ alloy-network.workspace          = true
 alloy-primitives.workspace       = true
 alloy-contract.workspace         = true
 alloy-provider.workspace         = true
+alloy-rpc-client.workspace       = true
 alloy-rpc-types-engine.workspace = true
 alloy-signer-local.workspace     = true
 alloy-sol-types.workspace        = true
@@ -45,10 +46,11 @@ reth-storage-api.workspace                = true
 revm.workspace = true
 
 # async + diagnostics
-async-trait.workspace = true
-thiserror.workspace   = true
-tokio.workspace       = true
-tracing.workspace     = true
+async-trait.workspace  = true
+futures-util.workspace = true
+thiserror.workspace    = true
+tokio.workspace        = true
+tracing.workspace      = true
 
 [dev-dependencies]
 # MockEthProvider: an in-memory StateProviderFactory for the prefix-state

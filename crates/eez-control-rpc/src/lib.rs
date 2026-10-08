@@ -24,6 +24,10 @@ use prost::Message;
 /// (encode) and server (decode).
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024 * 1024;
 
+/// Largest `ProveResponse` the signer sends and the composer accepts: a 32-byte
+/// hash and a 65-byte signature, with room for framing.
+pub const MAX_PROVE_RESPONSE_BYTES: usize = 1024;
+
 /// Encode one typed [`v1::ProveFailure`] for the gRPC status-details field.
 #[must_use]
 pub fn encode_prove_failure(failure: &v1::ProveFailure) -> Vec<u8> {
