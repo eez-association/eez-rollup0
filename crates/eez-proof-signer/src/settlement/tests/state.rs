@@ -23,17 +23,17 @@ fn rejects_missing_or_non_singular_state_updates() {
     let empty = CanonicalPostBatch::from_decoded_for_test(EvmBatch::default());
     assert_eq!(
         verify_state_update_chain(&empty, expected_rollup_id(), root, root).map(|_| ()),
-        Err(StateUpdateChainError::NoEntries)
+        Err(RollupUpdateChainError::NoEntries)
     );
 
     for entry_index in [0, 1] {
         for actual in [0, 2] {
             let mut batch = state_chain(&[root, root, root]);
-            let update = batch.entries[entry_index].stateUpdates[0].clone();
-            batch.entries[entry_index].stateUpdates = vec![update; actual];
+            let update = batch.entries[entry_index].rollupUpdates[0].clone();
+            batch.entries[entry_index].rollupUpdates = vec![update; actual];
             assert_eq!(
                 verify_state_update_chain(&batch, expected_rollup_id(), root, root).map(|_| ()),
-                Err(StateUpdateChainError::UpdateCount {
+                Err(RollupUpdateChainError::UpdateCount {
                     entry_index,
                     actual,
                 })
@@ -47,31 +47,31 @@ fn rejects_invalid_or_inconsistent_state_update_rollup_ids() {
     let root = B256::ZERO;
 
     let mut zero = state_chain(&[root, root]);
-    zero.entries[0].stateUpdates[0].rollupId = 0;
+    zero.entries[0].rollupUpdates[0].rollupId = 0;
     assert_eq!(
         verify_state_update_chain(&zero, expected_rollup_id(), root, root).map(|_| ()),
-        Err(StateUpdateChainError::ExpectedRollupMismatch {
+        Err(RollupUpdateChainError::ExpectedRollupMismatch {
             expected: 1,
             claimed: 0,
         })
     );
 
     let mut wrong_expected_rollup = state_chain(&[root, root]);
-    wrong_expected_rollup.entries[0].stateUpdates[0].rollupId = 2;
+    wrong_expected_rollup.entries[0].rollupUpdates[0].rollupId = 2;
     assert_eq!(
         verify_state_update_chain(&wrong_expected_rollup, expected_rollup_id(), root, root)
             .map(|_| ()),
-        Err(StateUpdateChainError::ExpectedRollupMismatch {
+        Err(RollupUpdateChainError::ExpectedRollupMismatch {
             expected: 1,
             claimed: 2,
         })
     );
 
     let mut mixed = state_chain(&[root, root, root]);
-    mixed.entries[1].stateUpdates[0].rollupId = 2;
+    mixed.entries[1].rollupUpdates[0].rollupId = 2;
     assert_eq!(
         verify_state_update_chain(&mixed, expected_rollup_id(), root, root).map(|_| ()),
-        Err(StateUpdateChainError::RollupMismatch {
+        Err(RollupUpdateChainError::RollupMismatch {
             entry_index: 1,
             expected: 1,
             claimed: 2,
@@ -89,24 +89,24 @@ fn rejects_wrong_state_update_endpoints_or_a_chain_break() {
 
     assert_eq!(
         verify_state_update_chain(&batch, expected_rollup_id(), wrong, c).map(|_| ()),
-        Err(StateUpdateChainError::InitialBlockMismatch {
+        Err(RollupUpdateChainError::InitialBlockMismatch {
             validated: wrong,
             claimed: a,
         })
     );
     assert_eq!(
         verify_state_update_chain(&batch, expected_rollup_id(), a, wrong).map(|_| ()),
-        Err(StateUpdateChainError::FinalMismatch {
+        Err(RollupUpdateChainError::FinalMismatch {
             validated: wrong,
             claimed: c,
         })
     );
 
     let mut broken = batch;
-    broken.entries[1].stateUpdates[0].currentState = wrong;
+    broken.entries[1].rollupUpdates[0].currentRoot = wrong;
     assert_eq!(
         verify_state_update_chain(&broken, expected_rollup_id(), a, c).map(|_| ()),
-        Err(StateUpdateChainError::ChainBreak {
+        Err(RollupUpdateChainError::ChainBreak {
             entry_index: 1,
             previous_claimed_candidate: b,
             next_claimed_predecessor: wrong,
@@ -135,9 +135,12 @@ fn accepts_only_a_canonical_anchor_for_an_empty_settling_block() {
 fn canonical_anchor_requires_a_zero_ether_delta() {
     let root = B256::ZERO;
     let settling = settling_with_effect_candidates(Vec::new());
-    for claimed in [I256::ONE, -I256::ONE] {
+    for claimed in [
+        alloy_primitives::aliases::I192::ONE,
+        -alloy_primitives::aliases::I192::ONE,
+    ] {
         let mut batch = state_chain(&[root, root]);
-        batch.entries[0].stateUpdates[0].etherDelta = claimed;
+        batch.entries[0].rollupUpdates[0].etherDelta = claimed;
         assert_eq!(
             verify_effect_prefix(&batch, root, &[], &settling).err(),
             Some(EffectPrefixError::NonZeroAnchorEtherDelta { claimed })
@@ -314,7 +317,7 @@ fn rejects_wrong_anchor_or_invalid_effect_checkpoints() {
         verify_effect_prefix(&batch, wrong, &valid_checkpoints, &settling).err(),
         Some(EffectPrefixError::AnchorRootMismatch {
             empty_prefix_hash: wrong,
-            claimed_anchor_post_state: pre_settling,
+            claimed_anchor_root: pre_settling,
         })
     );
     assert_eq!(
@@ -383,7 +386,7 @@ fn effect_checkpoints_cannot_hide_a_post_block_state_change() {
             final_root,
         )
         .map(|_| ()),
-        Err(StateUpdateChainError::FinalMismatch {
+        Err(RollupUpdateChainError::FinalMismatch {
             validated: final_root,
             claimed: transaction_root,
         })

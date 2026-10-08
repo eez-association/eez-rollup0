@@ -6,6 +6,7 @@ import {Test} from "forge-std/Test.sol";
 import {EEZ} from "eez-core-protocol/src/EEZ.sol";
 import {EEZL2} from "eez-core-protocol/src/L2/EEZL2.sol";
 import {Rollup} from "eez-core-protocol/src/rollupContract/Rollup.sol";
+import {deployRollup} from "eez-core-protocol/deployment/RollupDeployment.sol";
 
 import {ECDSAProofSystem} from "../src/ECDSAProofSystem.sol";
 
@@ -17,7 +18,7 @@ contract DeploymentSmokeTest is Test {
     address private constant PROXY_ORIGINAL_ADDRESS = address(bytes20(hex"11223344556677889900aabbccddeeff00112233"));
     uint64 private constant PROXY_ORIGINAL_ROLLUP_ID = 0x0102_0304_0506_0708;
     bytes32 private constant PACKED_PROXY_INFO = 0x000000010203040506070811223344556677889900aabbccddeeff0011223301;
-    bytes32 private constant INITIAL_STATE_ROOT = keccak256("eez deployment smoke initial state");
+    bytes32 private constant INITIAL_ROOT = keccak256("eez deployment smoke initial state");
 
     function testFreshProtocolDeployment() external {
         EEZ eez = new EEZ(RECOVERY_ADDRESS);
@@ -29,25 +30,26 @@ contract DeploymentSmokeTest is Test {
         bytes32[] memory vkeys = new bytes32[](1);
         vkeys[0] = vkey;
 
-        Rollup rollup = new Rollup(address(eez), OWNER, 1, proofSystems, vkeys);
-        uint64 rollupId = eez.registerRollup(address(rollup), INITIAL_STATE_ROOT);
+        Rollup rollup = deployRollup(address(eez), OWNER, 1, proofSystems, vkeys);
+        vm.prank(OWNER);
+        uint64 rollupId = eez.registerRollup(address(rollup), INITIAL_ROOT);
 
-        (address registeredRollup, bytes32 stateRoot, uint256 etherBalance) = eez.rollups(rollupId);
+        (address registeredRollup, bytes32 root, uint256 etherBalance) = eez.rollups(rollupId);
         assertEq(eez.RECOVERY_ADDRESS(), RECOVERY_ADDRESS);
         assertEq(rollupId, 1);
         assertEq(rollup.rollupId(), rollupId);
         assertEq(registeredRollup, address(rollup));
-        assertEq(stateRoot, INITIAL_STATE_ROOT);
+        assertEq(root, INITIAL_ROOT);
         assertEq(etherBalance, 0);
         assertEq(rollup.verificationKey(address(proofSystem)), vkey);
         assertEq(proofSystem.signer(), SIGNER);
 
         // Rust reads this field directly, so verify its raw mapping slot too.
         bytes32 rollupSlot = keccak256(abi.encode(uint256(rollupId), uint256(2)));
-        bytes32 stateRootSlot = bytes32(uint256(rollupSlot) + 1);
-        assertEq(vm.load(address(eez), stateRootSlot), INITIAL_STATE_ROOT);
+        bytes32 rootSlot = bytes32(uint256(rollupSlot) + 1);
+        assertEq(vm.load(address(eez), rootSlot), INITIAL_ROOT);
 
-        EEZL2 eezL2 = new EEZL2(rollupId, SYSTEM_ADDRESS, false);
+        EEZL2 eezL2 = new EEZL2(rollupId, SYSTEM_ADDRESS, false, SYSTEM_ADDRESS);
         assertNotEq(eezL2.SYSTEM_ADDRESS(), address(0));
         assertEq(eezL2.ROLLUP_ID(), rollupId);
         assertEq(eezL2.SYSTEM_ADDRESS(), SYSTEM_ADDRESS);
@@ -60,7 +62,7 @@ contract DeploymentSmokeTest is Test {
         address l1Proxy = eez.createCrossChainProxy(PROXY_ORIGINAL_ADDRESS, PROXY_ORIGINAL_ROLLUP_ID);
         _assertPackedProxyInfo(address(eez), l1Proxy);
 
-        EEZL2 eezL2 = new EEZL2(1, SYSTEM_ADDRESS, false);
+        EEZL2 eezL2 = new EEZL2(1, SYSTEM_ADDRESS, false, SYSTEM_ADDRESS);
         address l2Proxy = eezL2.createCrossChainProxy(PROXY_ORIGINAL_ADDRESS, PROXY_ORIGINAL_ROLLUP_ID);
         _assertPackedProxyInfo(address(eezL2), l2Proxy);
     }

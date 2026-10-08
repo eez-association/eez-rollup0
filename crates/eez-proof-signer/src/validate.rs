@@ -30,7 +30,7 @@ pub struct StateCheckpoint {
     /// State root at this position, before post-block changes.
     pub state_root: B256,
     /// Hash of the candidate block holding exactly this prefix — what settlement
-    /// gates compare an entry's claimed `newState` against.
+    /// gates compare an entry's claimed `newRoot` against.
     pub block_hash: B256,
 }
 

@@ -14,8 +14,8 @@ EEZL2_ADDRESS="0x4200000000000000000000000000000000000007"
 PROXY_VECTOR_ORIGINAL_ADDRESS="0x11223344556677889900aabbccddeeff00112233"
 PROXY_VECTOR_ORIGINAL_ROLLUP_ID=0
 EXPECTED_PROXY_SALT="0x7c432a8c413604983b9f189bb5b6650220b6b9b038267802fef07276a796e168"
-EXPECTED_PROXY_INIT_CODE_HASH="0x100891b4002d6e684a398f97a28410884f82cdafb956bc3840e74309b2f510d3"
-EXPECTED_PROXY_ADDRESS="0x7a18a09ef542498869176e60af9275d9dcc73e66"
+EXPECTED_PROXY_INIT_CODE_HASH="0x26f77730044fbffb547593b1a676eb53cbbb9a57879c3f2cf090cee88a283a4a"
+EXPECTED_PROXY_ADDRESS="0xc789b12d9aa4a9f0f0130346d80f749be743ebde"
 
 usage() {
     cat >&2 <<'EOF'
@@ -177,8 +177,8 @@ then
 fi
 runtime_hash="$(cast keccak "$runtime")"
 
-# Bind the canonical proxy creation bytecode, constructor encoding, and CREATE2
-# formula to an independent fixed vector.
+# Bind the canonical proxy creation bytecode and CREATE2 formula to an
+# independent fixed vector.
 proxy_artifact="$build_root/out/CrossChainProxy.sol/CrossChainProxy.json"
 proxy_creation_code="$(jq -er \
     '.bytecode.object | select(type == "string" and startswith("0x"))' \
@@ -187,9 +187,7 @@ proxy_salt="$(cast keccak "$(
     cast abi-encode --packed "f(uint64,address)" \
         "$PROXY_VECTOR_ORIGINAL_ROLLUP_ID" "$PROXY_VECTOR_ORIGINAL_ADDRESS"
 )")"
-proxy_constructor_args="$(cast abi-encode "f(address)" "$EEZL2_ADDRESS")"
-proxy_init_code="$(cast concat-hex "$proxy_creation_code" "$proxy_constructor_args")"
-proxy_init_code_hash="$(cast keccak "$proxy_init_code")"
+proxy_init_code_hash="$(cast keccak "$proxy_creation_code")"
 create2_preimage="$(cast concat-hex \
     0xff "$EEZL2_ADDRESS" "$proxy_salt" "$proxy_init_code_hash")"
 proxy_digest="$(cast keccak "$create2_preimage")"

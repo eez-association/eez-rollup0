@@ -36,7 +36,7 @@ fn inbound_candidate_requires_the_exact_l2_shape_and_rolling_hash() {
     let [sidecar_call] = sidecar.l2ToL1Calls.as_slice() else {
         panic!("derived inbound sidecar must contain one call");
     };
-    assert!(sidecar.stateUpdates.is_empty());
+    assert!(sidecar.rollupUpdates.is_empty());
     assert_eq!(sidecar.destinationRollupId, 1);
     assert!(sidecar.success);
     assert_eq!(sidecar_call.sourceRollupId, 0);
@@ -108,7 +108,7 @@ fn inbound_candidate_requires_the_exact_l2_shape_and_rolling_hash() {
     }
 
     let mut wrong_source_rollup = call;
-    wrong_source_rollup.sourceRollup = 2;
+    wrong_source_rollup._entries[0].incomingCalls[0].sourceRollupId = 2;
     assert_eq!(
         inspect(&wrong_source_rollup),
         Some(InboundObservationError::SourceRollup { actual: 2 })
@@ -123,15 +123,8 @@ fn inbound_candidate_requires_the_exact_l2_shape_and_rolling_hash() {
         } else {
             incoming.l2_rollup_id = RollupId(2);
         }
-        let entry = eez_protocol::entries::build_l2_incoming_entry(incoming.clone()).unwrap();
-        let calldata = eez_protocol::entries::encode_execute_incoming(
-            incoming.target,
-            incoming.value,
-            incoming.data,
-            incoming.source,
-            incoming.source_rollup_id,
-            entry,
-        );
+        let entry = eez_protocol::entries::build_l2_incoming_entry(incoming).unwrap();
+        let calldata = eez_protocol::entries::encode_execute_incoming(entry);
         let error =
             inspect_inbound_candidate(value, &calldata, true, expected_rollup_id()).unwrap_err();
         if source_changed {
@@ -231,11 +224,12 @@ fn inbound_effect_entries_handle_mixed_effect_positions_without_authorizing_outb
     let inbound = &mut batch.entries[2];
     inbound.proxyEntryHash = observation.recomputed_call_hash;
     inbound.returnData = observation.return_data.clone();
-    inbound.stateUpdates[0].etherDelta = I256::try_from(observation.value).unwrap();
+    inbound.rollupUpdates[0].etherDelta =
+        eez_protocol::abi::u256_to_i192(observation.value).unwrap();
     inbound.rollingHash = eez_protocol::rolling_hash::EntryRollingHash::seed_for_l1(
         [(
-            inbound.stateUpdates[0].rollupId,
-            inbound.stateUpdates[0].currentState,
+            inbound.rollupUpdates[0].rollupId,
+            inbound.rollupUpdates[0].currentRoot,
         )],
         inbound.proxyEntryHash,
     )
@@ -337,11 +331,11 @@ fn inbound_effect_entries_require_the_canonical_deferred_shape() {
     );
 
     let entry = &valid.entries[1];
-    let update = &entry.stateUpdates[0];
+    let update = &entry.rollupUpdates[0];
     assert_eq!(
         entry.rollingHash,
         eez_protocol::rolling_hash::EntryRollingHash::seed_for_l1(
-            [(update.rollupId, update.currentState)],
+            [(update.rollupId, update.currentRoot)],
             entry.proxyEntryHash,
         )
         .current(),
@@ -377,21 +371,21 @@ fn inbound_effect_entries_require_the_canonical_deferred_shape() {
     );
 
     let mut wrong_delta = valid;
-    wrong_delta.entries[1].stateUpdates[0].etherDelta = I256::ZERO;
+    wrong_delta.entries[1].rollupUpdates[0].etherDelta = alloy_primitives::aliases::I192::ZERO;
     let plan = effect_plan(&wrong_delta, &settling);
     assert_eq!(
         verify_inbound_effect_entries(&plan).err(),
         Some(InboundEffectError::EtherDeltaMismatch {
             entry_index: 1,
-            expected: I256::from_raw(U256::from(5)),
-            actual: I256::ZERO,
+            expected: eez_protocol::abi::u256_to_i192(U256::from(5)).unwrap(),
+            actual: alloy_primitives::aliases::I192::ZERO,
         })
     );
 }
 
 #[test]
-fn inbound_effect_entries_accept_the_int256_maximum_and_reject_the_next_value() {
-    let max_value = (U256::from(1) << 255) - U256::from(1);
+fn inbound_effect_entries_accept_the_int192_maximum_and_reject_the_next_value() {
+    let max_value = (U256::from(1) << 191) - U256::from(1);
     let max_settling = SettlingBlockObservations::for_test(
         vec![true],
         vec![observed_inbound_candidate(0, max_value, true)],
@@ -400,9 +394,12 @@ fn inbound_effect_entries_accept_the_int256_maximum_and_reject_the_next_value() 
     let max_batch = bindable_inbound_batch(&max_settling);
     let max_plan = effect_plan(&max_batch, &max_settling);
     assert!(verify_inbound_effect_entries(&max_plan).is_ok());
-    assert_eq!(max_batch.entries[1].stateUpdates[0].etherDelta, I256::MAX);
+    assert_eq!(
+        max_batch.entries[1].rollupUpdates[0].etherDelta,
+        alloy_primitives::aliases::I192::MAX
+    );
 
-    let value = U256::from(1) << 255;
+    let value = U256::from(1) << 191;
     let candidate = observed_inbound_candidate(0, value, true);
     let observation = candidate.inspection.as_ref().unwrap();
     let call_hash = observation.recomputed_call_hash;
@@ -411,8 +408,8 @@ fn inbound_effect_entries_accept_the_int256_maximum_and_reject_the_next_value() 
     let mut batch = effect_batch(&[B256::ZERO; 3], &[ClaimedEntryShape::Inbound]);
     batch.entries[1].proxyEntryHash = call_hash;
     batch.entries[1].returnData = return_data;
-    let update = &batch.entries[1].stateUpdates[0];
-    let rolling_seed = (update.rollupId, update.currentState);
+    let update = &batch.entries[1].rollupUpdates[0];
+    let rolling_seed = (update.rollupId, update.currentRoot);
     let proxy_entry_hash = batch.entries[1].proxyEntryHash;
     batch.entries[1].rollingHash =
         eez_protocol::rolling_hash::EntryRollingHash::seed_for_l1([rolling_seed], proxy_entry_hash)

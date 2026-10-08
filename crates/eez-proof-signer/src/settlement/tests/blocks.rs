@@ -220,7 +220,6 @@ fn strict_inbound_observation_rejects_composer_controlled_shape_changes() {
     let call = executeIncomingCrossChainCallCall::abi_decode(&calldata).unwrap();
 
     let mut wrong_source_rollup = call.clone();
-    wrong_source_rollup.sourceRollup = 2;
     wrong_source_rollup._entries[0].incomingCalls[0].sourceRollupId = 2;
     assert_eq!(
         inspect_inbound_candidate(
@@ -233,7 +232,7 @@ fn strict_inbound_observation_rejects_composer_controlled_shape_changes() {
     );
 
     type Mutation = fn(&mut executeIncomingCrossChainCallCall);
-    let mutations: [(Mutation, InboundObservationError); 12] = [
+    let mutations: [(Mutation, InboundObservationError); 9] = [
         (
             |call| call._entries.clear(),
             InboundObservationError::EntryCount { actual: 0 },
@@ -276,32 +275,15 @@ fn strict_inbound_observation_rejects_composer_controlled_shape_changes() {
             },
         ),
         (
-            |call| call._entries[0].incomingCalls[0].targetAddress = Address::ZERO,
-            InboundObservationError::OuterInnerMismatch {
-                field: "destination",
-            },
-        ),
-        (
             |call| call._entries[0].incomingCalls[0].value = U256::from(8),
-            InboundObservationError::OuterInnerMismatch { field: "value" },
-        ),
-        (
-            |call| {
-                call._entries[0].incomingCalls[0].data = Bytes::from_static(&[0xff]);
-            },
-            InboundObservationError::OuterInnerMismatch { field: "data" },
-        ),
-        (
-            |call| call._entries[0].incomingCalls[0].sourceAddress = Address::ZERO,
-            InboundObservationError::OuterInnerMismatch {
-                field: "sourceAddress",
+            InboundObservationError::NativeValueMismatch {
+                expected: U256::from(8),
+                actual: U256::from(7),
             },
         ),
         (
             |call| call._entries[0].incomingCalls[0].sourceRollupId = 1,
-            InboundObservationError::OuterInnerMismatch {
-                field: "sourceRollup",
-            },
+            InboundObservationError::SourceRollup { actual: 1 },
         ),
     ];
     for (mutate, expected) in mutations {
@@ -339,6 +321,20 @@ fn strict_inbound_observation_rejects_composer_controlled_shape_changes() {
             inspect_inbound_candidate(value, &malformed.abi_encode(), true, expected_rollup_id()),
             Err(InboundObservationError::InvalidEntryShape { field })
         );
+    }
+
+    let identity_mutations: [Mutation; 3] = [
+        |call| call._entries[0].incomingCalls[0].targetAddress = Address::ZERO,
+        |call| call._entries[0].incomingCalls[0].data = Bytes::from_static(&[0xff]),
+        |call| call._entries[0].incomingCalls[0].sourceAddress = Address::ZERO,
+    ];
+    for mutate in identity_mutations {
+        let mut malformed = call.clone();
+        mutate(&mut malformed);
+        assert!(matches!(
+            inspect_inbound_candidate(value, &malformed.abi_encode(), true, expected_rollup_id()),
+            Err(InboundObservationError::CallHashMismatch { .. })
+        ));
     }
 
     let mut forged_hash = call.clone();
