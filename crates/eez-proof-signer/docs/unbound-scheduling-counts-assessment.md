@@ -123,7 +123,7 @@ Consider two proved entries for one rollup:
 | `1` | Cross-chain entry, `proxyEntryHash != 0` | Persistent queue |
 
 The canonical batch has `immediateEntryCount = 1`. A poster changes only that
-field to `2` and submits from an EOA:
+field to `2` and submits from a contract with a no-op meta callback:
 
 1. The changed value remains within `entries.length`.
 2. The leading-L2Tx boundary guard passes: the value was increased, and there
@@ -131,13 +131,16 @@ field to `2` and submits from an EOA:
 3. The public-input hash is unchanged, so the same proof remains valid.
 4. Entry `0` executes and advances the loop cursor to `1`.
 5. Entry `1` stops the leading L2Tx loop because its hash is nonzero.
-6. The meta hook does not run because the EOA has no code.
+6. The poster's `executeMetaCrossChainTransactions()` callback runs but
+   intentionally leaves entry `1` unconsumed.
 7. Persistent publication starts at index `2`, so entry `1` is not queued.
 
 The proved content was not changed, but entry `1` is no longer available for
 consumption.
 
-The adversarial test
+An EOA cannot exercise this path: the contract reverts with
+`MetaEntriesWithoutReceiver` when meta entries remain but the poster has no
+code. The adversarial test
 [`testImmediateEntryCountCanDropADeferredEntryWithoutChangingPublicInput`](../../../contracts/test/PublicInputsHashVectors.t.sol)
 constructs the canonical and mutated batches on separate `EEZ` instances and
 checks that:
