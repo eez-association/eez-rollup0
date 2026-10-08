@@ -1,7 +1,10 @@
-# Incremental Composer-to-prover RPC (v2)
+# Streaming Composer-to-prover RPC
 
-Status: protocol proposal for staged implementation. `prove.v1.Prover/Prove`
-remains the only active runtime endpoint in this PR. The wire schema is
+The [Composer integration specification](SPEC.md) defines request construction,
+frame handling, recovery, proof verification, and L1 submission. Its
+[connection and frame contract](SPEC.md#2-connection-and-frame-contract) is the
+entry point for client implementers. This document also covers prover-side
+isolation and validation requirements. The canonical wire schema is
 [`proto/prove_stream.proto`](proto/prove_stream.proto).
 
 ## Identity and sharing
@@ -33,9 +36,9 @@ authentication.
 
 The reusable block identity includes the operator-configured rollup/chain and
 validation profile, exact consensus RLP, computed block hash, parent hash, and
-execution/proof version. A successful cached artifact contains locally checked
-pre/post roots, receipts, and settlement evidence; for a possible terminal Sync
-block it also contains all required transaction checkpoints. The server MUST
+execution/proof configuration. A successful cached artifact contains locally
+checked pre/post roots, receipts, and settlement evidence; for a possible
+terminal Sync block it also contains all required transaction checkpoints. The server MUST
 exact-decode an offered block and compare its canonical bytes and header/body
 commitments before satisfying it from cache. A witness is proving auxiliary
 data, not part of the consensus block identity. A failed or malformed witness
@@ -59,9 +62,14 @@ settlement. Process-global forkchoice selection and unsafe-head state reads are
 serialized; one Composer's session never owns or mutates another Composer's
 cursor. Merely sharing a post-state root, importing a block, or setting
 `head = terminal` is not an ancestry proof. Reth may stop exposing an unsafe
-fork after another Composer selects a competing head, so finalization
-re-submits the session's checked ordered blocks under the same forkchoice lock
-before the attestation gates run.
+fork after another Composer selects a competing head. In the reference
+implementation, block validation imports or selects the exact candidate branch
+when needed; finalization selects the already validated terminal with a
+forkchoice update and checks its canonical identity before settlement. It does
+not unconditionally re-submit the whole prefix at finalization. Unavailable or
+incompatible retained state must fail the attempt, never authorize an
+unchecked proof. This check describes the backend snapshot; it does not hold
+the forkchoice lock through signing or establish future L1 applicability.
 
 ## Session state machine
 
@@ -178,25 +186,27 @@ remain independent.
 
 ## Capacity and timing
 
-The present single-active-request gate is incompatible with parallel Composer
-sessions. Admission needs bounded per-Composer sessions, in-flight blocks,
-bytes, witnesses, and finalizations, plus a global execution cap and fair
-scheduling. No gRPC or prover backpressure may block L2 block commitment;
+The service bounds retained sessions, per-session blocks/bytes/witnesses, and
+queued requests; backends own execution scheduling and limits. It does not
+authenticate Composers or allocate per-identity quotas, so independent Composer
+ownership and admission controls require deployment support. No gRPC or prover
+backpressure may block L2 block commitment;
 Composer retains witnesses for retry. Failed capacity admission is explicit and
 does not silently downgrade validation. Artifact storage is bounded and may be
 evicted only when no active session needs it; a cache miss causes replay, never
 an unchecked proof.
 
-The 500 ms Composer proof budget begins at `Finalize`, not `Begin`; it includes
-the terminal-block work, settlement validation, signing, and response transit.
-An old validated prefix is not re-executed in the normal retained-branch path.
-If Reth has evicted a competing unsafe fork, correctness takes precedence: the
-stateful backend re-imports the exact checked blocks, and that work counts
-against the finalization deadline. Measure witness capture, send, validation
-ACK, finalization, and submission separately. The stateful backend must take
-fresh Reth providers at each block and finalization; it must not hold one read
-snapshot across an arbitrarily long stream. It adds no parallel execution
-database: Reth stores imported blocks and execution state, while the streaming
-layer stores only bounded session identities and immutable checked artifacts. A
+The Composer's configured proof budget covers the final proof attempt, not the
+lifetime of the session. It includes any reconnect/backfill, terminal-block
+work, settlement validation, signing, and response transit/validation; the
+server's `Finalize` deadline covers only its own finalization operation. An old
+validated prefix is not re-executed in the normal retained-branch path, but
+retention or branch-selection failures can still require recovery within the
+Composer's settlement cutoff. No fixed latency is guaranteed. Measure witness
+capture, send, validation ACK, finalization, and submission separately. The
+stateful backend must take fresh Reth providers at each block and finalization;
+it must not hold one read snapshot across an arbitrarily long stream. It adds
+no parallel execution database: Reth stores imported blocks and execution state,
+while the streaming layer stores only bounded session identities and immutable checked artifacts. A
 terminal block needing transaction checkpoints may be re-executed once on its
 Reth parent state when it arrives.

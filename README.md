@@ -32,7 +32,8 @@ its settlement effects before signing the recomputed public-input hash.
 a succinct validity proof, but the deployed verifier no longer accepts an
 unbound mock signature. The
 [Composer-to-prover gRPC specification](crates/eez-control-rpc/SPEC.md) defines
-request construction, response validation, and the prove-to-L1 handoff.
+streaming sessions, block prevalidation, recovery, proof verification, and the
+prove-to-L1 handoff.
 
 ## Run a chiado L2 (Docker)
 
