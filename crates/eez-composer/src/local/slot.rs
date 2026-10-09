@@ -37,7 +37,7 @@ use eez_protocol::entries::{InboundSidecar, IncomingEntry};
 use eez_protocol::system_tx::{SystemTxContext, build_inbound_system_txs};
 use eez_protocol::{
     CallMode, CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError,
-    ExecutorErrorKind, ExecutorResult, RollupId, SessionSnapshot, TargetExecutionSession,
+    ExecutorResult, RollupId, SessionSnapshot, TargetExecutionSession,
 };
 
 use super::build::{BuildError, ForkSnapshot, SyncBlockFork};
@@ -76,7 +76,7 @@ const VIEW_CALL_GAS_LIMIT: u64 = 1_000_000;
 const ZERO_CALL_GAS: u64 = 0;
 
 fn encoding_err(msg: impl Into<String>) -> ExecutorError {
-    ExecutorError::from(ExecutorErrorKind::Encoding(msg.into()))
+    ExecutorError::Encoding(msg.into())
 }
 
 /// Classify a `transact` failure. A database read failure is transient, and an
@@ -86,11 +86,10 @@ fn transact_err(e: EVMError<EvmDatabaseError<ProviderError>>) -> ExecutorError {
     match e {
         EVMError::Database(db) => provider_err(db),
         EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { fee, balance }) => {
-            ExecutorErrorKind::InsufficientFunds {
+            ExecutorError::InsufficientFunds {
                 available: *balance,
                 required: *fee,
             }
-            .into()
         }
         other => evm_err(other),
     }
@@ -99,10 +98,9 @@ fn transact_err(e: EVMError<EvmDatabaseError<ProviderError>>) -> ExecutorError {
 /// The same split for the block-fork path: `BuildError::Provider` is the store,
 /// everything else is the tx.
 fn fork_err(e: BuildError) -> ExecutorError {
-    if e.is_provider() {
-        provider_err(e)
-    } else {
-        evm_err(e)
+    match e {
+        provider @ BuildError::Provider(_) => provider_err(provider),
+        other => evm_err(other),
     }
 }
 
@@ -128,8 +126,8 @@ impl L1SlotState {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] when the head number or header
-    /// cannot be read, [`ExecutorErrorKind::Missing`] when the header is absent.
+    /// Returns [`ExecutorError::Provider`] when the head number or header
+    /// cannot be read, [`ExecutorError::Missing`] when the header is absent.
     pub fn open(client: &LocalChainClient) -> ExecutorResult<Self> {
         let provider = client.chain_provider();
         let num = provider.headers.best_block_number().map_err(provider_err)?;
@@ -137,7 +135,7 @@ impl L1SlotState {
             .headers
             .header_by_number(num)
             .map_err(provider_err)?
-            .ok_or_else(|| ExecutorError::from(ExecutorErrorKind::Missing("L1 anchor header")))?;
+            .ok_or(ExecutorError::Missing("L1 anchor header"))?;
         let anchor = SealedHeader::seal_slow(header);
         tracing::debug!(
             block = num,
@@ -186,8 +184,8 @@ impl L1SlotState {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] when the anchor state cannot be
-    /// opened, [`ExecutorErrorKind::Evm`] when env construction fails.
+    /// Returns [`ExecutorError::Provider`] when the anchor state cannot be
+    /// opened, [`ExecutorError::Evm`] when env construction fails.
     pub fn fork_state(
         &self,
         client: &LocalChainClient,
@@ -238,8 +236,8 @@ impl L1TargetSession {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] when the anchor state cannot be
-    /// opened, [`ExecutorErrorKind::Evm`] when env construction fails.
+    /// Returns [`ExecutorError::Provider`] when the anchor state cannot be
+    /// opened, [`ExecutorError::Evm`] when env construction fails.
     pub fn new(state: &L1SlotState, client: Arc<LocalChainClient>) -> ExecutorResult<Self> {
         let (state, mut evm_env) = state.open_state(&client, state.cache.clone())?;
         let chain_id = evm_env.cfg_env.chain_id;
@@ -365,10 +363,9 @@ impl TargetExecutionSession for L1TargetSession {
         // `Encoding` because `sim_error_is_poison` classifies it POISON: a call
         // mode is fixed by the tx, so retrying it re-fails forever.
         if req.call_mode == CallMode::Static {
-            return Err(ExecutorErrorKind::Encoding(
+            return Err(ExecutorError::Encoding(
                 "static target execution is not supported".into(),
-            )
-            .into());
+            ));
         }
 
         let proxy = self.proxy_address(req.source_address, req.source_rollup_id)?;
@@ -591,10 +588,9 @@ impl TargetExecutionSession for InboundL2TargetSession {
         _dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<ExecutionOutcome> {
         if req.call_mode == CallMode::Static {
-            return Err(ExecutorErrorKind::Encoding(
+            return Err(ExecutorError::Encoding(
                 "static target execution is not supported".into(),
-            )
-            .into());
+            ));
         }
 
         // ── PROBE ────────────────────────────────────────────────
@@ -775,11 +771,11 @@ mod tests {
         ));
 
         assert!(matches!(
-            error.kind(),
-            ExecutorErrorKind::InsufficientFunds {
+            error,
+            ExecutorError::InsufficientFunds {
                 available,
                 required,
-            } if *available == U256::from(3) && *required == U256::from(10)
+            } if available == U256::from(3) && required == U256::from(10)
         ));
     }
 }

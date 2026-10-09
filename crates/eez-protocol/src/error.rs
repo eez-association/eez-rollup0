@@ -1,7 +1,7 @@
 //! Typed errors for protocol materialization, target execution, composition,
 //! and runtime composition orchestration.
 //!
-//! Public wrapper structs expose non-exhaustive kind enums through `kind()`.
+//! Each error family is a plain non-exhaustive `thiserror` enum.
 //! [`ComposerError`] flattens the intermediate
 //! [`CompositionError`] layer while preserving the originating protocol or
 //! executor error.
@@ -9,69 +9,16 @@
 /// Boxed source error used by provider-specific variants without exposing
 /// their concrete error types.
 ///
-/// Crate-private on purpose: downstream code shouldn't need to think
-/// about `Box<dyn Error>`. Use the public constructors
-/// ([`ExecutorError::provider`], [`ExecutorError::evm`]) — they accept
-/// any `impl std::error::Error + Send + Sync + 'static` and box it
-/// internally.
+/// Crate-private on purpose: downstream code can box concrete source errors at
+/// construction sites without depending on this alias.
 pub(crate) type BoxedError = Box<dyn std::error::Error + Send + Sync>;
-
-/// Generate the struct-layer boilerplate for an error type that wraps a
-/// `*Kind` enum. Emits the struct, its `kind()` accessor, `Display`,
-/// `Error::source` forwarding, and `From<*Kind>`. The corresponding `*Kind`
-/// enum is declared separately and carries the actual variants + thiserror.
-macro_rules! error_struct {
-    (
-        $(#[$meta:meta])*
-        $vis:vis struct $name:ident wraps $kind:ident;
-    ) => {
-        $(#[$meta])*
-        $vis struct $name {
-            kind: $kind,
-        }
-
-        impl $name {
-            /// The underlying variant.
-            #[must_use]
-            pub fn kind(&self) -> &$kind {
-                &self.kind
-            }
-        }
-
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                std::fmt::Display::fmt(&self.kind, f)
-            }
-        }
-
-        impl std::error::Error for $name {
-            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-                self.kind.source()
-            }
-        }
-
-        impl From<$kind> for $name {
-            fn from(kind: $kind) -> Self {
-                Self { kind }
-            }
-        }
-    };
-}
 
 // ── ProtocolError ────────────────────────────────────────────────
 
-error_struct! {
-    /// Errors from pure protocol logic.
-    ///
-    /// Wraps a [`ProtocolErrorKind`].
-    #[derive(Debug)]
-    pub struct ProtocolError wraps ProtocolErrorKind;
-}
-
-/// Variants of [`ProtocolError`].
+/// Errors from pure protocol logic.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum ProtocolErrorKind {
+pub enum ProtocolError {
     /// Composition was attempted with no cross-chain calls to include.
     #[error("no cross-chain calls to compose")]
     EmptyCalls,
@@ -96,30 +43,10 @@ pub type ProtocolResult<T> = Result<T, ProtocolError>;
 
 // ── ExecutorError ────────────────────────────────────────────────
 
-error_struct! {
-    /// Errors from target-chain client/session implementations.
-    ///
-    /// Wraps an [`ExecutorErrorKind`].
-    #[derive(Debug)]
-    pub struct ExecutorError wraps ExecutorErrorKind;
-}
-
-impl ExecutorError {
-    /// Build a `Provider` error from any `Error + Send + Sync + 'static`.
-    /// Also accepts an already-boxed `Box<dyn Error + Send + Sync>`.
-    pub fn provider(e: impl Into<BoxedError>) -> Self {
-        ExecutorErrorKind::Provider(e.into()).into()
-    }
-    /// Build an `Evm` error from any `Error + Send + Sync + 'static`.
-    pub fn evm(e: impl Into<BoxedError>) -> Self {
-        ExecutorErrorKind::Evm(e.into()).into()
-    }
-}
-
-/// Variants of [`ExecutorError`].
+/// Errors from target-chain client/session implementations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum ExecutorErrorKind {
+pub enum ExecutorError {
     /// The target chain is not reachable or not configured for the
     /// requested operation.
     #[error("target chain unavailable: {0}")]
@@ -166,48 +93,18 @@ pub type ExecutorResult<T> = Result<T, ExecutorError>;
 
 // ── CompositionError ─────────────────────────────────────────────
 
-error_struct! {
-    /// Error from composing one source transaction. Preserves protocol
-    /// materialization failures and target-execution failures from the
-    /// surrounding composition pipeline.
-    #[derive(Debug)]
-    pub struct CompositionError wraps CompositionErrorKind;
-}
-
-impl From<ProtocolError> for CompositionError {
-    fn from(e: ProtocolError) -> Self {
-        CompositionErrorKind::Protocol(e).into()
-    }
-}
-
-impl From<ExecutorError> for CompositionError {
-    fn from(e: ExecutorError) -> Self {
-        CompositionErrorKind::Executor(e).into()
-    }
-}
-
-impl From<ProtocolErrorKind> for CompositionError {
-    fn from(k: ProtocolErrorKind) -> Self {
-        ProtocolError::from(k).into()
-    }
-}
-
-impl From<ExecutorErrorKind> for CompositionError {
-    fn from(k: ExecutorErrorKind) -> Self {
-        ExecutorError::from(k).into()
-    }
-}
-
-/// Variants of [`CompositionError`].
+/// Error from composing one source transaction. Preserves protocol
+/// materialization failures and target-execution failures from the surrounding
+/// composition pipeline.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum CompositionErrorKind {
+pub enum CompositionError {
     /// Protocol-layer failure during entry building or composition validation.
     #[error("protocol: {0}")]
-    Protocol(#[source] ProtocolError),
+    Protocol(#[from] ProtocolError),
     /// Target-chain execution failure raised during composition.
     #[error("executor: {0}")]
-    Executor(#[source] ExecutorError),
+    Executor(#[from] ExecutorError),
 }
 
 /// Shorthand for composition results.
@@ -215,57 +112,27 @@ pub type CompositionResult<T> = Result<T, CompositionError>;
 
 // ── ComposerError ────────────────────────────────────────────────
 
-error_struct! {
-    /// Error surfaced by runtime composition orchestration.
-    #[derive(Debug)]
-    pub struct ComposerError wraps ComposerErrorKind;
-}
-
-impl From<ProtocolError> for ComposerError {
-    fn from(e: ProtocolError) -> Self {
-        ComposerErrorKind::Protocol(e).into()
-    }
-}
-
-impl From<ExecutorError> for ComposerError {
-    fn from(e: ExecutorError) -> Self {
-        ComposerErrorKind::Executor(e).into()
-    }
-}
-
 impl From<CompositionError> for ComposerError {
     fn from(e: CompositionError) -> Self {
-        // Flatten the intermediate kind while preserving the originating
+        // Flatten the intermediate layer while preserving the originating
         // protocol or executor error.
-        match e.kind {
-            CompositionErrorKind::Protocol(p) => ComposerErrorKind::Protocol(p).into(),
-            CompositionErrorKind::Executor(ex) => ComposerErrorKind::Executor(ex).into(),
+        match e {
+            CompositionError::Protocol(p) => Self::Protocol(p),
+            CompositionError::Executor(ex) => Self::Executor(ex),
         }
     }
 }
 
-impl From<ProtocolErrorKind> for ComposerError {
-    fn from(k: ProtocolErrorKind) -> Self {
-        ProtocolError::from(k).into()
-    }
-}
-
-impl From<ExecutorErrorKind> for ComposerError {
-    fn from(k: ExecutorErrorKind) -> Self {
-        ExecutorError::from(k).into()
-    }
-}
-
-/// Variants of [`ComposerError`].
+/// Error surfaced by runtime composition orchestration.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum ComposerErrorKind {
+pub enum ComposerError {
     /// Protocol-layer failure surfaced through the orchestrator.
     #[error("protocol: {0}")]
-    Protocol(#[source] ProtocolError),
+    Protocol(#[from] ProtocolError),
     /// Executor-layer failure surfaced through the orchestrator.
     #[error("executor: {0}")]
-    Executor(#[source] ExecutorError),
+    Executor(#[from] ExecutorError),
 }
 
 /// Shorthand for composer results.

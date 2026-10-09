@@ -21,8 +21,8 @@ use revm::context::result::EVMError;
 
 use crate::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{
-    ChainClient, CompositionBuilder, ExecutorError, ExecutorErrorKind, ExecutorResult,
-    ProxyLookupConfig, RollupId, TargetExecutionSession,
+    ChainClient, CompositionBuilder, ExecutorError, ExecutorResult, ProxyLookupConfig, RollupId,
+    TargetExecutionSession,
 };
 
 use super::provider::{ChainProvider, HeaderReader, StateSnapshotProvider};
@@ -201,9 +201,9 @@ impl LocalChainClient {
     ///
     /// # Errors
     ///
-    /// [`ExecutorErrorKind::Unavailable`] on a follower client,
-    /// [`ExecutorErrorKind::Decode`] when the raw tx cannot be decoded or its
-    /// signer recovered, [`ExecutorErrorKind::Provider`] when the backing store
+    /// [`ExecutorError::Unavailable`] on a follower client,
+    /// [`ExecutorError::Decode`] when the raw tx cannot be decoded or its
+    /// signer recovered, [`ExecutorError::Provider`] when the backing store
     /// fails mid-execution, plus any error a nested dispatch raises.
     pub fn simulate_source_tx_on(
         &self,
@@ -230,17 +230,17 @@ impl LocalChainClient {
         // transactions. Keep the check here because callers use the uniform
         // `ChainClient` interface for both roles.
         let Role::Entry { .. } = &self.role else {
-            return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
+            return Err(ExecutorError::Unavailable(
                 "simulate_source_tx_on called on follower LocalChainClient".into(),
-            )));
+            ));
         };
 
         let mut raw: &[u8] = &raw_tx;
         let tx = TransactionSigned::decode_2718(&mut raw)
-            .map_err(|e| ExecutorError::from(ExecutorErrorKind::Decode(e.to_string())))?;
+            .map_err(|e| ExecutorError::Decode(e.to_string()))?;
         let signer = tx
             .recover_signer()
-            .map_err(|e| ExecutorError::from(ExecutorErrorKind::Decode(e.to_string())))?;
+            .map_err(|e| ExecutorError::Decode(e.to_string()))?;
 
         tracing::info!(
             ?signer,
@@ -264,7 +264,7 @@ impl LocalChainClient {
             // The backing store is unreachable — that is the slot's problem, not
             // the tx's, so it must not degrade into an empty composition (which
             // the drain reads as poison and evicts on).
-            Err(EVMError::Database(e)) => return Err(ExecutorError::provider(e)),
+            Err(EVMError::Database(e)) => return Err(ExecutorError::Provider(e.into())),
             // Rejected before execution (nonce, balance, fee). Same outcome as a
             // revert — no calls, so the drain evicts — but named for what it is.
             Err(EVMError::Transaction(e)) => {

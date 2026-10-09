@@ -304,9 +304,9 @@ where
             (before_snapshot, self.overlay_channel.pop_post_cache())
             && let Err(e) = crate::overlay::apply_overlay_diff(context, &before, &after)
         {
-            self.record_error(ExecutorError::evm(format!(
-                "overlay diff-apply failed: {e}"
-            )));
+            self.record_error(ExecutorError::Evm(
+                format!("overlay diff-apply failed: {e}").into(),
+            ));
         }
         let sim = match sim {
             Ok(response) => response,

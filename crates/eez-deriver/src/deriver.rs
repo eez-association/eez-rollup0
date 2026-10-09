@@ -48,7 +48,7 @@ impl BlockHeaderInputs {
         let (Some(beneficiary), Some(extra_data)) =
             (span.beneficiaries.get(index), span.extra_data.get(index))
         else {
-            return Err(DeriverError::l2_provider(format!(
+            return Err(DeriverError::L2Provider(format!(
                 "DA span has no header inputs for block index {index} (span covers {} blocks)",
                 span.block_count(),
             )));
@@ -338,7 +338,7 @@ where
             .l1_reader
             .finalized_block()
             .await
-            .map_err(DeriverError::l1_scan)?;
+            .map_err(DeriverError::L1Scan)?;
         // No finality yet (a chain younger than two epochs) → the floor, which
         // this scan read and the watcher's ancestor backfill makes reorg-safe.
         let seed = choose_seed(floor, end, finalized.map(|(n, _)| n));
@@ -347,10 +347,10 @@ where
             .l1_reader
             .canonical_l1_hash(seed)
             .await
-            .map_err(DeriverError::l1_scan)?
+            .map_err(DeriverError::L1Scan)?
             .ok_or_else(|| {
                 // Not served yet, or rewound mid-scan — retryable, not fatal.
-                DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                DeriverError::L1Scan(eez_l1::L1Error::SourceIncomplete {
                     block: seed,
                     tx_hash: B256::ZERO,
                     detail: "catch-up seed block not served by the L1 source yet".into(),
@@ -360,7 +360,7 @@ where
         // means the chain moved under us: retry so `revalidate_index_tail` drops
         // it. (A finalized seed needs no such check — it cannot reorg.)
         if indexed_tail.is_some_and(|t| t.l1_block == seed && t.l1_block_hash != canonical) {
-            return Err(DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+            return Err(DeriverError::L1Scan(eez_l1::L1Error::SourceIncomplete {
                 block: seed,
                 tx_hash: B256::ZERO,
                 detail: "catch-up seed block reorged during the scan; retry".into(),
@@ -421,7 +421,7 @@ where
                 .l1_reader
                 .canonical_l1_hash(tail.l1_block)
                 .await
-                .map_err(DeriverError::l1_scan)?;
+                .map_err(DeriverError::L1Scan)?;
             // `None` is not proof of a reorg — retreating would unwind L2 to
             // genesis, so retry. A head ABOVE this block means pruned/rewound,
             // which retrying won't fix; report it so that is diagnosable.
@@ -433,7 +433,7 @@ where
                     .await
                     .map(|r| r.head_block_number)
                     .ok();
-                return Err(DeriverError::l1_scan(eez_l1::L1Error::SourceIncomplete {
+                return Err(DeriverError::L1Scan(eez_l1::L1Error::SourceIncomplete {
                     block: tail.l1_block,
                     tx_hash: tail.tx_hash,
                     detail: format!(
@@ -481,13 +481,13 @@ where
             .inner
             .l2_provider
             .best_block_number()
-            .map_err(DeriverError::l2_provider)?;
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?;
         let mut chunks = self
             .inner
             .l1_reader
             .batch_log_chunks(from_l1_block)
             .await
-            .map_err(DeriverError::l1_scan)?;
+            .map_err(DeriverError::L1Scan)?;
         let to_l1_block = chunks.to_block();
         event!(
             name: "eez.deriver.catch_up.start",
@@ -516,7 +516,7 @@ where
             .l1_reader
             .next_batch_log_chunk(&mut chunks)
             .await
-            .map_err(DeriverError::l1_scan)?
+            .map_err(DeriverError::L1Scan)?
         {
             total_replayed += self
                 .reconcile_scanned_batches(&scanned_batches, &mut cumulative_l2)
@@ -613,7 +613,10 @@ where
                         applied_first = ?batch.settlement.first_applied(),
                         "local state root at the scan cursor is neither the root the batch's applied run started from nor its settled endpoint; refusing to replay",
                     );
-                    return Err(DeriverError::local_diverged(batch_first_l2));
+                    return Err(DeriverError::LocalDiverged {
+                        l2_block: batch_first_l2,
+                        detail: None,
+                    });
                 }
             }
 
@@ -705,7 +708,7 @@ where
             .inner
             .l2_provider
             .best_block_number()
-            .map_err(DeriverError::l2_provider)?;
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?;
         event!(
             name: "eez.deriver.execute_block.start",
             Level::DEBUG,
@@ -728,7 +731,7 @@ where
                     error = %e,
                     "sealed_header() failed",
                 );
-                DeriverError::l2_provider(e)
+                DeriverError::L2Provider(e.to_string())
             })?
             .ok_or_else(|| {
                 event!(
@@ -738,7 +741,7 @@ where
                     local_best,
                     "sealed_header() returned None — parent header is not in canonical chain",
                 );
-                DeriverError::l2_provider(format!(
+                DeriverError::L2Provider(format!(
                     "local L2 header at parent block {parent_block_number} missing"
                 ))
             })?;
@@ -766,7 +769,7 @@ where
                     error = %e,
                     "state_by_block_hash() failed for a header that sealed_header() returned successfully — likely reth state retention timing under reorg churn",
                 );
-                DeriverError::l2_provider(e)
+                DeriverError::L2Provider(e.to_string())
             })?;
         let state_db =
             StateProviderDatabase::new(state_provider.as_ref().into_evm_state_provider());
@@ -797,38 +800,36 @@ where
             .inner
             .evm_config
             .builder_for_next_block(&mut db, &parent_header, attributes)
-            .map_err(|e| {
-                DeriverError::l2_provider(format!("builder_for_next_block failed: {e}"))
-            })?;
+            .map_err(|e| DeriverError::L2Provider(format!("builder_for_next_block failed: {e}")))?;
 
         builder
             .apply_pre_execution_changes()
-            .map_err(|e| DeriverError::l2_provider(format!("pre-execution changes failed: {e}")))?;
+            .map_err(|e| DeriverError::L2Provider(format!("pre-execution changes failed: {e}")))?;
 
         for (tx_idx, tx_bytes) in raw_txs.iter().enumerate() {
             let tx = TransactionSigned::decode_2718(&mut tx_bytes.as_slice()).map_err(|e| {
-                DeriverError::local_diverged_with_msg(
-                    parent_block_number + 1,
-                    &format!("decode tx #{tx_idx}: {e}"),
-                )
+                DeriverError::LocalDiverged {
+                    l2_block: parent_block_number + 1,
+                    detail: Some(format!("decode tx #{tx_idx}: {e}")),
+                }
             })?;
             let recovered = SignedTransaction::try_into_recovered(tx).map_err(|_| {
-                DeriverError::local_diverged_with_msg(
-                    parent_block_number + 1,
-                    &format!("could not recover signer for tx #{tx_idx}"),
-                )
+                DeriverError::LocalDiverged {
+                    l2_block: parent_block_number + 1,
+                    detail: Some(format!("could not recover signer for tx #{tx_idx}")),
+                }
             })?;
-            builder.execute_transaction(recovered).map_err(|e| {
-                DeriverError::local_diverged_with_msg(
-                    parent_block_number + 1,
-                    &format!("execute tx #{tx_idx}: {e}"),
-                )
-            })?;
+            builder
+                .execute_transaction(recovered)
+                .map_err(|e| DeriverError::LocalDiverged {
+                    l2_block: parent_block_number + 1,
+                    detail: Some(format!("execute tx #{tx_idx}: {e}")),
+                })?;
         }
 
         let outcome = builder
             .finish(state_provider.as_ref(), None)
-            .map_err(|e| DeriverError::l2_provider(format!("block builder finish failed: {e}")))?;
+            .map_err(|e| DeriverError::L2Provider(format!("block builder finish failed: {e}")))?;
 
         let sealed_block = outcome.block.sealed_block().clone();
         let sealed_header = sealed_block.sealed_header().clone();
@@ -841,8 +842,8 @@ where
     /// # Errors
     ///
     /// Forwards [`Self::execute_block`] errors plus
-    /// [`DeriverError::is_invalid_forkchoice`] /
-    /// [`DeriverError::is_committer_closed`] from the
+    /// [`DeriverError::InvalidForkchoice`] /
+    /// [`DeriverError::CommitterClosed`] from the
     /// committer-side submission.
     pub async fn replay_block(
         &self,
@@ -912,7 +913,7 @@ where
             match rx.recv().await {
                 Ok(event) => {
                     if let Err(err) = self.handle_event(event).await {
-                        if err.is_committer_closed() {
+                        if matches!(&err, DeriverError::CommitterClosed) {
                             event!(
                                 name: "eez.deriver.committer.closed",
                                 Level::ERROR,
@@ -974,7 +975,7 @@ where
                 );
                 true
             }
-            Err(err) if err.is_committer_closed() => {
+            Err(err) if matches!(&err, DeriverError::CommitterClosed) => {
                 event!(
                     name: "eez.deriver.committer.closed",
                     Level::ERROR,
@@ -1162,7 +1163,10 @@ where
                     applied_first = ?settlement.first_applied(),
                     "local state root at cursor is neither the root the batch's applied run started from nor its settled endpoint; resync required",
                 );
-                return Err(DeriverError::local_diverged(from_block));
+                return Err(DeriverError::LocalDiverged {
+                    l2_block: from_block,
+                    detail: None,
+                });
             }
         }
 
@@ -1396,9 +1400,9 @@ where
         self.inner
             .l2_provider
             .sealed_header(l2_block)
-            .map_err(DeriverError::l2_provider)?
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
             .ok_or_else(|| {
-                DeriverError::l2_provider(format!("local L2 header at {l2_block} missing"))
+                DeriverError::L2Provider(format!("local L2 header at {l2_block} missing"))
             })
     }
 
@@ -1412,7 +1416,7 @@ where
             .inner
             .l2_provider
             .block_number(commitment)
-            .map_err(DeriverError::l2_provider)?
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
         else {
             return Ok(None);
         };
@@ -1422,7 +1426,7 @@ where
             .inner
             .l2_provider
             .sealed_header(number)
-            .map_err(DeriverError::l2_provider)?
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
             .map(|header| header.hash());
         Ok((canonical == Some(commitment)).then_some(number))
     }
@@ -1521,7 +1525,7 @@ where
                             eez_protocol::RollupId(cfg.this_rollup_id),
                         )
                         .map_err(|e| {
-                            DeriverError::l2_provider(format!(
+                            DeriverError::L2Provider(format!(
                                 "rebuild entry from DA action[{i}] for tx {tx_hash}: {e}"
                             ))
                         })
@@ -1565,18 +1569,21 @@ where
                 // An entry L1 did not apply leaves its tx out of the rebuilt
                 // block, and the composer re-queues it.
                 if sync_user_txs.len() < original_outbound_len {
-                    return Err(DeriverError::local_diverged_with_msg(
-                        from_block,
-                        &format!(
+                    return Err(DeriverError::LocalDiverged {
+                        l2_block: from_block,
+                        detail: Some(format!(
                             "outbound entries ({original_outbound_len}) exceed Sync-block user txs ({})",
                             sync_user_txs.len(),
-                        ),
-                    ));
+                        )),
+                    });
                 }
                 // Each outbound entry takes its OWN ordinal's user tx, so a
                 // skipped entry never shifts the pairing of the rest.
                 let slots = select_applied_slots(settlement, &outbound, &inbound, &sync_user_txs)
-                    .map_err(|e| DeriverError::local_diverged_with_msg(from_block, &e))?;
+                    .map_err(|e| DeriverError::LocalDiverged {
+                    l2_block: from_block,
+                    detail: Some(e),
+                })?;
                 if slots.outbound_paired.len() < original_outbound_len
                     || slots.inbound.len() < original_inbound_len
                 {
@@ -1629,14 +1636,14 @@ where
                         starting_nonce,
                     )
                     .map_err(|e| {
-                        DeriverError::l2_provider(format!(
+                        DeriverError::L2Provider(format!(
                             "build_cross_chain_sync_pairs(skipped prefix, tx={tx_hash}): {e}"
                         ))
                     })?;
                     starting_nonce = starting_nonce
                         .checked_add(prefix_pairs.len() as u64)
                         .ok_or_else(|| {
-                            DeriverError::l2_provider(format!(
+                            DeriverError::L2Provider(format!(
                                 "SYSTEM_ADDRESS nonce overflow over the skipped prefix (tx={tx_hash})"
                             ))
                         })?;
@@ -1648,7 +1655,7 @@ where
                     starting_nonce,
                 )
                 .map_err(|e| {
-                    DeriverError::l2_provider(format!(
+                    DeriverError::L2Provider(format!(
                         "build_cross_chain_sync_pairs(tx={tx_hash}): {e}"
                     ))
                 })?;
@@ -1690,11 +1697,14 @@ where
             // entries this batch settled are new. Append them to its EXISTING
             // content rather than a fresh block — see `batch_l2_range`.
             if stale_boundary {
-                return Err(DeriverError::local_diverged_with_msg(
-                    from_block,
-                    "resumed batch's Sync block is missing or reorged; cannot append its \
-                     settled entries without the existing content",
-                ));
+                return Err(DeriverError::LocalDiverged {
+                    l2_block: from_block,
+                    detail: Some(
+                        "resumed batch's Sync block is missing or reorged; cannot append its \
+                         settled entries without the existing content"
+                            .into(),
+                    ),
+                });
             }
             // Which Sync block these entries land in (issue #121).
             event!(
@@ -1713,9 +1723,9 @@ where
                 .inner
                 .l2_provider
                 .block_by_number(from_block)
-                .map_err(DeriverError::l2_provider)?
+                .map_err(|e| DeriverError::L2Provider(e.to_string()))?
                 .ok_or_else(|| {
-                    DeriverError::l2_provider(format!("local L2 block at {from_block} missing"))
+                    DeriverError::L2Provider(format!("local L2 block at {from_block} missing"))
                 })?
                 .body()
                 .transactions()
@@ -1763,13 +1773,13 @@ where
                     // an invalid forkchoice), so refuse loudly here (invariant 7).
                     let finalized_l2 = self.inner.l1_head.finalized_l2();
                     if from_block <= finalized_l2 {
-                        return Err(DeriverError::local_diverged_with_msg(
-                            from_block,
-                            &format!(
+                        return Err(DeriverError::LocalDiverged {
+                            l2_block: from_block,
+                            detail: Some(format!(
                                 "resumed batch would rewrite Sync block {from_block} at or below \
                                  the L1-finalized L2 head {finalized_l2}"
-                            ),
-                        ));
+                            )),
+                        });
                     }
                     let parent = self.l2_sealed_header_at(from_block - 1)?;
                     // Only safe retreats; finalized tracks L1 finality, which a
@@ -1808,7 +1818,7 @@ where
             self.inner
                 .l2_provider
                 .sealed_header(from_block + last_index as u64)
-                .map_err(DeriverError::l2_provider)?
+                .map_err(|e| DeriverError::L2Provider(e.to_string()))?
                 .map(|header| header.hash()),
             settlement.final_state,
         ) {
@@ -1903,11 +1913,11 @@ where
                 &observed,
                 cfg.this_rollup_id,
             )
-            .map_err(|e| {
-                DeriverError::local_diverged_with_msg(
-                    from_block,
-                    &format!("outbound authorization gate failed (tx={tx_hash}): {e}"),
-                )
+            .map_err(|e| DeriverError::LocalDiverged {
+                l2_block: from_block,
+                detail: Some(format!(
+                    "outbound authorization gate failed (tx={tx_hash}): {e}"
+                )),
             })?;
         }
         Ok((replayed, sync_block_hash))
@@ -1916,7 +1926,7 @@ where
     /// Outbound calls emitted by the L2 manager in `block`.
     ///
     /// # Errors
-    /// [`DeriverError::l2_provider`] if the block's receipts are missing locally.
+    /// [`DeriverError::L2Provider`] if the block's receipts are missing locally.
     fn observed_outbound_calls(
         &self,
         block: alloy_eips::BlockHashOrNumber,
@@ -1926,9 +1936,9 @@ where
             .inner
             .l2_provider
             .receipts_by_block(block)
-            .map_err(DeriverError::l2_provider)?
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
             .ok_or_else(|| {
-                DeriverError::l2_provider(format!("local receipts for Sync block {block} missing"))
+                DeriverError::L2Provider(format!("local receipts for Sync block {block} missing"))
             })?;
         Ok(extract_outbound_call_observations(&receipts, eez_l2))
     }
@@ -1942,9 +1952,9 @@ where
             .inner
             .l2_provider
             .sealed_header(parent_block_number)
-            .map_err(DeriverError::l2_provider)?
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
             .ok_or_else(|| {
-                DeriverError::l2_provider(format!(
+                DeriverError::L2Provider(format!(
                     "local L2 header at parent {parent_block_number} missing"
                 ))
             })?;
@@ -1952,11 +1962,11 @@ where
             .inner
             .l2_provider
             .state_by_block_hash(parent_header.hash())
-            .map_err(DeriverError::l2_provider)?;
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?;
         let system_address = eez_primitives::SYSTEM_ADDRESS;
         Ok(state
             .account_nonce(&system_address)
-            .map_err(DeriverError::l2_provider)?
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
             .unwrap_or(0))
     }
 
@@ -1996,9 +2006,9 @@ where
                 .inner
                 .l2_provider
                 .sealed_header(pre)
-                .map_err(DeriverError::l2_provider)?
+                .map_err(|e| DeriverError::L2Provider(e.to_string()))?
                 .ok_or_else(|| {
-                    DeriverError::l2_provider(format!("local L2 header at {pre} missing"))
+                    DeriverError::L2Provider(format!("local L2 header at {pre} missing"))
                 })?
                 .hash();
             if local_pre != claimed_curr {
@@ -2013,7 +2023,10 @@ where
                     claimed = %claimed_curr,
                     "local L2 state root at from_block-1 differs from the root the batch's applied run started from",
                 );
-                return Err(DeriverError::local_diverged(pre));
+                return Err(DeriverError::LocalDiverged {
+                    l2_block: pre,
+                    detail: None,
+                });
             }
         }
         // A partial settlement stops early, so find the block carrying the
@@ -2032,7 +2045,10 @@ where
                     tip,
                     "batch claims a range ending above the local tip; replay did not reach it",
                 );
-                return Err(DeriverError::local_diverged(to_block));
+                return Err(DeriverError::LocalDiverged {
+                    l2_block: to_block,
+                    detail: None,
+                });
             }
             // `from_block` is `anchor + 1` when fresh and `anchor` when
             // resumed, so the settleable range starts at the anchor either way.
@@ -2061,9 +2077,9 @@ where
                     .inner
                     .l2_provider
                     .sealed_header(to_block)
-                    .map_err(DeriverError::l2_provider)?
+                    .map_err(|e| DeriverError::L2Provider(e.to_string()))?
                     .ok_or_else(|| {
-                        DeriverError::l2_provider(format!("local L2 header at {to_block} missing"))
+                        DeriverError::L2Provider(format!("local L2 header at {to_block} missing"))
                     })?
                     .hash(),
             };
@@ -2079,7 +2095,10 @@ where
                     claimed = %claimed_new,
                     "local L2 state root at to_block differs from batch's claimed newRoot",
                 );
-                return Err(DeriverError::local_diverged(to_block));
+                return Err(DeriverError::LocalDiverged {
+                    l2_block: to_block,
+                    detail: None,
+                });
             }
             return Ok(Some(to_block));
         }
@@ -2128,7 +2147,7 @@ where
 {
     let Some(header) = l2_provider
         .sealed_header(block_number)
-        .map_err(DeriverError::l2_provider)?
+        .map_err(|e| DeriverError::L2Provider(e.to_string()))?
     else {
         return Ok(false);
     };
@@ -2175,18 +2194,18 @@ where
 {
     let Some(local_block) = l2_provider
         .block_by_number(from_block)
-        .map_err(DeriverError::l2_provider)?
+        .map_err(|e| DeriverError::L2Provider(e.to_string()))?
     else {
         return Ok(false);
     };
     let parent_block = from_block.checked_sub(1).ok_or_else(|| {
-        DeriverError::l2_provider("cannot reconcile a batch starting at genesis block")
+        DeriverError::L2Provider("cannot reconcile a batch starting at genesis block".into())
     })?;
     let expected_parent_hash = l2_provider
         .sealed_header(parent_block)
-        .map_err(DeriverError::l2_provider)?
+        .map_err(|e| DeriverError::L2Provider(e.to_string()))?
         .ok_or_else(|| {
-            DeriverError::l2_provider(format!("local L2 header at {parent_block} missing"))
+            DeriverError::L2Provider(format!("local L2 header at {parent_block} missing"))
         })?
         .hash();
 
@@ -2207,7 +2226,7 @@ where
 {
     let Some(local_block) = l2_provider
         .block_by_number(block_number)
-        .map_err(DeriverError::l2_provider)?
+        .map_err(|e| DeriverError::L2Provider(e.to_string()))?
     else {
         return Ok(false);
     };

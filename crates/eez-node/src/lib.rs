@@ -18,13 +18,13 @@ use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
 use eez_composer::composer::CrossChainWiring;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
-use eez_deriver::Deriver;
+use eez_deriver::{Deriver, DeriverError};
 use eez_driver::{
     BlockCommitterHandle, DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, RollupTiming,
     Sequencer, SyncSlotComposerHandle, spawn_l1_anchored,
 };
 use eez_l1::{
-    L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
+    L1CanonicalHead, L1Error, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
 };
 use eez_node_common::EezNode;
 use eez_node_common::{
@@ -678,7 +678,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         match deriver.catch_up_with_seed().await {
             Ok(seed) => break seed,
             Err(err)
-                if err.is_l1_transport() && {
+                if matches!(&err, DeriverError::L1Scan(L1Error::Provider(_))) && {
                     transport_failures += 1;
                     transport_failures >= BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES
                 } =>
@@ -695,7 +695,12 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                     "boot-time deriver catch_up gave up after {transport_failures} L1 transport failures: {err}"
                 ));
             }
-            Err(err) if err.is_source_incomplete() || err.is_l1_transport() => {
+            Err(err)
+                if matches!(
+                    &err,
+                    DeriverError::L1Scan(L1Error::SourceIncomplete { .. } | L1Error::Provider(_))
+                ) =>
+            {
                 catch_up_attempts += 1;
                 event!(
                     name: "eez.node.deriver.boot_catch_up.source_incomplete",

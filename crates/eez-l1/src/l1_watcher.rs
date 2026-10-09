@@ -323,7 +323,7 @@ impl L1Watcher {
                 // Retrying a deterministic error is an infinite silent stall.
                 // PANIC, don't return: reth's critical-task wrapper reports
                 // only panics, so a return exits just as quietly.
-                if err.is_terminal() {
+                if matches!(err, L1Error::Decode(_) | L1Error::ReorgTooDeep { .. }) {
                     event!(
                         name: "eez.l1_watcher.poll.terminal",
                         Level::ERROR,
@@ -1666,25 +1666,6 @@ mod tests {
         let mut state = WatcherState::new(0);
         state.push_canonical(9, B256::with_last_byte(9));
         assert_eq!(state.tip(), Some((9, B256::with_last_byte(9))));
-    }
-
-    /// Deterministic errors stop the loop; retryable ones must not.
-    #[test]
-    fn only_deterministic_errors_are_terminal() {
-        let depth = L1Error::ReorgTooDeep {
-            walked: 62,
-            max: 62,
-        };
-        let incomplete = L1Error::SourceIncomplete {
-            block: 1,
-            tx_hash: B256::ZERO,
-            detail: "warming up".into(),
-        };
-        assert!(L1Error::Decode("bad abi".into()).is_terminal());
-        assert!(depth.is_terminal());
-        // A malformed RPC response is retryable — re-requesting can succeed.
-        assert!(!L1Error::Provider("log missing block_hash".into()).is_terminal());
-        assert!(!incomplete.is_terminal());
     }
 
     #[test]
