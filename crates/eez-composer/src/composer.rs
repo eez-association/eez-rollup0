@@ -2330,6 +2330,16 @@ where
                                 );
                             }
                             continue;
+                        } else if escrow_remaining.is_none() {
+                            event!(
+                                name: "eez.composer.cc_compose.escrow_read_failed",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                need = %need,
+                                "escrow read returned None; over-escrow check skipped and withdrawal admitted (the bundle may revert on L1 if the rollup balance is insufficient)",
+                            );
                         }
                     }
                     // `[load, user]` must fit the Sync block or `build_sync_block`

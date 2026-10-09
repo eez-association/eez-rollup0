@@ -417,9 +417,10 @@ pub(crate) async fn scan_batch_logs_range(
     let mut consumed_forks: HashMap<u64, HashSet<B256>> = HashMap::new();
     let mut skip_forks: HashMap<u64, HashSet<B256>> = HashMap::new();
     for l in &evidence_logs {
-        let (Some(bn), Some(tx_index), Some(block_hash), Some(tx_hash)) = (
+        let (Some(bn), Some(tx_index), Some(log_index), Some(block_hash), Some(tx_hash)) = (
             l.block_number,
             l.transaction_index,
+            l.log_index,
             l.block_hash,
             l.transaction_hash,
         ) else {
@@ -442,7 +443,7 @@ pub(crate) async fn scan_batch_logs_range(
                 winner_tx_hashes.insert((block_hash, tx_hash));
                 settled_by_block.entry(bn).or_default().push(SettledRoot {
                     tx_index,
-                    log_index: l.log_index.unwrap_or_default(),
+                    log_index,
                     block_hash,
                     payload: decoded.newRoot,
                 });
@@ -465,13 +466,9 @@ pub(crate) async fn scan_batch_logs_range(
                     .or_default()
                     .push(ConsumedEntry {
                         tx_index,
-                        log_index: l.log_index.unwrap_or_default(),
+                        log_index,
                         block_hash,
-                        payload: (
-                            slot,
-                            decoded.crossChainCallHash,
-                            l.log_index.unwrap_or_default(),
-                        ),
+                        payload: (slot, decoded.crossChainCallHash, log_index),
                     });
             }
             Some(t) if *t == L2TxSkipped::SIGNATURE_HASH => {
@@ -519,6 +516,9 @@ pub(crate) async fn scan_batch_logs_range(
         let tx_index = log
             .transaction_index
             .ok_or_else(|| L1Error::Provider("BatchPosted log missing transaction_index".into()))?;
+        let log_index = log
+            .log_index
+            .ok_or_else(|| L1Error::Provider("BatchPosted log missing log_index".into()))?;
         let tx = fetch_log_transaction(provider, l1_block_number, l1_block_hash, tx_index, tx_hash)
             .await?;
         let submitter = tx.inner.signer();
@@ -552,7 +552,7 @@ pub(crate) async fn scan_batch_logs_range(
             l1_block_number,
             l1_block_hash,
             tx_hash,
-            log_index: log.log_index.unwrap_or_default(),
+            log_index,
             tx_index,
             submitter,
             // A batch verifies (and therefore wipes) our rollup iff it lists it
