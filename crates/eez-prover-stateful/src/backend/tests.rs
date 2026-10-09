@@ -168,6 +168,16 @@ impl HeaderProvider for ReorgingProvider {
 }
 
 impl StateProviderFactory for ReorgingProvider {
+    type Primitives = <MockEthProvider as StateProviderFactory>::Primitives;
+
+    fn state_with_block_appended(
+        &self,
+        parent_hash: B256,
+        block: reth_chain_state::ExecutedBlock<Self::Primitives>,
+    ) -> ProviderResult<StateProviderBox> {
+        self.inner.state_with_block_appended(parent_hash, block)
+    }
+
     fn latest(&self) -> ProviderResult<StateProviderBox> {
         self.inner.latest()
     }
@@ -255,7 +265,7 @@ fn checkpoint_plan_is_not_limited_before_the_provider_is_read() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -279,7 +289,7 @@ fn execution_errors_preserve_retryability() {
 #[test]
 fn empty_checkpoint_execution_retains_transaction_state() {
     let chain_spec = Arc::new(ChainSpec::default());
-    let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec));
+    let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap();
     let recipient = Address::repeat_byte(0x22);
     let signed = TxLegacy {
         nonce: 0,
@@ -309,9 +319,9 @@ fn empty_checkpoint_execution_retains_transaction_state() {
     let provider: MockEthProvider = MockEthProvider::new();
     provider.add_account(sender, ExtendedAccount::new(0, U256::from(u64::MAX)));
     let mut state = State::builder()
-        .with_database(StateProviderDatabase::new(
-            Box::new(provider) as Box<dyn StateProvider + Send>
-        ))
+        .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(
+            Box::new(provider) as Box<dyn StateProvider + Send>,
+        )))
         .with_bundle_update()
         .build();
 
@@ -337,7 +347,7 @@ fn follower_behind_the_required_anchor_is_retryable() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -356,7 +366,7 @@ fn conflicting_local_anchor_is_fatal() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -385,7 +395,7 @@ fn conflicting_known_block_is_fatal() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -447,7 +457,7 @@ fn anchor_reorg_is_aborted_through_the_complete_validation_path() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -483,7 +493,7 @@ fn invalid_standalone_header_is_fatal() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -507,7 +517,7 @@ fn replays_an_empty_terminal_block_from_local_anchor_state() {
     let output = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -532,7 +542,7 @@ fn replayed_state_root_must_match_the_block_header() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -552,7 +562,7 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
             .cancun_activated()
             .build(),
     );
-    let evm_config = EezEvmConfig::new(chain_spec);
+    let evm_config = EezEvmConfig::new(chain_spec).unwrap();
     let block = RecoveredBlock::try_recover(Block {
         header: Header {
             number: 1,
@@ -584,17 +594,21 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
         let provider: MockEthProvider = MockEthProvider::new();
         provider.add_state_root(B256::repeat_byte(0x11));
         let mut state = State::builder()
-            .with_database(StateProviderDatabase::new(
-                Box::new(provider) as Box<dyn StateProvider + Send>
-            ))
+            .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(
+                Box::new(provider) as Box<dyn StateProvider + Send>,
+            )))
             .with_bundle_update()
             .build();
         let result = if with_checkpoints {
-            let (result, checkpoints, _) =
-                execute_block_with_state_checkpoints(&evm_config, &mut state, &block, &[0])
-                    .unwrap();
+            let (result, checkpoints, _) = execute_block_with_state_checkpoints(
+                &evm_config,
+                &mut state,
+                &block,
+                &[CheckpointAt::Transaction(0)],
+            )
+            .unwrap();
             assert_eq!(checkpoints.len(), 1);
-            assert_eq!(checkpoints[0].transaction_index, 0);
+            assert_eq!(checkpoints[0].at, CheckpointAt::Transaction(0));
             result
         } else {
             execute_block(&evm_config, &mut state, &block).unwrap()
@@ -627,7 +641,7 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
 
 #[test]
 fn beacon_withdrawals_are_rejected_in_both_stateful_replay_paths() {
-    let evm_config = EezEvmConfig::new(Arc::new(ChainSpec::default()));
+    let evm_config = EezEvmConfig::new(Arc::new(ChainSpec::default())).unwrap();
     let block = RecoveredBlock::new_unhashed(
         Block {
             header: Header::default(),
@@ -649,9 +663,9 @@ fn beacon_withdrawals_are_rejected_in_both_stateful_replay_paths() {
     for with_checkpoints in [false, true] {
         let provider: MockEthProvider = MockEthProvider::new();
         let mut state = State::builder()
-            .with_database(StateProviderDatabase::new(
-                Box::new(provider) as Box<dyn StateProvider + Send>
-            ))
+            .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(
+                Box::new(provider) as Box<dyn StateProvider + Send>,
+            )))
             .with_bundle_update()
             .build();
         let error = if with_checkpoints {

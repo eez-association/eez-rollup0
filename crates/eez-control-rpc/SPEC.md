@@ -78,7 +78,7 @@ The current profile requires:
 
 | Batch field | Composer requirement |
 | --- | --- |
-| `expectedStateRootPerRollup` | Empty. |
+| `expectedRootPerRollup` | Empty. |
 | `entries` | One anchor, followed by zero or more outbound entries, then zero or more inbound entries. |
 | `staticEntries` | Empty. |
 | `immediateEntryCount` | Complete leading run with `proxyEntryHash == 0`: the anchor plus all outbound entries. |
@@ -95,15 +95,17 @@ Every entry MUST contain exactly one state update for the expected rollup. The
 updates MUST form one continuous chain:
 
 ```text
-entries[0].stateUpdates[0].currentState = hash of block posted
-entries[i].stateUpdates[0].currentState = entries[i - 1].stateUpdates[0].newState
-entries[last].stateUpdates[0].newState = terminal Sync-block hash
+entries[0].rollupUpdates[0].currentRoot = hash of block posted
+entries[i].rollupUpdates[0].currentRoot = entries[i - 1].rollupUpdates[0].newRoot
+entries[last].rollupUpdates[0].newRoot = terminal Sync-block hash
 ```
 
 The anchor is `entries[0]` and is not counted as a cross-chain effect. Effect
-`i` is `entries[i + 1]`. Let `P` be the terminal Sync block's parent hash, and
-let `R[i]` be the hash of the candidate block holding the transaction prefix
-through effect `i`'s effect-ending transaction:
+`i` is `entries[i + 1]`. Let `E` be the hash of the candidate block holding no
+transactions: the terminal Sync block sealed after its pre-block system calls
+(EIP-2935 / EIP-4788). It is not the parent's hash, because an empty block still
+changes state. Let `R[i]` be the hash of the candidate block holding the
+transaction prefix through effect `i`'s effect-ending transaction:
 
 - for an outbound effect, the effect-ending transaction is the user
   transaction in its `[system load, user]` pair; the system load alone is not a
@@ -120,25 +122,26 @@ are rebuilt from the prefix it carries, so `R` is a commitment chain rather
 than a parent-child chain. A Composer MAY capture these checkpoints during
 one complete execution or execute the prefixes separately.
 
-Let `U[j] = entries[j].stateUpdates[0]`. For a batch with `E > 0` effects, the
+Let `U[j] = entries[j].rollupUpdates[0]`. For a batch with `E > 0` effects, the
 state updates MUST be:
 
 ```text
-U[0].currentState = hash of block posted       // anchor
-U[0].newState = P
+U[0].currentRoot = hash of block posted       // anchor
+U[0].newRoot = E
 
-U[1].currentState = P                          // effect 0
-U[i + 1].currentState = R[i - 1]               for every 0 < i < E
-U[i + 1].newState = R[i]                       for every 0 <= i < E
+U[1].currentRoot = E                          // effect 0
+U[i + 1].currentRoot = R[i - 1]               for every 0 < i < E
+U[i + 1].newRoot = R[i]                       for every 0 <= i < E
 
 R[E - 1] = terminal Sync-block hash
 ```
 
 For an anchor-only batch (`E = 0`), there are no effect checkpoints:
-`U[0].currentState` is the hash of block `posted` and `U[0].newState` is the
+`U[0].currentRoot` is the hash of block `posted` and `U[0].newRoot` is the
 terminal Sync block's hash. The Composer MUST finalize every entry's
 L1 rolling hash only after all state updates have been assigned, because the
-rolling-hash seed commits to those updates.
+rolling-hash seed commits to those updates. Finalization then clears the
+`returnData` of each immediate entry, which the protocol requires to be empty.
 
 The exact accepted anchor, outbound, and inbound entry shapes are defined in
 the [proof-signer profile](../eez-proof-signer/SPEC.md#8-state-update-chain-and-effect-binding).
@@ -161,7 +164,7 @@ and sidecar projections are specified in the
 
 After assembling the batch, the Composer MUST exact-encode the complete
 `postAndVerifyBatch(ProofSystemBatchPerVerificationEntries)` call, including
-selector `0xcafef125`, into `post_batch.abi_calldata`.
+selector `0xe4a480e4`, into `post_batch.abi_calldata`.
 
 ### 3.2 Header and window bounds
 
@@ -250,7 +253,7 @@ following checks pass:
 - `post_batch.abi_calldata` is the canonical encoding of the supported batch
   profile and matches the configured rollup and proof system;
 - the entry state updates form the required chain, and every effect entry's
-  `newState` matches the corresponding candidate block hash described in
+  `newRoot` matches the corresponding candidate block hash described in
   section 3.1;
 - every inbound and outbound entry matches the applicable executed transaction,
   receipt, event, call hash, value, and ether-delta evidence for that effect;

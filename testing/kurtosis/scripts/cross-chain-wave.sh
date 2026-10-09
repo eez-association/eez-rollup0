@@ -38,6 +38,28 @@ if [[ -z "${L1:-}" || -z "${L2:-}" || -z "${L1F:-}" || -z "${L2F:-}" ]]; then
 fi
 # shellcheck disable=SC1091
 source "$K/scripts/lib.sh"
+
+# A host-run rig serves a PREBUILT image, so a result only counts if the binary
+# matches the tree. Opportunistic: skipped when the node is not that container.
+if [[ "${EEZ_SKIP_IMAGE_CHECK:-0}" != "1" ]]; then
+    _bin=/tmp/eez-composer-image-check
+    if docker cp eez-node-kurtosis:/usr/local/bin/eez-composer "$_bin" >/dev/null 2>&1; then
+        # Extract once, then grep the FILE: `strings | grep -q` makes strings die
+        # of SIGPIPE on a match, and under `pipefail` that reads as failure.
+        strings "$_bin" | sort -u > "$_bin.syms"
+        _missing=""
+        while read -r _sym; do
+            grep -qF -- "$_sym" "$_bin.syms" || _missing="$_missing $_sym"
+        done < <(grep -rhoE '"eez\.[a-z0-9_.]+"' \
+                    "$REPO/crates/eez-l1/src/submitter.rs" \
+                    "$REPO/crates/eez-composer/src/composer.rs" | tr -d '"' | sort -u)
+        rm -f "$_bin" "$_bin.syms"
+        [[ -z "$_missing" ]] || {
+            echo "STALE IMAGE: running node is missing$_missing"
+            exit 1
+        }
+    fi
+fi
 : "${L1:=$EEZ_DEVNET_L1_RPC}"
 : "${L2:=$EEZ_DEVNET_L2_RPC}"
 : "${L1F:=$EEZ_DEVNET_L1_FRONT}"
@@ -534,7 +556,7 @@ run_waves() {
     # postBatches actually landed on L1 (the original bundle-drop symptom).
     # Counted from THIS run's starting block, not the deploy block.
     local PB_COUNT
-    PB_COUNT=$(registry_events "BatchPosted(uint256)" "$L1_FIRST_COUNTED_BLOCK")
+    PB_COUNT=$(registry_events "BatchPosted(bytes32,uint64[])" "$L1_FIRST_COUNTED_BLOCK")
     if (( PB_COUNT >= WAVES )); then
         echo "    ✓ postBatches on L1 this run: $PB_COUNT (≥ $WAVES waves)"
     else
@@ -542,7 +564,7 @@ run_waves() {
     fi
 
     local EXECUTION_COUNT
-    EXECUTION_COUNT=$(registry_events "L2ExecutionPerformed(uint64,bytes32)" "$L1_FIRST_COUNTED_BLOCK")
+    EXECUTION_COUNT=$(registry_events "L2ExecutionPerformed(uint64,bytes32,uint256)" "$L1_FIRST_COUNTED_BLOCK")
     if (( EXECUTION_COUNT > 0 )); then
         echo "    ✓ L2 execution events on L1 this run: $EXECUTION_COUNT"
     else

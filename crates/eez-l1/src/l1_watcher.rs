@@ -103,13 +103,6 @@ pub enum L1Event {
         /// (its postBatch tx up to the next postBatch verifying our rollup).
         /// `is_empty()` = nothing settled → Deriver skips the batch.
         settlement: crate::scan::Settlement,
-        /// FIRST stateDelta's `currentState` for our rollup. Deriver
-        /// compares to local STF result at `from_block - 1` to catch
-        /// claimed-vs-derived divergence at the batch entry point.
-        claimed_current_state: Option<B256>,
-        /// LAST stateDelta's `newState` for our rollup — the claimed
-        /// full-chain end. Diagnostics only; see `settlement.final_state`.
-        claimed_new_state: Option<B256>,
         /// `true` for the LAST batch of its L1 block. The Deriver waits for it to
         /// move safe: two batches in one L1 block can rewrite the same L2 height.
         last_in_l1_block: bool,
@@ -718,8 +711,6 @@ impl L1Watcher {
                 call_data: b.call_data,
                 state_applied: b.state_applied,
                 settlement: b.settlement,
-                claimed_current_state: b.claimed_current_state,
-                claimed_new_state: b.claimed_new_state,
                 last_in_l1_block,
             });
         }
@@ -1000,7 +991,6 @@ mod tests {
             3_000,
         ));
         asserter.push_success(&serde_json::json!([])); // BatchPosted logs
-        asserter.push_success(&serde_json::json!([])); // winner logs
 
         watcher
             .poll_cycle(&provider, &mut state, 1)
@@ -1043,7 +1033,6 @@ mod tests {
             B256::with_last_byte(4),
             3_000,
         ));
-        asserter.push_success(&serde_json::json!([]));
         asserter.push_success(&serde_json::json!([]));
         // Ancestor window: parent of latest, then grandparent.
         asserter.push_success(&mock_block(199_999, latest_parent, ancestor2_hash, 4_999));
@@ -1099,7 +1088,6 @@ mod tests {
         asserter.push_success(&mock_block(50_000, latest_hash, latest_parent, 5_000));
         asserter.push_success(&mock_block(10, tip_hash, B256::with_last_byte(9), 10)); // at_old_height check
         asserter.push_success(&serde_json::json!([])); // BatchPosted logs
-        asserter.push_success(&serde_json::json!([])); // winner logs
         asserter.push_success(&mock_block(49_999, latest_parent, grandparent_hash, 4_999));
         asserter.push_success(&mock_block(
             49_998,
@@ -1136,7 +1124,6 @@ mod tests {
         let replacement_hash = B256::with_last_byte(0xDD);
         asserter.push_success(&mock_block(50_000, replacement_hash, latest_parent, 5_001));
         asserter.push_success(&serde_json::json!([])); // BatchPosted logs
-        asserter.push_success(&serde_json::json!([])); // winner logs
         asserter.push_success(&mock_block(50_000, replacement_hash, latest_parent, 5_001)); // fill_forward by-hash
 
         watcher
@@ -1307,7 +1294,6 @@ mod tests {
         // Tick 2: identical range retried — this time the scan succeeds.
         asserter.push_success(&mock_block(11, next_hash, tip_hash, 100));
         asserter.push_success(&serde_json::json!([])); // BatchPosted logs
-        asserter.push_success(&serde_json::json!([])); // winner logs
 
         watcher
             .poll_cycle(&provider, &mut state, 2)
@@ -1368,7 +1354,6 @@ mod tests {
         asserter.push_success(&mock_block(12, h12, h11, 200));
         asserter.push_success(&mock_block(11, h11, tip_hash, 110)); // walk-back fetch
         asserter.push_success(&serde_json::json!([])); // BatchPosted logs
-        asserter.push_success(&serde_json::json!([])); // winner logs
         asserter.push_success(&mock_block(12, h12, h11, 200)); // fill_forward: by-hash h12
         asserter.push_success(&mock_block(11, h11, tip_hash, 110)); // fill_forward: by-hash h11
 
@@ -1411,7 +1396,6 @@ mod tests {
         asserter.push_success(&mock_block(11, h11, tip_hash, 1_100)); // walk-back fetch
         asserter.push_failure_msg("query returned more than 10000 results"); // get_logs [11,13]
         asserter.push_success(&serde_json::json!([])); // get_logs [11,12] BatchPosted
-        asserter.push_success(&serde_json::json!([])); // get_logs [11,12] winners
         asserter.push_success(&mock_block(12, h12, h11, 1_200)); // boundary fetch (reached != latest)
         asserter.push_success(&mock_block(12, h12, h11, 1_200)); // fill_forward: by-hash h12
         asserter.push_success(&mock_block(11, h11, tip_hash, 1_100)); // fill_forward: by-hash h11
@@ -1475,8 +1459,6 @@ mod tests {
             call_data: Bytes::new(),
             state_applied: true,
             settlement: crate::scan::Settlement::NONE,
-            claimed_current_state: None,
-            claimed_new_state: None,
         }
     }
 
@@ -1557,6 +1539,110 @@ mod tests {
         assert!(state.lookup_hash(B256::with_last_byte(0)).is_none());
         assert!(state.lookup_hash(B256::with_last_byte(1)).is_none());
         assert_eq!(state.lookup_hash(B256::with_last_byte(2)), Some(2));
+    }
+
+    fn depth_boundary_state() -> WatcherState {
+        let canonical = |number: u64| B256::with_last_byte(number as u8);
+        let mut state = WatcherState::new(3);
+        for number in 97..=100 {
+            state.push_canonical(number, canonical(number));
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn reorg_below_depth_ceiling_finds_the_common_ancestor() {
+        let canonical = |number: u64| B256::with_last_byte(number as u8);
+        let state = depth_boundary_state();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let new_99 = B256::with_last_byte(0xd9);
+        asserter.push_success(&mock_block(99, new_99, canonical(98), 99));
+        let common = walk_back_to_common(&provider, new_99, 99, &state)
+            .await
+            .unwrap()
+            .expect("depth below cap is handled");
+        assert_eq!(common.number, 98);
+    }
+
+    #[tokio::test]
+    #[ignore = "known boundary defect: a depth-D ring retains the tip plus only D-1 ancestors"]
+    async fn reorg_exactly_at_depth_ceiling_finds_the_common_ancestor() {
+        let canonical = |number: u64| B256::with_last_byte(number as u8);
+        let state = depth_boundary_state();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let new_99 = B256::with_last_byte(0xe9);
+        let new_98 = B256::with_last_byte(0xe8);
+        asserter.push_success(&mock_block(99, new_99, new_98, 99));
+        asserter.push_success(&mock_block(98, new_98, canonical(97), 98));
+        asserter.push_success(&mock_block(97, canonical(97), canonical(96), 97));
+        let common = walk_back_to_common(&provider, new_99, 99, &state)
+            .await
+            .unwrap()
+            .expect("reorg exactly at cap is handled");
+        assert_eq!(common.number, 97);
+    }
+
+    #[tokio::test]
+    async fn reorg_beyond_depth_ceiling_has_no_common_ancestor() {
+        let canonical = |number: u64| B256::with_last_byte(number as u8);
+        let state = depth_boundary_state();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let new_99 = B256::with_last_byte(0xf9);
+        let new_98 = B256::with_last_byte(0xf8);
+        let new_97 = B256::with_last_byte(0xf7);
+        asserter.push_success(&mock_block(99, new_99, new_98, 99));
+        asserter.push_success(&mock_block(98, new_98, new_97, 98));
+        asserter.push_success(&mock_block(97, new_97, canonical(96), 97));
+        assert!(
+            walk_back_to_common(&provider, new_99, 99, &state)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "known finality defect: refresh_finalized currently accepts a replacement finalized hash"]
+    async fn changed_finalized_block_is_a_loud_failure_not_a_new_finality_event() {
+        // A finalized height cannot legitimately acquire a replacement hash.
+        let (watcher, mut rx) = test_watcher();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+
+        let finalized_a = B256::with_last_byte(0xa0);
+        let finalized_b = B256::with_last_byte(0xb0);
+        let parent = B256::with_last_byte(0x9f);
+        let mut state = WatcherState::new(3);
+
+        asserter.push_success(&mock_block(100, finalized_a, parent, 1_000));
+        watcher
+            .refresh_finalized(&provider, &mut state)
+            .await
+            .expect("first finalized observation is accepted");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(L1Event::Finalized {
+                block_number: 100,
+                block_hash,
+            }) if block_hash == finalized_a
+        ));
+
+        // Do not overwrite the remembered finality boundary or emit a new event.
+        asserter.push_success(&mock_block(100, finalized_b, parent, 1_001));
+        let result = watcher.refresh_finalized(&provider, &mut state).await;
+        assert!(
+            result.is_err(),
+            "a mutated finalized block must halt loudly; state became {:?}",
+            state.last_finalized_hash
+        );
+        assert_eq!(state.last_finalized_hash, Some(finalized_a));
+        assert!(
+            rx.try_recv().is_err(),
+            "no replacement Finalized event may escape after the invariant violation"
+        );
     }
 
     #[test]

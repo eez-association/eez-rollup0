@@ -65,8 +65,18 @@ WRAPPED_TOPIC=$(cast keccak 'Wrapped(uint256,bool,bool,uint256)')
 FUNDING_KEY="${EEZ_FUND_FROM_KEY:-$L2_DEPLOY_KEY}"
 L1_DEPLOY_KEY="${EEZ_L1_SETUP_KEY:-$FUNDING_KEY}"
 
-refresh_node_log() { kurtosis service logs -a "$ENCLAVE" eez-node >"$NODE_LOG" 2>&1 || true; }
-refresh_signer_log() { kurtosis service logs -a "$ENCLAVE" eez-proof-signer >"$SIGNER_LOG" 2>&1 || true; }
+_container() { docker ps --format "{{.Names}}" | grep -m1 -E "^$1(--|-)" || true; }
+# The node is a host container on the split rig and an enclave service in CI.
+# Reading only the enclave leaves the log EMPTY on the rig, and every log-driven
+# wait then times out with nothing to show for it.
+_logs_into() {
+    local svc="$1" dest="$2" c
+    c=$(_container "$svc")
+    if [[ -n "$c" ]]; then docker logs "$c" >"$dest" 2>&1 || true
+    else kurtosis service logs -a "$ENCLAVE" "$svc" >"$dest" 2>&1 || true; fi
+}
+refresh_node_log() { _logs_into eez-node "$NODE_LOG"; }
+refresh_signer_log() { _logs_into eez-proof-signer "$SIGNER_LOG"; }
 
 wait_for_sync_boundary() {
     # These scenarios assert that all prepared calls share one composed Sync
@@ -164,7 +174,8 @@ assert_root_convergence() {
 
 assert_proof_for_height() {
     local sync_height="$1" node_baseline="$2" signer_baseline="$3"
-    local deadline node_evidence signer_evidence settled attested_hash signed
+    local deadline node_evidence signer_evidence settled attested_hash signed safe_advanced
+    local l1_settled_commitment l2_safe_hash
     deadline=$((SECONDS + ${EEZ_STATE_CHAINING_PROOF_WAIT_SECS:-180}))
     while (( SECONDS < deadline )); do
         refresh_node_log
@@ -185,8 +196,15 @@ assert_proof_for_height() {
                 | grep -F "\"recomputed_public_inputs_hash\":\"$attested_hash\"" \
                 | tail -1 || true)
         fi
-        [[ -n "$settled" && -n "$signed" ]] && {
+        safe_advanced=$(grep -F '"event_name":"eez.deriver.safe.advanced"' <<<"$node_evidence" \
+            | grep -F "\"to_block\":$sync_height," | tail -1 || true)
+        l1_settled_commitment=$(jq -r '.fields.l1_settled_commitment // empty' <<<"$safe_advanced" 2>/dev/null || true)
+        l2_safe_hash=$(jq -r '.fields.new_safe_hash // empty' <<<"$safe_advanced" 2>/dev/null || true)
+        [[ -n "$settled" && -n "$signed" && -n "$safe_advanced" \
+            && -n "$l1_settled_commitment" \
+            && "${l1_settled_commitment,,}" == "${l2_safe_hash,,}" ]] && {
             echo "    ✓ bundle settled and proof signer validated Sync height $sync_height"
+            echo "    ✓ exact Sync-height L1 commitment matches the advanced L2 safe block hash"
             return 0
         }
         sleep 3
@@ -286,18 +304,6 @@ run_scenario() {
     [[ $(wc -l <<<"$source_blocks" | tr -d ' ') == 1 ]] \
         || { echo "$direction source transactions landed in different blocks: $source_blocks" >&2; return 1; }
 
-    for hash in "${hashes[@]}"; do
-        actual_results+=("$(wrapped_result "$hash" "$source_rpc" "$wrapper")")
-    done
-    for index in 0 1 2; do
-        result="${actual_results[$index]}"
-        [[ "$result" == "${expected_results[$index]}" ]] || {
-            echo "$direction $scenario transaction $((index + 1)) returned $result; expected ${expected_results[$index]}" >&2
-            return 1
-        }
-    done
-    echo "    ✓ ordered returns exactly match ${expected_results[*]}"
-
     target_event_deadline=$((SECONDS + RECEIPT_WAIT_SECS))
     while (( SECONDS < target_event_deadline )); do
         all_target_logs=$(retry cast logs --address "$target" --from-block 0 --to-block latest \
@@ -312,6 +318,26 @@ run_scenario() {
     target_blocks=$(jq -r '[.[].blockNumber] | unique | .[]' <<<"$target_logs")
     [[ $(wc -l <<<"$target_blocks" | tr -d ' ') == 1 ]] \
         || { echo "$direction destination calls landed in different blocks: $target_blocks" >&2; return 1; }
+
+    # The first receipts can belong to an optimistic Sync block that is later
+    # replaced if its L1 bundle is dropped. Refresh them after destination
+    # effects appear so proof matching uses the canonical retry height.
+    wait_for_receipts "$source_rpc" "${hashes[@]}"
+    source_blocks=$(unique_receipt_block "$source_rpc" "${hashes[@]}")
+    [[ $(wc -l <<<"$source_blocks" | tr -d ' ') == 1 ]] \
+        || { echo "$direction source transactions landed in different canonical blocks: $source_blocks" >&2; return 1; }
+
+    for hash in "${hashes[@]}"; do
+        actual_results+=("$(wrapped_result "$hash" "$source_rpc" "$wrapper")")
+    done
+    for index in 0 1 2; do
+        result="${actual_results[$index]}"
+        [[ "$result" == "${expected_results[$index]}" ]] || {
+            echo "$direction $scenario transaction $((index + 1)) returned $result; expected ${expected_results[$index]}" >&2
+            return 1
+        }
+    done
+    echo "    ✓ ordered returns exactly match ${expected_results[*]}"
 
     if [[ "$direction" == "inbound" ]]; then
         sync_height=$(cast to-dec "$target_blocks")

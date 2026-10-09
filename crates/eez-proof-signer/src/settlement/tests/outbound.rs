@@ -19,12 +19,7 @@ fn only_positioned_outbound_observation_failures_identify_a_user_transaction() {
         None
     );
     assert_eq!(
-        OutboundEffectError::RollingHashMismatch {
-            entry_index: 1,
-            recomputed: B256::ZERO,
-            claimed: B256::repeat_byte(0x11),
-        }
-        .poisoned_transaction_index(),
+        OutboundEffectError::NonCanonicalReturnData { entry_index: 1 }.poisoned_transaction_index(),
         None
     );
     assert_eq!(
@@ -40,7 +35,7 @@ fn only_positioned_outbound_observation_failures_identify_a_user_transaction() {
 }
 
 fn refresh_outbound_rolling_hash(entry: &mut ExecutionEntrySol) {
-    let [update] = entry.stateUpdates.as_slice() else {
+    let [update] = entry.rollupUpdates.as_slice() else {
         panic!("outbound fixture must contain one state update");
     };
     let [call] = entry.l2ToL1Calls.as_slice() else {
@@ -56,7 +51,7 @@ fn refresh_outbound_rolling_hash(entry: &mut ExecutionEntrySol) {
         data: &call.data,
     });
     let mut rolling_hash = eez_protocol::rolling_hash::EntryRollingHash::seed_for_l1(
-        [(update.rollupId, update.currentState)],
+        [(update.rollupId, update.currentRoot)],
         entry.proxyEntryHash,
     );
     rolling_hash.call_begin(call_hash);
@@ -84,8 +79,8 @@ fn outbound_event_and_l1_rolling_hash_share_the_zero_gas_identity() {
     assert_eq!(event_hash, l1_call_hash);
     let mut expected_rolling = eez_protocol::rolling_hash::EntryRollingHash::seed_for_l1(
         [(
-            entry.stateUpdates[0].rollupId,
-            entry.stateUpdates[0].currentState,
+            entry.rollupUpdates[0].rollupId,
+            entry.rollupUpdates[0].currentRoot,
         )],
         entry.proxyEntryHash,
     );
@@ -112,8 +107,10 @@ fn outbound_events_bind_by_transaction_and_preserve_duplicate_hashes() {
     let plan = effect_plan(&batch, &settling);
     let authorized = authorize_outbound_effects(&plan).unwrap();
     for binding in authorized.iter() {
-        assert!(binding.derived_da_entry().stateUpdates.is_empty());
-        assert_eq!(binding.derived_da_entry().rollingHash, B256::ZERO);
+        let da_entry = binding.derived_da_entry(&Bytes::new());
+        assert!(da_entry.rollupUpdates.is_empty());
+        assert_eq!(da_entry.rollingHash, B256::ZERO);
+        assert_eq!(binding.bind_return_data(&Bytes::new()), Ok(()));
     }
 
     let duplicate_batch = effect_batch(
@@ -388,9 +385,13 @@ fn outbound_effect_prefix_rejects_unsupported_target_shapes() {
 }
 
 #[test]
-fn outbound_authorizer_rejects_wrong_l1_rolling_hash() {
-    let valid = effect_batch(&[B256::ZERO; 3], &[ClaimedEntryShape::Outbound]);
-    let verify = |batch: &CanonicalPostBatch| {
+fn outbound_l1_rolling_hash_is_closed_by_the_da_return_data() {
+    let return_data = Bytes::from_static(&[0xca, 0xfe]);
+    let mut batch = effect_batch(&[B256::ZERO; 3], &[ClaimedEntryShape::Outbound]);
+    batch.entries[1].returnData = return_data.clone();
+    refresh_outbound_rolling_hash(&mut batch.entries[1]);
+    batch.entries[1].returnData = Bytes::new();
+    let authorize = |batch: &CanonicalPostBatch| {
         let mut settling = settling_with_outbound_pairs(1);
         settling
             .outbound_event_candidates_mut_for_test()
@@ -400,15 +401,28 @@ fn outbound_authorizer_rejects_wrong_l1_rolling_hash() {
                 &batch.entries[1].l2ToL1Calls[0],
             ));
         let plan = effect_plan(batch, &settling);
-        authorize_outbound_effects(&plan).err()
+        authorize_outbound_effects(&plan).unwrap()
     };
 
-    let mut wrong_rolling_hash = valid;
+    let authorized = authorize(&batch);
+    let binding = authorized.iter().next().unwrap();
+    assert_eq!(binding.bind_return_data(&return_data), Ok(()));
+    assert_eq!(
+        binding.derived_da_entry(&return_data).returnData,
+        return_data
+    );
+    assert!(binding.bind_return_data(&Bytes::new()).is_err());
+    assert!(
+        binding
+            .bind_return_data(&Bytes::from_static(&[0xbe, 0xef]))
+            .is_err()
+    );
+
+    let mut wrong_rolling_hash = batch;
     wrong_rolling_hash.entries[1].rollingHash = B256::repeat_byte(2);
-    assert!(matches!(
-        verify(&wrong_rolling_hash),
-        Some(OutboundEffectError::RollingHashMismatch { entry_index: 1, .. })
-    ));
+    let authorized = authorize(&wrong_rolling_hash);
+    let binding = authorized.iter().next().unwrap();
+    assert!(binding.bind_return_data(&return_data).is_err());
 }
 
 #[test]
@@ -427,48 +441,46 @@ fn outbound_effects_require_a_successful_outcome_and_exact_value_accounting() {
         authorize_outbound_effects(&plan).err()
     };
 
-    let mut nonempty_return_data = valid.clone();
-    nonempty_return_data.entries[1].returnData = Bytes::from_static(&[0xca, 0xfe]);
-    refresh_outbound_rolling_hash(&mut nonempty_return_data.entries[1]);
-    assert_eq!(verify(&nonempty_return_data), None);
-
-    let mut wrong_return_data = valid.clone();
-    wrong_return_data.entries[1].returnData = Bytes::from_static(&[0xca, 0xfe]);
-    assert!(matches!(
-        verify(&wrong_return_data),
-        Some(OutboundEffectError::RollingHashMismatch { entry_index: 1, .. })
-    ));
+    let mut noncanonical_return_data = valid.clone();
+    noncanonical_return_data.entries[1].returnData = Bytes::from_static(&[0xca, 0xfe]);
+    assert_eq!(
+        verify(&noncanonical_return_data),
+        Some(OutboundEffectError::NonCanonicalReturnData { entry_index: 1 })
+    );
 
     let mut wrong_delta = valid.clone();
-    wrong_delta.entries[1].stateUpdates[0].etherDelta = I256::ONE;
+    wrong_delta.entries[1].rollupUpdates[0].etherDelta = alloy_primitives::aliases::I192::ONE;
     assert_eq!(
         verify(&wrong_delta),
         Some(OutboundEffectError::EtherDeltaMismatch {
             entry_index: 1,
-            expected: I256::ZERO,
-            actual: I256::ONE,
+            expected: alloy_primitives::aliases::I192::ZERO,
+            actual: alloy_primitives::aliases::I192::ONE,
         })
     );
 
-    for value in [U256::from(1), (U256::from(1) << 255) - U256::from(1)] {
+    for value in [U256::from(1), (U256::from(1) << 191) - U256::from(1)] {
         let mut value_bearing = valid.clone();
         value_bearing.entries[1].l2ToL1Calls[0].value = value;
-        value_bearing.entries[1].stateUpdates[0].etherDelta = -I256::try_from(value).unwrap();
+        value_bearing.entries[1].rollupUpdates[0].etherDelta =
+            -eez_protocol::abi::u256_to_i192(value).unwrap();
         refresh_outbound_rolling_hash(&mut value_bearing.entries[1]);
         assert_eq!(verify(&value_bearing), None);
 
-        value_bearing.entries[1].stateUpdates[0].etherDelta += I256::ONE;
+        value_bearing.entries[1].rollupUpdates[0].etherDelta +=
+            alloy_primitives::aliases::I192::ONE;
         assert_eq!(
             verify(&value_bearing),
             Some(OutboundEffectError::EtherDeltaMismatch {
                 entry_index: 1,
-                expected: -I256::try_from(value).unwrap(),
-                actual: -I256::try_from(value).unwrap() + I256::ONE,
+                expected: -eez_protocol::abi::u256_to_i192(value).unwrap(),
+                actual: -eez_protocol::abi::u256_to_i192(value).unwrap()
+                    + alloy_primitives::aliases::I192::ONE,
             })
         );
     }
 
-    for value in [U256::from(1) << 255, U256::MAX] {
+    for value in [U256::from(1) << 191, U256::MAX] {
         let mut out_of_range = valid.clone();
         out_of_range.entries[1].l2ToL1Calls[0].value = value;
         refresh_outbound_rolling_hash(&mut out_of_range.entries[1]);

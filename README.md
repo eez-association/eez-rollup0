@@ -124,6 +124,27 @@ cast block-number --rpc-url http://localhost:18688   # L2 producing
 | **L1→L2 front** (Inbound) | `http://localhost:18999` | send L1-origin cross-chain txs here |
 | **L2→L1 front** (Outbound) | `http://localhost:18998` | send L2-origin cross-chain txs here |
 
+Composer nodes also expose `eez_composerInfo` on the L2 RPC. It takes no
+parameters and returns the configured contracts by name, the EEZ L1 and L2
+chain IDs, and the running composer version:
+
+```json
+{
+  "eezContracts": {
+    "eezRegistryAddress": "0x…",
+    "eezRollupManagerAddress": "0x…",
+    "eezL1BridgeSender": "0x…",
+    "eezL2Address": "0x4200000000000000000000000000000000000007",
+    "eezL2BridgeReceiver": "0x…"
+  },
+  "supportedNetworks": {
+    "eezL1": 10200,
+    "eezL2": 10201
+  },
+  "version": "0.1.0"
+}
+```
+
 The two **cross-chain ingress fronts** are transparent proxies:
 `eth_sendRawTransaction` sent to a front is held and composed into the next Sync
 block; every other `eth_*` is forwarded to that front's source-chain RPC. They
@@ -188,7 +209,12 @@ cargo run -p eez-follower -- node \
 
 ## Build, test, teardown
 
+Building needs LLVM 22, clang, Polly and m4: reth_gnosis turns on reth's
+`jit` and `gmp` features for the whole graph.
+
 ```bash
+sudo bash scripts/ci/install-llvm.sh    # no-op when already installed
+export LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                  # Rust; `cd contracts && forge test` for Solidity

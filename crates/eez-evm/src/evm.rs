@@ -1,28 +1,30 @@
-//! Native deposit minting around the unmodified Ethereum EVM.
+//! Native deposit minting and fee collection around the Ethereum EVM.
 //!
-//! Delegates execution and inspector dispatch to Alloy 0.34.0's [`EthEvm`]:
-//! <https://github.com/alloy-rs/alloy-evm/blob/6022e02ee1ab669f7c1ee59b58fc7a6b3f5f15d5/crates/evm/src/eth/mod.rs>.
+//! Delegates execution and inspector dispatch to Alloy 0.39.0's [`EthEvm`]:
+//! <https://github.com/alloy-rs/alloy-evm/blob/ba6f83b80aba8cf005175f4d776d8b90796c72d9/crates/evm/src/eth/mod.rs>.
 
 use alloy_evm::{
     Database, EthEvm, EthEvmFactory, Evm, EvmEnv, EvmFactory, eth::EthEvmContext,
     precompiles::PrecompilesMap,
 };
-use alloy_primitives::{Address, Bytes, TxKind};
+use alloy_primitives::{Address, Bytes, TxKind, U256};
 use eez_primitives::{EEZL2_ADDRESS, SYSTEM_ADDRESS, SYSTEM_TX_GAS_LIMIT, SYSTEM_TX_TYPE};
 use revm::{
     Inspector,
     context::{BlockEnv, CfgEnv, TxEnv},
     context_interface::{
-        JournalTr,
+        Cfg, JournalTr, Transaction,
         journaled_state::account::JournaledAccountTr,
         result::{EVMError, HaltReason, ResultAndState},
     },
     inspector::NoOpInspector,
     primitives::hardfork::SpecId,
+    state::Account,
 };
 
 pub struct EezEvm<DB: Database, I> {
     ethereum: EthEvm<DB, I, PrecompilesMap>,
+    fee_collector: Option<Address>,
 }
 
 impl<DB: Database, I> std::fmt::Debug for EezEvm<DB, I> {
@@ -60,7 +62,48 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> Evm for EezEvm<DB, I> {
     /// so all paths below preserve the inspector installed by our factory.
     fn transact_raw(&mut self, tx: TxEnv) -> Result<ResultAndState, Self::Error> {
         if tx.tx_type != SYSTEM_TX_TYPE {
-            return self.ethereum.transact_raw(tx);
+            let Some(collector) = self.fee_collector else {
+                return self.ethereum.transact_raw(tx);
+            };
+            if self.cfg_env().is_fee_charge_disabled() {
+                return self.ethereum.transact_raw(tx);
+            }
+            // Ethereum has already deducted these fees and will refund unused
+            // gas and reward the beneficiary. Restore only the amount it burns.
+            // The minimum also handles simulations with base-fee checks disabled.
+            let base_fee = if self.cfg_env().spec.is_enabled_in(SpecId::LONDON) {
+                u128::from(self.block().basefee)
+                    .min(tx.effective_gas_price(u128::from(self.block().basefee)))
+            } else {
+                0
+            };
+            let mut output = self.ethereum.transact_raw(tx)?;
+            let fee = U256::from(base_fee) * U256::from(output.result.tx_gas_used());
+            if !fee.is_zero() {
+                // Load only after execution: preloading would warm the collector
+                // and change BALANCE/CALL gas costs in the transaction itself.
+                let account = match output.state.entry(collector) {
+                    revm::primitives::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    revm::primitives::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(Account::from(
+                            self.ethereum
+                                .db_mut()
+                                .basic(collector)
+                                .map_err(EVMError::Database)?
+                                .unwrap_or_default(),
+                        ))
+                    }
+                };
+                // Preserve Ethereum's account lifecycle. A balance credit does
+                // not cancel deletion of a selfdestructed collector contract.
+                account.info.balance = account
+                    .info
+                    .balance
+                    .checked_add(fee)
+                    .ok_or_else(|| EVMError::Custom("fee collector balance overflow".into()))?;
+                account.mark_touch();
+            }
+            return Ok(output);
         }
         // Direct TxEnv callers bypass envelope conversion; enforce native sender,
         // target, and gas rules here before executing or minting value.
@@ -139,15 +182,23 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> Evm for EezEvm<DB, I> {
     }
 }
 
-/// Installs the minting wrapper for both ordinary and inspected execution.
+/// Installs identical minting and fee routing for ordinary and inspected execution.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct EezEvmFactory;
+pub struct EezEvmFactory {
+    fee_collector: Option<Address>,
+}
+
+impl EezEvmFactory {
+    pub const fn new(fee_collector: Option<Address>) -> Self {
+        Self { fee_collector }
+    }
+}
 
 impl EvmFactory for EezEvmFactory {
     type Evm<DB: Database, I: Inspector<EthEvmContext<DB>>> = EezEvm<DB, I>;
     type Context<DB: Database> = EthEvmContext<DB>;
     type Tx = TxEnv;
-    type Error<DBError: std::error::Error + Send + Sync + 'static> = EVMError<DBError>;
+    type Error<DBError: revm::database_interface::DBErrorMarker> = EVMError<DBError>;
     type HaltReason = HaltReason;
     type Spec = SpecId;
     type BlockEnv = BlockEnv;
@@ -156,6 +207,7 @@ impl EvmFactory for EezEvmFactory {
     fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> EezEvm<DB, NoOpInspector> {
         EezEvm {
             ethereum: EthEvmFactory::default().create_evm(db, input),
+            fee_collector: self.fee_collector,
         }
     }
 
@@ -167,6 +219,7 @@ impl EvmFactory for EezEvmFactory {
     ) -> EezEvm<DB, I> {
         EezEvm {
             ethereum: EthEvmFactory::default().create_evm_with_inspector(db, input, inspector),
+            fee_collector: self.fee_collector,
         }
     }
 }

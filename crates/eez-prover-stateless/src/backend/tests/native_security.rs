@@ -55,7 +55,7 @@ fn prover_rejects_beacon_withdrawal_mints() {
         SealedBlock::seal_slow(block.clone()).try_recover().unwrap(),
         witness.clone(),
         chain_spec.clone(),
-        eez_evm::EezEvmConfig::new(chain_spec),
+        eez_evm::EezEvmConfig::new(chain_spec).unwrap(),
     )
     .unwrap_err();
     assert!(

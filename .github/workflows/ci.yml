@@ -36,6 +36,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
+      - name: Install LLVM 22
+        run: |
+          sudo bash scripts/ci/install-llvm.sh
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -61,6 +66,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
+      - name: Install LLVM 22
+        run: |
+          sudo bash scripts/ci/install-llvm.sh
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
       - name: Unit tests (lib + bins, parallel)
         run: cargo nextest run --locked --workspace --lib --bins --no-fail-fast
       - name: Protocol integration vectors
@@ -134,10 +144,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libclang-dev pkg-config libssl-dev cmake protobuf-compiler
+      - name: Install LLVM 22
+        run: |
+          sudo bash scripts/ci/install-llvm.sh
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
       - name: Archive integration test executables
         run: |
           mkdir -p artifacts/e2e-build
-          cargo nextest archive --locked --cargo-profile ci-e2e -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test resumption --test resumption_append --test native_system --archive-file artifacts/e2e-build/tests.tar.zst
+          cargo nextest archive --locked --cargo-profile ci-e2e -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test durability --test resumption --test resumption_append --test native_system --archive-file artifacts/e2e-build/tests.tar.zst
       - name: Build E2E runtime binaries
         run: |
           cargo build --locked \
@@ -237,6 +252,9 @@ jobs:
           - id: chained-interstate
             name: chained interstate
             filter: binary(=chained_interstate)
+          - id: durability
+            name: durability
+            filter: binary(=durability)
           - id: resumption
             name: resumption
             filter: binary(=resumption) | binary(=resumption_append)

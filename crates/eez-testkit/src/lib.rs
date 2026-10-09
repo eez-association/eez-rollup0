@@ -245,6 +245,22 @@ struct BundleStub {
     _log_dir: Option<tempfile::TempDir>,
 }
 
+/// Fault modes exposed by the local relay stub for process-level tests.
+#[derive(Clone, Copy, Debug)]
+pub enum BuilderStubMode {
+    Forward,
+    Drop,
+}
+
+impl BuilderStubMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Drop => "drop",
+        }
+    }
+}
+
 impl BundleStub {
     async fn spawn(port_lease: PortLease, upstream: &str) -> Result<Self> {
         let port = port_lease.port();
@@ -285,6 +301,19 @@ impl BundleStub {
             "builder-stub did not bind within 3s on {listen}; log:\n{}",
             std::fs::read_to_string(&log_path).unwrap_or_default(),
         );
+    }
+
+    async fn set_mode(&self, mode: BuilderStubMode) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.url.parse()?);
+        let result: String = provider
+            .client()
+            .request("eez_setBuilderMode", (mode.as_str(),))
+            .await
+            .context("set builder stub mode")?;
+        if result != mode.as_str() {
+            bail!("builder stub returned unexpected mode {result}");
+        }
+        Ok(())
     }
 }
 
@@ -489,6 +518,38 @@ impl ProofSignerHandle {
                 std::fs::read_to_string(&self.log_path).unwrap_or_default()
             );
         }
+    }
+
+    #[cfg(unix)]
+    fn send_signal(&self, signal: &str) -> Result<()> {
+        let pid = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("proof signer child mutex poisoned"))?
+            .id()
+            .to_string();
+        let status = Command::new("kill")
+            .args([signal, &pid])
+            .status()
+            .with_context(|| format!("send {signal} to proof signer pid {pid}"))?;
+        if !status.success() {
+            bail!("sending {signal} to proof signer pid {pid} failed with {status}");
+        }
+        Ok(())
+    }
+
+    /// Suspend the real signer without closing its listening socket. This
+    /// exercises an in-flight prover outage rather than an immediate
+    /// connection-refused error.
+    #[cfg(unix)]
+    pub fn pause(&self) -> Result<()> {
+        self.send_signal("-STOP")
+    }
+
+    /// Resume a signer previously suspended by [`Self::pause`].
+    #[cfg(unix)]
+    pub fn resume(&self) -> Result<()> {
+        self.send_signal("-CONT")
     }
 }
 
@@ -761,6 +822,11 @@ impl Harness {
         Chain::new(&self.anvil, &self.dep)
     }
 
+    /// Select deterministic relay behavior for the next submissions.
+    pub async fn set_builder_mode(&self, mode: BuilderStubMode) -> Result<()> {
+        self.stub.set_mode(mode).await
+    }
+
     /// Counts signer successes so negative tests cannot pass because proving stalled.
     pub fn successful_attestations(&self) -> Result<usize> {
         self.provers
@@ -953,12 +1019,21 @@ sol! {
     interface IEEZ {
         error InvalidProof();
         error InvalidProofSystemConfig();
-        event BatchPosted(uint256 rollupCount);
-        event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newState);
+        event BatchPosted(bytes32 sharedPublicInput, uint64[] rollupIds);
+        event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newRoot, uint256 etherBalance);
         event L2TxSkipped(uint256 indexed transientIdx, bytes revertData);
-        function rollups(uint64 rollupId) external view returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
+        function rollups(uint64 rollupId) external view returns (address rollupContract, bytes32 root, uint256 etherBalance);
         function rollupCounter() external view returns (uint256);
         function registerRollup(address rollupContract, bytes32 initialState) external returns (uint64 rollupId);
+    }
+
+    interface IRollupManager {
+        function initialize(
+            address initialOwner,
+            uint256 initialThreshold,
+            address[] proofSystems,
+            bytes32[] vkeys
+        ) external;
     }
 }
 
@@ -1134,24 +1209,31 @@ async fn deploy_contracts_with_initial(
     )
     .await?;
 
-    // Rollup(address eez, address owner, uint256 threshold,
+    // Rollup(address eez) behind a proxy; initialize(address owner, uint256 threshold,
     //        address[] proofSystems, bytes32[] vkeys)
     let proof_systems: Vec<Address> = vec![proof_system_address];
     // vkey embeds the authorized signer address; the registry treats vkey as
     // opaque but checks non-zero + membership (see DeployRollup.s.sol:60).
     let vkeys: Vec<B256> = vec![attester.into_word()];
-    let rollup_manager_address = deploy(
+    let rollup_implementation = deploy(
         &provider,
         signer_addr,
         &out.join("Rollup.sol/Rollup.json"),
-        (
-            eez_address,
-            signer_addr,
-            U256::from(1u64),
-            proof_systems,
-            vkeys,
-        )
-            .abi_encode_params(),
+        eez_address.abi_encode(),
+    )
+    .await?;
+    let initialize = IRollupManager::initializeCall {
+        initialOwner: signer_addr,
+        initialThreshold: U256::from(1u64),
+        proofSystems: proof_systems,
+        vkeys,
+    }
+    .abi_encode();
+    let rollup_manager_address = deploy(
+        &provider,
+        signer_addr,
+        &out.join("TransparentUpgradeableProxy.sol/TransparentUpgradeableProxy.json"),
+        (rollup_implementation, signer_addr, Bytes::from(initialize)).abi_encode_params(),
     )
     .await?;
 
@@ -1875,7 +1957,7 @@ pub struct ChainSnapshot {
     pub entries_skipped: usize,
     /// What L1 stores for the rollup: a candidate block hash.
     pub rollup_commitment: B256,
-    pub latest_execution_state: Option<B256>,
+    pub latest_execution_root: Option<B256>,
 }
 
 pub struct Chain<'a> {
@@ -2007,14 +2089,14 @@ impl<'a> Chain<'a> {
                 Some(block),
             )
             .await?,
-            rollup_commitment: state_root_at(
+            rollup_commitment: rollup_root_at(
                 self.rpc_url,
                 self.eez_address,
                 self.rollup_id,
                 Some(block),
             )
             .await?,
-            latest_execution_state: latest_l2_execution_state_at(
+            latest_execution_root: latest_l2_execution_root_at(
                 self.rpc_url,
                 self.eez_address,
                 self.rollup_id,
@@ -2168,13 +2250,13 @@ pub async fn wait_for_l1_blocks(rpc_url: &str, target: u64, timeout: Duration) -
     .await
 }
 
-/// The commitment L1 stores for `rollup_id`. A candidate block hash, not a
-/// state root — the ABI field is still named `stateRoot`.
+/// The commitment L1 stores for `rollup_id`. A candidate block hash, not an
+/// EVM state root.
 pub async fn rollup_commitment(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<B256> {
-    state_root_at(rpc_url, eez, rollup_id, None).await
+    rollup_root_at(rpc_url, eez, rollup_id, None).await
 }
 
-async fn state_root_at(
+async fn rollup_root_at(
     rpc_url: &str,
     eez: Address,
     rollup_id: u64,
@@ -2186,7 +2268,7 @@ async fn state_root_at(
     if let Some(block) = block {
         call = call.block(BlockNumberOrTag::Number(block).into());
     }
-    Ok(call.call().await?.stateRoot)
+    Ok(call.call().await?.root)
 }
 
 pub async fn rollup_ether_balance(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<U256> {
@@ -2345,7 +2427,7 @@ pub async fn assert_latest_batch_signature(
     Ok(())
 }
 
-async fn latest_l2_execution_state_at(
+async fn latest_l2_execution_root_at(
     rpc_url: &str,
     contract: Address,
     rollup_id: u64,
@@ -2367,7 +2449,7 @@ async fn latest_l2_execution_state_at(
         return Ok(None);
     };
     let decoded = IEEZ::L2ExecutionPerformed::decode_log(&last.inner)?;
-    Ok(Some(decoded.newState))
+    Ok(Some(decoded.newRoot))
 }
 
 pub async fn all_l2_execution_states(
@@ -2380,14 +2462,14 @@ pub async fn all_l2_execution_states(
         all_l2_execution_events(rpc_url, contract, rollup_id, from_block)
             .await?
             .into_iter()
-            .map(|event| event.state)
+            .map(|event| event.root)
             .collect(),
     )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct L2ExecutionEvent {
-    state: B256,
+    root: B256,
     block_number: u64,
     transaction_hash: B256,
     log_index: u64,
@@ -2420,7 +2502,7 @@ async fn all_l2_execution_events(
                 .ok_or_else(|| anyhow!("L2ExecutionPerformed log is missing log_index"))?;
             let decoded = IEEZ::L2ExecutionPerformed::decode_log(&log.inner)?;
             Ok(L2ExecutionEvent {
-                state: decoded.newState,
+                root: decoded.newRoot,
                 block_number,
                 transaction_hash,
                 log_index,
@@ -2433,7 +2515,7 @@ async fn all_l2_execution_events(
 /// Using the full history avoids racing an advancing on-chain head.
 /// Waits until the node's safe block is one L1 attested, and is past genesis.
 ///
-/// Compares BLOCK HASHES: `executed_states` are the `newState` values L1
+/// Compares BLOCK HASHES: `executed_states` are the `newRoot` values L1
 /// emitted, which are candidate block hashes, so a state root could never
 /// appear in that set.
 pub async fn wait_for_safe_state(
@@ -2467,7 +2549,7 @@ pub async fn wait_for_safe_state(
 /// Waits for a safe block L1 attested after `previous_states`.
 ///
 /// `previous_states` and `executed_states` are both `L2ExecutionPerformed`
-/// `newState` values — candidate block hashes — so the safe block is matched by
+/// `newRoot` values — candidate block hashes — so the safe block is matched by
 /// its hash. Its state root is not a commitment and would never appear there.
 pub async fn wait_for_new_attested_safe_block(
     node: &NodeHandle,
@@ -2668,6 +2750,8 @@ fn write_fixture_genesis(
     genesis.timestamp = ts;
     if let Some(id) = chain_id {
         genesis.config.chain_id = id;
+        // The shared fixture is L2; the Ethereum dev L1 burns its own base fees.
+        genesis.config.extra_fields.remove("feeCollector");
     }
     let dir = tempfile::tempdir().context("genesis tempdir")?;
     let path = dir.path().join(filename);
@@ -2876,19 +2960,27 @@ pub async fn deploy_protocol_dev(
         padded[12..].copy_from_slice(attester.as_slice());
         padded
     })];
-    let rollup_manager_address = deploy_raw(
+    let rollup_implementation = deploy_raw(
         l1_rpc,
         deployer_key,
         DEV_CHAIN_ID,
         &out.join("Rollup.sol/Rollup.json"),
-        (
-            eez_address,
-            signer_addr,
-            U256::from(1u64),
-            vec![proof_system_address],
-            vkeys,
-        )
-            .abi_encode_params(),
+        eez_address.abi_encode(),
+    )
+    .await?;
+    let initialize = IRollupManager::initializeCall {
+        initialOwner: signer_addr,
+        initialThreshold: U256::from(1u64),
+        proofSystems: vec![proof_system_address],
+        vkeys,
+    }
+    .abi_encode();
+    let rollup_manager_address = deploy_raw(
+        l1_rpc,
+        deployer_key,
+        DEV_CHAIN_ID,
+        &out.join("TransparentUpgradeableProxy.sol/TransparentUpgradeableProxy.json"),
+        (rollup_implementation, signer_addr, Bytes::from(initialize)).abi_encode_params(),
     )
     .await?;
 
@@ -3296,7 +3388,7 @@ impl CrossChainConfig {
         // These CREATE nonces must match `deploy_protocol_dev`.
         let eez_address = deployer.create(0);
         let proof_system_address = deployer.create(1);
-        let rollup_manager_address = deployer.create(2);
+        let rollup_manager_address = deployer.create(3);
         let ts = now_unix_secs();
         let initial_state = l2_genesis_block_hash_at(ts)?;
         let l1_http_lease = PortLease::http_pair();
@@ -3580,6 +3672,33 @@ impl CrossChainWorld {
     }
     pub fn l2_rpc(&self) -> String {
         self.node.l2_rpc_url()
+    }
+
+    /// Environment for an L1-derived follower of this world's composer.
+    ///
+    /// The follower talks to the composer's embedded L1 over RPC and must not
+    /// reuse that process's bound HTTP, P2P, or cross-chain ports.
+    pub fn follower_env(&self) -> Vec<(&'static str, String)> {
+        self.cfg
+            .env()
+            .into_iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    *key,
+                    "EEZ_L1_HTTP_PORT"
+                        | "EEZ_L1_AUTH_PORT"
+                        | "EEZ_L1_P2P_PORT"
+                        | "EEZ_L1_XCHAIN_PORT"
+                        | "EEZ_L2_XCHAIN_PORT"
+                )
+            })
+            .map(|(key, mut value)| {
+                if key == "EEZ_COMPOSER_EXPECT_EXTERNAL_BATCHES" {
+                    value = "true".to_string();
+                }
+                (key, value)
+            })
+            .collect()
     }
 }
 
@@ -3949,7 +4068,7 @@ impl StandardOracleSnapshot {
             let endpoint = execution_events
                 .iter()
                 .rfind(|event| {
-                    event.block_number == l1_block_number && event.state == l1_settled
+                    event.block_number == l1_block_number && event.root == l1_settled
                 })
                 .ok_or_else(|| {
                     anyhow!(

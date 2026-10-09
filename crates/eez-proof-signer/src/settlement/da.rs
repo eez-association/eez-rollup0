@@ -1,10 +1,11 @@
 //! Decoding and exact verification of the batch data-availability payload.
 
 use alloy_consensus::Transaction as _;
-use alloy_primitives::Bytes;
+use alloy_primitives::{B256, Bytes};
 use alloy_sol_types::SolValue as _;
 use eez_payload_codec::{Action, DecodedSpan};
 use eez_protocol::RollupId;
+use eez_protocol::abi::ExecutionEntrySol;
 use eez_protocol::entries::manifest::entry_from_action;
 use reth_primitives_traits::BlockBody as _;
 use thiserror::Error;
@@ -59,6 +60,14 @@ pub(crate) enum DaPayloadError {
     ActionMismatch {
         entry_index: usize,
         transaction_index: usize,
+    },
+    #[error(
+        "batch callData action {entry_index} return data does not complete the L1 rolling hash for effect transaction {transaction_index}; recomputed {recomputed}"
+    )]
+    RollingHashMismatch {
+        entry_index: usize,
+        transaction_index: usize,
+        recomputed: B256,
     },
     #[error("batch callData action {entry_index} does not describe rollup {rollup_id}: {reason}")]
     UnrebuildableAction {
@@ -276,7 +285,7 @@ where
 
     payload_cursor.transactions_exhausted(retained_transactions)?;
 
-    verify_effect_sidecars(
+    let outbound_da_entries = verify_effect_sidecars(
         &payload_cursor,
         outbound_effects,
         inbound_effects,
@@ -288,6 +297,7 @@ where
             &settling.block,
             &settling.encoded_transactions,
             outbound_effects,
+            &outbound_da_entries,
             inbound_effects,
             system_transaction_reconstructor,
         )?;
@@ -414,29 +424,19 @@ fn verify_settling_block_transactions(
 /// same projection derivation uses and the result must equal the entry the
 /// authorized effect derives. That binds the action's own fields — target,
 /// value, calldata, outcome — because the rebuilt entry's `proxyEntryHash` and
-/// `rollingHash` are computed from them, not carried.
+/// `rollingHash` are computed from them, not carried. An outbound action's
+/// return data must also complete the claimed L1 rolling hash; the completed
+/// outbound entries are returned for Sync-block reconstruction.
 fn verify_effect_sidecars(
     payload: &DaPayload,
     outbound_effects: &AuthorizedOutboundEffects,
     inbound_effects: &AuthorizedInboundEffects<'_>,
     expected_sidecar_count: usize,
     expected_rollup_id: u64,
-) -> Result<(), DaPayloadError> {
-    let expected_sidecars = outbound_effects
-        .iter()
-        .map(|outbound| {
-            (
-                outbound.transaction_index(),
-                outbound.derived_da_entry().abi_encode(),
-            )
-        })
-        .chain(inbound_effects.iter().map(|inbound| {
-            (
-                inbound.transaction_index(),
-                inbound.observation().derived_da_entry.encoded(),
-            )
-        }));
-    for (entry_index, (transaction_index, expected_encoding)) in expected_sidecars.enumerate() {
+) -> Result<Vec<ExecutionEntrySol>, DaPayloadError> {
+    let rebuild = |entry_index: usize,
+                   transaction_index: usize|
+     -> Result<ExecutionEntrySol, DaPayloadError> {
         let action = payload
             .actions
             .get(entry_index)
@@ -444,14 +444,40 @@ fn verify_effect_sidecars(
                 entry_index,
                 transaction_index,
             })?;
-        let rebuilt = entry_from_action(action, RollupId(expected_rollup_id)).map_err(|error| {
+        entry_from_action(action, RollupId(expected_rollup_id)).map_err(|error| {
             DaPayloadError::UnrebuildableAction {
                 entry_index,
                 rollup_id: expected_rollup_id,
                 reason: error.to_string(),
             }
-        })?;
-        if rebuilt.abi_encode() != expected_encoding {
+        })
+    };
+
+    let mut outbound_da_entries = Vec::with_capacity(outbound_effects.len());
+    for (entry_index, outbound) in outbound_effects.iter().enumerate() {
+        let transaction_index = outbound.transaction_index();
+        let rebuilt = rebuild(entry_index, transaction_index)?;
+        let expected = outbound.derived_da_entry(&rebuilt.returnData);
+        if rebuilt.abi_encode() != expected.abi_encode() {
+            return Err(DaPayloadError::ActionMismatch {
+                entry_index,
+                transaction_index,
+            });
+        }
+        outbound
+            .bind_return_data(&rebuilt.returnData)
+            .map_err(|recomputed| DaPayloadError::RollingHashMismatch {
+                entry_index,
+                transaction_index,
+                recomputed,
+            })?;
+        outbound_da_entries.push(expected);
+    }
+    for (offset, inbound) in inbound_effects.iter().enumerate() {
+        let entry_index = outbound_da_entries.len() + offset;
+        let transaction_index = inbound.transaction_index();
+        let rebuilt = rebuild(entry_index, transaction_index)?;
+        if rebuilt.abi_encode() != inbound.observation().derived_da_entry.encoded() {
             return Err(DaPayloadError::ActionMismatch {
                 entry_index,
                 transaction_index,
@@ -464,7 +490,7 @@ fn verify_effect_sidecars(
             expected: expected_sidecar_count,
         });
     }
-    Ok(())
+    Ok(outbound_da_entries)
 }
 
 /// Bind the span's claimed per-block header inputs to the validated header.
@@ -526,6 +552,7 @@ fn verify_reconstructed_sync_block(
     block: &EthereumBlock,
     validated_transactions: &[Bytes],
     outbound_effects: &AuthorizedOutboundEffects,
+    outbound_da_entries: &[ExecutionEntrySol],
     inbound_effects: &AuthorizedInboundEffects<'_>,
     reconstructor: &SystemTransactionReconstructor,
 ) -> Result<(), DaPayloadError> {
@@ -548,11 +575,12 @@ fn verify_reconstructed_sync_block(
         .nonce();
     let outbound_reconstruction_inputs = outbound_effects
         .iter()
-        .map(|binding| {
+        .zip(outbound_da_entries)
+        .map(|(binding, da_entry)| {
             let user_transaction = validated_transactions
                 .get(binding.transaction_index())
                 .ok_or(DaPayloadError::InvalidEffectTransactionLayout)?;
-            Ok((binding.derived_da_entry().clone(), user_transaction.clone()))
+            Ok((da_entry.clone(), user_transaction.clone()))
         })
         .collect::<Result<Vec<_>, DaPayloadError>>()?;
     let inbound_reconstruction_entries = inbound_effects

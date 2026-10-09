@@ -92,7 +92,7 @@ enum CommitCommand<T: PayloadTypes> {
     },
     /// Roll the canonical head back to `target_header`. Used by the
     /// composer when a Sync block's bundle didn't settle on L1: per the
-    /// "L1 stateRoot is the finality oracle" model that block is
+    /// "L1 root is the finality oracle" model that block is
     /// unfinalized and must be rebuilt.
     ReorgTo {
         target_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,

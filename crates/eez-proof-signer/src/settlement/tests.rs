@@ -3,13 +3,13 @@
 use std::num::NonZeroU64;
 
 use alloy_consensus::{SignableTransaction as _, Transaction as _};
-use alloy_primitives::{Address, B256, Bytes, I256, Signature, U256, address, b256};
+use alloy_primitives::{Address, B256, Bytes, Signature, U256, address, b256};
 use alloy_sol_types::{SolCall as _, SolValue as _};
 use eez_primitives::{BlockBody, EezTxEnvelope as TransactionSigned};
 use eez_protocol::EvmBatch;
 use eez_protocol::abi::{
     ExecutionEntrySol, ExpectedL1ToL2CallSol, ExpectedOutgoingCrossChainCallSol,
-    ExpectedStateRootPerRollupSol, L2ToL1CallSol, RollupIdWithProofSystemsSol, StateUpdateSol,
+    ExpectedRootPerRollupSol, L2ToL1CallSol, RollupIdWithProofSystemsSol, RollupUpdateSol,
     StaticExecutionEntrySol,
 };
 use eez_protocol::entries::{
@@ -24,7 +24,8 @@ use eez_protocol::{
 use reth_primitives_traits::{BlockBody as _, SignerRecoverable as _};
 
 use crate::testkit::{
-    SYSTEM_TX, TEST_SYSTEM_ADDRESS, checkpoint, system_transaction_context, test_proof_system_vkey,
+    SYSTEM_TX, TEST_SYSTEM_ADDRESS, checkpoint, pre_execution_checkpoint,
+    system_transaction_context, test_proof_system_vkey,
 };
 use crate::validate::{OutboundEventObservation, SettlementBlockEvidence, ValidatedBlock};
 
@@ -32,8 +33,8 @@ use super::{
     AuthorizedInboundEffects, AuthorizedOutboundEffects, BlockInspectionError, BoundEffectSequence,
     CanonicalPostBatch, ClaimedEntryShape, DaPayloadError, EffectPrefixError, EthereumBlock,
     InboundCandidate, InboundEffectError, InboundObservationError, ObservedEffectKind,
-    OutboundEffectError, PostBatchDecodeError, PublicInputError, SettlingBlockObservations,
-    StateUpdateChainError, authorize_inbound_effects as authorize_inbound_effects_for_rollup,
+    OutboundEffectError, PostBatchDecodeError, PublicInputError, RollupUpdateChainError,
+    SettlingBlockObservations, authorize_inbound_effects as authorize_inbound_effects_for_rollup,
     authorize_outbound_effects as authorize_outbound_effects_for_rollup, bind_effects_to_execution,
     decode_canonical_post_batch, encode_da_payload, inspect_inbound_candidate,
     inspect_settling_block, inspect_validated_settling_block, recompute_public_input_hash,
@@ -116,11 +117,11 @@ fn rollup_row(rollup_id: u64) -> RollupIdWithProofSystemsSol {
 
 fn state_entry(rollup_id: u64, current: B256, new: B256) -> ExecutionEntrySol {
     ExecutionEntrySol {
-        stateUpdates: vec![StateUpdateSol {
+        rollupUpdates: vec![RollupUpdateSol {
             rollupId: rollup_id,
-            currentState: current,
-            newState: new,
-            etherDelta: I256::ZERO,
+            currentRoot: current,
+            newRoot: new,
+            etherDelta: alloy_primitives::aliases::I192::ZERO,
         }],
         proxyEntryHash: B256::ZERO,
         destinationRollupId: rollup_id,
@@ -150,7 +151,8 @@ fn effect_batch(roots: &[B256], kinds: &[ClaimedEntryShape]) -> CanonicalPostBat
         match kind {
             ClaimedEntryShape::Outbound => {
                 let call = l2_to_l1_call();
-                entry.stateUpdates[0].etherDelta = -I256::try_from(call.value).unwrap();
+                entry.rollupUpdates[0].etherDelta =
+                    -eez_protocol::abi::u256_to_i192(call.value).unwrap();
                 let call_hash = common_cross_chain_call_hash(CallHashInput {
                     call_mode: CallMode::Mutable,
                     source_address: call.sourceAddress,
@@ -160,9 +162,9 @@ fn effect_batch(roots: &[B256], kinds: &[ClaimedEntryShape]) -> CanonicalPostBat
                     value: call.value,
                     data: &call.data,
                 });
-                let update = &entry.stateUpdates[0];
+                let update = &entry.rollupUpdates[0];
                 let mut rolling_hash = EntryRollingHash::seed_for_l1(
-                    [(update.rollupId, update.currentState)],
+                    [(update.rollupId, update.currentRoot)],
                     entry.proxyEntryHash,
                 );
                 rolling_hash.call_begin(call_hash);
@@ -172,9 +174,9 @@ fn effect_batch(roots: &[B256], kinds: &[ClaimedEntryShape]) -> CanonicalPostBat
             }
             ClaimedEntryShape::Inbound => {
                 entry.proxyEntryHash = B256::repeat_byte(0x11);
-                let update = &entry.stateUpdates[0];
+                let update = &entry.rollupUpdates[0];
                 entry.rollingHash = EntryRollingHash::seed_for_l1(
-                    [(update.rollupId, update.currentState)],
+                    [(update.rollupId, update.currentRoot)],
                     entry.proxyEntryHash,
                 )
                 .current();
@@ -230,7 +232,7 @@ fn strict_inbound_calldata(value: U256, success: bool) -> Vec<u8> {
         target,
         source,
         value,
-        data: data.clone(),
+        data,
         source_rollup_id: RollupId(0),
         l2_rollup_id: RollupId(1),
         return_data: Bytes::from_static(&[0x01, 0x02]),
@@ -238,7 +240,7 @@ fn strict_inbound_calldata(value: U256, success: bool) -> Vec<u8> {
     })
     .expect("successful inbound fixture is supported");
     entry.success = success;
-    encode_execute_incoming(target, value, data, source, RollupId(0), entry)
+    encode_execute_incoming(entry)
 }
 
 fn observed_inbound_candidate(
@@ -265,10 +267,11 @@ fn bindable_inbound_batch(settling: &SettlingBlockObservations) -> CanonicalPost
     for (entry, observation) in batch.entries.iter_mut().skip(1).zip(observations) {
         entry.proxyEntryHash = observation.recomputed_call_hash;
         entry.returnData = observation.return_data.clone();
-        entry.stateUpdates[0].etherDelta = I256::try_from(observation.value).unwrap();
-        let update = &entry.stateUpdates[0];
+        entry.rollupUpdates[0].etherDelta =
+            eez_protocol::abi::u256_to_i192(observation.value).unwrap();
+        let update = &entry.rollupUpdates[0];
         entry.rollingHash = EntryRollingHash::seed_for_l1(
-            [(update.rollupId, update.currentState)],
+            [(update.rollupId, update.currentRoot)],
             entry.proxyEntryHash,
         )
         .current();
@@ -280,29 +283,34 @@ fn effect_plan<'batch, 'settling>(
     batch: &'batch CanonicalPostBatch,
     settling: &'settling SettlingBlockObservations,
 ) -> BoundEffectSequence<'batch, 'settling> {
-    let checkpoints = settling
-        .effect_candidate_positions()
-        .into_iter()
-        .map(|transaction_index| checkpoint(transaction_index, B256::ZERO))
-        .collect::<Vec<_>>();
+    // The anchor's candidate leads the list, then one per effect position.
+    let mut checkpoints = vec![pre_execution_checkpoint(B256::ZERO)];
+    checkpoints.extend(
+        settling
+            .effect_candidate_positions()
+            .into_iter()
+            .map(|transaction_index| checkpoint(transaction_index, B256::ZERO)),
+    );
     let verified_state_chain = verified_state_chain_for_test(batch);
-    bind_effects_to_execution(&verified_state_chain, B256::ZERO, &checkpoints, settling).unwrap()
+    bind_effects_to_execution(&verified_state_chain, &checkpoints, settling).unwrap()
 }
 
 /// Test shorthand for the fixture's fixed rollup identity.
 fn verify_effect_prefix<'batch, 'settling>(
     batch: &'batch CanonicalPostBatch,
-    pre_settling_root: B256,
-    transaction_state_checkpoints: &[crate::validate::TransactionStateCheckpoint],
+    empty_prefix_root: B256,
+    transaction_state_checkpoints: &[crate::validate::StateCheckpoint],
     settling: &'settling SettlingBlockObservations,
 ) -> Result<BoundEffectSequence<'batch, 'settling>, EffectPrefixError> {
     let verified_state_chain = verified_state_chain_for_test(batch);
-    bind_effects_to_execution(
-        &verified_state_chain,
-        pre_settling_root,
-        transaction_state_checkpoints,
-        settling,
-    )
+    // Fixtures describe the anchor by the root it claims. Like the plan, lead
+    // with the empty prefix only when the settling block holds transactions.
+    let mut checkpoints = Vec::new();
+    if !settling.system_sender_flags().is_empty() {
+        checkpoints.push(pre_execution_checkpoint(empty_prefix_root));
+    }
+    checkpoints.extend_from_slice(transaction_state_checkpoints);
+    bind_effects_to_execution(&verified_state_chain, &checkpoints, settling)
 }
 
 /// Build the state-chain capability required by effect-binding unit tests.
@@ -311,10 +319,10 @@ fn verify_effect_prefix<'batch, 'settling>(
 /// directly instead of bypassing this prerequisite.
 fn verified_state_chain_for_test(
     batch: &CanonicalPostBatch,
-) -> super::state_chain::VerifiedStateUpdateChain<'_> {
+) -> super::state_chain::VerifiedRollupUpdateChain<'_> {
     let entries = &batch.entries;
-    let window_pre_block_hash = entries[0].stateUpdates[0].currentState;
-    let window_post_block_hash = entries[entries.len() - 1].stateUpdates[0].newState;
+    let window_pre_block_hash = entries[0].rollupUpdates[0].currentRoot;
+    let window_post_block_hash = entries[entries.len() - 1].rollupUpdates[0].newRoot;
     verify_state_update_chain(
         batch,
         expected_rollup_id(),

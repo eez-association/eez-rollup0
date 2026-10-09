@@ -2,7 +2,7 @@ use super::*;
 use alloy_consensus::{SignableTransaction, TxEip1559, TxEip4844};
 use alloy_eips::eip4895::Withdrawal;
 use alloy_evm::{EvmFactory, FromRecoveredTx};
-use alloy_primitives::{Address, B256, Signature, TxKind, U256, address, bytes};
+use alloy_primitives::{B256, Signature, TxKind, U256, address, bytes};
 use eez_primitives::{
     EEZL2_ADDRESS, SYSTEM_ADDRESS, SYSTEM_TX_GAS_LIMIT, SYSTEM_TX_TYPE, SystemTransaction,
 };
@@ -17,10 +17,13 @@ use revm::{
     state::{AccountInfo, Bytecode},
 };
 
+mod fees;
+
 fn config() -> EezEvmConfig {
     EezEvmConfig::new(Arc::new(
         ChainSpecBuilder::mainnet().cancun_activated().build(),
     ))
+    .unwrap()
 }
 
 fn block(nonce: u64, chain_id: u64) -> reth_primitives_traits::RecoveredBlock<Block> {
@@ -202,9 +205,13 @@ fn l2_rejects_beacon_withdrawals_during_construction_import_and_engine_replay() 
             .contains("L2 blocks cannot contain beacon withdrawals")
     );
 
-    let payload: ExecutionData =
-        eez_primitives::engine::EezBuiltPayload::new(Arc::new(sealed), U256::ZERO, None, None)
-            .into();
+    let payload: ExecutionData = eez_primitives::engine::EezBuiltPayload::new(
+        Arc::new(sealed.try_recover().unwrap()),
+        U256::ZERO,
+        None,
+        None,
+    )
+    .into();
     let error = config.context_for_payload(&payload).unwrap_err();
     assert!(
         error
@@ -217,7 +224,7 @@ fn l2_rejects_beacon_withdrawals_during_construction_import_and_engine_replay() 
 fn native_execution_rejects_noncanonical_gas_fields_without_mutating_state() {
     let block = block(0, 1);
     let balance = U256::from(20_000_000);
-    let mut evm = EezEvmFactory.create_evm(
+    let mut evm = EezEvmFactory::default().create_evm(
         database(balance, bytes!("00")),
         config().evm_env(block.header()).unwrap(),
     );
@@ -254,7 +261,7 @@ fn native_execution_rejects_noncanonical_gas_fields_without_mutating_state() {
 fn failed_validation_and_uncommitted_execution_do_not_leak_minted_value() {
     let block = block(0, 1);
     let env = config().evm_env(block.header()).unwrap();
-    let mut evm = EezEvmFactory.create_evm(database(U256::from(5), bytes!("00")), env);
+    let mut evm = EezEvmFactory::default().create_evm(database(U256::from(5), bytes!("00")), env);
     let tx = TxEnv::from_recovered_tx(&block.body().transactions[0], SYSTEM_ADDRESS);
     for (nonce, chain) in [(1, 1), (0, 2)] {
         let mut invalid = tx.clone();
@@ -288,7 +295,7 @@ fn failed_validation_and_uncommitted_execution_do_not_leak_minted_value() {
 #[test]
 fn mint_overflow_does_not_poison_the_next_execution() {
     let block = block(0, 1);
-    let mut evm = EezEvmFactory.create_evm(
+    let mut evm = EezEvmFactory::default().create_evm(
         database(U256::MAX, bytes!("00")),
         config().evm_env(block.header()).unwrap(),
     );
@@ -333,9 +340,12 @@ fn inspection_and_normal_execution_apply_identical_mint_and_rollback_rules() {
                     ..Default::default()
                 },
             );
-            let mut plain = EezEvmFactory.create_evm(db.clone(), env.clone());
-            let mut inspected =
-                EezEvmFactory.create_evm_with_inspector(db, env, CountInspector::default());
+            let mut plain = EezEvmFactory::default().create_evm(db.clone(), env.clone());
+            let mut inspected = EezEvmFactory::default().create_evm_with_inspector(
+                db,
+                env,
+                CountInspector::default(),
+            );
             let tx = TxEnv {
                 tx_type,
                 caller,
@@ -397,7 +407,8 @@ fn native_gasprice_is_zero_in_nested_calls_including_reimbursement_and_positive_
                 },
             );
             let block = block(0, 1);
-            let mut evm = EezEvmFactory.create_evm(db, config().evm_env(block.header()).unwrap());
+            let mut evm =
+                EezEvmFactory::default().create_evm(db, config().evm_env(block.header()).unwrap());
             assert_eq!(evm.block().basefee, 1);
             let mut tx = TxEnv::from_recovered_tx(&block.body().transactions[0], SYSTEM_ADDRESS);
             let price = if native { 0 } else { 7 };
@@ -443,7 +454,8 @@ fn ordinary_transactions_still_pay_fees_and_outbound_eth_stays_at_the_system_add
             ..Default::default()
         },
     );
-    let mut evm = EezEvmFactory.create_evm(db, config().evm_env(block.header()).unwrap());
+    let mut evm =
+        EezEvmFactory::default().create_evm(db, config().evm_env(block.header()).unwrap());
     let native = TxEnv::from_recovered_tx(&block.body().transactions[0], SYSTEM_ADDRESS);
     let mint = evm.transact_raw(native.clone()).unwrap();
     evm.db_mut().commit(mint.state);
@@ -531,13 +543,9 @@ fn l2_block_and_engine_replay_reject_blobs_but_l1_simulation_still_executes_them
             assert!(result.unwrap().receipts[0].success);
         }
 
-        let payload: ExecutionData = eez_primitives::engine::EezBuiltPayload::new(
-            Arc::new(block.into_sealed_block()),
-            U256::ZERO,
-            None,
-            None,
-        )
-        .into();
+        let payload: ExecutionData =
+            eez_primitives::engine::EezBuiltPayload::new(Arc::new(block), U256::ZERO, None, None)
+                .into();
         let (raw, convert) = config
             .tx_iterator_for_payload(&payload)
             .unwrap()

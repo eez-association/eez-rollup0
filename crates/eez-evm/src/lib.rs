@@ -5,12 +5,12 @@
 //! the native receipt type, and decodes native transactions in Engine payloads.
 //! Ethereum's executor, gas accounting, system calls, block assembly, and header
 //! environment are reused. `eez-primitives` defines the zero-fee native TxEnv;
-//! `evm` adds deposit minting and rollback around the upstream Ethereum EVM.
+//! `evm` adds deposit minting, rollback, and genesis-configured fee collection.
 //!
 //! Configuration adapted from reth's `EthEvmConfig` at the pinned revision:
-//! <https://github.com/paradigmxyz/reth/blob/fd59fd2222b51239abebd9aa234f28b0b5f336eb/crates/ethereum/evm/src/lib.rs>.
-//! Receipt construction follows Alloy 0.34.0's Ethereum receipt builder:
-//! <https://github.com/alloy-rs/alloy-evm/blob/6022e02ee1ab669f7c1ee59b58fc7a6b3f5f15d5/crates/evm/src/eth/receipt_builder.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/evm/src/lib.rs>.
+//! Receipt construction follows Alloy 0.39.0's Ethereum receipt builder:
+//! <https://github.com/alloy-rs/alloy-evm/blob/ba6f83b80aba8cf005175f4d776d8b90796c72d9/crates/evm/src/eth/receipt_builder.rs>.
 
 use alloy_consensus::{Header, Typed2718};
 use alloy_eips::Decodable2718;
@@ -19,7 +19,7 @@ use alloy_evm::eth::{
     receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx},
     spec::EthExecutorSpec,
 };
-use alloy_primitives::Bytes;
+use alloy_primitives::{Address, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_primitives::{Block, EezPrimitives, EezTxEnvelope, EezTxType, Receipt};
 use reth_chainspec::{ChainSpec, EthChainSpec, Hardforks};
@@ -36,6 +36,16 @@ use std::{borrow::Cow, fmt, sync::Arc};
 
 mod evm;
 pub use evm::EezEvmFactory;
+
+/// Read the consensus fee destination. Absence retains historical Ethereum fee
+/// burning, including Ethereum L1 simulation. A configured value must be an address.
+pub fn fee_collector(config: &alloy_genesis::ChainConfig) -> Result<Option<Address>, AnyError> {
+    config
+        .extra_fields
+        .get("feeCollector")
+        .map(|value| serde_json::from_value(value.clone()).map_err(AnyError::new))
+        .transpose()
+}
 
 /// Enforce L2 transaction support during construction and replay. The underlying
 /// EVM is also used for L1 simulation, where blob transactions remain valid.
@@ -98,12 +108,13 @@ pub struct EezEvmConfig<C = ChainSpec> {
     executor: EthBlockExecutorFactory<EezReceiptBuilder, Arc<C>, EezEvmFactory>,
 }
 
-impl<C> EezEvmConfig<C> {
-    pub fn new(chain_spec: Arc<C>) -> Self {
-        Self {
+impl<C: EthChainSpec> EezEvmConfig<C> {
+    pub fn new(chain_spec: Arc<C>) -> Result<Self, AnyError> {
+        let factory = EezEvmFactory::new(fee_collector(&chain_spec.genesis().config)?);
+        Ok(Self {
             ethereum: EthEvmConfig::new(chain_spec.clone()),
-            executor: EthBlockExecutorFactory::new(EezReceiptBuilder, chain_spec, EezEvmFactory),
-        }
+            executor: EthBlockExecutorFactory::new(EezReceiptBuilder, chain_spec, factory),
+        })
     }
 
     pub fn chain_spec(&self) -> &Arc<C> {

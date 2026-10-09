@@ -149,7 +149,7 @@ impl fmt::Display for DeriverError {
                 write!(
                     f,
                     "local L2 block {l2_block} diverged from L1-confirmed batch; \
-                     the on-chain claimed newState doesn't match local STF output"
+                     the on-chain claimed newRoot doesn't match local STF output"
                 )?;
                 if let Some(detail) = detail {
                     write!(f, " ({detail})")?;

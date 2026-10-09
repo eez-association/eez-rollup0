@@ -6,7 +6,7 @@ pragma solidity ^0.8.28;
 /// is reached at CALL depth > 1, not as the tx's top-level `to`), then
 /// uses the synchronous result — decodes the L2 return tuple and emits
 /// it. Exercises the composer's per-frame proxy detection
-/// (eez-evm-inspector) + return-data synthesis (EEZBase
+/// (`eez-composer::inspector`) + return-data synthesis (EEZBase
 /// `entry.returnData`).
 contract SetterWrapper {
     address public immutable proxy;

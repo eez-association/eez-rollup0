@@ -7,7 +7,7 @@
 //! suffix runs. That suffix carries system transactions the deriver must append
 //! to the Sync block the prefix built.
 //!
-//! The prefix cannot be synthesised from nothing. Its `newState` has to be a
+//! The prefix cannot be synthesised from nothing. Its `newRoot` has to be a
 //! candidate block hash the composer actually computed for that transaction
 //! prefix; any other value names a block the deriver cannot build, so it would
 //! diverge instead of appending. So the prefix is cut from a real batch while
@@ -22,7 +22,8 @@ use alloy_sol_types::SolCall;
 use eez_protocol::abi::{EvmBatch, postAndVerifyBatchCall};
 use eez_protocol::signer::EcdsaProofSigner;
 use eez_testkit::{
-    IValue, OUTBOUND_USER, onchain_nonce, setup_cross_chain, sign_and_send, signals,
+    IValue, OUTBOUND_USER, all_l2_execution_states, onchain_nonce, setup_cross_chain,
+    sign_and_send, signals,
 };
 
 const TIMEOUT: Duration = Duration::from_mins(6);
@@ -83,10 +84,12 @@ async fn post_ahead(
                 .to(eez)
                 .input(postAndVerifyBatchCall { batch }.abi_encode().into())
                 // Ordering within the block is by effective tip, and the
-                // composer posts at its configured priority fee.
-                .max_priority_fee_per_gas(500_000_000_000u128)
-                .max_fee_per_gas(1_000_000_000_000u128)
-                .gas_limit(8_000_000),
+                // composer posts at its configured priority fee. The L1 node
+                // rejects txs whose worst-case fee exceeds its 1 ETH
+                // `--rpc.txfeecap`; this stays under it (4M gas × 200 gwei).
+                .max_priority_fee_per_gas(100_000_000_000u128)
+                .max_fee_per_gas(200_000_000_000u128)
+                .gas_limit(4_000_000),
         )
         .await?;
     Ok(*pending.tx_hash())
@@ -97,16 +100,15 @@ async fn post_ahead(
 /// Only the leading `proxyEntryHash == 0` run is taken: those settle on their
 /// own, whereas a deferred entry waits on a bundled user transaction this
 /// synthetic peer does not have.
-fn strict_prefix(batch: &EvmBatch) -> eyre::Result<EvmBatch> {
+fn strict_prefix(batch: &EvmBatch) -> EvmBatch {
     let mut prefix = batch.clone();
     prefix.entries.truncate(2);
     prefix.immediateEntryCount = U256::from(prefix.entries.len());
     prefix.proofs = Vec::new();
-    // The begin hash binds the starting state and identity, so it is never zero;
-    // without recomputing it `_executeEntry` refuses the entry for a rolling
-    // hash mismatch and the post unwinds with AllImmediateL2TxsFailed.
-    eez_protocol::entries::finalize_l1_rolling_hashes(&mut prefix)?;
-    Ok(prefix)
+    // Truncation keeps each entry's seed and call, so the posted rolling hashes
+    // stay valid. Never re-finalize: L1 entries no longer carry the outbound
+    // return data those hashes fold.
+    prefix
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -151,10 +153,15 @@ async fn a_resumed_batch_appends_the_l2_content_of_the_entries_it_settled() {
         // Poll tightly: the batch is only pending for part of one L1 slot.
         for _ in 0..80 {
             if let Some((batch, _)) = pending_batch_with_producing_entries(&l1, eez).await {
-                if let Ok(prefix) = strict_prefix(&batch)
-                    && post_ahead(&l1, eez, w.cfg.deployer_key, w.cfg.attester_key, prefix)
-                        .await
-                        .is_ok()
+                if post_ahead(
+                    &l1,
+                    eez,
+                    w.cfg.deployer_key,
+                    w.cfg.attester_key,
+                    strict_prefix(&batch),
+                )
+                .await
+                .is_ok()
                 {
                     raced += 1;
                 }
@@ -219,14 +226,23 @@ async fn a_resumed_batch_appends_the_l2_content_of_the_entries_it_settled() {
     w.node.assert_no_process_death();
 
     // A rising local head proves nothing: a wrongly rebuilt Sync block still
-    // produces blocks while L1 stops accepting them. Require a settled one.
+    // produces blocks while L1 stops accepting them. Require a later L1
+    // execution, not the resumed batch's own commitment, to settle.
     let rollup_id = w.cfg.rollup_id;
+    let executions_before = all_l2_execution_states(&l1, eez, rollup_id, w.dep.deploy_block)
+        .await
+        .expect("read L1 executions after resumed append")
+        .len();
     let before = eez_testkit::safe_block_hash(&l2).await.unwrap();
     eez_testkit::wait_for(TIMEOUT, || async {
         let Some(safe) = eez_testkit::safe_block_hash(&l2).await? else {
             return Ok(None);
         };
         if Some(safe) == before {
+            return Ok(None);
+        }
+        let executions = all_l2_execution_states(&l1, eez, rollup_id, w.dep.deploy_block).await?;
+        if executions.len() <= executions_before || executions.last() != Some(&safe) {
             return Ok(None);
         }
         let settled = eez_testkit::rollup_commitment(&l1, eez, rollup_id).await?;

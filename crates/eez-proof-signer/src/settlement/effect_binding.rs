@@ -1,13 +1,13 @@
 //! Binding Composer-claimed effects to locally validated execution evidence.
 
-use alloy_primitives::{B256, I256};
-use eez_protocol::abi::{ExecutionEntrySol, StateUpdateSol};
+use alloy_primitives::B256;
+use eez_protocol::abi::{ExecutionEntrySol, RollupUpdateSol};
 use eez_protocol::rolling_hash::EntryRollingHash;
 use thiserror::Error;
 
 use super::blocks::SettlingBlockObservations;
-use super::state_chain::VerifiedStateUpdateChain;
-use crate::validate::TransactionStateCheckpoint;
+use super::state_chain::VerifiedRollupUpdateChain;
+use crate::validate::{CheckpointAt, StateCheckpoint};
 
 /// Shape classification of one claimed batch entry; every unsupported shape
 /// is `Invalid` and fails closed.
@@ -51,7 +51,7 @@ pub(super) struct BoundEffect<'batch> {
     transaction_index: usize,
     kind: EffectKind,
     claimed_entry: &'batch ExecutionEntrySol,
-    claimed_state_update: &'batch StateUpdateSol,
+    claimed_state_update: &'batch RollupUpdateSol,
 }
 
 impl<'batch> BoundEffect<'batch> {
@@ -71,7 +71,7 @@ impl<'batch> BoundEffect<'batch> {
         self.claimed_entry
     }
 
-    pub(super) const fn claimed_state_update(&self) -> &'batch StateUpdateSol {
+    pub(super) const fn claimed_state_update(&self) -> &'batch RollupUpdateSol {
         self.claimed_state_update
     }
 }
@@ -122,23 +122,27 @@ pub(crate) enum EffectPrefixError {
     )]
     EffectCountMismatch { claimed: usize, observed: usize },
     #[error(
-        "anchor claims post-state {claimed_anchor_post_state}; validated pre-settling block is {validated_pre_settling_hash}"
+        "anchor claims root {claimed_anchor_root}; the settling block's empty prefix is {empty_prefix_hash}"
     )]
     AnchorRootMismatch {
-        validated_pre_settling_hash: B256,
-        claimed_anchor_post_state: B256,
+        empty_prefix_hash: B256,
+        claimed_anchor_root: B256,
     },
+    #[error(
+        "the leading state checkpoint is at {actual}; the anchor's candidate is sealed before transaction 0"
+    )]
+    AnchorCheckpointPositionMismatch { actual: CheckpointAt },
     #[error(
         "settlement effects require {expected} transaction state checkpoints, but received {actual}"
     )]
     TransactionStateCheckpointCountMismatch { expected: usize, actual: usize },
     #[error(
-        "transaction state checkpoint {checkpoint_index} targets transaction {actual}; expected effect-candidate transaction {expected}"
+        "state checkpoint {checkpoint_index} is at {actual}; expected effect-candidate transaction {expected}"
     )]
     TransactionStateCheckpointIndexMismatch {
         checkpoint_index: usize,
         expected: usize,
-        actual: usize,
+        actual: CheckpointAt,
     },
     #[error(
         "settlement entry {entry_index} is {claimed:?}, but effect-candidate transaction {transaction_index} is observed as {observed:?}"
@@ -159,20 +163,22 @@ pub(crate) enum EffectPrefixError {
         claimed_candidate: B256,
     },
     #[error("anchor ether delta is {claimed}; expected zero")]
-    NonZeroAnchorEtherDelta { claimed: I256 },
+    NonZeroAnchorEtherDelta {
+        claimed: alloy_primitives::aliases::I192,
+    },
 }
 
 /// Bind each verified state-update-chain entry to its settling-block candidate and
 /// transaction state checkpoint.
 ///
-/// [`VerifiedStateUpdateChain`] already guarantees a nonempty batch with exactly
+/// [`VerifiedRollupUpdateChain`] already guarantees a nonempty batch with exactly
 /// one continuous, expected-rollup update per entry. This gate adds effect-shape,
-/// candidate, and checkpoint bindings. For a nonempty effect set, the anchor's
-/// `newState` must equal the validated pre-settling root.
+/// candidate, and checkpoint bindings. The anchor's `newRoot` must equal the
+/// leading checkpoint's candidate — the settling block sealed over no
+/// transactions — so every entry commits to a block at the settling height.
 pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
-    verified_state_chain: &VerifiedStateUpdateChain<'batch>,
-    validated_settling_pre_block_hash: B256,
-    computed_transaction_state_checkpoints: &[TransactionStateCheckpoint],
+    verified_state_chain: &VerifiedRollupUpdateChain<'batch>,
+    computed_transaction_state_checkpoints: &[StateCheckpoint],
     settling_observations: &'settling SettlingBlockObservations,
 ) -> Result<BoundEffectSequence<'batch, 'settling>, EffectPrefixError> {
     let (leading, anchor_update) = verified_state_chain.leading();
@@ -210,13 +216,15 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
     }
     // A canonical anchor carries no cross-chain value. Check this only after
     // the leading Composer entry has actually been classified as an anchor.
-    if anchor_update.etherDelta != I256::ZERO {
+    if anchor_update.etherDelta != alloy_primitives::aliases::I192::ZERO {
         return Err(EffectPrefixError::NonZeroAnchorEtherDelta {
             claimed: anchor_update.etherDelta,
         });
     }
-    // With no effects the batch never represents the pre-settling root; the
-    // state-update-chain gate binds the anchor's `newState` to the final root instead.
+    // With no effects the anchor is the batch's only entry, so it carries the
+    // endpoint rather than a prefix; the state-update-chain gate binds it to the
+    // final root. Such a settling block holds no transactions, so nothing was
+    // requested and any checkpoint is a backend fault.
     if claimed == 0 {
         if !computed_transaction_state_checkpoints.is_empty() {
             return Err(EffectPrefixError::TransactionStateCheckpointCountMismatch {
@@ -230,16 +238,28 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
         });
     }
 
-    if anchor_update.newState != validated_settling_pre_block_hash {
-        return Err(EffectPrefixError::AnchorRootMismatch {
-            validated_pre_settling_hash: validated_settling_pre_block_hash,
-            claimed_anchor_post_state: anchor_update.newState,
+    // With effects, the anchor's candidate leads the checkpoint list: the
+    // settling block sealed over no transactions. Effects follow, one per
+    // candidate position, so every commitment names a block at this height and
+    // a short settlement is a sibling swap rather than a retreat.
+    // Split rather than index: the anchor is the head and the effects are the
+    // tail, so neither a `[0]` nor an `effect_index + 1` can drift apart.
+    let (anchor_checkpoint, effect_checkpoints) = computed_transaction_state_checkpoints
+        .split_first()
+        .filter(|(_, effects)| effects.len() == observed)
+        .ok_or(EffectPrefixError::TransactionStateCheckpointCountMismatch {
+            expected: observed + 1,
+            actual: computed_transaction_state_checkpoints.len(),
+        })?;
+    if anchor_checkpoint.at != CheckpointAt::PreExecution {
+        return Err(EffectPrefixError::AnchorCheckpointPositionMismatch {
+            actual: anchor_checkpoint.at,
         });
     }
-    if computed_transaction_state_checkpoints.len() != observed {
-        return Err(EffectPrefixError::TransactionStateCheckpointCountMismatch {
-            expected: observed,
-            actual: computed_transaction_state_checkpoints.len(),
+    if anchor_update.newRoot != anchor_checkpoint.block_hash {
+        return Err(EffectPrefixError::AnchorRootMismatch {
+            empty_prefix_hash: anchor_checkpoint.block_hash,
+            claimed_anchor_root: anchor_update.newRoot,
         });
     }
 
@@ -250,7 +270,7 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
         claimed_effects.into_iter().enumerate()
     {
         let transaction_index = effect_candidate_positions[effect_index];
-        let checkpoint = &computed_transaction_state_checkpoints[effect_index];
+        let checkpoint = &effect_checkpoints[effect_index];
         let claimed_kind = kind.claimed_shape();
         let observed_kind = if settling_observations.system_sender_flags()[transaction_index] {
             ObservedEffectKind::Inbound
@@ -270,18 +290,18 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
             });
         }
 
-        if checkpoint.transaction_index != transaction_index {
+        if checkpoint.at != CheckpointAt::Transaction(transaction_index) {
             return Err(EffectPrefixError::TransactionStateCheckpointIndexMismatch {
                 checkpoint_index: effect_index,
                 expected: transaction_index,
-                actual: checkpoint.transaction_index,
+                actual: checkpoint.at,
             });
         }
         // The entry claims the block a settlement stopping here must leave L2
         // holding. Compare it to the candidate the backend sealed over the same
         // transaction prefix.
         let recomputed_candidate = checkpoint.block_hash;
-        let claimed_candidate = update.newState;
+        let claimed_candidate = update.newRoot;
         if claimed_candidate != recomputed_candidate {
             return Err(EffectPrefixError::EffectCandidateMismatch {
                 entry_index,
@@ -309,7 +329,7 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
 /// kind; the per-kind gates bind that shape to locally recovered evidence.
 fn classify_claimed_entry(
     entry: &ExecutionEntrySol,
-    update: &StateUpdateSol,
+    update: &RollupUpdateSol,
     settled_rollup: u64,
 ) -> ClaimedEntryShape {
     if !entry.success || !entry.expectedL1ToL2Calls.is_empty() {
@@ -336,7 +356,7 @@ fn classify_claimed_entry(
     }
 
     let expected_anchor_hash =
-        EntryRollingHash::seed_for_l1([(update.rollupId, update.currentState)], B256::ZERO)
+        EntryRollingHash::seed_for_l1([(update.rollupId, update.currentRoot)], B256::ZERO)
             .current();
     if entry.destinationRollupId == settled_rollup
         && entry.returnData.is_empty()

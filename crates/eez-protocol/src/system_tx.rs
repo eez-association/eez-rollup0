@@ -52,14 +52,7 @@ pub fn build_inbound_system_txs(
         }
         let l2_entry =
             build_l2_incoming_entry(incoming.clone()).map_err(|error| error.to_string())?;
-        let calldata = encode_execute_incoming(
-            incoming.target,
-            incoming.value,
-            incoming.data,
-            incoming.source,
-            incoming.source_rollup_id,
-            l2_entry,
-        );
+        let calldata = encode_execute_incoming(l2_entry);
         let raw = encode_system_tx(
             nonce,
             cfg.eezl2_address,
@@ -412,7 +405,7 @@ mod tests {
     /// lowers to a `loadExecutionTable` system tx.
     fn outbound_entry() -> ExecutionEntrySol {
         ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: B256::ZERO, // outbound immediate
             l2ToL1Calls: vec![L2ToL1CallSol {
                 revertNextNCalls: 0,
@@ -726,7 +719,44 @@ mod tests {
         );
     }
 
-    /// Guards against a vacuous pass: the native bytes MUST vary with the nonce (so the
+    /// Canonical EIP-2718 bytes for the native unsigned system transaction
+    /// represented by `inbound_entry()`. The prefix pins type `0x76` and
+    /// the RLP body pins chain ID, nonce, EEZL2 target, value, and calldata.
+    #[test]
+    fn inbound_system_transaction_golden_vector() {
+        const EXPECTED: &str = concat!(
+            "76f9035f010794420000000000000000000000000000000000000780b90344c3fb5f3d00000000000000000000000000",
+            "000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000",
+            "000320000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000",
+            "0000000000000000000000000000000000002047d8d2c330b8e207c17da548b89a3058b10faad241a6b82f88302af38b",
+            "ff8fb700000000000000000000000000000000000000000000000000000000000000c000000000000000000000000000",
+            "000000000000000000000000000000000002407b6cdaf67ec74ff399bdbcf0e0d2a68fb4aa7b638a87d382baef85c6ba",
+            "8e5d3c000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000",
+            "000000000000000000000000000000000002600000000000000000000000000000000000000000000000000000000000",
+            "000001000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "000000000000000000000000000000000000cc0000000000000000000000000000000000000000000000000000000000",
+            "00000000000000000000000000000000000000000000000000000000000000000000bb00000000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "000100000000000000000000000000000000000000000000000000000000000000000212340000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000000000002abcd0000000000000000000000",
+            "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            "000000",
+        );
+
+        let entries = [inbound_entry()];
+        let built = build_inbound_system_txs(&inbound_sidecars(&entries), &ctx(), 7).unwrap();
+        assert_eq!(built.len(), 1);
+        assert_eq!(
+            built[0].as_ref(),
+            alloy_primitives::hex::decode(EXPECTED).unwrap(),
+            "canonical native inbound system transaction bytes drifted",
+        );
+    }
+
+    /// Guards against a vacuous pass: the signed bytes MUST vary with the nonce (so the
     /// equality above is non-trivial), and emit==rebuild must still hold at that nonce.
     #[test]
     fn byte_identity_is_non_vacuous_and_holds_across_nonces() {

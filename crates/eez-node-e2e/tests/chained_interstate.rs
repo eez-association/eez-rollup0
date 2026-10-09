@@ -156,7 +156,7 @@ async fn wait_for_count(rpc_url: &str, counter: Address, expected: u64, label: &
     .unwrap_or_else(|err| panic!("{label} never reached count={expected}: {err:#}"));
 }
 
-/// L1's stored `rollups[rid].stateRoot` must equal the L2 safe block's root.
+/// L1's stored `rollups[rid].root` must equal the L2 safe block's root.
 async fn assert_reconciled(w: &CrossChainWorld) {
     let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
     let (l1_rpc, l2_rpc) = (w.l1_rpc(), w.l2_rpc());
@@ -598,6 +598,7 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
     .await
     .expect("first increment must be admitted");
     nonce += 1;
+    let poison_cursor = w.node.signal_cursor().unwrap();
     let poison = sign_and_send(
         &w.l1_xchain(),
         ANVIL_KEY_6,
@@ -649,10 +650,21 @@ async fn poison_mid_bundle_leaves_survivors_correct() {
         None,
         "the poison tx must be dropped, not bundled",
     );
-    assert!(
-        w.node.log_count_matching(&["evicting", "evicted"]).unwrap() > 0,
-        "the poison tx must be evicted loudly",
-    );
+    let poison_hash = poison.to_string();
+    wait_for(SETTLE_TIMEOUT, || async {
+        let evicted = w
+            .node
+            .signals_since(poison_cursor)?
+            .into_iter()
+            .any(|record| {
+                record.name == signals::COMPOSER_POISON_EVICTION_COMPLETED
+                    && record.fields.get("tx_hash").and_then(|v| v.as_str())
+                        == Some(poison_hash.as_str())
+            });
+        Ok(evicted.then_some(()))
+    })
+    .await
+    .expect("the poison tx must emit a poison-eviction signal");
 
     // The window is not frozen: a later slot still settles.
     open_drain_window(&w).await;

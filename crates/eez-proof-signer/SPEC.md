@@ -8,7 +8,7 @@ EEZ protocol.
 
 The protocol source used by this profile is the `eez-core-protocol`
 submodule at commit
-`6fcc90b65063831cb7797e9fa361004064d28f9f`. The stateless backend uses
+`855fe0602484750861b4c31502a1a91355d33ed6`. The stateless backend uses
 `AdityaSripal/stateless` branch `aditya/generic-recovered-validation`,
 with the exact commit pinned in `Cargo.lock`.
 
@@ -337,6 +337,12 @@ An absent `system[i + 1]` at block end is treated as `true`. Thus an outbound
 `[system-load, user]` pair ends at the user transaction, while a standalone
 inbound system transaction ends at itself.
 
+If the terminal block holds at least one transaction, the plan first requests
+the pre-execution position: the terminal sealed after its pre-block system calls
+and before transaction 0, which is the anchor's candidate. The positions in `C`
+follow in order. An empty terminal requests nothing, since it already is that
+candidate.
+
 The Composer MUST NOT nominate checkpoint positions. The complete plan MUST be
 derived before earlier blocks are replayed. The backend MUST return exactly the
 requested positions in strict order. Preceding blocks MUST return no
@@ -359,12 +365,11 @@ The pre-state root of each block after the first MUST equal the preceding
 block's computed post-state root. This telescope is self-consistency, not proof
 that the first pre-state belongs to the canonical chain.
 
-The window exposes three settlement endpoints, each a block identity taken
-from a header rather than from a backend root:
+The window exposes two settlement endpoints, each a block identity taken from
+a header rather than from a backend root:
 
 - `window_pre_block_hash`: parent hash of the first block, which for a
-  one-block window is the terminal block's parent;
-- `settling_pre_block_hash`: parent hash of the terminal block; and
+  one-block window is the terminal block's parent; and
 - `window_post_block_hash`: computed hash of the terminal block.
 
 ### 6.4 Stateful replay guarantees
@@ -417,7 +422,7 @@ with malformed output is an internal failure, not an input rejection.
 
 `PostBatch.abi_calldata` MUST exact-decode as the current
 `postAndVerifyBatch(ProofSystemBatchPerVerificationEntries)` ABI with selector
-`0xcafef125`. Re-encoding the decoded argument MUST reproduce every byte after
+`0xe4a480e4`. Re-encoding the decoded argument MUST reproduce every byte after
 the selector. Alternate, partial, or trailing encodings MUST be rejected.
 
 Canonical decoding establishes byte identity only; every decoded claim remains
@@ -428,7 +433,7 @@ The decoded batch MUST satisfy all of these profile rules:
 1. `proofSystems` contains exactly the configured proof-system address.
 2. `rollupIdsWithProofSystems` contains exactly one item with the expected
    rollup ID and `proofSystemIndexes == [0]`.
-3. `expectedStateRootPerRollup` is empty.
+3. `expectedRootPerRollup` is empty.
 4. Every mutable entry has `destinationRollupId == expected_rollup_id`.
 5. `staticEntries` is empty.
 6. `immediateStaticEntryCount == 0`.
@@ -453,15 +458,15 @@ signer does not query L1 to confirm them.
 ### 8.1 State-update chain
 
 The batch MUST contain at least one mutable entry. Every entry MUST contain
-exactly one `StateUpdate` and that update's `rollupId` MUST equal the expected
+exactly one `RollupUpdate` and that update's `rollupId` MUST equal the expected
 rollup ID.
 
 For entries `E[0..n)` with updates `U[0..n)`, the signer MUST require:
 
 ```text
-U[0].currentState == window_pre_block_hash
-U[i].currentState == U[i - 1].newState       for every i > 0
-U[n - 1].newState == window_post_block_hash
+U[0].currentRoot == window_pre_block_hash
+U[i].currentRoot == U[i - 1].newRoot       for every i > 0
+U[n - 1].newRoot == window_post_block_hash
 ```
 
 Every committed value is a block hash. Interior values name candidate blocks:
@@ -472,7 +477,7 @@ canonical. The sequence is therefore a commitment chain, not a
 parent-child chain.
 
 These checks bind the continuous Composer claim to validated endpoints. The
-interior `newState` values are additionally bound to execution checkpoints
+interior `newRoot` values are additionally bound to execution checkpoints
 below.
 
 ### 8.2 Terminal-block framing
@@ -487,7 +492,7 @@ In the terminal block:
 
 - a transaction recovered from `SYSTEM_ADDRESS` MUST target `EEZL2_ADDRESS`;
 - every such transaction MUST have a successful receipt; and
-- a system-to-EEZL2 transaction beginning with selector `0x8d8461d9` is an
+- a system-to-EEZL2 transaction beginning with selector `0xc3fb5f3d` is an
   inbound candidate even when the remainder of its calldata is malformed.
 
 The number of entries after the anchor MUST equal the number of locally derived
@@ -526,11 +531,13 @@ Every later entry MUST be one of:
 A second anchor or any other shape MUST be rejected.
 
 The anchor's `etherDelta` MUST be zero. If at least one effect exists, the
-anchor's `newState` MUST equal `settling_pre_block_hash`. If no effects exist,
-the anchor alone covers the complete window transition.
+anchor's `newRoot` MUST equal the block hash of the leading pre-execution
+checkpoint: the terminal block sealed over no transactions. Every commitment
+then names a block at the terminal's height. If no effects exist, the anchor
+alone covers the complete window transition, and no checkpoint may be returned.
 
 For every effect at candidate position `C[i]`, the backend checkpoint MUST
-target `C[i]`, and the effect's `StateUpdate.newState` MUST equal the hash of
+target `C[i]`, and the effect's `RollupUpdate.newRoot` MUST equal the hash of
 the candidate block that checkpoint sealed over the prefix ending at `C[i]`.
 
 ## 9. Inbound authorization
@@ -541,19 +548,17 @@ An inbound candidate is authorized only if all rules in this section pass.
 
 The system transaction MUST have succeeded and its calldata MUST be the exact
 canonical encoding of current `executeIncomingCrossChainCall`, selector
-`0x8d8461d9`.
+`0xc3fb5f3d`.
 
 The decoded call MUST satisfy:
 
-- native transaction value equals the outer `value` argument;
-- `sourceRollup == 0`;
+- native transaction value equals the inner call's `value`;
 - `_entries` contains exactly one L2 mutable entry;
 - `_staticEntries` is empty;
 - that entry contains exactly one `incomingCall`;
 - entry `success == true`;
 - `expectedOutgoingCalls` is empty;
-- outer `destination`, `value`, `data`, `sourceAddress`, and `sourceRollup`
-  equal the corresponding inner call fields; and
+- the inner call's `sourceRollupId == 0`; and
 - the inner call has `revertNextNCalls == 0`, `isStatic == false`, and
   `gas == 0`.
 
@@ -581,7 +586,7 @@ The corresponding batch entry MUST:
 - use the L1 seed over its sole update and `proxyEntryHash` as its complete
   `rollingHash`; and
 - have `etherDelta == +value`, with `value` representable as a nonnegative
-  `int256`.
+  `int192`.
 
 There MUST be exactly one canonical inbound candidate for every claimed inbound
 effect and no unclaimed inbound candidate.
@@ -608,18 +613,21 @@ The event's `callGas` MUST be zero. The batch entry MUST:
 
 The call source address MUST NOT be `SYSTEM_ADDRESS`.
 
+The batch entry's `returnData` MUST be empty.
+
 The signer MUST recompute the mutable cross-chain call hash with target rollup
 `0` and the event's zero `callGas`; it MUST equal the event hash. The same
-zero-`callGas` identity is committed by the entry's L1 rolling hash:
+zero-`callGas` identity is committed by the entry's L1 rolling hash. The DA
+action supplies the return data used to complete that hash:
 
 ```text
 L1 seed(sole update, proxyEntryHash = 0)
   -> CALL_BEGIN(common zero-callGas call hash)
-  -> CALL_END(true, entry.returnData)
+  -> CALL_END(true, DA action returnData)
 ```
 
 The update MUST have `etherDelta == -value`, with `value` representable as a
-nonnegative `int256`.
+nonnegative `int192`.
 
 ## 11. Data-availability and Sync-block verification
 
@@ -648,10 +656,11 @@ match this projection exactly.
 
 There MUST be one `l2Entries` sidecar per effect, in effect order:
 
-- an outbound sidecar is the authorized batch entry with `stateUpdates`
-  cleared and `rollingHash` set to zero, with every other field unchanged;
+- an outbound sidecar is the authorized batch entry with `rollupUpdates`
+  cleared, `rollingHash` set to zero, and `returnData` supplied by the DA
+  action;
 - an inbound sidecar is derived from the executed inbound calldata with empty
-  `stateUpdates`, the recomputed proxy hash, one L1-shaped call copied from the
+  `rollupUpdates`, the recomputed proxy hash, one L1-shaped call copied from the
   L2 `incomingCall`, empty `expectedL1ToL2Calls`, the validated L2 rolling hash,
   the expected destination rollup, success flag, and return data.
 
@@ -752,7 +761,7 @@ not participate.
 The full mutable entries and `callData` are bound as above. The following batch
 carriers are not directly included in the digest:
 
-- `expectedStateRootPerRollup`;
+- `expectedRootPerRollup`;
 - `immediateEntryCount` and `immediateStaticEntryCount`;
 - proof-system contract addresses;
 - proof bytes; and
@@ -912,16 +921,16 @@ Updating either pinned external revision MUST include:
 Field order and integer widths are part of the ABI.
 
 ```solidity
-struct StateUpdate {
+struct RollupUpdate {
     uint64 rollupId;
-    bytes32 currentState;
-    bytes32 newState;
-    int256 etherDelta;
+    int192 etherDelta;
+    bytes32 currentRoot;
+    bytes32 newRoot;
 }
 
-struct ExpectedStateRootPerRollup {
+struct ExpectedRootPerRollup {
     uint64 rollupId;
-    bytes32 stateRoot;
+    bytes32 root;
 }
 
 struct L2ToL1Call {
@@ -944,7 +953,7 @@ struct ExpectedL1ToL2Call {
 }
 
 struct ExecutionEntry {
-    StateUpdate[] stateUpdates;
+    RollupUpdate[] rollupUpdates;
     bytes32 proxyEntryHash;
     L2ToL1Call[] l2ToL1Calls;
     ExpectedL1ToL2Call[] expectedL1ToL2Calls;
@@ -955,7 +964,7 @@ struct ExecutionEntry {
 }
 
 struct StaticExecutionEntry {
-    ExpectedStateRootPerRollup[] expectedStateRoots;
+    ExpectedRootPerRollup[] expectedRoots;
     bytes32 proxyEntryHash;
     L2ToL1Call[] l2ToL1Calls;
     bytes32 rollingHash;
@@ -970,7 +979,7 @@ struct RollupIdWithProofSystems {
 }
 
 struct ProofSystemBatchPerVerificationEntries {
-    ExpectedStateRootPerRollup[] expectedStateRootPerRollup;
+    ExpectedRootPerRollup[] expectedRootPerRollup;
     ExecutionEntry[] entries;
     StaticExecutionEntry[] staticEntries;
     uint256 immediateEntryCount;
@@ -1017,6 +1026,7 @@ struct L2ExecutionEntry {
 }
 
 struct L2StaticExecutionEntry {
+    uint256 expectedEntryIndex;
     bytes32 proxyEntryHash;
     CrossChainCall[] incomingCalls;
     bytes32 rollingHash;
@@ -1027,14 +1037,9 @@ struct L2StaticExecutionEntry {
 function loadExecutionTable(
     L2ExecutionEntry[] _entries,
     L2StaticExecutionEntry[] _staticEntries
-);
+) payable;
 
 function executeIncomingCrossChainCall(
-    address destination,
-    uint256 value,
-    bytes data,
-    address sourceAddress,
-    uint64 sourceRollup,
     L2ExecutionEntry[] _entries,
     L2StaticExecutionEntry[] _staticEntries
 ) payable returns (bytes);
@@ -1053,11 +1058,11 @@ Current selector locks are:
 
 | Function | Selector |
 | --- | --- |
-| `postAndVerifyBatch` | `0xcafef125` |
+| `postAndVerifyBatch` | `0xe4a480e4` |
 | `executeL2Txs` | `0xdc6d11fa` |
 | `staticCrossChainCall` | `0x31344ade` |
-| `loadExecutionTable` | `0xb301bc80` |
-| `executeIncomingCrossChainCall` | `0x8d8461d9` |
+| `loadExecutionTable` | `0xbf2eebd3` |
+| `executeIncomingCrossChainCall` | `0xc3fb5f3d` |
 
 ## Annex B. Hash formulas used by the supported profile
 
@@ -1107,7 +1112,7 @@ For L1:
 ```text
 states[0]   = bytes32(0)
 states[i+1] = H(states[i] || uint64_be(update[i].rollupId)
-                          || update[i].currentState)
+                          || update[i].currentRoot)
 l1_seed     = H(states[n] || proxyEntryHash)
 ```
 

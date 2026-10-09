@@ -7,14 +7,14 @@ mod pipeline;
 mod runtime;
 
 use alloy_consensus::{SignableTransaction as _, Transaction as _};
-use alloy_primitives::{B256, Bytes, I256, Signature, U256, address, b256, keccak256};
+use alloy_primitives::{B256, Bytes, Signature, U256, address, b256, keccak256};
 use alloy_sol_types::SolValue as _;
 use eez_control_rpc::v1::prover_client::ProverClient;
 use eez_control_rpc::v1::{
     BlockWitness, ExecutionWitness, PostBatch, ProveChunk, ProveHeader, ProveResponse, prove_chunk,
     prove_failure,
 };
-use eez_protocol::abi::{ExecutionEntrySol, L2ToL1CallSol, StateUpdateSol};
+use eez_protocol::abi::{ExecutionEntrySol, L2ToL1CallSol, RollupUpdateSol};
 use reth_primitives_traits::BlockBody as _;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -27,7 +27,8 @@ use super::settlement_job::{
 use super::*;
 use crate::cancel::CancellationToken;
 use crate::testkit::{
-    TEST_SYSTEM_ADDRESS, checkpoint, system_transaction_context, test_proof_system_vkey,
+    TEST_SYSTEM_ADDRESS, checkpoint, empty_prefix_candidate, pre_execution_checkpoint,
+    system_transaction_context, test_proof_system_vkey,
 };
 use crate::validate::Validator;
 use crate::validate::testing::backend_output_for;
@@ -118,8 +119,8 @@ fn anchor_batch_spanning(from: u64, to: u64) -> eez_protocol::EvmBatch {
 
 fn anchor_batch_spanning_for(rollup_id: u64, from: u64, to: u64) -> eez_protocol::EvmBatch {
     let mut batch = anchor_batch_for(rollup_id);
-    batch.entries[0].stateUpdates[0].currentState = block_hash_of(from - 1);
-    batch.entries[0].stateUpdates[0].newState = block_hash_of(to);
+    batch.entries[0].rollupUpdates[0].currentRoot = block_hash_of(from - 1);
+    batch.entries[0].rollupUpdates[0].newRoot = block_hash_of(to);
     eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
     batch
 }
@@ -134,11 +135,11 @@ fn interior_candidate() -> B256 {
 fn anchor_batch_for(rollup_id: u64) -> eez_protocol::EvmBatch {
     let mut batch = eez_protocol::EvmBatch::default();
     batch.entries.push(ExecutionEntrySol {
-        stateUpdates: vec![StateUpdateSol {
+        rollupUpdates: vec![RollupUpdateSol {
             rollupId: rollup_id,
-            currentState: B256::ZERO,
-            newState: B256::ZERO,
-            etherDelta: I256::ZERO,
+            currentRoot: B256::ZERO,
+            newRoot: B256::ZERO,
+            etherDelta: alloy_primitives::aliases::I192::ZERO,
         }],
         proxyEntryHash: B256::ZERO,
         destinationRollupId: rollup_id,
@@ -159,21 +160,17 @@ fn anchor_batch_for(rollup_id: u64) -> eez_protocol::EvmBatch {
 }
 
 /// An anchor plus one outbound effect, chained over the window's block hashes:
-/// the anchor closes on the settling block's parent and the effect closes the
+/// the anchor claims the settling block's empty prefix and the effect closes the
 /// window.
-fn outbound_batch(
-    window_pre: B256,
-    settling_pre: B256,
-    window_post: B256,
-) -> eez_protocol::EvmBatch {
+fn outbound_batch(window_pre: B256, window_post: B256) -> eez_protocol::EvmBatch {
     let mut batch = anchor_batch();
     let anchor = &mut batch.entries[0];
-    anchor.stateUpdates[0].currentState = window_pre;
-    anchor.stateUpdates[0].newState = settling_pre;
+    anchor.rollupUpdates[0].currentRoot = window_pre;
+    anchor.rollupUpdates[0].newRoot = empty_prefix_candidate();
 
     let mut effect = anchor.clone();
-    effect.stateUpdates[0].currentState = settling_pre;
-    effect.stateUpdates[0].newState = window_post;
+    effect.rollupUpdates[0].currentRoot = empty_prefix_candidate();
+    effect.rollupUpdates[0].newRoot = window_post;
     effect.l2ToL1Calls.push(l2_to_l1_call());
     batch.entries.push(effect);
     batch.immediateEntryCount = U256::from(2);
@@ -200,10 +197,10 @@ fn canonical_outbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256)
 }
 
 fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256) {
-    let (window_pre, settling_pre, window_post) = window_endpoints(5, 5);
-    let mut batch = outbound_batch(window_pre, settling_pre, window_post);
+    let (window_pre, _settling_pre, window_post) = window_endpoints(5, 5);
+    let mut batch = outbound_batch(window_pre, window_post);
     batch.entries[1].l2ToL1Calls[0].value = value;
-    batch.entries[1].stateUpdates[0].etherDelta = -I256::try_from(value).unwrap();
+    batch.entries[1].rollupUpdates[0].etherDelta = -eez_protocol::abi::u256_to_i192(value).unwrap();
     eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
     let call = &batch.entries[1].l2ToL1Calls[0];
     let call_hash = eez_protocol::l2_outbound_call_hash(
@@ -224,7 +221,7 @@ fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256
     };
     let user = user_body.encoded_2718_transactions_iter().next().unwrap();
     let mut sidecar = batch.entries[1].clone();
-    sidecar.stateUpdates.clear();
+    sidecar.rollupUpdates.clear();
     sidecar.rollingHash = B256::ZERO;
     let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &[(sidecar.clone(), Bytes::from(user.clone()))],
@@ -258,7 +255,10 @@ fn outbound_backend_output() -> validate::BackendWindowOutput {
     backend_output.blocks[0].set_transaction_results_for_test(vec![true, true]);
     // The pair ends on the block's last transaction, so its candidate is the
     // settling block itself.
-    backend_output.blocks[0].transaction_state_checkpoints = vec![checkpoint(1, block_hash_of(5))];
+    backend_output.blocks[0].transaction_state_checkpoints = vec![
+        pre_execution_checkpoint(empty_prefix_candidate()),
+        checkpoint(1, block_hash_of(5)),
+    ];
     backend_output.blocks[0]
         .settlement_evidence
         .set_system_sender_flags_for_test(vec![true, false]);
@@ -284,18 +284,18 @@ fn mixed_outbound_inbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, B256) {
     // candidate sealed at its own transaction and the inbound effect takes over
     // the window's closing hash.
     let (_, _, window_post) = window_endpoints(5, 5);
-    batch.entries[1].stateUpdates[0].newState = interior_candidate();
+    batch.entries[1].rollupUpdates[0].newRoot = interior_candidate();
     let mut inbound_entry = batch.entries[0].clone();
-    inbound_entry.stateUpdates[0].currentState = interior_candidate();
-    inbound_entry.stateUpdates[0].newState = window_post;
-    inbound_entry.stateUpdates[0].etherDelta = I256::try_from(value).unwrap();
+    inbound_entry.rollupUpdates[0].currentRoot = interior_candidate();
+    inbound_entry.rollupUpdates[0].newRoot = window_post;
+    inbound_entry.rollupUpdates[0].etherDelta = eez_protocol::abi::u256_to_i192(value).unwrap();
     inbound_entry.proxyEntryHash = inbound_call_hash;
     inbound_entry.returnData = return_data;
     batch.entries.push(inbound_entry);
     eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
 
     let mut outbound_sidecar = batch.entries[1].clone();
-    outbound_sidecar.stateUpdates.clear();
+    outbound_sidecar.rollupUpdates.clear();
     outbound_sidecar.rollingHash = B256::ZERO;
     let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
         &[(outbound_sidecar.clone(), Bytes::from(user.clone()))],
@@ -332,6 +332,7 @@ fn mixed_backend_output() -> validate::BackendWindowOutput {
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[0].set_transaction_results_for_test(vec![true, true, true]);
     backend_output.blocks[0].transaction_state_checkpoints = vec![
+        pre_execution_checkpoint(empty_prefix_candidate()),
         checkpoint(1, interior_candidate()),
         checkpoint(2, block_hash_of(5)),
     ];
@@ -543,7 +544,7 @@ fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, Exe
         .unwrap();
     let call_hash = entry.proxyEntryHash;
     let sidecar = ExecutionEntrySol {
-        stateUpdates: Vec::new(),
+        rollupUpdates: Vec::new(),
         proxyEntryHash: call_hash,
         l2ToL1Calls: vec![L2ToL1CallSol {
             revertNextNCalls: 0,
@@ -553,7 +554,7 @@ fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, Exe
             sourceRollupId: 0,
             targetAddress: target,
             value,
-            data: data.clone(),
+            data,
         }],
         expectedL1ToL2Calls: Vec::new(),
         rollingHash: entry.rollingHash,
@@ -561,14 +562,7 @@ fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, Exe
         success: true,
         returnData: return_data.clone(),
     };
-    let input = eez_protocol::entries::encode_execute_incoming(
-        target,
-        value,
-        data,
-        source,
-        eez_protocol::RollupId(0),
-        entry,
-    );
+    let input = eez_protocol::entries::encode_execute_incoming(entry);
     let context = system_transaction_context();
     let inbound = eez_protocol::entries::InboundSidecar::try_from(&sidecar).unwrap();
     let raw = eez_protocol::system_tx::build_inbound_system_txs(

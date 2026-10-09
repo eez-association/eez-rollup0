@@ -5,21 +5,35 @@
 
 use alloy_sol_types::sol;
 
+/// Converts an unsigned EVM value to the protocol's signed `int192` balance
+/// delta without truncation or accepting values above `int192::MAX`.
+pub fn u256_to_i192(value: alloy_primitives::U256) -> Option<alloy_primitives::aliases::I192> {
+    let [low, middle, high, overflow] = value.into_limbs();
+    if overflow != 0 {
+        return None;
+    }
+    let magnitude = alloy_primitives::aliases::U192::from_limbs([low, middle, high]);
+    alloy_primitives::aliases::I192::checked_from_sign_and_abs(
+        alloy_primitives::Sign::Positive,
+        magnitude,
+    )
+}
+
 sol! {
     /// One rollup state transition carried by an L1 entry.
     #[derive(Debug)]
-    struct StateUpdateSol {
+    struct RollupUpdateSol {
         uint64 rollupId;
-        bytes32 currentState;
-        bytes32 newState;
-        int256 etherDelta;
+        int192 etherDelta;
+        bytes32 currentRoot;
+        bytes32 newRoot;
     }
 
     /// A composer assertion about a rollup's live state root.
     #[derive(Debug)]
-    struct ExpectedStateRootPerRollupSol {
+    struct ExpectedRootPerRollupSol {
         uint64 rollupId;
-        bytes32 stateRoot;
+        bytes32 root;
     }
 
     /// One cross-chain call executed on L1.
@@ -48,7 +62,7 @@ sol! {
     /// One mutable top-level L1 execution entry.
     #[derive(Debug, Default)]
     struct ExecutionEntrySol {
-        StateUpdateSol[] stateUpdates;
+        RollupUpdateSol[] rollupUpdates;
         bytes32 proxyEntryHash;
         L2ToL1CallSol[] l2ToL1Calls;
         ExpectedL1ToL2CallSol[] expectedL1ToL2Calls;
@@ -61,7 +75,7 @@ sol! {
     /// One read-only top-level L1 execution entry.
     #[derive(Debug, Default)]
     struct StaticExecutionEntrySol {
-        ExpectedStateRootPerRollupSol[] expectedStateRoots;
+        ExpectedRootPerRollupSol[] expectedRoots;
         bytes32 proxyEntryHash;
         L2ToL1CallSol[] l2ToL1Calls;
         bytes32 rollingHash;
@@ -80,7 +94,7 @@ sol! {
     /// The single argument to `EEZ.postAndVerifyBatch`.
     #[derive(Debug, Default)]
     struct ProofSystemBatchPerVerificationEntriesSol {
-        ExpectedStateRootPerRollupSol[] expectedStateRootPerRollup;
+        ExpectedRootPerRollupSol[] expectedRootPerRollup;
         ExecutionEntrySol[] entries;
         StaticExecutionEntrySol[] staticEntries;
         uint256 immediateEntryCount;
@@ -102,13 +116,15 @@ sol! {
 
     function staticCrossChainCall(address sourceAddress, bytes callData) external view returns (bytes);
 
-    event BatchPosted(uint256 indexed rollupCount);
+    event BatchPosted(bytes32 sharedPublicInput, uint64[] rollupIds);
 
-    event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newState);
+    event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newRoot, uint256 etherBalance);
 
     event ExecutionConsumed(
         bytes32 indexed crossChainCallHash, uint64 indexed rollupId, uint256 indexed entryQueueIndex
     );
+
+    event L2TxSkipped(uint256 indexed transientIdx, bytes revertData);
 
     event CrossChainCallExecuted(
         bytes32 indexed crossChainCallHash,
@@ -186,6 +202,7 @@ sol! {
     /// One read-only top-level L2 execution entry.
     #[derive(Debug, Default)]
     struct L2StaticExecutionEntrySol {
+        uint256 expectedEntryIndex;
         bytes32 proxyEntryHash;
         CrossChainCallSol[] incomingCalls;
         bytes32 rollingHash;
@@ -196,14 +213,9 @@ sol! {
     function loadExecutionTable(
         L2ExecutionEntrySol[] _entries,
         L2StaticExecutionEntrySol[] _staticEntries
-    ) external;
+    ) external payable;
 
     function executeIncomingCrossChainCall(
-        address destination,
-        uint256 value,
-        bytes data,
-        address sourceAddress,
-        uint64 sourceRollup,
         L2ExecutionEntrySol[] _entries,
         L2StaticExecutionEntrySol[] _staticEntries
     ) external payable returns (bytes);
@@ -239,7 +251,7 @@ sol! {
 
 #[cfg(test)]
 mod selector_locks {
-    //! ABI pins from `eez-core-protocol` commit 6fcc90b.
+    //! ABI pins from `eez-core-protocol` commit 855fe06.
     use super::*;
     use alloy_sol_types::SolCall;
 
@@ -271,12 +283,12 @@ mod selector_locks {
     fn l2_selectors_match_upstream() {
         assert_eq!(
             loadExecutionTableCall::SELECTOR,
-            [0xb3, 0x01, 0xbc, 0x80],
+            [0xbf, 0x2e, 0xeb, 0xd3],
             "loadExecutionTable selector drifted from pinned protocol"
         );
         assert_eq!(
             executeIncomingCrossChainCallCall::SELECTOR,
-            [0x8d, 0x84, 0x61, 0xd9],
+            [0xc3, 0xfb, 0x5f, 0x3d],
             "executeIncomingCrossChainCall selector drifted from pinned protocol"
         );
     }
@@ -285,7 +297,7 @@ mod selector_locks {
     fn l1_selectors_match_upstream() {
         assert_eq!(
             postAndVerifyBatchCall::SELECTOR,
-            [0xca, 0xfe, 0xf1, 0x25],
+            [0xe4, 0xa4, 0x80, 0xe4],
             "postAndVerifyBatch selector drifted from pinned protocol"
         );
         assert_eq!(
@@ -297,6 +309,34 @@ mod selector_locks {
             staticCrossChainCallCall::SELECTOR,
             [0x31, 0x34, 0x4a, 0xde],
             "staticCrossChainCall selector drifted from pinned protocol"
+        );
+    }
+
+    /// Attribution reads these three by topic0, and drift is silent: `get_logs`
+    /// returns nothing and the scan reports "no entries applied".
+    #[test]
+    fn consumption_event_topics_match_upstream() {
+        use alloy_sol_types::SolEvent;
+        assert_eq!(
+            L2ExecutionPerformed::SIGNATURE_HASH,
+            alloy_primitives::b256!(
+                "8945ae7d1ab7f670bc04e5b87613a2ac6904a559769517d220308f4f22cd1b66"
+            ),
+            "L2ExecutionPerformed topic0 drifted; settlement endpoints would read empty"
+        );
+        assert_eq!(
+            ExecutionConsumed::SIGNATURE_HASH,
+            alloy_primitives::b256!(
+                "a17dc82da628b280737819918ee433b966773121ff974c081d8cbac4c6199d7d"
+            ),
+            "ExecutionConsumed topic0 drifted; consumed entries would read as unconsumed"
+        );
+        assert_eq!(
+            L2TxSkipped::SIGNATURE_HASH,
+            alloy_primitives::b256!(
+                "31dea3928d6f7bb415eb371434f719dfc337c078c82d58146f2b8a4726002e40"
+            ),
+            "L2TxSkipped topic0 drifted; a skipped immediate would read as applied"
         );
     }
 }

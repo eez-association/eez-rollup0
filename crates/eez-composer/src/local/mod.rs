@@ -1,9 +1,8 @@
 //! Reth-specific infrastructure for cross-chain composition.
 //!
 //! Per-transaction composition building lives in `eez-protocol`; the revm
-//! inspector lives in `eez-evm-inspector`.
-//! This module provides the reth-backed implementation of the
-//! protocol traits the orchestrator drives:
+//! inspector and overlay live in this crate. This module provides the
+//! reth-backed implementation of the protocol traits the orchestrator drives:
 //!
 //! - [`LocalChainClient`] — unified chain client impl (entry or follower)
 //! - `LocalExecutionSession` — stateful per-source-tx target session
@@ -21,7 +20,9 @@ pub(crate) mod session;
 pub(crate) mod slot;
 
 #[doc(inline)]
-pub use build::{BuildError, BuiltSyncBlock, build_sync_block, sync_block_pair_hashes};
+pub use build::{
+    BuildError, BuiltSyncBlock, SyncCandidates, build_sync_block, sync_block_candidates,
+};
 #[doc(inline)]
 pub use client::LocalChainClient;
 #[doc(inline)]
@@ -51,6 +52,6 @@ pub(crate) fn reset_frame_caller_nonce(
     addr: Address,
 ) {
     if let Some(account) = changes.get_mut(&addr) {
-        account.info.nonce = account.original_info.nonce;
+        account.info.nonce = account.original_info().nonce;
     }
 }

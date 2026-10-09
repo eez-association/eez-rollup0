@@ -1,6 +1,7 @@
 //! Direct tests for synchronous settlement processing.
 
 use super::*;
+use crate::validate::CheckpointAt;
 
 /// A window holding only block 5, sealed on the same `parent -> hash` grid the
 /// streamed fixtures use, so batches chain over identical endpoints here and in
@@ -8,7 +9,7 @@ use super::*;
 fn validated_single_block(
     block: validate::ValidatedBlock,
     receipt_successes: Vec<bool>,
-    transaction_state_checkpoints: Vec<validate::TransactionStateCheckpoint>,
+    transaction_state_checkpoints: Vec<validate::StateCheckpoint>,
 ) -> validate::ValidatedWindow {
     let (window_pre, settling_pre, window_post) = window_endpoints(5, 5);
     validate::ValidatedWindow::for_test(
@@ -63,8 +64,8 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
             "block_inspection",
         ),
         (
-            SettlementPipelineError::StateUpdateChain(
-                crate::settlement::StateUpdateChainError::NoEntries,
+            SettlementPipelineError::RollupUpdateChain(
+                crate::settlement::RollupUpdateChainError::NoEntries,
             ),
             "state_update_chain",
         ),
@@ -175,7 +176,7 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
             crate::settlement::EffectPrefixError::TransactionStateCheckpointIndexMismatch {
                 checkpoint_index: 0,
                 expected: 1,
-                actual: 0,
+                actual: CheckpointAt::Transaction(0),
             },
         ),
         SettlementPipelineError::DaPayload(crate::settlement::DaPayloadError::InvalidBlockRlp {
@@ -318,16 +319,16 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         validate::SettlementBlockEvidence::for_test(vec![true], Vec::new()),
     );
 
-    let (window_pre, settling_pre, window_post) = window_endpoints(5, 5);
+    let (window_pre, _settling_pre, window_post) = window_endpoints(5, 5);
     let mut batch = anchor_batch();
-    batch.entries[0].stateUpdates[0].currentState = window_pre;
-    batch.entries[0].stateUpdates[0].newState = settling_pre;
+    batch.entries[0].rollupUpdates[0].currentRoot = window_pre;
+    batch.entries[0].rollupUpdates[0].newRoot = empty_prefix_candidate();
     batch.entries.push(ExecutionEntrySol {
-        stateUpdates: vec![StateUpdateSol {
+        rollupUpdates: vec![RollupUpdateSol {
             rollupId: 1,
-            currentState: settling_pre,
-            newState: window_post,
-            etherDelta: I256::try_from(value).unwrap(),
+            currentRoot: empty_prefix_candidate(),
+            newRoot: window_post,
+            etherDelta: eez_protocol::abi::u256_to_i192(value).unwrap(),
         }],
         proxyEntryHash: call_hash,
         l2ToL1Calls: Vec::new(),
@@ -343,7 +344,10 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     let expected_hash = recompute_test_public_inputs_hash(&batch);
     let calldata = eez_protocol::entries::encode_postbatch(&batch);
     let statuses = [true];
-    let checkpoints = [checkpoint(0, block_hash_of(5))];
+    let checkpoints = [
+        pre_execution_checkpoint(empty_prefix_candidate()),
+        checkpoint(0, block_hash_of(5)),
+    ];
     let validated = validated_single_block(settling_block, statuses.to_vec(), checkpoints.to_vec());
     let cancellation = CancellationToken::default();
     let system_transaction_reconstructor =
@@ -464,7 +468,10 @@ fn a_reverted_outbound_load_reports_the_paired_user_transaction() {
     let validated = validated_single_block(
         settling_block,
         vec![false, true],
-        vec![checkpoint(1, block_hash_of(5))],
+        vec![
+            pre_execution_checkpoint(empty_prefix_candidate()),
+            checkpoint(1, block_hash_of(5)),
+        ],
     );
     let cancellation = CancellationToken::default();
     let system_transaction_reconstructor =
@@ -505,7 +512,10 @@ fn an_outbound_observation_failure_reports_the_user_transaction() {
     let validated = validated_single_block(
         settling_block,
         vec![true, true],
-        vec![checkpoint(1, block_hash_of(5))],
+        vec![
+            pre_execution_checkpoint(empty_prefix_candidate()),
+            checkpoint(1, block_hash_of(5)),
+        ],
     );
     let cancellation = CancellationToken::default();
     let system_transaction_reconstructor =
@@ -552,7 +562,10 @@ fn an_outbound_claim_hash_mismatch_remains_non_actionable() {
     let validated = validated_single_block(
         settling_block,
         vec![true, true],
-        vec![checkpoint(1, block_hash_of(5))],
+        vec![
+            pre_execution_checkpoint(empty_prefix_candidate()),
+            checkpoint(1, block_hash_of(5)),
+        ],
     );
     let cancellation = CancellationToken::default();
     let system_transaction_reconstructor =
@@ -592,7 +605,10 @@ fn a_fully_bound_outbound_effect_is_authorized() {
     let expected_hash = recompute_test_public_inputs_hash(&batch);
     let calldata = eez_protocol::entries::encode_postbatch(&batch);
     let statuses = [true, true];
-    let checkpoints = [checkpoint(1, block_hash_of(5))];
+    let checkpoints = [
+        pre_execution_checkpoint(empty_prefix_candidate()),
+        checkpoint(1, block_hash_of(5)),
+    ];
     let validated = validated_single_block(settling_block, statuses.to_vec(), checkpoints.to_vec());
     let cancellation = CancellationToken::default();
     let system_transaction_reconstructor =

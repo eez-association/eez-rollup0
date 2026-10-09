@@ -13,17 +13,19 @@ use eez_primitives::EezTxEnvelope as TransactionSigned;
 use reth_evm::{ConfigureEvm, Evm as _};
 use reth_primitives_traits::SignerRecoverable;
 use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderBox, StateProviderFactory};
+use reth_storage_api::{
+    BlockNumReader, EvmStateProviderAdapter, HeaderProvider, StateProviderBox, StateProviderFactory,
+};
 use revm::DatabaseCommit;
 use revm::context::result::EVMError;
 
-use eez_evm_inspector::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
+use crate::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{
     ChainClient, CompositionBuilder, ExecutorError, ExecutorErrorKind, ExecutorResult,
     ProxyLookupConfig, RollupId, TargetExecutionSession,
 };
 
-use super::provider::{ChainProvider, HeaderReader};
+use super::provider::{ChainProvider, HeaderReader, StateSnapshotProvider};
 use super::session::LocalExecutionSession;
 
 /// Discriminates how this client operates within the composition.
@@ -93,7 +95,7 @@ impl LocalChainClient {
             + 'static,
     {
         let headers: Arc<dyn HeaderReader> = Arc::new(provider.clone());
-        let state_provider: Arc<dyn StateProviderFactory> = Arc::new(provider.clone());
+        let state_provider: Arc<dyn StateSnapshotProvider> = Arc::new(provider.clone());
         ChainProvider {
             provider: state_provider,
             headers,
@@ -207,7 +209,7 @@ impl LocalChainClient {
         &self,
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
-        state: &mut State<StateProviderDatabase<StateProviderBox>>,
+        state: &mut State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>,
         evm_env: reth_evm::EvmEnvFor<EezEvmConfig>,
     ) -> ExecutorResult<()> {
         self.source_sim(raw_tx, dispatcher, state, evm_env)
@@ -219,7 +221,7 @@ impl LocalChainClient {
         &self,
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
-        state: &mut State<StateProviderDatabase<StateProviderBox>>,
+        state: &mut State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>,
         evm_env: reth_evm::EvmEnvFor<EezEvmConfig>,
     ) -> ExecutorResult<()> {
         use alloy_eips::eip2718::Decodable2718;

@@ -153,7 +153,7 @@ pub(super) enum SettlementPipelineError {
     #[error(transparent)]
     BlockInspection(#[from] settlement::BlockInspectionError),
     #[error(transparent)]
-    StateUpdateChain(#[from] settlement::StateUpdateChainError),
+    RollupUpdateChain(#[from] settlement::RollupUpdateChainError),
     #[error(transparent)]
     EffectPrefix(#[from] settlement::EffectPrefixError),
     #[error(transparent)]
@@ -173,7 +173,7 @@ impl SettlementPipelineError {
             Self::PostBatchCalldata(_) => "post_batch_calldata",
             Self::PublicInputs(_) => "public_inputs",
             Self::BlockInspection(_) => "block_inspection",
-            Self::StateUpdateChain(_) => "state_update_chain",
+            Self::RollupUpdateChain(_) => "state_update_chain",
             Self::EffectPrefix(_) => "effect_prefix",
             Self::InboundEffects(_) => "inbound_effects",
             Self::OutboundEffects(_) => "outbound_effects",
@@ -227,7 +227,8 @@ impl SettlementPipelineError {
                 }
                 | settlement::EffectPrefixError::TransactionStateCheckpointIndexMismatch {
                     ..
-                } => (
+                }
+                | settlement::EffectPrefixError::AnchorCheckpointPositionMismatch { .. } => (
                     tonic::Code::Internal,
                     "validation backend returned invalid output",
                 ),
@@ -244,7 +245,7 @@ impl SettlementPipelineError {
                 ),
             },
             Self::PublicInputs(settlement::PublicInputError::InvalidStructure(_))
-            | Self::StateUpdateChain(_)
+            | Self::RollupUpdateChain(_)
             | Self::InboundEffects(_)
             | Self::OutboundEffects(_) => (
                 tonic::Code::FailedPrecondition,
@@ -267,6 +268,7 @@ impl SettlementPipelineError {
                 | settlement::DaPayloadError::TransactionMismatch { .. }
                 | settlement::DaPayloadError::MissingAction { .. }
                 | settlement::DaPayloadError::ActionMismatch { .. }
+                | settlement::DaPayloadError::RollingHashMismatch { .. }
                 // The composer published a payload that contradicts the blocks
                 // it built: an action for another rollup, or header inputs the
                 // validated header does not carry. Both are the composer's
@@ -345,7 +347,6 @@ pub(super) fn run_settlement(
 
     let bound_effects = settlement::bind_effects_to_execution(
         &verified_state_chain,
-        validated_window.settling_pre_block_hash(),
         settling_block.transaction_state_checkpoints(),
         &settling_observations,
     )?;
