@@ -57,11 +57,23 @@ fn lookup_authorized_proxy_live<CTX: ContextTr + Host>(
     addr: Address,
 ) -> Option<ProxyInfo> {
     // Warm the rollups account before the SLOAD (see fn-level doc).
-    ctx.journal_mut()
-        .load_account(lookup.contract_address)
-        .ok()?;
+    if let Err(error) = ctx.journal_mut().load_account(lookup.contract_address) {
+        tracing::warn!(
+            contract = %lookup.contract_address,
+            error = ?error,
+            "proxy lookup: DB error loading proxy registry; treating as not-a-proxy",
+        );
+        return None;
+    }
     let key = proxy_mapping_key(addr, lookup.authorized_proxies_slot);
-    let load = ctx.sload(lookup.contract_address, key.into())?;
+    let Some(load) = ctx.sload(lookup.contract_address, key.into()) else {
+        tracing::warn!(
+            contract = %lookup.contract_address,
+            proxy = %addr,
+            "proxy lookup: DB error reading authorizedProxies slot; treating as not-a-proxy",
+        );
+        return None;
+    };
     decode_proxy_value(load.data)
 }
 

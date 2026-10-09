@@ -492,6 +492,21 @@ where
     <T::BuiltPayload as BuiltPayload>::Primitives: Send + Sync + 'static,
     SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>: Send,
 {
+    fn feed_witness(&self, block_hash: B256) {
+        let Some(sender) = &self.witness_sender else {
+            return;
+        };
+        if let Err(err) = sender.send(block_hash) {
+            event!(
+                name: "eez.committer.witness_feed.send_failed",
+                Level::ERROR,
+                block.hash = %block_hash,
+                error = %err,
+                "witness-feed channel closed; prover-capture task is gone — blocks will stop being proven and settlement will stall",
+            );
+        }
+    }
+
     async fn run(mut self) {
         while let Some(cmd) = self.receiver.recv().await {
             match cmd {
@@ -712,8 +727,8 @@ where
         // `feed_witness=false` so the prover isn't double-fed the same block.
         // The block is already canonical (the FCU above), so the witness task's
         // `recovered_block(hash)` resolves on the first try.
-        if feed_witness && let Some(sender) = &self.witness_sender {
-            let _ = sender.send(block_hash);
+        if feed_witness {
+            self.feed_witness(block_hash);
         }
 
         Ok(DeriveOutcome {
@@ -781,10 +796,7 @@ where
         *self.last_header.write().unwrap() = header.clone();
         // Prover-feed trigger (prover-chain P1): the block is now canonical, so
         // the witness task's `recovered_block(hash)` resolves on the first try.
-        // Best-effort — a closed/lagging channel just drops it.
-        if let Some(sender) = &self.witness_sender {
-            let _ = sender.send(header.hash());
-        }
+        self.feed_witness(header.hash());
         Ok(CommitOutcome { header })
     }
 }
