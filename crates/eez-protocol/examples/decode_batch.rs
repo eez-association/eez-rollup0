@@ -7,11 +7,11 @@ fn dump_entry(label: &str, e: &ExecutionEntrySol) {
     println!("== {label} ==");
     println!("  proxyEntryHash = {}", e.proxyEntryHash);
     println!("  destinationRollupId = {}", e.destinationRollupId);
-    println!("  stateUpdates.len() = {}", e.stateUpdates.len());
-    for (j, d) in e.stateUpdates.iter().enumerate() {
+    println!("  rollupUpdates.len() = {}", e.rollupUpdates.len());
+    for (j, d) in e.rollupUpdates.iter().enumerate() {
         println!(
-            "    update[{j}] rollupId={} currentState={} newState={} etherDelta={}",
-            d.rollupId, d.currentState, d.newState, d.etherDelta
+            "    update[{j}] rollupId={} currentRoot={} newRoot={} etherDelta={}",
+            d.rollupId, d.currentRoot, d.newRoot, d.etherDelta
         );
     }
     println!("  l2ToL1Calls.len() = {}", e.l2ToL1Calls.len());
@@ -147,8 +147,8 @@ fn main() {
     println!();
     println!("######## CLAIMED CHAIN (on-chain entries[] deltas, in order) ########");
     for (i, e) in b.entries.iter().enumerate() {
-        for d in &e.stateUpdates {
-            println!("entry[{i}]: {} -> {}", d.currentState, d.newState);
+        for d in &e.rollupUpdates {
+            println!("entry[{i}]: {} -> {}", d.currentRoot, d.newRoot);
         }
     }
 

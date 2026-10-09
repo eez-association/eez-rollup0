@@ -156,7 +156,7 @@ async fn wait_for_count(rpc_url: &str, counter: Address, expected: u64, label: &
     .unwrap_or_else(|err| panic!("{label} never reached count={expected}: {err:#}"));
 }
 
-/// L1's stored `rollups[rid].stateRoot` must equal the L2 safe block's root.
+/// L1's stored `rollups[rid].root` must equal the L2 safe block's root.
 async fn assert_reconciled(w: &CrossChainWorld) {
     let (eez, rollup_id) = (w.cfg.eez_address, w.cfg.rollup_id);
     let (l1_rpc, l2_rpc) = (w.l1_rpc(), w.l2_rpc());

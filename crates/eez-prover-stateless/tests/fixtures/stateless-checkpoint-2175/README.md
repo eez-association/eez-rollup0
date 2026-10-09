@@ -8,7 +8,7 @@ This fixture is block 2175 from an `eez-rollup0`
 
 The expected checkpoint indices `[0, 1, 2]` are the three ordered legacy
 effect boundaries in the recorded settling block. The corresponding roots in
-`checkpoint-oracle-2175.json` are the effect-entry `newState` values recorded
+`checkpoint-oracle-2175.json` are the effect-entry `newRoot` values recorded
 in that window's `PostBatch`. The composer calculated them from its full-state
 provider; that calculation was introduced by
 `5950df8aa5ffccdabb64dfb4119089b4da6add54`. The test therefore checks the

@@ -21,7 +21,7 @@ ethereum_package:
   mev_type: flashbots
   mev_params:
     mev_builder_image: ethpandaops/reth-rbuilder:develop
-    mev_relay_image: ethpandaops/mev-boost-relay:main
+    mev_relay_image: ethpandaops/mev-boost-relay@sha256:3600f04fcaf0bbb231f4737470f094fdf2314db54b4853197fa369aea90f8b19
     mev_boost_image: ethpandaops/mev-boost:develop
     mev_builder_cl_image: sigp/lighthouse:v8.1.2
     mev_builder_subsidy: 1

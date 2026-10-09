@@ -64,8 +64,8 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
             "block_inspection",
         ),
         (
-            SettlementPipelineError::StateUpdateChain(
-                crate::settlement::StateUpdateChainError::NoEntries,
+            SettlementPipelineError::RollupUpdateChain(
+                crate::settlement::RollupUpdateChainError::NoEntries,
             ),
             "state_update_chain",
         ),
@@ -321,14 +321,14 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
 
     let (window_pre, _settling_pre, window_post) = window_endpoints(5, 5);
     let mut batch = anchor_batch();
-    batch.entries[0].stateUpdates[0].currentState = window_pre;
-    batch.entries[0].stateUpdates[0].newState = empty_prefix_candidate();
+    batch.entries[0].rollupUpdates[0].currentRoot = window_pre;
+    batch.entries[0].rollupUpdates[0].newRoot = empty_prefix_candidate();
     batch.entries.push(ExecutionEntrySol {
-        stateUpdates: vec![StateUpdateSol {
+        rollupUpdates: vec![RollupUpdateSol {
             rollupId: 1,
-            currentState: empty_prefix_candidate(),
-            newState: window_post,
-            etherDelta: I256::try_from(value).unwrap(),
+            currentRoot: empty_prefix_candidate(),
+            newRoot: window_post,
+            etherDelta: eez_protocol::abi::u256_to_i192(value).unwrap(),
         }],
         proxyEntryHash: call_hash,
         l2ToL1Calls: Vec::new(),

@@ -754,7 +754,7 @@ alloy_sol_types::sol! {
         function rollups(uint64 rollupId)
             external
             view
-            returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
+            returns (address rollupContract, bytes32 root, uint256 etherBalance);
     }
 }
 
@@ -1416,7 +1416,7 @@ where
         // on a stale parent (see [`eez_driver::ParentContext`]).
         let parent_header = parent.header;
         let parent_number = parent_header.number();
-        let suggested_fee_recipient: Address = Address::ZERO;
+        let suggested_fee_recipient = rollup.config.fee_recipient;
 
         // ── One-in-flight gate ───────────────────────────────────────
         // Emit a postBatch only once the previous resolves — FAILED
@@ -1890,7 +1890,7 @@ where
                     &self.inner.evm_config,
                     &failed.parent,
                     timestamp,
-                    Address::ZERO,
+                    rollup.config.fee_recipient,
                     &[],
                 ) {
                     // feed_witness=true: a PRODUCED block — later historical
@@ -3138,7 +3138,7 @@ where
                 .await;
         }
         // Per-effect intermediate L2 roots: the prover requires each entry's
-        // `newState` to be its own effect's root, not the final Sync-block root.
+        // `newRoot` to be its own effect's root, not the final Sync-block root.
         // Failure here is systemic (like build/prepare) → degrade.
         let candidates = match sync_block_candidates(
             rollup.l2_provider.as_ref(),
@@ -3613,7 +3613,7 @@ where
             &self.inner.evm_config,
             parent_header,
             timestamp,
-            Address::ZERO,
+            rollup.config.fee_recipient,
             &[],
         ) {
             Ok(built) => Some(SyncSlotBlock {
@@ -3794,7 +3794,7 @@ where
         sync_height: u64,
         bundle: Vec<Bytes>,
         post_batch_hash: alloy_primitives::TxHash,
-        expected_final_state: B256,
+        expected_final_root: B256,
         optimistic: Arc<OptimisticallyIncluded>,
         target: BundleTarget,
     ) {
@@ -3804,7 +3804,7 @@ where
             sync_height,
             bundle,
             post_batch_hash,
-            expected_final_state,
+            expected_final_root,
             optimistic,
             submitter,
             target,
@@ -3824,10 +3824,10 @@ where
     /// deferred entries in drain order. One proof covers the merged batch.
     ///
     /// **Chained state updates**: this function
-    /// stitches the merged entries so `entries[k].currentState ==
-    /// entries[k-1].newState` per rollup; EEZ.sol's `_applyStateUpdates`
+    /// stitches the merged entries so `entries[k].currentRoot ==
+    /// entries[k-1].newRoot` per rollup; EEZ.sol's `_applyRollupUpdates`
     /// enforces the chain on L1 (`StateRootMismatch` revert) regardless of
-    /// proof system. Each effect entry's `newState` is its per-effect root from
+    /// proof system. Each effect entry's `newRoot` is its per-effect root from
     /// `candidates.per_effect` (verified by the proof signer's effect-prefix
     /// checks); the anchor claims `candidates.anchor`, so every entry
     /// commits to a candidate at the Sync block's height. The
@@ -3883,9 +3883,9 @@ where
         // it inline during postAndVerifyBatch, applying its state update
         // against L1's recorded root.
         //
-        // `currentState` = hash(posted), the L1-confirmed cursor block — must
-        // equal L1.config.stateRoot at postBatch time so the deriver's
-        // check_claimed_state agrees. `newState` = the Sync block sealed over no
+        // `currentRoot` = hash(posted), the L1-confirmed cursor block — must
+        // equal L1.config.root at postBatch time so the deriver's
+        // check_claimed_state agrees. `newRoot` = the Sync block sealed over no
         // transactions, so the anchor already sits at the Sync block's height
         // and later effect entries chain from it. With no effects that block IS
         // the Sync block, so it is also the required endpoint.
@@ -3909,17 +3909,17 @@ where
             h.hash()
         };
         let immediate_entry = eez_protocol::abi::ExecutionEntrySol {
-            stateUpdates: vec![eez_protocol::abi::StateUpdateSol {
+            rollupUpdates: vec![eez_protocol::abi::RollupUpdateSol {
                 rollupId: rollup_id,
-                currentState: pre_block_hash,
+                currentRoot: pre_block_hash,
                 // Alone, the anchor is the endpoint, so take it from the
                 // terminal rather than trust a caller for it.
-                newState: if candidates.per_effect.is_empty() {
+                newRoot: if candidates.per_effect.is_empty() {
                     sync_block_hash
                 } else {
                     candidates.anchor
                 },
-                etherDelta: alloy_primitives::I256::ZERO,
+                etherDelta: alloy_primitives::aliases::I192::ZERO,
             }],
             proxyEntryHash: B256::ZERO,
             l2ToL1Calls: Vec::new(),
@@ -3945,7 +3945,7 @@ where
         // Deposit value for inbound deferred entries: the lean on-chain entry binds
         // V only in its `proxyEntryHash` preimage, so read V from the DA sidecar
         // (`targets[].batch`, same `proxyEntryHash`). Value-free → absent → 0.
-        let inbound_ether: HashMap<B256, alloy_primitives::I256> = compositions
+        let inbound_ether: HashMap<B256, alloy_primitives::aliases::I192> = compositions
             .iter()
             .flat_map(|c| c.targets.iter())
             .flat_map(|t| t.batch.entries.iter())
@@ -3954,27 +3954,25 @@ where
                 if v.is_zero() {
                     return None;
                 }
-                alloy_primitives::I256::try_from(v)
-                    .ok()
-                    .map(|d| (e.proxyEntryHash, d))
+                eez_protocol::abi::u256_to_i192(v).map(|d| (e.proxyEntryHash, d))
             })
             .collect();
 
-        // Cross-chain entries arrive with EMPTY `stateUpdates`; attach one chained
+        // Cross-chain entries arrive with EMPTY `rollupUpdates`; attach one chained
         // settlement state update to each (the anchor already has its own) — else
-        // `_applyStateUpdates` no-ops and the L2 root never settles. Direction by
+        // `_applyRollupUpdates` no-ops and the L2 root never settles. Direction by
         // `proxyEntryHash`: outbound (== 0) → `-V` (via `outbound_ether_out`; None =
         // multi-call-with-value, unsupported → reject); inbound (!= 0) → `+V` deposit.
         // Value-free → 0.
-        // `newState` = effect `k`'s per-effect root `candidates.per_effect[k]`; entries are
+        // `newRoot` = effect `k`'s per-effect root `candidates.per_effect[k]`; entries are
         // ordered `[outbound… | inbound…]`, matching the Sync block's pair-ends.
-        // The prover requires this exact per-entry value. `currentState` is fixed
+        // The prover requires this exact per-entry value. `currentRoot` is fixed
         // by the stitch below.
         let mut effect_k = 0usize;
         for entry in &mut batch.entries {
             // Preserve the anchor's existing state update and fill only the
             // cross-chain effect entries, which arrive empty.
-            if !entry.stateUpdates.is_empty() {
+            if !entry.rollupUpdates.is_empty() {
                 continue;
             }
             let ether_delta = if entry.proxyEntryHash == B256::ZERO {
@@ -3986,28 +3984,28 @@ where
                     )
                 })?;
                 if v.is_zero() {
-                    alloy_primitives::I256::ZERO
+                    alloy_primitives::aliases::I192::ZERO
                 } else {
-                    -alloy_primitives::I256::try_from(v)
-                        .map_err(|e| format!("outbound etherOut {v} overflows I256: {e}"))?
+                    -eez_protocol::abi::u256_to_i192(v)
+                        .ok_or_else(|| format!("outbound etherOut {v} overflows int192"))?
                 }
             } else {
                 inbound_ether
                     .get(&entry.proxyEntryHash)
                     .copied()
-                    .unwrap_or(alloy_primitives::I256::ZERO)
+                    .unwrap_or(alloy_primitives::aliases::I192::ZERO)
             };
-            let new_state = *candidates.per_effect.get(effect_k).ok_or_else(|| {
+            let new_root = *candidates.per_effect.get(effect_k).ok_or_else(|| {
                 format!(
                     "settlement stitch: effect entry {effect_k} has no per-effect root \
                      (only {} pair-end roots — pair-end/entry misalignment)",
                     candidates.per_effect.len(),
                 )
             })?;
-            entry.stateUpdates = vec![eez_protocol::abi::StateUpdateSol {
+            entry.rollupUpdates = vec![eez_protocol::abi::RollupUpdateSol {
                 rollupId: rollup_id,
-                currentState: B256::ZERO,
-                newState: new_state,
+                currentRoot: B256::ZERO,
+                newRoot: new_root,
                 etherDelta: ether_delta,
             }];
             effect_k += 1;
@@ -4021,19 +4019,19 @@ where
             .into());
         }
 
-        // Stitch the per-rollup state-update chain: EEZ.sol `_applyStateUpdates`
-        // enforces `config.stateRoot == update.currentState` then sets it to
-        // `newState`, so each entry's `currentState` must chain to the prior
-        // entry's `newState`. This chains `posted → E → R_0 → … → R_last`, with
+        // Stitch the per-rollup state-update chain: EEZ.sol `_applyRollupUpdates`
+        // enforces `config.root == update.currentRoot` then sets it to
+        // `newRoot`, so each entry's `currentRoot` must chain to the prior
+        // entry's `newRoot`. This chains `posted → E → R_0 → … → R_last`, with
         // `E` the empty prefix and `R_last` the terminal, satisfying both EEZ.sol
         // and the prover's effect-prefix gate.
         let mut running_roots: HashMap<u64, B256> = HashMap::new();
         for entry in &mut batch.entries {
-            for update in &mut entry.stateUpdates {
+            for update in &mut entry.rollupUpdates {
                 if let Some(prev_new) = running_roots.get(&update.rollupId).copied() {
-                    update.currentState = prev_new;
+                    update.currentRoot = prev_new;
                 }
-                running_roots.insert(update.rollupId, update.newState);
+                running_roots.insert(update.rollupId, update.newRoot);
             }
         }
 
@@ -4044,15 +4042,15 @@ where
             batch
                 .entries
                 .last()
-                .and_then(|entry| entry.stateUpdates.last())
-                .map(|update| update.newState),
+                .and_then(|entry| entry.rollupUpdates.last())
+                .map(|update| update.newRoot),
             Some(sync_block_hash),
             "settlement chain must end at the Sync-block state root",
         );
 
         // The L1 rolling seed commits the finalized ordered state updates, so
         // it can only be computed after the stitch above has set every
-        // `currentState`.
+        // `currentRoot`.
         eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch)
             .map_err(|error| format!("finalize L1 rolling hashes: {error}"))?;
 
@@ -4087,7 +4085,7 @@ where
                 format!("unknown rollup_id {rollup_id} in prepare_post_batch_raw")
             })?;
         // Reuse the SAME cursor read that anchored the leading
-        // immediate's currentState above — a second read could race the
+        // immediate's currentRoot above — a second read could race the
         // Deriver's cursor advance and desync the callData range from
         // the state-update anchor (TOCTOU).
         let from = posted + 1;
@@ -4362,7 +4360,7 @@ where
         .abi_encode();
 
         // Log both settlement anchors. `StateRootMismatch` means
-        // `current_state` disagreed with L1's registered root at submission;
+        // `current_root` disagreed with L1's registered root at submission;
         // an over-budget `floor_gas` names the too-fat case.
         event!(
             name: "eez.composer.postbatch.anchors",
@@ -4374,7 +4372,7 @@ where
             span,
             calldata_bytes = calldata.len(),
             floor_gas = calldata_floor_gas(&calldata),
-            current_state = %pre_block_hash,
+            current_root = %pre_block_hash,
             claimed_final = %sync_block_hash,
             "postBatch anchors: cursor block hash, claimed final Sync block hash",
         );
@@ -4434,7 +4432,7 @@ fn ensure_batch_registry_native(
 /// `Composer::recover_failed_batch`, serialized with Sequencer commits.
 ///
 /// "Settled" requires an `L2ExecutionPerformed` in the inclusion block
-/// whose `newState` equals `expected_final_state` (the built Sync block's
+/// whose `newRoot` equals `expected_final_root` (the built Sync block's
 /// root) — the leading immediate advancing L1 partway doesn't count.
 async fn observe_bundle_outcome(
     rollup_id: u64,
@@ -4443,7 +4441,7 @@ async fn observe_bundle_outcome(
     // The verdict names this bundle, so it cannot land on a batch rebuilt at
     // the same height.
     post_batch_hash: alloy_primitives::TxHash,
-    expected_final_state: B256,
+    expected_final_root: B256,
     optimistic: Arc<OptimisticallyIncluded>,
     submitter: Submitter,
     target: BundleTarget,
@@ -4455,7 +4453,7 @@ async fn observe_bundle_outcome(
         _ => None,
     };
     // Settled = L1 reached the claimed endpoint. Anything less is partial.
-    let settled = settlement.is_some_and(|s| s.final_state == Some(expected_final_state));
+    let settled = settlement.is_some_and(|s| s.final_state == Some(expected_final_root));
     // The anchor names a candidate at THIS height, so any applied entry keeps
     // the height canonical; only an empty settlement leaves it unratified.
     let applied_any = settlement.is_some_and(|s| !s.is_empty());

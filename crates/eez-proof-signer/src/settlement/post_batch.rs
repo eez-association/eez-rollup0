@@ -200,9 +200,9 @@ fn validate_public_input_structure(
             "rollup assignment proof-system indices must be exactly [0]",
         ));
     }
-    if !batch.expectedStateRootPerRollup.is_empty() {
+    if !batch.expectedRootPerRollup.is_empty() {
         return Err(invalid_structure(
-            "expectedStateRootPerRollup must be empty in the supported profile",
+            "expectedRootPerRollup must be empty in the supported profile",
         ));
     }
 
