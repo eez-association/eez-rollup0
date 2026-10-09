@@ -98,10 +98,9 @@ fn transact_err(e: EVMError<EvmDatabaseError<ProviderError>>) -> ExecutorError {
 /// The same split for the block-fork path: `BuildError::Provider` is the store,
 /// everything else is the tx.
 fn fork_err(e: BuildError) -> ExecutorError {
-    if e.is_provider() {
-        provider_err(e)
-    } else {
-        evm_err(e)
+    match e {
+        provider @ BuildError::Provider(_) => provider_err(provider),
+        other => evm_err(other),
     }
 }
 

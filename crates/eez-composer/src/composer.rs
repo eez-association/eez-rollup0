@@ -2414,7 +2414,7 @@ where
                         Err((at, why)) => {
                             // A backing-store failure says nothing about the tx —
                             // abort the slot instead of evicting a valid pair.
-                            if why.is_provider() {
+                            if matches!(&why, BuildError::Provider(_)) {
                                 transient = Some((
                                     format!("outbound append tx#{idx} at {at}: {why}"),
                                     abort_rest(
@@ -2776,7 +2776,7 @@ where
                     if let Err((at, why)) = append_and_execute(&mut draft, &deliveries) {
                         // A backing-store failure says nothing about the tx —
                         // abort the slot instead of evicting a valid delivery.
-                        if why.is_provider() {
+                        if matches!(&why, BuildError::Provider(_)) {
                             transient = Some((
                                 format!("inbound append tx#{idx} at {at}: {why}"),
                                 abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
