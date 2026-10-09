@@ -47,13 +47,17 @@ enum Feature {
 
 message Begin {
   uint64 rollup_id = 1;
-  // Last settled block. The first expected streamed block is anchor_number + 1.
+  // Execution predecessor. The first expected block is anchor_number + 1;
+  // Finalize separately authenticates its selected predecessor's L1 acceptance.
   uint64 anchor_number = 2;
   bytes anchor_hash = 3;
   bytes anchor_state_root = 4;
   // Empty requests the baseline. The client must also check Ready contains
   // every required feature, so an older server ignoring this field fails closed.
   repeated Feature required_features = 5;
+  // Required 32-byte validation namespace, derived from the configured rules.
+  // Compare before accepting blocks; Ready returns the server's local identity.
+  bytes expected_validation_identity = 6;
 }
 
 // Optional FEATURE_RESUME: first frame on a new stream, with a new epoch on Ready.
@@ -94,40 +98,32 @@ message Finalize {
 message SettlementInput {
   // Exact proofless EEZ.postAndVerifyBatch calldata for the configured ABI.
   bytes abi_calldata = 1;
-  // FEATURE_BLOBS: one sidecar per distinct batch.blobIndices entry, sorted by
-  // transaction index. Public inputs use derived versioned hashes in batch order.
-  repeated BlobSidecar blobs = 2;
-  // FEATURE_POSTING_CONTEXT: required when the supported rollup's public inputs
-  // depend on the posting environment. Claims must be verified, not trusted.
-  PostingContext posting_context = 3;
+  // FEATURE_BLOBS: complete physical EIP-4844 blobs in transaction order.
+  // The prover derives commitments/versioned hashes itself. RollupX requires
+  // at least one blob, empty batch.callData, and blobIndices == [0, 1, ...].
+  repeated bytes blobs = 2;
+  // FEATURE_POSTING_CONTEXT: named L1 target, independently authenticated.
+  // Required together with parent_provenance for the RollupX profile.
+  L1PostingContext posting_context = 3;
+  // Evidence for the predecessor of Finalize.from_block, not necessarily the
+  // original Begin anchor. L1 authorization is checked even for cached execution.
+  ParentProvenance parent_provenance = 4;
 }
 
-message BlobSidecar {
-  // Index in the intended L1 transaction's blob array, NOT this message's array.
-  uint32 index = 1;
-  bytes blob = 2;        // 131072 bytes, canonical EIP-4844 field elements.
-  bytes commitment = 3;  // 48-byte KZG commitment.
-  bytes proof = 4;       // 48-byte KZG blob proof.
+// Same fields/tags as RollupX's L1PostingContext; not an inclusion/finality claim.
+message L1PostingContext {
+  uint64 chain_id = 1;
+  uint64 target_timestamp = 2;
+  uint64 parent_number = 3;
+  bytes parent_hash = 4; // nonzero 32-byte hash; authenticated on configured L1.
 }
 
-message PostingContext {
-  // 20-byte caller observed as msg.sender by EEZ, not necessarily tx.origin.
-  bytes sender = 1;
-  // Intended L1 posting block (not batch.blockNumber, which selects custom data).
-  uint64 block_number = 2;
-  uint64 timestamp = 3;
-  bytes parent_hash = 4; // 32-byte hash of its L1 parent.
-  // Exact manager-defined custom data for the batch's participating rollups.
-  // Recompute/check against configured rollup rules and authenticated L1 context.
-  repeated RollupPostingData rollup_data = 5;
-  // Optional canonical L1 header RLP, newest first starting at parent_hash,
-  // when historical BLOCKHASH/custom-data derivation needs ancestor evidence.
-  repeated bytes ancestor_headers = 6;
-}
-
-message RollupPostingData {
-  uint64 rollup_id = 1;
-  bytes custom_data = 2;
+// Same fields/tags as RollupX's ParentProvenance. These are L2 headers, not L1
+// ancestor headers. Their acceptance and complete live-slot set are checked on L1.
+message ParentProvenance {
+  bytes parent_header_rlp = 1;
+  uint64 accepted_l1_number = 2; // zero only for the configured L2 genesis.
+  repeated bytes live_slot_endpoint_headers_rlp = 3;
 }
 
 // Optional FEATURE_CANCEL; ordinary gRPC cancellation is enough for the baseline.
@@ -160,6 +156,9 @@ message Ready {
   // Resume/Rewind. Empty means baseline. Unknown advertised values are ignored;
   // clients use only recognized features and verify all Begin.required_features.
   repeated Feature supported_features = 3;
+  // Required 32-byte local identity, equal to Begin.expected_validation_identity
+  // and stable across Resume/Rewind. Never blindly echo the submitted value.
+  bytes validation_identity = 4;
 }
 
 message Validated {

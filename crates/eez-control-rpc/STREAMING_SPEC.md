@@ -16,7 +16,7 @@ Neither requires shared caches or a particular execution backend.
 Every implementation supports `ProveStream` with this baseline flow:
 
 ```text
-Begin(anchor) -> Ready(anchor, supported_features)
+Begin(anchor, expected_validation_identity) -> Ready(anchor, validation_identity, supported_features)
 Block(anchor + 1) -> Validated
 Block(anchor + 2) -> Validated
 ...
@@ -43,8 +43,8 @@ that silently ignored the new Begin field.
 | REWIND | Replace a validated suffix on the same stream, with a new epoch. |
 | CANCEL | Explicitly retire a session and acknowledge cancellation. |
 | PIPELINING | Accept bounded dependent Block/Finalize frames without per-block ACK waits. |
-| BLOBS | Accept and validate EIP-4844 sidecars in the common settlement input. |
-| POSTING_CONTEXT | Accept and verify the posting-environment/custom-data inputs below. |
+| BLOBS | Accept physical EIP-4844 blobs and independently derive their commitments. |
+| POSTING_CONTEXT | Authenticate the named L1 target and supplied L2 parent provenance. |
 
 Capabilities are stable for a session and MUST be repeated unchanged after
 Resume/Rewind. Unknown advertised features may be ignored; clients MUST NOT
@@ -58,10 +58,35 @@ an unbound stream returns an unbound rejection. Server capacity, retention,
 deadlines, configured chain/rollup rules, ABI and proof system are deployment
 parameters, not inferred from support for one optional feature.
 
+### Validation identity
+
+Begin MUST carry the client's independently configured 32-byte
+expected_validation_identity. The server compares it with its locally derived
+validation namespace before allocating a session or accepting blocks. Missing
+or wrong-width identities are INVALID_ARGUMENT; a mismatch is FAILED_PRECONDITION
+with no actionable failure details. These are unbound Rejected responses.
+
+Every Ready MUST carry that local validation_identity, not an unchecked echo.
+The client checks it before using the session, including after Resume/Rewind.
+The identity and capabilities remain fixed for the session; a server whose rules
+changed must reject a resumed session. An old Ready without the identity cannot
+satisfy this handshake, even if it otherwise looks like a baseline response.
+Do not learn the expected identity by blindly trusting the first server reply.
+
+The digest algorithm belongs to the configured validation profile, not to the
+transport. For RollupX, use its existing
+[identity implementation](https://github.com/eduadiez/rollupX/blob/1eab3955775aec75612a7144d70f8245771ba97d/crates/eez-control-rpc/src/identity.rs):
+schema 4, domain-separated RLP/Keccak over the rollup/chain IDs, system/EEZL2
+addresses, canonical loaded chain-document digest/version, validator revision
+and dependency digest. Resource limits are not identity components. This
+build-specific namespace is not a universal cross-implementation hash; other
+backends need an explicitly agreed profile/identity, not an assumed match from
+the chain ID alone. Equality is a compatibility check, not signing authority.
+
 ### Baseline client behavior
 
 Keep the stream open from Begin through Finalize and wait for each Block ACK.
-On disconnect, open a fresh stream, Begin at the current settlement anchor and
+On disconnect, open a fresh stream, Begin at the selected execution predecessor and
 backfill from durable block/witness storage. On a fork change, cancel the RPC,
 Begin again and resend the selected branch. After Proof, start a new stream
 for the next range. Do not attempt Resume/Rewind unless advertised.
@@ -94,8 +119,10 @@ attestations.
 
 Begin supplies the nonzero rollup registry ID and exact anchor number/hash/
 state root. Both hashes are 32 bytes; anchor_number must permit adding one.
-The anchor is the last block settled on L1. Admission checks configured chain
-identity and the anchor evidence required by that rollup's validation rules.
+The anchor is an execution predecessor, not a claim of L1 acceptance. Admission
+checks the validation identity and the profile's execution-parent rules. For
+RollupX, Finalize separately authenticates the selected predecessor; a current
+registry root or a caller-supplied state root alone cannot authorize it.
 
 Each Block contains one present BlockWitness: declared number, 32-byte hash
 and parent hash, exact consensus header/body RLP, and a present execution
@@ -108,6 +135,9 @@ execution-state continuity. Bind wire claims to decoded consensus bytes and
 complete execution/evidence validation before emitting Validated. Its number,
 hash and 32-byte post_state_root identify that block. Ordinary blocks require
 ordinary execution; settlement checkpoints belong to blocks that need them.
+These ACKs establish execution facts, not L1 authorization or correctness for
+an as-yet-unknown posting target. Finalize checks target-dependent constraints
+against those facts, including when the execution came from a cache.
 
 An exact duplicate of an already validated block is idempotent. A contradictory
 block or gap is rejected without advancing or replacing the prefix. Rejected
@@ -142,88 +172,111 @@ Composer abandons its corresponding batch or settlement cutoff.
 
 ## 3. Common finalization input
 
-New requests use `Finalize.settlement`, a SettlementInput containing exact
-proofless EEZ.postAndVerifyBatch calldata, zero or more blob sidecars and an
-optional PostingContext. This is not Rollup0's PostBatch: blobs and context are
-first-class wire inputs rather than an overloaded legacy L1 hash field.
-No Composer-claimed public-input hash is authoritative.
+New requests use `Finalize.settlement`, containing exact proofless
+EEZ.postAndVerifyBatch calldata, physical blobs, an L1PostingContext and
+ParentProvenance. The last three inputs are optional at the common wire layer;
+the configured profile decides which are required. Rollup0's calldata-only,
+timeless profile omits all three. The RollupX profile below requires all three.
+There is no authoritative Composer-claimed public-input hash, commitment or
+custom-data value in this envelope.
 
-The same envelope covers Rollup0's calldata-only/timeless case (no blobs or
-posting context) and blob/context-dependent rollups such as RollupX.
-Advertising BLOBS/POSTING_CONTEXT means the server supports those inputs for
-the configured rollup rules; it is not a claim to support arbitrary managers,
-DA codecs or verifier versions. Those rules are deployment configuration.
+The settlement inputs follow RollupX main at
+[`1eab395`](https://github.com/eduadiez/rollupX/blob/1eab3955775aec75612a7144d70f8245771ba97d/crates/eez-control-rpc/proto/prove.proto).
+L1PostingContext and ParentProvenance preserve its field names, types and tags.
+They are new `prove.v2` messages here: this does not replace either project's
+v1 RPC or copy RollupX's preparation, lease or cache APIs.
 
-A sender must request the capabilities it requires in Begin and check Ready.
-The server MUST reject unadvertised blob/context use with UNIMPLEMENTED,
-including when those inputs would otherwise be ignored. Empty inputs never
-make calldata requiring missing blobs or context acceptable. Malformed or
-inconsistent input is rejected; a server MUST NOT drop fields and sign a
-weaker statement. An absent/unrecognized finalization input is INVALID_ARGUMENT.
-Future proof-relevant input extensions must require a new advertised feature
-or a new input variant; unknown protobuf fields alone do not negotiate support.
+A client requests its required input capabilities in Begin and checks Ready.
+BLOBS covers physical blobs; POSTING_CONTEXT covers the L1 target and L2 parent
+provenance. A server MUST reject unadvertised use of either with UNIMPLEMENTED,
+not discard those fields. Unsupported validation profiles are never enabled
+merely by accepting a feature flag. Missing profile-required inputs, malformed
+encodings or an absent/unrecognized finalization variant are INVALID_ARGUMENT;
+inconsistent execution/settlement claims yield no proof. Future proof-relevant
+extensions must require a new feature or input variant: unknown protobuf fields
+alone do not negotiate support.
 
-### Blob sidecars
+### Physical blobs
 
-The blob encodings and KZG/versioned-hash rules follow
-[EIP-4844](https://eips.ethereum.org/EIPS/eip-4844). For BLOBS, the request
-supplies exactly one BlobSidecar for every distinct
-index referenced by batch.blobIndices, sorted by index, with no extras:
+`blobs` contains the complete intended transaction blob array, in transaction
+order. Each element is exactly 131072 bytes of canonical
+[EIP-4844](https://eips.ethereum.org/EIPS/eip-4844) field elements. The prover
+derives KZG commitments and versioned hashes from these bytes using its trusted
+chain configuration, then selects hashes in batch.blobIndices order. No separate
+index, claimed commitment or blob proof is sent; network sidecar construction
+remains the posting client's responsibility. The actual transaction must carry
+the same physical blobs in the same order.
 
-- index is the position in the **intended L1 transaction's blob array**, not
-  the sidecar's position in this request; it must fit uint32 and the configured
-  chain's transaction blob-index bound;
-- blob is exactly 131072 bytes of canonical EIP-4844 field elements;
-- commitment and proof are each 48-byte canonical KZG encodings; and
-- the prover verifies the blob KZG proof against that commitment using the
-  configured chain's trusted setup and rejects invalid data/proofs.
+RollupX additionally requires at least one blob, empty batch.callData and
+batch.blobIndices exactly `[0, 1, ..., blobs.len() - 1]`. It rejects gaps,
+duplicates, reordered indices, extra/unselected blobs and calldata-only DA.
+Resolve the active per-transaction/per-block allowance from the independently
+configured L1 chain profile and target timestamp, not a client-supplied limit.
+The native version-00 EEZ message stream must have its leading ChainOperation,
+complete semantic transaction brackets and CloseBlobStream with canonical
+packing/padding. Decode and compare the operations and semantic effects against
+the selected execution; hashing blobs alone is insufficient. The
+[RollupX DA gate](https://github.com/eduadiez/rollupX/blob/1eab3955775aec75612a7144d70f8245771ba97d/crates/eez-proof-signer/src/settlement/blob_da.rs)
+and its configured native codec define those profile rules.
 
-Derive the versioned hash from the checked commitment, not a client hash claim.
-Build the public-input blob-hash list by looking up indices in the exact
-batch.blobIndices order (including repeated references). Check the rollup's
-blob DA decoding against the selected validated blocks and settlement effects.
-The Composer must post the same selected blobs/commitments at those transaction
-indices; EEZ's BLOBHASH-based public inputs enforce the commitment binding.
-The transaction may contain other, unreferenced blobs. Its complete envelope
-is not supplied here; ensuring these indices exist in the actual posting
-transaction remains the Composer's responsibility.
+### L1 posting context
 
-### Posting context
+L1PostingContext contains exactly the RollupX target fields:
 
-PostingContext carries the intended EEZ caller (20-byte sender), L1 posting
-block number/timestamp, 32-byte parent hash, and per-rollup custom data. The
-posting block number is **not** batch.blockNumber: the latter selects the
-manager's getCustomData behavior. A supplied context has a nonzero posting
-block number, and rollup_data has one entry per batch participating rollup in
-batch assignment order, with matching IDs and no duplicates.
+- chain_id: nonzero and equal to the operator-trusted L1 network;
+- target_timestamp: nonzero, the intended child's exact timestamp;
+- parent_number: canonical L1 parent height, less than uint64.max; and
+- parent_hash: a nonzero 32-byte hash, independently authenticated at that height.
 
-When historical context is needed, ancestor_headers may carry canonical L1
-header RLP newest-first from parent_hash. Check exact header decoding, hashes,
-consecutive numbers and parent links. A header chain supplied by the Composer
-is not by itself authenticated L1 evidence: anchor it to the prover's trusted
-L1 view, or obtain the needed headers independently.
+The intended posting block is the child of this parent; neither parent_number
+nor that child height is batch.blockNumber. RollupX requires
+`batch.blockNumber == uint64.max` and `bindMsgSenderInPublicInput == false`.
+Derive the reference manager's custom data as
+`abi.encode(uint256(target_timestamp), parent_hash)` and the bound sender as
+zero. Timeless/specific-block requests and sender-bound requests are rejected
+by this profile; no arbitrary custom-data or sender override is supplied.
+The [implemented hash construction](https://github.com/eduadiez/rollupX/blob/1eab3955775aec75612a7144d70f8245771ba97d/crates/eez-protocol/src/public_inputs.rs)
+is authoritative for these values, not older examples of timeless batches.
 
-The prover must independently derive/check each custom_data value using the
-configured manager/rollup rules and authenticated context, not merely hash a
-claimed custom-data blob. For a manager whose implementation matches the
-reference timeless/past/current modes, this means deriving its empty data,
-historical block hash, or posting timestamp/parent hash as appropriate.
-Unknown rules, unavailable evidence or inconsistent claims yield no proof.
+Authenticate the named parent through the prover's configured L1 source and
+check the target timestamp against its chain/slot rules. The target is a
+proposed environment, not proof of future inclusion. A changed parent hash or
+timestamp needs a new Finalize and proof; retained execution may still be reused
+only after the new target's constraints are checked. Do not require the named
+parent to remain the tip: the on-chain latest-context binding determines whether
+the proof can be used in the actual posting environment.
 
-EEZ public inputs bind the selected versioned blob hashes, calldata, manager
-custom-data hashes and sender when batch.bindMsgSenderInPublicInput requests
-it. Use zero for the bound sender otherwise. The context envelope itself is
-**not** automatically hashed by EEZ: a proof must not claim an execution fact
-depends on a context field the configured verifier does not bind. If additional
-context must be bound, the rollup/verifier contract must provide that binding;
-adding a protobuf field cannot provide it.
+### Selected L2 parent provenance
 
-Context for a not-yet-mined posting block is a proposed environment, not proof
-of L1 inclusion. Verify its derivable constraints and bind the applicable
-public inputs. The Composer must ensure the actual posting produces those
-same inputs; if the applicable context changes, recompute/reprove rather than
-submitting the old proof or stripping context. An already-mined L1 block hash
-is not required merely to propose a future posting environment.
+RollupX requires ParentProvenance on every Finalize, including retries and
+cache-hit windows. It contains the canonical RLP of the selected L2 predecessor,
+its accepted_l1_number (zero only for the configured genesis), and the complete
+ordered live_slot_endpoint_headers_rlp set. These are **L2 headers**, not an L1
+ancestor-header chain. Bind the parent header's number/hash/state root to the
+predecessor of from_block; do not assume it is still the original Begin anchor.
+
+The prover independently authenticates the configured genesis or that parent's
+L1 acceptance, verifies the complete live-slot endpoint set against canonical
+L1 observations, and derives the descendant seed. Every selected block must
+extend that parent and use the authenticated seed and allowed timing. Registry
+state at the named target parent must equal the accepted predecessor or a
+terminal prefix independently justified by execution and settlement checks.
+A matching registry root or a manually assigned root alone is not provenance.
+
+RollupX limits each supplied header to 1024 bytes, exact-decodes and round-trips
+its RLP, and charges all headers to byte/witness quotas. Its
+[authorization implementation](https://github.com/eduadiez/rollupX/blob/1eab3955775aec75612a7144d70f8245771ba97d/crates/eez-l1/src/derivation/proof.rs)
+checks the named L1 parent's hash before and after the reads for a coherent
+snapshot. Unavailable evidence is UNAVAILABLE; a replaced target is ABORTED;
+invalid provenance is FAILED_PRECONDITION. These failures have no actionable
+candidate-eviction details. No proof may be issued until all authorization,
+execution and settlement gates pass, regardless of earlier Validated ACKs.
+
+This profile aligns the inputs and verification obligations with the pinned
+RollupX source. It does not mandate that implementation's worker/cache layout or
+assert live v2 interoperability. Its ABI, native codec, chain rules and validation
+identity must be configured together; this proposal does not upgrade this
+repository's protocol submodule or runtime to RollupX's deployment.
 
 ### Compatibility and unsupported inputs
 
@@ -234,6 +287,12 @@ older decoders see a missing PostBatch instead of silently ignoring additional
 fields inside an accepted PostBatch. Do not send both variants or automatically
 downgrade a failed blob/context request.
 
+RollupX MUST reject the legacy PostBatch variant: it cannot carry the mandatory
+physical blobs, target and parent provenance. This repository's unchanged v1
+PostBatch is not the extended PostBatch in RollupX's fork. New clients also
+require the validation-identity handshake above; older v2 clients without an
+identity need an explicit upgrade rather than an implicit compatibility mode.
+
 The generated accessor changes to Finalize.input. Runtime adapters for this
 proposal must dispatch it and perform capability checks explicitly. This
 design-only change does not alter the existing window runtime or assert that
@@ -243,8 +302,8 @@ RollupX settlement execution is already implemented in this repository.
 
 RESUME retains progress subject to published limits. Resume is the first frame
 on a new stream, with the retained ID and epoch zero. Ready returns the same
-ID, a fresh nonzero epoch, the retained cursor and unchanged capabilities.
-This atomically fences the old attachment; copying the new epoch on an old
+ID, a fresh nonzero epoch, the retained cursor, validation identity and unchanged
+capabilities. This atomically fences the old attachment; copying the new epoch on an old
 stream cannot regain authorization. Missing/evicted sessions return NOT_FOUND,
 requiring Begin and backfill. A lost ACK can mean more progress was validated
 than the client saw; reconcile both cursor number and hash.
