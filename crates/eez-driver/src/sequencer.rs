@@ -427,8 +427,15 @@ where
                     header: last_header.clone(),
                 };
                 let prebuilt = composer
-                    // Catch-up: next-available L1 block (unpinned), empty.
-                    .compose_sync_slot(rollup_id, parent, sync_ts, None, SyncSlotMode::Catchup)
+                    // Catch-up: target the immediate next L1 block without a
+                    // timestamp pin; the L2 terminal timestamp is historical.
+                    .compose_sync_slot(
+                        rollup_id,
+                        parent,
+                        sync_ts,
+                        Some(l1_head + 1),
+                        SyncSlotMode::Catchup,
+                    )
                     .await;
                 if let Some(built) = prebuilt {
                     if let Err(err) = self.commit_one_prebuilt(SlotKind::Sync, built).await {

@@ -40,6 +40,10 @@ pub enum BundleTarget {
     /// Resolved to `latest + NEXT_BLOCK_SLACK` at send time. Unpinned —
     /// used for off-cadence catch-up.
     NextBlock,
+    /// Land in exactly L1 block `block`, without pinning its timestamp.
+    /// Historical catch-up batches use this to target the slot that caused
+    /// their composition while allowing a past L2 terminal timestamp.
+    ExactBlock { block: u64 },
     /// Land in exactly L1 block `block`, and only if its timestamp equals
     /// `timestamp`. The timestamp pin makes the settlement slot match the
     /// L2 Sync block's anchored slot by construction: a gnosis block's
@@ -47,6 +51,17 @@ pub enum BundleTarget {
     /// late) won't match — the bundle drops instead of settling with a
     /// drifted L2 timestamp.
     Exact { block: u64, timestamp: u64 },
+}
+
+impl BundleTarget {
+    /// Preserve the target block while removing any timestamp constraint.
+    #[must_use]
+    pub const fn without_timestamp_pin(self) -> Self {
+        match self {
+            Self::Exact { block, .. } => Self::ExactBlock { block },
+            target => target,
+        }
+    }
 }
 
 /// One bundle attempt's outcome. `Dropped` is the expected miss path —
@@ -182,14 +197,14 @@ impl Submitter {
             ));
         }
         // Exact targets carry the L2 Sync block's anchored timestamp; pin
-        // the bundle to land only in a block at that exact time. NextBlock
-        // (catch-up) is off-cadence, so it stays unpinned.
+        // the bundle to land only in a block at that exact time. ExactBlock
+        // and NextBlock deliberately stay unpinned.
         let pin_timestamp = match target {
             BundleTarget::Exact { timestamp, .. } => Some(timestamp),
-            BundleTarget::NextBlock => None,
+            BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => None,
         };
         let target_block = match target {
-            BundleTarget::Exact { block, .. } => block,
+            BundleTarget::Exact { block, .. } | BundleTarget::ExactBlock { block } => block,
             BundleTarget::NextBlock => {
                 let target_provider = self.inner.build_target_provider();
                 target_provider
@@ -212,7 +227,7 @@ impl Submitter {
             Level::INFO,
             tx_hash = %post_batch_hash,
             target_block,
-            exact = matches!(target, BundleTarget::Exact { .. }),
+            exact = !matches!(target, BundleTarget::NextBlock),
             tx_count = raw_txs.len(),
             "dispatching bundle to builder",
         );
@@ -710,9 +725,29 @@ fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutc
 
 #[cfg(test)]
 mod tests {
-    use super::{PinnedVerdict, pinned_verdict, reverting_whitelist};
+    use super::{BundleTarget, PinnedVerdict, pinned_verdict, reverting_whitelist};
 
     const PIN: u64 = 1_700_000_012;
+
+    #[test]
+    fn removing_timestamp_pin_preserves_the_exact_block() {
+        assert_eq!(
+            BundleTarget::Exact {
+                block: 42,
+                timestamp: PIN,
+            }
+            .without_timestamp_pin(),
+            BundleTarget::ExactBlock { block: 42 },
+        );
+        assert_eq!(
+            BundleTarget::ExactBlock { block: 43 }.without_timestamp_pin(),
+            BundleTarget::ExactBlock { block: 43 },
+        );
+        assert_eq!(
+            BundleTarget::NextBlock.without_timestamp_pin(),
+            BundleTarget::NextBlock,
+        );
+    }
 
     /// The postBatch at index 0 is never whitelisted: if it reverts nothing
     /// settled, so letting the user_txs land would deliver calls with no state.

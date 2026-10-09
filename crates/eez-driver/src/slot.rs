@@ -153,9 +153,10 @@ pub enum SyncSlotMode {
 #[async_trait]
 pub trait SyncSlotComposer: Send + Sync + 'static {
     /// Compose a Sync slot. `target_l1_block`: `Some(n)` aims the postBatch
-    /// at exactly L1 block `n` (steady state, `l1_head + 1`); `None` aims the
-    /// next available block (catch-up). `mode` gates the drain: `Catchup`
-    /// blocks are empty (cross-chain waits for the next `Steady` slot).
+    /// at exactly L1 block `n`; steady mode also pins its timestamp, while
+    /// catch-up leaves the timestamp unpinned. `None` aims the next available
+    /// block. `mode` gates the drain: `Catchup` blocks are empty (cross-chain
+    /// waits for the next `Steady` slot).
     async fn compose_sync_slot(
         &self,
         rollup_id: u64,
