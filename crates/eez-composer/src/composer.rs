@@ -31,7 +31,7 @@ use eez_driver::{
     witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_evm::EezEvmConfig;
-use eez_l1::{BundleTarget, L1Event, SendOutcome, Submitter};
+use eez_l1::{BundleTarget, L1Error, L1Event, SendOutcome, Submitter};
 use eez_primitives::engine::EezEngineTypes;
 use eez_prover::{ActionableProverFailure, BlockWitness, Prover, ProverError, ProvingContext};
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
@@ -226,12 +226,10 @@ fn compose_crosschain(
     {
         // Unavailable ⇒ classified TRANSIENT: a wiring gap is not the tx's
         // fault, so the slot aborts and re-queues rather than evicting.
-        return Err(eez_protocol::ExecutorError::from(
-            eez_protocol::ExecutorErrorKind::Unavailable(format!(
-                "composition dispatched to rollup {unseeded}, which has no slot session; \
+        return Err(eez_protocol::ExecutorError::Unavailable(format!(
+            "composition dispatched to rollup {unseeded}, which has no slot session; \
                  it would execute unchained against chain state instead of this slot's state"
-            )),
-        )
+        ))
         .into());
     }
 
@@ -715,19 +713,19 @@ fn clamp_max_postbatch_gas(requested: u64) -> u64 {
 /// handles insufficient funds separately; other non-poison errors abort the
 /// slot and re-queue.
 fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
-    use eez_protocol::{ComposerErrorKind, ExecutorErrorKind};
-    match err.kind() {
+    use eez_protocol::{ComposerError, ExecutorError};
+    match err {
         // Protocol failures = the composition itself is invalid
         // (EmptyCalls, broken chaining, unknown target, bad encoding) —
         // deterministic for this tx.
-        ComposerErrorKind::Protocol(_) => true,
+        ComposerError::Protocol(_) => true,
         // Executor failures: poison EXCEPT the clearly-transient ones.
-        ComposerErrorKind::Executor(ee) => !matches!(
-            ee.kind(),
-            ExecutorErrorKind::Unavailable(_)
-                | ExecutorErrorKind::Provider(_)
-                | ExecutorErrorKind::Missing(_)
-                | ExecutorErrorKind::InsufficientFunds { .. }
+        ComposerError::Executor(ee) => !matches!(
+            ee,
+            ExecutorError::Unavailable(_)
+                | ExecutorError::Provider(_)
+                | ExecutorError::Missing(_)
+                | ExecutorError::InsufficientFunds { .. }
         ),
         // Lifecycle / internal (misconfigured, lock poisoned, double
         // register) — not the tx's fault → retry, don't evict.
@@ -736,11 +734,11 @@ fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
 }
 
 fn sim_error_is_insufficient_funds(err: &eez_protocol::ComposerError) -> bool {
-    use eez_protocol::{ComposerErrorKind, ExecutorErrorKind};
+    use eez_protocol::{ComposerError, ExecutorError};
     matches!(
-        err.kind(),
-        ComposerErrorKind::Executor(error)
-            if matches!(error.kind(), ExecutorErrorKind::InsufficientFunds { .. })
+        err,
+        ComposerError::Executor(error)
+            if matches!(error, ExecutorError::InsufficientFunds { .. })
     )
 }
 
@@ -4522,7 +4520,7 @@ async fn observe_bundle_outcome(
         let slot_skipped = match &outcome {
             // Never reached the relay, so it says nothing about the txs. A
             // relay-side REJECTION is L1Error::Submission and still counts.
-            Err(err) if err.is_transport() => true,
+            Err(L1Error::Provider(_)) => true,
             // Pin unsatisfiable (block ts != pin, or unreadable), not the txs.
             _ => match target {
                 BundleTarget::Exact { block, timestamp } => {
@@ -4844,7 +4842,7 @@ mod tests {
     #[test]
     fn insufficient_target_funds_are_not_poison() {
         let error =
-            eez_protocol::ComposerError::from(eez_protocol::ExecutorErrorKind::InsufficientFunds {
+            eez_protocol::ComposerError::Executor(eez_protocol::ExecutorError::InsufficientFunds {
                 available: U256::ZERO,
                 required: U256::from(1),
             });

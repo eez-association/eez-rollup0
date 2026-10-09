@@ -3174,6 +3174,7 @@ dependencies = [
  "reth-storage-api",
  "revm",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -3202,6 +3203,7 @@ dependencies = [
  "reth-revm",
  "reth-storage-api",
  "reth-trie",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]

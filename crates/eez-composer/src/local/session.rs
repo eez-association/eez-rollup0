@@ -19,7 +19,7 @@ use revm::database::CacheState;
 
 use eez_protocol::{
     CallMode, CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError,
-    ExecutorErrorKind, ExecutorResult, RollupId, TargetExecutionSession,
+    ExecutorResult, RollupId, TargetExecutionSession,
 };
 
 use super::provider::ChainProvider;
@@ -78,7 +78,7 @@ impl LocalExecutionSession {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] if reading the latest
+    /// Returns [`ExecutorError::Provider`] if reading the latest
     /// block number or header fails, or if opening the state provider
     /// fails.
     pub fn new(
@@ -95,7 +95,7 @@ impl LocalExecutionSession {
             .headers
             .header_by_number(num)
             .map_err(provider_err)?
-            .ok_or_else(|| ExecutorError::from(ExecutorErrorKind::Missing("target header")))?;
+            .ok_or(ExecutorError::Missing("target header"))?;
         tracing::debug!(
             block = num,
             state_root = %header.state_root,
@@ -314,10 +314,9 @@ impl TargetExecutionSession for LocalExecutionSession {
         dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<ExecutionOutcome> {
         if req.call_mode == CallMode::Static {
-            return Err(ExecutorErrorKind::Unavailable(
+            return Err(ExecutorError::Unavailable(
                 "static target execution is not implemented".to_owned(),
-            )
-            .into());
+            ));
         }
         let outcome = if let Some(factory) = self.inspector_factory.clone() {
             let inspector = factory.build(dispatcher);
@@ -354,9 +353,9 @@ impl TargetExecutionSession for LocalExecutionSession {
 
     fn rollback(&mut self, snapshot: eez_protocol::SessionSnapshot) -> ExecutorResult<()> {
         snapshot.downcast::<()>().map_err(|_e| {
-            ExecutorError::from(ExecutorErrorKind::Encoding(
+            ExecutorError::Encoding(
                 "LocalExecutionSession::rollback: snapshot type mismatch".into(),
-            ))
+            )
         })?;
         Ok(())
     }
@@ -374,9 +373,9 @@ pub(super) fn disable_checks(env: &mut reth_evm::EvmEnvFor<EezEvmConfig>) {
 pub(super) fn provider_err(
     e: impl Into<Box<dyn std::error::Error + Send + Sync>>,
 ) -> ExecutorError {
-    ExecutorError::provider(e)
+    ExecutorError::Provider(e.into())
 }
 
 pub(super) fn evm_err(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> ExecutorError {
-    ExecutorError::evm(e)
+    ExecutorError::Evm(e.into())
 }
