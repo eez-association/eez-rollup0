@@ -1668,34 +1668,6 @@ mod tests {
         assert_eq!(state.tip(), Some((9, B256::with_last_byte(9))));
     }
 
-    /// Deterministic errors stop the loop; retryable ones must not.
-    #[test]
-    fn only_deterministic_errors_are_terminal() {
-        let depth = L1Error::ReorgTooDeep {
-            walked: 62,
-            max: 62,
-        };
-        let incomplete = L1Error::SourceIncomplete {
-            block: 1,
-            tx_hash: B256::ZERO,
-            detail: "warming up".into(),
-        };
-        assert!(matches!(
-            L1Error::Decode("bad abi".into()),
-            L1Error::Decode(_)
-        ));
-        assert!(matches!(depth, L1Error::ReorgTooDeep { .. }));
-        // A malformed RPC response is retryable — re-requesting can succeed.
-        assert!(!matches!(
-            L1Error::Provider("log missing block_hash".into()),
-            L1Error::Decode(_) | L1Error::ReorgTooDeep { .. }
-        ));
-        assert!(!matches!(
-            incomplete,
-            L1Error::Decode(_) | L1Error::ReorgTooDeep { .. }
-        ));
-    }
-
     #[test]
     fn watcher_state_lookup_by_hash() {
         let mut state = WatcherState::new(10);
