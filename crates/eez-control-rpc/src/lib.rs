@@ -7,15 +7,16 @@
 //! recomputed `publicInputsHash`, and returns a [`v1::ProveResponse`]. One
 //! request/response: no feed, no dispatch, no sink.
 //!
-//! `prove.v2.Prover/ProveStream` adds resumable, reorg-safe per-block validation
-//! while v1 remains available during migration. Only generated types + tonic
-//! stubs live here — no `Prover`-trait coupling.
+//! The proposed `prove.v2.Prover/ProveStream` contract has a small sequential
+//! baseline, advertised optional session controls, and common calldata/blob/
+//! posting-context inputs. This crate defines wire types, not runtime support.
+//! Only generated types + tonic stubs live here — no `Prover`-trait coupling.
 
 mod generated;
 
 /// Tonic-generated protobuf module for the `prove.v1` package.
 pub use generated::v1;
-/// Tonic-generated protobuf module for the incremental `prove.v2` package.
+/// Tonic-generated protobuf module for the streaming `prove.v2` package.
 pub use generated::v2;
 
 use prost::Message;
@@ -111,6 +112,7 @@ mod tests {
                 anchor_number: 100,
                 anchor_hash: vec![0x11; 32],
                 anchor_state_root: vec![0x22; 32],
+                required_features: Vec::new(),
             })),
         };
         assert_eq!(
@@ -126,6 +128,7 @@ mod tests {
             kind: Some(server_frame::Kind::Ready(Ready {
                 validated_through: 100,
                 validated_hash: vec![0x11; 32],
+                supported_features: Vec::new(),
             })),
         };
         assert_eq!(
@@ -186,6 +189,7 @@ mod tests {
             kind: Some(server_frame::Kind::Ready(Ready {
                 validated_through: 100,
                 validated_hash: vec![0x11; 32],
+                supported_features: Vec::new(),
             })),
         };
         assert_eq!(

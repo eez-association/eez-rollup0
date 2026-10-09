@@ -1,6 +1,6 @@
-// Incremental Composer-to-prover protocol. prove.v1.Prover/Prove remains available
-// during migration. A stream carries one logical Composer session; reconnecting
-// uses Resume, while Rewind replaces an unsafe suffix after an L2 reorg.
+// Proposed Composer-to-prover streaming contract; see ../STREAMING_SPEC.md.
+// Required: Begin -> Block* -> Finalize on one stream, with no shared cache.
+// Ready advertises optional operations and settlement-input capabilities.
 syntax = "proto3";
 
 package prove.v2;
@@ -8,6 +8,8 @@ package prove.v2;
 import "prove.proto";
 
 service Prover {
+  // Baseline sessions end with their stream. FEATURE_RESUME optionally retains
+  // progress after disconnect/Proof. No runtime is added by this wire contract.
   rpc ProveStream(stream ClientFrame) returns (stream ServerFrame);
 }
 
@@ -15,10 +17,11 @@ message ClientFrame {
   // Empty only on Begin. The server issues this opaque ID; it is never a block
   // or proof identity and is not shared between Composers.
   bytes session_id = 1;
-  // Chosen by the client and echoed on every response to this operation.
+  // Chosen by the client, unique among outstanding operations, and echoed on
+  // every response to this operation. Superseded work need not receive a reply.
   uint64 request_id = 2;
-  // Zero on Begin and Resume. Ready issues a new fencing epoch; every other
-  // frame must carry the latest epoch returned for this session.
+  // Zero on Begin and Resume; otherwise echo Ready. Baseline servers may use
+  // the constant 1. Only Resume/Rewind require changing epochs and fencing.
   uint64 epoch = 3;
   oneof kind {
     Begin begin = 4;
@@ -30,26 +33,44 @@ message ClientFrame {
   }
 }
 
+// Session controls and settlement inputs are independently optional.
+// Unknown/unsupported required features cause UNIMPLEMENTED, never downgrade.
+enum Feature {
+  FEATURE_UNSPECIFIED = 0;
+  FEATURE_RESUME = 1;
+  FEATURE_REWIND = 2;
+  FEATURE_CANCEL = 3;
+  FEATURE_PIPELINING = 4;
+  FEATURE_BLOBS = 5;
+  FEATURE_POSTING_CONTEXT = 6;
+}
+
 message Begin {
   uint64 rollup_id = 1;
   // Last settled block. The first expected streamed block is anchor_number + 1.
   uint64 anchor_number = 2;
   bytes anchor_hash = 3;
   bytes anchor_state_root = 4;
+  // Empty requests the baseline. The client must also check Ready contains
+  // every required feature, so an older server ignoring this field fails closed.
+  repeated Feature required_features = 5;
 }
 
+// Optional FEATURE_RESUME: first frame on a new stream, with a new epoch on Ready.
 message Resume {}
 
 message Rewind {
+  // Optional FEATURE_REWIND. Unsupported controls return UNIMPLEMENTED.
   // Must identify the anchor or a fully validated block in this session's
   // current active prefix. The block number and state root are already known.
   bytes ancestor_hash = 1;
 }
 
 message Block {
-  // One block per stream frame. A contiguous run is sent as back-to-back frames
-  // on this same RPC without waiting for a Validated response between blocks.
-  // Contains exact consensus bytes and, for the stateless backend, its witness.
+  // One block per frame. Baseline clients wait for each ACK. FEATURE_PIPELINING
+  // permits a bounded contiguous run while draining responses; execution may
+  // remain sequential and backpressure/resource limits still apply.
+  // The complete witness is required; there is no backend-capability negotiation.
   prove.v1.BlockWitness data = 1;
 }
 
@@ -59,18 +80,62 @@ message Finalize {
   uint64 from_block = 1;
   uint64 to_block = 2;
   bytes terminal_hash = 3;
-  // Exact proofless postAndVerifyBatch calldata. No proof may be returned until
-  // it has been checked against this session's ordered validated prefix. A
-  // Proof closes this transport stream but leaves the session resumable from
-  // the selected predecessor anchor.
-  prove.v1.PostBatch post_batch = 4;
+  // A new field distinguishes the complete input from the old calldata-only
+  // layout. Old decoders see no PostBatch rather than signing stripped context.
+  oneof input {
+    // Original Rollup0-only encoding. New clients use settlement. Never retry a
+    // blob/context request by stripping its inputs and using this field.
+    prove.v1.PostBatch post_batch = 4 [deprecated = true];
+    SettlementInput settlement = 5;
+  }
 }
 
+// Common EEZ settlement input, independent of session recovery and prover backend.
+message SettlementInput {
+  // Exact proofless EEZ.postAndVerifyBatch calldata for the configured ABI.
+  bytes abi_calldata = 1;
+  // FEATURE_BLOBS: one sidecar per distinct batch.blobIndices entry, sorted by
+  // transaction index. Public inputs use derived versioned hashes in batch order.
+  repeated BlobSidecar blobs = 2;
+  // FEATURE_POSTING_CONTEXT: required when the supported rollup's public inputs
+  // depend on the posting environment. Claims must be verified, not trusted.
+  PostingContext posting_context = 3;
+}
+
+message BlobSidecar {
+  // Index in the intended L1 transaction's blob array, NOT this message's array.
+  uint32 index = 1;
+  bytes blob = 2;        // 131072 bytes, canonical EIP-4844 field elements.
+  bytes commitment = 3;  // 48-byte KZG commitment.
+  bytes proof = 4;       // 48-byte KZG blob proof.
+}
+
+message PostingContext {
+  // 20-byte caller observed as msg.sender by EEZ, not necessarily tx.origin.
+  bytes sender = 1;
+  // Intended L1 posting block (not batch.blockNumber, which selects custom data).
+  uint64 block_number = 2;
+  uint64 timestamp = 3;
+  bytes parent_hash = 4; // 32-byte hash of its L1 parent.
+  // Exact manager-defined custom data for the batch's participating rollups.
+  // Recompute/check against configured rollup rules and authenticated L1 context.
+  repeated RollupPostingData rollup_data = 5;
+  // Optional canonical L1 header RLP, newest first starting at parent_hash,
+  // when historical BLOCKHASH/custom-data derivation needs ancestor evidence.
+  repeated bytes ancestor_headers = 6;
+}
+
+message RollupPostingData {
+  uint64 rollup_id = 1;
+  bytes custom_data = 2;
+}
+
+// Optional FEATURE_CANCEL; ordinary gRPC cancellation is enough for the baseline.
 message Cancel {}
 
 message ServerFrame {
-  // A successful Begin carries the new nonempty ID; a rejected Begin carries
-  // an empty ID. Every response after Ready echoes the established session ID.
+  // A successful Begin carries a new 32-byte ID. Authorized responses echo the
+  // binding; a rejection without an authorized binding carries an empty ID.
   bytes session_id = 1;
   // Echoes the request_id of the ClientFrame this response addresses.
   uint64 request_id = 2;
@@ -91,17 +156,25 @@ message Ready {
   // This is the last FULLY VALIDATED block, not the last received message.
   uint64 validated_through = 1;
   bytes validated_hash = 2;
+  // Complete optional feature set enabled for THIS session/rollup, stable across
+  // Resume/Rewind. Empty means baseline. Unknown advertised values are ignored;
+  // clients use only recognized features and verify all Begin.required_features.
+  repeated Feature supported_features = 3;
 }
 
 message Validated {
   uint64 number = 1;
   bytes hash = 2;
   bytes post_state_root = 3;
-  // True only when another session's completed validation was reused.
+  // Diagnostic only. Caching/sharing is optional; always false is conformant.
+  // Clients must not change acceptance or recovery behavior based on this bit.
   bool reused = 4;
 }
 
 message Proof {
+  // Only this response attests settlement; Ready and Validated are not proofs.
+  // Success closes the stream. Only FEATURE_RESUME retains the selected range
+  // and predecessor anchor. It does not advance the L1 settlement cursor.
   bytes public_inputs_hash = 1;
   bytes proof = 2;
 }
@@ -109,8 +182,9 @@ message Proof {
 message Cancelled {}
 
 message Rejected {
-  // The numeric tonic::Code value. A rejection applies only to the named
-  // session/request; it must not terminate unrelated Composer sessions.
+  // The numeric standard gRPC status code (not a language-specific enum).
+  // Rejection applies only to the named session/request; it must not terminate
+  // unrelated Composer sessions.
   int32 code = 1;
   string message = 2;
   // Encoded prove.v1.ProveFailure when an actionable candidate is known.

@@ -1,202 +1,302 @@
-# Incremental Composer-to-prover RPC (v2)
+# Composer-to-prover streaming RPC
 
-Status: protocol proposal for staged implementation. `prove.v1.Prover/Prove`
-remains the only active runtime endpoint in this PR. The wire schema is
-[`proto/prove_stream.proto`](proto/prove_stream.proto).
+Status: proposed wire contract, following the design-only scope of
+[PR #168](https://github.com/eez-association/eez-rollup0/pull/168).
+This change does not implement a Composer or prover runtime. The existing
+[window RPC specification](SPEC.md) and endpoint remain unchanged.
+[prove_stream.proto](proto/prove_stream.proto) is the canonical schema.
 
-## Identity and sharing
+The contract separates three things: required streaming behavior, optional
+session controls, and settlement inputs. A prover may support blob settlement
+without supporting resumable sessions, or resumable sessions without blobs.
+Neither requires shared caches or a particular execution backend.
 
-One `ProveStream` belongs to one Composer session. `Begin` creates an opaque
-server-issued session ID; `Resume` can reconnect to that session. `Begin` MUST
-carry an empty session ID and epoch zero. A successful `Ready` echoes its request
-ID and carries the newly issued nonempty session ID and nonzero fencing epoch. A
-`Rejected` response to `Begin` carries an empty session ID and epoch zero because
-no session was created.
+## 1. Required interface and capability discovery
 
-`Resume` is the first frame on a new unbound stream and carries the retained
-session ID and epoch zero. Success atomically transfers that session to the new
-stream, fences any previous stream by issuing a new nonzero epoch, and returns
-the authoritative validated cursor in `Ready`. The server binds that epoch to
-the stream; subsequent frames and pending responses from a fenced stream are
-rejected, and that stream cannot reclaim the session by copying or guessing a
-newer epoch. All other client frames carry the current epoch. Responses echo
-their client request ID and carry the session's authoritative epoch;
-`Cancelled` echoes the accepted epoch that it retired. A response that cannot
-refer to an authorized session carries epoch zero. A server MUST NOT use the
-session ID, request ID, or epoch as a block, validation, or proof identity. An
-authorized Composer's session may refer to immutable validated-block artifacts
-already computed for another session, but cannot mutate another session's
-cursor, pending finalization, or result. Where multiple independently operated
-Composers share a prover, the transport MUST authenticate them and bind the
-session ID to that identity. The opaque ID is not a substitute for
-authentication.
+Every implementation supports `ProveStream` with this baseline flow:
 
-The reusable block identity includes the operator-configured rollup/chain and
-validation profile, exact consensus RLP, computed block hash, parent hash, and
-execution/proof version. A successful cached artifact contains locally checked
-pre/post roots, receipts, and settlement evidence; for a possible terminal Sync
-block it also contains all required transaction checkpoints. The server MUST
-exact-decode an offered block and compare its canonical bytes and header/body
-commitments before satisfying it from cache. A witness is proving auxiliary
-data, not part of the consensus block identity. A failed or malformed witness
-MUST NOT populate a negative cache entry for the block identity.
+```text
+Begin(anchor) -> Ready(anchor, supported_features)
+Block(anchor + 1) -> Validated
+Block(anchor + 2) -> Validated
+...
+Finalize(range, settlement) -> Proof -> EOF
+```
 
-Identical in-flight validation may be single-flighted, but cancellation of one
-waiter MUST NOT cancel work still required by another. A completed artifact may
-be shared only after backend replay and the shared output cross-check succeed.
-For the stateful backend, Reth's block tree is the shared continuation store:
-candidate blocks are downloaded directly from the Composer and imported as
-unsafe blocks. Import, or selecting a branch with forkchoice, does not make a
-block trusted. The exact predecessor selected by `Finalize` must match the
-L1-derived follower's last safe number and hash, and every imported block in the
-range must pass execution and consensus validation and link by exact parent hash
-from that safe block. The follower's safe and finalized labels remain
-L1-derived.
+A baseline prover needs only one stream-local prefix and sequential execution.
+It MAY limit capacity to one active stream/session, keep no global block cache,
+and discard the prefix when the stream ends. Its epoch can be the constant 1.
+It need not implement Resume, Rewind, application-level Cancel, pipelining,
+durable recovery, parallel execution, deduplication or cross-session sharing.
 
-Sessions retain exact anchor/prefix identities plus bounded immutable
-validation artifacts, including the consensus bytes already needed by
-settlement. Process-global forkchoice selection and unsafe-head state reads are
-serialized; one Composer's session never owns or mutates another Composer's
-cursor. Merely sharing a post-state root, importing a block, or setting
-`head = terminal` is not an ancestry proof. Reth may stop exposing an unsafe
-fork after another Composer selects a competing head, so finalization
-re-submits the session's checked ordered blocks under the same forkchoice lock
-before the attestation gates run.
+`Begin.required_features` lists features the client cannot operate without.
+Empty means no optional requirement. An unsupported or unknown required feature
+(including UNSPECIFIED) MUST reject Begin with UNIMPLEMENTED and allocate no
+session. The first Ready advertises the complete optional feature set enabled
+for this session and rollup. Before sending blocks the client MUST verify that
+this list contains every required feature; this also detects older servers
+that silently ignored the new Begin field.
 
-## Session state machine
+| Feature | Additional contract |
+| --- | --- |
+| RESUME | Retain a session across disconnect/Proof and reattach with a new epoch. |
+| REWIND | Replace a validated suffix on the same stream, with a new epoch. |
+| CANCEL | Explicitly retire a session and acknowledge cancellation. |
+| PIPELINING | Accept bounded dependent Block/Finalize frames without per-block ACK waits. |
+| BLOBS | Accept and validate EIP-4844 sidecars in the common settlement input. |
+| POSTING_CONTEXT | Accept and verify the posting-environment/custom-data inputs below. |
 
-`Begin` declares the nonzero rollup ID and the exact number, hash, and state root
-of the last settled block. The first expected streamed block is derived as
-`anchor_number + 1`. There is no proof range or settlement payload at this
-stage. The server checks identity and quotas and returns `Ready`. After `Begin`,
-`Resume`, or `Rewind`, the Composer waits for `Ready` before sending more frames
-because that response establishes the stream's fencing epoch. A resumed stream
-receives the server's authoritative **validated**, not merely received, cursor
-and hash. If no retained session or trusted checkpoint exists, it must fail or
-report the earlier recoverable cursor; the Composer backfills from its persistent
-witness store before finalizing.
+Capabilities are stable for a session and MUST be repeated unchanged after
+Resume/Rewind. Unknown advertised features may be ignored; clients MUST NOT
+use unadvertised features. There are no implicit dependencies between these
+features. A resumed session that cannot still honor its capabilities must be
+rejected, not silently downgraded.
 
-The Composer sends a contiguous run as back-to-back `Block` frames on the same
-long-lived RPC as each block's RLP and witness become available. It may pipeline
-those frames without waiting for a `Validated` response between blocks. Keeping
-one block per frame lets the prover decode, execute, acknowledge, retry, and
-apply backpressure at block granularity rather than buffering a whole run first.
-For each session the declared numbers must rise by one, hashes must link, and
-the first block must extend the declared anchor. A duplicate of exactly the
-same validated block is idempotent. A different block at the same height is
-rejected and MUST NOT implicitly overwrite the active prefix; replacing an
-unsafe suffix requires `Rewind`. `Validated` is emitted only after complete
-per-block execution and shared input/output checks. Its `reused` bit is
-diagnostic. An ACK is never an attestation.
+Unsupported optional controls return a correlated Rejected with UNIMPLEMENTED
+without changing progress or ending a bound stream. An unsupported Resume on
+an unbound stream returns an unbound rejection. Server capacity, retention,
+deadlines, configured chain/rollup rules, ABI and proof system are deployment
+parameters, not inferred from support for one optional feature.
 
-A session-bound `Rejected` reports the session's fully validated cursor and
-hash at the time of rejection. A rejection that cannot refer to an authorized
-session has `validated_through = 0` and an empty `validated_hash`. For a
-retryable rejection that leaves the active prefix unchanged, the Composer may
-continue on the same stream by resending from the block after the newest cursor
-it has observed for that epoch; it does not need `Resume` or `Rewind`. The server
-MUST NOT advance past a rejected gap using already-pipelined later frames. A
-contradictory block that replaces a validated suffix still requires `Rewind`.
+### Baseline client behavior
 
-`Rewind` carries the current epoch and the hash of the common ancestor. That
-hash must identify the anchor or a fully validated block in this session's
-current active prefix; received or globally cached blocks are insufficient. On
-success the server atomically increments the epoch, moves the session cursor to
-the ancestor, drops that session's later prefix and pending finalization, and
-returns `Ready` with the new epoch and cursor. The Composer waits for this
-`Ready`, then pipelines replacement `Block` frames under the new epoch. A
-rewind cannot replace or move below the session anchor. `Finalize` may advance
-the anchor within the validated prefix; any other anchor replacement requires a
-new `Begin`.
+Keep the stream open from Begin through Finalize and wait for each Block ACK.
+On disconnect, open a fresh stream, Begin at the current settlement anchor and
+backfill from durable block/witness storage. On a fork change, cancel the RPC,
+Begin again and resend the selected branch. After Proof, start a new stream
+for the next range. Do not attempt Resume/Rewind unless advertised.
 
-Every queued validation and finalization captures its session epoch. Once an
-epoch changes, work from an older epoch cannot mutate the session cursor or
-emit a proof. Independently valid old-fork work may still populate the immutable
-shared artifact cache, and another Composer session using that fork is
-unaffected. The server MUST NOT emit old-epoch responses after the `Ready` that
-establishes a new epoch.
+Streaming remains useful without these optimizations: ordinary block execution
+happens before finalization. It does not guarantee a fixed proof latency.
+Prevalidation and backpressure MUST NOT block L2 commitment or durable witness
+capture. Bound the final proof attempt including any reconnect/backfill and
+leave time for proof verification and L1 submission.
 
-`Finalize` specifies the exact contiguous inclusive `[from_block, to_block]`
-range, the terminal Sync-block hash, and canonical proofless
-`postAndVerifyBatch` calldata. The range may start at any fully validated block
-in the session's active prefix and must end at a fully validated block. Its
-predecessor must be either the current session anchor or an earlier fully
-validated block in that prefix. `Finalize` promotes that exact predecessor to
-the range's settlement anchor: the submitted batch must name its hash as the
-initial commitment, and a stateful prover must also match its number and hash
-to the L1-derived follower's current safe block. The session's previously
-validated parent links prove that the selected range descends from it.
+## 2. Frames and required validation
 
-The server takes an immutable snapshot of only the selected ordered range and
-reruns the existing shared state-chain, intermediate block, terminal
-effect/checkpoint, exact DA, proof-system, and public-input gates against that
-calldata. Only this complete path may invoke the attester. Before emitting
-`Proof`, the server rechecks that the snapshot's epoch is still current;
-otherwise it discards the stale result and rejects that finalization. On
-success, the retained session advances its anchor to the selected predecessor
-and may release its earlier prefix. Each Composer receives its own `Proof` or
-`Rejected` frame, even when another Composer used the same blocks. A successful
-final result may be cached only under the complete range, ordered block
-identities, selected anchor, terminal hash, exact calldata, proof system/vkey,
-and validation profile. A public-input hash or state root alone is not a
-sufficient cache key.
+A ClientFrame contains exactly one operation and an unambiguous outstanding
+request_id. Every response echoes that ID. Begin is the first frame on an
+unbound stream, with an empty session_id and epoch zero. Its Ready returns a
+new opaque 32-byte session ID, a nonzero epoch and the exact anchor cursor.
+Thereafter frames carry that stream's binding; the baseline simply echoes the
+same epoch throughout. A session ID is not a block/proof identity or an
+authentication credential. Shared deployments must authenticate and isolate
+Composers independently of these fields.
 
-`Proof` closes the current transport stream, but it does not retire the session.
-The Composer retains the opaque session ID and may resume it to validate later
-blocks or finalize a later range after its predecessor becomes the new safe
-anchor. This avoids resending blocks and witnesses already validated in that
-session. If a valid proof's L1 submission is dropped or remains unresolved, the
-anchor does not advance past that proof's predecessor and the retained prefix
-remains available. `Resume` issues a new epoch before work continues. An anchor
-replacement that is not a validated forward move within this session requires a
-new `Begin`; the session is otherwise retired only by `Cancel` or bounded
-eviction.
+A response without an authorized binding has empty session_id, zero epoch,
+zero validated_through and empty validated_hash. Otherwise Ready/Rejected
+report the authoritative fully validated cursor and its 32-byte hash, not
+merely the last received block. Clients correlate ID, epoch, request ID and
+response kind before changing local progress. Ready and Validated are not
+attestations.
 
-`Cancel` carries the current session ID and epoch in its frame. When the server
-accepts it, the server atomically retires only that session, drops its pending
-finalization, fences its queued work and responses, releases its quotas and
-session-owned artifact references, emits the correlated `Cancelled` response,
-and closes the stream successfully. No `Validated`, `Proof`, or other response
-from that session may follow `Cancelled`. The explicit acknowledgement tells the
-Composer that the cleanup signal was processed; merely enqueueing a frame is not
-enough. A transport cancellation or disconnect is not an application-level
-`Cancel` and leaves the session resumable.
+### Begin and Block
 
-Cancellation is a release signal, not an instruction to delete shared data.
-The server MAY eagerly remove session-local state and evict shared cache entries
-that have become unreferenced, subject to its normal retention policy. It MUST
-NOT cancel single-flighted work still needed by another session or delete
-immutable artifacts or Reth blocks that another session may still use. A
-successful `Rewind` likewise invalidates only that session's abandoned suffix
-and finalization candidates. Stateful validation must recheck the follower's
-last safe number and hash and every exact block identity before signing. An FCU
-update may select the branch and make its unsafe-head state readable, but the
-checked safe anchor plus exact parent links are the ancestry proof. The prover
-does not assume that a transport ACK proves the Composer's current L1 cursor;
-the on-chain commitment gate and the existing Composer/Deriver cursor rules
-remain independent.
+Begin supplies the nonzero rollup registry ID and exact anchor number/hash/
+state root. Both hashes are 32 bytes; anchor_number must permit adding one.
+The anchor is the last block settled on L1. Admission checks configured chain
+identity and the anchor evidence required by that rollup's validation rules.
 
-## Capacity and timing
+Each Block contains one present BlockWitness: declared number, 32-byte hash
+and parent hash, exact consensus header/body RLP, and a present execution
+witness sufficient for the configured validation rules. Witness acquisition
+is backend-independent at the wire boundary; omitting witnesses is not one of
+this proposal's capabilities.
 
-The present single-active-request gate is incompatible with parallel Composer
-sessions. Admission needs bounded per-Composer sessions, in-flight blocks,
-bytes, witnesses, and finalizations, plus a global execution cap and fair
-scheduling. No gRPC or prover backpressure may block L2 block commitment;
-Composer retains witnesses for retry. Failed capacity admission is explicit and
-does not silently downgrade validation. Artifact storage is bounded and may be
-evicted only when no active session needs it; a cache miss causes replay, never
-an unchecked proof.
+New blocks must extend the validated prefix by one with exact hash and
+execution-state continuity. Bind wire claims to decoded consensus bytes and
+complete execution/evidence validation before emitting Validated. Its number,
+hash and 32-byte post_state_root identify that block. Ordinary blocks require
+ordinary execution; settlement checkpoints belong to blocks that need them.
 
-The 500 ms Composer proof budget begins at `Finalize`, not `Begin`; it includes
-the terminal-block work, settlement validation, signing, and response transit.
-An old validated prefix is not re-executed in the normal retained-branch path.
-If Reth has evicted a competing unsafe fork, correctness takes precedence: the
-stateful backend re-imports the exact checked blocks, and that work counts
-against the finalization deadline. Measure witness capture, send, validation
-ACK, finalization, and submission separately. The stateful backend must take
-fresh Reth providers at each block and finalization; it must not hold one read
-snapshot across an arbitrarily long stream. It adds no parallel execution
-database: Reth stores imported blocks and execution state, while the streaming
-layer stores only bounded session identities and immutable checked artifacts. A
-terminal block needing transaction checkpoints may be re-executed once on its
-Reth parent state when it arrives.
+An exact duplicate of an already validated block is idempotent. A contradictory
+block or gap is rejected without advancing or replacing the prefix. Rejected
+reports the current cursor so the client can supply missing blocks on the same
+stream. No cache is necessary to implement this rule. `reused` is diagnostic;
+a conforming implementation may always return false.
+
+### Finalize and completion
+
+Finalize selects a nonempty contiguous inclusive [from_block, to_block] range
+and its 32-byte terminal_hash. Every selected block and its predecessor must
+belong to the validated prefix. The hash must match the selected terminal.
+Range selection may begin after the original anchor or end before the tip.
+The selected predecessor is the settlement anchor; L1 applicability and the
+rollup's settlement rules are checked at finalization, not established by ACKs.
+
+Finalize binds the complete settlement input in section 3 to that exact range.
+Only successful execution, settlement, DA, proof-system and public-input checks
+may yield Proof. A failed finalization yields no proof and does not consume
+validated progress. The client independently verifies the returned public-input
+hash and proof against the exact request and configured verifier.
+
+Proof closes the stream successfully. Without RESUME the session ends there;
+with RESUME it retains the selected range and any later validated suffix,
+promotes the selected predecessor to anchor and may release earlier data.
+Proof never advances the Composer's L1 settlement cursor by itself.
+
+Client half-close drains accepted work; EOF without a Proof is not success.
+Transport cancellation stops replies and releases stream-local work. Only
+RESUME grants retention after stream teardown. No proof may be used after the
+Composer abandons its corresponding batch or settlement cutoff.
+
+## 3. Common finalization input
+
+New requests use `Finalize.settlement`, a SettlementInput containing exact
+proofless EEZ.postAndVerifyBatch calldata, zero or more blob sidecars and an
+optional PostingContext. This is not Rollup0's PostBatch: blobs and context are
+first-class wire inputs rather than an overloaded legacy L1 hash field.
+No Composer-claimed public-input hash is authoritative.
+
+The same envelope covers Rollup0's calldata-only/timeless case (no blobs or
+posting context) and blob/context-dependent rollups such as RollupX.
+Advertising BLOBS/POSTING_CONTEXT means the server supports those inputs for
+the configured rollup rules; it is not a claim to support arbitrary managers,
+DA codecs or verifier versions. Those rules are deployment configuration.
+
+A sender must request the capabilities it requires in Begin and check Ready.
+The server MUST reject unadvertised blob/context use with UNIMPLEMENTED,
+including when those inputs would otherwise be ignored. Empty inputs never
+make calldata requiring missing blobs or context acceptable. Malformed or
+inconsistent input is rejected; a server MUST NOT drop fields and sign a
+weaker statement. An absent/unrecognized finalization input is INVALID_ARGUMENT.
+Future proof-relevant input extensions must require a new advertised feature
+or a new input variant; unknown protobuf fields alone do not negotiate support.
+
+### Blob sidecars
+
+The blob encodings and KZG/versioned-hash rules follow
+[EIP-4844](https://eips.ethereum.org/EIPS/eip-4844). For BLOBS, the request
+supplies exactly one BlobSidecar for every distinct
+index referenced by batch.blobIndices, sorted by index, with no extras:
+
+- index is the position in the **intended L1 transaction's blob array**, not
+  the sidecar's position in this request; it must fit uint32 and the configured
+  chain's transaction blob-index bound;
+- blob is exactly 131072 bytes of canonical EIP-4844 field elements;
+- commitment and proof are each 48-byte canonical KZG encodings; and
+- the prover verifies the blob KZG proof against that commitment using the
+  configured chain's trusted setup and rejects invalid data/proofs.
+
+Derive the versioned hash from the checked commitment, not a client hash claim.
+Build the public-input blob-hash list by looking up indices in the exact
+batch.blobIndices order (including repeated references). Check the rollup's
+blob DA decoding against the selected validated blocks and settlement effects.
+The Composer must post the same selected blobs/commitments at those transaction
+indices; EEZ's BLOBHASH-based public inputs enforce the commitment binding.
+The transaction may contain other, unreferenced blobs. Its complete envelope
+is not supplied here; ensuring these indices exist in the actual posting
+transaction remains the Composer's responsibility.
+
+### Posting context
+
+PostingContext carries the intended EEZ caller (20-byte sender), L1 posting
+block number/timestamp, 32-byte parent hash, and per-rollup custom data. The
+posting block number is **not** batch.blockNumber: the latter selects the
+manager's getCustomData behavior. A supplied context has a nonzero posting
+block number, and rollup_data has one entry per batch participating rollup in
+batch assignment order, with matching IDs and no duplicates.
+
+When historical context is needed, ancestor_headers may carry canonical L1
+header RLP newest-first from parent_hash. Check exact header decoding, hashes,
+consecutive numbers and parent links. A header chain supplied by the Composer
+is not by itself authenticated L1 evidence: anchor it to the prover's trusted
+L1 view, or obtain the needed headers independently.
+
+The prover must independently derive/check each custom_data value using the
+configured manager/rollup rules and authenticated context, not merely hash a
+claimed custom-data blob. For a manager whose implementation matches the
+reference timeless/past/current modes, this means deriving its empty data,
+historical block hash, or posting timestamp/parent hash as appropriate.
+Unknown rules, unavailable evidence or inconsistent claims yield no proof.
+
+EEZ public inputs bind the selected versioned blob hashes, calldata, manager
+custom-data hashes and sender when batch.bindMsgSenderInPublicInput requests
+it. Use zero for the bound sender otherwise. The context envelope itself is
+**not** automatically hashed by EEZ: a proof must not claim an execution fact
+depends on a context field the configured verifier does not bind. If additional
+context must be bound, the rollup/verifier contract must provide that binding;
+adding a protobuf field cannot provide it.
+
+Context for a not-yet-mined posting block is a proposed environment, not proof
+of L1 inclusion. Verify its derivable constraints and bind the applicable
+public inputs. The Composer must ensure the actual posting produces those
+same inputs; if the applicable context changes, recompute/reprove rather than
+submitting the old proof or stripping context. An already-mined L1 block hash
+is not required merely to propose a future posting environment.
+
+### Compatibility and unsupported inputs
+
+The original field 4, Finalize.post_batch, remains a deprecated oneof variant
+for the existing calldata-only Rollup0 encoding. Its l1_block_hash must be
+empty; its claimed public-input hash is ignored. New input uses field 5, so
+older decoders see a missing PostBatch instead of silently ignoring additional
+fields inside an accepted PostBatch. Do not send both variants or automatically
+downgrade a failed blob/context request.
+
+The generated accessor changes to Finalize.input. Runtime adapters for this
+proposal must dispatch it and perform capability checks explicitly. This
+design-only change does not alter the existing window runtime or assert that
+RollupX settlement execution is already implemented in this repository.
+
+## 4. Optional advanced session controls
+
+RESUME retains progress subject to published limits. Resume is the first frame
+on a new stream, with the retained ID and epoch zero. Ready returns the same
+ID, a fresh nonzero epoch, the retained cursor and unchanged capabilities.
+This atomically fences the old attachment; copying the new epoch on an old
+stream cannot regain authorization. Missing/evicted sessions return NOT_FOUND,
+requiring Begin and backfill. A lost ACK can mean more progress was validated
+than the client saw; reconcile both cursor number and hash.
+
+REWIND accepts only the anchor or a fully validated ancestor in this session's
+active prefix, not a block merely cached elsewhere. It truncates the suffix,
+fences pending old-prefix work, advances the epoch and returns Ready at the
+ancestor. It cannot replace the anchor. A rejected rewind changes neither
+epoch nor prefix. Without REWIND, replace the stream and backfill instead.
+
+CANCEL atomically retires the bound session, fences pending work, returns the
+correlated Cancelled at the accepted epoch and closes the stream. No later ACK
+or Proof follows. Without CANCEL, use transport cancellation; if RESUME is
+enabled, retained data remains subject to normal eviction. Cancellation never
+authorizes deleting another session's data.
+
+PIPELINING allows dependent Block/Finalize frames to queue in order. Bound
+outstanding data and drain responses while sending. Accepted Resume/Rewind/
+Cancel fences earlier work before its control response; stale work cannot
+mutate the active prefix or emit a usable Proof afterward. Results superseded
+by such controls need not receive individual replies. A rejected gap cannot
+be skipped by later queued blocks.
+
+Shared caches, singleflight, multiple sessions and parallel execution are
+implementation choices, not required capabilities. If used, bind reused
+evidence to exact consensus bytes, execution parent and validation rules.
+Isolate session progress and results; cancellation of one waiter must not
+cancel work still needed by another. Nothing in this protocol mandates Reth
+forkchoice, a database layout, or a second execution store.
+
+## 5. Errors, limits and conformance
+
+Rejected.code is the standard numeric gRPC status code; message is diagnostic,
+not machine-readable control flow. details may contain the existing ProveFailure
+encoding when an actionable settlement candidate is known. Clients must bind
+such details to the exact request's index/hash before changing candidates.
+RPC transport errors and operation rejections never constitute proofs.
+
+UNAVAILABLE, DEADLINE_EXCEEDED and ABORTED may permit bounded retries after
+reconciliation. NOT_FOUND permits session-loss recovery. UNIMPLEMENTED means
+a required feature is absent: use the baseline only if it still expresses the
+same complete proving request, otherwise select a suitable prover. Unsupported
+settlement data must never be converted into a weaker request. Capacity
+rejections use RESOURCE_EXHAUSTED; malformed input is not retried unchanged.
+
+Publish finite message/queue/session/byte/witness limits and bound connect,
+send, receive and operation deadlines. The minimal server can reject a second
+session at capacity without disturbing the first. No 500 ms or other fixed
+deadline is guaranteed by the wire contract.
+
+Conformance should cover baseline and optional exchanges separately. Codec
+vectors pin field numbers and capability negotiation; they are not substitutes
+for executed-block and on-chain proof oracles. Recorded live request/response
+transcripts belong with each runtime implementation. Keep vector fixtures and
+their test harness separate from this protocol proposal.
