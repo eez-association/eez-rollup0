@@ -1536,7 +1536,7 @@ where
                     &parent_header,
                     timestamp,
                     suggested_fee_recipient,
-                    bundle_target, // catch-up marker → next available block
+                    bundle_target, // catch-up → NextBlock (unpinned)
                 )
                 .await
                 .unwrap_or_else(|err| {
