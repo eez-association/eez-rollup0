@@ -427,8 +427,9 @@ where
                     header: last_header.clone(),
                 };
                 let prebuilt = composer
-                    // Catch-up: target the immediate next L1 block without a
-                    // timestamp pin; the L2 terminal timestamp is historical.
+                    // Supply the immediate next L1 block for any historical
+                    // chunk. The ordinary catch-up marker remains unpinned so
+                    // it can survive an L1 reorg.
                     .compose_sync_slot(
                         rollup_id,
                         parent,

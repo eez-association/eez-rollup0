@@ -53,18 +53,19 @@ use crate::prover_retry::{
 };
 use crate::rollup::RollupState;
 
-fn bundle_target_for_slot(
+fn bundle_targets_for_slot(
     target_l1_block: Option<u64>,
     timestamp: u64,
     mode: SyncSlotMode,
-) -> BundleTarget {
-    match (target_l1_block, mode) {
+) -> (BundleTarget, BundleTarget) {
+    let bundle_target = match (target_l1_block, mode) {
         (Some(block), SyncSlotMode::Steady) => BundleTarget::Exact { block, timestamp },
-        (Some(block), SyncSlotMode::Catchup | SyncSlotMode::Empty) => {
-            BundleTarget::ExactBlock { block }
-        }
-        (None, _) => BundleTarget::NextBlock,
-    }
+        _ => BundleTarget::NextBlock,
+    };
+    let historical_target = target_l1_block
+        .map(|block| BundleTarget::ExactBlock { block })
+        .unwrap_or(BundleTarget::NextBlock);
+    (bundle_target, historical_target)
 }
 
 /// Shared contract identities, public L2 parameters, and L1 submission resources
@@ -1394,10 +1395,12 @@ where
         target_l1_block: Option<u64>,
         mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock> {
-        // Steady bundles pin both block and timestamp. Catch-up bundles name
-        // the same known next block without a timestamp pin because their L2
-        // terminal is historical. None is reserved for deferred-late paths.
-        let bundle_target = bundle_target_for_slot(target_l1_block, timestamp, mode);
+        // Steady bundles pin both block and timestamp. Ordinary catch-up
+        // markers remain next-available so an L1 reorg cannot strand them,
+        // while historical chunks name the known next block without a
+        // timestamp pin. None is reserved for deferred-late paths.
+        let (bundle_target, historical_target) =
+            bundle_targets_for_slot(target_l1_block, timestamp, mode);
         event!(
             name: "eez.composer.sync_slot.invoked",
             Level::INFO,
@@ -1496,7 +1499,7 @@ where
                     rollup,
                     cursor,
                     sync_height,
-                    bundle_target,
+                    historical_target,
                 )
                 .await
             {
@@ -1526,14 +1529,15 @@ where
         // (cross-chain stays pooled for the next Steady slot).
         if matches!(mode, SyncSlotMode::Catchup) {
             return self
-                .dispatch_minimal_postbatch(
+                .dispatch_minimal_postbatch_with_historical_target(
                     &cc.exec_ctx,
                     rollup_id,
                     rollup,
                     &parent_header,
                     timestamp,
                     suggested_fee_recipient,
-                    bundle_target, // catch-up → exact block, timestamp unpinned
+                    bundle_target,     // catch-up marker → next available block
+                    historical_target, // gas fallback → exact historical block
                 )
                 .await
                 .unwrap_or_else(|err| {
@@ -3502,6 +3506,30 @@ where
         suggested_fee_recipient: Address,
         bundle_target: BundleTarget,
     ) -> Result<Option<SyncSlotBlock>, String> {
+        self.dispatch_minimal_postbatch_with_historical_target(
+            ctx,
+            rollup_id,
+            rollup,
+            parent_header,
+            timestamp,
+            suggested_fee_recipient,
+            bundle_target,
+            bundle_target.without_timestamp_pin(),
+        )
+        .await
+    }
+
+    async fn dispatch_minimal_postbatch_with_historical_target(
+        &self,
+        ctx: &CrossChainExecCtx,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
+        timestamp: u64,
+        suggested_fee_recipient: Address,
+        bundle_target: BundleTarget,
+        historical_target: BundleTarget,
+    ) -> Result<Option<SyncSlotBlock>, String> {
         let empty_built = match build_sync_block(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
@@ -3559,7 +3587,7 @@ where
                         rollup,
                         cursor,
                         sync_height,
-                        bundle_target,
+                        historical_target,
                     )
                     .await
                 {
@@ -4662,11 +4690,14 @@ mod tests {
     use alloy_sol_types::SolValue as _;
 
     #[test]
-    fn catchup_and_historical_targets_keep_the_triggering_l1_block() {
-        let catchup = bundle_target_for_slot(Some(101), 1_700_000_012, SyncSlotMode::Catchup);
-        assert_eq!(catchup, BundleTarget::ExactBlock { block: 101 });
+    fn catchup_marker_is_unpinned_but_historical_target_keeps_the_l1_block() {
+        let (catchup, historical) =
+            bundle_targets_for_slot(Some(101), 1_700_000_012, SyncSlotMode::Catchup);
+        assert_eq!(catchup, BundleTarget::NextBlock);
+        assert_eq!(historical, BundleTarget::ExactBlock { block: 101 });
 
-        let steady = bundle_target_for_slot(Some(102), 1_700_000_024, SyncSlotMode::Steady);
+        let (steady, historical) =
+            bundle_targets_for_slot(Some(102), 1_700_000_024, SyncSlotMode::Steady);
         assert_eq!(
             steady,
             BundleTarget::Exact {
@@ -4674,10 +4705,7 @@ mod tests {
                 timestamp: 1_700_000_024,
             }
         );
-        assert_eq!(
-            steady.without_timestamp_pin(),
-            BundleTarget::ExactBlock { block: 102 },
-        );
+        assert_eq!(historical, BundleTarget::ExactBlock { block: 102 },);
     }
 
     #[test]
