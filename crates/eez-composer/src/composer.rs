@@ -53,6 +53,21 @@ use crate::prover_retry::{
 };
 use crate::rollup::RollupState;
 
+fn bundle_targets_for_slot(
+    target_l1_block: Option<u64>,
+    timestamp: u64,
+    mode: SyncSlotMode,
+) -> (BundleTarget, BundleTarget) {
+    let bundle_target = match (target_l1_block, mode) {
+        (Some(block), SyncSlotMode::Steady) => BundleTarget::Exact { block, timestamp },
+        _ => BundleTarget::NextBlock,
+    };
+    let historical_target = target_l1_block
+        .map(|block| BundleTarget::ExactBlock { block })
+        .unwrap_or(BundleTarget::NextBlock);
+    (bundle_target, historical_target)
+}
+
 /// Shared contract identities, public L2 parameters, and L1 submission resources
 /// for cross-chain composition on Sync slots. Owned by `eez-node` at startup
 /// and carried inside [`CrossChainWiring`].
@@ -1380,13 +1395,12 @@ where
         target_l1_block: Option<u64>,
         mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock> {
-        // Some(n) → aim L1 block n exactly, pinned to this Sync block's
-        // timestamp (a skipped L1 slot then drops the bundle instead of
-        // settling with a drifted L2 timestamp); None → next available
-        // (catch-up, unpinned).
-        let bundle_target = target_l1_block.map_or(BundleTarget::NextBlock, |block| {
-            BundleTarget::Exact { block, timestamp }
-        });
+        // Steady bundles pin both block and timestamp. Ordinary catch-up
+        // markers remain next-available so an L1 reorg cannot strand them,
+        // while cap-triggered historical chunks name the known next block
+        // without a timestamp pin. None is reserved for deferred-late paths.
+        let (bundle_target, historical_target) =
+            bundle_targets_for_slot(target_l1_block, timestamp, mode);
         event!(
             name: "eez.composer.sync_slot.invoked",
             Level::INFO,
@@ -1479,7 +1493,14 @@ where
         // range by K a slot until the signer's window wedges it.
         if sync_height.saturating_sub(cursor) > self.inner.emission.max_blocks {
             if let Err(err) = self
-                .emit_historical_chunk(&cc.exec_ctx, rollup_id, rollup, cursor, sync_height)
+                .emit_historical_chunk(
+                    &cc.exec_ctx,
+                    rollup_id,
+                    rollup,
+                    cursor,
+                    sync_height,
+                    historical_target,
+                )
                 .await
             {
                 event!(
@@ -1496,10 +1517,10 @@ where
         }
 
         // Deferred-late: the bundle missed its L1 slot, so suppress PINNED
-        // emission only. Ordered after bounded emission on purpose — a
-        // historical chunk targets NextBlock and carries no pin, so lateness
-        // can't invalidate it; checking first would starve a chronically late
-        // node (slow prover, relay latency) of settlement entirely.
+        // emission only. Ordered after bounded emission on purpose — this path
+        // supplies NextBlock, so its historical chunk carries no pin and
+        // remains valid; checking first would starve a chronically late node
+        // (slow prover, relay latency) of settlement entirely.
         if matches!(mode, SyncSlotMode::Empty) {
             return self.build_empty_slot_block(rollup, &parent_header, timestamp);
         }
@@ -3535,7 +3556,14 @@ where
                 let cursor = rollup.l1_head.cursor();
                 let sync_height = parent_header.number() + 1;
                 if let Err(chunk_err) = self
-                    .emit_historical_chunk(ctx, rollup_id, rollup, cursor, sync_height)
+                    .emit_historical_chunk(
+                        ctx,
+                        rollup_id,
+                        rollup,
+                        cursor,
+                        sync_height,
+                        BundleTarget::NextBlock,
+                    )
                     .await
                 {
                     event!(
@@ -3637,6 +3665,7 @@ where
         rollup: &RollupState<L2>,
         cursor: u64,
         sync_height: u64,
+        historical_target: BundleTarget,
     ) -> Result<(), String> {
         let limits = self.inner.emission;
         let k = u64::from(limits.timing.k());
@@ -3681,7 +3710,7 @@ where
                     &[],
                     &[],
                     0, // no inline outbound target calls
-                    BundleTarget::NextBlock,
+                    historical_target,
                 )
                 .await
                 .map_err(|error| error.to_string())?
@@ -3707,8 +3736,8 @@ where
             rollup
                 .optimistic
                 .begin(boundary, post_batch_hash, boundary_parent, Vec::new());
-            // A past terminal can't be pinned to an L1 slot, so the bundle takes
-            // whichever block the relay lands it in.
+            // A past terminal cannot carry a timestamp pin, but the bundle can
+            // still target the exact L1 slot that triggered this composition.
             self.spawn_bundle_observer(
                 ctx,
                 rollup_id,
@@ -3717,7 +3746,7 @@ where
                 post_batch_hash,
                 boundary_header.hash(),
                 Arc::clone(&rollup.optimistic),
-                BundleTarget::NextBlock,
+                historical_target,
             );
             return Ok(());
         }
@@ -4526,7 +4555,7 @@ async fn observe_bundle_outcome(
                 BundleTarget::Exact { block, timestamp } => {
                     submitter.block_timestamp(block).await.ok().flatten() != Some(timestamp)
                 }
-                BundleTarget::NextBlock => false,
+                BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => false,
             },
         };
         optimistic.mark_failed(sync_height, post_batch_hash, slot_skipped);
@@ -4633,6 +4662,25 @@ mod tests {
     use super::*;
     use alloy_primitives::TxHash;
     use alloy_sol_types::SolValue as _;
+
+    #[test]
+    fn catchup_marker_is_unpinned_but_historical_target_keeps_the_l1_block() {
+        let (catchup, historical) =
+            bundle_targets_for_slot(Some(101), 1_700_000_012, SyncSlotMode::Catchup);
+        assert_eq!(catchup, BundleTarget::NextBlock);
+        assert_eq!(historical, BundleTarget::ExactBlock { block: 101 });
+
+        let (steady, historical) =
+            bundle_targets_for_slot(Some(102), 1_700_000_024, SyncSlotMode::Steady);
+        assert_eq!(
+            steady,
+            BundleTarget::Exact {
+                block: 102,
+                timestamp: 1_700_000_024,
+            }
+        );
+        assert_eq!(historical, BundleTarget::ExactBlock { block: 102 });
+    }
 
     #[test]
     fn submission_identity_must_match_post_batch_signer() {

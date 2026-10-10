@@ -427,8 +427,16 @@ where
                     header: last_header.clone(),
                 };
                 let prebuilt = composer
-                    // Catch-up: next-available L1 block (unpinned), empty.
-                    .compose_sync_slot(rollup_id, parent, sync_ts, None, SyncSlotMode::Catchup)
+                    // Supply the immediate next L1 block for a cap-triggered
+                    // historical chunk. The ordinary catch-up marker remains
+                    // unpinned so it can survive an L1 reorg.
+                    .compose_sync_slot(
+                        rollup_id,
+                        parent,
+                        sync_ts,
+                        Some(l1_head + 1),
+                        SyncSlotMode::Catchup,
+                    )
                     .await;
                 if let Some(built) = prebuilt {
                     if let Err(err) = self.commit_one_prebuilt(SlotKind::Sync, built).await {
