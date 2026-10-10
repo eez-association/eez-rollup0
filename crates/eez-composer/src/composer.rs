@@ -1397,8 +1397,8 @@ where
     ) -> Option<SyncSlotBlock> {
         // Steady bundles pin both block and timestamp. Ordinary catch-up
         // markers remain next-available so an L1 reorg cannot strand them,
-        // while historical chunks name the known next block without a
-        // timestamp pin. None is reserved for deferred-late paths.
+        // while cap-triggered historical chunks name the known next block
+        // without a timestamp pin. None is reserved for deferred-late paths.
         let (bundle_target, historical_target) =
             bundle_targets_for_slot(target_l1_block, timestamp, mode);
         event!(
@@ -1529,15 +1529,14 @@ where
         // (cross-chain stays pooled for the next Steady slot).
         if matches!(mode, SyncSlotMode::Catchup) {
             return self
-                .dispatch_minimal_postbatch_with_historical_target(
+                .dispatch_minimal_postbatch(
                     &cc.exec_ctx,
                     rollup_id,
                     rollup,
                     &parent_header,
                     timestamp,
                     suggested_fee_recipient,
-                    bundle_target,     // catch-up marker → next available block
-                    historical_target, // gas fallback → exact historical block
+                    bundle_target, // catch-up marker → next available block
                 )
                 .await
                 .unwrap_or_else(|err| {
@@ -3506,30 +3505,6 @@ where
         suggested_fee_recipient: Address,
         bundle_target: BundleTarget,
     ) -> Result<Option<SyncSlotBlock>, String> {
-        self.dispatch_minimal_postbatch_with_historical_target(
-            ctx,
-            rollup_id,
-            rollup,
-            parent_header,
-            timestamp,
-            suggested_fee_recipient,
-            bundle_target,
-            bundle_target.without_timestamp_pin(),
-        )
-        .await
-    }
-
-    async fn dispatch_minimal_postbatch_with_historical_target(
-        &self,
-        ctx: &CrossChainExecCtx,
-        rollup_id: u64,
-        rollup: &RollupState<L2>,
-        parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
-        timestamp: u64,
-        suggested_fee_recipient: Address,
-        bundle_target: BundleTarget,
-        historical_target: BundleTarget,
-    ) -> Result<Option<SyncSlotBlock>, String> {
         let empty_built = match build_sync_block(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
@@ -3587,7 +3562,7 @@ where
                         rollup,
                         cursor,
                         sync_height,
-                        historical_target,
+                        BundleTarget::NextBlock,
                     )
                     .await
                 {
@@ -3690,9 +3665,8 @@ where
         rollup: &RollupState<L2>,
         cursor: u64,
         sync_height: u64,
-        slot_target: BundleTarget,
+        historical_target: BundleTarget,
     ) -> Result<(), String> {
-        let historical_target = slot_target.without_timestamp_pin();
         let limits = self.inner.emission;
         let k = u64::from(limits.timing.k());
         // Under the cap the cap-bounded boundary is the sync height itself, which
@@ -4705,7 +4679,7 @@ mod tests {
                 timestamp: 1_700_000_024,
             }
         );
-        assert_eq!(historical, BundleTarget::ExactBlock { block: 102 },);
+        assert_eq!(historical, BundleTarget::ExactBlock { block: 102 });
     }
 
     #[test]

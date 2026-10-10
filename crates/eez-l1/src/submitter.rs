@@ -41,8 +41,8 @@ pub enum BundleTarget {
     /// used for off-cadence catch-up.
     NextBlock,
     /// Land in exactly L1 block `block`, without pinning its timestamp.
-    /// Historical catch-up batches use this to target the slot that caused
-    /// their composition while allowing a past L2 terminal timestamp.
+    /// Cap-triggered historical batches use this to target the slot that
+    /// caused their composition while allowing a past L2 terminal timestamp.
     ExactBlock { block: u64 },
     /// Land in exactly L1 block `block`, and only if its timestamp equals
     /// `timestamp`. The timestamp pin makes the settlement slot match the
@@ -51,17 +51,6 @@ pub enum BundleTarget {
     /// late) won't match — the bundle drops instead of settling with a
     /// drifted L2 timestamp.
     Exact { block: u64, timestamp: u64 },
-}
-
-impl BundleTarget {
-    /// Preserve the target block while removing any timestamp constraint.
-    #[must_use]
-    pub const fn without_timestamp_pin(self) -> Self {
-        match self {
-            Self::Exact { block, .. } => Self::ExactBlock { block },
-            target => target,
-        }
-    }
 }
 
 /// One bundle attempt's outcome. `Dropped` is the expected miss path —
@@ -725,29 +714,9 @@ fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutc
 
 #[cfg(test)]
 mod tests {
-    use super::{BundleTarget, PinnedVerdict, pinned_verdict, reverting_whitelist};
+    use super::{PinnedVerdict, pinned_verdict, reverting_whitelist};
 
     const PIN: u64 = 1_700_000_012;
-
-    #[test]
-    fn removing_timestamp_pin_preserves_the_exact_block() {
-        assert_eq!(
-            BundleTarget::Exact {
-                block: 42,
-                timestamp: PIN,
-            }
-            .without_timestamp_pin(),
-            BundleTarget::ExactBlock { block: 42 },
-        );
-        assert_eq!(
-            BundleTarget::ExactBlock { block: 43 }.without_timestamp_pin(),
-            BundleTarget::ExactBlock { block: 43 },
-        );
-        assert_eq!(
-            BundleTarget::NextBlock.without_timestamp_pin(),
-            BundleTarget::NextBlock,
-        );
-    }
 
     /// The postBatch at index 0 is never whitelisted: if it reverts nothing
     /// settled, so letting the user_txs land would deliver calls with no state.

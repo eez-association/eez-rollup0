@@ -427,9 +427,9 @@ where
                     header: last_header.clone(),
                 };
                 let prebuilt = composer
-                    // Supply the immediate next L1 block for any historical
-                    // chunk. The ordinary catch-up marker remains unpinned so
-                    // it can survive an L1 reorg.
+                    // Supply the immediate next L1 block for a cap-triggered
+                    // historical chunk. The ordinary catch-up marker remains
+                    // unpinned so it can survive an L1 reorg.
                     .compose_sync_slot(
                         rollup_id,
                         parent,
