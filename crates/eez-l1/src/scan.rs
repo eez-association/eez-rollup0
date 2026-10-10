@@ -1427,7 +1427,10 @@ mod tests {
         let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
             .await
             .expect_err("off-fork skips must be retryable, not silently 'nothing skipped'");
-        assert!(err.is_source_incomplete(), "unexpected error: {err}");
+        assert!(
+            matches!(err, L1Error::SourceIncomplete { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     /// The boot-crash fix's linchpin: a tx the L1 serves at (block hash, index) is
@@ -1454,7 +1457,6 @@ mod tests {
         let err = fetch_log_transaction(&provider, 14, B256::ZERO, 7, real_hash)
             .await
             .expect_err("null lookup must not yield a tx");
-        assert!(err.is_source_incomplete(), "unexpected error: {err}");
         match err {
             L1Error::SourceIncomplete {
                 block, tx_hash: h, ..
@@ -1481,7 +1483,10 @@ mod tests {
         let err = fetch_log_transaction(&provider, 14, B256::ZERO, 0, claimed_hash)
             .await
             .expect_err("mismatched tx must be rejected, not accepted");
-        assert!(err.is_source_incomplete(), "unexpected error: {err}");
+        assert!(
+            matches!(err, L1Error::SourceIncomplete { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     /// A result-count refusal must NARROW the range, not abort the scan: the
@@ -1699,7 +1704,10 @@ mod tests {
         let error = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
             .await
             .expect_err("a positionless log must not be skipped");
-        assert!(error.is_transport(), "retryable, not terminal: {error}");
+        assert!(
+            matches!(error, L1Error::Provider(_)),
+            "retryable, not terminal: {error}"
+        );
     }
 
     /// A postBatch for another rollup shares our block without closing our
@@ -1769,7 +1777,10 @@ mod tests {
         let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
             .await
             .expect_err("all settlement roots on a different fork must not settle empty");
-        assert!(err.is_source_incomplete(), "unexpected error: {err}");
+        assert!(
+            matches!(err, L1Error::SourceIncomplete { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     /// `BatchPosted` does not index rollupIds, so a peer posting via a
@@ -1802,6 +1813,9 @@ mod tests {
         let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
             .await
             .expect_err("an undecodable batch that moved our root must not be skipped");
-        assert!(err.is_terminal(), "unexpected error: {err}");
+        assert!(
+            matches!(err, L1Error::Decode(_) | L1Error::ReorgTooDeep { .. }),
+            "unexpected error: {err}"
+        );
     }
 }

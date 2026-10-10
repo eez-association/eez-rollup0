@@ -64,16 +64,6 @@ pub enum BuildError {
     Builder(String),
 }
 
-impl BuildError {
-    /// Whether this is a backing-store failure (reth MDBX read) rather than
-    /// anything the transaction did — transient, so a caller must retry rather
-    /// than blame the tx.
-    #[must_use]
-    pub const fn is_provider(&self) -> bool {
-        matches!(self, Self::Provider(_))
-    }
-}
-
 /// Built Sync-block artifact ready for [`commit_derived`].
 ///
 /// [`commit_derived`]: eez_driver::BlockCommitterHandle::commit_derived

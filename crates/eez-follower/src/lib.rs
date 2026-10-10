@@ -6,9 +6,9 @@ use std::{env, str::FromStr, sync::Arc, time::Duration};
 
 use alloy_primitives::Address;
 use alloy_provider::RootProvider;
-use eez_deriver::Deriver;
+use eez_deriver::{Deriver, DeriverError};
 use eez_driver::{BlockCommitterHandle, RollupTiming};
-use eez_l1::{L1CanonicalHead, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
+use eez_l1::{L1CanonicalHead, L1Error, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
 use eez_node_common::EezNode;
 use eez_node_common::{
     L2NodeBuilder, node_cli, read_checkpoint_dir, wait_for_l1_ready, warn_on_deprecated_env,
@@ -130,7 +130,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         match deriver.catch_up_with_seed().await {
             Ok(seed) => break seed,
             Err(err)
-                if err.is_l1_transport() && {
+                if matches!(&err, DeriverError::L1Scan(L1Error::Provider(_))) && {
                     transport_failures += 1;
                     transport_failures >= BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES
                 } =>
@@ -147,7 +147,12 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
                     "boot-time deriver catch_up gave up after {transport_failures} L1 transport failures: {err}"
                 ));
             }
-            Err(err) if err.is_source_incomplete() || err.is_l1_transport() => {
+            Err(err)
+                if matches!(
+                    &err,
+                    DeriverError::L1Scan(L1Error::SourceIncomplete { .. } | L1Error::Provider(_))
+                ) =>
+            {
                 attempts += 1;
                 event!(
                     name: "eez.node.deriver.boot_catch_up.source_incomplete",

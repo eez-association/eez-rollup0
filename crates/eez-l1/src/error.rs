@@ -47,28 +47,3 @@ pub enum L1Error {
     )]
     ReorgTooDeep { walked: usize, max: usize },
 }
-
-impl L1Error {
-    /// Returns true when the L1 source may simply need more time to
-    /// expose already-observed canonical data.
-    #[must_use]
-    pub const fn is_source_incomplete(&self) -> bool {
-        matches!(self, Self::SourceIncomplete { .. })
-    }
-
-    /// True for a transport failure (DNS, TCP, HTTP) — the peer never answered,
-    /// so it says nothing about the payload we sent. Decode failures are NOT
-    /// transport: they are deterministic and never clear on retry.
-    #[must_use]
-    pub const fn is_transport(&self) -> bool {
-        matches!(self, Self::Provider(_))
-    }
-
-    /// True when retrying re-reads the same bytes or re-walks the same chain,
-    /// so a polling caller would spin forever instead of failing. Both arms
-    /// document operator intervention; this is what makes that real.
-    #[must_use]
-    pub const fn is_terminal(&self) -> bool {
-        matches!(self, Self::Decode(_) | Self::ReorgTooDeep { .. })
-    }
-}

@@ -426,7 +426,12 @@ impl Inner {
                         // The receipt proves it landed, and a failed read says
                         // nothing about how it settled, so keep reading. If a
                         // reorg removes the block, the receipt goes with it.
-                        Err(err) if !err.is_terminal() => {
+                        Err(err)
+                            if !matches!(
+                                err,
+                                L1Error::Decode(_) | L1Error::ReorgTooDeep { .. }
+                            ) =>
+                        {
                             if settlement_read_warned
                                 .is_none_or(|at| at.elapsed() >= SETTLEMENT_READ_WARN_EVERY)
                             {
