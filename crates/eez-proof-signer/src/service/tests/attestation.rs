@@ -217,7 +217,7 @@ async fn a_second_anchor_is_rejected_by_the_effect_prefix_gate() {
 }
 
 #[tokio::test]
-async fn an_anchor_only_batch_rejects_a_missing_empty_prefix_checkpoint() {
+async fn anchor_only_output_requires_empty_prefix_checkpoint() {
     let inputs = happy_block_inputs();
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[2].transaction_state_checkpoints = Vec::new();
@@ -225,8 +225,8 @@ async fn an_anchor_only_batch_rejects_a_missing_empty_prefix_checkpoint() {
 
     let status = server.prove(happy_window()).await;
 
-    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
-    assert_eq!(status.message(), "settlement validation rejected");
+    assert_eq!(status.code(), Code::Internal, "{status:?}");
+    assert_eq!(status.message(), "validation backend returned invalid output");
 }
 
 #[tokio::test]
