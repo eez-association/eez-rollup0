@@ -84,25 +84,25 @@ message Finalize {
   uint64 from_block = 1;
   uint64 to_block = 2;
   bytes terminal_hash = 3;
-  // A new field distinguishes the complete input from the old calldata-only
-  // layout. Old decoders see no PostBatch rather than signing stripped context.
-  oneof input {
-    // Original Rollup0-only encoding. New clients use settlement. Never retry a
-    // blob/context request by stripping its inputs and using this field.
-    prove.v1.PostBatch post_batch = 4 [deprecated = true];
-    SettlementInput settlement = 5;
-  }
+  // Removed calldata-only alternative. Never reinterpret its bytes as settlement.
+  reserved 4;
+  reserved "post_batch";
+  // Required for every profile; absent input is INVALID_ARGUMENT.
+  SettlementInput settlement = 5;
 }
 
 // Common EEZ settlement input, independent of session recovery and prover backend.
 message SettlementInput {
-  // Exact proofless EEZ.postAndVerifyBatch calldata for the configured ABI.
+  // Exact proofless EEZ.postAndVerifyBatch calldata for the configured ABI,
+  // including when the posting client submits it through a settlement wrapper.
   bytes abi_calldata = 1;
   // FEATURE_BLOBS: complete physical EIP-4844 blobs in transaction order.
-  // The prover derives commitments/versioned hashes itself. RollupX requires
-  // at least one blob, empty batch.callData, and blobIndices == [0, 1, ...].
+  // The prover derives commitments/versioned hashes itself. RollupX and draft
+  // blob-based Rollup0 require all blobs, empty batch.callData and indices [0, 1, ...].
   repeated bytes blobs = 2;
   // FEATURE_POSTING_CONTEXT: named L1 target, independently authenticated.
+  // Manager-specific custom data is derived from trusted profile/deployment rules,
+  // not supplied here. Both blob profiles use these same target fields.
   // Required together with parent_provenance for the RollupX profile.
   L1PostingContext posting_context = 3;
   // Evidence for the predecessor of Finalize.from_block, not necessarily the

@@ -172,28 +172,35 @@ Composer abandons its corresponding batch or settlement cutoff.
 
 ## 3. Common finalization input
 
-New requests use `Finalize.settlement`, containing exact proofless
+Every request uses `Finalize.settlement`, containing exact proofless
 EEZ.postAndVerifyBatch calldata, physical blobs, an L1PostingContext and
 ParentProvenance. The last three inputs are optional at the common wire layer;
-the configured profile decides which are required. Rollup0's calldata-only,
-timeless profile omits all three. The RollupX profile below requires all three.
+the configured profile decides which are required. Today's calldata-only,
+timeless Rollup0 profile omits all three. RollupX requires all three. Blob-based
+Rollup0 uses the same blob and L1 target fields; its parent must be authenticated
+under its own settled-cursor rules. Supporting the wire fields does not imply
+that a prover implements every profile.
 There is no authoritative Composer-claimed public-input hash, commitment or
 custom-data value in this envelope.
 
 The settlement inputs follow RollupX main at
-[`1eab395`](https://github.com/eduadiez/rollupX/blob/1eab3955775aec75612a7144d70f8245771ba97d/crates/eez-control-rpc/proto/prove.proto).
+[`e15bb41`](https://github.com/eduadiez/rollupX/blob/e15bb412420b36bfa40a0e2a73233ac4f213441d/crates/eez-control-rpc/proto/prove.proto)
+and were checked against Rollup0's
+[draft Appendix D](https://github.com/eez-association/specs-draft/blob/2c6d346bea0b3736f7453c35174291495694d1fc/docs/rollup0-spec/D-wire-formats.md)
+and [DA/batch rules](https://github.com/eez-association/specs-draft/blob/2c6d346bea0b3736f7453c35174291495694d1fc/docs/rollup0-spec/07-da-batches-bundles.md).
 L1PostingContext and ParentProvenance preserve its field names, types and tags.
 They are new `prove.v2` messages here: this does not replace either project's
 v1 RPC or copy RollupX's preparation, lease or cache APIs.
+The outer v2 envelope is not byte-compatible with RollupX's v1 ProveHeader/PostBatch.
 
 A client requests its required input capabilities in Begin and checks Ready.
 BLOBS covers physical blobs; POSTING_CONTEXT covers the L1 target and L2 parent
 provenance. A server MUST reject unadvertised use of either with UNIMPLEMENTED,
 not discard those fields. Unsupported validation profiles are never enabled
 merely by accepting a feature flag. Missing profile-required inputs, malformed
-encodings or an absent/unrecognized finalization variant are INVALID_ARGUMENT;
+encodings or an absent settlement message are INVALID_ARGUMENT;
 inconsistent execution/settlement claims yield no proof. Future proof-relevant
-extensions must require a new feature or input variant: unknown protobuf fields
+extensions must require explicit feature or protocol negotiation: unknown protobuf fields
 alone do not negotiate support.
 
 ### Physical blobs
@@ -207,17 +214,37 @@ index, claimed commitment or blob proof is sent; network sidecar construction
 remains the posting client's responsibility. The actual transaction must carry
 the same physical blobs in the same order.
 
-RollupX additionally requires at least one blob, empty batch.callData and
-batch.blobIndices exactly `[0, 1, ..., blobs.len() - 1]`. It rejects gaps,
+Both RollupX and draft blob-based Rollup0 require at least one blob, empty
+batch.callData and batch.blobIndices exactly `[0, 1, ..., blobs.len() - 1]`. They reject gaps,
 duplicates, reordered indices, extra/unselected blobs and calldata-only DA.
 Resolve the active per-transaction/per-block allowance from the independently
 configured L1 chain profile and target timestamp, not a client-supplied limit.
-The native version-00 EEZ message stream must have its leading ChainOperation,
-complete semantic transaction brackets and CloseBlobStream with canonical
-packing/padding. Decode and compare the operations and semantic effects against
-the selected execution; hashing blobs alone is insufficient. The
-[RollupX DA gate](https://github.com/eduadiez/rollupX/blob/1eab3955775aec75612a7144d70f8245771ba97d/crates/eez-proof-signer/src/settlement/blob_da.rs)
-and its configured native codec define those profile rules.
+
+The draft delegates physical packing and framing to
+[EEZ Core's blob format](https://github.com/eez-association/eez-core-protocol/blob/9a1f815336c20d28e5ec5cecbf195c41fbd5ab0f/docs/blobs/BLOB_FORMAT_SPEC.md),
+shown here at RollupX's pinned Core revision. Each field element carries 31
+logical bytes: serialized offset 0 is zero and offsets 31 down to 1 recover
+the logical bytes in order. Concatenate elements and blobs in order; messages
+may cross blob boundaries. The version-00 stream ends its blob portion with
+CloseBlobStream followed by zero padding. The RPC carries the original 131072-byte
+blobs, not this unpacked stream or separately encoded per-block fragments.
+Core also defines a calldata tail; both blob profiles here require it to be empty.
+If another profile permits a tail, it is already in the ABI batch.callData field,
+not a second RPC payload.
+
+The rollup-specific payload version and codec live inside the opaque operations
+bytes. Draft Rollup0 uses its Appendix D columnar V0 span and restricted action
+brackets; RollupX uses its configured native codec. The same RPC fields carry
+either without claiming their payloads or execution rules are interchangeable.
+Validate the stream, then bind decoded operations and semantic effects to the
+selected execution; hashing blobs alone is insufficient. Do not enforce shortest
+varints on the outer EEZ stream, which permits non-minimal encodings. Rollup0's
+inner V0 uvarints have their own shortest-form rule.
+
+Rollup0's draft explicitly leaves the production Core revision and complete
+end-to-end vectors to be pinned. Its companion-docs/blob-da-spec.md is a retired
+placeholder, not the normative format. The common RPC can carry the required
+data, but wire compatibility does not resolve those deployment/spec blockers.
 
 ### L1 posting context
 
@@ -229,14 +256,25 @@ L1PostingContext contains exactly the RollupX target fields:
 - parent_hash: a nonzero 32-byte hash, independently authenticated at that height.
 
 The intended posting block is the child of this parent; neither parent_number
-nor that child height is batch.blockNumber. RollupX requires
-`batch.blockNumber == uint64.max` and `bindMsgSenderInPublicInput == false`.
-Derive the reference manager's custom data as
-`abi.encode(uint256(target_timestamp), parent_hash)` and the bound sender as
-zero. Timeless/specific-block requests and sender-bound requests are rejected
-by this profile; no arbitrary custom-data or sender override is supplied.
-The [implemented hash construction](https://github.com/eduadiez/rollupX/blob/1eab3955775aec75612a7144d70f8245771ba97d/crates/eez-protocol/src/public_inputs.rs)
-is authoritative for these values, not older examples of timeless batches.
+nor that child height is batch.blockNumber. Both blob profiles require
+`batch.blockNumber == uint64.max`; they do not use the older timeless mode.
+The manager's custom-data derivation is profile-specific:
+
+- RollupX uses `abi.encode(uint256(target_timestamp), parent_hash)` and rejects
+  sender-bound batches, as specified by its
+  [hash implementation](https://github.com/eduadiez/rollupX/blob/e15bb412420b36bfa40a0e2a73233ac4f213441d/crates/eez-protocol/src/public_inputs.rs).
+- Draft Rollup0 uses the richer candidate domain in Appendix D.2: the protocol
+  tag, L1 chain ID, EEZ/manager/active-wrapper addresses, EEZ rollup ID and L2 chain
+  ID, followed by the target timestamp and L1 parent hash. Its wrapper calls EEZ
+  with the unchanged batch and blob context; abi_calldata remains the inner
+  proofless EEZ call, not a second wrapper-call encoding.
+
+The existing target fields supply the changing L1 values for both. Derive all
+other domain values from trusted deployment configuration and authenticated L1
+state, including the active wrapper; do not add caller-selected custom data or
+manager/wrapper overrides. The profile and its validation identity must identify
+the applicable rules. Sharing fields does not mean sharing public-input hashes
+or accepting a signature under another deployment's domain.
 
 Authenticate the named parent through the prover's configured L1 source and
 check the target timestamp against its chain/slot rules. The target is a
@@ -272,31 +310,46 @@ invalid provenance is FAILED_PRECONDITION. These failures have no actionable
 candidate-eviction details. No proof may be issued until all authorization,
 execution and settlement gates pass, regardless of earlier Validated ACKs.
 
+The preceding parent-provenance rules are RollupX-specific. Draft Rollup0 instead
+requires the candidate's named parent to match its Ethereum-confirmed settled
+cursor; do not apply RollupX's terminal-prefix allowance merely because both
+use the same blob transport. Any supplied ParentProvenance must be bound to the
+selected predecessor and checked under the configured profile, never trusted.
+
 This profile aligns the inputs and verification obligations with the pinned
 RollupX source. It does not mandate that implementation's worker/cache layout or
 assert live v2 interoperability. Its ABI, native codec, chain rules and validation
 identity must be configured together; this proposal does not upgrade this
 repository's protocol submodule or runtime to RollupX's deployment.
 
+### Separate delivery-validation gap
+
+Rollup0 draft Chapters 7 and 8 require the exact signed L1 trigger transactions
+for simulation of any proposed nonzero synchronous prefix. They are deliberately
+absent from blob action identity: the bracket's tx_data is empty. Neither this
+settlement-only RPC nor RollupX's current RPC carries those delivery inputs.
+That remains a separate interface extension, not implicit support from BLOBS or
+POSTING_CONTEXT. A service claiming the draft's full validation behavior must
+obtain and simulate them through an explicit delivery interface before signing;
+without that interface it must reject such requests, not silently skip the check.
+No trigger-transaction or bundle-simulation fields are added by this proposal.
+
 ### Compatibility and unsupported inputs
 
-The original field 4, Finalize.post_batch, remains a deprecated oneof variant
-for the existing calldata-only Rollup0 encoding. Its l1_block_hash must be
-empty; its claimed public-input hash is ignored. New input uses field 5, so
-older decoders see a missing PostBatch instead of silently ignoring additional
-fields inside an accepted PostBatch. Do not send both variants or automatically
-downgrade a failed blob/context request.
+Finalize has one required settlement message at field 5. The old post_batch name
+and field 4 are reserved; there is no oneof or legacy fallback. Old field-4-only
+requests decode with settlement absent and MUST be rejected with INVALID_ARGUMENT.
+Conversely, an old decoder cannot interpret field 5 as the old PostBatch. Never
+strip blobs or context to retry as a weaker request.
 
-RollupX MUST reject the legacy PostBatch variant: it cannot carry the mandatory
-physical blobs, target and parent provenance. This repository's unchanged v1
-PostBatch is not the extended PostBatch in RollupX's fork. New clients also
-require the validation-identity handshake above; older v2 clients without an
-identity need an explicit upgrade rather than an implicit compatibility mode.
+Calldata-only Rollup0 can use the same settlement message with its optional inputs
+absent, then populate the existing blob/context fields when its profile migrates.
+The unchanged v1 endpoint remains separate. Older v2 clients must upgrade their
+Finalize encoding and validation-identity handshake explicitly.
 
-The generated accessor changes to Finalize.input. Runtime adapters for this
-proposal must dispatch it and perform capability checks explicitly. This
-design-only change does not alter the existing window runtime or assert that
-RollupX settlement execution is already implemented in this repository.
+The generated accessor is Finalize.settlement. Runtime adapters must check its
+presence and profile/capability requirements. This design-only change neither
+changes the existing runtime nor claims full Rollup0-draft or live RollupX conformance.
 
 ## 4. Optional advanced session controls
 

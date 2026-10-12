@@ -8,7 +8,7 @@
 //! request/response: no feed, no dispatch, no sink.
 //!
 //! The proposed `prove.v2.Prover/ProveStream` contract has a small sequential
-//! baseline, advertised optional session controls, and RollupX-aligned blob and
+//! baseline, advertised optional session controls, and shared blob and
 //! posting inputs. This crate defines wire types, not runtime support.
 //! Only generated types + tonic stubs live here — no `Prover`-trait coupling.
 
