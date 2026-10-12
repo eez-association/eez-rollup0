@@ -1,4 +1,4 @@
-// Proposed Composer-to-prover streaming contract; see ../STREAMING_SPEC.md.
+// Composer-to-prover streaming contract; see ../STREAMING_SPEC.md.
 // Required: Begin -> Block* -> Finalize on one stream, with no shared cache.
 // Unsupported operations or settlement inputs return Rejected with UNIMPLEMENTED.
 syntax = "proto3";
@@ -35,8 +35,9 @@ message ClientFrame {
 
 message Begin {
   uint64 rollup_id = 1;
-  // Execution predecessor. The first expected block is anchor_number + 1;
-  // Finalize separately authenticates its selected predecessor's L1 acceptance.
+  // Execution predecessor and baseline settlement parent. The first expected
+  // block is anchor_number + 1. The prover fetches and verifies the parent's
+  // L1 acceptance independently at Finalize.
   uint64 anchor_number = 2;
   bytes anchor_hash = 3;
   bytes anchor_state_root = 4;
@@ -61,9 +62,11 @@ message Block {
 }
 
 message Finalize {
-  // First block of the selected validated range. Its predecessor becomes this
-  // finalization's settlement anchor and must also belong to the session.
+  // Baseline: the block immediately after the current session anchor (initially Begin).
+  // Starting later is optional subrange finalization; unsupported requests return
+  // UNIMPLEMENTED. Its predecessor must already be in the validated session prefix.
   uint64 from_block = 1;
+  // Inclusive validated terminal; may precede the current tip.
   uint64 to_block = 2;
   bytes terminal_hash = 3;
   // Required for every profile; absent input is INVALID_ARGUMENT.
@@ -71,7 +74,7 @@ message Finalize {
 }
 
 // Common EEZ settlement input, independent of session recovery and prover backend.
-// Unsupported blobs, context or provenance cause UNIMPLEMENTED, never silent omission.
+// Unsupported blobs or context cause UNIMPLEMENTED, never silent omission.
 message SettlementInput {
   // Exact proofless EEZ.postAndVerifyBatch calldata for the configured ABI,
   // including when the posting client submits it through a settlement wrapper.
@@ -83,11 +86,8 @@ message SettlementInput {
   // Named L1 target, independently authenticated.
   // Manager-specific custom data is derived from trusted profile/deployment rules,
   // not supplied here. Both blob profiles use these same target fields.
-  // Required together with parent_provenance for the RollupX profile.
+  // Required for the RollupX profile.
   L1PostingContext posting_context = 3;
-  // Evidence for the predecessor of Finalize.from_block, not necessarily the
-  // original Begin anchor. L1 authorization is checked even for cached execution.
-  ParentProvenance parent_provenance = 4;
 }
 
 // Same fields/tags as RollupX's L1PostingContext; not an inclusion/finality claim.
@@ -96,14 +96,6 @@ message L1PostingContext {
   uint64 target_timestamp = 2;
   uint64 parent_number = 3;
   bytes parent_hash = 4; // nonzero 32-byte hash; authenticated on configured L1.
-}
-
-// Same fields/tags as RollupX's ParentProvenance. These are L2 headers, not L1
-// ancestor headers. Their acceptance and complete live-slot set are checked on L1.
-message ParentProvenance {
-  bytes parent_header_rlp = 1;
-  uint64 accepted_l1_number = 2; // zero only for the configured L2 genesis.
-  repeated bytes live_slot_endpoint_headers_rlp = 3;
 }
 
 // Optional; unsupported Cancel returns UNIMPLEMENTED. Ordinary gRPC cancellation

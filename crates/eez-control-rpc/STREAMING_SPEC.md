@@ -20,14 +20,14 @@ Begin(anchor) -> Ready(anchor)
 Block(anchor + 1) -> Validated
 Block(anchor + 2) -> Validated
 ...
-Finalize(range, settlement) -> Proof -> EOF
+Finalize(anchor + 1 .. terminal, settlement) -> Proof -> EOF
 ```
 
 A baseline prover needs only one stream-local prefix and sequential execution.
 It MAY limit capacity to one active stream/session, keep no global block cache,
 and discard the prefix when the stream ends. Its epoch can be the constant 1.
-It need not implement Resume, Rewind, application-level Cancel, durable recovery,
-parallel execution, deduplication or cross-session sharing.
+It need not implement subrange finalization, Resume, Rewind, application-level
+Cancel, durable recovery, parallel execution, deduplication or cross-session sharing.
 
 Optional operations and settlement inputs are attempted directly, without a
 capability handshake. Unsupported operations, including a
@@ -35,8 +35,8 @@ frame with no recognized operation, return a correlated Rejected with
 UNIMPLEMENTED. A rejection must not change progress or end a bound stream.
 Unsupported Resume on an unbound stream returns an unbound rejection.
 
-Unsupported blobs, posting context or parent provenance also return UNIMPLEMENTED;
-they must never be silently discarded. A client may fall back to the baseline
+Unsupported blobs or posting context also return UNIMPLEMENTED; they must never
+be silently discarded. A client may fall back to the baseline
 session flow, but must not remove proof-relevant inputs to obtain a proof.
 
 Server capacity, retention, deadlines, chain/rollup rules, ABI and proof system
@@ -112,9 +112,24 @@ a conforming implementation may always return false.
 Finalize selects a nonempty contiguous inclusive [from_block, to_block] range
 and its 32-byte terminal_hash. Every selected block and its predecessor must
 belong to the validated prefix. The hash must match the selected terminal.
-Range selection may begin after the original anchor or end before the tip.
-The selected predecessor is the settlement anchor; L1 applicability and the
-rollup's settlement rules are checked at finalization, not established by ACKs.
+
+The baseline starts immediately after the session anchor, initially
+`from_block == Begin.anchor_number + 1`. That anchor is its settlement parent.
+The terminal may be any validated block, including one before the tip.
+
+Starting at a later from_block is optional subrange finalization. Its predecessor
+must already be a validated block in the session. A prover that does not support
+this selection returns a correlated Rejected with UNIMPLEMENTED, leaving the
+anchor, epoch and validated prefix unchanged. The client can open a new stream,
+Begin at the desired predecessor and backfill the same requested range; it must
+not silently widen the range or change the settlement input.
+
+The prover obtains the selected parent's header and L1 acceptance evidence from
+its own L1/L2 data sources and authenticates them under the configured settlement
+rules. For an intermediate parent, its execution evidence is already retained;
+its L1 authorization must still be checked. Validated ACKs alone never establish
+settlement eligibility. Missing evidence is UNAVAILABLE, not permission to sign.
+No parent-provenance payload is sent by the Composer.
 
 Finalize binds the complete settlement input in section 3 to that exact range.
 Only successful execution, settlement, DA, proof-system and public-input checks
@@ -125,6 +140,8 @@ hash and proof against the exact request and configured verifier.
 Proof closes the stream successfully. Without Resume support the session ends
 there; with Resume support it retains the selected range and any later validated
 suffix, promotes the selected predecessor to anchor and may release earlier data.
+After resuming, the promoted anchor is the baseline parent for that session;
+Resume support alone does not require support for selecting a later parent.
 Proof never advances the Composer's L1 settlement cursor by itself.
 
 Client half-close drains accepted work; EOF without a Proof is not success.
@@ -135,13 +152,13 @@ after the Composer abandons its corresponding batch or settlement cutoff.
 ## 3. Common finalization input
 
 Every request uses `Finalize.settlement`, containing exact proofless
-EEZ.postAndVerifyBatch calldata, physical blobs, an L1PostingContext and
-ParentProvenance. The last three inputs are optional at the common wire layer;
-the configured profile decides which are required. Today's calldata-only,
-timeless Rollup0 profile omits all three. RollupX requires all three. Blob-based
-Rollup0 uses the same blob and L1 target fields; its parent must be authenticated
-under its own settled-cursor rules. Supporting the wire fields does not imply
-that a prover implements every profile.
+EEZ.postAndVerifyBatch calldata, physical blobs and an L1PostingContext.
+Blobs and posting context are optional at the common wire layer; the configured
+profile decides which are required. Today's calldata-only, timeless Rollup0
+profile omits both. The RollupX blob profile requires both. Blob-based Rollup0
+uses these same fields, with its own payload and settlement rules.
+Parent authorization is the prover's responsibility, not an RPC input.
+Supporting the wire fields does not imply that a prover implements every profile.
 There is no authoritative Composer-claimed public-input hash, commitment or
 custom-data value in this envelope.
 
@@ -150,12 +167,12 @@ The settlement inputs follow RollupX main at
 and were checked against Rollup0's
 [draft Appendix D](https://github.com/eez-association/specs-draft/blob/2c6d346bea0b3736f7453c35174291495694d1fc/docs/rollup0-spec/D-wire-formats.md)
 and [DA/batch rules](https://github.com/eez-association/specs-draft/blob/2c6d346bea0b3736f7453c35174291495694d1fc/docs/rollup0-spec/07-da-batches-bundles.md).
-L1PostingContext and ParentProvenance preserve its field names, types and tags.
-They are new `prove.v2` messages here: this does not replace either project's
-v1 RPC or copy RollupX's preparation, lease or cache APIs.
+L1PostingContext preserves its field names, types and tags. Unlike RollupX's
+existing RPC, this interface leaves provenance retrieval to the prover. It does
+not replace either project's v1 RPC or copy RollupX's preparation, lease or cache APIs.
 The outer v2 envelope is not byte-compatible with RollupX's v1 ProveHeader/PostBatch.
 
-A server MUST reject unsupported blobs, posting context or parent provenance
+A server MUST reject unsupported blobs or posting context
 with UNIMPLEMENTED, without producing a proof or changing validated progress.
 Unsupported rollup profiles also return UNIMPLEMENTED. Missing profile-required
 inputs, malformed encodings or an absent settlement message are INVALID_ARGUMENT;
@@ -244,37 +261,38 @@ only after the new target's constraints are checked. Do not require the named
 parent to remain the tip: the on-chain latest-context binding determines whether
 the proof can be used in the actual posting environment.
 
-### Selected L2 parent provenance
+### Prover-owned parent authorization
 
-RollupX requires ParentProvenance on every Finalize, including retries and
-cache-hit windows. It contains the canonical RLP of the selected L2 predecessor,
-its accepted_l1_number (zero only for the configured genesis), and the complete
-ordered live_slot_endpoint_headers_rlp set. These are **L2 headers**, not an L1
-ancestor-header chain. Bind the parent header's number/hash/state root to the
-predecessor of from_block; do not assume it is still the original Begin anchor.
+At every Finalize, including retries and cache hits, the prover authenticates
+the selected settlement parent. For the baseline this is the session anchor,
+initially supplied in Begin;
+with optional subrange finalization it is the retained block immediately before
+from_block. Fetch any missing header from the prover's L2 data source and bind
+its number, hash and state root to that session parent. Obtain acceptance history
+from the configured L1 source; neither a Composer-supplied anchor nor successful
+block execution proves L1 acceptance.
 
-The prover independently authenticates the configured genesis or that parent's
-L1 acceptance, verifies the complete live-slot endpoint set against canonical
-L1 observations, and derives the descendant seed. Every selected block must
-extend that parent and use the authenticated seed and allowed timing. Registry
-state at the named target parent must equal the accepted predecessor or a
-terminal prefix independently justified by execution and settlement checks.
-A matching registry root or a manually assigned root alone is not provenance.
+For the RollupX profile, authenticate the configured genesis or the selected
+parent's accepted endpoint on canonical L1. Obtain the complete ordered live-slot
+endpoint set and its L2 headers, verify them against canonical settlement, and
+derive the descendant seed. Every selected block must extend the parent and
+satisfy the authenticated seed and timing rules. Registry state at the named L1
+target must equal the accepted predecessor or a terminal prefix independently
+justified by execution and settlement checks. A matching registry root alone
+does not establish parent authorization. These are the obligations enforced by
+RollupX's [authorization implementation](https://github.com/eduadiez/rollupX/blob/e15bb412420b36bfa40a0e2a73233ac4f213441d/crates/eez-l1/src/derivation/proof.rs);
+its caller-supplied evidence is replaced here by prover-owned retrieval.
 
-RollupX limits each supplied header to 1024 bytes, exact-decodes and round-trips
-its RLP, and charges all headers to byte/witness quotas. Its
-[authorization implementation](https://github.com/eduadiez/rollupX/blob/1eab3955775aec75612a7144d70f8245771ba97d/crates/eez-l1/src/derivation/proof.rs)
-checks the named L1 parent's hash before and after the reads for a coherent
-snapshot. Unavailable evidence is UNAVAILABLE; a replaced target is ABORTED;
-invalid provenance is FAILED_PRECONDITION. These failures have no actionable
-candidate-eviction details. No proof may be issued until all authorization,
-execution and settlement gates pass, regardless of earlier Validated ACKs.
+The prover must use a coherent canonical L1 snapshot. Unavailable evidence is
+UNAVAILABLE; a replaced target is ABORTED; invalid parent authorization is
+FAILED_PRECONDITION. These failures have no actionable candidate-eviction details
+and must not consume validated progress. The prover needs access to the required
+history, but this contract does not mandate an index or storage layout.
 
-The preceding parent-provenance rules are RollupX-specific. Draft Rollup0 instead
-requires the candidate's named parent to match its Ethereum-confirmed settled
-cursor; do not apply RollupX's terminal-prefix allowance merely because both
-use the same blob transport. Any supplied ParentProvenance must be bound to the
-selected predecessor and checked under the configured profile, never trusted.
+Draft Rollup0 instead requires the selected parent to match its Ethereum-confirmed
+settled cursor. Do not apply RollupX's terminal-prefix allowance merely because
+both use the same blob transport. Supporting subrange selection never bypasses
+the configured rollup's parent-acceptance rules.
 
 This profile aligns the inputs and verification obligations with the pinned
 RollupX source. It does not mandate that implementation's worker/cache layout or
