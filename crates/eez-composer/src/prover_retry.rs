@@ -200,7 +200,9 @@ async fn prove_with_retry_at(
 
     loop {
         let attempt_timeout = match target {
-            BundleTarget::NextBlock => retry_deadline.saturating_duration_since(Instant::now()),
+            BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => {
+                retry_deadline.saturating_duration_since(Instant::now())
+            }
             BundleTarget::Exact { .. } => timing.proof_time(),
         };
         let result = match timeout(attempt_timeout, prover.prove(ctx.clone())).await {
@@ -746,5 +748,9 @@ mod tests {
             Some(94_500)
         );
         assert_eq!(proof_start_cutoff_ms(timing, BundleTarget::NextBlock), None);
+        assert_eq!(
+            proof_start_cutoff_ms(timing, BundleTarget::ExactBlock { block: 7 }),
+            None
+        );
     }
 }
