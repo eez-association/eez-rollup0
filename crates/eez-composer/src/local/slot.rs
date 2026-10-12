@@ -82,7 +82,7 @@ fn encoding_err(msg: impl Into<String>) -> ExecutorError {
 /// Classify a `transact` failure. A database read failure is transient, and an
 /// insufficient target balance is state-dependent; other validation failures
 /// are properties of the transaction (`Evm` ⇒ poison).
-fn transact_err(e: EVMError<EvmDatabaseError<ProviderError>>) -> ExecutorError {
+pub(super) fn transact_err(e: EVMError<EvmDatabaseError<ProviderError>>) -> ExecutorError {
     match e {
         EVMError::Database(db) => provider_err(db),
         EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { fee, balance }) => {

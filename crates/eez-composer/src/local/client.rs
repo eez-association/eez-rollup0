@@ -272,7 +272,7 @@ impl LocalChainClient {
                 (0, false, None)
             }
             Err(e) => {
-                tracing::warn!(%e, "source sim reverted");
+                tracing::warn!(%e, "source sim could not execute; tx will be evicted downstream");
                 (0, false, None)
             }
         };
