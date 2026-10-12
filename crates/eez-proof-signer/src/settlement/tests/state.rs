@@ -125,8 +125,7 @@ fn accepts_only_a_canonical_anchor_for_an_empty_settling_block() {
 
     let target_root = B256::repeat_byte(0x42);
     let target_batch = target_anchor_batch();
-    let target_batch =
-        verify_effect_prefix(&target_batch, target_root, &[], &settling).unwrap();
+    let target_batch = verify_effect_prefix(&target_batch, target_root, &[], &settling).unwrap();
     assert_eq!(
         (target_batch.inbound_count(), target_batch.outbound_count()),
         (0, 0)

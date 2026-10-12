@@ -226,7 +226,10 @@ async fn anchor_only_output_requires_empty_prefix_checkpoint() {
     let status = server.prove(happy_window()).await;
 
     assert_eq!(status.code(), Code::Internal, "{status:?}");
-    assert_eq!(status.message(), "validation backend returned invalid output");
+    assert_eq!(
+        status.message(),
+        "validation backend returned invalid output"
+    );
 }
 
 #[tokio::test]
