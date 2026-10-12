@@ -34,8 +34,7 @@ Empty means no optional requirement. An unsupported or unknown required feature
 (including UNSPECIFIED) MUST reject Begin with UNIMPLEMENTED and allocate no
 session. The first Ready advertises the complete optional feature set enabled
 for this session and rollup. Before sending blocks the client MUST verify that
-this list contains every required feature; this also detects older servers
-that silently ignored the new Begin field.
+this list contains every required feature.
 
 | Feature | Additional contract |
 | --- | --- |
@@ -69,8 +68,7 @@ with no actionable failure details. These are unbound Rejected responses.
 Every Ready MUST carry that local validation_identity, not an unchecked echo.
 The client checks it before using the session, including after Resume/Rewind.
 The identity and capabilities remain fixed for the session; a server whose rules
-changed must reject a resumed session. An old Ready without the identity cannot
-satisfy this handshake, even if it otherwise looks like a baseline response.
+changed must reject a resumed session. Missing or mismatching identities are invalid.
 Do not learn the expected identity by blindly trusting the first server reply.
 
 The digest algorithm belongs to the configured validation profile, not to the
@@ -81,7 +79,7 @@ addresses, canonical loaded chain-document digest/version, validator revision
 and dependency digest. Resource limits are not identity components. This
 build-specific namespace is not a universal cross-implementation hash; other
 backends need an explicitly agreed profile/identity, not an assumed match from
-the chain ID alone. Equality is a compatibility check, not signing authority.
+the chain ID alone. Equality checks agreement on validation rules, not signing authority.
 
 ### Baseline client behavior
 
@@ -334,22 +332,17 @@ obtain and simulate them through an explicit delivery interface before signing;
 without that interface it must reject such requests, not silently skip the check.
 No trigger-transaction or bundle-simulation fields are added by this proposal.
 
-### Compatibility and unsupported inputs
+### Required settlement input
 
-Finalize has one required settlement message at field 5. The old post_batch name
-and field 4 are reserved; there is no oneof or legacy fallback. Old field-4-only
-requests decode with settlement absent and MUST be rejected with INVALID_ARGUMENT.
-Conversely, an old decoder cannot interpret field 5 as the old PostBatch. Never
-strip blobs or context to retry as a weaker request.
+Every Finalize MUST supply settlement; absence is INVALID_ARGUMENT. The prover
+checks the input against the configured profile and negotiated capabilities.
+Never strip required blobs or context to retry as a weaker request.
 
 Calldata-only Rollup0 can use the same settlement message with its optional inputs
 absent, then populate the existing blob/context fields when its profile migrates.
-The unchanged v1 endpoint remains separate. Older v2 clients must upgrade their
-Finalize encoding and validation-identity handshake explicitly.
 
-The generated accessor is Finalize.settlement. Runtime adapters must check its
-presence and profile/capability requirements. This design-only change neither
-changes the existing runtime nor claims full Rollup0-draft or live RollupX conformance.
+This design-only change neither changes the existing runtime nor claims full
+Rollup0-draft or live RollupX conformance.
 
 ## 4. Optional advanced session controls
 

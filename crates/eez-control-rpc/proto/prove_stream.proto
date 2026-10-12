@@ -52,8 +52,8 @@ message Begin {
   uint64 anchor_number = 2;
   bytes anchor_hash = 3;
   bytes anchor_state_root = 4;
-  // Empty requests the baseline. The client must also check Ready contains
-  // every required feature, so an older server ignoring this field fails closed.
+  // Empty requests the baseline. The client must check Ready contains every
+  // required feature before sending blocks.
   repeated Feature required_features = 5;
   // Required 32-byte validation namespace, derived from the configured rules.
   // Compare before accepting blocks; Ready returns the server's local identity.
@@ -84,11 +84,8 @@ message Finalize {
   uint64 from_block = 1;
   uint64 to_block = 2;
   bytes terminal_hash = 3;
-  // Removed calldata-only alternative. Never reinterpret its bytes as settlement.
-  reserved 4;
-  reserved "post_batch";
   // Required for every profile; absent input is INVALID_ARGUMENT.
-  SettlementInput settlement = 5;
+  SettlementInput settlement = 4;
 }
 
 // Common EEZ settlement input, independent of session recovery and prover backend.
