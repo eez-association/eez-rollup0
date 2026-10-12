@@ -3534,7 +3534,10 @@ where
                 parent_header,
                 &empty_built.header,
                 Some(&empty_built.block),
-                &SyncCandidates::anchor_only(),
+                &SyncCandidates {
+                    anchor: empty_built.header.hash(),
+                    per_effect: Vec::new(),
+                },
                 &[], // no outbound entries
                 &[], // no outbound user txs
                 0,   // no inline outbound target calls
@@ -3706,7 +3709,10 @@ where
                     &boundary_parent,
                     &boundary_header,
                     None, // terminal is committed → witnesses come from the store
-                    &SyncCandidates::anchor_only(),
+                    &SyncCandidates {
+                        anchor: boundary_header.hash(),
+                        per_effect: Vec::new(),
+                    },
                     &[],
                     &[],
                     0, // no inline outbound target calls
@@ -3935,13 +3941,7 @@ where
             rollupUpdates: vec![eez_protocol::abi::RollupUpdateSol {
                 rollupId: rollup_id,
                 currentRoot: pre_block_hash,
-                // Alone, the anchor is the endpoint, so take it from the
-                // terminal rather than trust a caller for it.
-                newRoot: if candidates.per_effect.is_empty() {
-                    sync_block_hash
-                } else {
-                    candidates.anchor
-                },
+                newRoot: candidates.anchor,
                 etherDelta: alloy_primitives::aliases::I192::ZERO,
             }],
             proxyEntryHash: B256::ZERO,
@@ -4537,8 +4537,9 @@ async fn observe_bundle_outcome(
     if settled {
         optimistic.mark_settled(sync_height, post_batch_hash);
     } else if applied_any {
-        // L1 kept part of the batch, so this height stays canonical and
-        // recovery owes only the tail disposition — no rollback.
+        // Inclusion means any timestamp pin was satisfied, so this was not a
+        // skipped slot. L1 kept part of the batch, so this height stays
+        // canonical and recovery owes only the tail disposition — no rollback.
         optimistic.mark_settled_partial(sync_height, post_batch_hash);
     } else {
         // L1 ran nothing of this batch, so the height is unratified and the

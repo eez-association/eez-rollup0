@@ -217,13 +217,30 @@ async fn a_second_anchor_is_rejected_by_the_effect_prefix_gate() {
 }
 
 #[tokio::test]
-async fn empty_transaction_checkpoint_output_accepts_the_anchor_only_prefix() {
+async fn an_anchor_only_batch_rejects_a_missing_empty_prefix_checkpoint() {
     let inputs = happy_block_inputs();
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[2].transaction_state_checkpoints = Vec::new();
     let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output)]))).await;
 
-    let _response = server.attest(happy_window()).await;
+    let status = server.prove(happy_window()).await;
+
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+    assert_eq!(status.message(), "settlement validation rejected");
+}
+
+#[tokio::test]
+async fn an_anchor_only_batch_rejects_a_different_empty_prefix() {
+    let inputs = happy_block_inputs();
+    let mut backend_output = backend_output_for(&inputs);
+    backend_output.blocks[2].transaction_state_checkpoints =
+        vec![pre_execution_checkpoint(B256::repeat_byte(0xee))];
+    let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output)]))).await;
+
+    let status = server.prove(happy_window()).await;
+
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+    assert_eq!(status.message(), "settlement validation rejected");
 }
 
 #[tokio::test]
@@ -256,7 +273,7 @@ async fn an_outbound_effect_without_an_observed_call_is_rejected() {
 }
 
 #[tokio::test]
-async fn a_multi_block_effect_uses_the_penultimate_block_root() {
+async fn a_multi_block_outbound_effect_without_an_observed_call_is_rejected() {
     // The window closes on real block hashes, so the batch must claim the
     // blocks the fixture actually seals rather than arbitrary roots.
     let (window_pre, pre_settling_root, final_root) = window_endpoints(5, 6);

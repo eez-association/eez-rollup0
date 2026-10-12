@@ -446,6 +446,7 @@ fn anchor_reorg_is_aborted_through_the_complete_validation_path() {
     let terminal_root = B256::repeat_byte(3);
     let inner = provider_with_anchor(0, anchor_hash, anchor_root);
     inner.add_state_root(terminal_root);
+    inner.add_state_root(terminal_root);
     let provider = ReorgingProvider {
         inner,
         anchor_hash,
@@ -512,6 +513,7 @@ fn replays_an_empty_terminal_block_from_local_anchor_state() {
     let terminal_root = B256::repeat_byte(3);
     let provider = provider_with_anchor(0, anchor_hash, anchor_root);
     provider.add_state_root(terminal_root);
+    provider.add_state_root(terminal_root);
     let blocks = [admitted(1, anchor_hash, terminal_root)];
 
     let output = validate_blocks(
@@ -526,6 +528,14 @@ fn replays_an_empty_terminal_block_from_local_anchor_state() {
 
     assert_eq!(output.blocks.len(), 1);
     assert_eq!(output.blocks[0].post_state_root, terminal_root);
+    assert_eq!(
+        output.blocks[0].transaction_state_checkpoints,
+        [StateCheckpoint {
+            at: CheckpointAt::PreExecution,
+            state_root: terminal_root,
+            block_hash: blocks[0].claimed_hash(),
+        }],
+    );
 }
 
 #[test]
@@ -536,6 +546,7 @@ fn replayed_state_root_must_match_the_block_header() {
     let computed_root = B256::repeat_byte(3);
     let claimed_root = B256::repeat_byte(4);
     let provider = provider_with_anchor(0, anchor_hash, anchor_root);
+    provider.add_state_root(computed_root);
     provider.add_state_root(computed_root);
     let blocks = [admitted(1, anchor_hash, claimed_root)];
 

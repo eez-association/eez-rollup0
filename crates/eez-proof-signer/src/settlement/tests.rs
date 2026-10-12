@@ -304,11 +304,8 @@ fn verify_effect_prefix<'batch, 'settling>(
 ) -> Result<BoundEffectSequence<'batch, 'settling>, EffectPrefixError> {
     let verified_state_chain = verified_state_chain_for_test(batch);
     // Fixtures describe the anchor by the root it claims. Like the plan, lead
-    // with the empty prefix only when the settling block holds transactions.
-    let mut checkpoints = Vec::new();
-    if !settling.system_sender_flags().is_empty() {
-        checkpoints.push(pre_execution_checkpoint(empty_prefix_root));
-    }
+    // with the empty prefix for every settling block.
+    let mut checkpoints = vec![pre_execution_checkpoint(empty_prefix_root)];
     checkpoints.extend_from_slice(transaction_state_checkpoints);
     bind_effects_to_execution(&verified_state_chain, &checkpoints, settling)
 }

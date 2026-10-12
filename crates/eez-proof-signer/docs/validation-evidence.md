@@ -97,9 +97,8 @@ and `ValidatedWindow` is the only production handoff after shared checks. It:
 
 - separates `preceding_blocks` from the terminal `settling_block`;
 - carries `window_pre_block_hash` and `window_post_block_hash`;
-- reads every endpoint from a header field: `settling_pre_block_hash` is the
-  settling block's own parent hash, and `window_pre_block_hash` falls back to
-  it for a one-block window;
+- reads every endpoint from a header field; `window_pre_block_hash` falls back
+  to the settling block's own parent hash for a one-block window;
 - keeps the settling block's receipt outcomes and selected checkpoints beside
   that block; and
 - drops witnesses that execution has already consumed.

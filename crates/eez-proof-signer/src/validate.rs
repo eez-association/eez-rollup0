@@ -297,8 +297,6 @@ pub(crate) struct ValidatedWindow {
     /// Hash of the block before the first streamed one. Settlement still has
     /// to bind the batch's claimed anchor to this value.
     window_pre_block_hash: B256,
-    /// Hash of the block immediately before the settling block.
-    settling_pre_block_hash: B256,
     /// Hash of the settling block, closing the window.
     window_post_block_hash: B256,
     /// Validated blocks preceding the terminal settling block.
@@ -311,14 +309,6 @@ impl ValidatedWindow {
     /// Hash of the block before the first streamed one.
     pub(crate) fn window_pre_block_hash(&self) -> B256 {
         self.window_pre_block_hash
-    }
-
-    /// Hash of the block immediately before the terminal block. Test-only: the
-    /// anchor's gate reads the settling block's own empty-prefix candidate, not
-    /// its parent.
-    #[cfg(test)]
-    pub(crate) fn settling_pre_block_hash(&self) -> B256 {
-        self.settling_pre_block_hash
     }
 
     /// Hash of the settling block, closing the window.
@@ -340,14 +330,12 @@ impl ValidatedWindow {
     #[cfg(test)]
     pub(crate) fn for_test(
         window_pre_block_hash: B256,
-        settling_pre_block_hash: B256,
         window_post_block_hash: B256,
         preceding_blocks: Vec<ValidatedBlock>,
         settling_block: ValidatedSettlingBlock,
     ) -> Self {
         Self {
             window_pre_block_hash,
-            settling_pre_block_hash,
             window_post_block_hash,
             preceding_blocks,
             settling_block,
@@ -633,19 +621,16 @@ impl CheckedBackendWindowOutput {
     /// Rearrange already checked evidence for settlement without performing
     /// another trust transition.
     fn into_validated_window(self) -> ValidatedWindow {
-        // Every endpoint is a header field, so none needs deriving from the
-        // backend's roots — and the settling block's predecessor is simply its
-        // own parent, with no empty-window special case.
-        let settling_pre_block_hash = self.settling_block.output.decoded_parent_hash;
+        // Every endpoint is a header field, so none needs deriving from backend
+        // roots. A one-block window begins at the terminal's decoded parent.
         let window_pre_block_hash = self
             .preceding_blocks
             .first()
-            .map_or(settling_pre_block_hash, |block| {
+            .map_or(self.settling_block.output.decoded_parent_hash, |block| {
                 block.output.decoded_parent_hash
             });
         ValidatedWindow {
             window_pre_block_hash,
-            settling_pre_block_hash,
             window_post_block_hash: self.settling_block.output.computed_hash,
             preceding_blocks: self
                 .preceding_blocks

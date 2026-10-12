@@ -432,8 +432,8 @@ fn rejects_reexecuted_effects_and_unused_checkpoints_for_an_anchor_only_claim() 
         )
         .err(),
         Some(EffectPrefixError::TransactionStateCheckpointCountMismatch {
-            expected: 0,
-            actual: 1,
+            expected: 1,
+            actual: 2,
         })
     );
 }
