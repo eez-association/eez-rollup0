@@ -8,7 +8,7 @@
 //! request/response: no feed, no dispatch, no sink.
 //!
 //! The proposed `prove.v2.Prover/ProveStream` contract has a small sequential
-//! baseline, advertised optional session controls, and shared blob and
+//! baseline, optional session controls, and shared blob and
 //! posting inputs. This crate defines wire types, not runtime support.
 //! Only generated types + tonic stubs live here — no `Prover`-trait coupling.
 
@@ -112,8 +112,6 @@ mod tests {
                 anchor_number: 100,
                 anchor_hash: vec![0x11; 32],
                 anchor_state_root: vec![0x22; 32],
-                required_features: Vec::new(),
-                expected_validation_identity: vec![0x66; 32],
             })),
         };
         assert_eq!(
@@ -129,8 +127,6 @@ mod tests {
             kind: Some(server_frame::Kind::Ready(Ready {
                 validated_through: 100,
                 validated_hash: vec![0x11; 32],
-                supported_features: Vec::new(),
-                validation_identity: vec![0x66; 32],
             })),
         };
         assert_eq!(
@@ -191,8 +187,6 @@ mod tests {
             kind: Some(server_frame::Kind::Ready(Ready {
                 validated_through: 100,
                 validated_hash: vec![0x11; 32],
-                supported_features: Vec::new(),
-                validation_identity: vec![0x66; 32],
             })),
         };
         assert_eq!(

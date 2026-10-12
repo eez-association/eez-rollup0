@@ -1,6 +1,6 @@
 // Proposed Composer-to-prover streaming contract; see ../STREAMING_SPEC.md.
 // Required: Begin -> Block* -> Finalize on one stream, with no shared cache.
-// Ready advertises optional operations and settlement-input capabilities.
+// Unsupported operations or settlement inputs return Rejected with UNIMPLEMENTED.
 syntax = "proto3";
 
 package prove.v2;
@@ -8,7 +8,7 @@ package prove.v2;
 import "prove.proto";
 
 service Prover {
-  // Baseline sessions end with their stream. FEATURE_RESUME optionally retains
+  // Baseline sessions end with their stream. Resume optionally retains
   // progress after disconnect/Proof. No runtime is added by this wire contract.
   rpc ProveStream(stream ClientFrame) returns (stream ServerFrame);
 }
@@ -33,18 +33,6 @@ message ClientFrame {
   }
 }
 
-// Session controls and settlement inputs are independently optional.
-// Unknown/unsupported required features cause UNIMPLEMENTED, never downgrade.
-enum Feature {
-  FEATURE_UNSPECIFIED = 0;
-  FEATURE_RESUME = 1;
-  FEATURE_REWIND = 2;
-  FEATURE_CANCEL = 3;
-  FEATURE_PIPELINING = 4;
-  FEATURE_BLOBS = 5;
-  FEATURE_POSTING_CONTEXT = 6;
-}
-
 message Begin {
   uint64 rollup_id = 1;
   // Execution predecessor. The first expected block is anchor_number + 1;
@@ -52,29 +40,23 @@ message Begin {
   uint64 anchor_number = 2;
   bytes anchor_hash = 3;
   bytes anchor_state_root = 4;
-  // Empty requests the baseline. The client must check Ready contains every
-  // required feature before sending blocks.
-  repeated Feature required_features = 5;
-  // Required 32-byte validation namespace, derived from the configured rules.
-  // Compare before accepting blocks; Ready returns the server's local identity.
-  bytes expected_validation_identity = 6;
 }
 
-// Optional FEATURE_RESUME: first frame on a new stream, with a new epoch on Ready.
+// Optional: first frame on a new stream, with a new epoch on Ready.
+// Unsupported Resume returns UNIMPLEMENTED; the client can Begin and backfill.
 message Resume {}
 
 message Rewind {
-  // Optional FEATURE_REWIND. Unsupported controls return UNIMPLEMENTED.
+  // Optional. Unsupported Rewind returns UNIMPLEMENTED without changing progress.
   // Must identify the anchor or a fully validated block in this session's
   // current active prefix. The block number and state root are already known.
   bytes ancestor_hash = 1;
 }
 
 message Block {
-  // One block per frame. Baseline clients wait for each ACK. FEATURE_PIPELINING
-  // permits a bounded contiguous run while draining responses; execution may
-  // remain sequential and backpressure/resource limits still apply.
-  // The complete witness is required; there is no backend-capability negotiation.
+  // One block per frame. Baseline clients wait for each ACK. Clients that pipeline
+  // must drain responses while sending; servers may execute sequentially and
+  // apply backpressure/resource limits. The complete witness is required.
   prove.v1.BlockWitness data = 1;
 }
 
@@ -89,15 +71,16 @@ message Finalize {
 }
 
 // Common EEZ settlement input, independent of session recovery and prover backend.
+// Unsupported blobs, context or provenance cause UNIMPLEMENTED, never silent omission.
 message SettlementInput {
   // Exact proofless EEZ.postAndVerifyBatch calldata for the configured ABI,
   // including when the posting client submits it through a settlement wrapper.
   bytes abi_calldata = 1;
-  // FEATURE_BLOBS: complete physical EIP-4844 blobs in transaction order.
+  // Complete physical EIP-4844 blobs in transaction order.
   // The prover derives commitments/versioned hashes itself. RollupX and draft
   // blob-based Rollup0 require all blobs, empty batch.callData and indices [0, 1, ...].
   repeated bytes blobs = 2;
-  // FEATURE_POSTING_CONTEXT: named L1 target, independently authenticated.
+  // Named L1 target, independently authenticated.
   // Manager-specific custom data is derived from trusted profile/deployment rules,
   // not supplied here. Both blob profiles use these same target fields.
   // Required together with parent_provenance for the RollupX profile.
@@ -123,7 +106,8 @@ message ParentProvenance {
   repeated bytes live_slot_endpoint_headers_rlp = 3;
 }
 
-// Optional FEATURE_CANCEL; ordinary gRPC cancellation is enough for the baseline.
+// Optional; unsupported Cancel returns UNIMPLEMENTED. Ordinary gRPC cancellation
+// is enough for the baseline.
 message Cancel {}
 
 message ServerFrame {
@@ -149,13 +133,6 @@ message Ready {
   // This is the last FULLY VALIDATED block, not the last received message.
   uint64 validated_through = 1;
   bytes validated_hash = 2;
-  // Complete optional feature set enabled for THIS session/rollup, stable across
-  // Resume/Rewind. Empty means baseline. Unknown advertised values are ignored;
-  // clients use only recognized features and verify all Begin.required_features.
-  repeated Feature supported_features = 3;
-  // Required 32-byte local identity, equal to Begin.expected_validation_identity
-  // and stable across Resume/Rewind. Never blindly echo the submitted value.
-  bytes validation_identity = 4;
 }
 
 message Validated {
@@ -169,7 +146,7 @@ message Validated {
 
 message Proof {
   // Only this response attests settlement; Ready and Validated are not proofs.
-  // Success closes the stream. Only FEATURE_RESUME retains the selected range
+  // Success closes the stream. Provers supporting Resume retain the selected range
   // and predecessor anchor. It does not advance the L1 settlement cursor.
   bytes public_inputs_hash = 1;
   bytes proof = 2;

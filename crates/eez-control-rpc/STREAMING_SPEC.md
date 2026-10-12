@@ -11,12 +11,12 @@ session controls, and settlement inputs. A prover may support blob settlement
 without supporting resumable sessions, or resumable sessions without blobs.
 Neither requires shared caches or a particular execution backend.
 
-## 1. Required interface and capability discovery
+## 1. Required interface
 
 Every implementation supports `ProveStream` with this baseline flow:
 
 ```text
-Begin(anchor, expected_validation_identity) -> Ready(anchor, validation_identity, supported_features)
+Begin(anchor) -> Ready(anchor)
 Block(anchor + 1) -> Validated
 Block(anchor + 2) -> Validated
 ...
@@ -26,60 +26,23 @@ Finalize(range, settlement) -> Proof -> EOF
 A baseline prover needs only one stream-local prefix and sequential execution.
 It MAY limit capacity to one active stream/session, keep no global block cache,
 and discard the prefix when the stream ends. Its epoch can be the constant 1.
-It need not implement Resume, Rewind, application-level Cancel, pipelining,
-durable recovery, parallel execution, deduplication or cross-session sharing.
+It need not implement Resume, Rewind, application-level Cancel, durable recovery,
+parallel execution, deduplication or cross-session sharing.
 
-`Begin.required_features` lists features the client cannot operate without.
-Empty means no optional requirement. An unsupported or unknown required feature
-(including UNSPECIFIED) MUST reject Begin with UNIMPLEMENTED and allocate no
-session. The first Ready advertises the complete optional feature set enabled
-for this session and rollup. Before sending blocks the client MUST verify that
-this list contains every required feature.
+Optional operations and settlement inputs are attempted directly, without a
+capability handshake. Unsupported operations, including a
+frame with no recognized operation, return a correlated Rejected with
+UNIMPLEMENTED. A rejection must not change progress or end a bound stream.
+Unsupported Resume on an unbound stream returns an unbound rejection.
 
-| Feature | Additional contract |
-| --- | --- |
-| RESUME | Retain a session across disconnect/Proof and reattach with a new epoch. |
-| REWIND | Replace a validated suffix on the same stream, with a new epoch. |
-| CANCEL | Explicitly retire a session and acknowledge cancellation. |
-| PIPELINING | Accept bounded dependent Block/Finalize frames without per-block ACK waits. |
-| BLOBS | Accept physical EIP-4844 blobs and independently derive their commitments. |
-| POSTING_CONTEXT | Authenticate the named L1 target and supplied L2 parent provenance. |
+Unsupported blobs, posting context or parent provenance also return UNIMPLEMENTED;
+they must never be silently discarded. A client may fall back to the baseline
+session flow, but must not remove proof-relevant inputs to obtain a proof.
 
-Capabilities are stable for a session and MUST be repeated unchanged after
-Resume/Rewind. Unknown advertised features may be ignored; clients MUST NOT
-use unadvertised features. There are no implicit dependencies between these
-features. A resumed session that cannot still honor its capabilities must be
-rejected, not silently downgraded.
-
-Unsupported optional controls return a correlated Rejected with UNIMPLEMENTED
-without changing progress or ending a bound stream. An unsupported Resume on
-an unbound stream returns an unbound rejection. Server capacity, retention,
-deadlines, configured chain/rollup rules, ABI and proof system are deployment
-parameters, not inferred from support for one optional feature.
-
-### Validation identity
-
-Begin MUST carry the client's independently configured 32-byte
-expected_validation_identity. The server compares it with its locally derived
-validation namespace before allocating a session or accepting blocks. Missing
-or wrong-width identities are INVALID_ARGUMENT; a mismatch is FAILED_PRECONDITION
-with no actionable failure details. These are unbound Rejected responses.
-
-Every Ready MUST carry that local validation_identity, not an unchecked echo.
-The client checks it before using the session, including after Resume/Rewind.
-The identity and capabilities remain fixed for the session; a server whose rules
-changed must reject a resumed session. Missing or mismatching identities are invalid.
-Do not learn the expected identity by blindly trusting the first server reply.
-
-The digest algorithm belongs to the configured validation profile, not to the
-transport. For RollupX, use its existing
-[identity implementation](https://github.com/eduadiez/rollupX/blob/1eab3955775aec75612a7144d70f8245771ba97d/crates/eez-control-rpc/src/identity.rs):
-schema 4, domain-separated RLP/Keccak over the rollup/chain IDs, system/EEZL2
-addresses, canonical loaded chain-document digest/version, validator revision
-and dependency digest. Resource limits are not identity components. This
-build-specific namespace is not a universal cross-implementation hash; other
-backends need an explicitly agreed profile/identity, not an assumed match from
-the chain ID alone. Equality checks agreement on validation rules, not signing authority.
+Server capacity, retention, deadlines, chain/rollup rules, ABI and proof system
+are deployment parameters, not negotiated by this RPC. Clients and provers must
+be configured for the intended rollup and settlement rules. A server must not
+reuse retained validation under different rules.
 
 ### Baseline client behavior
 
@@ -87,7 +50,9 @@ Keep the stream open from Begin through Finalize and wait for each Block ACK.
 On disconnect, open a fresh stream, Begin at the selected execution predecessor and
 backfill from durable block/witness storage. On a fork change, cancel the RPC,
 Begin again and resend the selected branch. After Proof, start a new stream
-for the next range. Do not attempt Resume/Rewind unless advertised.
+for the next range. Clients using optional controls fall back to this flow on
+UNIMPLEMENTED: Begin and backfill after unsupported Resume, replace the stream
+after unsupported Rewind, and use transport cancellation after unsupported Cancel.
 
 Streaming remains useful without these optimizations: ordinary block execution
 happens before finalization. It does not guarantee a fixed proof latency.
@@ -118,15 +83,14 @@ attestations.
 Begin supplies the nonzero rollup registry ID and exact anchor number/hash/
 state root. Both hashes are 32 bytes; anchor_number must permit adding one.
 The anchor is an execution predecessor, not a claim of L1 acceptance. Admission
-checks the validation identity and the profile's execution-parent rules. For
+checks the configured rollup and the profile's execution-parent rules. For
 RollupX, Finalize separately authenticates the selected predecessor; a current
 registry root or a caller-supplied state root alone cannot authorize it.
 
 Each Block contains one present BlockWitness: declared number, 32-byte hash
 and parent hash, exact consensus header/body RLP, and a present execution
 witness sufficient for the configured validation rules. Witness acquisition
-is backend-independent at the wire boundary; omitting witnesses is not one of
-this proposal's capabilities.
+is backend-independent at the wire boundary; witnesses cannot be omitted.
 
 New blocks must extend the validated prefix by one with exact hash and
 execution-state continuity. Bind wire claims to decoded consensus bytes and
@@ -158,15 +122,15 @@ may yield Proof. A failed finalization yields no proof and does not consume
 validated progress. The client independently verifies the returned public-input
 hash and proof against the exact request and configured verifier.
 
-Proof closes the stream successfully. Without RESUME the session ends there;
-with RESUME it retains the selected range and any later validated suffix,
-promotes the selected predecessor to anchor and may release earlier data.
+Proof closes the stream successfully. Without Resume support the session ends
+there; with Resume support it retains the selected range and any later validated
+suffix, promotes the selected predecessor to anchor and may release earlier data.
 Proof never advances the Composer's L1 settlement cursor by itself.
 
 Client half-close drains accepted work; EOF without a Proof is not success.
 Transport cancellation stops replies and releases stream-local work. Only
-RESUME grants retention after stream teardown. No proof may be used after the
-Composer abandons its corresponding batch or settlement cutoff.
+Resume support grants retention after stream teardown. No proof may be used
+after the Composer abandons its corresponding batch or settlement cutoff.
 
 ## 3. Common finalization input
 
@@ -191,15 +155,13 @@ They are new `prove.v2` messages here: this does not replace either project's
 v1 RPC or copy RollupX's preparation, lease or cache APIs.
 The outer v2 envelope is not byte-compatible with RollupX's v1 ProveHeader/PostBatch.
 
-A client requests its required input capabilities in Begin and checks Ready.
-BLOBS covers physical blobs; POSTING_CONTEXT covers the L1 target and L2 parent
-provenance. A server MUST reject unadvertised use of either with UNIMPLEMENTED,
-not discard those fields. Unsupported validation profiles are never enabled
-merely by accepting a feature flag. Missing profile-required inputs, malformed
-encodings or an absent settlement message are INVALID_ARGUMENT;
+A server MUST reject unsupported blobs, posting context or parent provenance
+with UNIMPLEMENTED, without producing a proof or changing validated progress.
+Unsupported rollup profiles also return UNIMPLEMENTED. Missing profile-required
+inputs, malformed encodings or an absent settlement message are INVALID_ARGUMENT;
 inconsistent execution/settlement claims yield no proof. Future proof-relevant
-extensions must require explicit feature or protocol negotiation: unknown protobuf fields
-alone do not negotiate support.
+inputs that existing decoders would silently discard require a new protocol
+version; unknown protobuf fields are not a support check.
 
 ### Physical blobs
 
@@ -270,9 +232,9 @@ The manager's custom-data derivation is profile-specific:
 The existing target fields supply the changing L1 values for both. Derive all
 other domain values from trusted deployment configuration and authenticated L1
 state, including the active wrapper; do not add caller-selected custom data or
-manager/wrapper overrides. The profile and its validation identity must identify
-the applicable rules. Sharing fields does not mean sharing public-input hashes
-or accepting a signature under another deployment's domain.
+manager/wrapper overrides. The configured profile determines the applicable
+rules. Sharing fields does not mean sharing public-input hashes or accepting a
+signature under another deployment's domain.
 
 Authenticate the named parent through the prover's configured L1 source and
 check the target timestamp against its chain/slot rules. The target is a
@@ -316,9 +278,9 @@ selected predecessor and checked under the configured profile, never trusted.
 
 This profile aligns the inputs and verification obligations with the pinned
 RollupX source. It does not mandate that implementation's worker/cache layout or
-assert live v2 interoperability. Its ABI, native codec, chain rules and validation
-identity must be configured together; this proposal does not upgrade this
-repository's protocol submodule or runtime to RollupX's deployment.
+assert live v2 interoperability. Its ABI, native codec and chain rules must be
+configured together; this proposal does not upgrade this repository's protocol
+submodule or runtime to RollupX's deployment.
 
 ### Separate delivery-validation gap
 
@@ -326,17 +288,17 @@ Rollup0 draft Chapters 7 and 8 require the exact signed L1 trigger transactions
 for simulation of any proposed nonzero synchronous prefix. They are deliberately
 absent from blob action identity: the bracket's tx_data is empty. Neither this
 settlement-only RPC nor RollupX's current RPC carries those delivery inputs.
-That remains a separate interface extension, not implicit support from BLOBS or
-POSTING_CONTEXT. A service claiming the draft's full validation behavior must
-obtain and simulate them through an explicit delivery interface before signing;
+That remains a separate interface extension, not implicit support from carrying
+blobs or posting context. A service claiming the draft's full validation behavior
+must obtain and simulate them through an explicit delivery interface before signing;
 without that interface it must reject such requests, not silently skip the check.
 No trigger-transaction or bundle-simulation fields are added by this proposal.
 
 ### Required settlement input
 
 Every Finalize MUST supply settlement; absence is INVALID_ARGUMENT. The prover
-checks the input against the configured profile and negotiated capabilities.
-Never strip required blobs or context to retry as a weaker request.
+checks the complete input against the configured profile and rejects unsupported
+inputs. Never strip required blobs or context to retry as a weaker request.
 
 Calldata-only Rollup0 can use the same settlement message with its optional inputs
 absent, then populate the existing blob/context fields when its profile migrates.
@@ -346,35 +308,37 @@ Rollup0-draft or live RollupX conformance.
 
 ## 4. Optional advanced session controls
 
-RESUME retains progress subject to published limits. Resume is the first frame
+Resume retains progress subject to published limits. It is the first frame
 on a new stream, with the retained ID and epoch zero. Ready returns the same
-ID, a fresh nonzero epoch, the retained cursor, validation identity and unchanged
-capabilities. This atomically fences the old attachment; copying the new epoch on an old
-stream cannot regain authorization. Missing/evicted sessions return NOT_FOUND,
-requiring Begin and backfill. A lost ACK can mean more progress was validated
+ID, a fresh nonzero epoch and the retained cursor. This atomically fences the old
+attachment; copying the new epoch on an old stream cannot regain authorization.
+Missing/evicted sessions return NOT_FOUND, requiring Begin and backfill.
+A lost ACK can mean more progress was validated
 than the client saw; reconcile both cursor number and hash.
 
-REWIND accepts only the anchor or a fully validated ancestor in this session's
+Rewind accepts only the anchor or a fully validated ancestor in this session's
 active prefix, not a block merely cached elsewhere. It truncates the suffix,
 fences pending old-prefix work, advances the epoch and returns Ready at the
 ancestor. It cannot replace the anchor. A rejected rewind changes neither
-epoch nor prefix. Without REWIND, replace the stream and backfill instead.
+epoch nor prefix. Without Rewind support, replace the stream and backfill instead.
 
-CANCEL atomically retires the bound session, fences pending work, returns the
+Cancel atomically retires the bound session, fences pending work, returns the
 correlated Cancelled at the accepted epoch and closes the stream. No later ACK
-or Proof follows. Without CANCEL, use transport cancellation; if RESUME is
-enabled, retained data remains subject to normal eviction. Cancellation never
+or Proof follows. Without Cancel support, use transport cancellation; if Resume
+is supported, retained data remains subject to normal eviction. Cancellation never
 authorizes deleting another session's data.
 
-PIPELINING allows dependent Block/Finalize frames to queue in order. Bound
-outstanding data and drain responses while sending. Accepted Resume/Rewind/
-Cancel fences earlier work before its control response; stale work cannot
-mutate the active prefix or emit a usable Proof afterward. Results superseded
+Clients may pipeline dependent Block/Finalize frames in order, bounding
+outstanding data and draining responses while sending. Servers may read and
+execute sequentially, apply backpressure, or reject excess work with
+RESOURCE_EXHAUSTED; no unbounded queue or parallel execution is required.
+Accepted Resume/Rewind/Cancel fences earlier work before its control response;
+stale work cannot mutate the active prefix or emit a usable Proof afterward. Results superseded
 by such controls need not receive individual replies. A rejected gap cannot
 be skipped by later queued blocks.
 
 Shared caches, singleflight, multiple sessions and parallel execution are
-implementation choices, not required capabilities. If used, bind reused
+implementation choices, not protocol requirements. If used, bind reused
 evidence to exact consensus bytes, execution parent and validation rules.
 Isolate session progress and results; cancellation of one waiter must not
 cancel work still needed by another. Nothing in this protocol mandates Reth
@@ -390,8 +354,8 @@ RPC transport errors and operation rejections never constitute proofs.
 
 UNAVAILABLE, DEADLINE_EXCEEDED and ABORTED may permit bounded retries after
 reconciliation. NOT_FOUND permits session-loss recovery. UNIMPLEMENTED means
-a required feature is absent: use the baseline only if it still expresses the
-same complete proving request, otherwise select a suitable prover. Unsupported
+the operation or input is unsupported: use the baseline only if it still expresses
+the same complete proving request, otherwise select a suitable prover. Unsupported
 settlement data must never be converted into a weaker request. Capacity
 rejections use RESOURCE_EXHAUSTED; malformed input is not retried unchanged.
 
@@ -401,7 +365,7 @@ session at capacity without disturbing the first. No 500 ms or other fixed
 deadline is guaranteed by the wire contract.
 
 Conformance should cover baseline and optional exchanges separately. Codec
-vectors pin field numbers and capability negotiation; they are not substitutes
+vectors pin field numbers and request/response encoding; they are not substitutes
 for executed-block and on-chain proof oracles. Recorded live request/response
 transcripts belong with each runtime implementation. Keep vector fixtures and
 their test harness separate from this protocol proposal.
