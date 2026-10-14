@@ -433,6 +433,14 @@ fn declared_gas_limit(raw: &Bytes) -> u64 {
         .map_or(u64::MAX, |tx| tx.gas_limit())
 }
 
+/// The declared limit and active cap when an envelope can never fit.
+const fn gas_limit_violation(declared: u64, cap: Option<u64>) -> Option<(u64, u64)> {
+    match cap {
+        Some(cap) if declared > cap => Some((declared, cap)),
+        _ => None,
+    }
+}
+
 /// The refused pair's numbers, for the block-gas cut event.
 #[derive(Debug, Clone, Copy)]
 struct BlockGasCut {
@@ -883,6 +891,29 @@ fn push_poison_root(
         poison_gaps.push(gap);
     }
     poison.push(tx);
+}
+
+fn evict_gas_limit_violation(
+    rollup_id: u64,
+    tx_idx: usize,
+    tx: HeldTx,
+    declared: u64,
+    cap: u64,
+    poison: &mut Vec<HeldTx>,
+    poison_gaps: &mut Vec<(Address, Direction, u64)>,
+) {
+    event!(
+        name: "eez.composer.cc_compose.tx_gas_unfittable",
+        Level::WARN,
+        rollup_id,
+        tx_idx,
+        tx_hash = %tx.hash,
+        direction = ?tx.direction,
+        user_declared = declared,
+        user_gas_limit_cap = cap,
+        "user transaction exceeds the source chain's active per-transaction gas cap; evicting (resubmit with a lower gas limit)",
+    );
+    push_poison_root(poison, poison_gaps, tx);
 }
 
 fn push_deferred_root(
@@ -2094,8 +2125,21 @@ where
                 reopen(&[])
                     .map(|draft| (state, draft))
                     .map_err(|e| format!("SyncBlockState::open: {e}"))
+            })
+            .and_then(|(state, draft)| {
+                let cap = match bundle_target {
+                    BundleTarget::Exact { timestamp, .. } => local
+                        .l1_entry
+                        .next_declared_tx_gas_limit_cap(state.anchor.header(), timestamp),
+                    // A target without a timestamp inherits the anchor's rules.
+                    BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => local
+                        .l1_entry
+                        .declared_tx_gas_limit_cap_at(state.anchor.header()),
+                }
+                .map_err(|error| format!("resolve L1 transaction gas cap: {error}"))?;
+                Ok((state, draft, cap))
             });
-        let (mut l1_state, mut draft) = match slot_ctx {
+        let (mut l1_state, mut draft, inbound_gas_limit_cap) = match slot_ctx {
             Ok(contexts) => contexts,
             Err(e) => {
                 event!(
@@ -2120,6 +2164,8 @@ where
                     .await;
             }
         };
+        // The draft's EVM rules govern outbound envelopes.
+        let outbound_gas_limit_cap = draft.declared_tx_gas_limit_cap();
         event!(
             name: "eez.composer.phase2.slot_anchored",
             Level::INFO,
@@ -2233,6 +2279,23 @@ where
                     "same-sender tx above an underfunded outbound nonce; holding for a later slot",
                 );
                 funding_deferred.push((idx, held));
+                continue;
+            }
+
+            // Reject against the draft's cap before simulation can mark it poison.
+            let user_declared = declared_gas_limit(&held.raw_tx);
+            if let Some((declared, cap)) =
+                gas_limit_violation(user_declared, outbound_gas_limit_cap)
+            {
+                evict_gas_limit_violation(
+                    rollup_id,
+                    idx,
+                    held,
+                    declared,
+                    cap,
+                    &mut poison,
+                    &mut poison_gaps,
+                );
                 continue;
             }
 
@@ -2365,8 +2428,8 @@ where
                     }
                     // `[load, user]` must fit the Sync block or `build_sync_block`
                     // hard-errors. Before the L1 budget, so a refusal costs nothing.
-                    let declared = eez_primitives::SYSTEM_TX_GAS_LIMIT
-                        .saturating_add(declared_gas_limit(&held.raw_tx));
+                    let declared =
+                        eez_primitives::SYSTEM_TX_GAS_LIMIT.saturating_add(user_declared);
                     match block_gas_fit(draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
                         BlockGasFit::Accept => {}
                         BlockGasFit::Defer => {
@@ -2634,6 +2697,22 @@ where
                     "same-sender tx above an evicted poison nonce in the same drain; evicted (resubmit in order)",
                 );
                 poison.push(held);
+                continue;
+            }
+
+            // Source simulation is uncapped; enforce the L1 envelope cap first.
+            let user_declared = declared_gas_limit(&held.raw_tx);
+            if let Some((declared, cap)) = gas_limit_violation(user_declared, inbound_gas_limit_cap)
+            {
+                evict_gas_limit_violation(
+                    rollup_id,
+                    idx,
+                    held,
+                    declared,
+                    cap,
+                    &mut poison,
+                    &mut poison_gaps,
+                );
                 continue;
             }
 
@@ -4859,6 +4938,28 @@ mod tests {
         }
     }
 
+    fn signed_user_tx(gas_limit: u64) -> Bytes {
+        use alloy_consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
+        use alloy_network::{TxSignerSync as _, eip2718::Encodable2718 as _};
+        use alloy_primitives::{TxKind, U256};
+        use alloy_signer_local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
+        let mut tx = TxEip1559 {
+            chain_id: 6290,
+            nonce: 0,
+            gas_limit,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::new(),
+        };
+        let signature = signer.sign_transaction_sync(&mut tx).unwrap();
+        Bytes::from(TxEnvelope::from(tx.into_signed(signature)).encoded_2718())
+    }
+
     #[test]
     fn poison_gap_matches_only_same_chain_higher_nonce() {
         let sender = Address::repeat_byte(0xa);
@@ -5491,7 +5592,7 @@ mod tests {
     #[test]
     fn eip_7825_user_cap_is_independent_of_sync_block_fit() {
         // An invalid user limit can still fit in the aggregate Sync-block budget.
-        const EIP_7825_TX_GAS_LIMIT: u64 = 1 << 24;
+        const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
         const SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
         let invalid_user_limit = EIP_7825_TX_GAS_LIMIT + 1;
         let pair_limit = SYSTEM_TX_GAS_LIMIT + invalid_user_limit;
@@ -5506,39 +5607,20 @@ mod tests {
     }
 
     #[test]
-    fn declared_user_gas_limit_preserves_eip_7825_boundary() {
-        // The drain must compare the decoded user limit, not the aggregate pair.
-        use alloy_consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
-        use alloy_network::{TxSignerSync as _, eip2718::Encodable2718 as _};
-        use alloy_primitives::{Address, TxKind, U256};
-        use alloy_signer_local::PrivateKeySigner;
-
-        const EIP_7825_TX_GAS_LIMIT: u64 = 1 << 24;
-        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
-        let encode = |gas_limit| {
-            let mut tx = TxEip1559 {
-                chain_id: 6290,
-                nonce: 0,
-                gas_limit,
-                max_fee_per_gas: 1,
-                max_priority_fee_per_gas: 1,
-                to: TxKind::Call(Address::ZERO),
-                value: U256::ZERO,
-                access_list: Default::default(),
-                input: Bytes::new(),
-            };
-            let signature = signer.sign_transaction_sync(&mut tx).unwrap();
-            Bytes::from(TxEnvelope::from(tx.into_signed(signature)).encoded_2718())
-        };
+    fn gas_limit_violation_uses_the_decoded_eip_7825_boundary_only_when_active() {
+        const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
+        let at_cap = declared_gas_limit(&signed_user_tx(EIP_7825_TX_GAS_LIMIT));
+        let over_cap = declared_gas_limit(&signed_user_tx(EIP_7825_TX_GAS_LIMIT + 1));
 
         assert_eq!(
-            declared_gas_limit(&encode(EIP_7825_TX_GAS_LIMIT)),
-            EIP_7825_TX_GAS_LIMIT,
+            gas_limit_violation(at_cap, Some(EIP_7825_TX_GAS_LIMIT)),
+            None
         );
         assert_eq!(
-            declared_gas_limit(&encode(EIP_7825_TX_GAS_LIMIT + 1)),
-            EIP_7825_TX_GAS_LIMIT + 1,
+            gas_limit_violation(over_cap, Some(EIP_7825_TX_GAS_LIMIT)),
+            Some((EIP_7825_TX_GAS_LIMIT + 1, EIP_7825_TX_GAS_LIMIT)),
         );
+        assert_eq!(gas_limit_violation(over_cap, None), None);
     }
 
     #[test]

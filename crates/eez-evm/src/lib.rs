@@ -47,6 +47,19 @@ pub fn fee_collector(config: &alloy_genesis::ChainConfig) -> Result<Option<Addre
         .transpose()
 }
 
+/// Maximum declared `tx.gas` accepted by the current EVM rules.
+/// Amsterdam allows the envelope limit to include separately metered state gas,
+/// so only its regular-gas accounting uses the configured cap.
+#[must_use]
+pub fn declared_tx_gas_limit_cap(cfg: &impl revm::context_interface::Cfg) -> Option<u64> {
+    if cfg.is_amsterdam_eip8037_enabled() {
+        None
+    } else {
+        let cap = cfg.tx_gas_limit_cap();
+        (cap != u64::MAX).then_some(cap)
+    }
+}
+
 /// Enforce L2 transaction support during construction and replay. The underlying
 /// EVM is also used for L1 simulation, where blob transactions remain valid.
 pub fn ensure_supported_transaction(tx: &EezTxEnvelope) -> Result<(), AnyError> {
