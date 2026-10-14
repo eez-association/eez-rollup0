@@ -3,8 +3,10 @@
 //! The pinned `EthEvmConfig` fixes its primitives to Ethereum types, which cannot
 //! represent native type `0x76`. This wrapper selects `EezPrimitives`, preserves
 //! the native receipt type, and decodes native transactions in Engine payloads.
-//! Ethereum's executor, gas accounting, system calls, block assembly, and header
-//! environment are reused. `eez-primitives` defines the zero-fee native TxEnv;
+//! Ethereum transaction execution, gas accounting, block assembly, and header
+//! environment are reused. L2 block processing keeps EIP-2935 but disables
+//! beacon-root updates and consensus-layer requests. L1 simulation explicitly
+//! selects Ethereum block processing. `eez-primitives` defines the zero-fee native TxEnv;
 //! `evm` adds deposit minting, rollback, and genesis-configured fee collection.
 //!
 //! Configuration adapted from reth's `EthEvmConfig` at the pinned revision:
@@ -34,7 +36,9 @@ use reth_primitives_traits::{
 use reth_storage_errors::any::AnyError;
 use std::{borrow::Cow, fmt, sync::Arc};
 
+mod block;
 mod evm;
+pub use block::EezBlockExecutorFactory;
 pub use evm::EezEvmFactory;
 
 /// Read the consensus fee destination. Absence retains historical Ethereum fee
@@ -105,16 +109,28 @@ impl ReceiptBuilder for EezReceiptBuilder {
 #[derive(Debug, Clone)]
 pub struct EezEvmConfig<C = ChainSpec> {
     ethereum: EthEvmConfig<C>,
-    executor: EthBlockExecutorFactory<EezReceiptBuilder, Arc<C>, EezEvmFactory>,
+    executor: EezBlockExecutorFactory<C>,
 }
 
 impl<C: EthChainSpec> EezEvmConfig<C> {
+    /// Construct the shared Rollup0 execution configuration.
     pub fn new(chain_spec: Arc<C>) -> Result<Self, AnyError> {
         let factory = EezEvmFactory::new(fee_collector(&chain_spec.genesis().config)?);
         Ok(Self {
             ethereum: EthEvmConfig::new(chain_spec.clone()),
-            executor: EthBlockExecutorFactory::new(EezReceiptBuilder, chain_spec, factory),
+            executor: EezBlockExecutorFactory {
+                ethereum: EthBlockExecutorFactory::new(EezReceiptBuilder, chain_spec, factory),
+                is_l2: true,
+            },
         })
+    }
+
+    /// Preserve Ethereum block processing for the L1 composition client.
+    /// Embedded L1 consensus continues to use its upstream node executor.
+    pub fn new_l1(chain_spec: Arc<C>) -> Result<Self, AnyError> {
+        let mut config = Self::new(chain_spec)?;
+        config.executor.is_l2 = false;
+        Ok(config)
     }
 
     pub fn chain_spec(&self) -> &Arc<C> {
@@ -128,7 +144,7 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
     type Primitives = EezPrimitives;
     type Error = AnyError;
     type NextBlockEnvCtx = NextBlockEnvAttributes;
-    type BlockExecutorFactory = EthBlockExecutorFactory<EezReceiptBuilder, Arc<C>, EezEvmFactory>;
+    type BlockExecutorFactory = EezBlockExecutorFactory<C>;
     type BlockAssembler = EthBlockAssembler<C>;
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {

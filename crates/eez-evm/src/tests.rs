@@ -18,6 +18,7 @@ use revm::{
 };
 
 mod fees;
+mod system_calls;
 
 fn config() -> EezEvmConfig {
     EezEvmConfig::new(Arc::new(
