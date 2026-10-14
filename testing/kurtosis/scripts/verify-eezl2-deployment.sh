@@ -35,6 +35,7 @@ set +a
 for name in \
     EEZL2_ADDRESS \
     EEZ_L2_SYSTEM_ADDRESS \
+    EEZ_L2_RECOVERY_ADDRESS \
     EEZ_L2_EEZL2_CODE_HASH \
     EEZ_ROLLUP_ID \
     EEZ_INITIAL_STATE_ROOT \
@@ -44,6 +45,7 @@ do
 done
 
 actual_system="$(cast call "$EEZL2_ADDRESS" 'SYSTEM_ADDRESS()(address)' --rpc-url "$L2")"
+actual_recovery="$(cast call "$EEZL2_ADDRESS" 'RECOVERY_ADDRESS()(address)' --rpc-url "$L2")"
 actual_rollup_id="$(cast call "$EEZL2_ADDRESS" 'ROLLUP_ID()(uint64)' --rpc-url "$L2" | awk '{print $1}')"
 actual_use_gas_left="$(cast call "$EEZL2_ADDRESS" 'USE_GAS_LEFT()(bool)' --rpc-url "$L2")"
 runtime="$(cast code "$EEZL2_ADDRESS" --rpc-url "$L2")"
@@ -53,6 +55,10 @@ actual_block_hash="$(cast block 0 --rpc-url "$L2" --json | jq -er '.hash')"
 
 [[ "${actual_system,,}" == "${EEZ_L2_SYSTEM_ADDRESS,,}" ]] || {
     echo "live EEZL2 SYSTEM_ADDRESS mismatch: $actual_system != $EEZ_L2_SYSTEM_ADDRESS" >&2
+    exit 1
+}
+[[ "${actual_recovery,,}" == "${EEZ_L2_RECOVERY_ADDRESS,,}" ]] || {
+    echo "live EEZL2 RECOVERY_ADDRESS mismatch: $actual_recovery != $EEZ_L2_RECOVERY_ADDRESS" >&2
     exit 1
 }
 [[ "$actual_rollup_id" == "$EEZ_ROLLUP_ID" ]] || {
@@ -78,4 +84,4 @@ actual_block_hash="$(cast block 0 --rpc-url "$L2" --json | jq -er '.hash')"
     exit 1
 }
 
-echo "EEZL2 deployment bindings verified (rollupId=$EEZ_ROLLUP_ID, system=$EEZ_L2_SYSTEM_ADDRESS)"
+echo "EEZL2 deployment bindings verified (rollupId=$EEZ_ROLLUP_ID, system=$EEZ_L2_SYSTEM_ADDRESS, recovery=$EEZ_L2_RECOVERY_ADDRESS)"
