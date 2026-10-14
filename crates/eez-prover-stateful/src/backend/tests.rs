@@ -10,13 +10,14 @@ use reth_chainspec::ChainInfo;
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
 use reth_storage_api::errors::provider::ProviderResult;
 use reth_storage_api::{
-    AccountReader, BlockIdReader, BytecodeReader, HashedPostStateProvider, StateProofProvider,
-    StateProviderBox, StateRootProvider, StorageRootProvider,
+    AccountReader, BlockIdReader, BytecodeReader, StateProofProvider, StateProviderBox,
+    StorageRootProvider,
 };
+use reth_trie_common::updates::TrieUpdates;
 use reth_trie_common::{
     AccountProof, DecodedMultiProofV2, ExecutionWitnessMode, HashedPostState, HashedStorage,
     KeccakKeyHasher, MultiProof, MultiProofTargets, MultiProofTargetsV2, StorageMultiProof,
-    StorageProof, TrieInput, TrieUpdates,
+    StorageProof, TrieInput,
 };
 
 use super::*;
@@ -113,7 +114,7 @@ reth_storage_api::macros::delegate_impls_to_as_ref!(
         fn witness(&self, input: TrieInput, target: HashedPostState, mode: ExecutionWitnessMode) -> ProviderResult<Vec<Bytes>>;
     }
     StateProvider {
-        fn storage(&self, account: Address, key: U256) -> ProviderResult<Option<U256>>;
+        fn storage(&self, account: Address, key: B256) -> ProviderResult<Option<U256>>;
     }
 );
 
