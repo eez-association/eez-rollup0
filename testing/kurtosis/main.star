@@ -16,6 +16,7 @@ L2_XCHAIN_PORT = 18998
 BUILDER_FLASHBOTS_RPC_PORT = 8645
 PROOF_SIGNER_GRPC_PORT = 50061
 L2_CHAIN_ID = "6290"
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 
 def run(plan, args):
@@ -29,7 +30,7 @@ def run(plan, args):
     if (
         poster_key in ["", "0xCHANGE_ME"]
         or proof_signer_key in ["", "0xCHANGE_ME"]
-        or recovery_address in ["", "0xCHANGE_ME"]
+        or recovery_address in ["", "0xCHANGE_ME", ZERO_ADDRESS]
     ):
         fail(
             "set eez.poster_key, eez.proof_signer_key, and eez.recovery_address in the args file"
