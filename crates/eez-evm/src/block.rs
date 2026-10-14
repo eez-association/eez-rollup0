@@ -20,7 +20,6 @@ use eez_primitives::{EezTxEnvelope, EezTxType, Receipt};
 #[derive(Debug, Clone)]
 pub struct EezBlockExecutorFactory<C> {
     pub(crate) ethereum: EthBlockExecutorFactory<EezReceiptBuilder, Arc<C>, EezEvmFactory>,
-    pub(crate) is_l2: bool,
 }
 
 impl<C: EthExecutorSpec + 'static> BlockExecutorFactory for EezBlockExecutorFactory<C> {
@@ -47,7 +46,6 @@ impl<C: EthExecutorSpec + 'static> BlockExecutorFactory for EezBlockExecutorFact
     {
         EezBlockExecutor {
             ethereum: self.ethereum.create_executor(evm, ctx),
-            is_l2: self.is_l2,
         }
     }
 }
@@ -55,7 +53,6 @@ impl<C: EthExecutorSpec + 'static> BlockExecutorFactory for EezBlockExecutorFact
 #[derive(Debug)]
 pub struct EezBlockExecutor<'a, E, Spec> {
     ethereum: EthBlockExecutor<'a, E, Spec, &'a EezReceiptBuilder>,
-    is_l2: bool,
 }
 
 impl<E, Spec> BlockExecutor for EezBlockExecutor<'_, E, Spec>
@@ -73,9 +70,6 @@ where
     type Result = EthTxResult<E::HaltReason, EezTxType>;
 
     fn apply_pre_execution_changes(&mut self) -> Result<(), BlockExecutionError> {
-        if !self.is_l2 {
-            return self.ethereum.apply_pre_execution_changes();
-        }
         if self
             .ethereum
             .ctx
@@ -104,9 +98,6 @@ where
     }
 
     fn finish(self) -> Result<(Self::Evm, BlockExecutionResult<Receipt>), BlockExecutionError> {
-        if !self.is_l2 {
-            return self.ethereum.finish();
-        }
         // L2 has no consensus-layer requests (EIP-6110/7002/7251), beacon
         // withdrawals, or mining rewards. Do not execute those transitions and
         // discard their output: even an empty request list can change state.

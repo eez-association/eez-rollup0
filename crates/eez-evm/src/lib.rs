@@ -5,9 +5,10 @@
 //! the native receipt type, and decodes native transactions in Engine payloads.
 //! Ethereum transaction execution, gas accounting, block assembly, and header
 //! environment are reused. L2 block processing keeps EIP-2935 but disables
-//! beacon-root updates and consensus-layer requests. L1 simulation explicitly
-//! selects Ethereum block processing. `eez-primitives` defines the zero-fee native TxEnv;
-//! `evm` adds deposit minting, rollback, and genesis-configured fee collection.
+//! beacon-root updates and consensus-layer requests. L1 composition only uses
+//! transaction simulation, bypassing block processing. `eez-primitives` defines
+//! the zero-fee native TxEnv; `evm` adds deposit minting, rollback, and
+//! genesis-configured fee collection.
 //!
 //! Configuration adapted from reth's `EthEvmConfig` at the pinned revision:
 //! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/evm/src/lib.rs>.
@@ -120,17 +121,8 @@ impl<C: EthChainSpec> EezEvmConfig<C> {
             ethereum: EthEvmConfig::new(chain_spec.clone()),
             executor: EezBlockExecutorFactory {
                 ethereum: EthBlockExecutorFactory::new(EezReceiptBuilder, chain_spec, factory),
-                is_l2: true,
             },
         })
-    }
-
-    /// Preserve Ethereum block processing for the L1 composition client.
-    /// Embedded L1 consensus continues to use its upstream node executor.
-    pub fn new_l1(chain_spec: Arc<C>) -> Result<Self, AnyError> {
-        let mut config = Self::new(chain_spec)?;
-        config.executor.is_l2 = false;
-        Ok(config)
     }
 
     pub fn chain_spec(&self) -> &Arc<C> {
