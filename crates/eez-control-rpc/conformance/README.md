@@ -2,10 +2,9 @@
 
 These are recorded protobuf request/response payloads for the
 [`prove.v2` wire contract](../proto/prove_stream.proto), with a
-[standalone replay client](../examples/replay_streaming.rs). This change includes
-neither a prover runtime nor the implementation-dependent transcript recorder.
-Run it against a separately built streaming prover; the prover on the base
-revision of `main` does not implement this streaming runtime yet.
+[standalone replay client](../examples/replay_streaming.rs). Use them to check a
+streaming prover's responses against expected protocol behavior. The client
+connects to a running prover configured for the fixture and selected test profile.
 
 ## Cases and profiles
 
@@ -27,20 +26,22 @@ more cases requiring explicit server limits. Together they contain 339 requests,
 
 The `profile` field separates baseline, optional session/pipelining, and
 backend-specific cases. A minimal implementation can run `baseline-and-rejections`
-alone. The full suite targets the Rollup0 reference implementation; optional
-controls, shared caching, and concurrent sessions are not baseline requirements.
+alone. The full suite covers Rollup0's baseline and optional capabilities;
+session controls, shared caching, and concurrent sessions are not baseline
+requirements.
 Unsupported blobs/context are negative tests of this calldata-only profile,
 not requirements for a prover configured for another settlement profile.
 
-These vectors preserve current Rollup0 **conditional proofs**: a proof binds the
-transition to its selected parent but does not attest the parent's L1 acceptance.
+These vectors target Rollup0's calldata-only, timeless **conditional-proof
+profile**: a proof binds the transition to its selected parent but does not
+attest the parent's L1 acceptance.
 The L1 contract checks applicability when consuming it. They do not test the
 prover-owned L1 parent authentication described for blob-based profiles in the
 [streaming specification](../STREAMING_SPEC.md).
 
 ## Server setup and replay
 
-Use the existing six-empty-block
+Use the six-empty-block
 [`captured-devnet-window-84`](../../eez-prover-stateless/tests/fixtures/captured-devnet-window-84)
 fixture. Configure a streaming server with its `chain-config.json`, rollup ID,
 proof system, vkey, attester and L2 system address from `oracle.json`. The signing
@@ -48,17 +49,18 @@ key is the **public Anvil test key**
 `59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d`.
 Never use it outside an isolated test deployment.
 
-Normal cases use default Rollup0 server quotas and 30-second request/idle
-timeouts. Start a fresh server for the complete suite or the cold-cache witness
-case. From the repository root:
+For normal cases, configure quotas to admit the full fixture window and enable
+the optional capabilities exercised by the selected cases. Use 30-second
+request/idle timeouts. Start a fresh server for the complete suite or the
+cold-cache witness case. From the repository root:
 
 ```sh
 # All 17 normal cases against a separately configured server:
-CARGO_INCREMENTAL=0 cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0.0.1:50061
+cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0.0.1:50061
 # Minimal sequential profile:
-CARGO_INCREMENTAL=0 cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0.0.1:50061 baseline-and-rejections
+cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0.0.1:50061 baseline-and-rejections
 # Start a separate server with --max-request-blocks 2, then:
-CARGO_INCREMENTAL=0 cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0.0.1:50061 block-quota crates/eez-control-rpc/conformance/rollup0-limits-transcripts.json
+cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0.0.1:50061 block-quota crates/eez-control-rpc/conformance/rollup0-limits-transcripts.json
 ```
 
 Each limit case declares its required `server_args`: block quota 2, payload quota
@@ -81,25 +83,25 @@ assertions. Each proof's signature must recover the configured attester over the
 expected digest; a different valid ECDSA nonce is allowed. The saved deterministic
 signature is a reference, not a requirement for byte-identical ECDSA output.
 
-The recording tests derive expected progress from accepted requests and assert
-status codes, block identities and roots before saving responses. Full-fixture
-proofs were checked against the independent captured digest and test signature.
-Derived subrange/alternate-block proofs use the request-side protocol hash helper
-and signer recovery; they are not additional on-chain proof oracles. The separate
-implementation's recording tests compare against these saved files unless
-regeneration is explicitly requested. This standalone branch only replays them;
-it cannot silently regenerate expected results.
+The replay client treats the vector files as read-only expectations; it does not
+regenerate them from server responses. When updating vectors, derive expected
+progress from accepted requests and verify status codes, block identities, roots
+and proof digests independently of the responses being recorded.
+
+## Fixture provenance and coverage limits
+
+Full-fixture proof expectations come from the independent captured digest and
+test signature in `oracle.json`. Derived subrange/alternate-block proofs use the
+request-side protocol hash helper and signer recovery; they are not additional
+on-chain proof oracles.
 
 `invalid-witness-retry` requires a cold stateless cache: a server retaining that
 execution can legitimately ignore a replacement witness. `cache-parent-binding`
 also depends on conditional stateless anchor admission, not a requirement that
 a stateful prover admit an incorrect anchor root.
 
-These vectors passed against the real stateless signer and common session
-runtime, including the standalone replay client. Deliberately corrupted expected
-cursors, proof digests and attesters were rejected by that client. The fixture
-supplies witnesses, not a Reth database; a stateful server needs its anchor/history
-seeded separately. This suite does not cover nonempty Sync effects, actionable
-candidate-eviction details, L1 recovery, blob/RollupX positive conformance, or
-stress/deadline guarantees. Timing-dependent in-flight cancellation and
+The fixture supplies witnesses, not a Reth database; a stateful server needs its
+anchor/history seeded separately. This suite does not cover nonempty Sync
+effects, actionable candidate-eviction details, L1 recovery, blob/RollupX positive
+conformance, or stress/deadline guarantees. Timing-dependent in-flight cancellation and
 backpressure belong in runtime tests, not schedule-dependent wire vectors.
