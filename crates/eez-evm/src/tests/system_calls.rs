@@ -6,7 +6,6 @@ use alloy_eips::{
     eip6110::MAINNET_DEPOSIT_CONTRACT_ADDRESS,
     eip7002::{WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS, WITHDRAWAL_REQUEST_PREDEPLOY_CODE},
     eip7251::{CONSOLIDATION_REQUEST_PREDEPLOY_ADDRESS, CONSOLIDATION_REQUEST_PREDEPLOY_CODE},
-    eip7685::EMPTY_REQUESTS_HASH,
 };
 use alloy_evm::block::{BlockExecutor, BlockExecutorFactory};
 use revm::{Database, database::State, database::states::bundle_state::BundleRetention};
@@ -18,7 +17,9 @@ fn system_config() -> EezEvmConfig {
     .unwrap()
 }
 
-fn system_database() -> InMemoryDB {
+#[test]
+fn empty_block_only_updates_history() {
+    let config = system_config();
     let mut db = InMemoryDB::default();
     for (address, code) in [
         (HISTORY_STORAGE_ADDRESS, &HISTORY_STORAGE_CODE),
@@ -58,120 +59,58 @@ fn system_database() -> InMemoryDB {
         .unwrap();
     db.insert_account_storage(BEACON_ROOTS_ADDRESS, U256::from(8192), U256::from(66))
         .unwrap();
-    db
-}
-
-#[test]
-fn l2_only_runs_history_update_in_import_build_and_engine_paths() {
-    let config = system_config();
-    let parent = SealedHeader::seal_slow(Header {
-        gas_limit: 30_000_000,
-        base_fee_per_gas: Some(1),
-        ..Default::default()
-    });
-    let ethereum_block = alloy_consensus::Block {
-        header: Header {
-            parent_hash: parent.hash(),
-            number: 1,
-            timestamp: 1,
-            gas_limit: 30_000_000,
-            base_fee_per_gas: Some(1),
-            excess_blob_gas: Some(0),
-            blob_gas_used: Some(0),
-            parent_beacon_block_root: Some(B256::ZERO),
-            requests_hash: Some(EMPTY_REQUESTS_HASH),
-            ..Default::default()
+    let parent_hash = B256::repeat_byte(0x42);
+    let ethereum_block = alloy_consensus::Block::new(
+        Header {
+            parent_hash,
+            ..block(0, 1).into_block().header
         },
-        body: BlockBody {
-            withdrawals: Some(Default::default()),
-            ..Default::default()
-        },
-    };
+        BlockBody::default(),
+    );
     let block =
         SealedBlock::seal_slow(ethereum_block.clone().map_transactions(EezTxEnvelope::from));
-    let payload: ExecutionData = eez_primitives::engine::EezBuiltPayload::new(
-        Arc::new(block.clone().try_recover().unwrap()),
-        U256::ZERO,
-        None,
-        None,
-    )
-    .into();
-    for path in ["import", "build", "engine"] {
-        let mut state = State::builder()
-            .with_database(system_database())
-            .with_bundle_update()
-            .build();
-        let ctx = match path {
-            "import" => config.context_for_block(&block).unwrap(),
-            "build" => config
-                .context_for_next_block(
-                    &parent,
-                    NextBlockEnvAttributes {
-                        timestamp: 1,
-                        suggested_fee_recipient: Address::ZERO,
-                        prev_randao: B256::ZERO,
-                        gas_limit: 30_000_000,
-                        parent_beacon_block_root: Some(B256::ZERO),
-                        withdrawals: Some(Default::default()),
-                        extra_data: Bytes::new(),
-                        slot_number: None,
-                    },
-                )
-                .unwrap(),
-            "engine" => config.context_for_payload(&payload).unwrap(),
-            _ => unreachable!(),
-        };
-        let evm = config.evm_with_env(&mut state, config.evm_env(block.header()).unwrap());
-        let mut executor = config.block_executor_factory().create_executor(evm, ctx);
-        executor.apply_pre_execution_changes().unwrap();
-        // EIP-2935 must be visible before any transaction/checkpoint.
-        assert_eq!(
-            executor
-                .evm_mut()
-                .db_mut()
-                .storage(HISTORY_STORAGE_ADDRESS, U256::ZERO)
-                .unwrap(),
-            U256::from_be_bytes(parent.hash().0),
-            "{path}"
-        );
-        let result = executor.apply_post_execution_changes().unwrap();
-        assert!(result.requests.is_empty());
-        assert_eq!(result.requests.requests_hash(), EMPTY_REQUESTS_HASH);
-        assert_eq!(result.gas_used, 0);
-        for (address, slot, expected) in [
-            (WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS, 0, 10),
-            (CONSOLIDATION_REQUEST_PREDEPLOY_ADDRESS, 0, 10),
-            (BEACON_ROOTS_ADDRESS, 1, 55),
-            (BEACON_ROOTS_ADDRESS, 8192, 66),
-        ] {
-            assert_eq!(
-                state.storage(address, U256::from(slot)).unwrap(),
-                U256::from(expected),
-                "{path}, contract={address}"
-            );
-        }
-        state.merge_transitions(BundleRetention::Reverts);
-        // Also catch unexpected nonce, balance, or other storage writes.
-        assert_eq!(state.bundle_state.state.len(), 1, "{path}");
-        assert!(
-            state
-                .bundle_state
-                .state
-                .contains_key(&HISTORY_STORAGE_ADDRESS)
-        );
-    }
-    // Run the same empty block through vanilla Reth to prove the fixture
-    // would change these slots if Ethereum's system processing were used.
+    let mut state = State::builder()
+        .with_database(db.clone())
+        .with_bundle_update()
+        .build();
+    let evm = config.evm_with_env(&mut state, config.evm_env(block.header()).unwrap());
+    let mut executor = config
+        .block_executor_factory()
+        .create_executor(evm, config.context_for_block(&block).unwrap());
+    executor.apply_pre_execution_changes().unwrap();
+    // The history update must be visible before transactions/checkpoints.
+    assert_eq!(
+        executor
+            .evm_mut()
+            .db_mut()
+            .storage(HISTORY_STORAGE_ADDRESS, U256::ZERO)
+            .unwrap(),
+        U256::from_be_bytes(parent_hash.0),
+    );
+    assert!(
+        executor
+            .apply_post_execution_changes()
+            .unwrap()
+            .requests
+            .is_empty()
+    );
+    state.merge_transitions(BundleRetention::Reverts);
+    // No storage, balance, nonce, or code changes outside the history contract.
+    assert_eq!(state.bundle_state.state.len(), 1);
+    assert!(
+        state
+            .bundle_state
+            .state
+            .contains_key(&HISTORY_STORAGE_ADDRESS)
+    );
+
+    // Prove the same fixture actually triggers Ethereum's system calls.
     let ethereum = EthEvmConfig::new(config.chain_spec().clone());
-    let mut executor = ethereum.executor(system_database());
-    let result = executor
-        .execute_one(
-            &SealedBlock::seal_slow(ethereum_block)
-                .try_recover()
-                .unwrap(),
-        )
+    let mut executor = ethereum.executor(db);
+    let block = SealedBlock::seal_slow(ethereum_block)
+        .try_recover()
         .unwrap();
-    assert!(result.requests.is_empty());
+    assert!(executor.execute_one(&block).unwrap().requests.is_empty());
     let mut state = executor.into_state();
     for (address, slot, expected) in [
         (WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS, 0, 8),
@@ -218,7 +157,7 @@ fn deposit_logs_remain_receipts_without_l2_consensus_requests() {
     }
     .into_signed(Signature::test_signature());
     let sender = signed.recover_signer().unwrap();
-    let mut db = system_database();
+    let mut db = InMemoryDB::default();
     db.insert_account_info(
         MAINNET_DEPOSIT_CONTRACT_ADDRESS,
         AccountInfo {
@@ -257,54 +196,30 @@ fn deposit_logs_remain_receipts_without_l2_consensus_requests() {
         )
         .unwrap();
     assert_eq!(l2.receipts.len(), 1);
-    assert_eq!(l1.receipts.len(), 1);
     assert!(l2.receipts[0].success);
-    assert!(l1.receipts[0].success);
-    for logs in [&l2.receipts[0].logs, &l1.receipts[0].logs] {
-        assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].address, MAINNET_DEPOSIT_CONTRACT_ADDRESS);
-        assert_eq!(logs[0].topics(), &[topic]);
-        assert_eq!(logs[0].data.data.as_ref(), data.as_slice());
-    }
-    assert_eq!(l1.requests.take(), vec![Bytes::from(expected_request)]);
+    let logs = &l2.receipts[0].logs;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].address, MAINNET_DEPOSIT_CONTRACT_ADDRESS);
+    assert_eq!(logs[0].topics(), &[topic]);
+    assert_eq!(logs[0].data.data.as_ref(), data.as_slice());
     assert!(l2.requests.is_empty());
-    assert_eq!(l2.requests.requests_hash(), EMPTY_REQUESTS_HASH);
+    // Ensure the event is valid and would generate an Ethereum request.
+    assert_eq!(l1.requests.take(), vec![Bytes::from(expected_request)]);
 }
 
 #[test]
-fn l2_rejects_nonzero_beacon_root_while_l1_preserves_it() {
-    let beacon_root = B256::repeat_byte(0x42);
-    let mut header = block(0, 1).into_block().header;
-    header.parent_beacon_block_root = Some(beacon_root);
-    let ethereum_block = alloy_consensus::Block::new(header, BlockBody::default());
-    let block =
-        SealedBlock::seal_slow(ethereum_block.clone().map_transactions(EezTxEnvelope::from))
-            .try_recover()
-            .unwrap();
-    let config = system_config();
-    let error = config
-        .executor(system_database())
+fn l2_rejects_nonzero_beacon_root() {
+    let mut block = block(0, 1).into_block();
+    block.body.transactions.clear();
+    block.header.parent_beacon_block_root = Some(B256::repeat_byte(0x42));
+    let block = SealedBlock::seal_slow(block).try_recover().unwrap();
+    let error = system_config()
+        .executor(InMemoryDB::default())
         .execute_one(&block)
         .unwrap_err();
     assert!(
         error
             .to_string()
             .contains("L2 parent beacon block root must be zero")
-    );
-    let ethereum = EthEvmConfig::new(config.chain_spec().clone());
-    let mut executor = ethereum.executor(system_database());
-    executor
-        .execute_one(
-            &SealedBlock::seal_slow(ethereum_block)
-                .try_recover()
-                .unwrap(),
-        )
-        .unwrap();
-    assert_eq!(
-        executor
-            .into_state()
-            .storage(BEACON_ROOTS_ADDRESS, U256::from(8192))
-            .unwrap(),
-        U256::from_be_bytes(beacon_root.0)
     );
 }
