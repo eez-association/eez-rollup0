@@ -67,9 +67,12 @@ independently recomputed post-state root. The adapter telescopes against the
 pre-state root and carries the post-state root into `BackendBlockOutput`; it
 does not promote a copied Composer or header claim merely by renaming it.
 
-The checkpoint-enabled path is used only when the final selection is non-empty.
-An empty selection uses ordinary Stateless validation and reports an empty
-vector; it does not authorize an effect position.
+Nonempty terminals use checkpoint-enabled replay. An empty terminal uses ordinary
+Stateless validation, then returns the validated complete block as its sole
+zero-transaction candidate, including post-block state changes. Preceding blocks
+use ordinary replay and return no checkpoints. The shared `CheckpointPlan`
+selects replay positions and completes and checks each terminal's checkpoint
+output after successful execution validation.
 
 ## One associated output per block
 

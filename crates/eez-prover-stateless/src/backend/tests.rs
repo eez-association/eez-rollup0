@@ -1,3 +1,4 @@
+mod empty_terminal;
 mod fees;
 mod native_security;
 

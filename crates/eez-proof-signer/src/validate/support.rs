@@ -11,7 +11,8 @@ use reth_primitives_traits::RecoveredBlock;
 use tracing::debug;
 
 use super::{
-    CheckpointAt, DecodedOutboundEvent, OutboundEventObservation, StateCheckpoint, ValidationError,
+    BackendBlockOutput, CheckpointAt, DecodedOutboundEvent, OutboundEventObservation,
+    StateCheckpoint, ValidationError,
 };
 use crate::EEZL2_ADDRESS;
 use crate::cancel::CancellationToken;
@@ -43,8 +44,8 @@ impl CheckpointPlan {
             system_sender_flags.push(is_system_sender);
             sync_system_transaction_flags.push(is_system_tx(&transaction));
         }
-        // The anchor's candidate always leads: the block sealed after the
-        // pre-block system calls, holding no transactions.
+        // The anchor's zero-transaction candidate always leads. An empty
+        // terminal supplies it only after complete execution validation.
         let mut positions = vec![CheckpointAt::PreExecution];
         positions.extend(
             pair_end_positions(&sync_system_transaction_flags)
@@ -57,6 +58,32 @@ impl CheckpointPlan {
     /// Positions selected for checkpoint root computation.
     pub fn positions(&self) -> &[CheckpointAt] {
         &self.positions
+    }
+
+    /// Positions requiring intermediate replay snapshots. An empty terminal is
+    /// its own zero-transaction candidate, finalized by `complete` instead:
+    /// post-block system calls can change its state even without transactions.
+    pub fn execution_positions(&self) -> &[CheckpointAt] {
+        if self.positions == [CheckpointAt::PreExecution] {
+            &[]
+        } else {
+            &self.positions
+        }
+    }
+
+    /// Complete terminal checkpoints after the backend has validated execution,
+    /// including the recomputed final state root and all header commitments.
+    /// An empty terminal's candidate is that validated block, not a snapshot
+    /// taken before its post-block system calls.
+    pub fn complete(&self, output: &mut BackendBlockOutput) -> Result<(), ValidationError> {
+        if self.positions == [CheckpointAt::PreExecution] {
+            output.transaction_state_checkpoints.push(StateCheckpoint {
+                at: CheckpointAt::PreExecution,
+                state_root: output.post_state_root,
+                block_hash: output.computed_hash,
+            });
+        }
+        self.verify_returned(&output.transaction_state_checkpoints)
     }
 
     /// Check that a checkpoint-capable backend honored the selection exactly.

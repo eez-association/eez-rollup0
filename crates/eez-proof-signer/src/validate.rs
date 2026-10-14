@@ -16,9 +16,9 @@ pub mod support;
 
 type EthereumBlock = eez_primitives::Block;
 
-/// Where a candidate is sealed: the pre-execution seal or a transaction
-/// boundary. Re-exported from the validator so both backends and this contract
-/// name one type.
+/// Candidate prefix: zero transactions (`PreExecution`) or a transaction
+/// boundary. An empty terminal's zero-transaction candidate includes post-block
+/// changes. Re-exported so both backends and this contract name one type.
 pub use stateless_reth::CheckpointAt;
 
 /// One checkpoint position's replay outputs: the cumulative state root and the
@@ -27,7 +27,8 @@ pub use stateless_reth::CheckpointAt;
 pub struct StateCheckpoint {
     /// Where in the block this was sealed.
     pub at: CheckpointAt,
-    /// State root at this position, before post-block changes.
+    /// State root at this position. For an empty terminal this is the validated
+    /// final root, including post-block changes; other positions precede them.
     pub state_root: B256,
     /// Hash of the candidate block holding exactly this prefix — what settlement
     /// gates compare an entry's claimed `newRoot` against.

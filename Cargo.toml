@@ -77,6 +77,7 @@ reth-chain-state                = { git = "https://github.com/paradigmxyz/reth",
 reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-cli                        = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-db                         = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-db-common                  = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-engine-primitives          = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-ethereum-cli               = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }

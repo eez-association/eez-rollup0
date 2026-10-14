@@ -535,10 +535,9 @@ impl SyncBlockFork {
 /// execution-derived commitments differing per prefix. One becomes canonical.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncCandidates {
-    /// The candidate the anchor entry claims: the block
-    /// holding no transactions, sealed after the pre-block system calls
-    /// (EIP-2935 / EIP-4788). An empty Sync block still mutates state, so it is
-    /// not the parent's hash.
+    /// The candidate the anchor entry claims: the fully finalized block holding
+    /// no transactions, including pre- and post-block system calls. An empty
+    /// Sync block can still mutate state, so it is not the parent's hash.
     pub anchor: B256,
     /// One commitment per pair end, in effect order.
     pub per_effect: Vec<B256>,

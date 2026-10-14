@@ -40,7 +40,9 @@ changing `service/`; Operations is aimed at deployment and incident diagnosis.
 - **Transaction-state checkpoint:** a state root locally recomputed immediately
   after a selected transaction and before post-block processing, paired with
   the hash of the candidate block holding that prefix. Settlement later binds
-  that hash to a submitted state-update claim.
+  that hash to a submitted state-update claim. An empty terminal's sole
+  checkpoint instead carries its validated final state and block hash, including
+  post-block processing.
 - **DA sidecar / Sync block:** a sidecar is the canonical derivation projection
   for one effect; the Sync block is the terminal L2 block reconstructed from
   those projections and retained user transactions.

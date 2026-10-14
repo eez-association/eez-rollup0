@@ -205,17 +205,17 @@ where
     for (index, admitted) in blocks.iter().enumerate() {
         check_cancellation(cancellation, index, total_blocks)?;
         let is_settling = index + 1 == total_blocks;
-        let (block, checkpoint_positions, sender_flags) = if is_settling {
+        let (block, checkpoint_plan, sender_flags) = if is_settling {
             let (block, plan, flags) = prepared_settling_block.take().ok_or_else(|| {
                 ValidationError::InternalInvariant(
                     "prepared stateful settling block unexpectedly missing".to_owned(),
                 )
             })?;
-            (block, plan.positions().to_vec(), flags)
+            (block, Some(plan), flags)
         } else {
             let block = decode_match_and_recover_signers(admitted, chain_spec)?;
             let flags = system_sender_flags(&block, expected_l2_system_address);
-            (block, Vec::new(), flags)
+            (block, None, flags)
         };
         let number = block.header().number();
         consensus
@@ -237,6 +237,9 @@ where
             transactions = block.body().transactions.len(),
             "replaying stateful proof block",
         );
+        let checkpoint_positions = checkpoint_plan
+            .as_ref()
+            .map_or(&[][..], CheckpointPlan::execution_positions);
         let (result, checkpoints, block_access_list_hash) = if checkpoint_positions.is_empty()
             && block.header().block_access_list_hash().is_none()
         {
@@ -250,7 +253,7 @@ where
                 evm_config,
                 &mut state,
                 &block,
-                &checkpoint_positions,
+                checkpoint_positions,
             )?
         };
         validate_block_post_execution(
@@ -282,7 +285,7 @@ where
             .map(|receipt| receipt.success)
             .collect();
         let observed_outbound_events = observe_outbound_events(&result.receipts);
-        outputs.push(BackendBlockOutput {
+        let mut output = BackendBlockOutput {
             decoded_number: number,
             decoded_parent_hash: block.header().parent_hash(),
             computed_hash: block.hash(),
@@ -294,7 +297,11 @@ where
                 system_sender_flags: sender_flags,
                 observed_outbound_events,
             },
-        });
+        };
+        if let Some(plan) = checkpoint_plan {
+            plan.complete(&mut output)?;
+        }
+        outputs.push(output);
         debug!(block_number = number, %post_state_root, "stateful proof block validated");
     }
 

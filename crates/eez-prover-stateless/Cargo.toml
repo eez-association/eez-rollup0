@@ -38,9 +38,13 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [dev-dependencies]
+eez-composer.workspace = true
 eez-control-rpc.workspace = true
 eez-proof-signer = { workspace = true, features = ["test-utils"] }
+eez-prover-stateful.workspace = true
 hex.workspace = true
+reth-db-common.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }
 reth-trie-common.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }
 tonic.workspace = true

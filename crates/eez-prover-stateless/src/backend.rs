@@ -240,16 +240,20 @@ impl Backend {
             // Before this call the decoded block and witness remain untrusted.
             // Successful Stateless output means consensus, witness pre-state,
             // execution receipts, and the recomputed post-state commitment all
-            // passed. The terminal plan always includes the anchor checkpoint.
+            // passed. Empty terminals need no intermediate snapshots; the plan
+            // completes their anchor from the validated final output below.
             let witness = std::mem::take(witness);
-            let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
+            let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan
+                .as_ref()
+                .filter(|plan| !plan.execution_positions().is_empty())
+            {
                 Some(plan) => {
                     let output = stateless_validation_recovered_with_state_checkpoints(
                         recovered_block,
                         witness,
                         Arc::clone(&self.chain_spec),
                         self.evm_config.clone(),
-                        plan.positions(),
+                        plan.execution_positions(),
                     )
                     .map_err(|error| map_stateless_error(block_number, error))?;
                     let checkpoints = output
@@ -262,7 +266,6 @@ impl Backend {
                             block_hash: checkpoint.block_hash,
                         })
                         .collect::<Vec<_>>();
-                    plan.verify_returned(&checkpoints)?;
                     (output.validation, checkpoints)
                 }
                 None => {
@@ -329,7 +332,7 @@ impl Backend {
                     "stateless block validated",
                 );
             }
-            block_outputs.push(BackendBlockOutput {
+            let mut output = BackendBlockOutput {
                 decoded_number: block_number,
                 decoded_parent_hash,
                 computed_hash,
@@ -341,7 +344,11 @@ impl Backend {
                     system_sender_flags,
                     observed_outbound_events,
                 },
-            });
+            };
+            if let Some(plan) = checkpoint_plan {
+                plan.complete(&mut output)?;
+            }
+            block_outputs.push(output);
 
             if block_ordinal.is_multiple_of(DEBUG_PROGRESS_INTERVAL) {
                 debug!(

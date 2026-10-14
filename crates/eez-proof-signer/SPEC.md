@@ -337,10 +337,13 @@ An absent `system[i + 1]` at block end is treated as `true`. Thus an outbound
 `[system-load, user]` pair ends at the user transaction, while a standalone
 inbound system transaction ends at itself.
 
-The plan first requests the pre-execution position: the terminal sealed after
-its pre-block system calls and before transaction 0, which is the anchor's
-candidate. The positions in `C` follow in order. For an empty terminal, that
-single checkpoint seals the complete terminal block.
+The plan first requests `PreExecution`, identifying the zero-transaction
+candidate claimed by the anchor. The positions in `C` follow in order. For a
+nonempty terminal, replay captures that position after pre-block system calls
+and before transaction 0. For an empty terminal, its sole candidate is the
+complete terminal: the backend MUST finish post-block system calls and validate
+the resulting state root before returning that checkpoint. An empty transaction
+list does not imply that post-block system calls leave state unchanged.
 
 The Composer MUST NOT nominate checkpoint positions. The complete plan MUST be
 derived before earlier blocks are replayed. The backend MUST return exactly the
