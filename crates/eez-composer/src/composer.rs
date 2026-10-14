@@ -4941,7 +4941,7 @@ mod tests {
     fn signed_user_tx(gas_limit: u64) -> Bytes {
         use alloy_consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
         use alloy_network::{TxSignerSync as _, eip2718::Encodable2718 as _};
-        use alloy_primitives::{TxKind, U256};
+        use alloy_primitives::TxKind;
         use alloy_signer_local::PrivateKeySigner;
 
         let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
