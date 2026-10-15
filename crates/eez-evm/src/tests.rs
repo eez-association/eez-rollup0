@@ -26,6 +26,28 @@ fn config() -> EezEvmConfig {
     .unwrap()
 }
 
+#[test]
+fn declared_cap_tracks_osaka_and_amsterdam_semantics() {
+    use alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
+    use revm::context::CfgEnv;
+    use revm::primitives::hardfork::SpecId;
+
+    let prague = CfgEnv::new_with_spec(SpecId::PRAGUE);
+    assert_eq!(prague.tx_gas_limit_cap, None);
+    assert_eq!(declared_tx_gas_limit_cap(&prague), None);
+
+    let osaka = CfgEnv::new_with_spec(SpecId::OSAKA);
+    assert_eq!(osaka.tx_gas_limit_cap, None);
+    assert_eq!(
+        declared_tx_gas_limit_cap(&osaka),
+        Some(MAX_TX_GAS_LIMIT_OSAKA)
+    );
+
+    let amsterdam = CfgEnv::new_with_spec(SpecId::AMSTERDAM);
+    assert!(amsterdam.enable_amsterdam_eip8037);
+    assert_eq!(declared_tx_gas_limit_cap(&amsterdam), None);
+}
+
 fn block(nonce: u64, chain_id: u64) -> reth_primitives_traits::RecoveredBlock<Block> {
     let tx: EezTxEnvelope = SystemTransaction {
         chain_id,

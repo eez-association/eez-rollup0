@@ -321,6 +321,12 @@ impl std::fmt::Debug for SyncBlockState {
 }
 
 impl SyncBlockState {
+    /// Declared transaction-gas cap from this draft's next-block environment.
+    #[must_use]
+    pub(crate) fn declared_tx_gas_limit_cap(&self) -> Option<u64> {
+        eez_evm::declared_tx_gas_limit_cap(&self.evm_env.cfg_env)
+    }
+
     /// Open the state of a Sync block on `parent` whose first `prefix_txs` have
     /// executed.
     ///
