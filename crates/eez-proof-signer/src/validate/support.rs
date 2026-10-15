@@ -1,6 +1,9 @@
 //! Replay helpers shared by validation backends.
 
-use alloy_primitives::Address;
+use std::ops::Deref;
+use std::sync::Arc;
+
+use alloy_primitives::{Address, B256};
 use alloy_sol_types::SolEvent as _;
 use eez_primitives::Block;
 use eez_primitives::Receipt as EthereumReceipt;
@@ -11,11 +14,12 @@ use reth_primitives_traits::RecoveredBlock;
 use tracing::debug;
 
 use super::{
-    CheckpointAt, DecodedOutboundEvent, OutboundEventObservation, StateCheckpoint, ValidationError,
+    AdmittedBlock, BackendBlockOutput, CheckpointAt, DecodedOutboundEvent,
+    OutboundEventObservation, StateCheckpoint, ValidatedBlock, ValidationError,
+    check_backend_block_output,
 };
 use crate::EEZL2_ADDRESS;
 use crate::cancel::CancellationToken;
-use crate::window::AdmittedBlock;
 
 /// Positions at which settlement framing needs replay outputs.
 #[derive(Debug, PartialEq, Eq)]
@@ -30,8 +34,10 @@ impl CheckpointPlan {
         Self { positions }
     }
 
-    /// Derive effect-candidate boundaries and system-sender flags.
-    pub fn from_recovered_block(
+    /// Derive Sync-candidate checkpoints and system-sender flags for either RPC version.
+    /// A valid nonempty Sync contains native system transactions; an empty Sync
+    /// or ordinary block needs none. Settlement still verifies the exact effect layout.
+    pub fn for_block(
         block: &RecoveredBlock<Block>,
         expected_l2_system_address: Address,
     ) -> (Self, Vec<bool>) {
@@ -43,18 +49,17 @@ impl CheckpointPlan {
             system_sender_flags.push(is_system_sender);
             sync_system_transaction_flags.push(is_system_tx(&transaction));
         }
-        // The anchor's candidate leads: the block sealed after the pre-block
-        // system calls, holding no transactions. With no transactions at all the
-        // block already IS that candidate, so sealing it again is redundant.
         let mut positions = Vec::new();
-        if transaction_count > 0 {
+        if sync_system_transaction_flags.contains(&true) {
+            // The anchor's candidate leads: the block sealed after the pre-block
+            // system calls, holding no transactions. Effect boundaries follow.
             positions.push(CheckpointAt::PreExecution);
+            positions.extend(
+                pair_end_positions(&sync_system_transaction_flags)
+                    .into_iter()
+                    .map(CheckpointAt::Transaction),
+            );
         }
-        positions.extend(
-            pair_end_positions(&sync_system_transaction_flags)
-                .into_iter()
-                .map(CheckpointAt::Transaction),
-        );
         (Self { positions }, system_sender_flags)
     }
 
@@ -112,17 +117,76 @@ pub fn check_cancellation(
     }
 }
 
+/// Identity-bound input retained through execution, so finishing validation
+/// need not decode the submitted bytes or bind their identity a second time.
+#[derive(Debug, Clone)]
+pub struct DecodedBlock {
+    rlp: Vec<u8>,
+    block: RecoveredBlock<Block>,
+}
+
+impl Deref for DecodedBlock {
+    type Target = RecoveredBlock<Block>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.block
+    }
+}
+
+impl DecodedBlock {
+    /// An owned execution input for engines that consume their recovered block.
+    pub fn execution_input(&self) -> RecoveredBlock<Block> {
+        self.block.clone()
+    }
+
+    /// Publish checked execution evidence. Backends call this before inserting
+    /// a reusable result; callers cannot construct a validated block directly.
+    pub fn finish(
+        self,
+        output: BackendBlockOutput,
+        pre_state_root: B256,
+        allow_checkpoints: bool,
+    ) -> Result<Arc<ValidatedBlock>, ValidationError> {
+        let hash = self.block.hash();
+        let decoded = self.block.into_block();
+        check_backend_block_output(
+            decoded.header.number,
+            hash,
+            &decoded,
+            &output,
+            allow_checkpoints,
+        )
+        .map_err(|error| ValidationError::InvalidBackendOutput(error.to_string()))?;
+        Ok(Arc::new(ValidatedBlock {
+            number: decoded.header.number,
+            hash: output.computed_hash,
+            parent_hash: decoded.header.parent_hash,
+            pre_state_root,
+            post_state_root: output.post_state_root,
+            rlp: self.rlp,
+            decoded,
+            receipt_successes: output.receipt_successes,
+            transaction_state_checkpoints: output.transaction_state_checkpoints,
+            settlement_evidence: output.settlement_evidence,
+        }))
+    }
+}
+
 /// Exact-decode, match stream metadata, and recover transaction signers.
 pub fn decode_match_and_recover_signers(
     admitted: &AdmittedBlock,
     chain_spec: &ChainSpec,
-) -> Result<RecoveredBlock<Block>, ValidationError> {
+) -> Result<DecodedBlock, ValidationError> {
     let block = decode_and_match_stream_metadata(admitted)?;
     let number = block.header.number;
-    recover_block(block, chain_spec).map_err(|error| {
+    let block = recover_block(block, chain_spec).map_err(|error| {
         ValidationError::Rejected(format!(
             "block {number} transaction recovery failed: {error}",
         ))
+    })?;
+    Ok(DecodedBlock {
+        rlp: admitted.rlp().to_vec(),
+        block,
     })
 }
 

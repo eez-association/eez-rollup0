@@ -30,10 +30,10 @@ flowchart TB
     PLAN --> EXEC[Stateless and Reth re-execution]
     A --> EXEC
 
-    EXEC --> REPORT[BackendWindowOutput]
-    REPORT --> CHECK[Shared cross-checks]
-    A --> CHECK
-    CHECK --> VW[ValidatedWindow]
+    EXEC --> CHECK[DecodedBlock.finish: execution evidence checks]
+    RECOVER --> CHECK
+    CHECK --> VB[ValidatedBlock shared by backend cache and session]
+    VB --> VW[ValidatedWindow selected from the validated prefix]
 ```
 
 ## Startup initialization
@@ -75,40 +75,50 @@ vector; it does not authorize an effect position.
 
 | Output | Contents |
 | --- | --- |
-| `BackendWindowOutput` | One `BackendBlockOutput` per replayed block, oldest first |
-| `BackendBlockOutput` | Exact-decoded number, parent hash and transaction count; computed hash; recomputed post-state root; exact receipt outcomes; selected transaction-state checkpoints, each carrying a state root and the hash of the candidate block sealed over that prefix; and settlement evidence for the same block |
+| `BackendWindowOutput` | One checked `Arc<ValidatedBlock>` per replayed block, oldest first |
+| `BackendBlockOutput` | Execution hash, post-state root, receipt outcomes, selected checkpoints and settlement evidence, consumed inside the backend by `DecodedBlock::finish` |
+| `ValidatedBlock` | Identity-bound decoded block and exact RLP, actual pre/post-state roots, and structurally checked execution evidence; immutable after construction |
 | `SettlementBlockEvidence` | Fork-aware system-sender flags and ordered outbound receipt observations derived from that block's accepted execution |
 
-The backend output is not handed directly to settlement.
-[`validate.rs`](../src/validate.rs) consumes it alongside the admitted blocks
-and checks block count, every decoded identity and computed hash, decoded
-transaction count, exact receipt and system-sender
-coverage, outbound-observation transaction-index bounds and coordinate order,
-checkpoint order and bounds,
-and empty checkpoint selections for preceding blocks. A backend rejection is a
-window rejection; a backend that claims success with malformed output is an
-internal contract failure.
+Inside each backend, `DecodedBlock::finish` applies the common evidence checks
+from [`validate.rs`](../src/validate.rs): execution hash binding, exact receipt
+and sender coverage against the retained decoded transactions, outbound-event
+bounds/order, checkpoint bounds/order, and empty checkpoint selections for v1
+preceding blocks. A malformed success is an internal contract failure and never
+becomes a reusable checked block. In v2, the shared planner requests checkpoints
+only for blocks containing native system transactions: every valid nonempty
+Sync has those transactions, and an empty Sync needs no checkpoints. Ordinal
+blocks use ordinary execution (or reuse Reth's receipts) without checkpoint
+generation. This is only execution planning; settlement still verifies the
+selected terminal's full effect layout and rejects an Ordinal block presented
+as a nonempty Sync. The decision depends on block bytes, not on a caller flag,
+so cached results have the same checkpoint policy across sessions.
+Stateless stores checked blocks; stateful leaves blocks/receipts in
+Reth and publishes supplemental checkpoints only after checked construction.
 
 ## Why `ValidatedWindow` exists
 
-Parallel vectors make it easy to combine one block with another block's
-execution result. `BackendBlockOutput` first keeps associated results together,
-and `ValidatedWindow` is the only production handoff after shared checks. It:
+`ValidatedBlock` keeps execution facts bound to their decoded block.
+`ValidatedWindow` adds the selected-range guarantee without manufacturing a
+second block representation. It:
 
 - separates `preceding_blocks` from the terminal `settling_block`;
 - carries `window_pre_block_hash` and `window_post_block_hash`;
-- reads every endpoint from a header field: `settling_pre_block_hash` is the
-  settling block's own parent hash, and `window_pre_block_hash` falls back to
-  it for a one-block window;
-- keeps the settling block's receipt outcomes and selected checkpoints beside
-  that block; and
-- drops witnesses that execution has already consumed.
+- retains the selected predecessor hash and reads the terminal hash and its
+  parent from the checked block identity;
+- shares blocks, including their receipt outcomes and selected checkpoints,
+  with backend/session storage; and
+- contains no witnesses; those are consumed or discarded by execution.
 
 The window pre-block hash is not automatically a batch anchor. Settlement must
 still bind the leading submitted state update to it. `ValidatedWindow` is an
 architectural boundary, not another proof: construction is safe because the
-backend-output contract and admitted input were consumed and checked
-immediately beforehand.
+v1 admission/replay establishes the complete sequence, or the v2 backend
+validates each exact extension and the session owns append, rewind and range
+selection. An async append checks that its captured epoch/parent is
+still current. Selection checks new range bounds and terminal identity, rather
+than re-verifying immutable block linkage. Settlement reads the already-decoded
+blocks and checks the new batch claims, not RLP validity or evidence lengths.
 
 ## Pinned Stateless extension
 

@@ -41,6 +41,7 @@ eyre               = "0.6"
 serde              = { version = "1", features = ["derive"] }
 sha3               = "0.10"
 hex                = "0.4"
+lru                = "0.16.4"
 
 # grpc — eez-control-rpc `Prove` wire (composer client ↔ proof-signer server).
 # tonic 0.14 splits codegen out: tonic runtime, tonic-prost glue, tonic-prost-build (build-dep).
@@ -50,6 +51,7 @@ tonic-prost-build     = "0.14"
 protoc-bin-vendored   = "3"
 prost                 = "0.14"
 tokio-stream          = "0.1"
+getrandom             = "0.3"
 # compact binary serialization for the persistent witness store's values
 postcard              = { version = "1", features = ["use-std"] }
 # reth `debug_executionWitness` result shape — mirrors the proto ExecutionWitness.
