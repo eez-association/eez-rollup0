@@ -25,6 +25,8 @@ use std::{
 };
 
 use alloy_consensus::Transaction as _;
+use alloy_consensus::transaction::SignerRecoverable as _;
+use alloy_eips::eip2718::Decodable2718 as _;
 use alloy_primitives::{Address, B256, Bytes, Signature, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionReceipt, TransactionRequest};
@@ -126,7 +128,6 @@ pub struct Anvil {
 }
 
 struct AnvilConfig {
-    block_time_secs: u64,
     gas_limit: u64,
     genesis_timestamp: u64,
 }
@@ -134,7 +135,6 @@ struct AnvilConfig {
 impl AnvilConfig {
     fn standard(genesis_timestamp: u64) -> Self {
         Self {
-            block_time_secs: L1_BLOCK_TIME_SECS,
             gas_limit: 30_000_000,
             genesis_timestamp,
         }
@@ -153,8 +153,11 @@ impl Anvil {
             &port.to_string(),
             "--chain-id",
             &DEV_CHAIN_ID.to_string(),
-            "--block-time",
-            &cfg.block_time_secs.to_string(),
+            // The builder stub mines every block on the L1 slot cadence; FIFO
+            // keeps each bundle's transactions in submission order.
+            "--no-mining",
+            "--order",
+            "fifo",
             "--silent",
         ]);
         cmd.args(["--gas-limit", &cfg.gas_limit.to_string()]);
@@ -234,10 +237,7 @@ impl Drop for Anvil {
     }
 }
 
-/// Forwards single-transaction `eth_sendBundle` payloads to Anvil.
-///
-/// Anvil has no builder API, so the stub explicitly rejects bundles containing
-/// zero or multiple transactions instead of pretending to preserve atomicity.
+/// Mines Anvil's blocks and applies `eth_sendBundle` payloads atomically.
 struct BundleStub {
     child: Child,
     url: String,
@@ -273,6 +273,8 @@ impl BundleStub {
         command
             .arg(script)
             .args(["--listen", &listen, "--upstream", upstream])
+            .arg("--block-time")
+            .arg(L1_BLOCK_TIME_SECS.to_string())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err_log));
         drop(port_lease);
@@ -806,8 +808,11 @@ impl Harness {
         initial_state: B256,
         l2_genesis: (PathBuf, tempfile::TempDir),
     ) -> Result<Self> {
-        let anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
+        let mut anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
         let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url).await?;
+        // Route every harness client through the builder so its snapshot-based
+        // block assembly cannot race direct mutations of the backing Anvil.
+        anvil.rpc_url.clone_from(&stub.url);
         let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
         Ok(Self {
             anvil,
@@ -1998,15 +2003,16 @@ impl<'a> Chain<'a> {
         self.rollup_id
     }
 
-    /// Anvil uses `--block-time`, so `evm_setAutomine` does not stop it.
-    /// Interval 0 pauses block production; restore with `L1_BLOCK_TIME_SECS`.
+    /// The builder stub produces L1 blocks, so it is paused there rather than
+    /// in Anvil. Interval 0 pauses block production; any other value resumes
+    /// it on the `L1_BLOCK_TIME_SECS` cadence.
     pub async fn set_interval_mining(&self, secs: u64) -> Result<()> {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
         let _: serde_json::Value = provider
             .client()
-            .request("anvil_setIntervalMining", (secs,))
+            .request("eez_setMining", (secs != 0,))
             .await
-            .context("anvil_setIntervalMining")?;
+            .context("eez_setMining")?;
         Ok(())
     }
 
@@ -2015,9 +2021,9 @@ impl<'a> Chain<'a> {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
         let _: serde_json::Value = provider
             .client()
-            .request("evm_mine", ())
+            .request("eez_mine", ())
             .await
-            .context("evm_mine")?;
+            .context("eez_mine")?;
         Ok(())
     }
 
@@ -2158,7 +2164,7 @@ impl<'a> Chain<'a> {
     }
 
     /// Assert that a submitted `postAndVerifyBatch` for `expected_rollup_id`
-    /// was mined, reverted, and reproduces `expected_revert_selector` via
+    /// was rejected atomically and reproduces `expected_revert_selector` via
     /// `eth_call` against the resulting chain state.
     pub async fn assert_failed_post_and_verify_batch(
         &self,
@@ -2166,74 +2172,56 @@ impl<'a> Chain<'a> {
         expected_revert_selector: [u8; 4],
     ) -> Result<()> {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
-        let latest = provider.get_block_number().await?;
+        let rejected: Vec<Bytes> = provider
+            .client()
+            .request("eez_getRejectedTransactions", ())
+            .await
+            .context("eez_getRejectedTransactions")?;
 
-        for block_number in self.deploy_block..=latest {
-            let Some(block) = provider
-                .get_block_by_number(BlockNumberOrTag::Number(block_number))
-                .full()
-                .await?
-            else {
+        for raw in rejected {
+            let transaction = TxEnvelope::decode_2718(&mut raw.as_ref())?;
+            if transaction.to() != Some(self.eez_address)
+                || !transaction
+                    .input()
+                    .starts_with(&eez_protocol::abi::postAndVerifyBatchCall::SELECTOR)
+            {
                 continue;
-            };
-            for transaction in block.transactions.txns() {
-                if transaction.inner.to() != Some(self.eez_address)
-                    || !transaction
-                        .inner
-                        .input()
-                        .starts_with(&eez_protocol::abi::postAndVerifyBatchCall::SELECTOR)
-                {
-                    continue;
-                }
-                let call = eez_protocol::abi::postAndVerifyBatchCall::abi_decode(
-                    transaction.inner.input(),
-                )?;
-                if !call
-                    .batch
-                    .rollupIdsWithProofSystems
-                    .iter()
-                    .any(|rollup| rollup.rollupId == expected_rollup_id)
-                {
-                    continue;
-                }
-
-                let tx_hash = *transaction.inner.tx_hash();
-                let receipt = provider
-                    .get_transaction_receipt(tx_hash)
-                    .await?
-                    .ok_or_else(|| anyhow!("postAndVerifyBatch receipt {tx_hash} is missing"))?;
-                if receipt.status() {
-                    bail!(
-                        "postAndVerifyBatch transaction {tx_hash} for rollup {expected_rollup_id} succeeded"
-                    );
-                }
-
-                let replay = TransactionRequest::default()
-                    .from(transaction.inner.signer())
-                    .to(self.eez_address)
-                    .input(transaction.inner.input().clone().into());
-                let err = provider
-                    .call(replay)
-                    .await
-                    .expect_err("failed postAndVerifyBatch replay unexpectedly succeeded");
-                let expected = format!("0x{}", hex::encode(expected_revert_selector));
-                let error_response = err.as_error_resp().ok_or_else(|| {
-                    anyhow!("postAndVerifyBatch replay returned non-RPC error: {err}")
-                })?;
-                let observed = error_response.data.as_ref().map_or_else(
-                    || error_response.message.to_string(),
-                    |data| format!("{} {}", error_response.message, data.get()),
-                );
-                if !observed.contains(&expected) {
-                    bail!(
-                        "postAndVerifyBatch replay returned {observed}, expected selector {expected}"
-                    );
-                }
-                return Ok(());
             }
+            let call = eez_protocol::abi::postAndVerifyBatchCall::abi_decode(transaction.input())?;
+            if !call
+                .batch
+                .rollupIdsWithProofSystems
+                .iter()
+                .any(|rollup| rollup.rollupId == expected_rollup_id)
+            {
+                continue;
+            }
+
+            let replay = TransactionRequest::default()
+                .from(transaction.recover_signer()?)
+                .to(self.eez_address)
+                .input(transaction.input().clone().into());
+            let err = provider
+                .call(replay)
+                .await
+                .expect_err("failed postAndVerifyBatch replay unexpectedly succeeded");
+            let expected = format!("0x{}", hex::encode(expected_revert_selector));
+            let error_response = err.as_error_resp().ok_or_else(|| {
+                anyhow!("postAndVerifyBatch replay returned non-RPC error: {err}")
+            })?;
+            let observed = error_response.data.as_ref().map_or_else(
+                || error_response.message.to_string(),
+                |data| format!("{} {}", error_response.message, data.get()),
+            );
+            if !observed.contains(&expected) {
+                bail!(
+                    "postAndVerifyBatch replay returned {observed}, expected selector {expected}"
+                );
+            }
+            return Ok(());
         }
 
-        bail!("no mined postAndVerifyBatch transaction found for rollup {expected_rollup_id}")
+        bail!("no rejected postAndVerifyBatch transaction found for rollup {expected_rollup_id}")
     }
 }
 
@@ -3023,6 +3011,28 @@ async fn deploy_value(rpc_url: &str, key: &str, chain_id: u64, initial: U256) ->
         chain_id,
         &out.join("Value.sol/Value.json"),
         initial.abi_encode(),
+    )
+    .await
+}
+
+/// Deploy a `ParityGate` forwarding to `target`.
+///
+/// # Errors
+///
+/// Propagates deployment and receipt failures.
+pub async fn deploy_parity_gate(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    target: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("ParityGate.sol/ParityGate.json"),
+        target.abi_encode(),
     )
     .await
 }
