@@ -535,25 +535,13 @@ impl SyncBlockFork {
 /// execution-derived commitments differing per prefix. One becomes canonical.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncCandidates {
-    /// The candidate the anchor entry claims when there are effects: the block
+    /// The candidate the anchor entry claims: the block
     /// holding no transactions, sealed after the pre-block system calls
     /// (EIP-2935 / EIP-4788). An empty Sync block still mutates state, so it is
-    /// not the parent's hash. Unused without effects.
+    /// not the parent's hash.
     pub anchor: B256,
     /// One commitment per pair end, in effect order.
     pub per_effect: Vec<B256>,
-}
-
-impl SyncCandidates {
-    /// A batch with no effects. The anchor is then the only entry and carries
-    /// the endpoint, which `prepare_post_batch_raw` takes from the terminal.
-    #[must_use]
-    pub fn anchor_only() -> Self {
-        Self {
-            anchor: B256::ZERO,
-            per_effect: Vec::new(),
-        }
-    }
 }
 
 /// Build the Sync block's candidates by rebuilding it on the empty prefix and on
