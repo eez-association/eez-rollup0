@@ -3141,9 +3141,14 @@ dependencies = [
 name = "eez-control-rpc"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
+ "hex",
  "proptest",
  "prost",
  "protoc-bin-vendored",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
