@@ -35,8 +35,8 @@ impl CheckpointPlan {
     }
 
     /// Derive Sync-candidate checkpoints and system-sender flags for either RPC version.
-    /// A valid nonempty Sync contains native system transactions; an empty Sync
-    /// or ordinary block needs none. Settlement still verifies the exact effect layout.
+    /// A nonempty Sync contains native system transactions; an empty Sync needs
+    /// its anchor checkpoint. Ordinary nonempty blocks need no checkpoints.
     pub fn for_block(
         block: &RecoveredBlock<Block>,
         expected_l2_system_address: Address,
@@ -50,7 +50,7 @@ impl CheckpointPlan {
             sync_system_transaction_flags.push(is_system_tx(&transaction));
         }
         let mut positions = Vec::new();
-        if sync_system_transaction_flags.contains(&true) {
+        if transaction_count == 0 || sync_system_transaction_flags.contains(&true) {
             // The anchor's candidate leads: the block sealed after the pre-block
             // system calls, holding no transactions. Effect boundaries follow.
             positions.push(CheckpointAt::PreExecution);

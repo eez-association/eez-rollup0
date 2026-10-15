@@ -5,6 +5,7 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue};
 
 use eez_protocol::EEZL2_ADDRESS;
+use eez_protocol::abi::computeCrossChainProxyAddressCall;
 use eez_testkit::signals;
 use eez_testkit::{
     ANVIL_ATTESTER_KEY, DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER, INestedSetterInner,
@@ -13,13 +14,14 @@ use eez_testkit::{
     OUTBOUND_USER, ProverMutation, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead,
     TARGET_DEPLOYER, account_code, assert_latest_batch_signature, batches_posted,
     block_number_and_hash_at, call_read, call_revert_data, completed_proxy_calls, count_events,
-    cross_chain_source_proxy, deploy_nested_setter_inner, deploy_nested_setter_outer, events_since,
-    l2_balance, l2_value, last_proxy_result, onchain_nonce, read_state_word, receipt_ok,
-    rollup_commitment, run_scenarios, safe_block_hash, setter_call, setup_cross_chain,
-    setup_cross_chain_codeless, setup_cross_chain_empty_call, setup_cross_chain_nested_setter,
-    setup_cross_chain_outbound_return_data, setup_cross_chain_proxied,
-    setup_cross_chain_return_data, setup_cross_chain_reverting, sign_and_send, signer_address,
-    value_no_ret, value_read, wait_for, wait_for_safe_chain_contains,
+    create_l2_cross_chain_proxy, cross_chain_source_proxy, deploy_nested_setter_inner,
+    deploy_nested_setter_outer, events_since, l2_balance, l2_value, last_proxy_result,
+    onchain_nonce, read_state_word, receipt_ok, rollup_commitment, run_scenarios, safe_block_hash,
+    setter_call, setup_cross_chain, setup_cross_chain_codeless, setup_cross_chain_empty_call,
+    setup_cross_chain_nested_setter, setup_cross_chain_outbound_return_data,
+    setup_cross_chain_proxied, setup_cross_chain_return_data, setup_cross_chain_reverting,
+    sign_and_send, signer_address, value_no_ret, value_read, wait_for,
+    wait_for_safe_chain_contains,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -960,6 +962,62 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     w.node.assert_no_divergence_failure_logs();
 }
 
+/// Both pool-bypassing fronts must apply the EVM rules of their source chain
+/// before a transaction can enter the held pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_chain_fronts_reject_declared_gas_above_the_active_cap() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let over_cap = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA + 1;
+
+    let cases = [
+        (
+            "inbound",
+            w.l1_xchain(),
+            l1_rpc.clone(),
+            INBOUND_USER,
+            DEV_CHAIN_ID,
+            w.setter_proxy,
+        ),
+        (
+            "outbound",
+            w.l2_xchain(),
+            l2_rpc.clone(),
+            OUTBOUND_USER,
+            w.l2_chain_id,
+            w.outbound_proxy,
+        ),
+    ];
+
+    for (label, front, source_rpc, key, chain_id, target) in cases {
+        let nonce = onchain_nonce(&source_rpc, key).await.unwrap();
+        let error = sign_and_send(
+            &front,
+            key,
+            chain_id,
+            nonce,
+            Some(target),
+            U256::ZERO,
+            IValue::setValueCall { v: U256::from(1) }.abi_encode(),
+            over_cap,
+        )
+        .await
+        .expect_err("one-over-cap cross-chain transaction must be rejected at ingress");
+        let message = error.to_string();
+        assert!(
+            message.contains(&over_cap.to_string())
+                && message.contains(&alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA.to_string()),
+            "{label} rejection must name the declared gas and active cap: {message}",
+        );
+        assert_eq!(
+            onchain_nonce(&source_rpc, key).await.unwrap(),
+            nonce,
+            "{label} rejection must not consume the source nonce",
+        );
+    }
+}
+
 /// Ingress must reject a gap nonce immediately. The held pool only admits the
 /// next contiguous nonce, so N+1 cannot sit in the queue ahead of N.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1756,4 +1814,85 @@ async fn outbound_reverting_destination_is_evicted_without_state_changes() {
         .run(&w)
         .await
         .unwrap();
+}
+
+async fn composer_info(url: &str) -> serde_json::Value {
+    let response: serde_json::Value = reqwest::Client::new()
+        .post(url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eez_composerInfo",
+            "params": [],
+        }))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .unwrap_or_else(|err| panic!("eez_composerInfo at {url}: {err:#}"))
+        .json()
+        .await
+        .unwrap_or_else(|err| panic!("eez_composerInfo body at {url}: {err:#}"));
+    response
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| panic!("eez_composerInfo at {url} returned no result: {response}"))
+}
+
+/// The protocol's network harness discovers the deployment through the L1
+/// front, so both fronts must advertise exactly what the L2 RPC does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_chain_fronts_answer_composer_info() {
+    let w = setup_cross_chain().await.unwrap();
+    let expected = composer_info(&w.l2_rpc()).await;
+    let registry = expected["eezContracts"]["eezRegistryAddress"]
+        .as_str()
+        .and_then(|address| address.parse::<Address>().ok());
+    assert_eq!(registry, Some(w.cfg.eez_address), "{expected}");
+    for front in [w.l1_xchain(), w.l2_xchain()] {
+        assert_eq!(composer_info(&front).await, expected, "front {front}");
+    }
+}
+
+/// EEZ rejects a forwarded call whose destination is the manager itself
+/// (`EEZDestinationForbidden`), so the composer evicts it at compose time
+/// instead of posting a batch L1 cannot apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outbound_call_targeting_the_l1_manager_is_evicted() {
+    let w = setup_cross_chain().await.unwrap();
+    let l2_rpc = w.l2_rpc();
+    let manager_proxy =
+        create_l2_cross_chain_proxy(&l2_rpc, TARGET_DEPLOYER, w.cfg.eez_address, L1_ROLLUP_ID)
+            .await
+            .unwrap();
+    let nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+    let cursor = w.node.signal_cursor().unwrap();
+    let hash = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        nonce,
+        Some(manager_proxy),
+        U256::ZERO,
+        computeCrossChainProxyAddressCall {
+            originalAddress: Address::ZERO,
+            originalRollupId: w.cfg.rollup_id,
+        }
+        .abi_encode(),
+        1_200_000,
+    )
+    .await
+    .expect("an outbound call to the manager's proxy must be admitted");
+
+    wait_for_poison_eviction(&w, cursor, hash, "Outbound", "manager destination").await;
+    assert_eq!(
+        receipt_ok(&l2_rpc, hash).await.unwrap(),
+        None,
+        "an evicted manager-destination call must never land on its source chain",
+    );
+    let reason = w.node.log_lines_matching(&["EEZDestinationForbidden"], 5);
+    assert!(
+        !reason.is_empty(),
+        "the eviction must name EEZDestinationForbidden; log tail:\n{}",
+        w.node.log_tail(40),
+    );
 }

@@ -89,7 +89,7 @@ done < "$FWD_PIDS"
   echo "  something else is bound there — a socat left over from a run predating" >&2
   echo "  the PID file, or another service. Inspect with: ss -ltnp" >&2; exit 1; }
 
-echo "==> [5/7] resolve enode + CL peer-id"
+echo "==> [5/7] resolve enode + CL peer-id; check L1 tracing"
 for _ in $(seq 1 30); do PUBENODE=$(cast rpc admin_nodeInfo --rpc-url "http://127.0.0.1:$EL_RPC" 2>/dev/null | jq -r '.enode // empty'); [[ -n "$PUBENODE" ]] && break; sleep 2; done
 PUBKEY=$(sed -E 's#enode://([0-9a-f]+)@.*#\1#' <<<"${PUBENODE:-}")
 for _ in $(seq 1 30); do PEERID=$(curl -s "http://127.0.0.1:$CL_HTTP/eth/v1/node/identity" 2>/dev/null | jq -r '.data.peer_id // empty'); [[ -n "$PEERID" ]] && break; sleep 2; done
@@ -97,6 +97,21 @@ for _ in $(seq 1 30); do PEERID=$(curl -s "http://127.0.0.1:$CL_HTTP/eth/v1/node
 # unusable enode/multiaddr — fail here instead of at the handoff.
 [[ -n "$PUBKEY" && -n "${PEERID:-}" ]] || { echo "✗ could not resolve the EL enode or CL peer-id" >&2; exit 1; }
 echo "    enode pubkey=${PUBKEY:0:16}…  peer-id=$PEERID"
+# The batch scan traces contract-posted batches (debug_traceBlockByHash,
+# callTracer), so the EL must serve the debug namespace. Genesis has no parent
+# state to trace, so wait for block 1.
+TRACED=""
+for _ in $(seq 1 60); do
+  HEAD=$(cast block-number --rpc-url "http://127.0.0.1:$EL_RPC" 2>/dev/null)
+  if [[ "$HEAD" =~ ^[0-9]+$ ]] && (( HEAD >= 1 )) \
+    && cast rpc --rpc-url "http://127.0.0.1:$EL_RPC" debug_traceBlockByNumber latest \
+         '{"tracer":"callTracer","tracerConfig":{"withLog":true}}' >/dev/null 2>&1; then
+    TRACED=1; break
+  fi
+  sleep 2
+done
+[[ -n "$TRACED" ]] || { echo "✗ L1 EL does not answer debug_traceBlockByNumber with callTracer (head ${HEAD:-?}); the batch scan needs the debug namespace" >&2; exit 1; }
+echo "    debug_traceBlockByNumber(callTracer) answers at head $HEAD"
 
 echo "==> [6/7] public blockscout frontend (separate container; Kurtosis's stays intact)"
 FE=$(docker ps --format '{{.Names}}' | grep -i blockscout-frontend | grep -v public | head -1)

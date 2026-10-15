@@ -123,8 +123,9 @@ fn accepts_only_a_canonical_anchor_for_an_empty_settling_block() {
     let empty = verify_effect_prefix(&batch, root, &[], &settling).unwrap();
     assert_eq!((empty.inbound_count(), empty.outbound_count()), (0, 0));
 
+    let target_root = B256::repeat_byte(0x42);
     let target_batch = target_anchor_batch();
-    let target_batch = verify_effect_prefix(&target_batch, root, &[], &settling).unwrap();
+    let target_batch = verify_effect_prefix(&target_batch, target_root, &[], &settling).unwrap();
     assert_eq!(
         (target_batch.inbound_count(), target_batch.outbound_count()),
         (0, 0)
@@ -432,8 +433,8 @@ fn rejects_reexecuted_effects_and_unused_checkpoints_for_an_anchor_only_claim() 
         )
         .err(),
         Some(EffectPrefixError::TransactionStateCheckpointCountMismatch {
-            expected: 0,
-            actual: 1,
+            expected: 1,
+            actual: 2,
         })
     );
 }

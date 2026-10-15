@@ -88,6 +88,8 @@ services:
       # target-block oracle falls back to the embedded L1. Set it in
       # .env.chiado
       EEZ_L1_TARGET_RPC_URL: "${EEZ_L1_TARGET_RPC_URL:-}"
+      # Block-trace RPC; empty uses EEZ_L1_RPC_URL. Set it in .env.chiado.
+      EEZ_L1_TRACE_RPC_URL: "${EEZ_L1_TRACE_RPC_URL:-}"
       # Without this the embedded L1 falls back to the persisted
       # known-peers.json, which fills with cross-network noise and
       # leaves it on 0 peers, unable to backfill.

@@ -1140,7 +1140,11 @@ mod tests {
             let output = BackendBlockOutput {
                 computed_hash: block.claimed_hash(),
                 receipt_successes: Vec::new(),
-                transaction_state_checkpoints: Vec::new(),
+                transaction_state_checkpoints: vec![crate::validate::StateCheckpoint {
+                    at: crate::validate::CheckpointAt::PreExecution,
+                    state_root: post_root,
+                    block_hash: block.claimed_hash(),
+                }],
                 post_state_root: post_root,
                 settlement_evidence: SettlementBlockEvidence {
                     system_sender_flags: Vec::new(),

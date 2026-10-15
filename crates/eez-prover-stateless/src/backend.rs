@@ -254,7 +254,7 @@ impl Backend {
             // Before this call the decoded block and witness remain untrusted.
             // Successful Stateless output means consensus, witness pre-state,
             // execution receipts, and the recomputed post-state commitment all
-            // passed. Only a non-empty final selection uses the checkpoint path.
+            // passed. Only Sync candidates use the checkpoint path.
             let witness = std::mem::take(witness);
             let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
                 Some(plan) if !plan.positions().is_empty() => {
