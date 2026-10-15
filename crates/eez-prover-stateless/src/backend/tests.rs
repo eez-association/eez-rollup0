@@ -760,10 +760,26 @@ fn execution_must_produce_the_state_root_committed_by_the_header() {
 #[test]
 fn corrupt_witness_data_is_rejected_by_stateless() {
     let mut input = fixture_input();
+    let parent_hash = input.claimed_parent_hash();
     let parts = admitted_block_parts_mut(&mut input);
-    let mut node = parts.witness.state[0].to_vec();
+    let parent = parts
+        .witness
+        .headers
+        .iter()
+        .map(|raw| alloy_rlp::decode_exact::<Header>(raw).unwrap())
+        .find(|header| header.hash_slow() == parent_hash)
+        .unwrap();
+    // Corrupt a required node, not an arbitrary proof branch that was only
+    // accessed by the now-disabled Ethereum consensus-layer system calls.
+    let root = parts
+        .witness
+        .state
+        .iter_mut()
+        .find(|node| alloy_primitives::keccak256(node.as_ref()) == parent.state_root)
+        .unwrap();
+    let mut node = root.to_vec();
     node[0] ^= 0x01;
-    parts.witness.state[0] = node.into();
+    *root = node.into();
     assert!(matches!(
         Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(vec![input]),
         Err(ValidationError::Rejected(_))
