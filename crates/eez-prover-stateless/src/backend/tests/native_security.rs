@@ -14,7 +14,7 @@ fn prover_rejects_nonempty_consensus_requests_commitment() {
         .validate(vec![input])
         .unwrap_err();
     assert!(matches!(&error, ValidationError::Rejected(_)));
-    assert!(error.to_string().contains("requests hash"), "{error}");
+    assert!(error.to_string().contains("execution requests"), "{error}");
 }
 
 #[test]
