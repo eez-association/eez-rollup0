@@ -27,6 +27,9 @@ ethereum_package:
     mev_builder_subsidy: 1
 
 eez:
+  # `stateful` runs the proof service inside an L1-derived eez-follower so
+  # Reth owns unsafe block/state storage; the default remains `stateless`.
+  prover_backend: stateless
   # Blockscout adds eight services (frontend, backend, verifier, and database
   # for each chain). Disable it for a lighter network.
   enable_explorers: true

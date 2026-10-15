@@ -9,21 +9,7 @@ use tracing::{error, info};
 mod backend;
 mod config;
 
-#[cfg(test)]
-mod testkit {
-    use alloy_primitives::{Address, address};
-
-    pub const TEST_SYSTEM_ADDRESS_ARG: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076";
-    pub const TEST_SYSTEM_ADDRESS: Address = eez_primitives::SYSTEM_ADDRESS;
-    pub const LEGACY_SIGNER_ADDRESS: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-    pub const SYSTEM_TX: &str = "76d901809442000000000000000000000000000000000000078080";
-    pub const LEGACY_TX: &str = "f85f8001825208944200000000000000000000000000000000000007808026a0ed95c78ea14cbb6af669c61f27c5fb7fb0192101d4d706d055ab9ff9895c9f66a027c2e67303de8fa1cad36d0e59298a98df684e54295eb5f61ab99609c1738f73";
-}
-
 pub use backend::Backend;
-
-#[cfg(test)]
-mod service_tests;
 
 /// Run the standalone stateless proof-signer daemon.
 pub async fn run() -> eyre::Result<()> {
@@ -96,4 +82,15 @@ fn init_tracing() -> eyre::Result<()> {
         .try_init()
         .map_err(|error| eyre::eyre!(error))
         .wrap_err("install tracing subscriber")
+}
+
+#[cfg(test)]
+mod testkit {
+    use alloy_primitives::{Address, address};
+
+    pub const TEST_SYSTEM_ADDRESS_ARG: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076";
+    pub const TEST_SYSTEM_ADDRESS: Address = eez_primitives::SYSTEM_ADDRESS;
+    pub const LEGACY_SIGNER_ADDRESS: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+    pub const SYSTEM_TX: &str = "76d901809442000000000000000000000000000000000000078080";
+    pub const LEGACY_TX: &str = "f85f8001825208944200000000000000000000000000000000000007808026a0ed95c78ea14cbb6af669c61f27c5fb7fb0192101d4d706d055ab9ff9895c9f66a027c2e67303de8fa1cad36d0e59298a98df684e54295eb5f61ab99609c1738f73";
 }

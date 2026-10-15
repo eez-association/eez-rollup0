@@ -8,7 +8,7 @@ async fn a_stubbed_canonical_outbound_window_returns_a_recoverable_attestation()
     let expected_hash = recompute_test_public_inputs_hash(&batch);
     // Receipt extraction has dedicated adapter and golden tests; this stub
     // isolates the settlement-to-signature path.
-    let validator = Validator::stub_with_settlement_evidence(
+    let validator = StubBackend::with_settlement_evidence(
         outbound_backend_output(),
         vec![outbound_evidence(call_hash)],
     );
@@ -25,7 +25,7 @@ async fn a_stubbed_canonical_outbound_window_returns_a_recoverable_attestation()
 async fn a_stubbed_mixed_outbound_then_inbound_window_returns_an_attestation() {
     let (batch, block_rlp, outbound_call_hash) = mixed_outbound_inbound_case();
     let expected_hash = recompute_test_public_inputs_hash(&batch);
-    let validator = Validator::stub_with_settlement_evidence(
+    let validator = StubBackend::with_settlement_evidence(
         mixed_backend_output(),
         vec![mixed_evidence(outbound_call_hash)],
     );
@@ -43,7 +43,7 @@ async fn a_stubbed_value_bearing_outbound_window_returns_an_attestation() {
     let value = U256::from(1);
     let (batch, block_rlp, _user, call_hash) = outbound_case(value);
     let expected_hash = recompute_test_public_inputs_hash(&batch);
-    let validator = Validator::stub_with_settlement_evidence(
+    let validator = StubBackend::with_settlement_evidence(
         outbound_backend_output(),
         vec![outbound_evidence(call_hash)],
     );
@@ -134,12 +134,12 @@ async fn mismatched_intermediate_transaction_da_payload_is_rejected() {
 
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert_eq!(status.message(), "settlement validation rejected");
-    assert_eq!(inner.validator.stub_remaining(), 0);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 0);
 }
 
 #[tokio::test]
 async fn mismatched_immediate_entry_count_is_rejected() {
-    let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output_for(
+    let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output_for(
         &happy_block_inputs(),
     ))])))
     .await;
@@ -221,7 +221,7 @@ async fn empty_transaction_checkpoint_output_accepts_the_anchor_only_prefix() {
     let inputs = happy_block_inputs();
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[2].transaction_state_checkpoints = Vec::new();
-    let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output)]))).await;
+    let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output)]))).await;
 
     let _response = server.attest(happy_window()).await;
 }
@@ -245,7 +245,8 @@ async fn an_outbound_effect_without_an_observed_call_is_rejected() {
     let (batch, block_rlp, _user, _call_hash) = canonical_outbound_case();
     // The RLP still supplies the canonical [load, user] positions, but this
     // test backend intentionally supplies no receipt observation.
-    let server = TestServer::new(inner(Validator::stub(vec![Ok(outbound_backend_output())]))).await;
+    let server =
+        TestServer::new(inner(StubBackend::new(vec![Ok(outbound_backend_output())]))).await;
 
     let status = server
         .prove(single_block_settlement_window(batch, block_rlp))
@@ -279,7 +280,7 @@ async fn a_multi_block_effect_uses_the_penultimate_block_root() {
         pre_execution_checkpoint(empty_prefix_candidate()),
         checkpoint(0, final_root),
     ];
-    let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output)]))).await;
+    let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output)]))).await;
 
     let mut window =
         two_block_transaction_window(non_system_transaction(), non_system_transaction());
@@ -301,7 +302,7 @@ async fn a_state_update_final_block_mismatch_is_rejected() {
     let mut blocks = happy_block_inputs();
     *blocks.last_mut().unwrap() = AdmittedBlock::test(7, 0x06, 0xee);
     let backend_output = backend_output_for(&blocks);
-    let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output)]))).await;
+    let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output)]))).await;
     let mut window = happy_window();
     block_mut(window.last_mut().unwrap()).hash = vec![0xee; 32];
 
@@ -324,7 +325,7 @@ async fn a_state_update_rollup_mismatch_is_rejected() {
 
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert_eq!(status.message(), "settlement validation rejected");
-    assert_eq!(inner.validator.stub_remaining(), 0);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -348,7 +349,7 @@ async fn distinct_reexecuted_roots_are_attested_when_the_anchor_matches() {
     // matches because the window's endpoints are block hashes.
     let mut backend_output = backend_output_for(&happy_block_inputs());
     backend_output.blocks.last_mut().unwrap().post_state_root = B256::repeat_byte(0x12);
-    let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output)]))).await;
+    let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output)]))).await;
     let mut window = happy_window();
     replace_post_batch(
         &mut window,
@@ -363,7 +364,7 @@ async fn a_matching_nondefault_rollup_identity_is_attested() {
     const ROLLUP_ID: u64 = 7;
 
     let server = TestServer::new(inner_with_rollup(
-        Validator::stub(vec![Ok(backend_output_for(&happy_block_inputs()))]),
+        StubBackend::new(vec![Ok(backend_output_for(&happy_block_inputs()))]),
         expected_rollup_id(ROLLUP_ID),
     ))
     .await;
@@ -379,7 +380,7 @@ async fn a_matching_nondefault_rollup_identity_is_attested() {
 
 #[tokio::test]
 async fn the_composer_public_input_hash_cannot_control_the_attestation() {
-    let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output_for(
+    let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output_for(
         &happy_block_inputs(),
     ))])))
     .await;
@@ -409,7 +410,7 @@ async fn short_settling_statuses_are_an_invalid_backend_output() {
         status.message(),
         "validation backend returned invalid output"
     );
-    assert_eq!(inner.validator.stub_remaining(), 0);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -421,7 +422,7 @@ async fn a_reverted_system_transaction_is_failed_precondition_after_validation()
 
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert_eq!(status.message(), "settlement validation rejected");
-    assert_eq!(inner.validator.stub_remaining(), 0);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -452,7 +453,7 @@ async fn an_intermediate_system_transaction_is_rejected() {
 
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert_eq!(status.message(), "settlement validation rejected");
-    assert_eq!(inner.validator.stub_remaining(), 0);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -484,7 +485,7 @@ async fn an_inbound_candidate_hidden_in_an_outbound_pair_is_rejected() {
         pre_execution_checkpoint(empty_prefix_candidate()),
         checkpoint(1, block_hash_of(5)),
     ];
-    let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output)]))).await;
+    let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output)]))).await;
     let mut window = vec![
         header_chunk(5, 5),
         transactions_block_chunk(
@@ -510,7 +511,7 @@ async fn an_inbound_candidate_hidden_in_an_outbound_pair_is_rejected() {
 
 #[tokio::test]
 async fn a_static_entry_carrier_is_rejected() {
-    let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output_for(
+    let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output_for(
         &happy_block_inputs(),
     ))])))
     .await;
@@ -527,7 +528,7 @@ async fn a_static_entry_carrier_is_rejected() {
 
 #[tokio::test]
 async fn invalid_public_input_structure_is_failed_precondition_after_validation() {
-    let inner = inner(Validator::stub(vec![Ok(backend_output_for(
+    let inner = inner(StubBackend::new(vec![Ok(backend_output_for(
         &happy_block_inputs(),
     ))]));
     let server = TestServer::new(Arc::clone(&inner)).await;
@@ -540,7 +541,7 @@ async fn invalid_public_input_structure_is_failed_precondition_after_validation(
 
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert_eq!(status.message(), "settlement validation rejected");
-    assert_eq!(inner.validator.stub_remaining(), 0);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -559,7 +560,7 @@ async fn a_batch_for_a_different_proof_system_is_rejected() {
 
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert_eq!(status.message(), "settlement validation rejected");
-    assert_eq!(inner.validator.stub_remaining(), 0);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 0);
 }
 
 /// The current proof signer supports exactly one configured proof system.
@@ -581,7 +582,7 @@ async fn rejects_batch_with_more_than_one_proof_system() {
 
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert_eq!(status.message(), "settlement validation rejected");
-    assert_eq!(inner.validator.stub_remaining(), 0);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 0);
 }
 
 /// Block-number-bound public inputs remain disabled until the signer has an
@@ -602,7 +603,7 @@ async fn rejects_block_number_bound_batch_without_l1_oracle() {
 
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert_eq!(status.message(), "settlement validation rejected");
-    assert_eq!(inner.validator.stub_remaining(), 0);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -620,7 +621,7 @@ async fn malformed_settlement_calldata_is_rejected_after_validation() {
 
     assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
     assert_eq!(status.message(), "invalid PostBatch calldata");
-    assert_eq!(inner.validator.stub_remaining(), 0);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 0);
 }
 
 #[tokio::test]
@@ -629,7 +630,7 @@ async fn malformed_or_trailing_da_payload_is_an_invalid_argument() {
         Ok(backend_output_for(&happy_block_inputs())),
         Ok(backend_output_for(&happy_block_inputs())),
     ];
-    let inner = inner(Validator::stub(backend_outputs));
+    let inner = inner(StubBackend::new(backend_outputs));
     let server = TestServer::new(Arc::clone(&inner)).await;
     let mut trailing = settlement::encode_da_payload(&vec![Vec::new(); 3], &[]);
     trailing.push(0xff);
@@ -645,12 +646,12 @@ async fn malformed_or_trailing_da_payload_is_an_invalid_argument() {
         assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
         assert_eq!(status.message(), "invalid batch callData");
     }
-    assert_eq!(inner.validator.stub_remaining(), 0);
+    assert_eq!(inner.backend.remaining_test_actions().unwrap(), 0);
 }
 
 #[tokio::test]
 async fn validator_rejection_precedes_settlement_decoding() {
-    let server = TestServer::new(inner(Validator::stub(vec![Err(
+    let server = TestServer::new(inner(StubBackend::new(vec![Err(
         "re-execution mismatch".to_owned()
     )])))
     .await;
@@ -670,7 +671,7 @@ async fn validator_rejection_precedes_settlement_decoding() {
 
 #[tokio::test]
 async fn invalid_backend_outputs_are_internal_errors() {
-    let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output_for(&[]))]))).await;
+    let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output_for(&[]))]))).await;
 
     let status = server.prove(happy_window()).await;
     assert_eq!(status.code(), Code::Internal, "{status:?}");
@@ -682,7 +683,7 @@ async fn invalid_backend_outputs_are_internal_errors() {
 
 #[tokio::test]
 async fn the_validator_is_consulted_and_its_rejection_refuses() {
-    let inner = inner(Validator::stub(vec![
+    let inner = inner(StubBackend::new(vec![
         Ok(backend_output_for(&happy_block_inputs())),
         Err("re-execution mismatch".to_owned()),
     ]));
@@ -696,10 +697,9 @@ async fn the_validator_is_consulted_and_its_rejection_refuses() {
     assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
     assert_eq!(status.message(), "window validation rejected");
 
-    let validator = &inner.validator;
     assert_eq!(
-        validator.stub_remaining(),
-        0,
+        inner.backend.remaining_test_actions(),
+        Some(0),
         "both windows reached the backend"
     );
 }

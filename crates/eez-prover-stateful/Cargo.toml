@@ -10,10 +10,12 @@ description            = "Node-backed proof-signer backend for an L1-derived EEZ
 eez-primitives.workspace = true
 eez-evm.workspace = true
 eez-proof-signer.workspace = true
+eez-driver.workspace = true
 
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
+alloy-rlp.workspace = true
 alloy-rpc-types-debug.workspace = true
 
 reth-chainspec.workspace = true
@@ -24,10 +26,13 @@ reth-execution-types.workspace = true
 reth-primitives-traits.workspace = true
 reth-revm.workspace = true
 reth-storage-api.workspace = true
+reth-payload-primitives.workspace = true
 revm.workspace = true
 stateless-reth.workspace = true
 
+async-trait.workspace = true
 eyre.workspace = true
+lru.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
@@ -36,6 +41,7 @@ workspace = true
 
 [dev-dependencies]
 eez-proof-signer = { workspace = true, features = ["test-utils"] }
-alloy-rlp.workspace = true
 reth-chain-state.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }
+reth-engine-primitives.workspace = true
+reth-payload-builder.workspace = true
