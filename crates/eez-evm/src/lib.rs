@@ -69,9 +69,15 @@ pub fn ensure_supported_transaction(tx: &EezTxEnvelope) -> Result<(), AnyError> 
     Ok(())
 }
 
-#[derive(Debug)]
 struct L2WithdrawalsUnsupported {
     count: usize,
+}
+
+// Debug matches Display because stateless formats checkpoint executor errors with `{:?}`.
+impl fmt::Debug for L2WithdrawalsUnsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 impl fmt::Display for L2WithdrawalsUnsupported {

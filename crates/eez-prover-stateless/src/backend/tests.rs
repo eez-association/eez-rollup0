@@ -540,7 +540,15 @@ fn validates_the_golden_block_through_stateless() {
         b256!("f09d8f7da5bc5036f8dd9536c953e2212390a46fb3e553ece2b7d419131537b1")
     );
     assert!(block.receipt_successes.is_empty());
-    assert!(block.transaction_state_checkpoints.is_empty());
+    assert_eq!(
+        block.transaction_state_checkpoints,
+        [StateCheckpoint {
+            at: CheckpointAt::PreExecution,
+            state_root: block.post_state_root,
+            block_hash: block.computed_hash,
+        }],
+        "an empty terminal's Prague checkpoint must seal the validated block",
+    );
     assert!(block.settlement_evidence.system_sender_flags.is_empty());
     assert!(
         block

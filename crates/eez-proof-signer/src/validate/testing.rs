@@ -194,15 +194,21 @@ pub(crate) fn backend_output_for(blocks: &[AdmittedBlock]) -> BackendWindowOutpu
     BackendWindowOutput {
         blocks: blocks
             .iter()
-            .map(|block| {
+            .enumerate()
+            .map(|(index, block)| {
                 let decoded_transaction_count = decode_transaction_count(block).unwrap_or_default();
+                let transaction_state_checkpoints = (index + 1 == blocks.len()
+                    && decoded_transaction_count == 0)
+                    .then(|| crate::testkit::pre_execution_checkpoint(block.claimed_hash))
+                    .into_iter()
+                    .collect();
                 BackendBlockOutput {
                     decoded_number: block.declared_number,
                     decoded_parent_hash: block.claimed_parent_hash,
                     computed_hash: block.claimed_hash,
                     decoded_transaction_count,
                     receipt_successes: vec![true; decoded_transaction_count],
-                    transaction_state_checkpoints: Vec::new(),
+                    transaction_state_checkpoints,
                     post_state_root: B256::ZERO,
                     settlement_evidence: SettlementBlockEvidence::from_rlp_for_test(&block.rlp),
                 }
