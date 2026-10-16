@@ -7,14 +7,15 @@ import {EEZ} from "eez-core-protocol/src/EEZ.sol";
 import {
     ExecutionEntry,
     ExpectedL1ToL2Call,
-    ExpectedStateRootPerRollup,
+    ExpectedRootPerRollup,
     L2ToL1Call,
     ProofSystemBatchPerVerificationEntries,
     RollupIdWithProofSystems,
-    StateUpdate,
+    RollupUpdate,
     StaticExecutionEntry
 } from "eez-core-protocol/src/interfaces/IEEZ.sol";
 import {Rollup} from "eez-core-protocol/src/rollupContract/Rollup.sol";
+import {deployRollup} from "eez-core-protocol/deployment/RollupDeployment.sol";
 
 import {ECDSAProofSystem} from "../src/ECDSAProofSystem.sol";
 
@@ -189,7 +190,7 @@ contract PostBatchGasPinsTest is Test {
             vkeys[i] = bytes32(uint256(uint160(proofSystems[i].signer())));
             touched.push(address(proofSystems[i]));
         }
-        Rollup manager = new Rollup(address(eez), address(this), attesters, addresses, vkeys);
+        Rollup manager = deployRollup(address(eez), address(this), attesters, addresses, vkeys);
 
         assertEq(eez.registerRollup(address(manager), GENESIS_ROOT), ROLLUP_ID, "unexpected rollup id");
         touched.push(address(eez));
@@ -249,7 +250,7 @@ contract PostBatchGasPinsTest is Test {
         bytes[] memory proofs = new bytes[](attesters.length);
 
         ProofSystemBatchPerVerificationEntries memory batch = ProofSystemBatchPerVerificationEntries({
-            expectedStateRootPerRollup: new ExpectedStateRootPerRollup[](0),
+            expectedRootPerRollup: new ExpectedRootPerRollup[](0),
             entries: entries,
             staticEntries: new StaticExecutionEntry[](0),
             immediateEntryCount: entries.length,
@@ -269,21 +270,21 @@ contract PostBatchGasPinsTest is Test {
     }
 
     /// An outbound settlement entry: `proxyEntryHash == 0` so EEZ.sol drains it
-    /// inline, one state delta chaining `currentState` to the prior `newState`.
+    /// inline, one state delta chaining `currentRoot` to the prior `newRoot`.
     function _entry(
         EEZ eez,
-        bytes32 currentState,
-        bytes32 newState,
+        bytes32 currentRoot,
+        bytes32 newRoot,
         L2ToL1Call[] memory calls
     )
         private
         view
         returns (ExecutionEntry memory)
     {
-        StateUpdate[] memory updates = new StateUpdate[](1);
-        updates[0] = StateUpdate({rollupId: ROLLUP_ID, currentState: currentState, newState: newState, etherDelta: 0});
+        RollupUpdate[] memory updates = new RollupUpdate[](1);
+        updates[0] = RollupUpdate({rollupId: ROLLUP_ID, currentRoot: currentRoot, newRoot: newRoot, etherDelta: 0});
         return ExecutionEntry({
-            stateUpdates: updates,
+            rollupUpdates: updates,
             proxyEntryHash: bytes32(0),
             l2ToL1Calls: calls,
             expectedL1ToL2Calls: new ExpectedL1ToL2Call[](0),
@@ -298,7 +299,7 @@ contract PostBatchGasPinsTest is Test {
     /// CALL_END per call. Every call succeeds with empty return data.
     function _rollingHash(
         EEZ eez,
-        StateUpdate[] memory updates,
+        RollupUpdate[] memory updates,
         L2ToL1Call[] memory calls
     )
         private
@@ -306,7 +307,7 @@ contract PostBatchGasPinsTest is Test {
         returns (bytes32 hash)
     {
         for (uint256 i = 0; i < updates.length; i++) {
-            hash = keccak256(abi.encodePacked(hash, updates[i].rollupId, updates[i].currentState));
+            hash = keccak256(abi.encodePacked(hash, updates[i].rollupId, updates[i].currentRoot));
         }
         hash = keccak256(abi.encodePacked(hash, bytes32(0))); // proxyEntryHash
         for (uint256 i = 0; i < calls.length; i++) {

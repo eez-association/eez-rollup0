@@ -125,7 +125,15 @@ fn ensure_only_known_genesis_fields(
 
 /// Reject fields captured by `ChainConfig`'s extension map.
 fn ensure_no_chain_config_extensions(config: &ChainConfig, context: &str) -> eyre::Result<()> {
-    ensure_no_unsupported_fields(context, config.extra_fields.keys().map(String::as_str))
+    eez_evm::fee_collector(config)?;
+    ensure_no_unsupported_fields(
+        context,
+        config
+            .extra_fields
+            .keys()
+            .map(String::as_str)
+            .filter(|field| *field != "feeCollector"),
+    )
 }
 
 /// Reject unsupported fields inside extension-friendly nested objects.

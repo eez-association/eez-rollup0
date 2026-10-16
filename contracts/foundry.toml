@@ -32,6 +32,7 @@ auto_detect_remappings = false
 remappings = [
     "eez-core-protocol/=../eez-core-protocol/",
     "@openzeppelin/contracts/=../eez-core-protocol/lib/openzeppelin-contracts/contracts/",
+    "@openzeppelin/contracts-upgradeable/=../eez-core-protocol/lib/openzeppelin-contracts-upgradeable/contracts/",
     "forge-std/=../eez-core-protocol/lib/forge-std/src/",
 ]
 

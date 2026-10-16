@@ -36,6 +36,18 @@ source "$ENV_FILE"
 
 configured_initial_state_root="${EEZ_INITIAL_STATE_ROOT:-}"
 
+# One deployment setting selects both the genesis base-fee collector and the
+# composer's priority-fee recipient. Validate it before broadcasting anything.
+GENESIS_BASE="${EEZ_GENESIS_BASE:-$REPO/genesis.json}"
+if ! EEZ_L2_FEE_RECIPIENT="$(jq -ner \
+    --arg recipient "${EEZ_L2_FEE_RECIPIENT-$(jq -er '.config.feeCollector' "$GENESIS_BASE")}" \
+    '$recipient | gsub("^\\s+|\\s+$"; "")
+     | select(test("^0x[0-9a-fA-F]{40}$")) | ascii_downcase')"
+then
+    echo "deploy: EEZ_L2_FEE_RECIPIENT must be a 20-byte address (defaults to genesis feeCollector)" >&2
+    exit 1
+fi
+
 # Deploy/own key, decoupled from the composer's poster so posting can't advance
 # the deployer's nonce or shift the CREATE addresses. Defaults to the poster.
 EEZ_DEPLOY_KEY="${EEZ_DEPLOY_KEY:-$EEZ_L1_POSTER_KEY}"
@@ -45,6 +57,11 @@ AUTHORIZED_SIGNER="$(cast wallet address --private-key "$EEZ_PROOF_SIGNER_KEY")"
 PROOF_SYSTEM_VKEY="0x000000000000000000000000${AUTHORIZED_SIGNER#0x}"
 OWNER="$(cast wallet address --private-key "$EEZ_DEPLOY_KEY")"
 EEZ_L2_SYSTEM_ADDRESS="0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076"
+EEZ_L2_RECOVERY_ADDRESS="$(cast to-check-sum-address "$EEZ_L2_RECOVERY_ADDRESS")"
+if [[ "${EEZ_L2_RECOVERY_ADDRESS,,}" == "0x0000000000000000000000000000000000000000" ]]; then
+    echo "deploy: EEZ_L2_RECOVERY_ADDRESS must be non-zero" >&2
+    exit 1
+fi
 if [[ "${AUTHORIZED_SIGNER,,}" == "${EEZ_L2_SYSTEM_ADDRESS,,}" ]]; then
     echo "deploy: proof attester must differ from the reserved L2 system address" >&2
     exit 1
@@ -54,6 +71,7 @@ echo "deploy: RPC                  = $EEZ_L1_RPC_URL"
 echo "deploy: deployer / owner     = $OWNER"
 echo "deploy: authorized signer    = $AUTHORIZED_SIGNER"
 echo "deploy: L2 system address    = $EEZ_L2_SYSTEM_ADDRESS"
+echo "deploy: L2 recovery address  = $EEZ_L2_RECOVERY_ADDRESS"
 echo
 
 CONTRACTS="$REPO/contracts"
@@ -162,12 +180,12 @@ ROLLUP_COUNTER="$(cast call "$EEZ_REGISTRY_ADDRESS" "rollupCounter()(uint256)" \
 EXPECTED_ROLLUP_ID=1
 GENESIS_OUT="${EEZ_GENESIS_OUT:-$REPO/datadir/genesis.json}"
 GENESIS_PROFILE_OUT="${EEZ_GENESIS_PROFILE_OUT:-${GENESIS_OUT%.json}.profile.json}"
-GENESIS_BASE="${EEZ_GENESIS_BASE:-$REPO/genesis.json}"
 
-echo "      rendering L2 genesis (rollupId=$EXPECTED_ROLLUP_ID, system=$EEZ_L2_SYSTEM_ADDRESS)"
+echo "      rendering L2 genesis (rollupId=$EXPECTED_ROLLUP_ID, system=$EEZ_L2_SYSTEM_ADDRESS, recovery=$EEZ_L2_RECOVERY_ADDRESS)"
 "$REPO/scripts/update-eezl2-genesis.sh" --render \
     --rollup-id "$EXPECTED_ROLLUP_ID" \
     --system-address "$EEZ_L2_SYSTEM_ADDRESS" \
+    --recovery-address "$EEZ_L2_RECOVERY_ADDRESS" \
     --base "$GENESIS_BASE" \
     --output "$GENESIS_OUT" \
     --profile-output "$GENESIS_PROFILE_OUT"
@@ -200,8 +218,9 @@ DEPLOY_BLOCK_TS_HEX="$(cast block "$EEZ_REGISTRY_DEPLOY_BLOCK" --rpc-url "$EEZ_L
     exit 1
 }
 GENESIS_TIMESTAMP_TMP="$(mktemp "${GENESIS_OUT}.tmp.XXXXXX")"
-jq --arg timestamp "$DEPLOY_BLOCK_TS_HEX" '
+jq --arg timestamp "$DEPLOY_BLOCK_TS_HEX" --arg fee_recipient "$EEZ_L2_FEE_RECIPIENT" '
     .timestamp = $timestamp
+    | .config.feeCollector = $fee_recipient
     | .config += {
         homesteadBlock: 0,
         eip150Block: 0,
@@ -295,6 +314,8 @@ EEZ_INITIAL_STATE_ROOT=$EEZ_INITIAL_STATE_ROOT
 EEZ_INITIAL_BLOCK_HASH=$EEZ_INITIAL_BLOCK_HASH
 EEZ_L2_GENESIS_PATH=$GENESIS_OUT
 EEZ_L2_GENESIS_PROFILE_PATH=$GENESIS_PROFILE_OUT
+# Also used by the composer for priority fees; base fees are fixed in genesis.
+EEZ_L2_FEE_RECIPIENT=$EEZ_L2_FEE_RECIPIENT
 
 # L1 cross-chain bridge contracts (DeployBridgeL1).
 EEZ_L1_L2_PROXY=$EEZ_L1_L2_PROXY
@@ -305,6 +326,8 @@ EEZ_L2_BRIDGE_RECEIVER=$EEZ_L2_BRIDGE_RECEIVER
 EEZL2_ADDRESS=0x4200000000000000000000000000000000000007
 # Reserved sender for unsigned native L2 system transactions.
 EEZ_L2_SYSTEM_ADDRESS=$EEZ_L2_SYSTEM_ADDRESS
+# Recipient for funds recovered by EEZL2.
+EEZ_L2_RECOVERY_ADDRESS=$EEZ_L2_RECOVERY_ADDRESS
 EEZ_L2_EEZL2_CODE_HASH=$EEZ_L2_EEZL2_CODE_HASH
 EOF
 

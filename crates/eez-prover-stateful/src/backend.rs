@@ -59,7 +59,8 @@ impl<P> Backend<P> {
         chain_spec: Arc<ChainSpec>,
         expected_l2_system_address: Address,
     ) -> Self {
-        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec));
+        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec))
+            .expect("execution chain configuration was validated at startup");
         Self {
             provider,
             chain_spec,

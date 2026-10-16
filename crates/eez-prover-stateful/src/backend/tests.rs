@@ -9,7 +9,16 @@ use eez_proof_signer::window::testing::admitted_block_from_consensus_rlp;
 use reth_chainspec::ChainInfo;
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
 use reth_storage_api::errors::provider::ProviderResult;
-use reth_storage_api::{BlockIdReader, StateProviderBox};
+use reth_storage_api::{
+    AccountReader, BlockIdReader, BytecodeReader, StateProofProvider, StateProviderBox,
+    StorageRootProvider,
+};
+use reth_trie_common::updates::TrieUpdates;
+use reth_trie_common::{
+    AccountProof, DecodedMultiProofV2, ExecutionWitnessMode, HashedPostState, HashedStorage,
+    KeccakKeyHasher, MultiProof, MultiProofTargets, MultiProofTargetsV2, StorageMultiProof,
+    StorageProof, TrieInput,
+};
 
 use super::*;
 
@@ -49,6 +58,101 @@ fn provider_with_anchor(number: u64, hash: B256, state_root: B256) -> MockEthPro
         },
     );
     provider
+}
+
+#[derive(Clone)]
+struct HistoryCheckpointProvider {
+    inner: MockEthProvider,
+    checkpoint_root: B256,
+    history_value: U256,
+}
+
+impl HistoryCheckpointProvider {
+    fn assert_history_update(&self, state: &HashedPostState) {
+        let address =
+            alloy_primitives::keccak256(alloy_eips::eip2935::HISTORY_STORAGE_ADDRESS.as_slice());
+        let value = state.storages.get(&address).and_then(|storage| {
+            storage
+                .storage
+                .get(&alloy_primitives::keccak256(B256::ZERO))
+        });
+        assert_eq!(
+            value,
+            Some(&self.history_value),
+            "checkpoint omitted the EIP-2935 history update"
+        );
+    }
+}
+
+impl AsRef<MockEthProvider> for HistoryCheckpointProvider {
+    fn as_ref(&self) -> &MockEthProvider {
+        &self.inner
+    }
+}
+
+reth_storage_api::macros::delegate_impls_to_as_ref!(
+    for HistoryCheckpointProvider =>
+    AccountReader {
+        fn basic_account(&self, address: &Address) -> ProviderResult<Option<reth_primitives_traits::Account>>;
+    }
+    BlockHashReader {
+        fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>>;
+        fn canonical_hashes_range(&self, start: u64, end: u64) -> ProviderResult<Vec<B256>>;
+    }
+    BytecodeReader {
+        fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<reth_primitives_traits::Bytecode>>;
+    }
+    StorageRootProvider {
+        fn storage_root(&self, address: Address, state: HashedStorage) -> ProviderResult<B256>;
+        fn storage_proof(&self, address: Address, slot: B256, state: HashedStorage) -> ProviderResult<StorageProof>;
+        fn storage_multiproof(&self, address: Address, slots: &[B256], state: HashedStorage) -> ProviderResult<StorageMultiProof>;
+    }
+    StateProofProvider {
+        fn proof(&self, input: TrieInput, address: Address, slots: &[B256]) -> ProviderResult<AccountProof>;
+        fn multiproof(&self, input: TrieInput, targets: MultiProofTargets) -> ProviderResult<MultiProof>;
+        fn multiproof_v2(&self, input: TrieInput, targets: MultiProofTargetsV2) -> ProviderResult<DecodedMultiProofV2>;
+        fn witness(&self, input: TrieInput, target: HashedPostState, mode: ExecutionWitnessMode) -> ProviderResult<Vec<Bytes>>;
+    }
+    StateProvider {
+        fn storage(&self, account: Address, key: B256) -> ProviderResult<Option<U256>>;
+    }
+);
+
+impl HashedPostStateProvider for HistoryCheckpointProvider {
+    fn hashed_post_state(
+        &self,
+        state: &revm::database::BundleState,
+    ) -> ProviderResult<HashedPostState> {
+        Ok(HashedPostState::from_bundle_state::<KeccakKeyHasher>(
+            state.state(),
+        ))
+    }
+}
+
+impl StateRootProvider for HistoryCheckpointProvider {
+    fn state_root(&self, state: HashedPostState) -> ProviderResult<B256> {
+        self.assert_history_update(&state);
+        Ok(self.checkpoint_root)
+    }
+
+    fn state_root_from_nodes(&self, input: TrieInput) -> ProviderResult<B256> {
+        self.inner.state_root_from_nodes(input)
+    }
+
+    fn state_root_with_updates(
+        &self,
+        state: HashedPostState,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        self.assert_history_update(&state);
+        Ok((self.checkpoint_root, TrieUpdates::default()))
+    }
+
+    fn state_root_from_nodes_with_updates(
+        &self,
+        input: TrieInput,
+    ) -> ProviderResult<(B256, TrieUpdates)> {
+        self.inner.state_root_from_nodes_with_updates(input)
+    }
 }
 
 #[derive(Debug)]
@@ -265,7 +369,7 @@ fn checkpoint_plan_is_not_limited_before_the_provider_is_read() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -289,7 +393,7 @@ fn execution_errors_preserve_retryability() {
 #[test]
 fn empty_checkpoint_execution_retains_transaction_state() {
     let chain_spec = Arc::new(ChainSpec::default());
-    let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec));
+    let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap();
     let recipient = Address::repeat_byte(0x22);
     let signed = TxLegacy {
         nonce: 0,
@@ -347,7 +451,7 @@ fn follower_behind_the_required_anchor_is_retryable() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -366,7 +470,7 @@ fn conflicting_local_anchor_is_fatal() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -395,7 +499,7 @@ fn conflicting_known_block_is_fatal() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -446,6 +550,7 @@ fn anchor_reorg_is_aborted_through_the_complete_validation_path() {
     let terminal_root = B256::repeat_byte(3);
     let inner = provider_with_anchor(0, anchor_hash, anchor_root);
     inner.add_state_root(terminal_root);
+    inner.add_state_root(terminal_root);
     let provider = ReorgingProvider {
         inner,
         anchor_hash,
@@ -457,7 +562,7 @@ fn anchor_reorg_is_aborted_through_the_complete_validation_path() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -493,7 +598,7 @@ fn invalid_standalone_header_is_fatal() {
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -512,12 +617,13 @@ fn replays_an_empty_terminal_block_from_local_anchor_state() {
     let terminal_root = B256::repeat_byte(3);
     let provider = provider_with_anchor(0, anchor_hash, anchor_root);
     provider.add_state_root(terminal_root);
+    provider.add_state_root(terminal_root);
     let blocks = [admitted(1, anchor_hash, terminal_root)];
 
     let output = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -526,6 +632,75 @@ fn replays_an_empty_terminal_block_from_local_anchor_state() {
 
     assert_eq!(output.blocks.len(), 1);
     assert_eq!(output.blocks[0].post_state_root, terminal_root);
+    assert_eq!(
+        output.blocks[0].transaction_state_checkpoints,
+        [StateCheckpoint {
+            at: CheckpointAt::PreExecution,
+            state_root: terminal_root,
+            block_hash: blocks[0].claimed_hash(),
+        }],
+    );
+}
+
+#[test]
+fn empty_checkpoint_includes_eip_2935_and_matches_the_composer_anchor() {
+    use alloy_eips::eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE};
+    use eez_composer::local::build_sync_block;
+
+    let chain_spec = Arc::new(
+        reth_chainspec::ChainSpecBuilder::mainnet()
+            .prague_activated()
+            .build(),
+    );
+    let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap();
+    let parent = SealedHeader::seal_slow(Header {
+        number: 0,
+        timestamp: 0,
+        gas_limit: 30_000_000,
+        base_fee_per_gas: Some(1),
+        excess_blob_gas: Some(0),
+        blob_gas_used: Some(0),
+        ..Default::default()
+    });
+    let provider = provider_with_anchor(0, parent.hash(), parent.state_root());
+    provider.add_account(
+        HISTORY_STORAGE_ADDRESS,
+        ExtendedAccount::new(0, U256::ZERO).with_bytecode(HISTORY_STORAGE_CODE.clone()),
+    );
+
+    let checkpoint_root = B256::repeat_byte(3);
+    provider.add_state_root(checkpoint_root);
+    let composer_block =
+        build_sync_block(&provider, &evm_config, &parent, 1, Address::ZERO, &[]).unwrap();
+
+    let checkpoint_provider = HistoryCheckpointProvider {
+        inner: provider,
+        checkpoint_root,
+        history_value: U256::from_be_slice(parent.hash().as_slice()),
+    };
+    let mut state = State::builder()
+        .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(
+            Box::new(checkpoint_provider) as Box<dyn StateProvider + Send>,
+        )))
+        .with_bundle_update()
+        .build();
+
+    let (_, checkpoints, _) = execute_block_with_state_checkpoints(
+        &evm_config,
+        &mut state,
+        &composer_block.block,
+        &[CheckpointAt::PreExecution],
+    )
+    .unwrap();
+
+    assert_eq!(
+        checkpoints,
+        [StateCheckpoint {
+            at: CheckpointAt::PreExecution,
+            state_root: checkpoint_root,
+            block_hash: composer_block.header.hash(),
+        }],
+    );
 }
 
 #[test]
@@ -537,12 +712,13 @@ fn replayed_state_root_must_match_the_block_header() {
     let claimed_root = B256::repeat_byte(4);
     let provider = provider_with_anchor(0, anchor_hash, anchor_root);
     provider.add_state_root(computed_root);
+    provider.add_state_root(computed_root);
     let blocks = [admitted(1, anchor_hash, claimed_root)];
 
     let error = validate_blocks(
         &provider,
         &chain_spec,
-        &EezEvmConfig::new(Arc::clone(&chain_spec)),
+        &EezEvmConfig::new(Arc::clone(&chain_spec)).unwrap(),
         Address::repeat_byte(9),
         &blocks,
         &CancellationToken::default(),
@@ -562,7 +738,7 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
             .cancun_activated()
             .build(),
     );
-    let evm_config = EezEvmConfig::new(chain_spec);
+    let evm_config = EezEvmConfig::new(chain_spec).unwrap();
     let block = RecoveredBlock::try_recover(Block {
         header: Header {
             number: 1,
@@ -641,7 +817,7 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
 
 #[test]
 fn beacon_withdrawals_are_rejected_in_both_stateful_replay_paths() {
-    let evm_config = EezEvmConfig::new(Arc::new(ChainSpec::default()));
+    let evm_config = EezEvmConfig::new(Arc::new(ChainSpec::default())).unwrap();
     let block = RecoveredBlock::new_unhashed(
         Block {
             header: Header::default(),

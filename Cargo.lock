@@ -3176,6 +3176,7 @@ dependencies = [
  "reth-storage-api",
  "revm",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -3204,6 +3205,7 @@ dependencies = [
  "reth-revm",
  "reth-storage-api",
  "reth-trie",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -3215,6 +3217,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-evm",
+ "alloy-genesis",
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "eez-primitives",
@@ -3224,6 +3227,7 @@ dependencies = [
  "reth-primitives-traits",
  "reth-storage-errors",
  "revm",
+ "serde_json",
 ]
 
 [[package]]
@@ -3539,6 +3543,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-debug",
+ "eez-composer",
  "eez-evm",
  "eez-primitives",
  "eez-proof-signer",
@@ -3553,6 +3558,7 @@ dependencies = [
  "reth-provider",
  "reth-revm",
  "reth-storage-api",
+ "reth-trie-common",
  "revm",
  "stateless",
  "tokio",
@@ -3581,6 +3587,7 @@ dependencies = [
  "reth-chainspec",
  "reth-ethereum-primitives",
  "reth-primitives-traits",
+ "reth-trie-common",
  "serde_json",
  "stateless",
  "tokio",
@@ -7230,9 +7237,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.17"
+version = "0.11.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
+checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -11003,9 +11010,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",

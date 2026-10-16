@@ -92,7 +92,7 @@ enum CommitCommand<T: PayloadTypes> {
     },
     /// Roll the canonical head back to `target_header`. Used by the
     /// composer when a Sync block's bundle didn't settle on L1: per the
-    /// "L1 stateRoot is the finality oracle" model that block is
+    /// "L1 root is the finality oracle" model that block is
     /// unfinalized and must be rebuilt.
     ReorgTo {
         target_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
@@ -200,32 +200,34 @@ where
     {
         let best = provider
             .best_block_number()
-            .map_err(DriverError::provider)?;
+            .map_err(|e| DriverError::Provider(e.to_string()))?;
         let initial_header = provider
             .sealed_header(best)
-            .map_err(DriverError::provider)?
-            .ok_or_else(|| DriverError::missing_header(best))?;
+            .map_err(|e| DriverError::Provider(e.to_string()))?
+            .ok_or(DriverError::MissingHeader { block_number: best })?;
         let genesis =
             || -> DriverResult<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>> {
                 provider
                     .sealed_header(0)
-                    .map_err(DriverError::provider)?
-                    .ok_or_else(|| DriverError::missing_header(0))
+                    .map_err(|e| DriverError::Provider(e.to_string()))?
+                    .ok_or(DriverError::MissingHeader { block_number: 0 })
             };
         let safe_header = match provider
             .safe_block_num_hash()
-            .map_err(DriverError::provider)?
+            .map_err(|e| DriverError::Provider(e.to_string()))?
         {
             Some(safe) => provider
                 .header(safe.hash)
-                .map_err(DriverError::provider)?
+                .map_err(|e| DriverError::Provider(e.to_string()))?
                 .map(|header| SealedHeader::new(header, safe.hash))
-                .ok_or_else(|| DriverError::missing_header(safe.number))?,
+                .ok_or(DriverError::MissingHeader {
+                    block_number: safe.number,
+                })?,
             None => genesis()?,
         };
         let finalized_hash = match provider
             .finalized_block_num_hash()
-            .map_err(DriverError::provider)?
+            .map_err(|e| DriverError::Provider(e.to_string()))?
         {
             Some(finalized) => finalized.hash,
             None => genesis()?.hash(),
@@ -265,12 +267,12 @@ where
     /// only [`Self::advance_safe_finalized`] moves those.
     ///
     /// `parent_hash` is the head the caller computed `attrs.timestamp`
-    /// against; returns [`DriverError::is_stale_parent`] upon mismatch
+    /// against; returns [`DriverError::StaleParent`] upon mismatch
     /// prevents timestamp-drifted block.
     ///
     /// # Errors
     ///
-    /// - [`DriverError::is_stale_parent`] on snapshot mismatch.
+    /// - [`DriverError::StaleParent`] on snapshot mismatch.
     /// - Engine-API failures or `committer_closed`.
     ///
     /// # Panics
@@ -295,7 +297,10 @@ where
             let _guard = self.reconcile_lock.lock().await;
             let current_head = self.last_header.read().unwrap().hash();
             if current_head != parent_hash {
-                return Err(DriverError::stale_parent(parent_hash, current_head));
+                return Err(DriverError::StaleParent {
+                    expected: parent_hash,
+                    actual: current_head,
+                });
             }
         }
         let (response_tx, response_rx) = oneshot::channel();
@@ -305,10 +310,10 @@ where
                 response: response_tx,
             })
             .await
-            .map_err(|_| DriverError::committer_closed())?;
+            .map_err(|_| DriverError::CommitterClosed)?;
         response_rx
             .await
-            .map_err(|_| DriverError::committer_closed())?
+            .map_err(|_| DriverError::CommitterClosed)?
     }
 
     /// Re-publishes the current forkchoice state without attaching
@@ -325,10 +330,10 @@ where
                 response: response_tx,
             })
             .await
-            .map_err(|_| DriverError::committer_closed())?;
+            .map_err(|_| DriverError::CommitterClosed)?;
         response_rx
             .await
-            .map_err(|_| DriverError::committer_closed())?
+            .map_err(|_| DriverError::CommitterClosed)?
     }
 
     /// Updates the `safe` and `finalized` cursors and sends a fresh FCU
@@ -341,7 +346,7 @@ where
     ///
     /// Same shape as [`Self::commit_sequenced`]. If reth rejects the
     /// updated triplet (e.g., the safe / finalized hashes aren't on its
-    /// canonical chain), returns [`DriverError::is_invalid_forkchoice`].
+    /// canonical chain), returns [`DriverError::InvalidForkchoice`].
     pub async fn advance_safe_finalized(
         &self,
         safe: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
@@ -355,10 +360,10 @@ where
                 response: response_tx,
             })
             .await
-            .map_err(|_| DriverError::committer_closed())?;
+            .map_err(|_| DriverError::CommitterClosed)?;
         response_rx
             .await
-            .map_err(|_| DriverError::committer_closed())?
+            .map_err(|_| DriverError::CommitterClosed)?
     }
 
     /// Roll the canonical L2 head back to `target_header` (FCU with
@@ -391,10 +396,10 @@ where
                 response: response_tx,
             })
             .await
-            .map_err(|_| DriverError::committer_closed())?;
+            .map_err(|_| DriverError::CommitterClosed)?;
         response_rx
             .await
-            .map_err(|_| DriverError::committer_closed())?
+            .map_err(|_| DriverError::CommitterClosed)?
     }
 
     /// Advances the unsafe head mirror through a bare FCU. Safe and
@@ -419,10 +424,10 @@ where
                 response: response_tx,
             })
             .await
-            .map_err(|_| DriverError::committer_closed())?;
+            .map_err(|_| DriverError::CommitterClosed)?;
         response_rx
             .await
-            .map_err(|_| DriverError::committer_closed())?
+            .map_err(|_| DriverError::CommitterClosed)?
     }
 
     /// Commit a Deriver-built [`ExecutionData`] via `newPayloadV3` +
@@ -449,10 +454,10 @@ where
                 response: response_tx,
             })
             .await
-            .map_err(|_| DriverError::committer_closed())?;
+            .map_err(|_| DriverError::CommitterClosed)?;
         response_rx
             .await
-            .map_err(|_| DriverError::committer_closed())?
+            .map_err(|_| DriverError::CommitterClosed)?
     }
 }
 
@@ -487,6 +492,21 @@ where
     <T::BuiltPayload as BuiltPayload>::Primitives: Send + Sync + 'static,
     SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>: Send,
 {
+    fn feed_witness(&self, block_hash: B256) {
+        let Some(sender) = &self.witness_sender else {
+            return;
+        };
+        if let Err(err) = sender.send(block_hash) {
+            event!(
+                name: "eez.committer.witness_feed.send_failed",
+                Level::ERROR,
+                block.hash = %block_hash,
+                error = %err,
+                "witness-feed channel closed; prover-capture task is gone — blocks will stop being proven and settlement will stall",
+            );
+        }
+    }
+
     async fn run(mut self) {
         while let Some(cmd) = self.receiver.recv().await {
             match cmd {
@@ -546,9 +566,9 @@ where
             .to_engine
             .fork_choice_updated(state, None)
             .await
-            .map_err(DriverError::engine_rpc)?;
+            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
         if !res.is_valid() {
-            return Err(DriverError::invalid_forkchoice(format!(
+            return Err(DriverError::InvalidForkchoice(format!(
                 "reorg_to({target_hash}): {res:?}"
             )));
         }
@@ -606,9 +626,9 @@ where
                 self.to_engine
                     .fork_choice_updated(state, None)
                     .await
-                    .map_err(DriverError::engine_rpc)
+                    .map_err(|e| DriverError::EngineRpc(e.to_string()))
             }
-            Err(err) => Err(DriverError::engine_rpc(err)),
+            Err(err) => Err(DriverError::EngineRpc(err.to_string())),
         }
     }
 
@@ -617,7 +637,7 @@ where
         let safe_header = self.safe_header.clone();
         let res = self.forkchoice_or_demote_head(state, &safe_header).await?;
         if !res.is_valid() && !res.is_syncing() {
-            return Err(DriverError::invalid_forkchoice(format!("{res:?}")));
+            return Err(DriverError::InvalidForkchoice(format!("{res:?}")));
         }
         Ok(())
     }
@@ -632,7 +652,7 @@ where
         state.finalized_block_hash = finalized;
         let res = self.forkchoice_or_demote_head(state, &safe).await?;
         if !res.is_valid() && !res.is_syncing() {
-            return Err(DriverError::invalid_forkchoice(format!("{res:?}")));
+            return Err(DriverError::InvalidForkchoice(format!("{res:?}")));
         }
         self.safe_header = safe;
         self.finalized_hash = finalized;
@@ -650,7 +670,7 @@ where
             Err(BeaconForkChoiceUpdateError::ForkchoiceUpdateError(
                 ForkchoiceUpdateError::InvalidState,
             )) => return Ok(ForkchoiceOutcome::InvalidState),
-            Err(err) => return Err(DriverError::engine_rpc(err)),
+            Err(err) => return Err(DriverError::EngineRpc(err.to_string())),
         };
         let outcome = classify_advance_head_response(&res)?;
         if matches!(
@@ -678,9 +698,9 @@ where
             .to_engine
             .new_payload(payload)
             .await
-            .map_err(DriverError::engine_rpc)?;
+            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
         if !np.is_valid() {
-            return Err(DriverError::invalid_payload(format!("{np:?}")));
+            return Err(DriverError::InvalidPayload(format!("{np:?}")));
         }
 
         // Advance reth's canonical head to the derived block. Safe /
@@ -692,9 +712,9 @@ where
             .to_engine
             .fork_choice_updated(state, None)
             .await
-            .map_err(DriverError::engine_rpc)?;
+            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
         if !fcu.is_valid() {
-            return Err(DriverError::invalid_forkchoice(format!("{fcu:?}")));
+            return Err(DriverError::InvalidForkchoice(format!("{fcu:?}")));
         }
         // Mirror the new head into the shared `RwLock`.
         self.unsafe_head_hash = block_hash;
@@ -707,8 +727,8 @@ where
         // `feed_witness=false` so the prover isn't double-fed the same block.
         // The block is already canonical (the FCU above), so the witness task's
         // `recovered_block(hash)` resolves on the first try.
-        if feed_witness && let Some(sender) = &self.witness_sender {
-            let _ = sender.send(block_hash);
+        if feed_witness {
+            self.feed_witness(block_hash);
         }
 
         Ok(DeriveOutcome {
@@ -731,18 +751,18 @@ where
             .to_engine
             .fork_choice_updated(state, Some(attrs))
             .await
-            .map_err(DriverError::engine_rpc)?;
+            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
         if !fcu.is_valid() {
-            return Err(DriverError::invalid_forkchoice(format!("{fcu:?}")));
+            return Err(DriverError::InvalidForkchoice(format!("{fcu:?}")));
         }
-        let payload_id = fcu.payload_id.ok_or_else(DriverError::payload_missing)?;
+        let payload_id = fcu.payload_id.ok_or(DriverError::PayloadMissing)?;
 
         let payload = self
             .payload_builder
             .resolve_kind(payload_id, PayloadKind::WaitForPending)
             .await
-            .ok_or_else(DriverError::payload_missing)?
-            .map_err(DriverError::engine_rpc)?;
+            .ok_or(DriverError::PayloadMissing)?
+            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
 
         let header: SealedHeader<_> = payload.block().sealed_header().clone();
         let exec_payload = T::block_to_payload(payload.block().clone(), None);
@@ -751,9 +771,9 @@ where
             .to_engine
             .new_payload(exec_payload)
             .await
-            .map_err(DriverError::engine_rpc)?;
+            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
         if !np.is_valid() {
-            return Err(DriverError::invalid_payload(format!("{np:?}")));
+            return Err(DriverError::InvalidPayload(format!("{np:?}")));
         }
 
         // Canonicalize the just-built block immediately (head-FCU, mirroring
@@ -767,19 +787,16 @@ where
             .to_engine
             .fork_choice_updated(state, None)
             .await
-            .map_err(DriverError::engine_rpc)?;
+            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
         if !fcu.is_valid() {
-            return Err(DriverError::invalid_forkchoice(format!("{fcu:?}")));
+            return Err(DriverError::InvalidForkchoice(format!("{fcu:?}")));
         }
 
         self.unsafe_head_hash = header.hash();
         *self.last_header.write().unwrap() = header.clone();
         // Prover-feed trigger (prover-chain P1): the block is now canonical, so
         // the witness task's `recovered_block(hash)` resolves on the first try.
-        // Best-effort — a closed/lagging channel just drops it.
-        if let Some(sender) = &self.witness_sender {
-            let _ = sender.send(header.hash());
-        }
+        self.feed_witness(header.hash());
         Ok(CommitOutcome { header })
     }
 }
@@ -790,6 +807,6 @@ fn classify_advance_head_response(res: &ForkchoiceUpdated) -> DriverResult<Forkc
     } else if res.is_syncing() {
         Ok(ForkchoiceOutcome::Syncing)
     } else {
-        Err(DriverError::invalid_forkchoice(format!("{res:?}")))
+        Err(DriverError::InvalidForkchoice(format!("{res:?}")))
     }
 }

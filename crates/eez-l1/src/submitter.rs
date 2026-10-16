@@ -40,6 +40,10 @@ pub enum BundleTarget {
     /// Resolved to `latest + NEXT_BLOCK_SLACK` at send time. Unpinned —
     /// used for off-cadence catch-up.
     NextBlock,
+    /// Land in exactly L1 block `block`, without pinning its timestamp.
+    /// Cap-triggered historical batches use this to target the slot that
+    /// caused their composition while allowing a past L2 terminal timestamp.
+    ExactBlock { block: u64 },
     /// Land in exactly L1 block `block`, and only if its timestamp equals
     /// `timestamp`. The timestamp pin makes the settlement slot match the
     /// L2 Sync block's anchored slot by construction: a gnosis block's
@@ -182,14 +186,14 @@ impl Submitter {
             ));
         }
         // Exact targets carry the L2 Sync block's anchored timestamp; pin
-        // the bundle to land only in a block at that exact time. NextBlock
-        // (catch-up) is off-cadence, so it stays unpinned.
+        // the bundle to land only in a block at that exact time. ExactBlock
+        // and NextBlock deliberately stay unpinned.
         let pin_timestamp = match target {
             BundleTarget::Exact { timestamp, .. } => Some(timestamp),
-            BundleTarget::NextBlock => None,
+            BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => None,
         };
         let target_block = match target {
-            BundleTarget::Exact { block, .. } => block,
+            BundleTarget::Exact { block, .. } | BundleTarget::ExactBlock { block } => block,
             BundleTarget::NextBlock => {
                 let target_provider = self.inner.build_target_provider();
                 target_provider
@@ -212,7 +216,7 @@ impl Submitter {
             Level::INFO,
             tx_hash = %post_batch_hash,
             target_block,
-            exact = matches!(target, BundleTarget::Exact { .. }),
+            exact = !matches!(target, BundleTarget::NextBlock),
             tx_count = raw_txs.len(),
             "dispatching bundle to builder",
         );
@@ -426,7 +430,12 @@ impl Inner {
                         // The receipt proves it landed, and a failed read says
                         // nothing about how it settled, so keep reading. If a
                         // reorg removes the block, the receipt goes with it.
-                        Err(err) if !err.is_terminal() => {
+                        Err(err)
+                            if !matches!(
+                                err,
+                                L1Error::Decode(_) | L1Error::ReorgTooDeep { .. }
+                            ) =>
+                        {
                             if settlement_read_warned
                                 .is_none_or(|at| at.elapsed() >= SETTLEMENT_READ_WARN_EVERY)
                             {
@@ -510,11 +519,11 @@ impl Inner {
         }
     }
 
-    /// Did L1's stored stateRoot for our rollup reach the claimed state
+    /// Did L1's stored root for our rollup reach the claimed state
     /// in `l1_block`?
     ///
     /// - `Some(root)`: true iff some `L2ExecutionPerformed(rollupId,
-    ///   newState)` in the block has `newState == root`. The leading
+    ///   newRoot)` in the block has `newRoot == root`. The leading
     ///   immediate entry always emits this event, so matching "any
     ///   event" would report settled even with every deferred entry
     ///   unconsumed; requiring the FINAL root means L1 reached exactly

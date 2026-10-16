@@ -152,10 +152,13 @@ pub enum SyncSlotMode {
 /// `eez-composer`, to avoid a dependency cycle.
 #[async_trait]
 pub trait SyncSlotComposer: Send + Sync + 'static {
-    /// Compose a Sync slot. `target_l1_block`: `Some(n)` aims the postBatch
-    /// at exactly L1 block `n` (steady state, `l1_head + 1`); `None` aims the
-    /// next available block (catch-up). `mode` gates the drain: `Catchup`
-    /// blocks are empty (cross-chain waits for the next `Steady` slot).
+    /// Compose a Sync slot. `target_l1_block`: `Some(n)` supplies the exact L1
+    /// target for cap-triggered historical chunks; steady mode also uses it
+    /// for the regular postBatch and pins its timestamp. `None` leaves that
+    /// historical emission aimed at the next available block. `mode` gates the
+    /// drain: `Catchup` blocks are empty (cross-chain waits for the next
+    /// `Steady` slot), and their regular minimal postBatch remains
+    /// next-available.
     async fn compose_sync_slot(
         &self,
         rollup_id: u64,

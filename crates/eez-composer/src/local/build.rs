@@ -64,16 +64,6 @@ pub enum BuildError {
     Builder(String),
 }
 
-impl BuildError {
-    /// Whether this is a backing-store failure (reth MDBX read) rather than
-    /// anything the transaction did — transient, so a caller must retry rather
-    /// than blame the tx.
-    #[must_use]
-    pub const fn is_provider(&self) -> bool {
-        matches!(self, Self::Provider(_))
-    }
-}
-
 /// Built Sync-block artifact ready for [`commit_derived`].
 ///
 /// [`commit_derived`]: eez_driver::BlockCommitterHandle::commit_derived
@@ -331,6 +321,12 @@ impl std::fmt::Debug for SyncBlockState {
 }
 
 impl SyncBlockState {
+    /// Declared transaction-gas cap from this draft's next-block environment.
+    #[must_use]
+    pub(crate) fn declared_tx_gas_limit_cap(&self) -> Option<u64> {
+        eez_evm::declared_tx_gas_limit_cap(&self.evm_env.cfg_env)
+    }
+
     /// Open the state of a Sync block on `parent` whose first `prefix_txs` have
     /// executed.
     ///
@@ -545,25 +541,13 @@ impl SyncBlockFork {
 /// execution-derived commitments differing per prefix. One becomes canonical.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncCandidates {
-    /// The candidate the anchor entry claims when there are effects: the block
+    /// The candidate the anchor entry claims: the block
     /// holding no transactions, sealed after the pre-block system calls
     /// (EIP-2935 / EIP-4788). An empty Sync block still mutates state, so it is
-    /// not the parent's hash. Unused without effects.
+    /// not the parent's hash.
     pub anchor: B256,
     /// One commitment per pair end, in effect order.
     pub per_effect: Vec<B256>,
-}
-
-impl SyncCandidates {
-    /// A batch with no effects. The anchor is then the only entry and carries
-    /// the endpoint, which `prepare_post_batch_raw` takes from the terminal.
-    #[must_use]
-    pub fn anchor_only() -> Self {
-        Self {
-            anchor: B256::ZERO,
-            per_effect: Vec::new(),
-        }
-    }
 }
 
 /// Build the Sync block's candidates by rebuilding it on the empty prefix and on
@@ -670,7 +654,8 @@ mod tests {
     fn fixture() -> Fixture {
         let evm_config = EezEvmConfig::new(Arc::new(
             ChainSpecBuilder::mainnet().cancun_activated().build(),
-        ));
+        ))
+        .unwrap();
 
         let provider: MockEthProvider = MockEthProvider::new();
         provider.add_account(
