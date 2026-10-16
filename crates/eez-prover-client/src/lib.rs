@@ -112,8 +112,10 @@ impl Prover for RemoteProver {
         let chunks = chunks_for(&ctx);
         let n_blocks = chunks.len().saturating_sub(1);
 
-        // Raise the message-size cap on both directions: a single block's witness
-        // can exceed tonic's 4 MiB default → `ResourceExhausted`. Server matches.
+        // Requests carry whole witnesses and can exceed tonic's 4 MiB default
+        // (`ResourceExhausted`), so their cap is raised; the server matches. The
+        // response is a hash and a signature, so a prover sending more is refused
+        // before the composer buffers it.
         let mut client = ProverClient::connect(self.inner.url.clone())
             .await
             .map_err(|error| ProverError::Retryable {
@@ -121,7 +123,7 @@ impl Prover for RemoteProver {
                 message: format!("connect {}: {error}", self.inner.url),
             })?
             .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
-            .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES);
+            .max_decoding_message_size(eez_control_rpc::MAX_PROVE_RESPONSE_BYTES);
         let resp = client
             .prove(tokio_stream::iter(chunks))
             .await

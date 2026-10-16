@@ -2,18 +2,18 @@
 
 use std::time::Duration;
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 
 use eez_testkit::signals;
 use eez_testkit::{
-    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
-    ANVIL_KEY_6, BuilderStubMode, Harness, INVALID_PROOF_SELECTOR,
-    INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary, NodeConfig, NodeHandle, STAGING_USER_KEY,
-    block_number_and_hash_at, override_env, safe_block_hash, send_l2_value_transfer,
-    send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
-    wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
+    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_ATTESTER_KEY, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3,
+    ANVIL_KEY_4, ANVIL_KEY_6, BuilderStubMode, Harness, INVALID_PROOF_SELECTOR,
+    INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary, NodeConfig, NodeHandle, QuorumSigner,
+    STAGING_USER_KEY, block_number_and_hash_at, override_env, posted_batches, safe_block_hash,
+    send_l2_value_transfer, send_l2_value_transfer_confirmed, verify_batch_proofs, wait_for,
+    wait_for_latest_height, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
@@ -662,6 +662,143 @@ async fn failure_prover_signer_mismatch() {
     assert_eq!(snapshot.batches_posted, 0);
     assert_eq!(snapshot.executions_performed, 0);
     assert_eq!(snapshot.rollup_commitment, chain.initial_commitment());
+    node.assert_no_process_death();
+}
+
+/// Every registered `(proof system, attester)` pair of `harness`.
+fn registered_pairs(harness: &Harness) -> Vec<(Address, Address)> {
+    harness
+        .attesters()
+        .iter()
+        .map(|registered| (registered.proof_system, registered.attester))
+        .collect()
+}
+
+/// Two attesters and a threshold of two: every batch carries a proof from
+/// each, so neither signer alone can settle the rollup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn happy_case_quorum_two_of_two() {
+    let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4], 2)
+        .await
+        .unwrap();
+    let chain = harness.chain();
+    let env = harness
+        .env_with_attesters(&[QuorumSigner::Honest, QuorumSigner::Honest])
+        .await
+        .unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-two-of-two",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+
+    chain
+        .wait_for_batches(2, DEFAULT_TIMEOUT)
+        .await
+        .expect("the quorum never settled a batch");
+
+    let attesters = registered_pairs(&harness);
+    let mut both: Vec<Address> = attesters.iter().map(|&(ps, _)| ps).collect();
+    both.sort_unstable();
+    let posted = posted_batches(
+        chain.rpc_url(),
+        harness.dep.eez_address,
+        harness.dep.deploy_block,
+        harness.dep.rollup_id,
+    )
+    .await
+    .unwrap();
+    assert!(!posted.is_empty(), "settled batches must be visible on L1");
+    for posted in &posted {
+        assert!(posted.succeeded, "no batch may revert: {posted:?}");
+        assert_eq!(
+            posted.batch.proofSystems, both,
+            "every batch carries both proofs"
+        );
+        verify_batch_proofs(&posted.batch, &attesters).unwrap();
+    }
+    assert_ne!(
+        chain.snapshot().await.unwrap().rollup_commitment,
+        chain.initial_commitment(),
+        "the commitment must have moved off genesis",
+    );
+    node.assert_no_process_death();
+}
+
+/// Two of three attesters, one of which signs over a vkey the manager does not
+/// register. Its proof recovers to the right key, so only the composer's own
+/// check against the registered digest can tell; it is dropped, and the other
+/// two settle every batch without one reverting on L1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quorum_settles_without_an_attester_signing_the_wrong_digest() {
+    let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4, ANVIL_KEY_6], 2)
+        .await
+        .unwrap();
+    let chain = harness.chain();
+    let env = harness
+        .env_with_attesters(&[
+            QuorumSigner::Honest,
+            QuorumSigner::Honest,
+            QuorumSigner::StaleVkey,
+        ])
+        .await
+        .unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-stale-vkey",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+
+    chain
+        .wait_for_batches(2, DEFAULT_TIMEOUT)
+        .await
+        .expect("the honest attesters never settled a batch");
+    wait_for(DEFAULT_TIMEOUT, || async {
+        Ok((harness.attestations_of(2)? > 0).then_some(()))
+    })
+    .await
+    .expect("the stale signer never answered, so its proof was never checked");
+    wait_for(DEFAULT_TIMEOUT, || async {
+        Ok((!node
+            .log_lines_matching(&["invalid attestation: recovers to"], 1)
+            .is_empty())
+        .then_some(()))
+    })
+    .await
+    .expect("the composer never rejected the stale proof by its own digest check");
+
+    let attesters = registered_pairs(&harness);
+    let stale = attesters[2].0;
+    let posted = posted_batches(
+        chain.rpc_url(),
+        harness.dep.eez_address,
+        harness.dep.deploy_block,
+        harness.dep.rollup_id,
+    )
+    .await
+    .unwrap();
+    assert!(!posted.is_empty(), "settled batches must be visible on L1");
+    for posted in &posted {
+        assert!(posted.succeeded, "no batch may revert: {posted:?}");
+        assert_eq!(
+            posted.batch.proofSystems.len(),
+            2,
+            "the two honest proofs settle each batch"
+        );
+        assert!(
+            !posted.batch.proofSystems.contains(&stale),
+            "the stale proof must never reach L1: {posted:?}",
+        );
+        verify_batch_proofs(&posted.batch, &attesters).unwrap();
+    }
     node.assert_no_process_death();
 }
 
