@@ -2246,7 +2246,7 @@ where
         // ── PHASE 1 — OUTBOUND (L2→L1) ───────────────────────────────
         // Source-sim runs on a fork of the Sync block against the L2 ENTRY
         // client (the L2 follower errors `Unavailable`); the L1 side executes
-        // real `_processNCalls` frames on a fork of the state. On accept the
+        // real `_processL2ToL1Calls` frames on a fork of the state. On accept the
         // canonical `[load, user]` pair extends the block and the L1 frames
         // commit to the state.
         let mut out_iter = outbounds.into_iter();
