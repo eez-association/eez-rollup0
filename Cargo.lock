@@ -3321,6 +3321,7 @@ dependencies = [
  "reth-node-core",
  "reth-node-ethereum",
  "reth-rpc-eth-api",
+ "reth-rpc-server-types",
  "reth-storage-api",
  "reth-tasks",
  "reth_gnosis",

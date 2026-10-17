@@ -98,6 +98,7 @@ reth-primitives-traits          = { version = "0.8.1", default-features = false 
 reth-provider                   = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-revm                       = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-rpc-eth-api                = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-rpc-server-types           = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-storage-errors = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-storage-api                = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-tasks                      = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
