@@ -1813,3 +1813,40 @@ async fn outbound_reverting_destination_is_evicted_without_state_changes() {
         .await
         .unwrap();
 }
+
+async fn composer_info(url: &str) -> serde_json::Value {
+    let response: serde_json::Value = reqwest::Client::new()
+        .post(url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eez_composerInfo",
+            "params": [],
+        }))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .unwrap_or_else(|err| panic!("eez_composerInfo at {url}: {err:#}"))
+        .json()
+        .await
+        .unwrap_or_else(|err| panic!("eez_composerInfo body at {url}: {err:#}"));
+    response
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| panic!("eez_composerInfo at {url} returned no result: {response}"))
+}
+
+/// The protocol's network harness discovers the deployment through the L1
+/// front, so both fronts must advertise exactly what the L2 RPC does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_chain_fronts_answer_composer_info() {
+    let w = setup_cross_chain().await.unwrap();
+    let expected = composer_info(&w.l2_rpc()).await;
+    let registry = expected["eezContracts"]["eezRegistryAddress"]
+        .as_str()
+        .and_then(|address| address.parse::<Address>().ok());
+    assert_eq!(registry, Some(w.cfg.eez_address), "{expected}");
+    for front in [w.l1_xchain(), w.l2_xchain()] {
+        assert_eq!(composer_info(&front).await, expected, "front {front}");
+    }
+}
