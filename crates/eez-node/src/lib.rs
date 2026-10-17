@@ -726,12 +726,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                     "boot-time deriver catch_up gave up after {transport_failures} L1 transport failures: {err}"
                 ));
             }
-            Err(err)
-                if matches!(
-                    &err,
-                    DeriverError::L1Scan(L1Error::SourceIncomplete { .. } | L1Error::Provider(_))
-                ) =>
-            {
+            Err(err) if matches!(&err, DeriverError::L1Scan(l1) if l1.is_retryable()) => {
                 catch_up_attempts += 1;
                 event!(
                     name: "eez.node.deriver.boot_catch_up.source_incomplete",

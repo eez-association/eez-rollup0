@@ -149,10 +149,11 @@ alloy-eips             = { version = "=2.5.0", default-features = false }
 alloy-genesis          = { version = "=2.5.0", default-features = false }
 alloy-network          = { version = "2", default-features = false }
 alloy-primitives       = { version = "1", default-features = false }
-alloy-provider         = { version = "2", default-features = false, features = ["reqwest"] }
+alloy-provider         = { version = "2", default-features = false, features = ["reqwest", "debug-api"] }
 alloy-rlp              = { version = "0.3", features = ["derive"] }
 alloy-rpc-types-engine = { version = "2", default-features = false }
 alloy-rpc-types-eth    = { version = "2", default-features = false }
+alloy-rpc-types-trace  = { version = "=2.5.0", default-features = false }
 alloy-signer           = { version = "2", default-features = false }
 alloy-signer-local     = { version = "2", default-features = false }
 alloy-sol-types        = { version = "1", default-features = false }
@@ -404,7 +405,6 @@ map_unwrap_or                    = "allow"
 clone_on_ref_ptr                 = "allow"
 # New in clippy 1.99; `assert!(v.is_empty())` reads better in tests than `[] as [T; 0]`.
 assert_is_empty                  = "allow"
-# constructors / handlers (Deriver::new wires 9 deps,
-# on_batch_posted 10, compose_via_evm_composer 8) need these params;
+# constructors (Deriver::new wires 9 deps) need these params;
 # a refactor or dediacted crates would reduce some of this
 too_many_arguments               = "allow"
