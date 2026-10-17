@@ -6,6 +6,8 @@ import {Test} from "forge-std/Test.sol";
 import {EEZ} from "eez-core-protocol/src/EEZ.sol";
 import {EEZL2} from "eez-core-protocol/src/L2/EEZL2.sol";
 import {Rollup} from "eez-core-protocol/src/rollupContract/Rollup.sol";
+// Makes forge emit EEZPostBatcher's artifact, which the contract_post e2e deploys.
+import {EEZPostBatcher} from "eez-core-protocol/src/periphery/EEZPostBatcher.sol";
 import {deployRollup} from "eez-core-protocol/deployment/RollupDeployment.sol";
 
 import {ECDSAProofSystem} from "../src/ECDSAProofSystem.sol";

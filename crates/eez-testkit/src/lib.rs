@@ -40,6 +40,7 @@ use eez_control_rpc::{
     },
 };
 use eez_protocol::EEZL2_ADDRESS;
+use eez_protocol::abi::postAndVerifyBatchCall;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -1021,7 +1022,7 @@ sol! {
         error InvalidProofSystemConfig();
         event BatchPosted(bytes32 sharedPublicInput, uint64[] rollupIds);
         event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newRoot, uint256 etherBalance);
-        event L2TxSkipped(uint256 indexed transientIdx, bytes revertData);
+        event L2TxSkipped(uint256 indexed entryIndex, bytes revertData);
         function rollups(uint64 rollupId) external view returns (address rollupContract, bytes32 root, uint256 etherBalance);
         function rollupCounter() external view returns (uint256);
         function registerRollup(address rollupContract, bytes32 initialState) external returns (uint64 rollupId);
@@ -2256,7 +2257,8 @@ pub async fn rollup_commitment(rpc_url: &str, eez: Address, rollup_id: u64) -> R
     rollup_root_at(rpc_url, eez, rollup_id, None).await
 }
 
-async fn rollup_root_at(
+/// [`rollup_commitment`] as of L1 block `block`, or latest for `None`.
+pub async fn rollup_root_at(
     rpc_url: &str,
     eez: Address,
     rollup_id: u64,
@@ -3162,6 +3164,18 @@ pub async fn deploy_setter_wrapper(
         ISetterWrapper::setSameValueTwiceCall::SELECTOR,
     )?;
     deploy_raw(rpc_url, key, chain_id, &artifact, proxy.abi_encode()).await
+}
+
+/// Deploy the protocol's `EEZPostBatcher` for `eez` on the dev L1. Forge emits
+/// its artifact because `contracts/test/DeploymentSmoke.t.sol` imports it.
+pub async fn deploy_eez_post_batcher(rpc_url: &str, key: &str, eez: Address) -> Result<Address> {
+    let artifact = repo_root().join("contracts/out/EEZPostBatcher.sol/EEZPostBatcher.json");
+    require_artifact_method(
+        &artifact,
+        postAndVerifyBatchCall::SIGNATURE,
+        postAndVerifyBatchCall::SELECTOR,
+    )?;
+    deploy_raw(rpc_url, key, DEV_CHAIN_ID, &artifact, eez.abi_encode()).await
 }
 
 /// Wait until the outbound fixture is readable and Composer observes an L2
