@@ -10,10 +10,12 @@ use std::{fs, path::PathBuf};
 use alloy_primitives::{Address, B256, Bytes, U256, hex, keccak256};
 use alloy_sol_types::{SolValue, sol};
 use eez_protocol::abi::{
-    ExecutionEntrySol, ExpectedRootPerRollupSol, RollupUpdateSol, StaticExecutionEntrySol,
+    EvmBatch, ExecutionEntrySol, ExpectedRootPerRollupSol, RollupIdWithProofSystemsSol,
+    RollupUpdateSol, StaticExecutionEntrySol,
 };
 use eez_protocol::public_inputs::{
-    all_per_ps_hashes, entry_hash, shared_public_input, static_entry_hash,
+    all_per_ps_hashes, batch_shared_public_input, entry_hash, shared_public_input,
+    static_entry_hash,
 };
 use eez_protocol::{ProofPlan, RollupId, RollupProofAssignment};
 use serde::Deserialize;
@@ -139,9 +141,9 @@ fn build_plan(vector: &Vector) -> ProofPlan {
     }
 }
 
-#[test]
-fn execution_entry_encoding_matches_pinned_solidity() {
-    let entry = ExecutionEntrySol {
+/// The entry the Solidity oracle hashes for the full-entry vector.
+fn full_entry() -> ExecutionEntrySol {
+    ExecutionEntrySol {
         rollupUpdates: vec![RollupUpdateSol {
             rollupId: 1,
             currentRoot: B256::from(U256::from(0x1111)),
@@ -155,10 +157,13 @@ fn execution_entry_encoding_matches_pinned_solidity() {
         destinationRollupId: 1,
         success: true,
         returnData: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
-    };
+    }
+}
 
+#[test]
+fn execution_entry_encoding_matches_pinned_solidity() {
     assert_eq!(
-        entry_hash(&entry),
+        entry_hash(&full_entry()),
         parse_b256("0x752aa6c5ddc53a6bfdfec261248ee29246f6e831c59d3567d2c22d80dbf93dc1")
     );
 }
@@ -275,4 +280,46 @@ fn rust_matches_pinned_solidity_vectors() {
             vector.name
         );
     }
+}
+
+/// The scan's composition reproduces the shared input of every vector inside
+/// the supported profile.
+#[test]
+fn batch_shared_public_input_matches_pinned_solidity_vectors() {
+    let in_profile = load_vectors().into_iter().filter(|v| {
+        v.blob_hashes.is_empty()
+            && v.static_entry_hashes.is_empty()
+            && v.rollup_assignments.iter().all(|a| a.custom_data == "0x")
+    });
+    let mut checked = 0;
+    for vector in in_profile {
+        // The oracle's only entry is `full_entry`.
+        let full = entry_hash(&full_entry());
+        assert!(
+            vector.entry_hashes.iter().all(|h| parse_b256(h) == full),
+            "vector `{}`",
+            vector.name
+        );
+        let batch = EvmBatch {
+            entries: vec![full_entry(); vector.entry_hashes.len()],
+            rollupIdsWithProofSystems: vector
+                .rollup_assignments
+                .iter()
+                .map(|a| RollupIdWithProofSystemsSol {
+                    rollupId: a.rollup_id,
+                    proofSystemIndexes: a.proof_system_indexes.clone(),
+                })
+                .collect(),
+            callData: parse_bytes(&vector.call_data),
+            ..Default::default()
+        };
+        assert_eq!(
+            batch_shared_public_input(&batch, Address::ZERO),
+            Ok(parse_b256(&vector.expected_shared_public_input)),
+            "vector `{}`",
+            vector.name
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 3, "three vectors lie inside the supported profile");
 }

@@ -669,6 +669,52 @@ pub fn decode_postbatch(calldata: &[u8]) -> alloy_sol_types::Result<EvmBatch> {
     Ok(postAndVerifyBatchCall::abi_decode(calldata)?.batch)
 }
 
+/// What an applied entry contributes to the Sync block. `ordinal` ranks within
+/// its own direction — the DA layout — so a skipped entry never shifts the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryRole {
+    /// State-only: moves the commitment but signs no system tx.
+    Anchor,
+    /// L2→L1 settlement — its DA slot and its Sync-block user tx.
+    Outbound {
+        /// Rank among the rollup's outbound entries.
+        ordinal: usize,
+    },
+    /// L1→L2 delivery.
+    Inbound {
+        /// Rank among the rollup's inbound entries.
+        ordinal: usize,
+    },
+}
+
+/// Role of each entry for `rollup_id`, `None` where it updates only other
+/// rollups; ordinals count only `rollup_id`'s entries. `proxyEntryHash`
+/// decides first: inbound entries carry no `l2ToL1Calls`.
+#[must_use]
+pub fn entry_roles(entries: &[ExecutionEntrySol], rollup_id: u64) -> Vec<Option<EntryRole>> {
+    let (mut outbound, mut inbound) = (0, 0);
+    entries
+        .iter()
+        .map(|entry| {
+            if !entry.rollupUpdates.iter().any(|u| u.rollupId == rollup_id) {
+                return None;
+            }
+            let role = if entry.proxyEntryHash != B256::ZERO {
+                let ordinal = inbound;
+                inbound += 1;
+                EntryRole::Inbound { ordinal }
+            } else if entry.l2ToL1Calls.is_empty() {
+                EntryRole::Anchor
+            } else {
+                let ordinal = outbound;
+                outbound += 1;
+                EntryRole::Outbound { ordinal }
+            };
+            Some(role)
+        })
+        .collect()
+}
+
 fn supported_return_data(call: &ExecutedAction) -> ProtocolResult<&[u8]> {
     if call.outcome.is_pending() {
         return Err(crate::ProtocolError::InvalidEncoding(
@@ -1118,5 +1164,44 @@ mod tests {
         let encoded = encode_postbatch(&batch);
         assert_eq!(&encoded[..4], &postAndVerifyBatchCall::SELECTOR);
         assert_eq!(decode_postbatch(&encoded).unwrap().entries.len(), 0);
+    }
+
+    /// The composer's builders in Sync order (anchor, outbound immediates, inbound
+    /// deferred) with rollup 8's entries interleaved: ordinals count per rollup.
+    #[test]
+    fn entry_roles_rank_each_rollups_own_entries_per_direction() {
+        use EntryRole::{Anchor, Inbound, Outbound};
+        let rollup = RollupId(7);
+        let eoa = Address::repeat_byte(0xcc);
+        let anchor = build_l1_settlement_only(rollup);
+        let outbound = build_l1_postbatch(&[record(RollupId::MAINNET, rollup)], rollup).unwrap();
+        let inbound =
+            build_l1_inbound_entry(eoa, U256::ZERO, Bytes::new(), eoa, rollup, Bytes::new());
+        let updating = |batch: &EvmBatch, rollups: &[u64]| ExecutionEntrySol {
+            rollupUpdates: rollups
+                .iter()
+                .map(|&r| state_update(r, B256::ZERO))
+                .collect(),
+            ..batch.entries[0].clone()
+        };
+        let entries = [
+            updating(&anchor, &[7]),
+            updating(&outbound, &[7]),
+            updating(&outbound, &[7]),
+            updating(&inbound, &[8]),
+            updating(&inbound, &[7, 8]),
+            updating(&outbound, &[8]),
+            updating(&inbound, &[7]),
+        ];
+        let anc = Some(Anchor);
+        let out = |ordinal| Some(Outbound { ordinal });
+        let inb = |ordinal| Some(Inbound { ordinal });
+        for (id, roles) in [
+            (7, [anc, out(0), out(1), None, inb(0), None, inb(1)]),
+            (8, [None, None, None, inb(0), inb(1), out(0), None]),
+            (9, [None; 7]),
+        ] {
+            assert_eq!(entry_roles(&entries, id), roles, "rollup {id}");
+        }
     }
 }

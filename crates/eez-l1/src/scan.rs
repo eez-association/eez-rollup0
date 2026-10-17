@@ -477,7 +477,7 @@ pub(crate) async fn scan_batch_logs_range(
                     data: l.data().clone(),
                 })
                 .map_err(|e| L1Error::Decode(format!("decode L2TxSkipped: {e}")))?;
-                let index = usize::try_from(decoded.transientIdx).map_err(|_| {
+                let index = usize::try_from(decoded.entryIndex).map_err(|_| {
                     L1Error::Decode("L2TxSkipped transient index overflows usize".into())
                 })?;
                 skip_forks.entry(bn).or_default().insert(block_hash);
@@ -1385,7 +1385,7 @@ mod tests {
             inner: alloy_primitives::Log {
                 address: Address::ZERO,
                 data: L2TxSkipped {
-                    transientIdx: U256::from(transient_idx),
+                    entryIndex: U256::from(transient_idx),
                     revertData: Bytes::new(),
                 }
                 .encode_log_data(),
