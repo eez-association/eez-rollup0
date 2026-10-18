@@ -122,8 +122,15 @@ endpoint's limits.
 
 ### Trace latency (measured)
 
-The benchmark commit records p50, p95 and maximum trace latency and response
-size on the kurtosis 12 s L1 in this section.
+`debug_traceBlockByHash` (callTracer, withLog) against the node's embedded L1
+(reth 2.7.0) on the kurtosis 12 s L1, sequential, 2026-10-18:
+
+| sample | txs/block | p50 | p95 | max | max size |
+|---|---:|---:|---:|---:|---:|
+| last 50 blocks under cross-chain load | 2.4 | 1.1 ms | 2.6 ms | 4.3 ms | 36.3 KiB |
+| 8 blocks holding a contract post | 3–7 | 1.6 ms | 1.8 ms | 1.8 ms | 38.7 KiB |
+
+A trace costs milliseconds against a 12 s slot.
 
 ## Unsupported shapes
 
