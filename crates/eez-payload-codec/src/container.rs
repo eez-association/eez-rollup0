@@ -550,8 +550,7 @@ mod tests {
             .expect("decoding should not reject action after failed return");
         assert_eq!(decoded.actions, manifest);
 
-        let mut forged =
-            encode_container(ROLLUP, &span(), std::slice::from_ref(&failed)).unwrap();
+        let mut forged = encode_container(ROLLUP, &span(), std::slice::from_ref(&failed)).unwrap();
         let second = encode_container(ROLLUP, &span(), std::slice::from_ref(&succeeding)).unwrap();
         forged.extend_from_slice(&second[first_bracket_offset()..]);
         assert_eq!(
