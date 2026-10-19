@@ -34,7 +34,7 @@ BLOCKSCOUT_CURL_ARGS=(
 # shellcheck disable=SC1090
 source "$EEZ_DEPLOYMENTS_FILE"
 
-for name in EEZL2_ADDRESS EEZ_L2_SYSTEM_ADDRESS EEZ_L2_EEZL2_CODE_HASH EEZ_ROLLUP_ID; do
+for name in EEZL2_ADDRESS EEZ_L2_SYSTEM_ADDRESS EEZ_L2_RECOVERY_ADDRESS EEZ_L2_EEZL2_CODE_HASH EEZ_ROLLUP_ID; do
     [[ -n "${!name:-}" ]] || { echo "$name missing from $EEZ_DEPLOYMENTS_FILE" >&2; exit 1; }
 done
 
@@ -79,8 +79,8 @@ contract_id="$(jq -er '
     | "\(.[0].key):\(.[0].value)"
 ' "$artifact")"
 constructor_args="$(cast abi-encode \
-    'constructor(uint64,address,bool)' \
-    "$EEZ_ROLLUP_ID" "$EEZ_L2_SYSTEM_ADDRESS" false)"
+    'constructor(uint64,address,bool,address)' \
+    "$EEZ_ROLLUP_ID" "$EEZ_L2_SYSTEM_ADDRESS" false "$EEZ_L2_RECOVERY_ADDRESS")"
 standard_input="$(
     cd "$PROTOCOL"
     forge verify-contract \

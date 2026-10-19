@@ -41,6 +41,10 @@ use tracing::{Level, event};
 
 const MAX_BODY: usize = 10 * 1024 * 1024;
 
+/// Resolves the source chain's current declared transaction-gas cap.
+pub type TxGasLimitCapResolver =
+    Arc<dyn Fn() -> Result<Option<u64>, String> + Send + Sync + 'static>;
+
 /// Outcome of the admission gate.
 #[derive(Debug)]
 pub enum Admission {
@@ -57,15 +61,21 @@ pub enum Admission {
 /// nonce for this direction. An existing queued nonce may be replaced in
 /// place. A gapped held tx would poison the all-or-nothing bundle and break
 /// bundle-mates' chains.
-pub async fn gate_and_hold(
+async fn gate_and_hold(
     envelope: &TxEnvelope,
     raw_tx: &Bytes,
     direction: Direction,
     held_pool: &HeldPool,
     expected_source_chain_id: u64,
+    tx_gas_limit_cap: Option<u64>,
     validation_provider: &RootProvider,
 ) -> Admission {
-    if let Err(msg) = validate_front_envelope(envelope, direction, expected_source_chain_id) {
+    if let Err(msg) = validate_front_envelope(
+        envelope,
+        direction,
+        expected_source_chain_id,
+        tx_gas_limit_cap,
+    ) {
         return Admission::Rejected(msg);
     }
     let cost = match upfront_cost(envelope) {
@@ -75,8 +85,7 @@ pub async fn gate_and_hold(
     let Ok(sender) = envelope.recover_signer() else {
         return Admission::Rejected("signature recovery failed".into());
     };
-    // The front forwards creations, so HTTP never gets here. This guards direct
-    // callers of a public fn.
+    // HTTP forwards creations before admission; keep direct callers safe.
     let Some(to) = envelope.to() else {
         return Admission::Rejected(
             "creations are not cross-chain: a contract creation has no target; submit deploys to the chain's own RPC".into(),
@@ -166,6 +175,7 @@ fn validate_front_envelope(
     envelope: &TxEnvelope,
     direction: Direction,
     expected_source_chain_id: u64,
+    tx_gas_limit_cap: Option<u64>,
 ) -> Result<(), String> {
     // Allowlist: only types the pipeline is known to handle. Notably out:
     // EIP-4844 (blobs) and EIP-7702 (authorizations bump OTHER accounts'
@@ -188,6 +198,14 @@ fn validate_front_envelope(
     if chain_id != expected_source_chain_id {
         return Err(format!(
             "wrong source-chain id {chain_id} for {direction:?} front: expected {expected_source_chain_id}"
+        ));
+    }
+    if let Some(cap) = tx_gas_limit_cap
+        && envelope.gas_limit() > cap
+    {
+        return Err(format!(
+            "declared gas limit {} exceeds the active transaction gas limit cap {cap}",
+            envelope.gas_limit(),
         ));
     }
     Ok(())
@@ -221,6 +239,7 @@ struct Ctx {
     held_pool: Arc<HeldPool>,
     validation_provider: RootProvider,
     expected_source_chain_id: u64,
+    tx_gas_limit_cap: TxGasLimitCapResolver,
 }
 
 /// Verify that a configured cross-chain front points at its expected source chain.
@@ -256,6 +275,7 @@ pub async fn run_cross_chain_front(
     held_pool: Arc<HeldPool>,
     validation_provider: RootProvider,
     expected_source_chain_id: u64,
+    tx_gas_limit_cap: TxGasLimitCapResolver,
     ready: Arc<std::sync::atomic::AtomicBool>,
 ) -> eyre::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -280,6 +300,7 @@ pub async fn run_cross_chain_front(
         held_pool,
         validation_provider,
         expected_source_chain_id,
+        tx_gas_limit_cap,
     };
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -510,12 +531,30 @@ async fn intercept_send_raw(
         return None;
     }
     let id = json.get("id").cloned().unwrap_or(Value::Null);
+    let tx_gas_limit_cap = match (ctx.tx_gas_limit_cap)() {
+        Ok(cap) => cap,
+        Err(error) => {
+            event!(
+                name: "eez.xchain_front.gas_cap_lookup_failed",
+                Level::WARN,
+                direction = ?ctx.direction,
+                %error,
+                "source-chain EVM rules unavailable; rejecting cross-chain transaction",
+            );
+            return Some(rpc_error(
+                id,
+                -32000,
+                &format!("source-chain transaction gas limit lookup failed: {error}"),
+            ));
+        }
+    };
     let resp_body = match gate_and_hold(
         &envelope,
         &raw,
         ctx.direction,
         &ctx.held_pool,
         ctx.expected_source_chain_id,
+        tx_gas_limit_cap,
         &ctx.validation_provider,
     )
     .await
@@ -579,7 +618,50 @@ mod tests {
     use super::*;
 
     // Osaka is active from genesis on the Rollup0 L2 test chain.
-    const EIP_7825_TX_GAS_LIMIT: u64 = 1 << 24;
+    const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
+
+    async fn gate_with_test_cap(
+        envelope: &TxEnvelope,
+        raw_tx: &Bytes,
+        direction: Direction,
+        held_pool: &HeldPool,
+        expected_source_chain_id: u64,
+        validation_provider: &RootProvider,
+    ) -> Admission {
+        super::gate_and_hold(
+            envelope,
+            raw_tx,
+            direction,
+            held_pool,
+            expected_source_chain_id,
+            Some(EIP_7825_TX_GAS_LIMIT),
+            validation_provider,
+        )
+        .await
+    }
+
+    async fn run_test_front(
+        port: u16,
+        upstream_rpc_url: String,
+        direction: Direction,
+        held_pool: Arc<HeldPool>,
+        validation_provider: RootProvider,
+        expected_source_chain_id: u64,
+        ready: Arc<std::sync::atomic::AtomicBool>,
+    ) -> eyre::Result<()> {
+        let cap: TxGasLimitCapResolver = Arc::new(|| Ok(Some(EIP_7825_TX_GAS_LIMIT)));
+        super::run_cross_chain_front(
+            port,
+            upstream_rpc_url,
+            direction,
+            held_pool,
+            validation_provider,
+            expected_source_chain_id,
+            cap,
+            ready,
+        )
+        .await
+    }
 
     fn test_signer() -> PrivateKeySigner {
         PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).expect("valid signer")
@@ -674,7 +756,7 @@ mod tests {
         push_admission_lookups(&asserter, 1_000_000, 0);
 
         let admission =
-            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await;
+            gate_with_test_cap(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await;
 
         assert!(matches!(admission, Admission::Held(_)));
         assert_eq!(pool.len(), 1);
@@ -689,7 +771,7 @@ mod tests {
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
         push_admission_lookups(&asserter, EIP_7825_TX_GAS_LIMIT, 0);
 
-        let admission = gate_and_hold(
+        let admission = gate_with_test_cap(
             &envelope,
             &raw,
             Direction::Outbound,
@@ -704,30 +786,27 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "known defect #148: cross-chain ingress does not enforce EIP-7825"]
-    async fn outbound_eip_7825_one_over_cap_is_rejected_at_envelope_gate() {
-        // No RPC responses: the envelope gate must reject before source lookups.
+    async fn both_fronts_reject_eip_7825_one_over_cap_at_envelope_gate() {
+        // No RPC responses: both directions must reject before source lookups.
         let (_, envelope, raw) = signed_eip1559(31337, U256::ZERO, EIP_7825_TX_GAS_LIMIT + 1, 1);
-        let pool = HeldPool::new();
-        let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            let pool = HeldPool::new();
+            let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
 
-        let msg = rejection(
-            gate_and_hold(
-                &envelope,
-                &raw,
-                Direction::Outbound,
-                &pool,
-                31337,
-                &provider,
-            )
-            .await,
-        );
+            let msg = rejection(
+                gate_with_test_cap(&envelope, &raw, direction, &pool, 31337, &provider).await,
+            );
 
-        assert!(
-            msg.contains("16777217") && msg.contains("16777216"),
-            "rejection must name the declared gas limit and EIP-7825 cap: {msg}"
-        );
-        assert_eq!(pool.len(), 0, "invalid transaction mutated HeldPool");
+            assert!(
+                msg.contains("16777217") && msg.contains("16777216"),
+                "{direction:?} rejection must name the declared gas limit and EIP-7825 cap: {msg}"
+            );
+            assert_eq!(
+                pool.len(),
+                0,
+                "{direction:?} invalid transaction mutated HeldPool"
+            );
+        }
     }
 
     /// Retrying the exact same signed submission is idempotent at the ingress
@@ -744,9 +823,9 @@ mod tests {
         }
 
         let first =
-            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await;
+            gate_with_test_cap(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await;
         let duplicate =
-            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await;
+            gate_with_test_cap(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await;
 
         let (Admission::Held(first_hash), Admission::Held(duplicate_hash)) = (first, duplicate)
         else {
@@ -768,7 +847,7 @@ mod tests {
         let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
 
         let msg = rejection(
-            gate_and_hold(&envelope, &raw, Direction::Outbound, &pool, 2, &provider).await,
+            gate_with_test_cap(&envelope, &raw, Direction::Outbound, &pool, 2, &provider).await,
         );
 
         assert!(msg.contains("wrong source-chain id 1"));
@@ -782,7 +861,7 @@ mod tests {
         let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
 
         let msg = rejection(
-            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
+            gate_with_test_cap(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
         );
 
         assert!(msg.contains("missing source-chain id"));
@@ -796,7 +875,7 @@ mod tests {
         let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
 
         let msg = rejection(
-            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
+            gate_with_test_cap(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
         );
 
         assert!(msg.contains("unsupported transaction type"));
@@ -816,7 +895,7 @@ mod tests {
         }
 
         assert!(matches!(
-            gate_and_hold(
+            gate_with_test_cap(
                 &original,
                 &original_raw,
                 Direction::Inbound,
@@ -829,7 +908,7 @@ mod tests {
         ));
         // 5% gas_price bump < 10% → rejected on both fee dimensions.
         let msg = rejection(
-            gate_and_hold(
+            gate_with_test_cap(
                 &underpriced,
                 &underpriced_raw,
                 Direction::Inbound,
@@ -842,7 +921,7 @@ mod tests {
         assert!(msg.contains("replacement underpriced"), "{msg}");
         // 10% bump → replaces.
         assert!(matches!(
-            gate_and_hold(
+            gate_with_test_cap(
                 &replacement,
                 &replacement_raw,
                 Direction::Inbound,
@@ -878,7 +957,7 @@ mod tests {
         let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
 
         let msg = rejection(
-            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
+            gate_with_test_cap(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
         );
 
         assert!(msg.contains("unsupported transaction type"), "{msg}");
@@ -892,7 +971,7 @@ mod tests {
         let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
 
         let msg = rejection(
-            gate_and_hold(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
+            gate_with_test_cap(&envelope, &raw, Direction::Inbound, &pool, 31337, &provider).await,
         );
 
         assert!(msg.contains("upfront cost overflow"));
@@ -1028,7 +1107,7 @@ mod tests {
         push_admission_lookups(&asserter, 1_000_000, 1);
 
         assert!(matches!(
-            gate_and_hold(&first, &first_raw, Direction::Inbound, &pool, 1, &provider,).await,
+            gate_with_test_cap(&first, &first_raw, Direction::Inbound, &pool, 1, &provider,).await,
             Admission::Held(_)
         ));
 
@@ -1036,7 +1115,7 @@ mod tests {
         assert_eq!(drained.len(), 1);
         assert_eq!(pool.len(), 0);
 
-        let rejected = gate_and_hold(
+        let rejected = gate_with_test_cap(
             &same_nonce,
             &same_nonce_raw,
             Direction::Inbound,
@@ -1051,7 +1130,7 @@ mod tests {
         assert!(message.contains("invalid nonce 0"), "{message}");
         assert!(message.contains("next unreserved nonce 1"), "{message}");
 
-        let rejected = gate_and_hold(
+        let rejected = gate_with_test_cap(
             &gapped,
             &gapped_raw,
             Direction::Inbound,
@@ -1066,7 +1145,7 @@ mod tests {
         assert!(message.contains("nonce 1"), "{message}");
 
         assert!(matches!(
-            gate_and_hold(&next, &next_raw, Direction::Inbound, &pool, 1, &provider,).await,
+            gate_with_test_cap(&next, &next_raw, Direction::Inbound, &pool, 1, &provider,).await,
             Admission::Held(_)
         ));
     }
@@ -1086,7 +1165,7 @@ mod tests {
             push_admission_lookups(&asserter, 10_000_000, 0);
         }
 
-        let Admission::Held(original_hash) = gate_and_hold(
+        let Admission::Held(original_hash) = gate_with_test_cap(
             &original,
             &original_raw,
             Direction::Inbound,
@@ -1099,7 +1178,7 @@ mod tests {
             panic!("original transaction should be held");
         };
         // A 9% bump is below the required 10% replacement threshold.
-        let Admission::Rejected(msg) = gate_and_hold(
+        let Admission::Rejected(msg) = gate_with_test_cap(
             &underpriced,
             &underpriced_raw,
             Direction::Inbound,
@@ -1112,7 +1191,7 @@ mod tests {
             panic!("underpriced replacement must be rejected");
         };
         assert!(msg.contains("replacement underpriced"), "{msg}");
-        let Admission::Held(suffix_hash) = gate_and_hold(
+        let Admission::Held(suffix_hash) = gate_with_test_cap(
             &suffix,
             &suffix_raw,
             Direction::Inbound,
@@ -1124,7 +1203,7 @@ mod tests {
         else {
             panic!("suffix transaction should be held");
         };
-        let Admission::Held(replacement_hash) = gate_and_hold(
+        let Admission::Held(replacement_hash) = gate_with_test_cap(
             &replacement,
             &replacement_raw,
             Direction::Inbound,
@@ -1197,7 +1276,7 @@ mod tests {
             ProviderBuilder::default().connect_mocked_client(outbound_asserter.clone());
         push_admission_lookups(&outbound_asserter, 1_000_000, 0);
 
-        let inbound_task = tokio::spawn(run_cross_chain_front(
+        let inbound_task = tokio::spawn(run_test_front(
             inbound_port,
             "http://127.0.0.1:1".into(),
             Direction::Inbound,
@@ -1206,7 +1285,7 @@ mod tests {
             1,
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
         ));
-        let outbound_task = tokio::spawn(run_cross_chain_front(
+        let outbound_task = tokio::spawn(run_test_front(
             outbound_port,
             "http://127.0.0.1:1".into(),
             Direction::Outbound,
@@ -1257,7 +1336,7 @@ mod tests {
         let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
         push_admission_lookups(&asserter, 1_000_000, 0);
 
-        let task = tokio::spawn(run_cross_chain_front(
+        let task = tokio::spawn(run_test_front(
             port,
             "http://127.0.0.1:1".into(),
             Direction::Inbound,
@@ -1350,7 +1429,7 @@ mod tests {
         // Empty asserter: the gate must not run a single lookup for a creation.
         let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
 
-        let task = tokio::spawn(run_cross_chain_front(
+        let task = tokio::spawn(run_test_front(
             port,
             upstream,
             Direction::Outbound,
@@ -1395,7 +1474,7 @@ mod tests {
         asserter.push_success(&U256::from(1_000_000u64));
         asserter.push_success(&0_u64);
 
-        let task = tokio::spawn(run_cross_chain_front(
+        let task = tokio::spawn(run_test_front(
             port,
             "http://127.0.0.1:1".into(),
             Direction::Inbound,
@@ -1427,7 +1506,7 @@ mod tests {
         let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
 
         let msg = rejection(
-            gate_and_hold(&envelope, &raw, Direction::Outbound, &pool, 1, &provider).await,
+            gate_with_test_cap(&envelope, &raw, Direction::Outbound, &pool, 1, &provider).await,
         );
 
         assert!(msg.contains("creations are not cross-chain"), "{msg}");

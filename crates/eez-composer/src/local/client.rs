@@ -84,6 +84,55 @@ impl std::fmt::Debug for LocalChainClient {
 }
 
 impl LocalChainClient {
+    fn current_header(&self) -> Result<alloy_consensus::Header, String> {
+        let number = self
+            .provider
+            .headers
+            .best_block_number()
+            .map_err(|error| format!("read source head number: {error}"))?;
+        self.provider
+            .headers
+            .header_by_number(number)
+            .map_err(|error| format!("read source head {number}: {error}"))?
+            .ok_or_else(|| format!("source head {number} is missing"))
+    }
+
+    /// Resolve the declared transaction-gas cap from this source chain's
+    /// current canonical EVM environment, matching Reth's pool fork tracking.
+    ///
+    /// # Errors
+    /// Returns an error when the canonical header or its EVM environment cannot
+    /// be read.
+    pub fn current_declared_tx_gas_limit_cap(&self) -> Result<Option<u64>, String> {
+        let header = self.current_header()?;
+        self.declared_tx_gas_limit_cap_at(&header)
+    }
+
+    /// Resolve the declared transaction-gas cap for a header.
+    pub(crate) fn declared_tx_gas_limit_cap_at(
+        &self,
+        header: &alloy_consensus::Header,
+    ) -> Result<Option<u64>, String> {
+        let env = self
+            .provider
+            .evm_config
+            .evm_env(header)
+            .map_err(|error| format!("build source EVM environment: {error}"))?;
+        Ok(eez_evm::declared_tx_gas_limit_cap(&env.cfg_env))
+    }
+
+    /// Resolve the transaction-gas cap for a known next-block timestamp.
+    pub(crate) fn next_declared_tx_gas_limit_cap(
+        &self,
+        parent: &alloy_consensus::Header,
+        timestamp: u64,
+    ) -> Result<Option<u64>, String> {
+        let mut header = parent.clone();
+        header.number = header.number.saturating_add(1);
+        header.timestamp = timestamp;
+        self.declared_tx_gas_limit_cap_at(&header)
+    }
+
     fn build_chain_provider<P>(provider: &P, evm_config: EezEvmConfig) -> ChainProvider
     where
         P: StateProviderFactory
@@ -272,7 +321,7 @@ impl LocalChainClient {
                 (0, false, None)
             }
             Err(e) => {
-                tracing::warn!(%e, "source sim reverted");
+                tracing::warn!(%e, "source sim could not execute; tx will be evicted downstream");
                 (0, false, None)
             }
         };

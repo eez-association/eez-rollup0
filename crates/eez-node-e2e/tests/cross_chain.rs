@@ -960,6 +960,62 @@ async fn both_directions_return_value_and_wrapper_success_repeated_waves() {
     w.node.assert_no_divergence_failure_logs();
 }
 
+/// Both pool-bypassing fronts must apply the EVM rules of their source chain
+/// before a transaction can enter the held pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_chain_fronts_reject_declared_gas_above_the_active_cap() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let over_cap = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA + 1;
+
+    let cases = [
+        (
+            "inbound",
+            w.l1_xchain(),
+            l1_rpc.clone(),
+            INBOUND_USER,
+            DEV_CHAIN_ID,
+            w.setter_proxy,
+        ),
+        (
+            "outbound",
+            w.l2_xchain(),
+            l2_rpc.clone(),
+            OUTBOUND_USER,
+            w.l2_chain_id,
+            w.outbound_proxy,
+        ),
+    ];
+
+    for (label, front, source_rpc, key, chain_id, target) in cases {
+        let nonce = onchain_nonce(&source_rpc, key).await.unwrap();
+        let error = sign_and_send(
+            &front,
+            key,
+            chain_id,
+            nonce,
+            Some(target),
+            U256::ZERO,
+            IValue::setValueCall { v: U256::from(1) }.abi_encode(),
+            over_cap,
+        )
+        .await
+        .expect_err("one-over-cap cross-chain transaction must be rejected at ingress");
+        let message = error.to_string();
+        assert!(
+            message.contains(&over_cap.to_string())
+                && message.contains(&alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA.to_string()),
+            "{label} rejection must name the declared gas and active cap: {message}",
+        );
+        assert_eq!(
+            onchain_nonce(&source_rpc, key).await.unwrap(),
+            nonce,
+            "{label} rejection must not consume the source nonce",
+        );
+    }
+}
+
 /// Ingress must reject a gap nonce immediately. The held pool only admits the
 /// next contiguous nonce, so N+1 cannot sit in the queue ahead of N.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

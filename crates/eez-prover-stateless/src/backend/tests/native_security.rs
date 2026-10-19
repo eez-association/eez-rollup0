@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn prover_rejects_nonempty_consensus_requests_commitment() {
+    let mut input = fixture_input();
+    let mut block = alloy_rlp::decode_exact::<Block>(input.rlp()).unwrap();
+    let requests = alloy_eips::eip7685::Requests::new(vec![Bytes::from(vec![1; 77])]);
+    block.header.requests_hash = Some(requests.requests_hash());
+    let parts = admitted_block_parts_mut(&mut input);
+    *parts.claimed_hash = block.header.hash_slow();
+    *parts.rlp = alloy_rlp::encode(block);
+
+    let error = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
+        .validate(vec![input])
+        .unwrap_err();
+    assert!(matches!(&error, ValidationError::Rejected(_)));
+    assert!(error.to_string().contains("execution requests"), "{error}");
+}
+
+#[test]
 fn prover_rejects_beacon_withdrawal_mints() {
     use alloy_consensus::{Header, proofs::calculate_withdrawals_root};
     use alloy_eips::eip4895::Withdrawal;

@@ -73,9 +73,8 @@ already validated facts but cannot manufacture missing execution evidence.
    to its admitted block, and normalizes the checked result into
    `ValidatedWindow`.
 4. `ValidatedWindow` drops the consumed witnesses. It retains exact block RLP,
-   `window_pre_block_hash`, `settling_pre_block_hash`,
-   `window_post_block_hash`, `preceding_blocks`, and the terminal
-   `settling_block` with its settlement evidence.
+   `window_pre_block_hash`, `window_post_block_hash`, `preceding_blocks`, and
+   the terminal `settling_block` with its settlement evidence.
 5. Independently, the submitted `PostBatch` calldata becomes a
    `CanonicalPostBatch`. Canonical decoding does not validate its state or
    effect claims. Settlement binds those claims into a `BoundEffectSequence`,
