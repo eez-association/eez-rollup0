@@ -2,6 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {Test} from "forge-std/Test.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {EEZ, ProofSystemBatchPerVerificationEntries, RollupIdWithProofSystems} from "eez-core-protocol/src/EEZ.sol";
 import {Rollup} from "eez-core-protocol/src/rollupContract/Rollup.sol";
@@ -16,6 +17,8 @@ import {
 } from "eez-core-protocol/src/interfaces/IEEZ.sol";
 import {MockProofSystem} from "eez-core-protocol/test/mocks/MockProofSystem.sol";
 import {ECDSAProofSystem} from "../src/ECDSAProofSystem.sol";
+import {Rollup0Manager} from "../src/Rollup0Manager.sol";
+import {Rollup0SettlementWrapper} from "../src/Rollup0SettlementWrapper.sol";
 
 /// Solidity oracle for the two-stage public-input construction at the pinned
 /// protocol revision. Each vector is also submitted to the real EEZ contract,
@@ -217,6 +220,78 @@ contract PublicInputsHashVectorsTest is Test {
         batch.callData = hex"01";
         vm.expectRevert(EEZ.InvalidProof.selector);
         eez.postAndVerifyBatch(batch);
+    }
+
+    /// The wrapper leaves the EEZ rolling-hash invariant to EEZ itself.
+    function testPinnedEezAcceptsCandidateV1SeededAnchorRollingHash() external {
+        uint256 signerKey = 0xA11CE;
+        address signer = vm.addr(signerKey);
+        bytes32 vkey = bytes32(uint256(uint160(signer)));
+        bytes32 initialState = bytes32(uint256(0x1111));
+        bytes32 nextState = bytes32(uint256(0x2222));
+        bytes32 blobHash = bytes32(uint256(0x0101));
+
+        EEZ eez = new EEZ(address(0xDEAD));
+        ECDSAProofSystem proofSystem = new ECDSAProofSystem(signer);
+        address[] memory proofSystems = new address[](1);
+        proofSystems[0] = address(proofSystem);
+        bytes32[] memory vkeys = _singleton(vkey);
+
+        Rollup0Manager implementation = new Rollup0Manager(address(eez), block.chainid);
+        ERC1967Proxy proxy = new ERC1967Proxy(
+            address(implementation), abi.encodeCall(Rollup0Manager.initialize, (address(this), proofSystems, vkeys))
+        );
+        Rollup0Manager manager = Rollup0Manager(address(proxy));
+        uint64 rollupId = eez.registerRollup(address(manager), initialState);
+        Rollup0SettlementWrapper wrapper = new Rollup0SettlementWrapper(address(eez), address(manager));
+        manager.setSettlementWrapper(address(wrapper));
+
+        ProofSystemBatchPerVerificationEntries memory batch = _emptyBatch();
+        batch.blockNumber = type(uint64).max;
+        batch.immediateEntryCount = 1;
+        batch.blobIndices = new uint256[](1);
+        batch.blobIndices[0] = 0;
+        batch.proofSystems = proofSystems;
+        batch.proofs = new bytes[](1);
+        batch.rollupIdsWithProofSystems = _assignments1(rollupId, 0);
+        batch.entries = new ExecutionEntry[](1);
+        batch.entries[0].rollupUpdates = new RollupUpdate[](1);
+        batch.entries[0].rollupUpdates[0] =
+            RollupUpdate({rollupId: rollupId, currentRoot: initialState, newRoot: nextState, etherDelta: 0});
+        batch.entries[0].l2ToL1Calls = new L2ToL1Call[](0);
+        batch.entries[0].expectedL1ToL2Calls = new ExpectedL1ToL2Call[](0);
+        bytes32 statesHash = keccak256(abi.encodePacked(bytes32(0), rollupId, initialState));
+        batch.entries[0].rollingHash = keccak256(abi.encodePacked(statesHash, bytes32(0)));
+        batch.entries[0].destinationRollupId = rollupId;
+        batch.entries[0].success = true;
+
+        vm.roll(100);
+        vm.warp(1_700_000_000);
+        bytes32 parentHash = bytes32(uint256(0xBEEF));
+        vm.setBlockhash(99, parentHash);
+        bytes32[] memory blobHashes = _singleton(blobHash);
+        vm.blobhashes(blobHashes);
+
+        bytes[] memory customData = new bytes[](1);
+        customData[0] = abi.encode(
+            manager.CANDIDATE_DOMAIN_TAG(),
+            block.chainid,
+            address(eez),
+            address(manager),
+            address(wrapper),
+            uint256(rollupId),
+            block.chainid,
+            block.timestamp,
+            parentHash
+        );
+        bytes32 shared = _shared(batch, blobHashes, customData, address(0));
+        bytes32 publicInput = _publicInput(shared, _singleton(rollupId), vkeys);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, publicInput);
+        batch.proofs[0] = abi.encodePacked(r, s, v);
+
+        wrapper.postAndVerifyBatch(batch);
+        (, bytes32 settledRoot,) = eez.rollups(rollupId);
+        assertEq(settledRoot, nextState);
     }
 
     /// `immediateEntryCount` is an intentional poster-controlled scheduling

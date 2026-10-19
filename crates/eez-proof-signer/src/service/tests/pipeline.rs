@@ -255,6 +255,7 @@ fn cancelled_settlement_stops_before_decoding_untrusted_input() {
 
     let run = run_settlement(SettlementInput {
         submitted_post_batch_calldata: b"not ABI calldata".to_vec(),
+        blob: None,
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -351,6 +352,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
 
     let run = run_settlement(SettlementInput {
         submitted_post_batch_calldata: calldata.clone(),
+        blob: None,
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -408,6 +410,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         substituted.callData = replacement.into();
         let error = run_settlement(SettlementInput {
             submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&substituted),
+            blob: None,
             validated_window: &validated,
             expected_rollup_id: expected_rollup_id(1),
             expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -429,6 +432,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     let reverted = validated_single_block(reverted_block, vec![false], checkpoints.to_vec());
     let error = run_settlement(SettlementInput {
         submitted_post_batch_calldata: calldata,
+        blob: None,
         validated_window: &reverted,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -475,6 +479,7 @@ fn a_reverted_outbound_load_reports_the_paired_user_transaction() {
 
     let error = run_settlement(SettlementInput {
         submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+        blob: None,
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -519,6 +524,7 @@ fn an_outbound_observation_failure_reports_the_user_transaction() {
 
     let error = run_settlement(SettlementInput {
         submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+        blob: None,
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -569,6 +575,7 @@ fn an_outbound_claim_hash_mismatch_remains_non_actionable() {
 
     let error = run_settlement(SettlementInput {
         submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+        blob: None,
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -612,6 +619,7 @@ fn a_fully_bound_outbound_effect_is_authorized() {
 
     let run = run_settlement(SettlementInput {
         submitted_post_batch_calldata: calldata,
+        blob: None,
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -634,6 +642,7 @@ fn a_fully_bound_outbound_effect_is_authorized() {
     let mismatched_calldata = eez_protocol::entries::encode_postbatch(&mismatched_da);
     let run = run_settlement(SettlementInput {
         submitted_post_batch_calldata: mismatched_calldata,
+        blob: None,
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,

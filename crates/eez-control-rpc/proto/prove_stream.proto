@@ -75,7 +75,8 @@ message Finalize {
 }
 
 // Common EEZ settlement input, independent of session recovery and prover backend.
-// Unsupported blobs or context cause UNIMPLEMENTED, never silent omission.
+// A calldata-only deployment rejects blobs or context with UNIMPLEMENTED;
+// Blob-settlement deployments require both and never silently omit either.
 message SettlementInput {
   // Exact proofless EEZ.postAndVerifyBatch calldata for the configured ABI,
   // including when the posting client submits it through a settlement wrapper.
@@ -87,7 +88,7 @@ message SettlementInput {
   // Named L1 target, independently authenticated.
   // Manager-specific custom data is derived from trusted profile/deployment rules,
   // not supplied here. Both blob profiles use these same target fields.
-  // Required for the RollupX profile.
+  // Required for every configured blob profile.
   L1PostingContext posting_context = 3;
 }
 

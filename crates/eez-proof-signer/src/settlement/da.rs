@@ -3,6 +3,7 @@
 use alloy_consensus::Transaction as _;
 use alloy_primitives::{B256, Bytes};
 use alloy_sol_types::SolValue as _;
+use eez_blob::KzgSettings;
 use eez_payload_codec::{Action, DecodedSpan};
 use eez_protocol::RollupId;
 use eez_protocol::abi::ExecutionEntrySol;
@@ -95,6 +96,22 @@ pub(crate) enum DaPayloadError {
     SyncBlockTransactionCount { expected: usize, actual: usize },
     #[error("validated effect positions are inconsistent with the settling block transactions")]
     InvalidEffectTransactionLayout,
+    #[error("KZG commitment derivation failed: {0}")]
+    Kzg(String),
+}
+
+/// Blob material accepted by both the physical decoder and KZG commitment
+/// derivation. These hashes are in transaction order and are the only values
+/// that may be folded into the batch public input.
+#[derive(Debug)]
+pub(crate) struct VerifiedBlobDa {
+    versioned_hashes: Vec<B256>,
+}
+
+impl VerifiedBlobDa {
+    pub(crate) fn versioned_hashes(&self) -> &[B256] {
+        &self.versioned_hashes
+    }
 }
 
 /// The decoded payload plus a cursor into its flat transaction column.
@@ -121,6 +138,22 @@ impl DaPayload {
             })?;
         // Fatal here, unlike the deriver: we are asked to attest THIS batch,
         // and a payload for another rollup is not it.
+        if container.rollup_id != expected_rollup_id {
+            return Err(invalid_da_payload(format!(
+                "DA payload carries rollup {} operations, expected {expected_rollup_id}",
+                container.rollup_id,
+            )));
+        }
+        Ok(Self {
+            span: container.span,
+            actions: container.actions,
+            next_transaction: 0,
+        })
+    }
+
+    fn decode_blobs(blobs: &[Vec<u8>], expected_rollup_id: u64) -> Result<Self, DaPayloadError> {
+        let container = eez_payload_codec::decode_blob_container(blobs)
+            .map_err(|error| invalid_da_payload(error.to_string()))?;
         if container.rollup_id != expected_rollup_id {
             return Err(invalid_da_payload(format!(
                 "DA payload carries rollup {} operations, expected {expected_rollup_id}",
@@ -223,6 +256,61 @@ pub(crate) fn verify_da_payload(
     )
 }
 
+/// Blob-profile adapter. Candidate V1 has no calldata tail; all logical
+/// messages are decoded from the authenticated physical blobs.
+pub(crate) fn verify_blob_da_payload(
+    batch: &CanonicalPostBatch,
+    blobs: &[Vec<u8>],
+    validated_window: &ValidatedWindow,
+    outbound_effects: &AuthorizedOutboundEffects,
+    inbound_effects: &AuthorizedInboundEffects<'_>,
+    system_transaction_reconstructor: &SystemTransactionReconstructor,
+    expected_rollup_id: u64,
+    kzg_settings: &KzgSettings,
+) -> Result<VerifiedBlobDa, DaPayloadError> {
+    if batch.as_batch().blobIndices.len() != blobs.len() {
+        return Err(invalid_da_payload(format!(
+            "submitted blob count {} does not match {} selected blob indices",
+            blobs.len(),
+            batch.as_batch().blobIndices.len(),
+        )));
+    }
+    let payload = DaPayload::decode_blobs(blobs, expected_rollup_id)?;
+    verify_decoded_da_payload(
+        payload,
+        validated_window,
+        outbound_effects,
+        inbound_effects,
+        system_transaction_reconstructor,
+        expected_rollup_id,
+    )?;
+
+    // The decoder already proved every element canonical, so KZG cannot reject one.
+    let versioned_hashes = eez_blob::versioned_hashes(blobs, kzg_settings)
+        .map_err(|error| DaPayloadError::Kzg(error.to_string()))?;
+    Ok(VerifiedBlobDa { versioned_hashes })
+}
+
+#[cfg(test)]
+mod blob_kzg_tests {
+    use eez_blob::EnvKzgSettings;
+    use eez_payload_codec::SpanBlock;
+
+    use super::*;
+
+    #[test]
+    fn rollup0_physical_blob_is_ethereum_kzg_compatible() {
+        let blobs = eez_payload_codec::encode_blob_container(1, &[SpanBlock::default()], &[])
+            .expect("fixture encodes");
+        let hashes = eez_blob::versioned_hashes(&blobs, EnvKzgSettings::Default.get())
+            .expect("Rollup0 packing must produce canonical Ethereum field elements");
+
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0][0], 1, "EIP-4844 version byte");
+        assert_ne!(hashes[0], B256::ZERO);
+    }
+}
+
 /// Raw-input adapter for focused DA unit tests.
 #[cfg(test)]
 pub(crate) fn verify_da_payload_for_test<'a, I>(
@@ -266,7 +354,53 @@ fn verify_encoded_da_payload<'a, I>(
 where
     I: ExactSizeIterator<Item = (u64, &'a EthereumBlock)>,
 {
-    let mut payload_cursor = DaPayload::decode(encoded_payload, expected_rollup_id)?;
+    let payload_cursor = DaPayload::decode(encoded_payload, expected_rollup_id)?;
+    verify_decoded_da_payload_parts(
+        payload_cursor,
+        intermediate_blocks,
+        settling_block,
+        outbound_effects,
+        inbound_effects,
+        system_transaction_reconstructor,
+        expected_rollup_id,
+    )
+}
+
+fn verify_decoded_da_payload(
+    payload: DaPayload,
+    validated_window: &ValidatedWindow,
+    outbound_effects: &AuthorizedOutboundEffects,
+    inbound_effects: &AuthorizedInboundEffects<'_>,
+    system_transaction_reconstructor: &SystemTransactionReconstructor,
+    expected_rollup_id: u64,
+) -> Result<(), DaPayloadError> {
+    let settling = validated_window.settling_block();
+    verify_decoded_da_payload_parts(
+        payload,
+        validated_window
+            .preceding_blocks()
+            .iter()
+            .map(|block| (block.number(), block.decoded())),
+        (settling.number(), settling.decoded()),
+        outbound_effects,
+        inbound_effects,
+        system_transaction_reconstructor,
+        expected_rollup_id,
+    )
+}
+
+fn verify_decoded_da_payload_parts<'a, I>(
+    mut payload_cursor: DaPayload,
+    intermediate_blocks: I,
+    settling_block: (u64, &'a EthereumBlock),
+    outbound_effects: &AuthorizedOutboundEffects,
+    inbound_effects: &AuthorizedInboundEffects<'_>,
+    system_transaction_reconstructor: &SystemTransactionReconstructor,
+    expected_rollup_id: u64,
+) -> Result<(), DaPayloadError>
+where
+    I: ExactSizeIterator<Item = (u64, &'a EthereumBlock)>,
+{
     let expected_blocks = intermediate_blocks.len() + 1;
     let omitted_terminal_count = outbound_effects
         .len()

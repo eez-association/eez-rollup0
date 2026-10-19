@@ -571,9 +571,7 @@ where
                 );
                 continue;
             }
-            let Some(container) =
-                self.decode_our_payload(batch.batch.callData.as_ref(), batch.id.l1_block)?
-            else {
+            let Some(container) = self.decode_our_payload(batch).await? else {
                 continue;
             };
             let decoded = &container.span;
@@ -854,17 +852,30 @@ where
             .await?)
     }
 
-    /// Decode a posted DA payload, or `None` when it is not ours.
+    /// Decode a post's DA payload — its blobs under candidate V1, else its
+    /// calldata — or `None` when it is not ours.
     ///
     /// Skipped rather than fatal: we read one `ChainOperation`, so a legitimate
     /// multi-rollup batch reads as foreign, and halting would hand a peer a
     /// stop. Unchecked outside cross-chain mode, which configures no rollup id.
-    fn decode_our_payload(
+    async fn decode_our_payload(
         &self,
-        call_data: &[u8],
-        l1_block_number: u64,
+        post: &Post,
     ) -> DeriverResult<Option<eez_payload_codec::DecodedContainer>> {
-        let container = eez_payload_codec::decode_container(call_data)?;
+        let l1_block_number = post.id.l1_block;
+        let container = if post.blob_hashes.is_empty() {
+            eez_payload_codec::decode_container(&post.batch.callData)?
+        } else {
+            // Fetched only past the processed/settled gates: pruned blobs of an
+            // indexed post never block a rescan.
+            let blobs = self
+                .inner
+                .l1_reader
+                .post_blobs(post)
+                .await
+                .map_err(DeriverError::L1Scan)?;
+            eez_payload_codec::decode_blob_container(&blobs)?
+        };
         let ours = self.inner.system_tx_cfg.as_ref().map(|c| c.this_rollup_id);
         if ours.is_some_and(|ours| container.rollup_id != ours) {
             event!(
@@ -1021,7 +1032,6 @@ where
         let l1_block_number = post.id.l1_block;
         let tx_hash = post.tx_hash;
         let submitter = post.sender;
-        let call_data = &post.batch.callData;
         let settlement = &post.settlement;
         // At or before the indexed tail: already processed by catch_up or an
         // earlier event; this is a stale live event.
@@ -1056,7 +1066,7 @@ where
 
         // Decode only after the gates above, so a skipped peer batch in a codec
         // we do not read cannot halt us.
-        let Some(container) = self.decode_our_payload(call_data.as_ref(), l1_block_number)? else {
+        let Some(container) = self.decode_our_payload(post).await? else {
             return self.flush_deferred_safe(last_in_l1_block).await;
         };
         let decoded = &container.span;

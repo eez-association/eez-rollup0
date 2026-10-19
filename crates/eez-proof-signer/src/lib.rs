@@ -13,7 +13,9 @@ use eyre::WrapErr as _;
 use tracing::{info, warn};
 
 pub mod attest;
+pub mod blob_profile;
 pub mod cancel;
+pub mod rpc_blob_source;
 pub mod service;
 mod settlement;
 pub mod validate;
@@ -26,6 +28,11 @@ mod testkit;
 pub use eez_protocol::EEZL2_ADDRESS;
 
 pub use attest::{Attester, NonZeroProofSystemVkey};
+pub use blob_profile::{
+    AppendixDBlobAuthority, AppendixDBlobConfig, AuthenticatedBlobContext, BlobContextError,
+    L1PostingContext, Rollup0L1Source, SettlementState,
+};
+pub use rpc_blob_source::{BlobServiceConfig, RpcRollup0L1Source};
 pub use service::{ProveSvc, ServiceLimits, ServiceLimitsParams, ServiceState};
 pub use validate::ValidationBackend;
 
@@ -44,23 +51,50 @@ pub async fn serve(
     backend: impl ValidationBackend,
     shutdown: impl Future<Output = ()>,
 ) -> eyre::Result<()> {
+    serve_inner(config, backend, None, shutdown).await
+}
+
+/// Serve with the Appendix-D blob profile enabled.
+///
+/// The L1 source supplies canonical headers and the settled Rollup0 cursor;
+/// the deployment, slot grid and blob schedule come from trusted config.
+pub async fn serve_with_blob_source(
+    config: ServerConfig,
+    backend: impl ValidationBackend,
+    source: Arc<dyn Rollup0L1Source>,
+    blob_config: AppendixDBlobConfig,
+    shutdown: impl Future<Output = ()>,
+) -> eyre::Result<()> {
+    let authority = Arc::new(AppendixDBlobAuthority::new(source, blob_config)?);
+    serve_inner(config, backend, Some(authority), shutdown).await
+}
+
+async fn serve_inner(
+    config: ServerConfig,
+    backend: impl ValidationBackend,
+    blob_context_authority: Option<Arc<AppendixDBlobAuthority>>,
+    shutdown: impl Future<Output = ()>,
+) -> eyre::Result<()> {
     let ServerConfig {
         listen_addr,
         limits,
         expected_rollup_id,
         attester,
     } = config;
+    let blob_profile_enabled = blob_context_authority.is_some();
     log_server_config(
         listen_addr,
         limits,
         &backend,
         expected_rollup_id.get(),
         &attester,
+        blob_profile_enabled,
     );
-    let svc = ProveSvc::new(
-        Arc::new(ServiceState::new(backend, expected_rollup_id, attester)?),
-        limits,
-    );
+    let mut state = ServiceState::new(backend, expected_rollup_id, attester)?;
+    if let Some(authority) = blob_context_authority {
+        state = state.with_blob_context_authority(authority);
+    }
+    let svc = ProveSvc::new(Arc::new(state), limits);
     if !listen_addr.ip().is_loopback() {
         warn!(
             listen = %listen_addr,
@@ -84,6 +118,7 @@ fn log_server_config(
     backend: &dyn ValidationBackend,
     expected_rollup_id: u64,
     attester: &Attester,
+    blob_profile_enabled: bool,
 ) {
     let window_limits = limits.window_limits();
     info!(
@@ -102,7 +137,11 @@ fn log_server_config(
         proof_system_vkey = %attester.proof_system_vkey(),
         l2_chain_id = backend.chain_id(),
         expected_l2_system_address = %backend.expected_l2_system_address(),
-        profile = "anchor_single_call_outbound_then_inbound",
+        profile = if blob_profile_enabled {
+            "appendix_d_candidate_v1"
+        } else {
+            "calldata_anchor_outbound_then_inbound"
+        },
         "serving Prove — waiting for composer windows",
     );
 }

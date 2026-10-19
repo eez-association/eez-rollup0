@@ -411,7 +411,8 @@ transcripts belong with each runtime implementation.
 
 The stateless signer and the stateful follower signer implement Resume, Rewind,
 Cancel, subrange selection and bounded pipelining. Both reject nonempty blobs
-or any posting context with UNIMPLEMENTED; this is not a blob-profile implementation.
+or any posting context with UNIMPLEMENTED unless `EEZ_SETTLEMENT_WRAPPER_ADDRESS`
+selects blob settlement, which requires both.
 Ordinary execution ACKs do not claim L1 acceptance. Final settlement retains
 the current Rollup0 [conditional-proof rules](#parent-authorization-by-profile);
 stateful fork selection additionally obeys Reth's safe/finalized ancestry.

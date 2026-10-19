@@ -107,6 +107,12 @@ impl Prover for ProveSvc {
         &self,
         request: Request<Streaming<ProveChunk>>,
     ) -> Result<Response<ProveResponse>, Status> {
+        // v1 carries neither blobs nor a posting context.
+        if self.state.blob_context_authority.is_some() {
+            return Err(Status::unimplemented(
+                "candidate V1 settles only through ProveStream",
+            ));
+        }
         let request_permit = self.try_acquire_request_slot()?;
         let timing = self.request_timing()?;
         // Ingestion admits stream structure only: exactly the declared block

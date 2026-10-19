@@ -53,6 +53,54 @@ fn target_batch_has_a_valid_state_update_chain() {
     );
 }
 
+fn blob_profile(batch: &CanonicalPostBatch, submitted: usize, limit: usize) -> bool {
+    CheckedPublicInputProfile::new_blob(
+        batch,
+        expected_rollup_id(),
+        EXPECTED_PROOF_SYSTEM,
+        submitted,
+        limit,
+    )
+    .is_ok()
+}
+
+#[test]
+fn blob_profile_checks_shape_and_trusted_limit_before_da() {
+    let mut batch = target_anchor_batch();
+    batch.blockNumber = u64::MAX;
+    batch.blobIndices = vec![U256::ZERO, U256::from(1)];
+    assert!(blob_profile(&batch, 2, 2));
+
+    let mut wrong_block = batch.clone();
+    wrong_block.blockNumber = 0;
+    assert!(!blob_profile(&wrong_block, 2, 2));
+
+    let mut calldata_tail = batch.clone();
+    calldata_tail.callData = Bytes::from_static(b"tail");
+    assert!(!blob_profile(&calldata_tail, 2, 2));
+
+    let mut no_blobs = batch.clone();
+    no_blobs.blobIndices.clear();
+    assert!(!blob_profile(&no_blobs, 0, 2));
+
+    let mut noncanonical_indices = batch.clone();
+    noncanonical_indices.blobIndices = vec![U256::ZERO, U256::from(2)];
+    assert!(!blob_profile(&noncanonical_indices, 2, 2));
+
+    assert!(!blob_profile(&batch, 1, 2));
+    assert!(!blob_profile(&batch, 2, 1));
+
+    let mut outbound_prefix = batch.clone();
+    let second_immediate = outbound_prefix.entries[0].clone();
+    outbound_prefix.entries.push(second_immediate);
+    outbound_prefix.immediateEntryCount = U256::from(2);
+    assert!(!blob_profile(&outbound_prefix, 2, 2));
+
+    let mut sender_bound = batch;
+    sender_bound.bindMsgSenderInPublicInput = true;
+    assert!(!blob_profile(&sender_bound, 2, 2));
+}
+
 #[test]
 fn wrong_selector_is_rejected() {
     let mut calldata = encode_postbatch(&EvmBatch::default());

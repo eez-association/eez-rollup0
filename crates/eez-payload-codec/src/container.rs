@@ -2,8 +2,8 @@
 //!
 //! `eez-core-protocol/docs/blobs/BLOB_FORMAT_SPEC.md` defines one continuous
 //! stream: the batch's blobs in order, with `callData` appended after the last
-//! blob. We publish no blobs yet, so `callData` IS the whole stream — the same
-//! format with an empty blob portion, not a framing of our own.
+//! blob. The calldata helpers preserve the deployed legacy profile; the blob
+//! helpers implement Rollup0 candidate V1's blob-only profile.
 //!
 //! ```text
 //!   stream := 00                                       # protocol version, never a message
@@ -12,7 +12,8 @@
 //! ```
 //!
 //! `CloseBlobStream` (type 1) ends the blob portion and is invalid inside the
-//! `callData` tail, so a zero-blob stream never emits one.
+//! `callData` tail. Candidate V1 uses the blob-only helpers in this module;
+//! the calldata helpers remain for the deployed calldata-only profile.
 //!
 //! Wire conventions (§1.1): scalars little-endian fixed-width, `address` 20
 //! bytes, `u256` 32 bytes little-endian, every `bytes` field length-prefixed
@@ -23,11 +24,6 @@
 //! rides inside it verbatim. Nothing here extends it: the span's start comes
 //! from the settled parent EEZ names, not from a field of our own.
 //!
-//! INTERIM CALLDATA PROFILE, not full blob-format compliance: §2.1 and §5
-//! cond. 2 want `CloseBlobStream` in the blob portion, cond. 3 forbids it in
-//! the tail, and a zero-blob stream has nowhere legal to put it. Open with the
-//! spec owner.
-
 use crate::{CodecError, CodecResult, Cursor, DecodedSpan, SpanBlock};
 use tracing::warn;
 
@@ -35,6 +31,7 @@ use tracing::warn;
 pub const STREAM_VERSION: u8 = 0x00;
 
 const MSG_CHAIN_OPERATION: u8 = 2;
+const MSG_CLOSE_BLOB_STREAM: u8 = 1;
 const MSG_INITIATE: u8 = 3;
 const MSG_CALL: u8 = 4;
 const MSG_RETURN_SUCCESS: u8 = 6;
@@ -43,6 +40,13 @@ const MSG_FINISH: u8 = 10;
 
 /// Width of a `u256` field, in bytes.
 const VALUE_BYTES: usize = 32;
+
+/// Physical EIP-4844 blob byte length.
+pub const BYTES_PER_BLOB: usize = 131_072;
+const FIELD_ELEMENT_BYTES: usize = 32;
+const LOGICAL_FIELD_BYTES: usize = 31;
+const FIELD_ELEMENTS_PER_BLOB: usize = BYTES_PER_BLOB / FIELD_ELEMENT_BYTES;
+const LOGICAL_BYTES_PER_BLOB: usize = FIELD_ELEMENTS_PER_BLOB * LOGICAL_FIELD_BYTES;
 
 /// One cross-chain action, in its semantic form.
 ///
@@ -143,6 +147,48 @@ pub fn encode_container(
     Ok(out)
 }
 
+/// Encode candidate V1 into complete, canonical physical blobs.
+pub fn encode_blob_container(
+    rollup_id: u64,
+    blocks: &[SpanBlock],
+    actions: &[Action],
+) -> CodecResult<Vec<Vec<u8>>> {
+    if actions
+        .iter()
+        .any(|action| action.source_rollup_id != 0 || action.target_rollup_id != rollup_id)
+    {
+        return Err(CodecError::InvalidBlobProfile(
+            "candidate V1 actions must originate on L1 and target the candidate rollup",
+        ));
+    }
+    if actions.iter().rev().skip(1).any(|action| !action.success) {
+        return Err(CodecError::ActionAfterFailure);
+    }
+    let mut stream = encode_container(rollup_id, blocks, actions)?;
+    stream.push(MSG_CLOSE_BLOB_STREAM);
+    Ok(pack_blobs(stream))
+}
+
+/// Packs a closed stream into physical blobs: 31 bytes per field element,
+/// zero-padded to the last blob.
+fn pack_blobs(mut stream: Vec<u8>) -> Vec<Vec<u8>> {
+    let blob_count = stream.len().div_ceil(LOGICAL_BYTES_PER_BLOB);
+    stream.resize(blob_count * LOGICAL_BYTES_PER_BLOB, 0);
+
+    let mut blobs = Vec::with_capacity(blob_count);
+    for logical_blob in stream.chunks_exact(LOGICAL_BYTES_PER_BLOB) {
+        let mut blob = vec![0; BYTES_PER_BLOB];
+        for (field_index, logical) in logical_blob.chunks_exact(LOGICAL_FIELD_BYTES).enumerate() {
+            let start = field_index * FIELD_ELEMENT_BYTES;
+            for (offset, byte) in logical.iter().enumerate() {
+                blob[start + FIELD_ELEMENT_BYTES - 1 - offset] = *byte;
+            }
+        }
+        blobs.push(blob);
+    }
+    blobs
+}
+
 /// Decode an EEZ message stream from `batch.callData`.
 ///
 /// A malformed stream is rejected whole (§5): an unknown version, an unknown
@@ -153,6 +199,37 @@ pub fn encode_container(
 ///
 /// [`CodecError`] describes the first rule the stream broke.
 pub fn decode_container(payload: &[u8]) -> CodecResult<DecodedContainer> {
+    decode_stream(payload, false)
+}
+
+/// Decode complete physical blobs under the candidate-V1 blob-only profile.
+pub fn decode_blob_container(blobs: &[Vec<u8>]) -> CodecResult<DecodedContainer> {
+    if blobs.is_empty() {
+        return Err(CodecError::NoBlobs);
+    }
+    let mut stream = Vec::with_capacity(blobs.len() * LOGICAL_BYTES_PER_BLOB);
+    for (blob_index, blob) in blobs.iter().enumerate() {
+        if blob.len() != BYTES_PER_BLOB {
+            return Err(CodecError::InvalidBlobLength {
+                index: blob_index,
+                actual: blob.len(),
+                expected: BYTES_PER_BLOB,
+            });
+        }
+        for (field_index, field) in blob.chunks_exact(FIELD_ELEMENT_BYTES).enumerate() {
+            if field[0] != 0 {
+                return Err(CodecError::NonCanonicalFieldElement {
+                    blob_index,
+                    field_index,
+                });
+            }
+            stream.extend(field[1..].iter().rev());
+        }
+    }
+    decode_stream(&stream, true)
+}
+
+fn decode_stream(payload: &[u8], require_close: bool) -> CodecResult<DecodedContainer> {
     let Some((&version, body)) = payload.split_first() else {
         return Err(CodecError::Empty);
     };
@@ -168,10 +245,31 @@ pub fn decode_container(payload: &[u8]) -> CodecResult<DecodedContainer> {
     let span = crate::decode(take_bytes(&mut cur, "operations")?)?;
 
     let mut actions = Vec::new();
-    while cur.remaining() != 0 {
-        if actions
-            .last()
-            .is_some_and(|action: &Action| !action.success)
+    while cur.remaining() != 0 && (!require_close || cur.peek() != Some(MSG_CLOSE_BLOB_STREAM)) {
+        let action = decode_action(&mut cur, rollup_id)?;
+        // These restrictions apply only to blobs; legacy peer calldata remains valid.
+        if require_close {
+            if actions
+                .last()
+                .is_some_and(|previous: &Action| !previous.success)
+            {
+                return Err(CodecError::ActionAfterFailure);
+            }
+            if action.source_rollup_id != 0 {
+                return Err(CodecError::InvalidBlobProfile(
+                    "Initiate chain_id must be the settlement L1 rollup id 0",
+                ));
+            }
+            if action.target_rollup_id != rollup_id {
+                return Err(CodecError::InvalidBlobProfile(
+                    "Call to_chain must equal the candidate rollup id",
+                ));
+            }
+        }
+        if !require_close
+            && actions
+                .last()
+                .is_some_and(|previous: &Action| !previous.success)
         {
             warn!(
                 rollup_id,
@@ -179,7 +277,16 @@ pub fn decode_container(payload: &[u8]) -> CodecResult<DecodedContainer> {
                 "ActionAfterFailure: action follows failed return"
             );
         }
-        actions.push(decode_action(&mut cur, rollup_id)?);
+        actions.push(action);
+    }
+    if require_close {
+        if cur.peek() != Some(MSG_CLOSE_BLOB_STREAM) {
+            return Err(CodecError::CloseBlobStreamMissing);
+        }
+        cur.byte("CloseBlobStream")?;
+        if cur.remaining_slice().iter().any(|byte| *byte != 0) {
+            return Err(CodecError::NonZeroBlobPadding);
+        }
     }
     Ok(DecodedContainer {
         rollup_id,
@@ -342,6 +449,54 @@ mod tests {
         assert!(decode_container(&encoded).unwrap().actions.is_empty());
     }
 
+    #[test]
+    fn physical_blob_profile_round_trips_across_blob_boundaries() {
+        let blocks = vec![SpanBlock {
+            beneficiary: [0x11; 20],
+            extra_data: vec![],
+            transactions: vec![vec![0x42; LOGICAL_BYTES_PER_BLOB]],
+        }];
+        let blobs = encode_blob_container(ROLLUP, &blocks, &[]).unwrap();
+        assert_eq!(blobs.len(), 2);
+        assert!(blobs.iter().all(|blob| blob.len() == BYTES_PER_BLOB));
+        assert_eq!(
+            decode_blob_container(&blobs).unwrap().span.transactions[0].len(),
+            LOGICAL_BYTES_PER_BLOB
+        );
+    }
+
+    #[test]
+    fn physical_blob_profile_rejects_bad_field_elements_and_padding() {
+        let mut blobs = encode_blob_container(ROLLUP, &span(), &[]).unwrap();
+        blobs[0][0] = 1;
+        assert!(matches!(
+            decode_blob_container(&blobs),
+            Err(CodecError::NonCanonicalFieldElement { .. })
+        ));
+
+        let mut blobs = encode_blob_container(ROLLUP, &span(), &[]).unwrap();
+        *blobs[0].last_mut().unwrap() = 1;
+        assert_eq!(
+            decode_blob_container(&blobs),
+            Err(CodecError::NonZeroBlobPadding)
+        );
+    }
+
+    #[test]
+    fn physical_blob_profile_enforces_rollup0_action_rules() {
+        let mut invalid_source = action(true);
+        invalid_source.source_rollup_id = 7;
+        assert!(matches!(
+            encode_blob_container(ROLLUP, &span(), &[invalid_source]),
+            Err(CodecError::InvalidBlobProfile(_))
+        ));
+
+        assert_eq!(
+            encode_blob_container(ROLLUP, &span(), &[action(false), action(true)]),
+            Err(CodecError::ActionAfterFailure)
+        );
+    }
+
     /// The stream opens exactly as the spec defines: protocol version byte,
     /// then a ChainOperation whose chain_id is little-endian.
     #[test]
@@ -491,6 +646,11 @@ mod tests {
         assert_eq!(
             decode_container(&forged).unwrap_err(),
             CodecError::NonEmptyTransactionData,
+        );
+        forged.push(MSG_CLOSE_BLOB_STREAM);
+        assert_eq!(
+            decode_blob_container(&pack_blobs(forged)),
+            Err(CodecError::NonEmptyTransactionData),
         );
     }
 

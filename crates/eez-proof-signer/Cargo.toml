@@ -16,10 +16,14 @@ eez-control-rpc.workspace = true
 # Canonical `postAndVerifyBatch` ABI types and codec.
 eez-protocol.workspace = true
 eez-payload-codec.workspace = true
+eez-blob.workspace = true
 
 alloy-consensus.workspace = true
+alloy-contract.workspace = true
 alloy-eips.workspace = true
 alloy-primitives = { workspace = true, features = ["k256"] }
+alloy-provider.workspace = true
+alloy-rpc-types-eth.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-debug.workspace = true
 alloy-sol-types.workspace = true
@@ -35,6 +39,7 @@ tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+url.workspace = true
 getrandom.workspace = true
 
 stateless-reth.workspace = true

@@ -38,7 +38,10 @@
 
 mod container;
 
-pub use container::{Action, DecodedContainer, STREAM_VERSION, decode_container, encode_container};
+pub use container::{
+    Action, BYTES_PER_BLOB, DecodedContainer, STREAM_VERSION, decode_blob_container,
+    decode_container, encode_blob_container, encode_container,
+};
 
 /// A raw EIP-2718 signed transaction, exactly as it enters the block's
 /// transaction trie. Opaque to this crate: the span never reserializes or
@@ -155,6 +158,36 @@ pub enum CodecError {
     /// A bracket followed a failed return, which terminates the manifest.
     #[error("an action bracket follows a failed return")]
     ActionAfterFailure,
+    /// Candidate V1 requires at least one physical blob.
+    #[error("candidate V1 requires at least one physical blob")]
+    NoBlobs,
+    /// A physical EIP-4844 blob did not have the required byte length.
+    #[error("blob {index} has length {actual}; expected {expected}")]
+    InvalidBlobLength {
+        /// Zero-based blob position.
+        index: usize,
+        /// Submitted byte length.
+        actual: usize,
+        /// Required EIP-4844 byte length.
+        expected: usize,
+    },
+    /// The high byte of a packed field element must be zero.
+    #[error("blob {blob_index} field element {field_index} has a nonzero high byte")]
+    NonCanonicalFieldElement {
+        /// Zero-based blob position.
+        blob_index: usize,
+        /// Zero-based field-element position.
+        field_index: usize,
+    },
+    /// A blob-backed stream omitted its mandatory close marker.
+    #[error("blob stream is missing CloseBlobStream")]
+    CloseBlobStreamMissing,
+    /// Bytes after the close marker must be zero padding.
+    #[error("blob stream has nonzero padding after CloseBlobStream")]
+    NonZeroBlobPadding,
+    /// A decoded message is valid EEZ but outside Rollup0 candidate V1.
+    #[error("invalid Rollup0 blob profile: {0}")]
+    InvalidBlobProfile(&'static str),
     /// A value did not fit the `uvarint32` domain on encode.
     #[error("{what} = {value} exceeds u32")]
     ValueTooLarge {
@@ -388,6 +421,14 @@ impl<'a> Cursor<'a> {
 
     pub(crate) const fn remaining(&self) -> usize {
         self.body.len() - self.at
+    }
+
+    pub(crate) fn peek(&self) -> Option<u8> {
+        self.body.get(self.at).copied()
+    }
+
+    pub(crate) fn remaining_slice(&self) -> &'a [u8] {
+        &self.body[self.at..]
     }
 
     pub(crate) fn take(&mut self, what: &'static str, len: usize) -> CodecResult<&'a [u8]> {
@@ -773,7 +814,7 @@ mod tests {
         use super::*;
         use alloy_primitives::hex;
 
-        /// D.4.2 Vector 1 — six empty blocks, 31 bytes.
+        /// Six empty blocks fit in 31 bytes.
         #[test]
         fn vector_1_six_empty_blocks() {
             let bytes =
@@ -795,7 +836,7 @@ mod tests {
             );
         }
 
-        /// D.4.2 Vector 2 — one EIP-1559 transaction, multiple metadata runs.
+        /// One EIP-1559 transaction with multiple metadata runs.
         #[test]
         fn vector_2_one_transaction_and_multiple_runs() {
             let bytes = hex::decode(
@@ -843,7 +884,7 @@ mod tests {
             );
         }
 
-        /// D.4.2 Vectors 3-7 — every one must be rejected, and for the stated
+        /// These malformed inputs must be rejected, and for the stated
         /// reason.
         #[test]
         fn vectors_3_to_7_are_rejected() {

@@ -48,15 +48,24 @@ where
     } = config;
     let backend =
         Backend::with_committer(provider, chain_spec, expected_l2_system_address, committer);
-    eez_proof_signer::serve(
-        ServerConfig {
-            listen_addr,
-            limits,
-            expected_rollup_id,
-            attester,
-        },
-        backend,
-        shutdown,
-    )
-    .await
+    let server = ServerConfig {
+        listen_addr,
+        limits,
+        expected_rollup_id,
+        attester,
+    };
+    let l2_chain_id = eez_proof_signer::ValidationBackend::chain_id(&backend);
+    match eez_proof_signer::BlobServiceConfig::from_env(expected_rollup_id.get(), l2_chain_id)? {
+        Some(blob) => {
+            eez_proof_signer::serve_with_blob_source(
+                server,
+                backend,
+                blob.source,
+                blob.authority,
+                shutdown,
+            )
+            .await
+        }
+        None => eez_proof_signer::serve(server, backend, shutdown).await,
+    }
 }

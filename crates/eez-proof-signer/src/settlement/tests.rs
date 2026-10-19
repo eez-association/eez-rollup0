@@ -31,10 +31,11 @@ use crate::validate::{OutboundEventObservation, SettlementBlockEvidence, Validat
 
 use super::{
     AuthorizedInboundEffects, AuthorizedOutboundEffects, BlockInspectionError, BoundEffectSequence,
-    CanonicalPostBatch, ClaimedEntryShape, DaPayloadError, EffectPrefixError, EthereumBlock,
-    InboundCandidate, InboundEffectError, InboundObservationError, ObservedEffectKind,
-    OutboundEffectError, PostBatchDecodeError, PublicInputError, RollupUpdateChainError,
-    SettlingBlockObservations, authorize_inbound_effects as authorize_inbound_effects_for_rollup,
+    CanonicalPostBatch, CheckedPublicInputProfile, ClaimedEntryShape, DaPayloadError,
+    EffectPrefixError, EthereumBlock, InboundCandidate, InboundEffectError,
+    InboundObservationError, ObservedEffectKind, OutboundEffectError, PostBatchDecodeError,
+    PublicInputError, RollupUpdateChainError, SettlingBlockObservations,
+    authorize_inbound_effects as authorize_inbound_effects_for_rollup,
     authorize_outbound_effects as authorize_outbound_effects_for_rollup, bind_effects_to_execution,
     decode_canonical_post_batch, encode_da_payload, inspect_inbound_candidate,
     inspect_settling_block, inspect_validated_settling_block, recompute_public_input_hash,

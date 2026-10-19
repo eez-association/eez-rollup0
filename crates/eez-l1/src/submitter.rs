@@ -203,11 +203,18 @@ impl Submitter {
                     + NEXT_BLOCK_SLACK
             }
         };
-        let post_batch_envelope =
-            alloy_consensus::TxEnvelope::decode_2718(&mut raw_txs[0].as_ref()).map_err(|e| {
-                L1Error::Submission(format!("send_bundle: decode postBatch envelope: {e}"))
-            })?;
-        let post_batch_hash = *post_batch_envelope.tx_hash();
+        // A Candidate-V1 post is a pooled type-3 wrapper carrying its sidecar.
+        let post_batch_hash = if raw_txs[0].first() == Some(&3) {
+            eez_blob::pooled_blob_transaction_hash(&raw_txs[0]).map_err(|error| {
+                L1Error::Submission(format!("send_bundle: decode blob postBatch: {error}"))
+            })?
+        } else {
+            let envelope = alloy_consensus::TxEnvelope::decode_2718(&mut raw_txs[0].as_ref())
+                .map_err(|error| {
+                    L1Error::Submission(format!("send_bundle: decode postBatch envelope: {error}"))
+                })?;
+            *envelope.tx_hash()
+        };
         // Dispatch breadcrumb: correlate this postBatch tx to the L1 block we
         // aim it at. `SendOutcome::Included` later carries the ACTUAL inclusion
         // block, so joining on tx_hash gives the N+1 next-slot targeting hit-rate.
@@ -528,6 +535,7 @@ impl Inner {
             &self.reader.build_trace_provider(),
             self.reader.eez(),
             self.reader.rollup_id(),
+            self.reader.candidate(),
             l1_block,
             l1_block,
         )
@@ -796,6 +804,7 @@ mod tests {
             tx_hash,
             sender: Address::ZERO,
             batch: eez_protocol::abi::EvmBatch::default(),
+            blob_hashes: Vec::new(),
             settlement: Settlement::new(Vec::new(), root(log_index), None, false),
         };
         let theirs = post(TxHash::repeat_byte(0x0B), 1);

@@ -27,7 +27,7 @@ supported public-input hash, and signs that hash. The supported backends are
 witness-backed Stateless/Reth execution and node-backed execution over an
 L1-derived follower's canonical L2 database.
 
-The only supported execution-entry sequence is:
+The deployed calldata profile supports this execution-entry sequence:
 
 ```text
 anchor, outbound*, inbound*
@@ -40,11 +40,33 @@ where:
 - each outbound effect represents one successful mutable L2-to-L1 call; and
 - each inbound effect represents one successful mutable L1-to-L2 delivery.
 
-The profile supports exactly one nonzero rollup ID, one nonzero proof-system
+Both profiles support exactly one nonzero rollup ID, one nonzero proof-system
 address, and one nonzero proof-system verification key. It does not support
 static entries, nested calls, multiple calls per effect, explicit call gas,
-force-revert spans, blobs, L1 block binding, sender binding, or multiple proof
-systems.
+force-revert spans, sender binding, or multiple proof systems.
+
+`EEZ_SETTLEMENT_WRAPPER_ADDRESS` selects the blob-settlement profile for
+both daemons. Each `Finalize` must then carry the complete physical blobs and an
+`L1PostingContext`, and the signer additionally requires:
+
+- the posting parent canonical on its own `EEZ_L1_RPC_URL`, read again after the
+  other L1 reads, and a target timestamp on a later slot start of the
+  `EEZ_L1_GENESIS_TIMESTAMP` / `EEZ_L1_SLOT_SECONDS` grid;
+- at that parent, EEZ's Rollup0 manager and that manager's active wrapper equal
+  the configured ones, and the EEZ root equals the selected L2 parent's hash;
+- at most `min(per_tx, per_block)` blobs of the `EEZ_L1_BLOB_FORKS` rule active
+  at the target, with `blobIndices == [0, n)` and empty `callData`;
+- `blockNumber == uint64.max`, one immediate anchor, and a span of whole
+  `K = EEZ_L1_BLOCK_TIME_MS / EEZ_L2_BLOCK_TIME_MS` intervals ending at a Sync
+  height; and
+- the decoded blob stream bound to the validated window, with versioned hashes
+  and manager data derived locally from trusted configuration.
+
+Unsupported blobs or context in the calldata profile, and the v1 `Prove` RPC in
+candidate V1, fail `UNIMPLEMENTED`;
+malformed or missing candidate inputs fail `INVALID_ARGUMENT`; a replaced parent
+fails `ABORTED`; an unavailable L1 source fails `UNAVAILABLE`; and a parent other
+than the settled cursor, or another manager or wrapper, fails `FAILED_PRECONDITION`.
 
 No failed stage may produce a signature. A successful signature authorizes the
 locally recomputed public-input hash only under all rules in this document.

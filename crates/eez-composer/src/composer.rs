@@ -110,6 +110,19 @@ pub struct CrossChainExecCtx {
     /// `ECDSA.recover(publicInputsHash, proof) == signer`; the remote proof
     /// signer signs that exact hash after validating the batch.
     pub ecdsa_proof_system_address: Address,
+    /// Blob settlement; `None` keeps the calldata
+    /// profile and its type-2 postBatch.
+    pub blob_posting: Option<BlobPostingConfig>,
+}
+
+/// Blob posting: the deployment the signed domain binds, the L1 slot
+/// grid and blob schedule shared with the proof signer, and the blob-gas cap.
+#[derive(Clone, Debug)]
+pub struct BlobPostingConfig {
+    pub deployment: eez_protocol::Rollup0Deployment,
+    pub clock: eez_blob::L1SlotClock,
+    pub schedule: eez_blob::BlobSchedule,
+    pub max_fee_per_blob_gas: u128,
 }
 
 impl std::fmt::Debug for CrossChainExecCtx {
@@ -118,6 +131,7 @@ impl std::fmt::Debug for CrossChainExecCtx {
             .field("system_address", &eez_primitives::SYSTEM_ADDRESS)
             .field("eezl2_address", &self.eezl2_address)
             .field("l2_chain_id", &self.l2_chain_id)
+            .field("blob_posting", &self.blob_posting)
             .finish_non_exhaustive()
     }
 }
@@ -1169,7 +1183,6 @@ where
         let submitter_poster = submitter.poster_address();
         let post_batch_signer = cross_chain.exec_ctx.l1_poster_signer.address();
         ensure_submission_identity(submitter_poster, post_batch_signer)?;
-
         Ok(Self {
             inner: Arc::new(Inner {
                 rollups,
@@ -1516,6 +1529,28 @@ where
             );
             return self.build_empty_slot_block(rollup, &parent_header, timestamp);
         }
+
+        // Pinned only once a post may follow; a failed read still owes the slot
+        // a block, since None would let commit_one mint a tx-bearing one.
+        let (bundle_target, historical_target) = match &cc.exec_ctx.blob_posting {
+            Some(config) => {
+                let targets = [bundle_target, historical_target];
+                match pin_candidate_targets(&cc.exec_ctx.l1_provider, config, targets).await {
+                    Ok(pinned) => pinned,
+                    Err(error) => {
+                        event!(
+                            name: "eez.composer.sync_slot.target_unpinned",
+                            Level::WARN,
+                            rollup_id,
+                            error = %error,
+                            "candidate-V1 slot target unavailable; committing Sync block without emission",
+                        );
+                        return self.build_empty_slot_block(rollup, &parent_header, timestamp);
+                    }
+                }
+            }
+            None => (bundle_target, historical_target),
+        };
 
         // ── Bounded emission ─────────────────────────────────────────
         // A stall holds `cursor` still while the head keeps cadence, growing the
@@ -3525,10 +3560,8 @@ where
 
         // ── Dispatch the rich L1 bundle and register the optimistic block. ──
         let sync_height = built.header.number();
-        // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
-        // recorded in the ledger so the finality audit can look up the
-        // postBatch receipt.
-        let post_batch_hash = alloy_primitives::keccak256(&postbatch_raw);
+        // Recorded in the ledger so the finality audit can look up the receipt.
+        let post_batch_hash = post_batch_tx_hash(&postbatch_raw);
         let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivors.len());
         bundle.push(postbatch_raw);
         // Only INBOUND survivors ride the L1 bundle (L1-signed, execute on L1).
@@ -3652,7 +3685,13 @@ where
                         rollup,
                         cursor,
                         sync_height,
-                        BundleTarget::NextBlock,
+                        // Candidate V1 signs for the pinned slot; elsewhere a
+                        // past terminal carries no pin.
+                        if ctx.blob_posting.is_some() {
+                            bundle_target
+                        } else {
+                            BundleTarget::NextBlock
+                        },
                     )
                     .await
                 {
@@ -3680,10 +3719,8 @@ where
             }
         };
         let sync_height = empty_built.header.number();
-        // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
-        // recorded in the ledger so the finality audit can look up the
-        // postBatch receipt.
-        let post_batch_hash = alloy_primitives::keccak256(&minimal_postbatch_raw);
+        // Recorded in the ledger so the finality audit can look up the receipt.
+        let post_batch_hash = post_batch_tx_hash(&minimal_postbatch_raw);
         event!(
             name: "eez.composer.phase1.bundle.dispatched",
             Level::INFO,
@@ -3825,7 +3862,7 @@ where
                 "settlement backlog exceeds the batch cap; settling a bounded historical chunk",
             );
 
-            let post_batch_hash = alloy_primitives::keccak256(&raw);
+            let post_batch_hash = post_batch_tx_hash(&raw);
             rollup
                 .optimistic
                 .begin(boundary, post_batch_hash, boundary_parent, Vec::new());
@@ -3978,6 +4015,14 @@ where
         use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
 
         let sync_block_hash = terminal_header.hash();
+
+        // Candidate V1 opens no outbound front, so this only guards against a
+        // batch the settlement wrapper would reject (immediateEntryCount == 1).
+        if ctx.blob_posting.is_some()
+            && (!outbound_entries.is_empty() || !outbound_user_txs.is_empty())
+        {
+            return Err("candidate V1 admits no action starting on Rollup0".into());
+        }
 
         // Merge inbound compositions' L1 source batches, or start empty so an
         // idle Sync slot can carry only the leading immediate entry that
@@ -4332,9 +4377,44 @@ where
             )
             .into());
         }
-        let payload = eez_payload_codec::encode_container(rollup_id, &blocks, &actions)
-            .map_err(|e| format!("eez_payload_codec::encode_container: {e}"))?;
-        batch.callData = alloy_primitives::Bytes::from(payload);
+        // Candidate V1 carries the stream in blobs sized for the target's fork.
+        let blob_fork = match (&ctx.blob_posting, bundle_target) {
+            (Some(config), BundleTarget::Exact { timestamp, .. }) => Some(
+                config
+                    .schedule
+                    .fork_at(timestamp)
+                    .ok_or("no blob fork is active at the candidate-V1 target")?,
+            ),
+            (Some(_), _) => return Err("candidate V1 needs an exact L1 target".into()),
+            (None, _) => None,
+        };
+        let physical_blobs = if let Some(fork) = blob_fork {
+            let blobs = eez_payload_codec::encode_blob_container(rollup_id, &blocks, &actions)
+                .map_err(|e| format!("eez_payload_codec::encode_blob_container: {e}"))?;
+            let maximum = fork.max_blobs();
+            if blobs.len() as u64 > maximum {
+                event!(
+                    name: "eez.composer.emission.candidate_over_blob_limit",
+                    Level::DEBUG,
+                    rollup_id,
+                    from,
+                    to = sync_block_number,
+                    blobs = blobs.len(),
+                    maximum,
+                    "candidate range needs more blobs than one settlement tx carries",
+                );
+                return Ok(None);
+            }
+            batch.callData = Bytes::new();
+            batch.blockNumber = u64::MAX;
+            batch.blobIndices = (0..blobs.len()).map(U256::from).collect();
+            Some((blobs, fork.sidecar_encoding))
+        } else {
+            let payload = eez_payload_codec::encode_container(rollup_id, &blocks, &actions)
+                .map_err(|e| format!("eez_payload_codec::encode_container: {e}"))?;
+            batch.callData = alloy_primitives::Bytes::from(payload);
+            None
+        };
 
         // Priced on the encoded candidate before witnesses and proving; `Ok(None)`
         // is over-budget, not an error, and the caller chooses what to do.
@@ -4425,6 +4505,24 @@ where
             // Tests may use a lightweight prover without a witness source.
             None => Vec::new(),
         };
+        let (blob, carrier) =
+            if let (Some(config), Some((blobs, encoding))) = (&ctx.blob_posting, physical_blobs) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_secs());
+                let (blob, carrier) = prepare_candidate_v1(
+                    &ctx.l1_provider,
+                    config,
+                    bundle_target,
+                    blobs,
+                    encoding,
+                    now,
+                )
+                .await?;
+                (Some(blob), Some(carrier))
+            } else {
+                (None, None)
+            };
         let proving_ctx = ProvingContext {
             rollup_id,
             from_block: from,
@@ -4436,7 +4534,10 @@ where
             }),
             batch: batch.clone(),
             blocks: block_witnesses,
-            l1_block_hash: None, // timeless batch (blockNumber 0)
+            // Candidate V1 binds the target through posting_context rather
+            // than the legacy v1 block-hash side channel.
+            l1_block_hash: None,
+            blob,
         };
         let proof = match prove_with_retry(
             self.inner.prover.as_ref(),
@@ -4499,17 +4600,23 @@ where
             .and_then(|s| s.parse::<Address>().ok())
             .ok_or("EEZ_REGISTRY_ADDRESS missing or not a valid address")?;
 
-        Ok(sign_post_batch_tx(
+        // The wrapper keeps EEZ's selector, so the same calldata is posted to it.
+        let to = ctx
+            .blob_posting
+            .as_ref()
+            .map_or(eez_address, |config| config.deployment.settlement_wrapper);
+        let raw = sign_post_batch_tx(
             &ctx.l1_poster_signer,
             &ctx.l1_provider,
-            eez_address,
+            to,
             calldata,
             ctx.l1_chain_id,
             ctx.l1_post_batch_priority_fee,
             self.inner.emission.max_gas,
+            carrier,
         )
-        .await
-        .map(Some)?)
+        .await?;
+        Ok(Some(raw))
     }
 }
 
@@ -4655,6 +4762,17 @@ async fn observe_bundle_outcome(
     }
 }
 
+/// The signed postBatch's tx hash. A candidate-V1 post is a pooled type-3
+/// wrapper whose bytes also carry the sidecar, so keccak of them is not it.
+fn post_batch_tx_hash(raw: &[u8]) -> B256 {
+    if raw.first() == Some(&3)
+        && let Ok(hash) = eez_blob::pooled_blob_transaction_hash(raw)
+    {
+        return hash;
+    }
+    alloy_primitives::keccak256(raw)
+}
+
 /// Sign an EIP-1559 L1 transaction used for `postAndVerifyBatch` submission.
 ///
 /// Sets `max_priority_fee_per_gas` from the caller (so we can order
@@ -4668,11 +4786,12 @@ async fn observe_bundle_outcome(
 async fn sign_post_batch_tx(
     signer: &alloy_signer_local::PrivateKeySigner,
     provider: &alloy_provider::RootProvider,
-    eez_address: Address,
+    to: Address,
     calldata: Vec<u8>,
     chain_id: u64,
     priority_fee: u128,
     max_gas: u64,
+    blob: Option<BlobCarrier>,
 ) -> Result<Bytes, String> {
     use alloy_consensus::TxEip1559;
     use alloy_eips::BlockNumberOrTag;
@@ -4714,7 +4833,14 @@ async fn sign_post_batch_tx(
 
     // Diagnostic only — from the outside a drained poster looks exactly like a
     // dead relay. Don't abort; the tx still lands if the base fee settles.
-    let required = U256::from(gas_limit).saturating_mul(U256::from(max_fee_per_gas));
+    let blob_reserve = blob.as_ref().map_or(U256::ZERO, |blob| {
+        let blob_gas =
+            blob.sidecar.versioned_hashes().len() as u64 * alloy_eips::eip4844::DATA_GAS_PER_BLOB;
+        U256::from(blob_gas).saturating_mul(U256::from(blob.max_fee_per_blob_gas))
+    });
+    let required = U256::from(gas_limit)
+        .saturating_mul(U256::from(max_fee_per_gas))
+        .saturating_add(blob_reserve);
     if let Ok(balance) = provider.get_balance(from).await
         && balance < required
     {
@@ -4730,13 +4856,28 @@ async fn sign_post_batch_tx(
         );
     }
 
+    if let Some(blob) = blob {
+        let params = eez_blob::BlobTransactionParams {
+            chain_id,
+            nonce,
+            gas_limit,
+            max_fee_per_gas,
+            max_priority_fee_per_gas: priority_fee,
+            max_fee_per_blob_gas: blob.max_fee_per_blob_gas,
+            to,
+            input: calldata.into(),
+        };
+        return eez_blob::sign_blob_transaction(params, blob.sidecar, signer)
+            .map(|signed| signed.pooled_transaction)
+            .map_err(|e| format!("sign candidate-V1 postBatch: {e}"));
+    }
     let mut tx = TxEip1559 {
         chain_id,
         nonce,
         gas_limit,
         max_fee_per_gas,
         max_priority_fee_per_gas: priority_fee,
-        to: TxKind::Call(eez_address),
+        to: TxKind::Call(to),
         value: U256::ZERO,
         access_list: alloy_eips::eip2930::AccessList::default(),
         input: calldata.into(),
@@ -4750,11 +4891,259 @@ async fn sign_post_batch_tx(
     Ok(Bytes::from(buf))
 }
 
+/// A blob-settlement signature binds one exact L1 slot and its parent hash,
+/// so a target that is not already exact becomes the slot
+/// after the current L1 head. A missed slot drops the bundle; the next Sync
+/// slot rebuilds and re-signs it.
+async fn pin_candidate_targets(
+    l1_provider: &alloy_provider::RootProvider,
+    config: &BlobPostingConfig,
+    targets: [BundleTarget; 2],
+) -> Result<(BundleTarget, BundleTarget), String> {
+    use alloy_eips::BlockNumberOrTag;
+    use alloy_provider::Provider as _;
+
+    let exact = |target: &BundleTarget| matches!(target, BundleTarget::Exact { .. });
+    let next = if targets.iter().all(exact) {
+        None
+    } else {
+        let head = l1_provider
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+            .map_err(|e| format!("get L1 head: {e}"))?
+            .ok_or("L1 head unavailable")?;
+        Some(BundleTarget::Exact {
+            block: head.header.number + 1,
+            timestamp: config.clock.next_slot_after(head.header.timestamp),
+        })
+    };
+    let [bundle, historical] = targets.map(|target| match (target, next) {
+        (BundleTarget::Exact { .. }, _) | (_, None) => target,
+        (_, Some(next)) => next,
+    });
+    Ok((bundle, historical))
+}
+
+/// Type-3 carrier of a candidate-V1 post: its sidecar and blob-gas fee cap.
+struct BlobCarrier {
+    sidecar: eez_blob::PreparedBlobSidecar,
+    max_fee_per_blob_gas: u128,
+}
+
+/// Fee headroom over the current blob base fee, which rises at most 12.5% a block.
+const BLOB_FEE_HEADROOM: u128 = 2;
+
+/// Binds a candidate-V1 post to its exact target slot before proving: the
+/// posting context the signer re-authenticates, the manager data the
+/// attestation is checked against, and a sidecar priced to land.
+async fn prepare_candidate_v1(
+    l1_provider: &alloy_provider::RootProvider,
+    config: &BlobPostingConfig,
+    bundle_target: BundleTarget,
+    blobs: Vec<Vec<u8>>,
+    encoding: eez_blob::BlobSidecarEncoding,
+    now: u64,
+) -> Result<(eez_prover::BlobProvingContext, BlobCarrier), String> {
+    use alloy_eips::BlockNumberOrTag;
+    use alloy_provider::Provider as _;
+
+    let BundleTarget::Exact {
+        block: target_block,
+        timestamp: target_timestamp,
+    } = bundle_target
+    else {
+        return Err("candidate V1 needs an exact L1 target".into());
+    };
+    let parent_number = target_block
+        .checked_sub(1)
+        .ok_or("candidate V1 cannot target L1 genesis")?;
+    let parent = l1_provider
+        .get_block_by_number(BlockNumberOrTag::Number(parent_number))
+        .await
+        .map_err(|e| format!("get candidate-V1 L1 parent {parent_number}: {e}"))?
+        .ok_or_else(|| format!("candidate-V1 L1 parent {parent_number} is unavailable"))?;
+    if !config.clock.is_slot_start(target_timestamp) || target_timestamp <= parent.header.timestamp
+    {
+        return Err(format!(
+            "candidate-V1 target {target_timestamp} is not the slot after L1 parent {parent_number}"
+        ));
+    }
+    // A lagging L1 RPC or slow composition can pin a slot that has already begun.
+    if target_timestamp <= now {
+        return Err(format!(
+            "candidate-V1 target slot {target_timestamp} has already begun (now {now})"
+        ));
+    }
+    // A cap below the current blob base fee cannot land; refuse before proving.
+    let blob_base_fee = l1_provider
+        .get_blob_base_fee()
+        .await
+        .map_err(|e| format!("eth_blobBaseFee: {e}"))?;
+    if blob_base_fee > config.max_fee_per_blob_gas {
+        return Err(format!(
+            "blob base fee {blob_base_fee} exceeds EEZ_L1_MAX_FEE_PER_BLOB_GAS {}; deferring the post",
+            config.max_fee_per_blob_gas,
+        ));
+    }
+    let max_fee_per_blob_gas = blob_base_fee
+        .saturating_mul(BLOB_FEE_HEADROOM)
+        .clamp(1, config.max_fee_per_blob_gas);
+    let sidecar = eez_blob::prepare_blob_sidecar(&blobs, encoding)
+        .map_err(|e| format!("prepare candidate-V1 sidecar: {e}"))?;
+    let blob = eez_prover::BlobProvingContext {
+        blobs: blobs.into_iter().map(Bytes::from).collect(),
+        posting_context: eez_prover::L1PostingContext {
+            chain_id: config.deployment.l1_chain_id,
+            target_timestamp,
+            parent_number,
+            parent_hash: parent.header.hash,
+        },
+        expected_custom_data: config
+            .deployment
+            .custom_data(target_timestamp, parent.header.hash),
+    };
+    Ok((
+        blob,
+        BlobCarrier {
+            sidecar,
+            max_fee_per_blob_gas,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::TxHash;
     use alloy_sol_types::SolValue as _;
+
+    mod candidate_v1 {
+        use alloy_provider::ProviderBuilder;
+        use alloy_transport::mock::Asserter;
+
+        use super::*;
+
+        fn config() -> BlobPostingConfig {
+            BlobPostingConfig {
+                deployment: eez_protocol::Rollup0Deployment {
+                    l1_chain_id: 1,
+                    eez: Address::repeat_byte(0xEE),
+                    manager: Address::repeat_byte(0x3A),
+                    settlement_wrapper: Address::repeat_byte(0x3B),
+                    eez_rollup_id: 1,
+                    l2_chain_id: 10,
+                },
+                clock: eez_blob::L1SlotClock::new(100, 12).unwrap(),
+                schedule: "0:6:6:eip4844".parse().unwrap(),
+                max_fee_per_blob_gas: 50,
+            }
+        }
+
+        fn l1_block(number: u64, timestamp: u64, hash: B256) -> alloy_rpc_types_eth::Block {
+            let mut block = alloy_rpc_types_eth::Block::default();
+            block.header.hash = hash;
+            block.header.inner.number = number;
+            block.header.inner.timestamp = timestamp;
+            block
+        }
+
+        fn mocked() -> (Asserter, alloy_provider::RootProvider) {
+            let asserter = Asserter::new();
+            let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
+            (asserter, provider)
+        }
+
+        #[tokio::test]
+        async fn unpinned_targets_become_the_slot_after_the_l1_head() {
+            let exact = BundleTarget::Exact {
+                block: 9,
+                timestamp: 196,
+            };
+            // Already exact: no L1 read at all.
+            let (_, provider) = mocked();
+            let pinned = pin_candidate_targets(&provider, &config(), [exact, exact]).await;
+            assert_eq!(pinned.unwrap(), (exact, exact));
+
+            let (asserter, provider) = mocked();
+            asserter.push_success(&l1_block(41, 112, B256::repeat_byte(1)));
+            let targets = [
+                BundleTarget::NextBlock,
+                BundleTarget::ExactBlock { block: 42 },
+            ];
+            let next = BundleTarget::Exact {
+                block: 42,
+                timestamp: 124,
+            };
+            let pinned = pin_candidate_targets(&provider, &config(), targets).await;
+            assert_eq!(pinned.unwrap(), (next, next));
+        }
+
+        #[tokio::test]
+        async fn a_candidate_binds_its_slot_domain_and_a_landable_blob_fee() {
+            let parent_hash = B256::repeat_byte(0x99);
+            let target = BundleTarget::Exact {
+                block: 42,
+                timestamp: 124,
+            };
+            let blobs = || vec![vec![0_u8; eez_blob::BYTES_PER_BLOB]];
+            let encoding = eez_blob::BlobSidecarEncoding::Eip4844;
+
+            let (asserter, provider) = mocked();
+            asserter.push_success(&l1_block(41, 112, parent_hash));
+            asserter.push_success(&U256::from(10));
+            let (blob, carrier) =
+                prepare_candidate_v1(&provider, &config(), target, blobs(), encoding, 0)
+                    .await
+                    .unwrap();
+            assert_eq!(blob.posting_context.parent_hash, parent_hash);
+            assert_eq!(blob.posting_context.parent_number, 41);
+            assert_eq!(blob.posting_context.target_timestamp, 124);
+            assert_eq!(
+                blob.expected_custom_data,
+                config().deployment.custom_data(124, parent_hash),
+            );
+            assert_eq!(
+                carrier.max_fee_per_blob_gas, 20,
+                "2x headroom under the cap"
+            );
+            assert_eq!(carrier.sidecar.versioned_hashes().len(), 1);
+
+            // Twice the base fee would pass the cap, so the cap is offered.
+            let (asserter, provider) = mocked();
+            asserter.push_success(&l1_block(41, 112, parent_hash));
+            asserter.push_success(&U256::from(40));
+            let (_, carrier) =
+                prepare_candidate_v1(&provider, &config(), target, blobs(), encoding, 0)
+                    .await
+                    .unwrap();
+            assert_eq!(carrier.max_fee_per_blob_gas, 50);
+
+            // Above the cap the post cannot land, so it is refused before proving.
+            let (asserter, provider) = mocked();
+            asserter.push_success(&l1_block(41, 112, parent_hash));
+            asserter.push_success(&U256::from(51));
+            let refused =
+                prepare_candidate_v1(&provider, &config(), target, blobs(), encoding, 0).await;
+            assert!(refused.is_err_and(|e| e.contains("deferring")));
+
+            // A target that is not the parent's next slot names no real block.
+            let (asserter, provider) = mocked();
+            asserter.push_success(&l1_block(41, 124, parent_hash));
+            let stale = prepare_candidate_v1(&provider, &config(), target, blobs(), encoding, 0);
+            assert!(stale.await.is_err());
+            let unpinned = BundleTarget::NextBlock;
+            let (_, provider) = mocked();
+            let unpinned =
+                prepare_candidate_v1(&provider, &config(), unpinned, blobs(), encoding, 0).await;
+            assert!(unpinned.is_err());
+
+            // A slot that has already begun cannot be hit by a bundle signed now.
+            let (asserter, provider) = mocked();
+            asserter.push_success(&l1_block(41, 112, parent_hash));
+            let late = prepare_candidate_v1(&provider, &config(), target, blobs(), encoding, 124);
+            assert!(late.await.is_err_and(|e| e.contains("already begun")));
+        }
+    }
 
     #[test]
     fn catchup_marker_is_unpinned_but_historical_target_keeps_the_l1_block() {

@@ -97,10 +97,13 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         None,
     )?;
 
-    let l1_reader_config = L1ReaderConfig::from_env()?;
+    // Candidate-V1 posts are read when a settlement wrapper is configured.
+    let candidate =
+        eez_protocol::Rollup0Deployment::from_env(read_l1_chain_id()?, chain_spec.chain().id())?;
+    let l1_reader_config = L1ReaderConfig::from_env()?.with_candidate(candidate)?;
     let deploy_block = l1_reader_config.deploy_block;
     let l1_reader = L1Reader::new(l1_reader_config);
-    let l1_watcher = L1Watcher::new(L1WatcherConfig::from_env()?);
+    let l1_watcher = L1Watcher::new(L1WatcherConfig::from_env()?.with_candidate(candidate));
     let system_tx_cfg = system_config.into_context(chain_spec.chain().id());
     event!(
         name: "eez.node.follower.system_tx_cfg",

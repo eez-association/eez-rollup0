@@ -109,6 +109,8 @@ pub struct ServiceState {
     expected_l2_system_address: Address,
     attester: Attester,
     system_transaction_reconstructor: settlement::SystemTransactionReconstructor,
+    blob_context_authority: Option<crate::blob_profile::SharedBlobContextAuthority>,
+    blob_kzg_settings: Option<&'static eez_blob::KzgSettings>,
 }
 
 impl ServiceState {
@@ -136,7 +138,20 @@ impl ServiceState {
             expected_l2_system_address,
             attester,
             system_transaction_reconstructor,
+            blob_context_authority: None,
+            blob_kzg_settings: None,
         })
+    }
+
+    /// Enable blob settlement with an authenticated L1 source.
+    pub fn with_blob_context_authority(
+        mut self,
+        authority: crate::blob_profile::SharedBlobContextAuthority,
+    ) -> Self {
+        self.blob_context_authority = Some(authority);
+        // Loads the trusted setup now rather than on the first blob request.
+        self.blob_kzg_settings = Some(eez_blob::EnvKzgSettings::Default.get());
+        self
     }
 }
 

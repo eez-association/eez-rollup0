@@ -111,6 +111,9 @@ pub struct L1WatcherConfig {
     /// bound. Configurable so dev / testnet operators can tighten or
     /// loosen.
     pub reorg_max_depth: usize,
+    /// Candidate-V1 deployment whose blob posts the scan reproduces; see
+    /// [`L1ReaderConfig::candidate`](crate::L1ReaderConfig::candidate).
+    pub candidate: Option<eez_protocol::Rollup0Deployment>,
 }
 
 impl L1WatcherConfig {
@@ -168,7 +171,15 @@ impl L1WatcherConfig {
             eez,
             rollup_id,
             reorg_max_depth,
+            candidate: None,
         })
+    }
+
+    /// Read candidate-V1 posts of `candidate`; `None` keeps the calldata profile.
+    #[must_use]
+    pub fn with_candidate(mut self, candidate: Option<eez_protocol::Rollup0Deployment>) -> Self {
+        self.candidate = candidate;
+        self
     }
 }
 
@@ -379,6 +390,7 @@ impl L1Watcher {
                 trace,
                 eez,
                 rollup_id,
+                self.inner.config.candidate.as_ref(),
                 latest_number,
                 latest_number,
             )
@@ -490,6 +502,7 @@ impl L1Watcher {
                     trace,
                     self.inner.config.eez,
                     self.inner.config.rollup_id,
+                    self.inner.config.candidate.as_ref(),
                     scan_from,
                     chunk_to,
                 )
@@ -593,6 +606,7 @@ impl L1Watcher {
                 trace,
                 self.inner.config.eez,
                 self.inner.config.rollup_id,
+                self.inner.config.candidate.as_ref(),
                 scan_from,
                 latest_number,
             )
@@ -920,6 +934,7 @@ mod tests {
                     eez: alloy_primitives::Address::ZERO,
                     rollup_id: 1,
                     reorg_max_depth: 3,
+                    candidate: None,
                 },
                 event_tx,
             }),
@@ -1432,6 +1447,7 @@ mod tests {
             tx_hash: B256::with_last_byte(tx),
             sender: Address::ZERO,
             batch: eez_protocol::abi::EvmBatch::default(),
+            blob_hashes: Vec::new(),
             settlement: crate::scan::Settlement::NONE,
         }
     }

@@ -56,11 +56,19 @@ Each call whose post lists this rollup is checked against its own `BatchPosted`:
 
 1. the bytes decode as `postAndVerifyBatch`, else `Decode`;
 2. `rollupIdsWithProofSystems[].rollupId` equals `rollupIds`, else `Decode`;
-3. no `blobIndices` and `blockNumber == 0`, else `Unsupported`;
-4. `batch_shared_public_input(batch, sender)` equals `sharedPublicInput`
-   (`:753-762`), else `Decode`, or `Unsupported` when another listed rollup
-   may bind `customData` the scan cannot reproduce. The proof signer's
-   `public_inputs_hashes` uses the same composition, so the two cannot drift.
+3. no `blobIndices` and `blockNumber == 0`; or, in a blob-carrying tx under
+   the configured `Rollup0Deployment`, a post listing only this rollup must be
+   a candidate-V1 carrier: `blockNumber == uint64.max`, empty `callData` and
+   `blobIndices == [0, n)` over the tx's `n` blobs (`Decode` otherwise). Any
+   other shape is `Unsupported`;
+4. the shared public input equals `sharedPublicInput` (`:753-762`), else
+   `Decode`, or `Unsupported` when another listed rollup may bind `customData`
+   the scan cannot reproduce. A Rollup0 blob post binds the tx's versioned
+   hashes and manager data derived from its own block's timestamp and
+   parent. The proof signer uses the same composition, so the two cannot drift.
+
+Derivation fetches a settled, unprocessed candidate-V1 post's blobs from
+`EEZ_L1_BEACON_URL` and keeps only those matching its versioned hashes.
 
 The hash does not bind `immediateEntryCount`, `expectedRootPerRollup` or the
 proofs; the scan reads them from the exact bytes EEZ received.
@@ -96,7 +104,7 @@ must match its entry, else `Decode`: `callHash` and `queue` (`:1304-1320`),
 | Variant | Class | Raised for |
 |---|---|---|
 | `Provider` | retryable | transport; a malformed `get_logs` answer; a trace failure other than `-32601`, including a post's transaction failing or missing |
-| `SourceIncomplete` | retryable | two hashes for one block; a transaction or block the endpoint does not serve yet |
+| `SourceIncomplete` | retryable | two hashes for one block; a missing or replaced transaction; a trace endpoint that lacks the block |
 | `Decode` | terminal | undecodable bytes; a `rollupIds` or commitment mismatch; a grammar, pairing, ownership or entry-match violation |
 | `Unsupported` | terminal | the shapes below; a multi-rollup commitment mismatch; a post not made by a selector `CALL` |
 | `TraceUnavailable` | terminal | `-32601` (no `debug` namespace) on a block that needs a trace |
@@ -134,8 +142,9 @@ A trace costs milliseconds against a 12 s slot.
 
 ## Unsupported shapes
 
-- **Blobs.** The scan reads no blob data; the composer never sets `blobIndices`.
-- **`blockNumber != 0`.** `customData` comes from the rollup's `getCustomData`,
-  which may read any state, so the call alone cannot recompute the hash.
+- **Other blob profiles.** The scan accepts only the configured Rollup0 blob
+  carrier. It cannot reproduce another rollup's manager data.
+- **Other nonzero block numbers.** `customData` may read arbitrary manager
+  state, so the call alone cannot reproduce it.
 - **`upgradeToAndCall` posts.** They run by `DELEGATECALL` into a proxied EEZ;
   ours is not proxied.

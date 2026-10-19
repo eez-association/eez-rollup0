@@ -33,6 +33,9 @@ pub struct Post {
     /// EEZ's `msg.sender` for this call.
     pub sender: Address,
     pub batch: EvmBatch,
+    /// Candidate-V1 carrier: the versioned hashes `blobIndices` selected, in
+    /// order. Empty for the calldata profile, whose stream is `batch.callData`.
+    pub blob_hashes: Vec<B256>,
     /// What L1 applied of it for our rollup.
     pub settlement: Settlement,
 }

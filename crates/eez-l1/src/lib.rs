@@ -15,6 +15,7 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+pub mod blob_source;
 pub mod config;
 pub mod error;
 mod fetch;
@@ -25,6 +26,8 @@ pub mod l1_watcher;
 pub mod scan;
 pub mod submitter;
 
+#[doc(inline)]
+pub use blob_source::BeaconBlobSource;
 #[doc(inline)]
 pub use config::{L1ReaderConfig, SubmitterConfig};
 #[doc(inline)]

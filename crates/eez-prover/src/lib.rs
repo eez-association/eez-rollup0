@@ -135,6 +135,28 @@ pub struct ProvingAnchor {
     pub state_root: B256,
 }
 
+/// L1 target proposed by the composer and independently authenticated by a
+/// blob-enabled proof signer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L1PostingContext {
+    pub chain_id: u64,
+    pub target_timestamp: u64,
+    pub parent_number: u64,
+    pub parent_hash: B256,
+}
+
+/// Candidate-V1 data that accompanies the proofless EEZ batch.
+#[derive(Debug, Clone)]
+pub struct BlobProvingContext {
+    /// Complete physical blobs in transaction order.
+    pub blobs: Vec<Bytes>,
+    /// Target authenticated by the signer against its own L1 source.
+    pub posting_context: L1PostingContext,
+    /// Manager data derived locally by the composer for response checking.
+    /// The signer derives its own copy and never trusts this field.
+    pub expected_custom_data: Bytes,
+}
+
 /// Inputs the prover needs to finalize one posted settlement window.
 ///
 /// The complete block list remains present for v1 compatibility and v2
@@ -160,6 +182,8 @@ pub struct ProvingContext {
     /// `blockhash(N)` for a block-bound batch's `blockNumber = N`; `None` for a
     /// timeless (0) batch.
     pub l1_block_hash: Option<B256>,
+    /// Candidate-V1 blob carrier. `None` selects the deployed calldata profile.
+    pub blob: Option<BlobProvingContext>,
 }
 
 /// Produces the [`BlockWitness`] for a committed L2 block — the seam by which

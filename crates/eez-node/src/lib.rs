@@ -115,6 +115,29 @@ fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
     })
 }
 
+/// Candidate-V1 posting for the configured deployment: the L1 slot grid and
+/// blob schedule the proof signer shares, and the blob-gas fee cap.
+fn blob_posting_from_env(
+    candidate: Option<eez_protocol::Rollup0Deployment>,
+) -> eyre::Result<Option<eez_composer::BlobPostingConfig>> {
+    let Some(deployment) = candidate else {
+        return Ok(None);
+    };
+    let (clock, schedule) = eez_blob::l1_schedule_from_env()?;
+    let max_fee_per_blob_gas = env::var("EEZ_L1_MAX_FEE_PER_BLOB_GAS")
+        .map_err(|_| eyre::eyre!("EEZ_L1_MAX_FEE_PER_BLOB_GAS is required for candidate V1"))?
+        .parse::<u128>()
+        .ok()
+        .filter(|cap| *cap > 0)
+        .ok_or_else(|| eyre::eyre!("EEZ_L1_MAX_FEE_PER_BLOB_GAS must be a nonzero wei amount"))?;
+    Ok(Some(eez_composer::BlobPostingConfig {
+        deployment,
+        clock,
+        schedule,
+        max_fee_per_blob_gas,
+    }))
+}
+
 fn optional_address_from_env(name: &str) -> eyre::Result<Option<Address>> {
     match env::var(name) {
         Ok(value) => Address::from_str(value.trim())
@@ -274,6 +297,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         EmbeddedL1::Chiado(chiado_handle) => chiado_handle.node.chain_spec().inner.chain().id(),
     };
     let l2_chain_id = builder.config().chain.chain().id();
+    // Candidate V1 is selected by its settlement wrapper. The scan, the
+    // submitter and the Composer all bind this one deployment.
+    let candidate = eez_protocol::Rollup0Deployment::from_env(l1_source_chain_id, l2_chain_id)?;
     let composer_info = composer_rpc::ComposerInfo::new(
         composer_rpc::ComposerContracts {
             registry: eez_registry,
@@ -322,14 +348,15 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MAX_SPECULATIVE_DEPTH);
 
-    let submitter_config = SubmitterConfig::from_env()?;
+    let mut submitter_config = SubmitterConfig::from_env()?;
+    submitter_config.reader = submitter_config.reader.with_candidate(candidate)?;
     let deploy_block = submitter_config.reader.deploy_block;
     let rollup_config = RollupConfig::from_env(
         eez_evm::fee_collector(&chain_spec.genesis.config)?.unwrap_or_default(),
     )?;
     let attributes = EthAttributesBuilder::new(chain_spec.clone())
         .with_fee_recipient(rollup_config.fee_recipient);
-    let l1_watcher_config = L1WatcherConfig::from_env()?;
+    let l1_watcher_config = L1WatcherConfig::from_env()?.with_candidate(candidate);
 
     let submitter = Submitter::new(submitter_config);
     // Handle only — polling starts after boot catch-up fixes the
@@ -489,6 +516,14 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 .await
                 .map_err(|_| eyre::eyre!("timed out reading chain id from EEZ_L1_RPC_URL"))?
                 .map_err(|e| eyre::eyre!("read chain id from EEZ_L1_RPC_URL: {e}"))?;
+        // The signed domain binds the chain where the wrapper executes.
+        if let Some(deployment) = candidate {
+            eyre::ensure!(
+                deployment.l1_chain_id == l1_submission_chain_id,
+                "candidate V1 binds L1 chain {} but EEZ_L1_RPC_URL serves chain {l1_submission_chain_id}",
+                deployment.l1_chain_id,
+            );
+        }
         let l1_poster_key = env::var("EEZ_L1_POSTER_KEY")
             .map_err(|_| eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing"))?;
         let l1_poster_signer =
@@ -523,6 +558,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             l1_chain_id: l1_submission_chain_id,
             l1_post_batch_priority_fee,
             ecdsa_proof_system_address,
+            blob_posting: blob_posting_from_env(candidate)?,
         });
         event!(
             name: "eez.node.evm_composer.ready",
@@ -650,7 +686,8 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     // Resolve both required fronts now. Their upstream chain-id checks run
     // after the L1 readiness gate so the ports can bind while L1 catches up.
     let mut xchain_fronts = Vec::new();
-    for spec in xchain_front_specs(l1_source_chain_id, l2_source_chain_id) {
+    let outbound = candidate.is_none();
+    for spec in xchain_front_specs(l1_source_chain_id, l2_source_chain_id, outbound) {
         let (port, url, parsed) = read_xchain_front_config(spec.port_env, spec.url_env)?;
         let validation_provider = alloy_provider::RootProvider::new_http(parsed);
         xchain_fronts.push((spec, port, url, validation_provider));
@@ -834,23 +871,26 @@ struct XchainFrontSpec {
     expected_source_chain_id: u64,
 }
 
-fn xchain_front_specs(l1_chain_id: u64, l2_chain_id: u64) -> [XchainFrontSpec; 2] {
-    [
-        XchainFrontSpec {
-            port_env: "EEZ_L1_XCHAIN_PORT",
-            url_env: "EEZ_L1_RPC_URL",
-            direction: eez_composer::Direction::Inbound,
-            task: "eez-l1-xchain-front",
-            expected_source_chain_id: l1_chain_id,
-        },
-        XchainFrontSpec {
+/// The blob profile admits no action starting on Rollup0, so it
+/// opens no outbound front and outbound txs are refused at the door.
+fn xchain_front_specs(l1_chain_id: u64, l2_chain_id: u64, outbound: bool) -> Vec<XchainFrontSpec> {
+    let mut specs = vec![XchainFrontSpec {
+        port_env: "EEZ_L1_XCHAIN_PORT",
+        url_env: "EEZ_L1_RPC_URL",
+        direction: eez_composer::Direction::Inbound,
+        task: "eez-l1-xchain-front",
+        expected_source_chain_id: l1_chain_id,
+    }];
+    if outbound {
+        specs.push(XchainFrontSpec {
             port_env: "EEZ_L2_XCHAIN_PORT",
             url_env: "EEZ_L2_RPC_URL",
             direction: eez_composer::Direction::Outbound,
             task: "eez-l2-xchain-front",
             expected_source_chain_id: l2_chain_id,
-        },
-    ]
+        });
+    }
+    specs
 }
 
 fn read_xchain_front_config(
@@ -1034,7 +1074,7 @@ mod tests {
 
     #[test]
     fn xchain_front_specs_assign_source_chain_ids() {
-        let specs = xchain_front_specs(31_337, 90_210);
+        let specs = xchain_front_specs(31_337, 90_210, true);
 
         assert_eq!(specs[0].port_env, "EEZ_L1_XCHAIN_PORT");
         assert_eq!(specs[0].direction, eez_composer::Direction::Inbound);
@@ -1043,5 +1083,13 @@ mod tests {
         assert_eq!(specs[1].port_env, "EEZ_L2_XCHAIN_PORT");
         assert_eq!(specs[1].direction, eez_composer::Direction::Outbound);
         assert_eq!(specs[1].expected_source_chain_id, 90_210);
+    }
+
+    #[test]
+    fn candidate_v1_opens_only_the_inbound_front() {
+        let specs = xchain_front_specs(31_337, 90_210, false);
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].direction, eez_composer::Direction::Inbound);
     }
 }
