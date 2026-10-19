@@ -75,11 +75,12 @@ pub(super) struct Call {
     pub logs: usize,
 }
 
+/// Names a log's position for error messages.
 fn at(block: u64, log: &ScannedLog) -> String {
     format!("block {block} tx {} log {}", log.tx_hash, log.log_index)
 }
 
-/// A log whose position checked out, before it is decoded.
+/// A log and its position, before it is decoded.
 #[derive(Debug)]
 struct Placed<'a> {
     log_index: u64,
@@ -88,8 +89,8 @@ struct Placed<'a> {
     log: &'a Log,
 }
 
-/// Groups a `get_logs` answer into ascending blocks in log order. Position
-/// faults are found before any log is decoded, so they are retried.
+/// Groups a `get_logs` answer into ascending blocks in log order. The answer is
+/// trusted to be one consistent view; only one mixing forks of a block is retried (#184).
 pub(super) fn group_blocks(raw: &[Log]) -> L1Result<Vec<Block>> {
     let mut blocks: BTreeMap<u64, (B256, Vec<Placed<'_>>)> = BTreeMap::new();
     for log in raw {
@@ -100,7 +101,7 @@ pub(super) fn group_blocks(raw: &[Log]) -> L1Result<Vec<Block>> {
             log.transaction_hash,
             log.log_index,
         ) else {
-            // Mined logs always carry these; dropping one could hide an entry.
+            // alloy leaves these optional for pending logs; a mined log has them.
             return Err(L1Error::Provider(format!(
                 "EEZ log without its position: {log:?}"
             )));
@@ -118,20 +119,8 @@ pub(super) fn group_blocks(raw: &[Log]) -> L1Result<Vec<Block>> {
             log,
         });
     }
-    for (block, (_, placed)) in &mut blocks {
+    for (_, placed) in blocks.values_mut() {
         placed.sort_unstable_by_key(|placed| placed.log_index);
-        for pair in placed.windows(2) {
-            let (a, b) = (&pair[0], &pair[1]);
-            let same_tx = a.tx_index == b.tx_index;
-            let duplicate = a.log_index == b.log_index;
-            if duplicate || b.tx_index < a.tx_index || (same_tx && a.tx_hash != b.tx_hash) {
-                let detail = format!(
-                    "block {block}: log {} (tx {} {}) and log {} (tx {} {}) are out of order",
-                    a.log_index, a.tx_index, a.tx_hash, b.log_index, b.tx_index, b.tx_hash
-                );
-                return Err(L1Error::Provider(detail));
-            }
-        }
     }
     let mut decoded = Vec::with_capacity(blocks.len());
     for (number, (hash, placed)) in blocks {
@@ -156,6 +145,7 @@ pub(super) fn group_blocks(raw: &[Log]) -> L1Result<Vec<Block>> {
     Ok(decoded)
 }
 
+/// Decodes one scanned EEZ log into its `Event`.
 fn decode(log: &Log, here: &str) -> L1Result<Event> {
     fn event<E: SolEvent>(log: &Log, here: &str) -> L1Result<E> {
         let decoded = E::decode_log_data_validate(log.data());
@@ -231,10 +221,12 @@ struct Tx<'a> {
 /// exact because posts and entries never nest (EEZ.sol:380, :871-881, :896).
 fn parse_tx(block: u64, logs: &[ScannedLog]) -> L1Result<Tx<'_>> {
     let mut items = Vec::new();
+    // The entry being read: its first log, its `ExecutionConsumed` if any, its roots so far.
     let mut open: Option<(usize, Option<Consumed>, Vec<(u64, B256)>)> = None;
     for (position, log) in logs.iter().enumerate() {
         let here = at(block, log);
         let (first, kind) = match (&log.event, open.take()) {
+            // A root opens an unconsumed (leading-run) entry, or extends the open one.
             (&Event::Root(rollup, root), opened) => {
                 let (first, consumed, mut roots) = opened.unwrap_or((position, None, Vec::new()));
                 // Updates ascend strictly by rollup, above L1's id 0 (EEZ.sol:578-584).
@@ -244,10 +236,12 @@ fn parse_tx(block: u64, logs: &[ScannedLog]) -> L1Result<Tx<'_>> {
                 open = Some((first, consumed, roots));
                 continue;
             }
+            // A consumption opens an entry; its roots and `EntryExecuted` follow (EEZ.sol:949-951).
             (&Event::Consumed(consumed), None) => {
                 open = Some((position, Some(consumed), Vec::new()));
                 continue;
             }
+            // `EntryExecuted` closes the open entry into one record.
             (&Event::Executed(index, rolling_hash), Some((first, consumed, roots))) => {
                 // Every entry has an update (EEZ.sol:569).
                 ensure!(!roots.is_empty(), "{here}: entry applied no rollup update");
@@ -264,13 +258,17 @@ fn parse_tx(block: u64, logs: &[ScannedLog]) -> L1Result<Tx<'_>> {
                 };
                 (first, Kind::Record(record))
             }
+            // A post's last log, outside any entry (EEZ.sol:470-475).
             (Event::Posted(spi, ids), None) => (position, Kind::Posted(*spi, ids.clone())),
+            // A leading-run entry that reverted and applied nothing (EEZ.sol:414-436).
             (&Event::Skipped(index), None) => (position, Kind::Skipped(index)),
+            // `EntryExecuted` with no entry open.
             (event, None) => {
                 return Err(L1Error::Decode(format!(
                     "{here}: {event:?} with no entry open"
                 )));
             }
+            // Anything else inside an open entry: entries never nest (EEZ.sol:871-881).
             (event, Some(_)) => {
                 return Err(L1Error::Decode(format!(
                     "{here}: {event:?} inside an open entry"
@@ -312,6 +310,7 @@ pub(super) fn calls_in_tx(
     type Out = (Vec<Call>, usize);
     /// False when a committed post nests in another, which EEZ.sol:380 reverts.
     fn walk(frame: &CallFrame, eez: Address, inside: Option<usize>, out: &mut Out) -> bool {
+        // A failed frame and everything under it rolled back.
         if frame.error.is_some() || frame.revert_reason.is_some() {
             return true;
         }
@@ -328,6 +327,7 @@ pub(super) fn calls_in_tx(
                 logs: 0,
             });
         }
+        // Count this frame's own scanned EEZ logs, for the tx and the post it runs in.
         let scanned = frame.logs.iter().filter(|log| {
             let topic0 = log.topics.as_ref().and_then(|topics| topics.first());
             log.address == Some(eez) && topic0.is_some_and(|topic| SCANNED_TOPICS.contains(topic))
@@ -358,37 +358,43 @@ enum Place {
     Untraced,
 }
 
-/// Every post in `block` that lists `us`, in log order. `calls` holds the
-/// committed calls and scanned-log count of each tx whose `BatchPosted` lists `us`.
+/// Every post in `block` that lists `us`, in log order. `calls_by_tx` holds, by
+/// tx index, the committed calls and scanned-log count of each tx whose
+/// `BatchPosted` lists `us`.
 pub(super) fn read_block(
     block: &Block,
-    calls: &BTreeMap<u64, (Vec<Call>, usize)>,
+    calls_by_tx: &BTreeMap<u64, (Vec<Call>, usize)>,
     us: u64,
 ) -> L1Result<Vec<Post>> {
-    let mut txs = Vec::new();
+    let mut parsed = Vec::new();
     for logs in block.logs.chunk_by(|a, b| a.tx_index == b.tx_index) {
-        txs.push(parse_tx(block.number, logs)?);
+        parsed.push(parse_tx(block.number, logs)?);
     }
+    // Place every item, and start reading each post that lists us.
     let mut posts = Vec::new();
-    let mut places = Vec::with_capacity(txs.len());
-    for tx in &txs {
-        let calls = calls.get(&tx.logs[0].tx_index);
-        places.push(label(block, tx, calls, us, &mut posts)?);
+    let mut places_by_tx = Vec::with_capacity(parsed.len());
+    for tx in &parsed {
+        let tx_calls = calls_by_tx.get(&tx.logs[0].tx_index);
+        places_by_tx.push(label(block, tx, tx_calls, us, &mut posts)?);
     }
-    // A queue belongs to the latest post in the block that listed it (EEZ.sol:804-811, :1578-1582).
+    // Walk the block in log order. A queue belongs to the latest post that
+    // listed it (EEZ.sol:804-811, :1578-1582).
     let mut owners = BTreeMap::new();
-    for (tx, places) in txs.iter().zip(&places) {
+    for (tx, places) in parsed.iter().zip(&places_by_tx) {
         for (item, &place) in tx.items.iter().zip(places) {
             let here = at(block.number, &tx.logs[item.last]);
             let ours = |record: &Record| record.roots.iter().any(|&(rollup, _)| rollup == us);
             match (&item.kind, place) {
+                // Our post ends: it reported its whole leading run, and owns the queues it listed.
                 (Kind::Posted(_, ids), Place::Ours(i)) => {
                     // By its `BatchPosted` a post reported its whole leading run (EEZ.sol:414-436).
                     let reported = posts[i].next_leading == posts[i].run;
                     ensure!(reported, "{here}: leading run unreported");
                     owners.extend(ids.iter().map(|&queue| (queue, Some(i))));
                 }
+                // Any other post resets the queues it listed to an owner that is not ours.
                 (Kind::Posted(_, ids), _) => owners.extend(ids.iter().map(|&queue| (queue, None))),
+                // Our post skipped its next leading-run entry.
                 (&Kind::Skipped(index), Place::Ours(i)) => {
                     let next = posts[i].leading(&here)?;
                     ensure!(index == next as u64, "{here}: skip of {index}, not {next}");
@@ -397,16 +403,20 @@ pub(super) fn read_block(
                 (Kind::Skipped(_), place) => {
                     ensure!(place != Place::Between, "{here}: skip outside a call");
                 }
+                // An entry run inside our post's call: its leading run or meta hook.
                 (Kind::Record(record), Place::Ours(i)) => posts[i].in_call(record, &here)?,
                 // An entry updates only its batch's rollups (EEZ.sol:581).
                 (Kind::Record(record), Place::Foreign) => {
                     ensure!(!ours(record), "{here}: our entry in a foreign post");
                 }
+                // An entry run outside every post's call.
                 (Kind::Record(record), place) => match record.consumed {
+                    // Unconsumed entries run only in a leading run: another rollup's, untraced.
                     None => {
                         let fine = place == Place::Untraced && !ours(record);
                         ensure!(fine, "{here}: leading-run entry outside a call");
                     }
+                    // A consumption that updates us: the queue's owner applied it.
                     Some(consumed) if ours(record) => {
                         let Some(&Some(i)) = owners.get(&consumed.queue) else {
                             let queue = consumed.queue;
@@ -415,6 +425,7 @@ pub(super) fn read_block(
                         };
                         posts[i].deferred(record, consumed, &here)?;
                     }
+                    // Another rollup's consumption.
                     Some(_) => {}
                 },
             }
@@ -429,16 +440,18 @@ pub(super) fn read_block(
 fn label(
     block: &Block,
     tx: &Tx<'_>,
-    calls: Option<&(Vec<Call>, usize)>,
+    tx_calls: Option<&(Vec<Call>, usize)>,
     us: u64,
     posts: &mut Vec<Reading>,
 ) -> L1Result<Vec<Place>> {
-    let Some((calls, committed)) = calls else {
+    // No post in this tx lists us, so its calls are not read.
+    let Some((calls, committed)) = tx_calls else {
         return Ok(vec![Place::Untraced; tx.items.len()]);
     };
     let head = &tx.logs[0];
     let scanned = tx.logs.len();
     let site = |item: &Item| at(block.number, &tx.logs[item.last]);
+    // The tx's `BatchPosted` items: each ends one post.
     let ends: Vec<_> = (tx.items.iter())
         .filter_map(|item| match &item.kind {
             Kind::Posted(spi, ids) => Some((item, *spi, ids)),
@@ -450,6 +463,7 @@ fn label(
     let counts =
         format!("{made} calls, {committed} logs traced; {posted} BatchPosted, {scanned} logs");
     let tx_at = at(block.number, head);
+    // The trace and get_logs agree on the tx's logs, and every committed call posted.
     ensure!(*committed == scanned && made <= posted, "{tx_at}: {counts}");
     if made < posted {
         // A BatchPosted without its CALL: posted by DELEGATECALL or upgradeToAndCall.
@@ -459,6 +473,7 @@ fn label(
             detail: format!("tx {}: {counts}", head.tx_hash),
         });
     }
+    // Call k owns the `call.logs` logs ending at the k-th `BatchPosted`; calls don't overlap.
     let mut labels = vec![None; scanned];
     let mut floor = 0;
     for (k, (call, (end, ..))) in calls.iter().zip(&ends).enumerate() {
@@ -468,11 +483,13 @@ fn label(
         labels[start..=end.last].fill(Some(k));
         floor = end.last + 1;
     }
+    // An entry runs inside one call or between calls, never across a boundary.
     for item in &tx.items {
         let span = &labels[item.first..=item.last];
         let one_call = span.iter().all(|&label| label == span[0]);
         ensure!(one_call, "{}: entry straddles a call boundary", site(item));
     }
+    // Start reading each post that lists us; another rollup's post is foreign.
     let mut by_call = Vec::with_capacity(made);
     for (call, &(end, spi, ids)) in calls.iter().zip(&ends) {
         if !ids.contains(&us) {
@@ -495,6 +512,7 @@ fn label(
         by_call.push(Place::Ours(posts.len()));
         posts.push(Reading::new(post, us, &here)?);
     }
+    // An item outside every call ran between them.
     let place = |item: &Item| labels[item.first].map_or(Place::Between, |k| by_call[k]);
     Ok(tx.items.iter().map(place).collect())
 }
@@ -542,6 +560,7 @@ struct Reading {
 }
 
 impl Reading {
+    /// Starts reading `post`: our entries' roles and its leading-run bounds.
     fn new(post: Post, us: u64, here: &str) -> L1Result<Self> {
         let entries = &post.batch.entries;
         let immediate = usize::try_from(post.batch.immediateEntryCount).unwrap_or(usize::MAX);
@@ -620,6 +639,7 @@ impl Reading {
         Ok(())
     }
 
+    /// The post with its settlement: the entries applied, in order, and their end states.
     fn finish(mut self, us: u64) -> Post {
         let entries = &self.post.batch.entries;
         let roots = |applied: &AppliedEntry| {

@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 
-use alloy_consensus::transaction::TxHashRef;
 use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256};
 use alloy_provider::Provider;
@@ -36,6 +35,7 @@ pub struct BatchLogChunks {
 }
 
 impl BatchLogChunks {
+    /// Splits `[from_block, to_block]` into `LOG_SCAN_CHUNK_BLOCKS` ranges, oldest first out.
     pub(crate) fn new(from_block: u64, to_block: u64) -> Self {
         let span = LOG_SCAN_CHUNK_BLOCKS - 1;
         let chunk = |from: u64| (from, from.saturating_add(span).min(to_block));
@@ -115,6 +115,7 @@ pub(crate) async fn scan_batch_logs_range_adaptive(
     Ok((read_logs(logs, trace, eez, rollup_id, &raw).await?, hi))
 }
 
+/// Scans the oldest pending chunk; `None` once every chunk is scanned.
 pub(crate) async fn scan_next_batch_log_chunk(
     logs: &impl Provider,
     trace: &impl Provider,
@@ -183,8 +184,9 @@ async fn read_logs(
     for block in group_blocks(raw)? {
         let number = block.number;
         let block_hash = block.hash;
-        let mut calls = BTreeMap::new();
+        let mut calls_by_tx = BTreeMap::new();
         let mut traced = Vec::new();
+        // Only txs with a post listing us are fetched; a direct post's call is the tx itself.
         for tx_logs in block.logs.chunk_by(|a, b| a.tx_index == b.tx_index) {
             let index = tx_logs[0].tx_index;
             let hash = tx_logs[0].tx_hash;
@@ -192,7 +194,7 @@ async fn read_logs(
             if tx_logs.iter().any(lists) {
                 let tx = fetch_log_transaction(logs, number, block_hash, index, hash).await?;
                 if let Some(call) = direct_call(&tx, eez, count) {
-                    calls.insert(index, (vec![call], count));
+                    calls_by_tx.insert(index, (vec![call], count));
                 } else {
                     traced.push((index, hash));
                 }
@@ -207,20 +209,22 @@ async fn read_logs(
                 txs = traced.len(),
                 "tracing a block whose contract post lists our rollup",
             );
+            // One trace of the block gives every other such tx's committed calls.
             let hashes: Vec<_> = traced.iter().map(|&(_, hash)| hash).collect();
             let frames = trace_block(trace, number, block_hash, &hashes).await?;
             for ((index, hash), frame) in traced.into_iter().zip(frames) {
                 let here = format!("block {number} tx {hash}");
-                calls.insert(index, calls_in_tx(&frame, eez, &here)?);
+                calls_by_tx.insert(index, calls_in_tx(&frame, eez, &here)?);
             }
         }
-        posts.extend(read_block(&block, &calls, rollup_id)?);
+        posts.extend(read_block(&block, &calls_by_tx, rollup_id)?);
     }
     Ok(posts)
 }
 
 /// Fetches a post's tx by (block hash, index), never by tx hash, which a
-/// minimal node can't serve. Another hash there means a reorg since the logs.
+/// minimal node can't serve. A block pinned by hash cannot change, so a
+/// missing tx only means the node lags or pruned it.
 async fn fetch_log_transaction(
     provider: &impl Provider,
     block: u64,
@@ -232,16 +236,10 @@ async fn fetch_log_transaction(
         .get_transaction_by_block_hash_and_index(block_hash, tx_index as usize)
         .await
         .map_err(|e| L1Error::Provider(format!("get_tx({block_hash}#{tx_index}): {e}")))?;
-    match tx {
-        Some(tx) if *tx.inner.tx_hash() == tx_hash => Ok(tx),
-        other => Err(L1Error::SourceIncomplete {
-            block,
-            detail: format!(
-                "tx {tx_hash} is not at ({block_hash}, {tx_index}): found {:?}; retry",
-                other.map(|tx| *tx.inner.tx_hash())
-            ),
-        }),
-    }
+    tx.ok_or_else(|| L1Error::SourceIncomplete {
+        block,
+        detail: format!("tx {tx_hash} at ({block_hash}, {tx_index}) not served yet; retry"),
+    })
 }
 
 #[cfg(test)]
@@ -509,17 +507,12 @@ mod tests {
         forked.block_hash = Some(B256::ZERO);
         let mut unplaced = rpc_log(1, 1, ours.clone());
         unplaced.log_index = None;
-        let mut rehashed = rpc_log(1, 1, ours.clone());
-        rehashed.transaction_hash = Some(H);
         let short = LogData::new_unchecked(vec![BatchPosted::SIGNATURE_HASH], Bytes::new());
         let provider: fn(&L1Error) -> bool = |e| matches!(e, L1Error::Provider(_));
         #[rustfmt::skip]
-        let cases: [(&str, Log, fn(&L1Error) -> bool); 6] = [
+        let cases: [(&str, Log, fn(&L1Error) -> bool); 3] = [
             ("two block hashes", forked, |e| matches!(e, L1Error::SourceIncomplete { .. })),
             ("a log without its position", unplaced, provider),
-            ("two logs at one index", rpc_log(1, 0, ours.clone()), provider),
-            ("a tx index falling", rpc_log(0, 1, ours.clone()), provider),
-            ("one tx index with two hashes", rehashed, provider),
             ("an undecodable log", rpc_log(1, 1, short), |e| matches!(e, L1Error::Decode(_))),
         ];
         for (name, log, class) in cases {
@@ -886,12 +879,10 @@ mod tests {
         let traced = frame("CALL", ROUTER, &Bytes::new(), 1, vec![into_eez]);
         let extra = json!([{"txHash": tx.inner.tx_hash(), "result": traced}]);
         let (tx, block) = (json!(tx), json!(Block::<Transaction>::default()));
-        let other_tx = json!(signed_tx(EEZ, Bytes::new(), 9));
         // The trace's own failures are classified in `fetch`; one shows they propagate.
         #[rustfmt::skip]
-        let cases: [(&str, Vec<Value>, fn(&L1Error) -> bool); 4] = [
+        let cases: [(&str, Vec<Value>, fn(&L1Error) -> bool); 3] = [
             ("no tx at the post's index", vec![json!(null)], lagging),
-            ("another tx there", vec![other_tx], lagging),
             ("a trace without the tx", vec![tx.clone(), block.clone(), json!([])], provider),
             ("a trace committing other logs than get_logs", vec![tx, block, extra], decode),
         ];
