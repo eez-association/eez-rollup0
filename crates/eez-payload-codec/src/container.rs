@@ -29,6 +29,7 @@
 //! spec owner.
 
 use crate::{CodecError, CodecResult, Cursor, DecodedSpan, SpanBlock};
+use tracing::warn;
 
 /// First byte of the stream: the EEZ protocol version (§6). Never a message.
 pub const STREAM_VERSION: u8 = 0x00;
@@ -100,7 +101,12 @@ pub fn encode_container(
     for (index, action) in actions.iter().enumerate() {
         validate_target_rollup(rollup_id, action.target_rollup_id)?;
         if !action.success && index + 1 != actions.len() {
-            return Err(CodecError::ActionAfterFailure);
+            warn!(
+                rollup_id,
+                failed_action_index = index,
+                action_count = actions.len(),
+                "ActionAfterFailure: action follows failed return"
+            );
         }
     }
 
@@ -167,7 +173,11 @@ pub fn decode_container(payload: &[u8]) -> CodecResult<DecodedContainer> {
             .last()
             .is_some_and(|action: &Action| !action.success)
         {
-            return Err(CodecError::ActionAfterFailure);
+            warn!(
+                rollup_id,
+                decoded_actions = actions.len(),
+                "ActionAfterFailure: action follows failed return"
+            );
         }
         actions.push(decode_action(&mut cur, rollup_id)?);
     }
@@ -529,20 +539,24 @@ mod tests {
     }
 
     #[test]
-    fn an_action_after_a_failed_return_is_rejected() {
+    fn action_after_failed_return_is_non_halting() {
         let failed = action(false);
         let succeeding = action(true);
-        assert_eq!(
-            encode_container(ROLLUP, &span(), &[failed.clone(), succeeding.clone()]).unwrap_err(),
-            CodecError::ActionAfterFailure,
-        );
+        let manifest = vec![failed.clone(), succeeding.clone()];
 
-        let mut forged = encode_container(ROLLUP, &span(), &[failed]).unwrap();
-        let second = encode_container(ROLLUP, &span(), &[succeeding]).unwrap();
+        let encoded = encode_container(ROLLUP, &span(), &manifest)
+            .expect("encoding should not reject action after failed return");
+        let decoded = decode_container(&encoded)
+            .expect("decoding should not reject action after failed return");
+        assert_eq!(decoded.actions, manifest);
+
+        let mut forged =
+            encode_container(ROLLUP, &span(), std::slice::from_ref(&failed)).unwrap();
+        let second = encode_container(ROLLUP, &span(), std::slice::from_ref(&succeeding)).unwrap();
         forged.extend_from_slice(&second[first_bracket_offset()..]);
         assert_eq!(
-            decode_container(&forged).unwrap_err(),
-            CodecError::ActionAfterFailure,
+            decode_container(&forged).unwrap().actions,
+            vec![failed, succeeding],
         );
     }
 
