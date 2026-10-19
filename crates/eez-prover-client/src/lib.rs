@@ -474,8 +474,9 @@ impl RemoteProver {
             })
             .transpose()?;
 
-        // A baseline server may reject subrange selection on a retained session.
-        // Retry once at the supplied exact predecessor, preserving all proof inputs.
+        // Retained history can fill the quota or prune a prefix needed after an
+        // L1 rollback; baseline servers can also reject subrange selection.
+        // Rebuild once at the exact predecessor, preserving inputs and deadline.
         let mut retry_at_anchor = state.session.is_some()
             && finalize.as_ref().is_some_and(|f| anchor.number.checked_add(1) == Some(f.from_block));
         'attempt: loop {
@@ -483,6 +484,9 @@ impl RemoteProver {
         // what to send, including work completed after a previous response was lost.
         let (requests, mut responses, blocks, mut cursor) = loop {
             let creating = state.session.is_none();
+            if creating {
+                retry_at_anchor = false; // Already starting at the requested anchor.
+            }
             let begin = creating.then(|| StreamBegin {
                 rollup_id,
                 anchor_number: anchor.number,
@@ -641,10 +645,11 @@ impl RemoteProver {
                 response = state.response(&mut responses, request_id, range), if !pending.is_empty() => {
                     let response = response?;
                     let (_, index) = pending.pop_front().expect("response has an outstanding request");
-                    if index == blocks.len() && retry_at_anchor
+                    if retry_at_anchor && !response.session_id.is_empty()
                         && matches!(&response.kind, Some(server_frame::Kind::Rejected(rejected))
-                            if Code::from_i32(rejected.code) == Code::Unimplemented) {
-                        retry_at_anchor = false;
+                            if Code::from_i32(rejected.code) == Code::ResourceExhausted
+                                || (index == blocks.len() && matches!(Code::from_i32(rejected.code),
+                                    Code::InvalidArgument | Code::Unimplemented))) {
                         state.session = None;
                         continue 'attempt;
                     }

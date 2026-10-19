@@ -12,6 +12,7 @@ use eez_control_rpc::v1::{
 };
 use eez_prover::{Prover as _, ProvingAnchor, ProvingContext};
 use eez_prover_client::RemoteProver;
+use prost::Message as _;
 use tokio::net::TcpListener;
 
 const FIXTURE: &str = "captured-devnet-window-84";
@@ -264,6 +265,125 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
     assert_eq!(
         pipelined.prove(repeated).await.unwrap().as_ref(),
         expected_signature.as_slice()
+    );
+
+    // Split the captured empty-block window into two valid adjacent batches.
+    // This exercises the real client's recovery, not just raw wire rejections.
+    let subrange = |range: std::ops::Range<usize>| {
+        let mut selected = context.clone();
+        if range.start > 0 {
+            let parent = alloy_rlp::decode_exact::<eez_primitives::Block>(
+                &context.blocks[range.start - 1].rlp,
+            )
+            .unwrap();
+            selected.anchor = Some(ProvingAnchor {
+                number: parent.header.number,
+                hash: parent.header.hash_slow(),
+                state_root: parent.header.state_root,
+            });
+        }
+        selected.blocks = context.blocks[range].to_vec();
+        selected.from_block = selected.blocks.first().unwrap().number;
+        selected.to_block = selected.blocks.last().unwrap().number;
+        let update = &mut selected.batch.entries[0].rollupUpdates[0];
+        update.currentRoot = selected.anchor.unwrap().hash;
+        update.newRoot = selected.blocks.last().unwrap().hash;
+        let span = selected
+            .blocks
+            .iter()
+            .map(|block| {
+                let decoded = alloy_rlp::decode_exact::<eez_primitives::Block>(&block.rlp).unwrap();
+                assert!(decoded.body.transactions.is_empty());
+                eez_payload_codec::SpanBlock {
+                    beneficiary: decoded.header.beneficiary.into_array(),
+                    extra_data: decoded.header.extra_data.to_vec(),
+                    transactions: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        selected.batch.callData =
+            eez_payload_codec::encode_container(selected.rollup_id, &span, &[])
+                .unwrap()
+                .into();
+        eez_protocol::entries::finalize_l1_rolling_hashes(&mut selected.batch).unwrap();
+        selected
+    };
+    let first = subrange(0..3);
+    let second = subrange(3..6);
+    let charges = window[1..]
+        .iter()
+        .map(|chunk| {
+            let Some(prove_chunk::Kind::Block(block)) = &chunk.kind else {
+                unreachable!()
+            };
+            let witness = block.witness.as_ref().unwrap();
+            (
+                block.encoded_len(),
+                witness.state.len()
+                    + witness.codes.len()
+                    + witness.keys.len()
+                    + witness.headers.len(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let payload_limit = charges
+        .chunks(3)
+        .map(|group| group.iter().map(|c| c.0).sum::<usize>())
+        .max()
+        .unwrap();
+    let witness_limit = charges
+        .chunks(3)
+        .map(|group| group.iter().map(|c| c.1).sum::<usize>())
+        .max()
+        .unwrap();
+    let mut failures = Vec::new();
+    for (flag, limit) in [
+        ("--max-request-blocks", 3),
+        ("--max-request-bytes", payload_limit),
+        ("--max-request-witness-items", witness_limit),
+        ("rollback", 0),
+    ] {
+        let args = if flag == "rollback" {
+            Vec::new()
+        } else {
+            vec![flag.to_owned(), limit.to_string()]
+        };
+        let (_server, endpoint) = start_signer(&oracle, &args).await;
+        let prover = RemoteProver::new(endpoint, signer);
+        let result = async {
+            prover.prove(first.clone()).await?;
+            // Each batch fits separately, but together they exceed the quota.
+            prover.prove(second.clone()).await?;
+            if flag == "rollback" {
+                // L1 rolled back both batches; L2 regenerates identical bytes.
+                // Ready still matches the tip, but the session has pruned the
+                // first batch. Recover without restarting either process.
+                assert_eq!(
+                    prover.prove(context.clone()).await?.as_ref(),
+                    expected_signature.as_slice()
+                );
+            } else {
+                // A fresh session cannot rescue an intrinsically oversized
+                // window: surface its rejection rather than looping forever.
+                let error = prover.prove(context.clone()).await.unwrap_err();
+                assert!(
+                    error.to_string().contains("quota exceeded"),
+                    "{flag}: {error}"
+                );
+                assert!(error.retryable_kind().is_none(), "{flag}: {error}");
+                // The rejected large window must not strand the next valid one.
+                prover.prove(second.clone()).await?;
+            }
+            Ok::<_, eez_prover::ProverError>(())
+        }
+        .await;
+        if let Err(error) = result {
+            failures.push(format!("{flag}: {error}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "retained session recovery failed: {failures:#?}"
     );
 }
 
