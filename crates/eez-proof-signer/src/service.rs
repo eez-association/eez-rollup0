@@ -144,6 +144,7 @@ impl ServiceState {
     }
 
     /// Enable blob settlement with an authenticated L1 source.
+    #[must_use]
     pub fn with_blob_context_authority(
         mut self,
         authority: crate::blob_profile::SharedBlobContextAuthority,

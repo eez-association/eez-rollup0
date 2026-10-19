@@ -291,26 +291,6 @@ pub(crate) fn verify_blob_da_payload(
     Ok(VerifiedBlobDa { versioned_hashes })
 }
 
-#[cfg(test)]
-mod blob_kzg_tests {
-    use eez_blob::EnvKzgSettings;
-    use eez_payload_codec::SpanBlock;
-
-    use super::*;
-
-    #[test]
-    fn rollup0_physical_blob_is_ethereum_kzg_compatible() {
-        let blobs = eez_payload_codec::encode_blob_container(1, &[SpanBlock::default()], &[])
-            .expect("fixture encodes");
-        let hashes = eez_blob::versioned_hashes(&blobs, EnvKzgSettings::Default.get())
-            .expect("Rollup0 packing must produce canonical Ethereum field elements");
-
-        assert_eq!(hashes.len(), 1);
-        assert_eq!(hashes[0][0], 1, "EIP-4844 version byte");
-        assert_ne!(hashes[0], B256::ZERO);
-    }
-}
-
 /// Raw-input adapter for focused DA unit tests.
 #[cfg(test)]
 pub(crate) fn verify_da_payload_for_test<'a, I>(
@@ -796,4 +776,24 @@ pub(crate) fn encode_da_payload_for(
         })
         .collect();
     eez_payload_codec::encode_container(rollup_id, &span, &actions).expect("test payload encodes")
+}
+
+#[cfg(test)]
+mod blob_kzg_tests {
+    use eez_blob::EnvKzgSettings;
+    use eez_payload_codec::SpanBlock;
+
+    use super::*;
+
+    #[test]
+    fn rollup0_physical_blob_is_ethereum_kzg_compatible() {
+        let blobs = eez_payload_codec::encode_blob_container(1, &[SpanBlock::default()], &[])
+            .expect("fixture encodes");
+        let hashes = eez_blob::versioned_hashes(&blobs, EnvKzgSettings::Default.get())
+            .expect("Rollup0 packing must produce canonical Ethereum field elements");
+
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0][0], 1, "EIP-4844 version byte");
+        assert_ne!(hashes[0], B256::ZERO);
+    }
 }

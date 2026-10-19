@@ -11,7 +11,7 @@ use eez_protocol::Rollup0Deployment;
 use url::Url;
 
 use crate::{
-    AppendixDBlobConfig, BlobContextError, L1PostingContext, Rollup0L1Source, SettlementState,
+    BlobContextConfig, BlobContextError, L1PostingContext, Rollup0L1Source, SettlementState,
 };
 
 sol! {
@@ -42,7 +42,7 @@ pub struct RpcRollup0L1Source {
 #[derive(Debug)]
 pub struct BlobServiceConfig {
     pub source: Arc<RpcRollup0L1Source>,
-    pub authority: AppendixDBlobConfig,
+    pub authority: BlobContextConfig,
 }
 
 impl BlobServiceConfig {
@@ -96,13 +96,13 @@ impl BlobServiceConfig {
             deployment.eez,
             expected_rollup_id,
         ));
-        let authority = AppendixDBlobConfig {
+        let authority = BlobContextConfig {
             deployment,
             clock,
             schedule,
             sync_interval: l1_block_ms / l2_block_ms,
         };
-        crate::AppendixDBlobAuthority::new(source.clone(), authority.clone())?;
+        crate::BlobContextAuthority::new(source.clone(), authority.clone())?;
         Ok(Some(Self { source, authority }))
     }
 }

@@ -29,7 +29,7 @@ pub use eez_protocol::EEZL2_ADDRESS;
 
 pub use attest::{Attester, NonZeroProofSystemVkey};
 pub use blob_profile::{
-    AppendixDBlobAuthority, AppendixDBlobConfig, AuthenticatedBlobContext, BlobContextError,
+    AuthenticatedBlobContext, BlobContextAuthority, BlobContextConfig, BlobContextError,
     L1PostingContext, Rollup0L1Source, SettlementState,
 };
 pub use rpc_blob_source::{BlobServiceConfig, RpcRollup0L1Source};
@@ -54,7 +54,7 @@ pub async fn serve(
     serve_inner(config, backend, None, shutdown).await
 }
 
-/// Serve with the Appendix-D blob profile enabled.
+/// Serve with the candidate-V1 blob profile enabled.
 ///
 /// The L1 source supplies canonical headers and the settled Rollup0 cursor;
 /// the deployment, slot grid and blob schedule come from trusted config.
@@ -62,17 +62,17 @@ pub async fn serve_with_blob_source(
     config: ServerConfig,
     backend: impl ValidationBackend,
     source: Arc<dyn Rollup0L1Source>,
-    blob_config: AppendixDBlobConfig,
+    blob_config: BlobContextConfig,
     shutdown: impl Future<Output = ()>,
 ) -> eyre::Result<()> {
-    let authority = Arc::new(AppendixDBlobAuthority::new(source, blob_config)?);
+    let authority = Arc::new(BlobContextAuthority::new(source, blob_config)?);
     serve_inner(config, backend, Some(authority), shutdown).await
 }
 
 async fn serve_inner(
     config: ServerConfig,
     backend: impl ValidationBackend,
-    blob_context_authority: Option<Arc<AppendixDBlobAuthority>>,
+    blob_context_authority: Option<Arc<BlobContextAuthority>>,
     shutdown: impl Future<Output = ()>,
 ) -> eyre::Result<()> {
     let ServerConfig {
@@ -138,7 +138,7 @@ fn log_server_config(
         l2_chain_id = backend.chain_id(),
         expected_l2_system_address = %backend.expected_l2_system_address(),
         profile = if blob_profile_enabled {
-            "appendix_d_candidate_v1"
+            "candidate_v1"
         } else {
             "calldata_anchor_outbound_then_inbound"
         },
