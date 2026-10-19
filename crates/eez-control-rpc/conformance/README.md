@@ -69,6 +69,14 @@ its own configured server; the runner does not configure or launch servers.
 Stop any test servers and remove temporary chain data after use, keeping only
 the logs needed to explain results.
 
+To run all cases against isolated stateless signer processes, including each
+case's required limits and a cold cache, use the integration suite. It shares
+the standalone client's wire replayer and reads the same vector files:
+
+```sh
+cargo test --locked -p eez-prover-stateless --test streaming_rpc
+```
+
 ## Assertions and portability
 
 Steps open named streams, send/receive hex-encoded protobuf payloads, half-close,

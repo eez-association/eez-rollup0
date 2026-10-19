@@ -18,8 +18,8 @@ const FIXTURE: &str = "captured-devnet-window-84";
 const SYSTEM_ADDRESS: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076";
 const ATTESTER_KEY: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 
-#[path = "streaming_rpc/vectors.rs"]
-mod vectors;
+#[path = "../../eez-control-rpc/conformance/replay.rs"]
+mod replay;
 
 struct SignerProcess(Child);
 
@@ -250,8 +250,8 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
     assert_eq!(proof.as_ref(), expected_signature.as_slice());
 
     // Independent Composer clients overlap on one real signer process.
-    let a = RemoteProver::new(endpoint.clone(), signer).with_pipelining();
-    let b = RemoteProver::new(endpoint.clone(), signer).with_pipelining();
+    let a = RemoteProver::new(endpoint.clone(), signer);
+    let b = RemoteProver::new(endpoint.clone(), signer);
     let (a, b) = tokio::join!(a.prove(context.clone()), b.prove(context.clone()));
     assert_eq!(a.unwrap().as_ref(), expected_signature.as_slice());
     assert_eq!(b.unwrap().as_ref(), expected_signature.as_slice());
@@ -260,10 +260,47 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
     // legitimate duplicate submissions, not a claim of a longer executed chain.
     let mut repeated = context.clone();
     repeated.blocks = context.blocks.iter().cycle().take(192).cloned().collect();
-    let pipelined = RemoteProver::new(endpoint.clone(), signer).with_pipelining();
+    let pipelined = RemoteProver::new(endpoint.clone(), signer);
     assert_eq!(
         pipelined.prove(repeated).await.unwrap().as_ref(),
         expected_signature.as_slice()
     );
-    Box::pin(vectors::verify(&endpoint, anchor, &window, &oracle)).await;
+}
+
+#[tokio::test]
+async fn recorded_streaming_vectors_match_the_real_signer() {
+    let oracle: serde_json::Value = serde_json::from_str(&fixture("oracle.json")).unwrap();
+    let attester = fixture_str(&oracle, "attester").parse().unwrap();
+    for filename in [
+        "rollup0-transcripts.json",
+        "rollup0-limits-transcripts.json",
+    ] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../eez-control-rpc/conformance")
+            .join(filename);
+        let document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(document["oracle"], oracle);
+        let cases = document["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let args: Vec<String> = case["server_args"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|arg| arg.as_str().unwrap().to_owned())
+                .collect();
+            // Isolate caches and session state, including the cold-witness case.
+            let (_server, endpoint) = start_signer(&oracle, &args).await;
+            tokio::time::timeout(
+                Duration::from_mins(2),
+                replay::replay(&endpoint, case, attester),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{name}: replay deadline: {error}"))
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            eprintln!("PASS {name}");
+        }
+    }
 }
