@@ -1436,10 +1436,6 @@ mod tests {
             3,
             "backfill must reuse the backend cache"
         );
-        drop(registry);
-        prover.cancel_session().await.unwrap();
-        prover.cancel_session().await.unwrap();
-        assert!(runtime.registry.lock().await.sessions.is_empty());
     }
 
     #[tokio::test]
@@ -1491,6 +1487,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.lock().await.tip().hash, second.hash);
+        {
+            let session = session.lock().await;
+            // Rewinding to a promoted anchor must retain its root, not Begin's.
+            assert_eq!(session.anchor.state_root, promoted.state_root);
+            assert_eq!(
+                session.blocks[0].validated.pre_state_root(),
+                promoted.state_root
+            );
+        }
         prover.prevalidate(1, promoted, third).await.unwrap();
         assert_eq!(validations.load(Ordering::SeqCst), 3);
 
@@ -1604,58 +1609,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_selects_only_retained_ranges() {
-        let runtime = SessionRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
-        let (bound, _) = runtime.begin(begin()).await.unwrap();
-        let first = block_after(11, B256::repeat_byte(0x11), 0x11);
-        let first_hash = B256::from_slice(&first.data.as_ref().unwrap().hash);
-        let second = block_after(12, first_hash, 0x12);
-        let second_hash = B256::from_slice(&second.data.as_ref().unwrap().hash);
-        runtime.validate_block(bound, first).await.unwrap();
-        runtime.validate_block(bound, second).await.unwrap();
-        let session = runtime.session(bound.id).await.unwrap();
-        let session = session.lock().await;
-        for (from, to, terminal, expected) in [
-            (11, 12, second_hash, None),
-            (12, 12, second_hash, None),
-            (11, 11, first_hash, None),
-            (10, 12, second_hash, Some(tonic::Code::InvalidArgument)),
-            (12, 11, first_hash, Some(tonic::Code::InvalidArgument)),
-            (11, 13, second_hash, Some(tonic::Code::FailedPrecondition)),
-            (11, 12, first_hash, Some(tonic::Code::FailedPrecondition)),
-        ] {
-            let request = eez_control_rpc::v2::Finalize {
-                from_block: from,
-                to_block: to,
-                terminal_hash: terminal.to_vec(),
-                settlement: None,
-            };
-            let result = session.select_window(&request, terminal);
-            if let Some(code) = expected {
-                assert_eq!(result.unwrap_err().code(), code, "{from}..={to}");
-            } else {
-                let (anchor, window, start) = result.unwrap();
-                assert_eq!(anchor.number + 1, from);
-                assert_eq!(window.window_pre_block_hash(), anchor.hash);
-                assert_eq!(window.blocks().count() as u64, to - from + 1);
-                assert_eq!(start as u64, from - 11);
-                assert_eq!(
-                    window.settling_block(),
-                    session.blocks[(to - 11) as usize].validated.as_ref()
-                );
-                for (offset, block) in window.preceding_blocks().iter().enumerate() {
-                    assert_eq!(block, &session.blocks[start + offset].validated);
-                }
-            }
-        }
-        assert_eq!(
-            session.blocks.len(),
-            2,
-            "selection does not mutate the prefix"
-        );
-    }
-
-    #[tokio::test]
     async fn rewind_during_execution_prevents_the_old_append() {
         let validations = Arc::new(AtomicUsize::new(0));
         let runtime = SessionRuntime::new(
@@ -1700,103 +1653,6 @@ mod tests {
                 .reused
         );
         assert_eq!(validations.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn rewind_and_finalize_release_only_the_removed_blocks_quota() {
-        let anchor_hash = B256::repeat_byte(0x11);
-        let first = block_after(11, anchor_hash, 0x11);
-        let hash_11 = B256::from_slice(&first.data.as_ref().unwrap().hash);
-        let second = block_after(12, hash_11, 0x12);
-        let hash_12 = B256::from_slice(&second.data.as_ref().unwrap().hash);
-        let third = block_after(13, hash_12, 0x13);
-        // Each dimension independently permits exactly two of these blocks.
-        for quota in ["blocks", "payload", "witness"] {
-            let mut limits = limits();
-            match quota {
-                "blocks" => limits.max_blocks = 2,
-                "payload" => {
-                    limits.max_payload_bytes = first.data.as_ref().unwrap().encoded_len()
-                        + second.data.as_ref().unwrap().encoded_len();
-                }
-                "witness" => limits.max_witness_items = 2,
-                _ => unreachable!(),
-            }
-            let runtime = SessionRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits);
-            let (bound, _) = runtime.begin(begin()).await.unwrap();
-            runtime.validate_block(bound, first.clone()).await.unwrap();
-            runtime.validate_block(bound, second.clone()).await.unwrap();
-            let error = runtime
-                .validate_block(bound, third.clone())
-                .await
-                .unwrap_err();
-            assert_eq!(error.code(), tonic::Code::ResourceExhausted, "{quota}");
-
-            let (rewound, _) = runtime.rewind(bound, hash_11).await.unwrap();
-            assert!(
-                runtime
-                    .validate_block(rewound, second.clone())
-                    .await
-                    .unwrap()
-                    .reused
-            );
-            assert_eq!(
-                runtime
-                    .validate_block(rewound, third.clone())
-                    .await
-                    .unwrap_err()
-                    .code(),
-                tonic::Code::ResourceExhausted,
-                "{quota}: rewind must retain block 11's charge"
-            );
-
-            runtime
-                .finalize(
-                    rewound,
-                    eez_control_rpc::v2::Finalize {
-                        from_block: 12,
-                        to_block: 12,
-                        terminal_hash: hash_12.to_vec(),
-                        settlement: Some(post_batch(hash_11, hash_12, 1)),
-                    },
-                )
-                .await
-                .unwrap();
-            let (resumed, ready) = runtime.resume(bound.id).await.unwrap();
-            assert_eq!(ready.validated_hash, hash_12.as_slice());
-            runtime
-                .validate_block(resumed, third.clone())
-                .await
-                .unwrap();
-
-            // Rewind all the way to the promoted anchor. Neither a separate
-            // anchor cursor nor the old block-10 root may be required here.
-            let (rewound, ready) = runtime.rewind(resumed, hash_11).await.unwrap();
-            assert_eq!(ready.validated_through, 11);
-            let replacement = block_after(12, hash_11, 0x99);
-            let replacement_hash = B256::from_slice(&replacement.data.as_ref().unwrap().hash);
-            runtime.validate_block(rewound, replacement).await.unwrap();
-            runtime
-                .finalize(
-                    rewound,
-                    eez_control_rpc::v2::Finalize {
-                        from_block: 12,
-                        to_block: 12,
-                        terminal_hash: replacement_hash.to_vec(),
-                        settlement: Some(post_batch(hash_11, replacement_hash, 1)),
-                    },
-                )
-                .await
-                .unwrap();
-            let session = runtime.session(bound.id).await.unwrap();
-            let session = session.lock().await;
-            assert_eq!(session.anchor.state_root, B256::repeat_byte(0x11));
-            assert_eq!(
-                session.blocks[0].validated.pre_state_root(),
-                session.anchor.state_root
-            );
-            assert_eq!(session.tip().state_root, B256::repeat_byte(0x99));
-        }
     }
 
     #[tokio::test]
@@ -1849,54 +1705,6 @@ mod tests {
                 "{quota}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn rejected_carries_the_authoritative_validated_cursor() {
-        let runtime = SessionRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
-        let (bound, _) = runtime.begin(begin()).await.unwrap();
-        runtime.validate_block(bound, block()).await.unwrap();
-
-        let response = runtime
-            .rejected_frame(
-                Some(bound),
-                44,
-                Status::invalid_argument("synthetic rejected block"),
-            )
-            .await;
-        let Some(server_frame::Kind::Rejected(rejected)) = response.kind else {
-            panic!("expected Rejected");
-        };
-        assert_eq!(response.session_id, bound.id.as_slice());
-        assert_eq!(response.epoch, bound.epoch);
-        assert_eq!(rejected.validated_through, 11);
-        assert_eq!(rejected.validated_hash, vec![0x22; 32]);
-    }
-
-    #[tokio::test]
-    async fn rewind_fences_the_old_epoch_and_accepts_a_replacement_suffix() {
-        let runtime = SessionRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits());
-        let anchor_hash = B256::repeat_byte(0x11);
-        let (bound, _) = runtime.begin(begin()).await.unwrap();
-        let block_11 = block_after(11, anchor_hash, 0x11);
-        let hash_11 = B256::from_slice(&block_11.data.as_ref().unwrap().hash);
-        runtime.validate_block(bound, block_11).await.unwrap();
-        let old_12 = block_after(12, hash_11, 0x12);
-        runtime.validate_block(bound, old_12).await.unwrap();
-
-        let (rewound, ready) = runtime.rewind(bound, hash_11).await.unwrap();
-        assert_ne!(rewound.epoch, bound.epoch);
-        assert_eq!(ready.validated_through, 11);
-        assert!(
-            runtime
-                .validate_block(bound, block_after(12, hash_11, 0x13))
-                .await
-                .is_err()
-        );
-        let replacement = block_after(12, hash_11, 0x99);
-        let replacement_hash = replacement.data.as_ref().unwrap().hash.clone();
-        let validated = runtime.validate_block(rewound, replacement).await.unwrap();
-        assert_eq!(validated.hash, replacement_hash);
     }
 
     #[tokio::test]

@@ -18,9 +18,9 @@ use eez_control_rpc::v1::{
     ProveHeader, prove_chunk, prove_failure, prover_client::ProverClient,
 };
 use eez_control_rpc::v2::{
-    Begin as StreamBegin, Block as StreamBlock, Cancel as StreamCancel, ClientFrame,
-    Finalize as StreamFinalize, Resume as StreamResume, Rewind as StreamRewind, ServerFrame,
-    client_frame, prover_client::ProverClient as StreamingProverClient, server_frame,
+    Begin as StreamBegin, Block as StreamBlock, ClientFrame, Finalize as StreamFinalize,
+    Resume as StreamResume, Rewind as StreamRewind, ServerFrame, client_frame,
+    prover_client::ProverClient as StreamingProverClient, server_frame,
 };
 use eez_prover::{
     ActionableProverFailure, BlockWitness, Prover, ProverError, ProverResult, ProvingAnchor,
@@ -30,12 +30,14 @@ use tokio::sync::Mutex;
 use tonic::{Code, Status};
 use tracing::{Level, event};
 
+// Rollup0 clients require bounded pipelining support from the streaming server.
+const MAX_IN_FLIGHT: usize = 8;
+
 /// A [`Prover`] backed by the v2 streaming service, with v1 fallback.
 /// Cheap to clone (`Arc<Inner>`).
 #[derive(Debug, Clone)]
 pub struct RemoteProver {
     inner: Arc<Inner>,
-    max_in_flight: usize,
 }
 
 #[derive(Debug)]
@@ -85,7 +87,6 @@ impl RemoteProver {
                 // Bound a stalled transport even outside Composer's shorter proof budget.
                 exchange_timeout: Duration::from_secs(5),
             }),
-            max_in_flight: 1,
         }
     }
 
@@ -93,92 +94,6 @@ impl RemoteProver {
     #[must_use]
     pub fn attester(&self) -> Address {
         self.inner.attester
-    }
-
-    /// Opt into the bounded pipelining profile for a server known to support it.
-    /// The default remains the sequential, interoperable baseline.
-    #[must_use]
-    pub fn with_pipelining(mut self) -> Self {
-        self.max_in_flight = 8;
-        self
-    }
-
-    /// Ask the prover to retire the retained proving session and wait for
-    /// its correlated `Cancelled` acknowledgement. A missing session is an
-    /// idempotent no-op.
-    pub async fn cancel_session(&self) -> ProverResult<()> {
-        tokio::time::timeout(self.inner.exchange_timeout, async {
-            let mut state = self.inner.streaming.lock().await;
-            let Some(session_id) = state.session.as_ref().map(|session| session.id.clone()) else {
-                return Ok(());
-            };
-            let (requests, mut responses, ready) = self.open_stream(&mut state, None, 0, 0).await?;
-            // Cancellation abandons the local transport even when optional controls
-            // are unavailable; it must not leave a binding for the next attempt.
-            state.session = None;
-            if matches!(&ready.kind, Some(server_frame::Kind::Rejected(rejected))
-                if Code::from_i32(rejected.code) == Code::Unimplemented)
-            {
-                return Ok(());
-            }
-            if let Some(error) = rejection_error(&ready, 0, 0) {
-                if matches!(
-                    error,
-                    ProverError::Retryable {
-                        kind: RetryableProverError::Aborted,
-                        ..
-                    }
-                ) {
-                    state.session = None;
-                    return Ok(());
-                }
-                return Err(error);
-            }
-            if !matches!(ready.kind, Some(server_frame::Kind::Ready(_))) || ready.epoch == 0 {
-                return Err(ProverError::Backend(
-                    "ProveStream did not acknowledge Resume before Cancel".into(),
-                ));
-            }
-            let cancel_id = state.next_id();
-            requests
-                .send(ClientFrame {
-                    session_id: session_id.clone(),
-                    request_id: cancel_id,
-                    epoch: ready.epoch,
-                    kind: Some(client_frame::Kind::Cancel(StreamCancel {})),
-                })
-                .await
-                .map_err(|_| ProverError::Backend("ProveStream closed before Cancel".into()))?;
-            let cancelled = next_stream_response(
-                &mut responses,
-                cancel_id,
-                Some(session_id.as_slice()),
-                Some(ready.epoch),
-                0,
-                0,
-            )
-            .await?;
-            if matches!(&cancelled.kind, Some(server_frame::Kind::Rejected(rejected))
-                if Code::from_i32(rejected.code) == Code::Unimplemented)
-            {
-                return Ok(());
-            }
-            if let Some(error) = rejection_error(&cancelled, 0, 0) {
-                return Err(error);
-            }
-            if !matches!(cancelled.kind, Some(server_frame::Kind::Cancelled(_))) {
-                return Err(ProverError::Backend(
-                    "ProveStream did not acknowledge Cancel".into(),
-                ));
-            }
-            state.session = None;
-            Ok(())
-        })
-        .await
-        .map_err(|_| ProverError::Retryable {
-            kind: RetryableProverError::DeadlineExceeded,
-            message: "ProveStream Cancel deadline exceeded".into(),
-        })?
     }
 }
 
@@ -698,7 +613,7 @@ impl RemoteProver {
         };
 
         // Poll both directions: a slow reader must not deadlock our request sender.
-        // Depth one is the baseline; the optional profile bounds outstanding frames.
+        // Keep outstanding frames bounded while draining acknowledgements.
         let total = blocks.len() + usize::from(finalize.is_some());
         let mut pending_finalize = finalize.clone();
         let mut next = 0;
@@ -707,7 +622,7 @@ impl RemoteProver {
         while next < total || !pending.is_empty() {
             let request_id = pending.front().map_or(0, |&(id, _)| id);
             tokio::select! {
-                permit = requests.reserve(), if next < total && pending.len() < self.max_in_flight => {
+                permit = requests.reserve(), if next < total && pending.len() < MAX_IN_FLIGHT => {
                     let permit = permit.map_err(|_| ProverError::Retryable {
                         kind: RetryableProverError::Unavailable,
                         message: "ProveStream request stream closed".into(),
@@ -1616,64 +1531,57 @@ mod tests {
 
     #[tokio::test]
     async fn skipped_prevalidation_preserves_progress_for_proof_backfill() {
-        for pipelining in [false, true] {
-            let key = test_key();
-            let attester = key.address();
-            let hash = eez_protocol::public_inputs::public_inputs_hashes(
-                &test_batch(),
-                attester.into_word(),
-            )
-            .unwrap()[0];
-            let begins = Arc::new(AtomicUsize::new(0));
-            let blocks = Arc::new(AtomicUsize::new(0));
-            let cursor = Arc::new(Mutex::new((0, B256::ZERO)));
-            let endpoint = spawn_streaming_stub(StreamingStub {
-                signer: key,
-                hash,
-                blocks: Arc::clone(&blocks),
-                cursor: Arc::clone(&cursor),
-                begins: Arc::clone(&begins),
-                baseline_only: true,
-                cross_wire_block_response: false,
+        let key = test_key();
+        let attester = key.address();
+        let hash =
+            eez_protocol::public_inputs::public_inputs_hashes(&test_batch(), attester.into_word())
+                .unwrap()[0];
+        let begins = Arc::new(AtomicUsize::new(0));
+        let blocks = Arc::new(AtomicUsize::new(0));
+        let cursor = Arc::new(Mutex::new((0, B256::ZERO)));
+        let endpoint = spawn_streaming_stub(StreamingStub {
+            signer: key,
+            hash,
+            blocks: Arc::clone(&blocks),
+            cursor: Arc::clone(&cursor),
+            begins: Arc::clone(&begins),
+            baseline_only: true,
+            cross_wire_block_response: false,
+        })
+        .await;
+        let prover = RemoteProver::new(endpoint, attester);
+        let anchor = test_anchor();
+        let first = test_block(11, anchor.hash, 0x22);
+        let second = test_block(12, first.hash, 0x23);
+        let third = test_block(13, second.hash, 0x24);
+        prover.prevalidate(1, anchor, first.clone()).await.unwrap();
+
+        // Busy witness capture skipped block 12; block 13 must not discard 11.
+        prover.prevalidate(1, anchor, third.clone()).await.unwrap();
+        assert_eq!(begins.load(Ordering::SeqCst), 1);
+        assert_eq!(blocks.load(Ordering::SeqCst), 1);
+        assert_eq!(*cursor.lock().await, (11, first.hash));
+
+        let proof = prover
+            .prove(ProvingContext {
+                rollup_id: 1,
+                from_block: 11,
+                to_block: 13,
+                anchor: Some(anchor),
+                blocks: vec![first, second, third.clone()],
+                batch: test_batch(),
+                l1_block_hash: None,
             })
-            .await;
-            let mut prover = RemoteProver::new(endpoint, attester);
-            if pipelining {
-                prover = prover.with_pipelining();
-            }
-            let anchor = test_anchor();
-            let first = test_block(11, anchor.hash, 0x22);
-            let second = test_block(12, first.hash, 0x23);
-            let third = test_block(13, second.hash, 0x24);
-            prover.prevalidate(1, anchor, first.clone()).await.unwrap();
-
-            // Busy witness capture skipped block 12; block 13 must not discard 11.
-            prover.prevalidate(1, anchor, third.clone()).await.unwrap();
-            assert_eq!(begins.load(Ordering::SeqCst), 1);
-            assert_eq!(blocks.load(Ordering::SeqCst), 1);
-            assert_eq!(*cursor.lock().await, (11, first.hash));
-
-            let proof = prover
-                .prove(ProvingContext {
-                    rollup_id: 1,
-                    from_block: 11,
-                    to_block: 13,
-                    anchor: Some(anchor),
-                    blocks: vec![first, second, third.clone()],
-                    batch: test_batch(),
-                    l1_block_hash: None,
-                })
-                .await
-                .unwrap();
-            assert_eq!(proof.len(), 65);
-            assert_eq!(begins.load(Ordering::SeqCst), 1);
-            assert_eq!(
-                blocks.load(Ordering::SeqCst),
-                3,
-                "only 12 and 13 need backfill"
-            );
-            assert_eq!(*cursor.lock().await, (13, third.hash));
-        }
+            .await
+            .unwrap();
+        assert_eq!(proof.len(), 65);
+        assert_eq!(begins.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            blocks.load(Ordering::SeqCst),
+            3,
+            "only 12 and 13 need backfill"
+        );
+        assert_eq!(*cursor.lock().await, (13, third.hash));
     }
 
     #[tokio::test]
@@ -1736,7 +1644,7 @@ mod tests {
 
     #[tokio::test]
     async fn optional_operations_fall_back_to_the_same_baseline_work() {
-        for operation in ["resume", "rewind", "cancel", "subrange"] {
+        for operation in ["resume", "rewind", "subrange"] {
             let key = test_key();
             let attester = key.address();
             let hash = eez_protocol::public_inputs::public_inputs_hashes(
@@ -1763,10 +1671,6 @@ mod tests {
             prover.prevalidate(1, anchor, first.clone()).await.unwrap();
             prover.prevalidate(1, anchor, second.clone()).await.unwrap();
             match operation {
-                "cancel" => {
-                    prover.cancel_session().await.unwrap();
-                    prover.prevalidate(1, anchor, first).await.unwrap();
-                }
                 "rewind" => {
                     prover
                         .prevalidate(1, anchor, test_block(11, anchor.hash, 0x99))
@@ -1836,7 +1740,7 @@ mod tests {
         let anchor = test_anchor();
         let block_11 = test_block(11, anchor.hash, 0x22);
         let block_12 = test_block(12, block_11.hash, 0x23);
-        let prover = RemoteProver::new(format!("http://{addr}"), attester).with_pipelining();
+        let prover = RemoteProver::new(format!("http://{addr}"), attester);
 
         let proof = prover
             .prove(ProvingContext {

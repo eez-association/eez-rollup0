@@ -19,8 +19,8 @@ async fn shared_stateful_prover_composers_recover_from_l1_reorg() -> Result<()> 
     shared_prover_reorg(true).await
 }
 
-// First prove with one sequential Composer, then race a pipelined Composer on
-// that very same prover and replace the L1 suffix underneath both live sessions.
+// First prove with one Composer, then race another on the same prover
+// and replace the L1 suffix underneath both live sessions.
 async fn shared_prover_reorg(stateful: bool) -> Result<()> {
     let harness = Harness::fresh().await?;
     let chain = harness.chain();
@@ -103,10 +103,9 @@ async fn shared_prover_reorg(stateful: bool) -> Result<()> {
         "baseline Composer never received a proof"
     );
 
-    let mut env_b = harness
+    let env_b = harness
         .env_for_prover(ANVIL_KEY_4, &endpoint, witness_b.path())
         .await?;
-    env_b.push(("EEZ_PROVER_PIPELINING", "true".to_owned()));
     let b = NodeHandle::start("shared-pipelined-b", &config, &env_b).await?;
     b.run_tx_spammer(ANVIL_KEY_2);
     chain

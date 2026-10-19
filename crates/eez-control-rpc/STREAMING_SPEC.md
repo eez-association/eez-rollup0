@@ -416,10 +416,9 @@ Ordinary execution ACKs do not claim L1 acceptance. Final settlement retains
 the current Rollup0 [conditional-proof rules](#parent-authorization-by-profile);
 stateful fork selection additionally obeys Reth's safe/finalized ancestry.
 
-Composer defaults to sequential ACKs on a retained live stream. Set
-`EEZ_PROVER_PIPELINING=true` only for a known pipelining server; it limits
-outstanding requests to eight while draining responses concurrently. Unsupported
-session controls and subrange selection fall back to fresh Begin/backfill without
+Rollup0's Composer requires a pipelining-capable server and retains a live stream,
+limiting outstanding requests to eight while draining responses concurrently.
+Unsupported session controls and subrange selection fall back to fresh Begin/backfill without
 changing the requested settlement. An exchange, including reconnect and EOF,
 has a five-second transport deadline; the Composer's proof cutoff can be shorter.
 
@@ -434,96 +433,8 @@ not protocol guarantees.
 
 ### Executed Rollup0 transcripts
 
-[`conformance/rollup0-transcripts.json`](conformance/rollup0-transcripts.json)
-contains protobuf request/response payloads recorded against the standalone
-Stateless signer. Its 17 cases separate the baseline from optional session,
-pipelining and stateless-cache behavior. A further four cases in
-[`conformance/rollup0-limits-transcripts.json`](conformance/rollup0-limits-transcripts.json)
-require explicit deployment limits. Together they contain 339 requests, 338
-correlated replies, one terminal transport error, and 25 successful proofs.
-Each case is independently replayable; start with a fresh signer for the complete
-suite or the cold-cache witness case. These are Rollup0 reference-profile vectors,
-not a requirement to implement every optional operation or this backend's cache.
-Unsupported blobs and posting context are negative tests of today's Rollup0
-profile, not requirements for a prover configured for another settlement profile.
-
-| Operation | Normal and boundary coverage |
-| --- | --- |
-| Begin | Correct anchor; unsupported rollup; missing/31/33-byte hashes and roots; number overflow; invalid initial binding; second Begin cannot replace a session. |
-| Block | Real execution; duplicate at/before tip; missing data/witness; hash/parent widths; zero/max/gapped numbers; contradictory parent/hash/RLP; invalid witness followed by a valid retry; cache-parent binding. |
-| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix, invalid/outside ranges and terminal; malformed/missing ABI input; mismatched parent/terminal/rollup/proof system/DA; unsupported blob/context/profile fields; valid retry after rejection. |
-| Resume | Retained progress after half-close and Proof; live attachment takeover; missing/malformed/retired session; nonzero initial epoch; old transport cannot copy the new epoch. |
-| Rewind | Tip, intermediate block and anchor; malformed/unknown/pruned ancestors; stale epoch; removed suffix cannot finalize; promoted anchor survives Resume. |
-| Cancel | Correlated acknowledgement and EOF; retired session cannot resume; cross-stream cancellation denied; another Composer can still finish. |
-| Framing/pipelining | Unknown operation; unauthorized bindings; request IDs zero/max; interleaved Composers; gap does not authorize later queued blocks; half-close drains accepted work; terminal replies close without client half-close. |
-| Limits | Exact block/payload/witness quota and excess rejection; duplicate and per-session charges; selective release on Rewind/Finalize; exactly 4096-byte frame accepted and 4097-byte frame terminates with RESOURCE_EXHAUSTED, followed by Resume. |
-
-Every rejection checks the unchanged authoritative cursor, or an empty binding
-and cursor when unauthorized. Recording asserts expected status codes and derives
-progress from accepted requests rather than copying Ready/Rejected into an oracle.
-`check` labels identify the boundary being exercised; `profile` distinguishes
-baseline from optional or backend-specific cases.
-
-The source is the six-empty-block
-[`captured-devnet-window-84`](../eez-prover-stateless/tests/fixtures/captured-devnet-window-84)
-fixture. Configure the server with its `chain-config.json`, rollup ID, proof
-system and vkey from `oracle.json`, and the **public Anvil test signer key**
-`59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d`.
-Never use that key outside an isolated test deployment. Full-fixture proofs are
-checked against its independent captured digest and test signature. Derived
-subrange/alternate-block proofs are checked against a hash computed from the
-request through the protocol hash helper, and against the recovered signer, before recording; these derived
-cases are not additional on-chain oracles.
-
-Run the wire-only replayer against that separately configured server:
-
-```sh
-CARGO_INCREMENTAL=0 cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0.0.1:50061
-# A minimal implementation can select only the baseline case:
-CARGO_INCREMENTAL=0 cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0.0.1:50061 baseline-and-rejections
-# With a separate signer started using --max-request-blocks 2:
-CARGO_INCREMENTAL=0 cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0.0.1:50061 block-quota crates/eez-control-rpc/conformance/rollup0-limits-transcripts.json
-```
-
-The other limit cases declare their exact `server_args`: payload quota 6528
-bytes, witness quota 30 items, and message limit 4096 bytes. Run each against its
-own configured signer. Normal cases use the default limits and a 30-second
-request/idle timeout. The cold-cache invalid-witness case is stateless-specific:
-a prover already retaining that exact execution may legitimately ignore the new
-witness. `cache-parent-binding` also depends on stateless conditional-anchor
-admission; it is not a requirement that a stateful prover admit an incorrect root.
-
-Frames omit the gRPC compression/length prefix. The runner substitutes actual
-server-issued session IDs and nonzero epochs for recorded placeholders, checking
-that sessions remain distinct and recovery changes epochs. It ignores only
-`Validated.reused` and `Rejected.message`; cursor, status, binding, public-input
-hash, response order and EOF remain assertions. Unmapped malformed/unknown IDs and
-epochs are literal test inputs, not substituted bindings. The `rpc_error` action
-asserts a terminal gRPC status rather than a Rejected frame. The wire runner
-cryptographically checks that each signature recovers the configured attester
-over the expected digest; a different valid ECDSA nonce is allowed. Saved frames
-retain this signer's deterministic signature as a reference, and the fixture's
-original full-window signature remains an exact assertion in the recording test.
-
-The fixture supplies execution witnesses, not a complete Reth database. A
-stateful implementation must separately seed its authenticated anchor/history;
-these transcripts alone do not bootstrap it, cover nonempty Sync effects or
-actionable candidate-eviction details, or prove L1 recovery. Timing-dependent
-in-flight cancellation, backpressure and deadline tests remain in the shared
-session regression suite rather than requiring a particular schedule in vectors. The live
-`eez-node-e2e` shared-prover tests cover both backends with actual Composers,
-L1 settlement and reorgs. Neither suite establishes RollupX/blob conformance or
-an unconditional latency guarantee.
-
-Regenerate deliberately, then rerun without the update flag to compare against
-the committed transcript:
-
-```sh
-CARGO_INCREMENTAL=0 UPDATE_STREAMING_VECTORS=1 cargo test --locked -p eez-prover-stateless --test streaming_rpc
-CARGO_INCREMENTAL=0 cargo test --locked -p eez-prover-stateless --test streaming_rpc
-```
-
-The integration test starts and reaps isolated signer processes for both files;
-it creates no chain database. Regeneration is explicit: CI uses only the second
-command, so behavior changes fail against the saved bytes instead of rewriting
-expectations automatically.
+See the [conformance guide](conformance/README.md) for the recorded normal and
+boundary cases, deployment profiles, replay instructions and coverage limits.
+The standalone client and the stateless signer integration suite share the same
+wire replayer and read-only expectations. The integration suite starts a fresh
+signer for each case, including cold-cache and configured-limit cases.

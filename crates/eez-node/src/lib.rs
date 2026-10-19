@@ -94,14 +94,7 @@ fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
         .map_err(|_| eyre::eyre!("EEZ_ATTESTER_ADDRESS is required for composer proving"))?;
     let attester =
         Address::from_str(attester.trim()).map_err(|e| eyre::eyre!("EEZ_ATTESTER_ADDRESS: {e}"))?;
-    let mut prover = eez_prover_client::RemoteProver::new(url, attester);
-    if env::var("EEZ_PROVER_PIPELINING")
-        .unwrap_or_else(|_| "false".to_owned())
-        .parse::<bool>()
-        .map_err(|e| eyre::eyre!("EEZ_PROVER_PIPELINING: {e}"))?
-    {
-        prover = prover.with_pipelining();
-    }
+    let prover = eez_prover_client::RemoteProver::new(url, attester);
     let (sender, receiver) = mpsc::unbounded_channel::<B256>();
     let witness_db_path =
         env::var("EEZ_WITNESS_DB_PATH").unwrap_or_else(|_| "eez-witnesses".to_owned());
