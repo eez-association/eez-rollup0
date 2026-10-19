@@ -61,9 +61,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::entries;
-use crate::error::{
-    CompositionResult, ExecutorError, ExecutorErrorKind, ExecutorResult, ProtocolErrorKind,
-};
+use crate::error::{CompositionResult, ExecutorError, ExecutorResult, ProtocolError};
 use crate::executor::{ChainClient, ExecutionRequest, TargetExecutionSession};
 use crate::rollup_id::RollupId;
 use crate::types::{
@@ -291,10 +289,10 @@ impl CompositionBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`ProtocolErrorKind::EmptyCalls`] when there are no recorded
-    /// calls or no registered rollups, [`ProtocolErrorKind::UnknownTarget`] for
-    /// an unregistered target, [`ProtocolErrorKind::InvalidEncoding`] for an
-    /// unresolved call, and [`ProtocolErrorKind::Unsupported`] for execution
+    /// Returns [`ProtocolError::EmptyCalls`] when there are no recorded
+    /// calls or no registered rollups, [`ProtocolError::UnknownTarget`] for
+    /// an unregistered target, [`ProtocolError::InvalidEncoding`] for an
+    /// unresolved call, and [`ProtocolError::Unsupported`] for execution
     /// shapes outside the supported materialization profile.
     // Keep the structured public error type rather than boxing it.
     #[allow(clippy::result_large_err)]
@@ -305,12 +303,12 @@ impl CompositionBuilder {
         tracing::debug!(name: "composer.finalize.start", "composition finalize started");
 
         if self.recorded.is_empty() || self.rollups.is_empty() {
-            return Err(ProtocolErrorKind::EmptyCalls.into());
+            return Err(ProtocolError::EmptyCalls.into());
         }
 
         for call in &self.recorded {
             if !self.rollups.contains_key(&call.target_rollup_id) {
-                return Err(ProtocolErrorKind::UnknownTarget {
+                return Err(ProtocolError::UnknownTarget {
                     got: call.target_rollup_id,
                 }
                 .into());
@@ -393,8 +391,8 @@ impl CompositionBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::InvalidReentry`] for prohibited re-entry
-    /// and [`ExecutorErrorKind::Unavailable`] for an unregistered target.
+    /// Returns [`ExecutorError::InvalidReentry`] for prohibited re-entry
+    /// and [`ExecutorError::Unavailable`] for an unregistered target.
     /// Propagates rollback, session creation, checkpoint, and target-execution
     /// errors.
     #[tracing::instrument(
@@ -474,23 +472,23 @@ impl CompositionBuilder {
     ) -> ExecutorResult<usize> {
         let source_rollup_id = req.source_rollup_id;
         if target_rollup_id == source_rollup_id && target_rollup_id != self.entry_rollup_id {
-            return Err(ExecutorError::from(ExecutorErrorKind::InvalidReentry {
+            return Err(ExecutorError::InvalidReentry {
                 caller: source_rollup_id,
                 target: target_rollup_id,
-            }));
+            });
         }
         // Nested materialization is rejected later, but simulation must still
         // refuse cycles such as entry→A→B→A to prevent silent session-state
         // loss while A's session is checked out.
         if self.checked_out.contains(&target_rollup_id) {
-            return Err(ExecutorError::from(ExecutorErrorKind::InvalidReentry {
+            return Err(ExecutorError::InvalidReentry {
                 caller: source_rollup_id,
                 target: target_rollup_id,
-            }));
+            });
         }
         if !self.rollups.contains_key(&target_rollup_id) {
-            return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
-                format!("no rollup registered for {target_rollup_id}"),
+            return Err(ExecutorError::Unavailable(format!(
+                "no rollup registered for {target_rollup_id}"
             )));
         }
         // Lazy-open the target session and snapshot its current state
@@ -889,7 +887,7 @@ mod tests {
             .dispatch_call(RollupId(1), make_request(1))
             .expect_err("cycle must be refused");
         assert!(
-            matches!(err.kind(), ExecutorErrorKind::InvalidReentry { .. }),
+            matches!(err, ExecutorError::InvalidReentry { .. }),
             "got: {err}"
         );
         // The outer session was put back despite the inner error.
@@ -906,7 +904,7 @@ mod tests {
         let err = builder
             .dispatch_call(RollupId(99), make_request(99))
             .expect_err("should fail");
-        assert!(matches!(err.kind(), ExecutorErrorKind::Unavailable(_)));
+        assert!(matches!(err, ExecutorError::Unavailable(_)));
     }
 
     #[test]
@@ -916,9 +914,9 @@ mod tests {
         let builder = CompositionBuilder::new(RollupId(0), rollups);
         let err = builder.finalize().expect_err("should fail");
         assert!(matches!(
-            err.kind(),
-            crate::error::CompositionErrorKind::Protocol(p)
-                if matches!(p.kind(), crate::error::ProtocolErrorKind::EmptyCalls)
+            err,
+            crate::error::CompositionError::Protocol(p)
+                if matches!(p, crate::error::ProtocolError::EmptyCalls)
         ));
     }
 
@@ -985,11 +983,11 @@ mod tests {
 
         let err = builder.finalize().expect_err("should fail");
         assert!(matches!(
-            err.kind(),
-            crate::error::CompositionErrorKind::Protocol(p)
+            err,
+            crate::error::CompositionError::Protocol(p)
                 if matches!(
-                    p.kind(),
-                    crate::error::ProtocolErrorKind::UnknownTarget { got: RollupId(99) }
+                    &p,
+                    crate::error::ProtocolError::UnknownTarget { got: RollupId(99) }
                 )
         ));
     }
@@ -1011,11 +1009,11 @@ mod tests {
             .expect_err("static entry materialization is not implemented");
 
         assert!(matches!(
-            error.kind(),
-            crate::error::CompositionErrorKind::Protocol(protocol)
+            error,
+            crate::error::CompositionError::Protocol(protocol)
                 if matches!(
-                    protocol.kind(),
-                    crate::ProtocolErrorKind::Unsupported(
+                    &protocol,
+                    crate::ProtocolError::Unsupported(
                         "static cross-chain calls are not supported"
                     )
                 )
@@ -1040,11 +1038,11 @@ mod tests {
             .expect_err("finalize must reject every unresolved call");
 
         assert!(matches!(
-            error.kind(),
-            crate::error::CompositionErrorKind::Protocol(protocol)
+            error,
+            crate::error::CompositionError::Protocol(protocol)
                 if matches!(
-                    protocol.kind(),
-                    crate::ProtocolErrorKind::InvalidEncoding(reason)
+                    &protocol,
+                    crate::ProtocolError::InvalidEncoding(reason)
                         if reason == "recorded cross-chain call still has a pending outcome"
                 )
         ));
@@ -1228,11 +1226,11 @@ mod tests {
             .finalize()
             .expect_err("unsuccessful calls are outside the supported profile");
         assert!(matches!(
-            error.kind(),
-            crate::error::CompositionErrorKind::Protocol(protocol)
+            error,
+            crate::error::CompositionError::Protocol(protocol)
                 if matches!(
-                    protocol.kind(),
-                    crate::ProtocolErrorKind::Unsupported(
+                    &protocol,
+                    crate::ProtocolError::Unsupported(
                         "unsuccessful cross-chain calls are not supported"
                     )
                 )
@@ -1258,11 +1256,11 @@ mod tests {
             .finalize()
             .expect_err("nested calls are outside the supported profile");
         assert!(matches!(
-            error.kind(),
-            crate::error::CompositionErrorKind::Protocol(protocol)
+            error,
+            crate::error::CompositionError::Protocol(protocol)
                 if matches!(
-                    protocol.kind(),
-                    crate::ProtocolErrorKind::Unsupported(
+                    &protocol,
+                    crate::ProtocolError::Unsupported(
                         "nested cross-chain calls are not supported"
                     )
                 )
@@ -1288,11 +1286,11 @@ mod tests {
             .finalize()
             .expect_err("entry-chain self-calls are outside the supported profile");
         assert!(matches!(
-            error.kind(),
-            crate::error::CompositionErrorKind::Protocol(protocol)
+            error,
+            crate::error::CompositionError::Protocol(protocol)
                 if matches!(
-                    protocol.kind(),
-                    crate::ProtocolErrorKind::Unsupported(
+                    &protocol,
+                    crate::ProtocolError::Unsupported(
                         "same-chain cross-chain calls are not supported"
                     )
                 )
@@ -1315,9 +1313,9 @@ mod tests {
             .expect_err("L2 → L2 self-dispatch must be rejected");
         assert!(
             matches!(
-                err.kind(),
-                ExecutorErrorKind::InvalidReentry { caller, target }
-                    if *caller == RollupId(1) && *target == RollupId(1)
+                err,
+                ExecutorError::InvalidReentry { caller, target }
+                    if caller == RollupId(1) && target == RollupId(1)
             ),
             "expected InvalidReentry {{ caller: 1, target: 1 }}, got {err:?}",
         );

@@ -240,10 +240,10 @@ impl Backend {
             // Before this call the decoded block and witness remain untrusted.
             // Successful Stateless output means consensus, witness pre-state,
             // execution receipts, and the recomputed post-state commitment all
-            // passed. Only a non-empty final selection uses the checkpoint path.
+            // passed. The terminal plan always includes the anchor checkpoint.
             let witness = std::mem::take(witness);
             let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
-                Some(plan) if !plan.positions().is_empty() => {
+                Some(plan) => {
                     let output = stateless_validation_recovered_with_state_checkpoints(
                         recovered_block,
                         witness,
@@ -265,7 +265,7 @@ impl Backend {
                     plan.verify_returned(&checkpoints)?;
                     (output.validation, checkpoints)
                 }
-                _ => {
+                None => {
                     let output = stateless_validation_recovered(
                         recovered_block,
                         witness,

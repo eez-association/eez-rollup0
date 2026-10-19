@@ -31,7 +31,7 @@ use eez_driver::{
     witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_evm::EezEvmConfig;
-use eez_l1::{BundleTarget, L1Event, SendOutcome, Submitter};
+use eez_l1::{BundleTarget, L1Error, L1Event, SendOutcome, Submitter};
 use eez_primitives::engine::EezEngineTypes;
 use eez_prover::{ActionableProverFailure, BlockWitness, Prover, ProverError, ProvingContext};
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
@@ -52,6 +52,21 @@ use crate::prover_retry::{
     actionable_held_tx, partition_retryable, prove_with_retry, validate_actionable_prover_failure,
 };
 use crate::rollup::RollupState;
+
+fn bundle_targets_for_slot(
+    target_l1_block: Option<u64>,
+    timestamp: u64,
+    mode: SyncSlotMode,
+) -> (BundleTarget, BundleTarget) {
+    let bundle_target = match (target_l1_block, mode) {
+        (Some(block), SyncSlotMode::Steady) => BundleTarget::Exact { block, timestamp },
+        _ => BundleTarget::NextBlock,
+    };
+    let historical_target = target_l1_block
+        .map(|block| BundleTarget::ExactBlock { block })
+        .unwrap_or(BundleTarget::NextBlock);
+    (bundle_target, historical_target)
+}
 
 /// Shared contract identities, public L2 parameters, and L1 submission resources
 /// for cross-chain composition on Sync slots. Owned by `eez-node` at startup
@@ -226,12 +241,10 @@ fn compose_crosschain(
     {
         // Unavailable ⇒ classified TRANSIENT: a wiring gap is not the tx's
         // fault, so the slot aborts and re-queues rather than evicting.
-        return Err(eez_protocol::ExecutorError::from(
-            eez_protocol::ExecutorErrorKind::Unavailable(format!(
-                "composition dispatched to rollup {unseeded}, which has no slot session; \
+        return Err(eez_protocol::ExecutorError::Unavailable(format!(
+            "composition dispatched to rollup {unseeded}, which has no slot session; \
                  it would execute unchained against chain state instead of this slot's state"
-            )),
-        )
+        ))
         .into());
     }
 
@@ -418,6 +431,14 @@ fn declared_gas_limit(raw: &Bytes) -> u64 {
     use alloy_eips::eip2718::Decodable2718 as _;
     reth_ethereum_primitives::TransactionSigned::decode_2718(&mut raw.as_ref())
         .map_or(u64::MAX, |tx| tx.gas_limit())
+}
+
+/// The declared limit and active cap when an envelope can never fit.
+const fn gas_limit_violation(declared: u64, cap: Option<u64>) -> Option<(u64, u64)> {
+    match cap {
+        Some(cap) if declared > cap => Some((declared, cap)),
+        _ => None,
+    }
 }
 
 /// The refused pair's numbers, for the block-gas cut event.
@@ -715,19 +736,19 @@ fn clamp_max_postbatch_gas(requested: u64) -> u64 {
 /// handles insufficient funds separately; other non-poison errors abort the
 /// slot and re-queue.
 fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
-    use eez_protocol::{ComposerErrorKind, ExecutorErrorKind};
-    match err.kind() {
+    use eez_protocol::{ComposerError, ExecutorError};
+    match err {
         // Protocol failures = the composition itself is invalid
         // (EmptyCalls, broken chaining, unknown target, bad encoding) —
         // deterministic for this tx.
-        ComposerErrorKind::Protocol(_) => true,
+        ComposerError::Protocol(_) => true,
         // Executor failures: poison EXCEPT the clearly-transient ones.
-        ComposerErrorKind::Executor(ee) => !matches!(
-            ee.kind(),
-            ExecutorErrorKind::Unavailable(_)
-                | ExecutorErrorKind::Provider(_)
-                | ExecutorErrorKind::Missing(_)
-                | ExecutorErrorKind::InsufficientFunds { .. }
+        ComposerError::Executor(ee) => !matches!(
+            ee,
+            ExecutorError::Unavailable(_)
+                | ExecutorError::Provider(_)
+                | ExecutorError::Missing(_)
+                | ExecutorError::InsufficientFunds { .. }
         ),
         // Lifecycle / internal (misconfigured, lock poisoned, double
         // register) — not the tx's fault → retry, don't evict.
@@ -736,11 +757,11 @@ fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
 }
 
 fn sim_error_is_insufficient_funds(err: &eez_protocol::ComposerError) -> bool {
-    use eez_protocol::{ComposerErrorKind, ExecutorErrorKind};
+    use eez_protocol::{ComposerError, ExecutorError};
     matches!(
-        err.kind(),
-        ComposerErrorKind::Executor(error)
-            if matches!(error.kind(), ExecutorErrorKind::InsufficientFunds { .. })
+        err,
+        ComposerError::Executor(error)
+            if matches!(error, ExecutorError::InsufficientFunds { .. })
     )
 }
 
@@ -870,6 +891,29 @@ fn push_poison_root(
         poison_gaps.push(gap);
     }
     poison.push(tx);
+}
+
+fn evict_gas_limit_violation(
+    rollup_id: u64,
+    tx_idx: usize,
+    tx: HeldTx,
+    declared: u64,
+    cap: u64,
+    poison: &mut Vec<HeldTx>,
+    poison_gaps: &mut Vec<(Address, Direction, u64)>,
+) {
+    event!(
+        name: "eez.composer.cc_compose.tx_gas_unfittable",
+        Level::WARN,
+        rollup_id,
+        tx_idx,
+        tx_hash = %tx.hash,
+        direction = ?tx.direction,
+        user_declared = declared,
+        user_gas_limit_cap = cap,
+        "user transaction exceeds the source chain's active per-transaction gas cap; evicting (resubmit with a lower gas limit)",
+    );
+    push_poison_root(poison, poison_gaps, tx);
 }
 
 fn push_deferred_root(
@@ -1382,13 +1426,12 @@ where
         target_l1_block: Option<u64>,
         mode: SyncSlotMode,
     ) -> Option<SyncSlotBlock> {
-        // Some(n) → aim L1 block n exactly, pinned to this Sync block's
-        // timestamp (a skipped L1 slot then drops the bundle instead of
-        // settling with a drifted L2 timestamp); None → next available
-        // (catch-up, unpinned).
-        let bundle_target = target_l1_block.map_or(BundleTarget::NextBlock, |block| {
-            BundleTarget::Exact { block, timestamp }
-        });
+        // Steady bundles pin both block and timestamp. Ordinary catch-up
+        // markers remain next-available so an L1 reorg cannot strand them,
+        // while cap-triggered historical chunks name the known next block
+        // without a timestamp pin. None is reserved for deferred-late paths.
+        let (bundle_target, historical_target) =
+            bundle_targets_for_slot(target_l1_block, timestamp, mode);
         event!(
             name: "eez.composer.sync_slot.invoked",
             Level::INFO,
@@ -1481,7 +1524,14 @@ where
         // range by K a slot until the signer's window wedges it.
         if sync_height.saturating_sub(cursor) > self.inner.emission.max_blocks {
             if let Err(err) = self
-                .emit_historical_chunk(&cc.exec_ctx, rollup_id, rollup, cursor, sync_height)
+                .emit_historical_chunk(
+                    &cc.exec_ctx,
+                    rollup_id,
+                    rollup,
+                    cursor,
+                    sync_height,
+                    historical_target,
+                )
                 .await
             {
                 event!(
@@ -1498,10 +1548,10 @@ where
         }
 
         // Deferred-late: the bundle missed its L1 slot, so suppress PINNED
-        // emission only. Ordered after bounded emission on purpose — a
-        // historical chunk targets NextBlock and carries no pin, so lateness
-        // can't invalidate it; checking first would starve a chronically late
-        // node (slow prover, relay latency) of settlement entirely.
+        // emission only. Ordered after bounded emission on purpose — this path
+        // supplies NextBlock, so its historical chunk carries no pin and
+        // remains valid; checking first would starve a chronically late node
+        // (slow prover, relay latency) of settlement entirely.
         if matches!(mode, SyncSlotMode::Empty) {
             return self.build_empty_slot_block(rollup, &parent_header, timestamp);
         }
@@ -2075,8 +2125,21 @@ where
                 reopen(&[])
                     .map(|draft| (state, draft))
                     .map_err(|e| format!("SyncBlockState::open: {e}"))
+            })
+            .and_then(|(state, draft)| {
+                let cap = match bundle_target {
+                    BundleTarget::Exact { timestamp, .. } => local
+                        .l1_entry
+                        .next_declared_tx_gas_limit_cap(state.anchor.header(), timestamp),
+                    // A target without a timestamp inherits the anchor's rules.
+                    BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => local
+                        .l1_entry
+                        .declared_tx_gas_limit_cap_at(state.anchor.header()),
+                }
+                .map_err(|error| format!("resolve L1 transaction gas cap: {error}"))?;
+                Ok((state, draft, cap))
             });
-        let (mut l1_state, mut draft) = match slot_ctx {
+        let (mut l1_state, mut draft, inbound_gas_limit_cap) = match slot_ctx {
             Ok(contexts) => contexts,
             Err(e) => {
                 event!(
@@ -2101,6 +2164,8 @@ where
                     .await;
             }
         };
+        // The draft's EVM rules govern outbound envelopes.
+        let outbound_gas_limit_cap = draft.declared_tx_gas_limit_cap();
         event!(
             name: "eez.composer.phase2.slot_anchored",
             Level::INFO,
@@ -2214,6 +2279,23 @@ where
                     "same-sender tx above an underfunded outbound nonce; holding for a later slot",
                 );
                 funding_deferred.push((idx, held));
+                continue;
+            }
+
+            // Reject against the draft's cap before simulation can mark it poison.
+            let user_declared = declared_gas_limit(&held.raw_tx);
+            if let Some((declared, cap)) =
+                gas_limit_violation(user_declared, outbound_gas_limit_cap)
+            {
+                evict_gas_limit_violation(
+                    rollup_id,
+                    idx,
+                    held,
+                    declared,
+                    cap,
+                    &mut poison,
+                    &mut poison_gaps,
+                );
                 continue;
             }
 
@@ -2332,12 +2414,22 @@ where
                                 );
                             }
                             continue;
+                        } else if escrow_remaining.is_none() {
+                            event!(
+                                name: "eez.composer.cc_compose.escrow_read_failed",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                need = %need,
+                                "escrow read returned None; over-escrow check skipped and withdrawal admitted (the bundle may revert on L1 if the rollup balance is insufficient)",
+                            );
                         }
                     }
                     // `[load, user]` must fit the Sync block or `build_sync_block`
                     // hard-errors. Before the L1 budget, so a refusal costs nothing.
-                    let declared = eez_primitives::SYSTEM_TX_GAS_LIMIT
-                        .saturating_add(declared_gas_limit(&held.raw_tx));
+                    let declared =
+                        eez_primitives::SYSTEM_TX_GAS_LIMIT.saturating_add(user_declared);
                     match block_gas_fit(draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
                         BlockGasFit::Accept => {}
                         BlockGasFit::Defer => {
@@ -2416,7 +2508,7 @@ where
                         Err((at, why)) => {
                             // A backing-store failure says nothing about the tx —
                             // abort the slot instead of evicting a valid pair.
-                            if why.is_provider() {
+                            if matches!(&why, BuildError::Provider(_)) {
                                 transient = Some((
                                     format!("outbound append tx#{idx} at {at}: {why}"),
                                     abort_rest(
@@ -2608,6 +2700,22 @@ where
                 continue;
             }
 
+            // Source simulation is uncapped; enforce the L1 envelope cap first.
+            let user_declared = declared_gas_limit(&held.raw_tx);
+            if let Some((declared, cap)) = gas_limit_violation(user_declared, inbound_gas_limit_cap)
+            {
+                evict_gas_limit_violation(
+                    rollup_id,
+                    idx,
+                    held,
+                    declared,
+                    cap,
+                    &mut poison,
+                    &mut poison_gaps,
+                );
+                continue;
+            }
+
             let contexts = draft
                 .fork()
                 .map_err(|e| format!("SyncBlockState::fork: {e}"))
@@ -2778,7 +2886,7 @@ where
                     if let Err((at, why)) = append_and_execute(&mut draft, &deliveries) {
                         // A backing-store failure says nothing about the tx —
                         // abort the slot instead of evicting a valid delivery.
-                        if why.is_provider() {
+                        if matches!(&why, BuildError::Provider(_)) {
                             transient = Some((
                                 format!("inbound append tx#{idx} at {at}: {why}"),
                                 abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
@@ -3515,7 +3623,10 @@ where
                 parent_header,
                 &empty_built.header,
                 Some(&empty_built.block),
-                &SyncCandidates::anchor_only(),
+                &SyncCandidates {
+                    anchor: empty_built.header.hash(),
+                    per_effect: Vec::new(),
+                },
                 &[], // no outbound entries
                 &[], // no outbound user txs
                 0,   // no inline outbound target calls
@@ -3537,7 +3648,14 @@ where
                 let cursor = rollup.l1_head.cursor();
                 let sync_height = parent_header.number() + 1;
                 if let Err(chunk_err) = self
-                    .emit_historical_chunk(ctx, rollup_id, rollup, cursor, sync_height)
+                    .emit_historical_chunk(
+                        ctx,
+                        rollup_id,
+                        rollup,
+                        cursor,
+                        sync_height,
+                        BundleTarget::NextBlock,
+                    )
                     .await
                 {
                     event!(
@@ -3639,6 +3757,7 @@ where
         rollup: &RollupState<L2>,
         cursor: u64,
         sync_height: u64,
+        historical_target: BundleTarget,
     ) -> Result<(), String> {
         let limits = self.inner.emission;
         let k = u64::from(limits.timing.k());
@@ -3679,11 +3798,14 @@ where
                     &boundary_parent,
                     &boundary_header,
                     None, // terminal is committed → witnesses come from the store
-                    &SyncCandidates::anchor_only(),
+                    &SyncCandidates {
+                        anchor: boundary_header.hash(),
+                        per_effect: Vec::new(),
+                    },
                     &[],
                     &[],
                     0, // no inline outbound target calls
-                    BundleTarget::NextBlock,
+                    historical_target,
                 )
                 .await
                 .map_err(|error| error.to_string())?
@@ -3709,8 +3831,8 @@ where
             rollup
                 .optimistic
                 .begin(boundary, post_batch_hash, boundary_parent, Vec::new());
-            // A past terminal can't be pinned to an L1 slot, so the bundle takes
-            // whichever block the relay lands it in.
+            // A past terminal cannot carry a timestamp pin, but the bundle can
+            // still target the exact L1 slot that triggered this composition.
             self.spawn_bundle_observer(
                 ctx,
                 rollup_id,
@@ -3719,7 +3841,7 @@ where
                 post_batch_hash,
                 boundary_header.hash(),
                 Arc::clone(&rollup.optimistic),
-                BundleTarget::NextBlock,
+                historical_target,
             );
             return Ok(());
         }
@@ -3908,13 +4030,7 @@ where
             rollupUpdates: vec![eez_protocol::abi::RollupUpdateSol {
                 rollupId: rollup_id,
                 currentRoot: pre_block_hash,
-                // Alone, the anchor is the endpoint, so take it from the
-                // terminal rather than trust a caller for it.
-                newRoot: if candidates.per_effect.is_empty() {
-                    sync_block_hash
-                } else {
-                    candidates.anchor
-                },
+                newRoot: candidates.anchor,
                 etherDelta: alloy_primitives::aliases::I192::ZERO,
             }],
             proxyEntryHash: B256::ZERO,
@@ -4510,8 +4626,9 @@ async fn observe_bundle_outcome(
     if settled {
         optimistic.mark_settled(sync_height, post_batch_hash);
     } else if applied_any {
-        // L1 kept part of the batch, so this height stays canonical and
-        // recovery owes only the tail disposition — no rollback.
+        // Inclusion means any timestamp pin was satisfied, so this was not a
+        // skipped slot. L1 kept part of the batch, so this height stays
+        // canonical and recovery owes only the tail disposition — no rollback.
         optimistic.mark_settled_partial(sync_height, post_batch_hash);
     } else {
         // L1 ran nothing of this batch, so the height is unratified and the
@@ -4522,13 +4639,13 @@ async fn observe_bundle_outcome(
         let slot_skipped = match &outcome {
             // Never reached the relay, so it says nothing about the txs. A
             // relay-side REJECTION is L1Error::Submission and still counts.
-            Err(err) if err.is_transport() => true,
+            Err(L1Error::Provider(_)) => true,
             // Pin unsatisfiable (block ts != pin, or unreadable), not the txs.
             _ => match target {
                 BundleTarget::Exact { block, timestamp } => {
                     submitter.block_timestamp(block).await.ok().flatten() != Some(timestamp)
                 }
-                BundleTarget::NextBlock => false,
+                BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => false,
             },
         };
         optimistic.mark_failed(sync_height, post_batch_hash, slot_skipped);
@@ -4635,6 +4752,25 @@ mod tests {
     use super::*;
     use alloy_primitives::TxHash;
     use alloy_sol_types::SolValue as _;
+
+    #[test]
+    fn catchup_marker_is_unpinned_but_historical_target_keeps_the_l1_block() {
+        let (catchup, historical) =
+            bundle_targets_for_slot(Some(101), 1_700_000_012, SyncSlotMode::Catchup);
+        assert_eq!(catchup, BundleTarget::NextBlock);
+        assert_eq!(historical, BundleTarget::ExactBlock { block: 101 });
+
+        let (steady, historical) =
+            bundle_targets_for_slot(Some(102), 1_700_000_024, SyncSlotMode::Steady);
+        assert_eq!(
+            steady,
+            BundleTarget::Exact {
+                block: 102,
+                timestamp: 1_700_000_024,
+            }
+        );
+        assert_eq!(historical, BundleTarget::ExactBlock { block: 102 });
+    }
 
     #[test]
     fn submission_identity_must_match_post_batch_signer() {
@@ -4803,6 +4939,28 @@ mod tests {
         }
     }
 
+    fn signed_user_tx(gas_limit: u64) -> Bytes {
+        use alloy_consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
+        use alloy_network::{TxSignerSync as _, eip2718::Encodable2718 as _};
+        use alloy_primitives::TxKind;
+        use alloy_signer_local::PrivateKeySigner;
+
+        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
+        let mut tx = TxEip1559 {
+            chain_id: 6290,
+            nonce: 0,
+            gas_limit,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            to: TxKind::Call(Address::ZERO),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Bytes::new(),
+        };
+        let signature = signer.sign_transaction_sync(&mut tx).unwrap();
+        Bytes::from(TxEnvelope::from(tx.into_signed(signature)).encoded_2718())
+    }
+
     #[test]
     fn poison_gap_matches_only_same_chain_higher_nonce() {
         let sender = Address::repeat_byte(0xa);
@@ -4844,7 +5002,7 @@ mod tests {
     #[test]
     fn insufficient_target_funds_are_not_poison() {
         let error =
-            eez_protocol::ComposerError::from(eez_protocol::ExecutorErrorKind::InsufficientFunds {
+            eez_protocol::ComposerError::Executor(eez_protocol::ExecutorError::InsufficientFunds {
                 available: U256::ZERO,
                 required: U256::from(1),
             });
@@ -5435,7 +5593,7 @@ mod tests {
     #[test]
     fn eip_7825_user_cap_is_independent_of_sync_block_fit() {
         // An invalid user limit can still fit in the aggregate Sync-block budget.
-        const EIP_7825_TX_GAS_LIMIT: u64 = 1 << 24;
+        const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
         const SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
         let invalid_user_limit = EIP_7825_TX_GAS_LIMIT + 1;
         let pair_limit = SYSTEM_TX_GAS_LIMIT + invalid_user_limit;
@@ -5450,39 +5608,20 @@ mod tests {
     }
 
     #[test]
-    fn declared_user_gas_limit_preserves_eip_7825_boundary() {
-        // The drain must compare the decoded user limit, not the aggregate pair.
-        use alloy_consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
-        use alloy_network::{TxSignerSync as _, eip2718::Encodable2718 as _};
-        use alloy_primitives::{Address, TxKind, U256};
-        use alloy_signer_local::PrivateKeySigner;
-
-        const EIP_7825_TX_GAS_LIMIT: u64 = 1 << 24;
-        let signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(1)).unwrap();
-        let encode = |gas_limit| {
-            let mut tx = TxEip1559 {
-                chain_id: 6290,
-                nonce: 0,
-                gas_limit,
-                max_fee_per_gas: 1,
-                max_priority_fee_per_gas: 1,
-                to: TxKind::Call(Address::ZERO),
-                value: U256::ZERO,
-                access_list: Default::default(),
-                input: Bytes::new(),
-            };
-            let signature = signer.sign_transaction_sync(&mut tx).unwrap();
-            Bytes::from(TxEnvelope::from(tx.into_signed(signature)).encoded_2718())
-        };
+    fn gas_limit_violation_uses_the_decoded_eip_7825_boundary_only_when_active() {
+        const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
+        let at_cap = declared_gas_limit(&signed_user_tx(EIP_7825_TX_GAS_LIMIT));
+        let over_cap = declared_gas_limit(&signed_user_tx(EIP_7825_TX_GAS_LIMIT + 1));
 
         assert_eq!(
-            declared_gas_limit(&encode(EIP_7825_TX_GAS_LIMIT)),
-            EIP_7825_TX_GAS_LIMIT,
+            gas_limit_violation(at_cap, Some(EIP_7825_TX_GAS_LIMIT)),
+            None
         );
         assert_eq!(
-            declared_gas_limit(&encode(EIP_7825_TX_GAS_LIMIT + 1)),
-            EIP_7825_TX_GAS_LIMIT + 1,
+            gas_limit_violation(over_cap, Some(EIP_7825_TX_GAS_LIMIT)),
+            Some((EIP_7825_TX_GAS_LIMIT + 1, EIP_7825_TX_GAS_LIMIT)),
         );
+        assert_eq!(gas_limit_violation(over_cap, None), None);
     }
 
     #[test]

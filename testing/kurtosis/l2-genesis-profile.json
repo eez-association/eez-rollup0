@@ -1,7 +1,8 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "rollupId": 1,
   "systemAddress": "0xEeEEEEeeeEEeeeEeeEEeEEEeeEeeeeeeeeEe0076",
+  "recoveryAddress": "0xEeEEEEeeeEEeeeEeeEEeEEEeeEeeeeeeeeEe0076",
   "useGasLeft": false,
   "eezL2Address": "0x4200000000000000000000000000000000000007",
   "runtimeCodeHash": "0x958bcd64899023e3ab7cea07a73c4f8e65731f3df69d640a5d91737377d976ed",

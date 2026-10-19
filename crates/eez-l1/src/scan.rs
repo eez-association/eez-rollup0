@@ -417,9 +417,10 @@ pub(crate) async fn scan_batch_logs_range(
     let mut consumed_forks: HashMap<u64, HashSet<B256>> = HashMap::new();
     let mut skip_forks: HashMap<u64, HashSet<B256>> = HashMap::new();
     for l in &evidence_logs {
-        let (Some(bn), Some(tx_index), Some(block_hash), Some(tx_hash)) = (
+        let (Some(bn), Some(tx_index), Some(log_index), Some(block_hash), Some(tx_hash)) = (
             l.block_number,
             l.transaction_index,
+            l.log_index,
             l.block_hash,
             l.transaction_hash,
         ) else {
@@ -442,7 +443,7 @@ pub(crate) async fn scan_batch_logs_range(
                 winner_tx_hashes.insert((block_hash, tx_hash));
                 settled_by_block.entry(bn).or_default().push(SettledRoot {
                     tx_index,
-                    log_index: l.log_index.unwrap_or_default(),
+                    log_index,
                     block_hash,
                     payload: decoded.newRoot,
                 });
@@ -465,13 +466,9 @@ pub(crate) async fn scan_batch_logs_range(
                     .or_default()
                     .push(ConsumedEntry {
                         tx_index,
-                        log_index: l.log_index.unwrap_or_default(),
+                        log_index,
                         block_hash,
-                        payload: (
-                            slot,
-                            decoded.crossChainCallHash,
-                            l.log_index.unwrap_or_default(),
-                        ),
+                        payload: (slot, decoded.crossChainCallHash, log_index),
                     });
             }
             Some(t) if *t == L2TxSkipped::SIGNATURE_HASH => {
@@ -519,6 +516,9 @@ pub(crate) async fn scan_batch_logs_range(
         let tx_index = log
             .transaction_index
             .ok_or_else(|| L1Error::Provider("BatchPosted log missing transaction_index".into()))?;
+        let log_index = log
+            .log_index
+            .ok_or_else(|| L1Error::Provider("BatchPosted log missing log_index".into()))?;
         let tx = fetch_log_transaction(provider, l1_block_number, l1_block_hash, tx_index, tx_hash)
             .await?;
         let submitter = tx.inner.signer();
@@ -552,7 +552,7 @@ pub(crate) async fn scan_batch_logs_range(
             l1_block_number,
             l1_block_hash,
             tx_hash,
-            log_index: log.log_index.unwrap_or_default(),
+            log_index,
             tx_index,
             submitter,
             // A batch verifies (and therefore wipes) our rollup iff it lists it
@@ -1427,7 +1427,10 @@ mod tests {
         let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
             .await
             .expect_err("off-fork skips must be retryable, not silently 'nothing skipped'");
-        assert!(err.is_source_incomplete(), "unexpected error: {err}");
+        assert!(
+            matches!(err, L1Error::SourceIncomplete { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     /// The boot-crash fix's linchpin: a tx the L1 serves at (block hash, index) is
@@ -1454,7 +1457,6 @@ mod tests {
         let err = fetch_log_transaction(&provider, 14, B256::ZERO, 7, real_hash)
             .await
             .expect_err("null lookup must not yield a tx");
-        assert!(err.is_source_incomplete(), "unexpected error: {err}");
         match err {
             L1Error::SourceIncomplete {
                 block, tx_hash: h, ..
@@ -1481,7 +1483,10 @@ mod tests {
         let err = fetch_log_transaction(&provider, 14, B256::ZERO, 0, claimed_hash)
             .await
             .expect_err("mismatched tx must be rejected, not accepted");
-        assert!(err.is_source_incomplete(), "unexpected error: {err}");
+        assert!(
+            matches!(err, L1Error::SourceIncomplete { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     /// A result-count refusal must NARROW the range, not abort the scan: the
@@ -1699,7 +1704,10 @@ mod tests {
         let error = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
             .await
             .expect_err("a positionless log must not be skipped");
-        assert!(error.is_transport(), "retryable, not terminal: {error}");
+        assert!(
+            matches!(error, L1Error::Provider(_)),
+            "retryable, not terminal: {error}"
+        );
     }
 
     /// A postBatch for another rollup shares our block without closing our
@@ -1769,7 +1777,10 @@ mod tests {
         let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
             .await
             .expect_err("all settlement roots on a different fork must not settle empty");
-        assert!(err.is_source_incomplete(), "unexpected error: {err}");
+        assert!(
+            matches!(err, L1Error::SourceIncomplete { .. }),
+            "unexpected error: {err}"
+        );
     }
 
     /// `BatchPosted` does not index rollupIds, so a peer posting via a
@@ -1802,6 +1813,9 @@ mod tests {
         let err = scan_batch_logs_range(&provider, Address::ZERO, 1, 700, 700)
             .await
             .expect_err("an undecodable batch that moved our root must not be skipped");
-        assert!(err.is_terminal(), "unexpected error: {err}");
+        assert!(
+            matches!(err, L1Error::Decode(_) | L1Error::ReorgTooDeep { .. }),
+            "unexpected error: {err}"
+        );
     }
 }

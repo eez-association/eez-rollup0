@@ -21,8 +21,8 @@ use revm::context::result::EVMError;
 
 use crate::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{
-    ChainClient, CompositionBuilder, ExecutorError, ExecutorErrorKind, ExecutorResult,
-    ProxyLookupConfig, RollupId, TargetExecutionSession,
+    ChainClient, CompositionBuilder, ExecutorError, ExecutorResult, ProxyLookupConfig, RollupId,
+    TargetExecutionSession,
 };
 
 use super::provider::{ChainProvider, HeaderReader, StateSnapshotProvider};
@@ -84,6 +84,55 @@ impl std::fmt::Debug for LocalChainClient {
 }
 
 impl LocalChainClient {
+    fn current_header(&self) -> Result<alloy_consensus::Header, String> {
+        let number = self
+            .provider
+            .headers
+            .best_block_number()
+            .map_err(|error| format!("read source head number: {error}"))?;
+        self.provider
+            .headers
+            .header_by_number(number)
+            .map_err(|error| format!("read source head {number}: {error}"))?
+            .ok_or_else(|| format!("source head {number} is missing"))
+    }
+
+    /// Resolve the declared transaction-gas cap from this source chain's
+    /// current canonical EVM environment, matching Reth's pool fork tracking.
+    ///
+    /// # Errors
+    /// Returns an error when the canonical header or its EVM environment cannot
+    /// be read.
+    pub fn current_declared_tx_gas_limit_cap(&self) -> Result<Option<u64>, String> {
+        let header = self.current_header()?;
+        self.declared_tx_gas_limit_cap_at(&header)
+    }
+
+    /// Resolve the declared transaction-gas cap for a header.
+    pub(crate) fn declared_tx_gas_limit_cap_at(
+        &self,
+        header: &alloy_consensus::Header,
+    ) -> Result<Option<u64>, String> {
+        let env = self
+            .provider
+            .evm_config
+            .evm_env(header)
+            .map_err(|error| format!("build source EVM environment: {error}"))?;
+        Ok(eez_evm::declared_tx_gas_limit_cap(&env.cfg_env))
+    }
+
+    /// Resolve the transaction-gas cap for a known next-block timestamp.
+    pub(crate) fn next_declared_tx_gas_limit_cap(
+        &self,
+        parent: &alloy_consensus::Header,
+        timestamp: u64,
+    ) -> Result<Option<u64>, String> {
+        let mut header = parent.clone();
+        header.number = header.number.saturating_add(1);
+        header.timestamp = timestamp;
+        self.declared_tx_gas_limit_cap_at(&header)
+    }
+
     fn build_chain_provider<P>(provider: &P, evm_config: EezEvmConfig) -> ChainProvider
     where
         P: StateProviderFactory
@@ -201,9 +250,9 @@ impl LocalChainClient {
     ///
     /// # Errors
     ///
-    /// [`ExecutorErrorKind::Unavailable`] on a follower client,
-    /// [`ExecutorErrorKind::Decode`] when the raw tx cannot be decoded or its
-    /// signer recovered, [`ExecutorErrorKind::Provider`] when the backing store
+    /// [`ExecutorError::Unavailable`] on a follower client,
+    /// [`ExecutorError::Decode`] when the raw tx cannot be decoded or its
+    /// signer recovered, [`ExecutorError::Provider`] when the backing store
     /// fails mid-execution, plus any error a nested dispatch raises.
     pub fn simulate_source_tx_on(
         &self,
@@ -230,17 +279,17 @@ impl LocalChainClient {
         // transactions. Keep the check here because callers use the uniform
         // `ChainClient` interface for both roles.
         let Role::Entry { .. } = &self.role else {
-            return Err(ExecutorError::from(ExecutorErrorKind::Unavailable(
+            return Err(ExecutorError::Unavailable(
                 "simulate_source_tx_on called on follower LocalChainClient".into(),
-            )));
+            ));
         };
 
         let mut raw: &[u8] = &raw_tx;
         let tx = TransactionSigned::decode_2718(&mut raw)
-            .map_err(|e| ExecutorError::from(ExecutorErrorKind::Decode(e.to_string())))?;
+            .map_err(|e| ExecutorError::Decode(e.to_string()))?;
         let signer = tx
             .recover_signer()
-            .map_err(|e| ExecutorError::from(ExecutorErrorKind::Decode(e.to_string())))?;
+            .map_err(|e| ExecutorError::Decode(e.to_string()))?;
 
         tracing::info!(
             ?signer,
@@ -264,7 +313,7 @@ impl LocalChainClient {
             // The backing store is unreachable — that is the slot's problem, not
             // the tx's, so it must not degrade into an empty composition (which
             // the drain reads as poison and evicts on).
-            Err(EVMError::Database(e)) => return Err(ExecutorError::provider(e)),
+            Err(EVMError::Database(e)) => return Err(ExecutorError::Provider(e.into())),
             // Rejected before execution (nonce, balance, fee). Same outcome as a
             // revert — no calls, so the drain evicts — but named for what it is.
             Err(EVMError::Transaction(e)) => {
@@ -272,7 +321,7 @@ impl LocalChainClient {
                 (0, false, None)
             }
             Err(e) => {
-                tracing::warn!(%e, "source sim reverted");
+                tracing::warn!(%e, "source sim could not execute; tx will be evicted downstream");
                 (0, false, None)
             }
         };

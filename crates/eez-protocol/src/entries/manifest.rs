@@ -29,24 +29,21 @@ use crate::{ProtocolResult, RollupId};
 /// more than one — neither shape is produced by the entry builders.
 pub fn action_from_entry(entry: &ExecutionEntrySol, local: RollupId) -> ProtocolResult<Action> {
     let [call] = entry.l2ToL1Calls.as_slice() else {
-        return Err(crate::ProtocolErrorKind::InvalidEncoding(
+        return Err(crate::ProtocolError::InvalidEncoding(
             "a DA action needs exactly one call on its entry".to_string(),
-        )
-        .into());
+        ));
     };
     // Reject what an `Action` cannot carry: the deriver rebuilds the entry
     // from it, so anything dropped here rebuilds a different entry.
     if !entry.expectedL1ToL2Calls.is_empty() {
-        return Err(crate::ProtocolErrorKind::InvalidEncoding(
+        return Err(crate::ProtocolError::InvalidEncoding(
             "a DA action cannot carry nested expected calls".to_string(),
-        )
-        .into());
+        ));
     }
     if call.isStatic || call.revertNextNCalls != 0 {
-        return Err(crate::ProtocolErrorKind::InvalidEncoding(
+        return Err(crate::ProtocolError::InvalidEncoding(
             "a DA action needs a flat, mutable call: no static call, no revert span".to_string(),
-        )
-        .into());
+        ));
     }
     // An entry whose call originates here is our outbound settlement, so its
     // target is the settlement L1; anything else is an inbound delivery to us.
@@ -57,11 +54,10 @@ pub fn action_from_entry(entry: &ExecutionEntrySol, local: RollupId) -> Protocol
         // Another rollup's delivery is not ours to project; retargeting it
         // silently would rebuild a different entry.
         if entry.destinationRollupId != local.0 {
-            return Err(crate::ProtocolErrorKind::InvalidEncoding(format!(
+            return Err(crate::ProtocolError::InvalidEncoding(format!(
                 "a DA action's inbound entry targets rollup {}, not {}",
                 entry.destinationRollupId, local.0,
-            ))
-            .into());
+            )));
         }
         local
     };
@@ -90,10 +86,9 @@ pub fn entry_from_action(action: &Action, local: RollupId) -> ProtocolResult<Exe
     let outbound = source_rollup_id == local && target_rollup_id.is_mainnet();
     let inbound = target_rollup_id == local;
     if !outbound && !inbound {
-        return Err(crate::ProtocolErrorKind::InvalidEncoding(
+        return Err(crate::ProtocolError::InvalidEncoding(
             "a DA action must have this rollup as its source or its target".to_string(),
-        )
-        .into());
+        ));
     }
 
     let value = U256::from_be_bytes(action.value);

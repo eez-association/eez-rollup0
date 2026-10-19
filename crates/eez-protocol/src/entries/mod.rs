@@ -30,7 +30,7 @@ const SELF_CALL: &str = "same-chain cross-chain calls are not supported";
 pub(crate) fn ensure_materializable_calls(calls: &[ExecutedAction]) -> ProtocolResult<()> {
     for call in calls {
         if call.source_rollup_id == call.target_rollup_id {
-            return Err(crate::ProtocolErrorKind::Unsupported(SELF_CALL).into());
+            return Err(crate::ProtocolError::Unsupported(SELF_CALL));
         }
         supported_return_data(call)?;
     }
@@ -46,7 +46,7 @@ pub(crate) fn ensure_source_side_calls<'a>(
         .into_iter()
         .any(|call| call.source_rollup_id != source_rollup_id)
     {
-        return Err(crate::ProtocolErrorKind::Unsupported(NESTED_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(NESTED_CALL));
     }
     Ok(())
 }
@@ -127,10 +127,9 @@ pub(crate) fn build_l1_postbatch(
     for call in calls {
         let return_data = supported_top_level_return_data(call, source_rollup_id)?;
         if !call.target_rollup_id.is_mainnet() {
-            return Err(crate::ProtocolErrorKind::Unsupported(
+            return Err(crate::ProtocolError::Unsupported(
                 "L1 post-batch entries only support L2-to-L1 calls",
-            )
-            .into());
+            ));
         }
 
         entries.push(ExecutionEntrySol {
@@ -170,27 +169,25 @@ pub(crate) fn build_l1_postbatch(
 /// Returns an error when any entry is incomplete or outside that profile.
 pub fn finalize_l1_rolling_hashes(batch: &mut EvmBatch) -> ProtocolResult<()> {
     if !batch.staticEntries.is_empty() {
-        return Err(crate::ProtocolErrorKind::Unsupported(STATIC_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(STATIC_CALL));
     }
 
     for (entry_index, entry) in batch.entries.iter_mut().enumerate() {
         if entry.rollupUpdates.is_empty() {
-            return Err(crate::ProtocolErrorKind::InvalidEncoding(format!(
+            return Err(crate::ProtocolError::InvalidEncoding(format!(
                 "L1 entry {entry_index} has no RollupUpdates"
-            ))
-            .into());
+            )));
         }
         if !entry.success {
-            return Err(crate::ProtocolErrorKind::Unsupported(UNSUCCESSFUL_CALL).into());
+            return Err(crate::ProtocolError::Unsupported(UNSUCCESSFUL_CALL));
         }
         if !entry.expectedL1ToL2Calls.is_empty() {
-            return Err(crate::ProtocolErrorKind::Unsupported(NESTED_CALL).into());
+            return Err(crate::ProtocolError::Unsupported(NESTED_CALL));
         }
         if entry.l2ToL1Calls.len() > 1 {
-            return Err(crate::ProtocolErrorKind::Unsupported(
+            return Err(crate::ProtocolError::Unsupported(
                 "multiple flat calls in one L1 entry are not supported",
-            )
-            .into());
+            ));
         }
 
         let mut rolling_hash = EntryRollingHash::seed_for_l1(
@@ -281,10 +278,9 @@ impl InboundSidecar {
     /// Derive the canonical sidecar for one successful incoming L2 call.
     pub fn new(entry: IncomingEntry) -> ProtocolResult<Self> {
         if entry.l2_rollup_id.is_mainnet() || entry.source_rollup_id == entry.l2_rollup_id {
-            return Err(crate::ProtocolErrorKind::Unsupported(
+            return Err(crate::ProtocolError::Unsupported(
                 "inbound sidecars require a different, non-L1 destination rollup",
-            )
-            .into());
+            ));
         }
         let destination = entry.l2_rollup_id.0;
         let l2_entry = build_l2_incoming_entry(entry)?;
@@ -341,10 +337,9 @@ impl TryFrom<&ExecutionEntrySol> for InboundSidecar {
 
     fn try_from(entry: &ExecutionEntrySol) -> ProtocolResult<Self> {
         let [call] = entry.l2ToL1Calls.as_slice() else {
-            return Err(crate::ProtocolErrorKind::InvalidEncoding(
+            return Err(crate::ProtocolError::InvalidEncoding(
                 "inbound sidecar must contain exactly one incoming call".into(),
-            )
-            .into());
+            ));
         };
         let sidecar = Self::new(IncomingEntry {
             target: call.targetAddress,
@@ -357,10 +352,9 @@ impl TryFrom<&ExecutionEntrySol> for InboundSidecar {
             success: entry.success,
         })?;
         if sidecar.encoded() != entry.abi_encode() {
-            return Err(crate::ProtocolErrorKind::InvalidEncoding(
+            return Err(crate::ProtocolError::InvalidEncoding(
                 "noncanonical inbound sidecar (shape or L2 hashes differ)".into(),
-            )
-            .into());
+            ));
         }
         Ok(sidecar)
     }
@@ -391,7 +385,7 @@ pub fn build_l2_incoming_entry(entry: IncomingEntry) -> ProtocolResult<L2Executi
         success,
     } = entry;
     if !success {
-        return Err(crate::ProtocolErrorKind::Unsupported(UNSUCCESSFUL_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(UNSUCCESSFUL_CALL));
     }
 
     let call_hash = common_cross_chain_call_hash(CallHashInput {
@@ -464,7 +458,7 @@ pub fn build_l2_outbound_entry(entry: OutboundEntry) -> ProtocolResult<L2Executi
         success,
     } = entry;
     if !success {
-        return Err(crate::ProtocolErrorKind::Unsupported(UNSUCCESSFUL_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(UNSUCCESSFUL_CALL));
     }
 
     let proxy_entry_hash = l2_outbound_call_hash(
@@ -541,10 +535,9 @@ pub(crate) fn build_inbound_target_entries(
     for call in calls {
         let return_data = supported_return_data(call)?;
         if call.target_rollup_id != target_rollup_id || call.source_rollup_id == target_rollup_id {
-            return Err(crate::ProtocolErrorKind::Unsupported(
+            return Err(crate::ProtocolError::Unsupported(
                 "inbound sidecars only support top-level calls from another rollup",
-            )
-            .into());
+            ));
         }
 
         let sidecar = InboundSidecar::new(IncomingEntry {
@@ -678,16 +671,15 @@ pub fn decode_postbatch(calldata: &[u8]) -> alloy_sol_types::Result<EvmBatch> {
 
 fn supported_return_data(call: &ExecutedAction) -> ProtocolResult<&[u8]> {
     if call.outcome.is_pending() {
-        return Err(crate::ProtocolErrorKind::InvalidEncoding(
+        return Err(crate::ProtocolError::InvalidEncoding(
             "recorded cross-chain call still has a pending outcome".to_owned(),
-        )
-        .into());
+        ));
     }
     if call.call_mode == CallMode::Static {
-        return Err(crate::ProtocolErrorKind::Unsupported(STATIC_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(STATIC_CALL));
     }
     if call.revert_span.is_some() {
-        return Err(crate::ProtocolErrorKind::Unsupported(REVERT_SPAN).into());
+        return Err(crate::ProtocolError::Unsupported(REVERT_SPAN));
     }
     match &call.outcome {
         crate::ExecutionOutcome::Resolved {
@@ -696,7 +688,7 @@ fn supported_return_data(call: &ExecutedAction) -> ProtocolResult<&[u8]> {
             ..
         } => Ok(return_data),
         crate::ExecutionOutcome::Resolved { success: false, .. } => {
-            Err(crate::ProtocolErrorKind::Unsupported(UNSUCCESSFUL_CALL).into())
+            Err(crate::ProtocolError::Unsupported(UNSUCCESSFUL_CALL))
         }
         crate::ExecutionOutcome::Pending => unreachable!("pending outcome rejected above"),
     }
@@ -708,23 +700,22 @@ fn supported_top_level_return_data(
 ) -> ProtocolResult<&[u8]> {
     let return_data = supported_return_data(call)?;
     if call.source_rollup_id != source_rollup_id {
-        return Err(crate::ProtocolErrorKind::Unsupported(NESTED_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(NESTED_CALL));
     }
     Ok(return_data)
 }
 
 fn ensure_supported_flat_call(call: &L2ToL1CallSol) -> ProtocolResult<()> {
     if call.revertNextNCalls != 0 {
-        return Err(crate::ProtocolErrorKind::Unsupported(REVERT_SPAN).into());
+        return Err(crate::ProtocolError::Unsupported(REVERT_SPAN));
     }
     if call.isStatic {
-        return Err(crate::ProtocolErrorKind::Unsupported(STATIC_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(STATIC_CALL));
     }
     if call.gas != 0 {
-        return Err(crate::ProtocolErrorKind::Unsupported(
+        return Err(crate::ProtocolError::Unsupported(
             "explicit cross-chain call gas limits are not supported",
-        )
-        .into());
+        ));
     }
     Ok(())
 }

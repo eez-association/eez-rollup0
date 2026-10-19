@@ -322,7 +322,6 @@ fn normalizes_validated_output_for_settlement() {
     // Endpoints come from the block headers; the re-executed state roots set
     // above must reach none of them.
     assert_eq!(validated.window_pre_block_hash(), B256::repeat_byte(0x04));
-    assert_eq!(validated.settling_pre_block_hash(), B256::repeat_byte(0x06));
     assert_eq!(validated.window_post_block_hash(), B256::repeat_byte(0x07));
     assert_eq!(
         validated
@@ -336,7 +335,7 @@ fn normalizes_validated_output_for_settlement() {
 }
 
 #[test]
-fn uses_the_window_pre_state_as_the_settling_pre_state_for_one_block() {
+fn uses_the_terminal_parent_as_the_window_pre_hash_for_one_block() {
     let window = vec![chained_admitted_block(5)];
     let mut output = backend_output_for(&window);
     output.blocks[0].post_state_root = B256::repeat_byte(0x11);
@@ -349,10 +348,6 @@ fn uses_the_window_pre_state_as_the_settling_pre_state_for_one_block() {
         )
         .unwrap();
 
-    assert_eq!(validated.settling_pre_block_hash(), B256::repeat_byte(0x04));
-    assert_eq!(
-        validated.window_pre_block_hash(),
-        validated.settling_pre_block_hash()
-    );
+    assert_eq!(validated.window_pre_block_hash(), B256::repeat_byte(0x04));
     assert!(validated.preceding_blocks().is_empty());
 }
