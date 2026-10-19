@@ -23,7 +23,7 @@ UNSUPPORTED_TARGETS=(
     revert       # forced revert
 )
 
-for tool in bash bc cast forge git jq kurtosis; do
+for tool in bash bc cast curl forge git jq kurtosis python3 timeout; do
     command -v "$tool" >/dev/null || { echo "$tool not found in PATH" >&2; exit 1; }
 done
 
@@ -56,7 +56,6 @@ MANAGER_L2="${MANAGER_L2:-${EEZL2_ADDRESS:-0x42000000000000000000000000000000000
 
 # Hardhat account #2, shared with the earlier cross-chain wave.
 PK="${PK:-0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a}"
-SENDER="$(cast wallet address --private-key "$PK")"
 
 echo "==> protocol E2E endpoints"
 echo "    protocol:     $actual_protocol"
@@ -64,34 +63,36 @@ echo "    L1 RPC/front: $L1_RPC / $L1_FRONT"
 echo "    L2 RPC/front: $L2_RPC / $L2_FRONT"
 echo "    registry:     $ROLLUPS"
 
-(
-    cd "$PROTOCOL"
-    bash script/e2e/run/prepare-network.sh \
-        --l1-rpc "$L1_RPC" \
-        --l1-front "$L1_FRONT" \
-        --l2-rpc "$L2_RPC" \
-        --pk "$PK" \
-        --rollups "$ROLLUPS"
-)
-
-# prepare-network.sh only warns if its L2 funding bridge fails.
-min_l2_balance=10000000000000000
-l2_balance="$(cast balance "$SENDER" --rpc-url "$L2_RPC")"
-if (( $(echo "$l2_balance < $min_l2_balance" | bc) )); then
-    echo "L2 balance for $SENDER is $l2_balance wei, below the $min_l2_balance wei minimum" >&2
-    exit 1
-fi
-
+# The upstream runners discover deployment addresses through eez_composerInfo on
+# the L1 front, so the env file carries only endpoints and the key.
 env_file="$deploy_dir/chain.env"
 cat >"$env_file" <<ENV
 L1_RPC=$L1_RPC
 L1_FRONT=$L1_FRONT
 L2_RPC=$L2_RPC
 L2_FRONT=$L2_FRONT
-ROLLUPS=$ROLLUPS
-MANAGER_L2=$MANAGER_L2
 PK=$PK
 ENV
+
+discovered="$(bash "$PROTOCOL/script/e2e/lib/composer-info.sh" \
+    --l1-front "$L1_FRONT" --l1-rpc "$L1_RPC" --l2-rpc "$L2_RPC" --env)" || {
+    echo "eez_composerInfo discovery failed on the L1 front $L1_FRONT" >&2
+    exit 1
+}
+discovered_rollups="$(sed -n 's/^ROLLUPS=//p' <<<"$discovered")"
+discovered_manager_l2="$(sed -n 's/^MANAGER_L2=//p' <<<"$discovered")"
+if [[ "${discovered_rollups,,}" != "${ROLLUPS,,}" || "${discovered_manager_l2,,}" != "${MANAGER_L2,,}" ]]; then
+    echo "composer discovery disagrees with the enclave deployment" >&2
+    echo "discovered: ROLLUPS=$discovered_rollups MANAGER_L2=$discovered_manager_l2" >&2
+    echo "deployed:   ROLLUPS=$ROLLUPS MANAGER_L2=$MANAGER_L2" >&2
+    exit 1
+fi
+
+# Bridges only the missing balance and fails if L2 delivery times out.
+(
+    cd "$PROTOCOL"
+    DEVNET_ENV="$env_file" bash script/e2e/run/network/setup.sh 0.05 "$env_file"
+)
 
 if [[ -n "${EEZ_PROTOCOL_SCENARIOS:-}" ]]; then
     read -r -a targets <<<"$EEZ_PROTOCOL_SCENARIOS"
@@ -105,7 +106,7 @@ status=0
 (
     cd "$PROTOCOL"
     DEVNET_ENV="$env_file" \
-        bash script/e2e/run/network-sequential.sh "${targets[@]}"
+        bash script/e2e/run/network/sequential.sh "${targets[@]}"
 ) >"$run_log" 2>&1 || status=$?
 cat "$run_log"
 if [[ -d "$PROTOCOL/tmp/e2e-network" ]]; then
@@ -152,7 +153,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
 fi
 
 if (( status != 0 && ${#failed[@]} == 0 )); then
-    echo "network-sequential.sh exited $status without reporting a failed scenario" >&2
+    echo "sequential.sh exited $status without reporting a failed scenario" >&2
     exit "$status"
 fi
 (( ${#failed[@]} == 0 ))

@@ -251,7 +251,7 @@ sol! {
 
 #[cfg(test)]
 mod selector_locks {
-    //! ABI pins from `eez-core-protocol` commit 855fe06.
+    //! ABI pins from `eez-core-protocol` commit 143d87e.
     use super::*;
     use alloy_sol_types::SolCall;
 

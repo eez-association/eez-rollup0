@@ -3,14 +3,17 @@
 //! Both implement [`TargetExecutionSession`], but neither approximates the
 //! protocol: each runs the real contract path the chain will run.
 //!
-//! - [`L1TargetSession`] replays `EEZ._processNCalls`' frames
-//!   (`EEZ.sol:1149-1178`) over an [`L1SlotState`] pinned at drain start,
+//! - [`L1TargetSession`] replays `EEZ._processL2ToL1Calls`' frames
+//!   (`EEZ.sol:1143-1222`) over an [`L1SlotState`] pinned at drain start,
 //!   committing every surviving effect so later simulations in the same slot
 //!   observe it.
 //! - [`InboundL2TargetSession`] executes the canonical delivery system tx on
 //!   a fork of the Sync block under construction and reads the claim off the
-//!   real `EEZL2 → proxy` frame (`EEZL2.sol:547-552`) captured by
+//!   real `EEZL2 → proxy` frame (`EEZL2.sol:615-618`) captured by
 //!   [`ProbeInspector`].
+//!
+//! Both reject a call that targets their own manager before running it, as
+//! `EEZBase._validateCallDestination` (`EEZBase.sol:404-406`) does on chain.
 
 use std::sync::Arc;
 
@@ -77,6 +80,19 @@ const ZERO_CALL_GAS: u64 = 0;
 
 fn encoding_err(msg: impl Into<String>) -> ExecutorError {
     ExecutorError::Encoding(msg.into())
+}
+
+/// `EEZBase._validateCallDestination`: a forwarded call must not target its own
+/// manager, which would re-enter it with the proxy's authorized identity.
+fn reject_manager_destination(target: Address, manager: Address) -> ExecutorResult<()> {
+    if target == manager {
+        // `Encoding` so `sim_error_is_poison` evicts the tx: the chain rejects
+        // this call on every attempt.
+        return Err(encoding_err(format!(
+            "cross-chain call targets its own manager {manager}; the protocol rejects it with EEZDestinationForbidden"
+        )));
+    }
+    Ok(())
 }
 
 /// Classify a `transact` failure. A database read failure is transient, and an
@@ -199,7 +215,7 @@ impl L1SlotState {
 
 // ── L1 manager execution ─────────────────────────────────────────
 
-/// Target-chain session that replays `EEZ._processNCalls`' frames on a fork of
+/// Target-chain session that replays `EEZ._processL2ToL1Calls`' frames on a fork of
 /// the [`L1SlotState`].
 ///
 /// ## Checkpoint payload contract
@@ -310,7 +326,7 @@ impl L1TargetSession {
         self.manager_frame(data, VIEW_CALL_GAS_LIMIT, false)
     }
 
-    /// `EEZ.sol:1150` — `computeCrossChainProxyAddress(source, sourceRollup)`.
+    /// `EEZBase.sol:250` — `computeCrossChainProxyAddress(source, sourceRollup)`.
     fn proxy_address(
         &mut self,
         source: Address,
@@ -327,7 +343,7 @@ impl L1TargetSession {
             .map_err(|e| encoding_err(format!("decode computeCrossChainProxyAddress: {e}")))
     }
 
-    /// `EEZ.sol:1151` — `authorizedProxies[proxy].isProxy`.
+    /// `EEZBase.sol:222` — `authorizedProxies[proxy].isProxy`.
     fn is_authorized_proxy(&mut self, proxy: Address) -> ExecutorResult<bool> {
         let out = self.view_call(authorizedProxiesCall { proxy }.abi_encode())?;
         authorizedProxiesCall::abi_decode_returns(&out)
@@ -335,7 +351,7 @@ impl L1TargetSession {
             .map_err(|e| encoding_err(format!("decode authorizedProxies: {e}")))
     }
 
-    /// `EEZ.sol:1152` — the permissionless CREATE2 deployment + registration
+    /// `EEZBase.sol:231` — the permissionless CREATE2 deployment + registration
     /// the manager performs itself when the proxy is missing.
     fn create_proxy(&mut self, source: Address, source_rollup: RollupId) -> ExecutorResult<()> {
         let calldata = createCrossChainProxyCall {
@@ -367,6 +383,7 @@ impl TargetExecutionSession for L1TargetSession {
                 "static target execution is not supported".into(),
             ));
         }
+        reject_manager_destination(req.target_address, self.manager)?;
 
         let proxy = self.proxy_address(req.source_address, req.source_rollup_id)?;
         if !self.is_authorized_proxy(proxy)? {
@@ -434,8 +451,8 @@ impl TargetExecutionSession for L1TargetSession {
             "L1 manager frame executed"
         );
 
-        // The frame's raw output IS what `_processNCalls` folds into CALL_END
-        // (`EEZ.sol:1181`) — revert data included on failure.
+        // The frame's raw output IS what `_processL2ToL1Calls` folds into CALL_END
+        // (`EEZ.sol:1197`) — revert data included on failure.
         Ok(ExecutionOutcome::Resolved {
             return_data: return_data.to_vec(),
             gas_used,
@@ -512,7 +529,7 @@ struct ProbeSnapshot {
 /// Two runs per call: a PROBE with a placeholder rolling hash, whose only
 /// purpose is to capture the real `EEZL2 → proxy` frame outcome, and the REAL
 /// run with that outcome folded in, which must succeed — the same on-chain
-/// compare (`EEZL2.sol:466`) the proof signer enforces; running it here turns a
+/// compare (`EEZL2.sol:526`) the proof signer enforces; running it here turns a
 /// claim mismatch into a one-tx eviction instead of a rejected window.
 pub struct InboundL2TargetSession {
     fork: SyncBlockFork,
@@ -592,6 +609,8 @@ impl TargetExecutionSession for InboundL2TargetSession {
                 "static target execution is not supported".into(),
             ));
         }
+        // EEZL2 rejects it too, but before the probed frame: name the cause.
+        reject_manager_destination(req.target_address, self.cfg.eezl2_address)?;
 
         // ── PROBE ────────────────────────────────────────────────
         // Placeholder return data: the entry hash is exact (it is computable a
@@ -692,15 +711,15 @@ impl TargetExecutionSession for InboundL2TargetSession {
 /// One captured `EEZL2 → proxy` `executeOnBehalf` frame.
 #[derive(Clone, Debug)]
 pub struct ProbeCapture {
-    /// Frame outcome as `_processNCalls` sees it (`EEZL2.sol:547-550`).
+    /// Frame outcome as `_processIncomingCalls` sees it (`EEZL2.sol:615`).
     pub success: bool,
     /// Raw frame output — return data on success, revert data on failure.
     pub output: Bytes,
 }
 
 /// Captures, in order, every non-static `executeOnBehalf` CALL the L2 manager
-/// makes — the exact `(success, retData)` pair `_processNCalls` folds into
-/// CALL_END (`EEZL2.sol:551`).
+/// makes — the exact `(success, retData)` pair `_processIncomingCalls` folds into
+/// CALL_END (`EEZL2.sol:618`).
 ///
 /// Pass it to the EVM by `&mut` and read `captures` after the run.
 pub struct ProbeInspector {
@@ -760,6 +779,17 @@ impl<CTX: ContextTr> Inspector<CTX> for ProbeInspector {
 mod tests {
     use super::*;
     use alloy_primitives::U256;
+
+    #[test]
+    fn a_call_targeting_its_manager_is_poison() {
+        let manager = Address::repeat_byte(0x11);
+        let error = reject_manager_destination(manager, manager).unwrap_err();
+        assert!(
+            matches!(&error, ExecutorError::Encoding(message) if message.contains("EEZDestinationForbidden")),
+            "{error}"
+        );
+        assert!(reject_manager_destination(Address::repeat_byte(0x22), manager).is_ok());
+    }
 
     #[test]
     fn lack_of_funds_is_classified_as_state_dependent() {
