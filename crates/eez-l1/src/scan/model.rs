@@ -76,6 +76,7 @@ pub(super) struct Consumed {
 pub(super) struct Call {
     pub input: Bytes,
     pub from: Address,
+    pub tx_sender: Address,
     pub logs: usize,
     pub blob_hashes: Vec<B256>,
 }
@@ -310,13 +311,21 @@ fn parse_tx(block: u64, logs: &[ScannedLog]) -> L1Result<Tx<'_>> {
     Ok(Tx { logs, items })
 }
 
-/// The call of a tx sent straight to EEZ with the selector: the whole tx, sent by its signer.
-pub(super) fn direct_call(tx: &Transaction, eez: Address, logs: usize) -> Option<Call> {
+/// Read a transaction whose calldata reaches EEZ unchanged.
+pub(super) fn direct_call(
+    tx: &Transaction,
+    eez: Address,
+    settlement_wrapper: Option<Address>,
+    logs: usize,
+) -> Option<Call> {
     let input = tx.input();
-    let direct = tx.to() == Some(eez) && input.starts_with(&postAndVerifyBatchCall::SELECTOR);
+    let to = tx.to()?;
+    let direct = (to == eez || settlement_wrapper == Some(to))
+        && input.starts_with(&postAndVerifyBatchCall::SELECTOR);
     direct.then(|| Call {
         input: input.clone(),
-        from: tx.inner.signer(),
+        from: if to == eez { tx.inner.signer() } else { to },
+        tx_sender: tx.inner.signer(),
         logs,
         blob_hashes: tx.blob_versioned_hashes().unwrap_or_default().to_vec(),
     })
@@ -347,6 +356,7 @@ pub(super) fn calls_in_tx(
             out.0.push(Call {
                 input: frame.input.clone(),
                 from: frame.from,
+                tx_sender: Address::ZERO,
                 logs: 0,
                 blob_hashes: Vec::new(),
             });
@@ -365,6 +375,9 @@ pub(super) fn calls_in_tx(
     let mut out = (Vec::new(), 0);
     let flat = walk(root, eez, None, &mut out);
     ensure!(flat, "{here}: trace nests a committed post");
+    for call in &mut out.0 {
+        call.tx_sender = root.from;
+    }
     Ok(out)
 }
 
@@ -525,6 +538,7 @@ fn label(
             id,
             tx_hash: head.tx_hash,
             sender: call.from,
+            tx_sender: call.tx_sender,
             batch,
             blob_hashes,
             settlement: Settlement::NONE,
@@ -600,9 +614,13 @@ fn candidate_commitment(
         batch.blockNumber == u64::MAX && canonical,
         "{here}: not a canonical candidate-V1 carrier"
     );
-    let custom_data = candidate
-        .deployment
-        .custom_data(candidate.timestamp, candidate.parent_hash);
+    // A historical post may precede a wrapper rotation. Its committed EEZ
+    // caller is the wrapper that forwarded it, not today's configured wrapper.
+    let deployment = Rollup0Deployment {
+        settlement_wrapper: call.from,
+        ..*candidate.deployment
+    };
+    let custom_data = deployment.custom_data(candidate.timestamp, candidate.parent_hash);
     let context = SettlementContext {
         blob_hashes: &call.blob_hashes,
         custom_data: std::slice::from_ref(&custom_data),

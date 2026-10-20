@@ -347,7 +347,14 @@ pub(super) fn run_settlement(
         Some(blob) => {
             let block_count = validated_window.blocks().count();
             let sync_interval = blob.context.sync_interval();
-            validate_blob_window_shape(block_count, settling_block.number(), sync_interval)?;
+            validate_blob_window_shape(
+                block_count,
+                settling_block.number(),
+                settling_block.decoded().header.timestamp,
+                blob.context.target_timestamp(),
+                canonical_batch.as_batch().entries.len() == 1,
+                sync_interval,
+            )?;
             settlement::CheckedPublicInputProfile::new_blob(
                 &canonical_batch,
                 expected_rollup_id,
@@ -426,10 +433,9 @@ pub(super) fn run_settlement(
             expected_rollup_id.get(),
             blob.kzg_settings,
         )?;
-        checked_public_input_profile.recompute_blob_public_inputs_hash(
+        checked_public_input_profile.recompute_public_inputs_hash(
             proof_system_vkey,
-            &verified_da,
-            blob.context.custom_data(),
+            Some((&verified_da, blob.context.custom_data())),
         )?
     } else {
         settlement::verify_da_payload(
@@ -440,23 +446,29 @@ pub(super) fn run_settlement(
             system_transaction_reconstructor,
             expected_rollup_id.get(),
         )?;
-        checked_public_input_profile.recompute_public_inputs_hash(proof_system_vkey)?
+        checked_public_input_profile.recompute_public_inputs_hash(proof_system_vkey, None)?
     };
     Ok(AttestablePublicInputsHash(recomputed_public_inputs_hash))
 }
 
-/// A blob-settlement anchor covers whole Sync intervals ending at a Sync
-/// height, where Sync heights are multiples of `K`.
+/// A blob settlement covers whole Sync intervals. A batch with user entries
+/// must end at the L1 target time. An anchor-only batch may end earlier, when
+/// an older interval is posted into a later slot.
 fn validate_blob_window_shape(
     block_count: usize,
     terminal_block: u64,
+    terminal_timestamp: u64,
+    target_timestamp: u64,
+    anchor_only: bool,
     sync_interval: u64,
 ) -> Result<(), SettlementPipelineError> {
     let whole = (block_count as u64).is_multiple_of(sync_interval);
-    if block_count == 0 || !whole || !terminal_block.is_multiple_of(sync_interval) {
+    let timing = terminal_timestamp == target_timestamp
+        || (anchor_only && terminal_timestamp < target_timestamp);
+    if block_count == 0 || !whole || !terminal_block.is_multiple_of(sync_interval) || !timing {
         return Err(settlement::PublicInputError::InvalidBlobInput(format!(
             "candidate V1 needs whole {sync_interval}-block Sync intervals ending at a Sync height; \
-             got {block_count} blocks ending at {terminal_block}",
+             got {block_count} blocks ending at {terminal_block} timestamp {terminal_timestamp}, target {target_timestamp}",
         ))
         .into());
     }
@@ -526,14 +538,16 @@ mod blob_window_tests {
 
     #[test]
     fn candidate_v1_accepts_only_complete_sync_intervals() {
-        assert!(validate_blob_window_shape(6, 6, 6).is_ok());
-        assert!(validate_blob_window_shape(12, 18, 6).is_ok());
+        assert!(validate_blob_window_shape(6, 6, 100, 100, false, 6).is_ok());
+        assert!(validate_blob_window_shape(12, 18, 50, 100, true, 6).is_ok());
         // A slower L1 slot changes the grid, not the rule.
-        assert!(validate_blob_window_shape(5, 10, 5).is_ok());
-        assert!(validate_blob_window_shape(6, 6, 5).is_err());
+        assert!(validate_blob_window_shape(5, 10, 100, 100, false, 5).is_ok());
+        assert!(validate_blob_window_shape(6, 6, 100, 100, false, 5).is_err());
+        assert!(validate_blob_window_shape(6, 6, 50, 100, false, 6).is_err());
 
         for (block_count, terminal) in [(0, 0), (1, 6), (6, 7), (7, 12)] {
-            let error = validate_blob_window_shape(block_count, terminal, 6).unwrap_err();
+            let error =
+                validate_blob_window_shape(block_count, terminal, 100, 100, true, 6).unwrap_err();
             assert_eq!(error.gate(), "public_inputs");
             assert_eq!(error.status().code(), tonic::Code::InvalidArgument);
         }

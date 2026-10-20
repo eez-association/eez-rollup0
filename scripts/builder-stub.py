@@ -19,36 +19,77 @@ import argparse
 import http.server
 import json
 import socketserver
+import time
 import urllib.request
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
     upstream = ""
+    beacon = ""
     mode = "forward"
+
+    def _rpc(self, method, params, timeout=10):
+        body = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        }).encode()
+        response = urllib.request.urlopen(
+            urllib.request.Request(
+                self.upstream,
+                data=body,
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=timeout,
+        ).read()
+        decoded = json.loads(response)
+        if "error" in decoded:
+            raise RuntimeError(decoded["error"])
+        return decoded.get("result")
+
+    def _tell_beacon(self, raw):
+        tx_hash = self._rpc("eth_sendRawTransaction", [raw])
+        receipt = None
+        for _ in range(80):
+            receipt = self._rpc("eth_getTransactionReceipt", [tx_hash])
+            if receipt:
+                break
+            time.sleep(0.1)
+        if not receipt:
+            raise RuntimeError(f"type-3 transaction {tx_hash} was not mined")
+        block = self._rpc("eth_getBlockByHash", [receipt["blockHash"], False])
+        notice = json.dumps({
+            "raw": raw,
+            "blockHash": receipt["blockHash"],
+            "timestamp": int(block["timestamp"], 16),
+        }).encode()
+        urllib.request.urlopen(
+            urllib.request.Request(
+                self.beacon.rstrip("/") + "/ingest",
+                data=notice,
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=10,
+        ).read()
+        return tx_hash
 
     def log_message(self, *_):
         pass
 
+    def _reply(self, response):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+
     def _wait_for_block(self, target):
         if target <= 0:
             return
-        import time
         for _ in range(60):
             try:
-                resp = urllib.request.urlopen(
-                    urllib.request.Request(
-                        self.upstream,
-                        data=json.dumps({
-                            "jsonrpc": "2.0",
-                            "id": 0,
-                            "method": "eth_blockNumber",
-                            "params": [],
-                        }).encode(),
-                        headers={"Content-Type": "application/json"},
-                    ),
-                    timeout=2,
-                ).read()
-                bn = int(json.loads(resp).get("result", "0x0"), 16)
+                bn = int(self._rpc("eth_blockNumber", [], timeout=2), 16)
                 if bn >= target:
                     return
             except Exception:
@@ -95,11 +136,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "data": {"transactionCount": len(txs)},
                     },
                 }).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(resp)))
-                self.end_headers()
-                self.wfile.write(resp)
+                self._reply(resp)
                 return
             raw = txs[0]
             target_hex = params.get("blockNumber", "0x0")
@@ -110,20 +147,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # soon as a tx arrives at >= block_time cadence).
             self._wait_for_block(target - 1)
 
-            forwarded = {
-                "jsonrpc": "2.0",
-                "id": body.get("id"),
-                "method": "eth_sendRawTransaction",
-                "params": [raw],
-            }
-            resp = urllib.request.urlopen(
-                urllib.request.Request(
-                    self.upstream,
-                    data=json.dumps(forwarded).encode(),
-                    headers={"Content-Type": "application/json"},
-                ),
-                timeout=10,
-            ).read()
+            if self.beacon and raw.startswith(("0x03", "0X03")):
+                try:
+                    tx_hash = self._tell_beacon(raw)
+                except Exception as error:
+                    message = json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": body.get("id"),
+                        "error": {
+                            "code": -32000,
+                            "message": f"beacon stub ingest failed: {error}",
+                        },
+                    }).encode()
+                    self._reply(message)
+                    return
+                resp = json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": body.get("id"),
+                    "result": {"bundleHash": tx_hash},
+                }).encode()
+            else:
+                forwarded = {
+                    "jsonrpc": "2.0",
+                    "id": body.get("id"),
+                    "method": "eth_sendRawTransaction",
+                    "params": [raw],
+                }
+                resp = urllib.request.urlopen(
+                    urllib.request.Request(
+                        self.upstream,
+                        data=json.dumps(forwarded).encode(),
+                        headers={"Content-Type": "application/json"},
+                    ),
+                    timeout=10,
+                ).read()
         else:
             resp = urllib.request.urlopen(
                 urllib.request.Request(
@@ -133,20 +190,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ),
                 timeout=10,
             ).read()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(resp)))
-        self.end_headers()
-        self.wfile.write(resp)
+        self._reply(resp)
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--listen", required=True, help="host:port")
     p.add_argument("--upstream", required=True, help="anvil RPC url")
+    p.add_argument("--beacon", default="", help="beacon stub base URL")
     args = p.parse_args()
     host, port = args.listen.split(":")
     Handler.upstream = args.upstream
+    Handler.beacon = args.beacon
 
     class Reusable(socketserver.ThreadingTCPServer):
         allow_reuse_address = True

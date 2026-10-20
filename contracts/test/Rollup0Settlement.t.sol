@@ -23,6 +23,8 @@ contract Rollup0SettlementTest is Test {
     Rollup0SettlementWrapper private wrapper;
     bytes32 private _liveRoot;
     bytes private _observedCustomData;
+    bool private _skipAnchor;
+    bool private _reenter;
 
     function setUp() external {
         Rollup0Manager implementation = new Rollup0Manager(address(this), L2_CHAIN_ID);
@@ -126,6 +128,117 @@ contract Rollup0SettlementTest is Test {
         wrapper.postAndVerifyBatch(_batch(1));
     }
 
+    function testWrapperRejectsStaleAndUnchangedAnchors() external {
+        _setBlob();
+        ProofSystemBatchPerVerificationEntries memory batch = _batch(1);
+        batch.entries[0].rollupUpdates[0].currentRoot = NEXT;
+        vm.expectRevert(abi.encodeWithSelector(Rollup0SettlementWrapper.StaleAnchor.selector, PARENT, NEXT));
+        wrapper.postAndVerifyBatch(batch);
+
+        batch = _batch(1);
+        batch.entries[0].rollupUpdates[0].newRoot = PARENT;
+        vm.expectRevert(Rollup0SettlementWrapper.UnchangedAnchorRoot.selector);
+        wrapper.postAndVerifyBatch(batch);
+        assertEq(_liveRoot, PARENT);
+    }
+
+    function testPostcheckFailureRollsBackSessionAndBlockLatch() external {
+        _setBlob();
+        _skipAnchor = true;
+        vm.expectRevert(abi.encodeWithSelector(Rollup0SettlementWrapper.AnchorNotApplied.selector, NEXT, PARENT));
+        wrapper.postAndVerifyBatch(_batch(1));
+        assertEq(manager.lastSettlementBlock(), 0);
+        assertEq(_observedCustomData.length, 0);
+
+        _skipAnchor = false;
+        wrapper.postAndVerifyBatch(_batch(1));
+        assertEq(_liveRoot, NEXT);
+    }
+
+    function testBlockLatchSurvivesWrapperRotation() external {
+        _setBlob();
+        wrapper.postAndVerifyBatch(_batch(1));
+        manager.setSettlementWrapper(address(this));
+        vm.expectRevert(Rollup0Manager.SettlementAlreadyAttemptedThisBlock.selector);
+        manager.beginSettlement();
+
+        vm.roll(block.number + 1);
+        manager.beginSettlement();
+        manager.endSettlement();
+    }
+
+    function testManagerRejectsUnauthorizedAndInactiveSessions() external {
+        vm.expectRevert(Rollup0Manager.NotActiveSettlementWrapper.selector);
+        manager.beginSettlement();
+        vm.expectRevert(Rollup0Manager.UnauthorizedCustomDataRead.selector);
+        manager.getCustomData(type(uint64).max);
+
+        manager.setSettlementWrapper(address(this));
+        vm.expectRevert(Rollup0Manager.SettlementNotActive.selector);
+        manager.endSettlement();
+        manager.beginSettlement();
+        vm.expectRevert(Rollup0Manager.SettlementAlreadyActive.selector);
+        manager.beginSettlement();
+        vm.expectRevert(Rollup0Manager.SettlementAlreadyActive.selector);
+        manager.setSettlementWrapper(address(wrapper));
+        vm.expectRevert(abi.encodeWithSelector(Rollup0Manager.UnsupportedCandidateBlockNumber.selector, uint64(1)));
+        manager.getCustomData(1);
+        manager.endSettlement();
+        vm.expectRevert(Rollup0Manager.UnauthorizedCustomDataRead.selector);
+        manager.getCustomData(type(uint64).max);
+    }
+
+    function testWrapperRejectsReentrancyAndRollsBack() external {
+        _setBlob();
+        _reenter = true;
+        vm.expectRevert(Rollup0SettlementWrapper.ReentrantSettlement.selector);
+        wrapper.postAndVerifyBatch(_batch(1));
+        assertEq(manager.lastSettlementBlock(), 0);
+        assertEq(_liveRoot, PARENT);
+        _reenter = false;
+        wrapper.postAndVerifyBatch(_batch(1));
+    }
+
+    function testWrapperRejectsNonCanonicalBlobIndices() external {
+        _setBlob();
+        ProofSystemBatchPerVerificationEntries memory batch = _batch(1);
+        batch.blobIndices[0] = 1;
+        vm.expectRevert(Rollup0SettlementWrapper.InvalidBlobIndices.selector);
+        wrapper.postAndVerifyBatch(batch);
+        batch.blobIndices = new uint256[](0);
+        vm.expectRevert(Rollup0SettlementWrapper.InvalidBlobIndices.selector);
+        wrapper.postAndVerifyBatch(batch);
+    }
+
+    function testWrapperRejectsCalldataAndStaticPrefix() external {
+        ProofSystemBatchPerVerificationEntries memory batch = _batch(1);
+        batch.callData = hex"00";
+        vm.expectRevert(Rollup0SettlementWrapper.NonEmptyCallData.selector);
+        wrapper.postAndVerifyBatch(batch);
+        batch = _batch(1);
+        batch.immediateStaticEntryCount = 1;
+        vm.expectRevert(Rollup0SettlementWrapper.InvalidImmediateStaticEntryCount.selector);
+        wrapper.postAndVerifyBatch(batch);
+    }
+
+    function testWrapperRejectsMissingRollupAndMalformedAnchor() external {
+        _setBlob();
+        ProofSystemBatchPerVerificationEntries memory batch = _batch(1);
+        batch.rollupIdsWithProofSystems[0].rollupId++;
+        vm.expectRevert(Rollup0SettlementWrapper.Rollup0NotIncluded.selector);
+        wrapper.postAndVerifyBatch(batch);
+        batch = _batch(1);
+        batch.entries[0].proxyEntryHash = bytes32(uint256(1));
+        vm.expectRevert(Rollup0SettlementWrapper.InvalidAnchor.selector);
+        wrapper.postAndVerifyBatch(batch);
+    }
+
+    function _setBlob() private {
+        bytes32[] memory hashes = new bytes32[](1);
+        hashes[0] = bytes32(uint256(1));
+        vm.blobhashes(hashes);
+    }
+
     // Minimal EEZ surface used by the wrapper fixture.
     function rollups(uint64 id) external view returns (address rollupContract, bytes32 root, uint256 etherBalance) {
         assertEq(id, ROLLUP_ID);
@@ -135,7 +248,8 @@ contract Rollup0SettlementTest is Test {
     function postAndVerifyBatch(ProofSystemBatchPerVerificationEntries calldata batch) external {
         assertEq(msg.sender, address(wrapper));
         _observedCustomData = manager.getCustomData(batch.blockNumber);
-        _liveRoot = batch.entries[0].rollupUpdates[0].newRoot;
+        if (_reenter) wrapper.postAndVerifyBatch(batch);
+        if (!_skipAnchor) _liveRoot = batch.entries[0].rollupUpdates[0].newRoot;
     }
 
     function _batch(uint256 immediateCount) private pure returns (ProofSystemBatchPerVerificationEntries memory batch) {

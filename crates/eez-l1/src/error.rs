@@ -18,8 +18,9 @@ pub enum L1Error {
     /// rather than loop. A malformed RPC *response* is `Provider`, not this.
     #[error("L1 decode error: {0}")]
     Decode(String),
-    /// L1 served part of what a read needs but not the rest yet: a lagging
-    /// source, a reorg between two calls, or logs from two forks of one block.
+    /// L1 exposed canonical metadata but not all data needed to decode
+    /// or replay it yet. This is expected while a local L1 source is
+    /// warming up or changes forks and should be retried by reconciliation.
     #[error("L1 source incomplete at block {block}: {detail}")]
     SourceIncomplete { block: u64, detail: String },
     /// A batch post for our rollup in a shape this node does not read.

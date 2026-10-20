@@ -11,9 +11,9 @@ mod schedule;
 mod transport;
 
 pub use alloy_eips::eip4844::env_settings::{EnvKzgSettings, KzgSettings};
-pub use schedule::{BlobFork, BlobSchedule, L1SlotClock, ScheduleError, l1_schedule_from_env};
+pub use schedule::{ActiveBlobLimit, blob_limit_at, on_later_slot};
 pub use transport::{
     BYTES_PER_BLOB, BlobSidecarEncoding, BlobTransactionParams, PreparedBlobSidecar,
-    SignedBlobTransaction, TransportError, pooled_blob_transaction_hash, prepare_blob_sidecar,
-    sign_blob_transaction, versioned_hashes,
+    SignedBlobTransaction, TransportError, pooled_blob_bytes, pooled_blob_transaction_hash,
+    prepare_blob_sidecar, sign_blob_transaction, versioned_hashes,
 };

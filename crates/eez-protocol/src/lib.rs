@@ -17,9 +17,9 @@
 //!   which the proof signer verifies rather than re-executing the call on L1.
 //! - **Canonical public inputs.** [`public_inputs::public_inputs_hashes`] is the
 //!   reconstruction used by the proof signer; another encoding changes the
-//!   signed inputs. Blob settlement supplies independently derived versioned
-//!   hashes and the configured [`Rollup0Deployment`] domain rather than trusting
-//!   caller-provided commitments or custom data.
+//!   signed inputs. The supported profiles require one uniform verification
+//!   key and no sender binding. Blob settlement additionally binds versioned
+//!   hashes and the configured [`Rollup0Deployment`] domain.
 //! - **Settlement root.** Before signing, the proof signer checks
 //!   `RollupUpdate.newRoot` against the root reth produced for the block.
 //!

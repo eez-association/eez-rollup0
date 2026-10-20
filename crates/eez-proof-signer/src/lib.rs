@@ -32,7 +32,7 @@ pub use blob_profile::{
     AuthenticatedBlobContext, BlobContextAuthority, BlobContextConfig, BlobContextError,
     L1PostingContext, Rollup0L1Source, SettlementState,
 };
-pub use rpc_blob_source::{BlobServiceConfig, RpcRollup0L1Source};
+pub use rpc_blob_source::RpcRollup0L1Source;
 pub use service::{ProveSvc, ServiceLimits, ServiceLimitsParams, ServiceState};
 pub use validate::ValidationBackend;
 
@@ -54,19 +54,16 @@ pub async fn serve(
     serve_inner(config, backend, None, shutdown).await
 }
 
-/// Serve with the candidate-V1 blob profile enabled.
-///
-/// The L1 source supplies canonical headers and the settled Rollup0 cursor;
-/// the deployment, slot grid and blob schedule come from trusted config.
-pub async fn serve_with_blob_source(
+/// Serve either settlement profile, selected by `EEZ_SETTLEMENT_WRAPPER_ADDRESS`.
+pub async fn serve_from_env(
     config: ServerConfig,
     backend: impl ValidationBackend,
-    source: Arc<dyn Rollup0L1Source>,
-    blob_config: BlobContextConfig,
     shutdown: impl Future<Output = ()>,
 ) -> eyre::Result<()> {
-    let authority = Arc::new(BlobContextAuthority::new(source, blob_config)?);
-    serve_inner(config, backend, Some(authority), shutdown).await
+    let authority =
+        BlobContextAuthority::from_env(config.expected_rollup_id.get(), backend.chain_id())?
+            .map(Arc::new);
+    serve_inner(config, backend, authority, shutdown).await
 }
 
 async fn serve_inner(

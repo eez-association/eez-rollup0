@@ -154,7 +154,7 @@ jobs:
       - name: Archive integration test executables
         run: |
           mkdir -p artifacts/e2e-build
-          cargo nextest archive --locked --cargo-profile ci-e2e -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test durability --test resumption --test resumption_append --test native_system --test contract_post --archive-file artifacts/e2e-build/tests.tar.zst
+          cargo nextest archive --locked --cargo-profile ci-e2e -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test durability --test resumption --test resumption_append --test native_system --test contract_post --test blob_settlement --archive-file artifacts/e2e-build/tests.tar.zst
       - name: Build E2E runtime binaries
         run: |
           cargo build --locked \
@@ -162,6 +162,7 @@ jobs:
             -p eez-node \
             -p eez-follower \
             -p eez-prover-stateless \
+            -p eez-l1 \
             --bins \
             --examples
       - name: Stage E2E runtime binaries
@@ -171,6 +172,7 @@ jobs:
           cp target/ci-e2e/eez-proof-signer artifacts/e2e-build/
           cp target/ci-e2e/examples/genesis_state_root artifacts/e2e-build/eez-genesis-state-root
           cp target/ci-e2e/examples/genesis_block_hash artifacts/e2e-build/eez-genesis-block-hash
+          cp target/ci-e2e/examples/verify_blob_settlement artifacts/e2e-build/eez-verify-blob-settlement
           strip artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -266,6 +268,9 @@ jobs:
           - id: contract-post
             name: contract post
             filter: binary(=contract_post)
+          - id: blob-settlement
+            name: blob settlement
+            filter: binary(=blob_settlement)
     env:
       EEZ_TEST_PROOF_SIGNER_BIN: ${{ github.workspace }}/artifacts/e2e-build/eez-proof-signer
       EEZ_TEST_LOG_DIR: ${{ github.workspace }}/artifacts/cross-chain-e2e/${{ matrix.suite.id }}/logs
@@ -339,7 +344,7 @@ jobs:
           name: e2e-build
           path: artifacts/e2e-build
       - name: Restore runtime binary permissions
-        run: chmod +x artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash
+        run: chmod +x artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash artifacts/e2e-build/eez-verify-blob-settlement
       - name: Reclaim runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
@@ -356,6 +361,8 @@ jobs:
           kurtosis engine start
       - name: Run Enclave
         run: bash testing/kurtosis/run-ci.sh
+      - name: Verify blob settlement
+        run: bash testing/kurtosis/run-blob-ci.sh
       - name: Stop kurtosis enclave
         if: always()
         run: bash testing/kurtosis/stop.sh

@@ -319,7 +319,7 @@ if [[ "$DIVERGED_LEGACY" -eq 0 ]]; then
     DIV_OK=1
     [[ "$DIVERGED_DERIVER" -eq 0 ]] \
         && echo "    ✓ zero state-root divergence events" \
-        || echo "    ⚠ $DIVERGED_DERIVER deriver-side divergence WARN(s), each followed by a resync from L1 — residual; reconcile is authoritative"
+        || echo "    ⚠ $DIVERGED_DERIVER deriver-side WARN(s) from skipped (state_applied=false) batches — residual; reconcile is authoritative"
 else
     echo "    ✗ legacy divergences: $DIVERGED_LEGACY"
 fi

@@ -63,8 +63,8 @@ impl L1CanonicalHead {
     }
 
     /// The most recently indexed batch, or `None` if empty. Anchor for the
-    /// Deriver's resync: its `post.id.l1_block_hash` is canonicality-checked and
-    /// its `post.id.l1_block` is the scan's lower bound.
+    /// Deriver's resync: its `post.l1_block_hash` is canonicality-checked and
+    /// its `post.l1_block` is the scan's lower bound.
     ///
     /// # Panics
     ///

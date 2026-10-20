@@ -31,6 +31,7 @@ use eez_node_common::{
     L2NodeBuilder, NoRoleArgs, node_cli, read_checkpoint_dir, wait_for_l1_ready,
     warn_on_deprecated_env,
 };
+use reth_chainspec::EthChainSpec as _;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_ethereum::EthereumNode;
 use tokio::sync::mpsc;
@@ -115,15 +116,27 @@ fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
     })
 }
 
-/// Candidate-V1 posting for the configured deployment: the L1 slot grid and
-/// blob schedule the proof signer shares, and the blob-gas fee cap.
+/// Candidate-V1 posting. Blob limits come from the embedded L1 chain spec.
+/// The slot length is `EEZ_L1_BLOCK_TIME_MS`. The proof signer loads the same
+/// chain in its own process.
 fn blob_posting_from_env(
     candidate: Option<eez_protocol::Rollup0Deployment>,
+    chain_spec: std::sync::Arc<reth_chainspec::ChainSpec>,
+    slot_duration: std::time::Duration,
 ) -> eyre::Result<Option<eez_composer::BlobPostingConfig>> {
     let Some(deployment) = candidate else {
         return Ok(None);
     };
-    let (clock, schedule) = eez_blob::l1_schedule_from_env()?;
+    eyre::ensure!(
+        !slot_duration.is_zero() && slot_duration.subsec_nanos() == 0,
+        "EEZ_L1_BLOCK_TIME_MS must be a positive whole number of seconds for candidate V1",
+    );
+    eyre::ensure!(
+        chain_spec.chain_id() == deployment.l1_chain_id,
+        "embedded L1 chain {} differs from EEZ_L1_CHAIN_ID {}",
+        chain_spec.chain_id(),
+        deployment.l1_chain_id,
+    );
     let max_fee_per_blob_gas = env::var("EEZ_L1_MAX_FEE_PER_BLOB_GAS")
         .map_err(|_| eyre::eyre!("EEZ_L1_MAX_FEE_PER_BLOB_GAS is required for candidate V1"))?
         .parse::<u128>()
@@ -132,8 +145,8 @@ fn blob_posting_from_env(
         .ok_or_else(|| eyre::eyre!("EEZ_L1_MAX_FEE_PER_BLOB_GAS must be a nonzero wei amount"))?;
     Ok(Some(eez_composer::BlobPostingConfig {
         deployment,
-        clock,
-        schedule,
+        chain_spec,
+        slot_seconds: slot_duration.as_secs(),
         max_fee_per_blob_gas,
     }))
 }
@@ -408,6 +421,10 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         // Source simulation uses EezEvmConfig's transaction EVM, not its L2 block executor.
         // L1 consensus still uses the upstream Ethereum/Gnosis node executor;
         // the EEZ envelope is used here only by the local composition client.
+        let posting_chain_spec: Arc<reth_chainspec::ChainSpec> = match &l1_variant {
+            EmbeddedL1::Ethereum(handle) => handle.node.chain_spec(),
+            EmbeddedL1::Chiado(handle) => Arc::new(handle.node.chain_spec().inner.clone()),
+        };
         let l1_entry_client: Arc<LocalChainClient> = match l1_variant {
             EmbeddedL1::Ethereum(l1_handle) => {
                 let l1_provider = l1_handle.node.provider.clone();
@@ -558,7 +575,11 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             l1_chain_id: l1_submission_chain_id,
             l1_post_batch_priority_fee,
             ecdsa_proof_system_address,
-            blob_posting: blob_posting_from_env(candidate)?,
+            blob_posting: blob_posting_from_env(
+                candidate,
+                posting_chain_spec,
+                timing.l1_block_time(),
+            )?,
         });
         event!(
             name: "eez.node.evm_composer.ready",
@@ -871,8 +892,7 @@ struct XchainFrontSpec {
     expected_source_chain_id: u64,
 }
 
-/// The blob profile admits no action starting on Rollup0, so it
-/// opens no outbound front and outbound txs are refused at the door.
+/// The blob profile admits only inbound actions, so it opens no outbound front.
 fn xchain_front_specs(l1_chain_id: u64, l2_chain_id: u64, outbound: bool) -> Vec<XchainFrontSpec> {
     let mut specs = vec![XchainFrontSpec {
         port_env: "EEZ_L1_XCHAIN_PORT",
@@ -1083,6 +1103,31 @@ mod tests {
         assert_eq!(specs[1].port_env, "EEZ_L2_XCHAIN_PORT");
         assert_eq!(specs[1].direction, eez_composer::Direction::Outbound);
         assert_eq!(specs[1].expected_source_chain_id, 90_210);
+    }
+
+    #[test]
+    fn blob_posting_rejects_fractional_l1_slots() {
+        let deployment = eez_protocol::Rollup0Deployment {
+            l1_chain_id: 1,
+            l2_chain_id: 10,
+            eez: Address::repeat_byte(1),
+            manager: Address::repeat_byte(2),
+            settlement_wrapper: Address::repeat_byte(3),
+            eez_rollup_id: 1,
+        };
+        let spec = Arc::new(reth_chainspec::ChainSpecBuilder::mainnet().build());
+        for duration in [
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1500),
+        ] {
+            let error =
+                blob_posting_from_env(Some(deployment), spec.clone(), duration).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("positive whole number of seconds")
+            );
+        }
     }
 
     #[test]

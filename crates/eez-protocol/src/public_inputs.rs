@@ -302,7 +302,6 @@ pub fn public_inputs_hashes(batch: &EvmBatch, vkey: B256) -> Result<Vec<B256>, P
     if batch.bindMsgSenderInPublicInput {
         return Err(PublicInputsError::UnsupportedSenderBinding);
     }
-    // Refuses a nonzero block number and blobs.
     let shared = batch_shared_public_input(batch, Address::ZERO)?;
     let custom_data = vec![Bytes::new(); batch.rollupIdsWithProofSystems.len()];
     per_ps_hashes_for(batch, vkey, custom_data, shared)
@@ -321,6 +320,11 @@ pub fn public_inputs_hashes_with_context(
     blob_hashes: &[B256],
     custom_data: Bytes,
 ) -> Result<Vec<B256>, PublicInputsError> {
+    if batch.blockNumber != u64::MAX {
+        return Err(PublicInputsError::UnsupportedBlockNumber {
+            block_number: batch.blockNumber,
+        });
+    }
     if batch.bindMsgSenderInPublicInput {
         return Err(PublicInputsError::UnsupportedSenderBinding);
     }
@@ -643,6 +647,17 @@ mod tests {
                 expected: 1,
                 actual: 0
             }),
+        );
+        let mut wrong_block = batch.clone();
+        wrong_block.blockNumber = 0;
+        assert_eq!(
+            public_inputs_hashes_with_context(
+                &wrong_block,
+                vkey,
+                &blob_hashes,
+                custom_data.clone()
+            ),
+            Err(PublicInputsError::UnsupportedBlockNumber { block_number: 0 }),
         );
         let mut bound = batch.clone();
         bound.bindMsgSenderInPublicInput = true;

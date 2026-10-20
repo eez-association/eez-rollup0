@@ -116,11 +116,8 @@ impl VerifiedBlobDa {
 
 /// The decoded payload plus a cursor into its flat transaction column.
 ///
-/// Parsing is `eez-payload-codec`, the same decoder the composer encodes with
-/// and the deriver reads with. A second implementation here is what let the
-/// wire format drift from the gate that is supposed to police it; the
-/// independence that matters is the VERIFICATION below, which binds the
-/// payload to the validated blocks and never trusts what it decoded.
+/// `eez-payload-codec` handles parsing for the composer, signer, and deriver.
+/// Verification below binds the decoded payload to the validated blocks.
 struct DaPayload {
     span: DecodedSpan,
     actions: Vec<Action>,
@@ -136,24 +133,19 @@ impl DaPayload {
                 }
                 other => invalid_da_payload(other.to_string()),
             })?;
-        // Fatal here, unlike the deriver: we are asked to attest THIS batch,
-        // and a payload for another rollup is not it.
-        if container.rollup_id != expected_rollup_id {
-            return Err(invalid_da_payload(format!(
-                "DA payload carries rollup {} operations, expected {expected_rollup_id}",
-                container.rollup_id,
-            )));
-        }
-        Ok(Self {
-            span: container.span,
-            actions: container.actions,
-            next_transaction: 0,
-        })
+        Self::from_container(container, expected_rollup_id)
     }
 
     fn decode_blobs(blobs: &[Vec<u8>], expected_rollup_id: u64) -> Result<Self, DaPayloadError> {
         let container = eez_payload_codec::decode_blob_container(blobs)
             .map_err(|error| invalid_da_payload(error.to_string()))?;
+        Self::from_container(container, expected_rollup_id)
+    }
+
+    fn from_container(
+        container: eez_payload_codec::DecodedContainer,
+        expected_rollup_id: u64,
+    ) -> Result<Self, DaPayloadError> {
         if container.rollup_id != expected_rollup_id {
             return Err(invalid_da_payload(format!(
                 "DA payload carries rollup {} operations, expected {expected_rollup_id}",
@@ -241,14 +233,9 @@ pub(crate) fn verify_da_payload(
     system_transaction_reconstructor: &SystemTransactionReconstructor,
     expected_rollup_id: u64,
 ) -> Result<(), DaPayloadError> {
-    let settling = validated_window.settling_block();
-    verify_encoded_da_payload(
-        batch.as_batch().callData.as_ref(),
-        validated_window
-            .preceding_blocks()
-            .iter()
-            .map(|block| (block.number(), block.decoded())),
-        (settling.number(), settling.decoded()),
+    verify_decoded_da_payload(
+        DaPayload::decode(&batch.as_batch().callData, expected_rollup_id)?,
+        validated_window,
         outbound_effects,
         inbound_effects,
         system_transaction_reconstructor,
@@ -309,36 +296,12 @@ where
         .map(|(number, rlp)| decode_validated_block(number, rlp).map(|block| (number, block)))
         .collect::<Result<Vec<_>, _>>()?;
     let settling = decode_validated_block(settling_block.0, settling_block.1)?;
-    verify_encoded_da_payload(
-        encoded_payload,
+    verify_decoded_da_payload_parts(
+        DaPayload::decode(encoded_payload, expected_rollup_id)?,
         intermediate_blocks
             .iter()
             .map(|(number, block)| (*number, block)),
         (settling_block.0, &settling),
-        outbound_effects,
-        inbound_effects,
-        system_transaction_reconstructor,
-        expected_rollup_id,
-    )
-}
-
-fn verify_encoded_da_payload<'a, I>(
-    encoded_payload: &[u8],
-    intermediate_blocks: I,
-    settling_block: (u64, &'a EthereumBlock),
-    outbound_effects: &AuthorizedOutboundEffects,
-    inbound_effects: &AuthorizedInboundEffects<'_>,
-    system_transaction_reconstructor: &SystemTransactionReconstructor,
-    expected_rollup_id: u64,
-) -> Result<(), DaPayloadError>
-where
-    I: ExactSizeIterator<Item = (u64, &'a EthereumBlock)>,
-{
-    let payload_cursor = DaPayload::decode(encoded_payload, expected_rollup_id)?;
-    verify_decoded_da_payload_parts(
-        payload_cursor,
-        intermediate_blocks,
-        settling_block,
         outbound_effects,
         inbound_effects,
         system_transaction_reconstructor,

@@ -26,6 +26,7 @@ def run(plan, args):
     eth_args = args["ethereum_package"]
     eez = args.get("eez", {})
     enable_explorers = eez.get("enable_explorers", False)
+    blob_settlement = eez.get("deploy_candidate_v1", False)
     prover_backend = eez.get("prover_backend", "stateless")
     if prover_backend not in ["stateless", "stateful"]:
         fail("eez.prover_backend must be 'stateless' or 'stateful'")
@@ -82,6 +83,15 @@ def run(plan, args):
         store=[StoreSpec(src="/jwt/jwtsecret", name="eez-jwt")],
     )
 
+    blob_env = ""
+    if blob_settlement:
+        blob_env = " ".join([
+            "&& printf '%s\\n'",
+            '"EEZ_L1_MAX_FEE_PER_BLOB_GAS=100000000000"',
+            '"EEZ_L1_BEACON_URL={}"'.format(participants[0].cl_context.beacon_http_url),
+            ">> /out/deployments.env",
+        ])
+
     # Deploy protocol contracts and emit /out/deployments.env + /out/l2-genesis.json.
     deploy = plan.run_sh(
         description="deploy EEZ contracts + generate L2 genesis on the shared L1",
@@ -93,8 +103,9 @@ def run(plan, args):
             "EEZ_L2_RECOVERY_ADDRESS": recovery_address,
             "EEZ_DEPLOYMENTS_FILE": "/out/deployments.env",
             "EEZ_GENESIS_OUT": "/out/l2-genesis.json",
+            "EEZ_DEPLOY_CANDIDATE_V1": "1" if blob_settlement else "0",
         },
-        run="mkdir -p /out && bash /repo/scripts/deploy.sh && cp -R /repo/contracts/broadcast /out/foundry-broadcast",
+        run="mkdir -p /out && bash /repo/scripts/deploy.sh && cp -R /repo/contracts/broadcast /out/foundry-broadcast" + blob_env,
         store=[StoreSpec(src="/out", name="eez-deployments")],
         wait="900s",
     )
@@ -111,6 +122,18 @@ def run(plan, args):
     )
 
     prover_service = "eez-proof-signer"
+    signer_files = {"/out": deploy.files_artifacts[0]}
+    signer_env = {
+        "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+        "EEZ_L1_RPC_URL": l1_el.rpc_http_url,
+        "EEZ_L1_CHAIN_ID": chain_id,
+        "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
+        "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 2000)),
+        "RUST_LOG": eez.get("proof_signer_rust_log", "info"),
+    }
+    if blob_settlement:
+        signer_files["/genesis"] = "el_cl_genesis_data"
+        signer_env["EEZ_L1_CHAIN_CONFIG"] = "/genesis/genesis.json"
     if prover_backend == "stateless":
         plan.add_service(
             name=prover_service,
@@ -123,13 +146,8 @@ def run(plan, args):
                         wait="2m",
                     ),
                 },
-                files={
-                    "/out": deploy.files_artifacts[0],
-                },
-                env_vars={
-                    "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
-                    "RUST_LOG": eez.get("proof_signer_rust_log", "info"),
-                },
+                files=signer_files,
+                env_vars=signer_env,
                 entrypoint=["/bin/sh", "-c"],
                 cmd=[signer_cmd],
             ),
@@ -169,11 +187,10 @@ def run(plan, args):
                         application_protocol="http",
                     ),
                 },
-                files={
-                    "/out": deploy.files_artifacts[0],
-                },
+                files=signer_files,
                 env_vars={
                     "EEZ_L1_RPC_URL": l1_el.rpc_http_url,
+                    "EEZ_L1_CHAIN_CONFIG": "/genesis/genesis.json" if blob_settlement else "",
                     "EEZ_L1_CHAIN_ID": chain_id,
                     "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
                     "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 2000)),
@@ -243,31 +260,28 @@ def run(plan, args):
         ]
     )
 
+    node_ports = {
+        "l1-engine": PortSpec(
+            number=EMBEDDED_L1_ENGINE_PORT, transport_protocol="TCP"
+        ),
+        "l2-rpc": PortSpec(
+            number=L2_RPC_PORT, transport_protocol="TCP", application_protocol="http"
+        ),
+        "l1-xchain": PortSpec(
+            number=L1_XCHAIN_PORT, transport_protocol="TCP", application_protocol="http"
+        ),
+    }
+    if not blob_settlement:
+        node_ports["l2-xchain"] = PortSpec(
+            number=L2_XCHAIN_PORT, transport_protocol="TCP", application_protocol="http"
+        )
+
     # Follower beacon drives eez-node's embedded reth over the engine API.
     plan.add_service(
         name="eez-node",
         config=ServiceConfig(
             image=eez.get("eez_node_image", "eez-node:dev"),
-            ports={
-                "l1-engine": PortSpec(
-                    number=EMBEDDED_L1_ENGINE_PORT, transport_protocol="TCP"
-                ),
-                "l2-rpc": PortSpec(
-                    number=L2_RPC_PORT,
-                    transport_protocol="TCP",
-                    application_protocol="http",
-                ),
-                "l1-xchain": PortSpec(
-                    number=L1_XCHAIN_PORT,
-                    transport_protocol="TCP",
-                    application_protocol="http",
-                ),
-                "l2-xchain": PortSpec(
-                    number=L2_XCHAIN_PORT,
-                    transport_protocol="TCP",
-                    application_protocol="http",
-                ),
-            },
+            ports=node_ports,
             files={
                 "/out": deploy.files_artifacts[0],
                 "/genesis": "el_cl_genesis_data",

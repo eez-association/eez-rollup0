@@ -4,9 +4,9 @@ use std::{fmt, sync::Arc};
 
 use alloy_primitives::{Address, B256, Bytes};
 use async_trait::async_trait;
-use eez_blob::{BlobSchedule, L1SlotClock};
 use eez_control_rpc::v2;
 use eez_protocol::Rollup0Deployment;
+use reth_chainspec::{ChainSpec, EthChainSpec as _};
 use thiserror::Error;
 
 /// Caller-proposed L1 target before authentication.
@@ -29,12 +29,13 @@ pub struct SettlementState {
 }
 
 /// Values derived from one coherent, canonical L1 snapshot. Only
-/// [`AppendixDBlobAuthority::authenticate`] constructs one.
+/// [`BlobContextAuthority::authenticate`] constructs one.
 #[derive(Debug, Clone)]
 pub struct AuthenticatedBlobContext {
     custom_data: Bytes,
     max_blobs: usize,
     sync_interval: u64,
+    target_timestamp: u64,
 }
 
 impl AuthenticatedBlobContext {
@@ -48,6 +49,10 @@ impl AuthenticatedBlobContext {
 
     pub(crate) const fn sync_interval(&self) -> u64 {
         self.sync_interval
+    }
+
+    pub(crate) const fn target_timestamp(&self) -> u64 {
+        self.target_timestamp
     }
 }
 
@@ -82,32 +87,42 @@ pub trait Rollup0L1Source: Send + Sync + fmt::Debug {
     ) -> Result<SettlementState, BlobContextError>;
 }
 
-/// Trusted blob-settlement configuration: the deployment, the L1 slot grid
-/// and blob schedule shared with the Composer, and the L2 Sync interval.
+/// Trusted blob-settlement configuration. Blob limits come from `chain_spec`.
+/// The slot length is the L1 block time. The composer uses its own embedded
+/// copy of that spec.
 #[derive(Debug, Clone)]
-pub struct AppendixDBlobConfig {
+pub struct BlobContextConfig {
     pub deployment: Rollup0Deployment,
-    pub clock: L1SlotClock,
-    pub schedule: BlobSchedule,
+    pub chain_spec: Arc<ChainSpec>,
+    pub slot_seconds: u64,
     /// L2 blocks per Sync interval (`K`); a candidate ends on this grid.
     pub sync_interval: u64,
 }
 
 /// Blob-settlement authority built over an independently configured canonical L1 source.
 #[derive(Debug)]
-pub struct AppendixDBlobAuthority {
+pub struct BlobContextAuthority {
     source: Arc<dyn Rollup0L1Source>,
-    config: AppendixDBlobConfig,
+    config: BlobContextConfig,
 }
 
-impl AppendixDBlobAuthority {
+impl BlobContextAuthority {
     pub fn new(
         source: Arc<dyn Rollup0L1Source>,
-        config: AppendixDBlobConfig,
+        config: BlobContextConfig,
     ) -> Result<Self, BlobContextError> {
         // A Sync slot needs Live blocks around it, so K >= 2 (RollupTiming).
         let deployment = &config.deployment;
-        if deployment.l1_chain_id == 0 || deployment.l2_chain_id == 0 || config.sync_interval < 2 {
+        if config.chain_spec.chain_id() != deployment.l1_chain_id
+            || deployment.l1_chain_id == 0
+            || deployment.l2_chain_id == 0
+            || deployment.eez_rollup_id == 0
+            || deployment.eez.is_zero()
+            || deployment.manager.is_zero()
+            || deployment.settlement_wrapper.is_zero()
+            || config.slot_seconds == 0
+            || config.sync_interval < 2
+        {
             return Err(BlobContextError::Invalid(
                 "blob-settlement deployment configuration",
             ));
@@ -143,14 +158,13 @@ impl AppendixDBlobAuthority {
         if canonical_hash != requested.parent_hash {
             return Err(BlobContextError::StaleTarget);
         }
-        if requested.target_timestamp <= parent_timestamp {
+        if !eez_blob::on_later_slot(
+            parent_timestamp,
+            requested.target_timestamp,
+            self.config.slot_seconds,
+        ) {
             return Err(BlobContextError::Invalid(
-                "target timestamp is not after parent",
-            ));
-        }
-        if !self.config.clock.is_slot_start(requested.target_timestamp) {
-            return Err(BlobContextError::Invalid(
-                "target is not on an L1 slot boundary",
+                "target is not on a later L1 slot",
             ));
         }
         // The signed domain binds the live wrapper, so rotation stops signing.
@@ -163,13 +177,12 @@ impl AppendixDBlobAuthority {
         if state.root != selected_parent {
             return Err(BlobContextError::WrongSettledCursor);
         }
-        let max_blobs = self
-            .config
-            .schedule
-            .max_blobs_at(requested.target_timestamp)
-            .ok_or(BlobContextError::Invalid(
-                "no blob fork is active at the target",
-            ))?;
+        let max_blobs =
+            eez_blob::blob_limit_at(&self.config.chain_spec, requested.target_timestamp)
+                .ok_or(BlobContextError::Invalid(
+                    "no blob fork is active at the target",
+                ))?
+                .max_blobs;
         let Some((final_hash, final_timestamp)) = self
             .source
             .canonical_header(requested.parent_number)
@@ -184,6 +197,7 @@ impl AppendixDBlobAuthority {
             custom_data: deployment.custom_data(requested.target_timestamp, requested.parent_hash),
             max_blobs,
             sync_interval: self.config.sync_interval,
+            target_timestamp: requested.target_timestamp,
         })
     }
 }
@@ -206,8 +220,6 @@ pub(crate) fn parse_posting_context(
         parent_hash,
     })
 }
-
-pub(crate) type SharedBlobContextAuthority = Arc<AppendixDBlobAuthority>;
 
 #[cfg(test)]
 mod tests {
@@ -279,8 +291,8 @@ mod tests {
         }
     }
 
-    fn config() -> AppendixDBlobConfig {
-        AppendixDBlobConfig {
+    fn config() -> BlobContextConfig {
+        BlobContextConfig {
             deployment: Rollup0Deployment {
                 l1_chain_id: 1,
                 eez: address!("1111111111111111111111111111111111111111"),
@@ -289,14 +301,39 @@ mod tests {
                 eez_rollup_id: 7,
                 l2_chain_id: 10,
             },
-            clock: L1SlotClock::new(100, 12).unwrap(),
-            schedule: "0:6:2:eip4844".parse().unwrap(),
+            chain_spec: Arc::new(
+                reth_chainspec::ChainSpecBuilder::mainnet()
+                    .cancun_activated()
+                    .build(),
+            ),
+            slot_seconds: 12,
             sync_interval: 6,
         }
     }
 
-    fn authority() -> AppendixDBlobAuthority {
-        AppendixDBlobAuthority::new(Arc::new(Source), config()).unwrap()
+    fn authority() -> BlobContextAuthority {
+        BlobContextAuthority::new(Arc::new(Source), config()).unwrap()
+    }
+
+    #[test]
+    fn rejects_incomplete_deployments_and_zero_slot_length() {
+        for field in 0..8 {
+            let mut invalid = config();
+            match field {
+                0 => invalid.deployment.l1_chain_id = 0,
+                1 => invalid.deployment.l2_chain_id = 0,
+                2 => invalid.deployment.eez_rollup_id = 0,
+                3 => invalid.deployment.eez = Address::ZERO,
+                4 => invalid.deployment.manager = Address::ZERO,
+                5 => invalid.deployment.settlement_wrapper = Address::ZERO,
+                6 => invalid.slot_seconds = 0,
+                _ => invalid.sync_interval = 1,
+            }
+            assert!(matches!(
+                BlobContextAuthority::new(Arc::new(Source), invalid),
+                Err(BlobContextError::Invalid(_))
+            ));
+        }
     }
 
     #[tokio::test]
@@ -311,7 +348,7 @@ mod tests {
             .authenticate(target, B256::repeat_byte(0xbb))
             .await
             .unwrap();
-        assert_eq!(context.max_blobs(), 2);
+        assert_eq!(context.max_blobs(), 6);
         assert_eq!(context.sync_interval(), 6);
         assert_eq!(
             context.custom_data(),
@@ -362,14 +399,14 @@ mod tests {
                 .await,
             Err(BlobContextError::WrongSettledCursor)
         ));
-        let rotated = AppendixDBlobConfig {
+        let rotated = BlobContextConfig {
             deployment: Rollup0Deployment {
                 settlement_wrapper: address!("4444444444444444444444444444444444444444"),
                 ..config().deployment
             },
             ..config()
         };
-        let rotated = AppendixDBlobAuthority::new(Arc::new(Source), rotated).unwrap();
+        let rotated = BlobContextAuthority::new(Arc::new(Source), rotated).unwrap();
         assert!(matches!(
             rotated.authenticate(base, selected).await,
             Err(BlobContextError::WrongDeployment)
@@ -379,7 +416,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_reorg_during_snapshot_reads() {
         let authority =
-            AppendixDBlobAuthority::new(Arc::new(ReorgingSource(AtomicUsize::new(0))), config())
+            BlobContextAuthority::new(Arc::new(ReorgingSource(AtomicUsize::new(0))), config())
                 .unwrap();
         let result = authority
             .authenticate(

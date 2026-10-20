@@ -36,11 +36,15 @@ ids strictly increase (`:578-584`).
 
 ## Calls
 
-- **Direct post.** `tx.to` is EEZ and the input starts with the selector: the
-  bytes are `tx.input`, the sender `tx.from`, and every scanned log is the post's.
+- **Direct post.** `tx.to` is EEZ, or the configured settlement wrapper, and the
+  input starts with the selector. The wrapper forwards that calldata in one
+  EEZ call, so the bytes are `tx.input`. `sender` is `tx.from` for a direct EEZ
+  post and the wrapper for a wrapper post. `tx_sender` is the outer signer
+  either way. Every scanned log is the post's.
 - **Contract post.** Anything else (router, Safe, ERC-4337, EIP-7702,
   `EEZPostBatcher`) may build the bytes in memory, so the scan traces the block
   with `debug_traceBlockByHash` (`callTracer`, `withLog`), pinned by hash.
+  `tx_sender` is the traced transaction's signer.
 
 The walk drops every frame with an `error` or `revertReason`, and its subtree.
 A call is a committed `CALL` to EEZ with the selector, sent by the frame's
@@ -61,11 +65,13 @@ Each call whose post lists this rollup is checked against its own `BatchPosted`:
    a candidate-V1 carrier: `blockNumber == uint64.max`, empty `callData` and
    `blobIndices == [0, n)` over the tx's `n` blobs (`Decode` otherwise). Any
    other shape is `Unsupported`;
-4. the shared public input equals `sharedPublicInput` (`:753-762`), else
-   `Decode`, or `Unsupported` when another listed rollup may bind `customData`
-   the scan cannot reproduce. A Rollup0 blob post binds the tx's versioned
-   hashes and manager data derived from its own block's timestamp and
-   parent. The proof signer uses the same composition, so the two cannot drift.
+4. the shared public input equals `sharedPublicInput`, else `Decode`, or
+   `Unsupported` when another listed rollup may bind `customData` the scan
+   cannot reproduce. A Rollup0 blob post binds the tx's versioned hashes and
+   manager data derived from its own block's timestamp and parent. Historical
+   posts use their committed EEZ caller as the wrapper, so rotating the wrapper
+   does not invalidate earlier history. The proof signer authenticates the
+   active wrapper from its own L1 read before signing a new candidate.
 
 Derivation fetches a settled, unprocessed candidate-V1 post's blobs from
 `EEZ_L1_BEACON_URL` and keeps only those matching its versioned hashes.

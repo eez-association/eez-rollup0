@@ -14,6 +14,10 @@ eez-node.workspace     = true
 eyre.workspace         = true
 
 [dev-dependencies]
+eez-payload-codec.workspace = true
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 alloy-consensus-any.workspace = true
 jsonrpsee.workspace = true
 alloy-eips.workspace = true
@@ -32,6 +36,7 @@ alloy-signer-local.workspace = true
 alloy-sol-types.workspace = true
 anyhow = "1"
 eez-control-rpc.workspace = true
+eez-blob.workspace = true
 eez-protocol.workspace = true
 eez-testkit.workspace = true
 reth-chainspec.workspace = true

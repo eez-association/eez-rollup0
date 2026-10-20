@@ -67,7 +67,7 @@ pub const STAGING_USER_KEY: &str =
     "0x6f7d72ecb79c8bf1bd8e7c49a1c4a22741ab708f06bb19e5b5d44a6f0934a7c1";
 
 // K = L1/L2 = 2 leaves one L2 slot for proving.
-const L1_BLOCK_TIME_SECS: u64 = 4;
+pub const L1_BLOCK_TIME_SECS: u64 = 4;
 
 // Consumed by the launcher as `--chain`; never forwarded to `eez-node`.
 const TEST_L2_GENESIS_ENV: &str = "EEZ_TEST_L2_GENESIS_PATH";
@@ -130,6 +130,7 @@ struct AnvilConfig {
     block_time_secs: u64,
     gas_limit: u64,
     genesis_timestamp: u64,
+    hardfork: Option<&'static str>,
 }
 
 impl AnvilConfig {
@@ -138,6 +139,7 @@ impl AnvilConfig {
             block_time_secs: L1_BLOCK_TIME_SECS,
             gas_limit: 30_000_000,
             genesis_timestamp,
+            hardfork: None,
         }
     }
 }
@@ -160,6 +162,9 @@ impl Anvil {
         ]);
         cmd.args(["--gas-limit", &cfg.gas_limit.to_string()]);
         cmd.args(["--timestamp", &cfg.genesis_timestamp.to_string()]);
+        if let Some(hardfork) = cfg.hardfork {
+            cmd.args(["--hardfork", hardfork]);
+        }
         cmd.stdout(Stdio::from(log)).stderr(Stdio::from(err_log));
         drop(port_lease);
         let mut child = cmd.spawn().context("spawn anvil")?;
@@ -263,7 +268,7 @@ impl BuilderStubMode {
 }
 
 impl BundleStub {
-    async fn spawn(port_lease: PortLease, upstream: &str) -> Result<Self> {
+    async fn spawn(port_lease: PortLease, upstream: &str, beacon: Option<&str>) -> Result<Self> {
         let port = port_lease.port();
         let script = repo_root().join("scripts/builder-stub.py");
         let listen = format!("127.0.0.1:{port}");
@@ -273,7 +278,11 @@ impl BundleStub {
         let mut command = Command::new("python3");
         command
             .arg(script)
-            .args(["--listen", &listen, "--upstream", upstream])
+            .args(["--listen", &listen, "--upstream", upstream]);
+        if let Some(beacon) = beacon {
+            command.args(["--beacon", beacon]);
+        }
+        command
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err_log));
         drop(port_lease);
@@ -400,6 +409,7 @@ struct ProofSignerConfig<'a> {
     /// unauthorized-signer tests.
     vkey: B256,
     proof_system: Address,
+    extra_env: &'a [(&'static str, String)],
 }
 
 /// Owns a proof-signer process and its diagnostic log.
@@ -449,6 +459,11 @@ impl ProofSignerHandle {
             .env("EEZ_PROOF_SIGNER_KEY", cfg.signer_key)
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "info")
+            .envs(
+                cfg.extra_env
+                    .iter()
+                    .map(|(key, value)| (*key, value.as_str())),
+            )
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err_log));
         drop(port_lease);
@@ -791,6 +806,10 @@ pub struct Harness {
     l2_genesis: (PathBuf, tempfile::TempDir),
     // Each composer gets isolated state because the signer admits one request at a time.
     provers: std::sync::Mutex<Vec<(ProofSignerHandle, tempfile::TempDir)>>,
+    /// Extra signer environment for candidate V1. Empty on the calldata harness.
+    signer_env: Vec<(&'static str, String)>,
+    beacon_url: Option<String>,
+    _l1_genesis: Option<tempfile::TempDir>,
 }
 
 impl Harness {
@@ -808,7 +827,7 @@ impl Harness {
         l2_genesis: (PathBuf, tempfile::TempDir),
     ) -> Result<Self> {
         let anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
-        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url).await?;
+        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url, None).await?;
         let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
         Ok(Self {
             anvil,
@@ -816,6 +835,62 @@ impl Harness {
             dep,
             l2_genesis,
             provers: std::sync::Mutex::new(Vec::new()),
+            signer_env: Vec::new(),
+            beacon_url: None,
+            _l1_genesis: None,
+        })
+    }
+
+    /// Anvil, builder, and candidate-V1 deployment. `beacon_url` receives every
+    /// type-3 bundle the builder forwards, before `eth_sendBundle` returns.
+    pub async fn blob(beacon_url: &str) -> Result<Self> {
+        let ts = now_unix_secs();
+        let l2_genesis = write_l2_genesis_at(ts)?;
+        let mut cfg = AnvilConfig::standard(ts);
+        cfg.hardfork = Some("osaka");
+        let anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
+        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url, Some(beacon_url)).await?;
+        let dep = deploy_candidate_v1_with_initial(
+            &anvil.rpc_url,
+            ANVIL_KEY,
+            l2_genesis_block_hash_at(ts)?,
+        )
+        .await?;
+        let l1_genesis_dir = tempfile::tempdir().context("L1 genesis tempdir")?;
+        let l1_genesis_path = l1_genesis_dir.path().join("genesis.json");
+        std::fs::write(&l1_genesis_path, l1_chain_genesis(DEV_CHAIN_ID))?;
+        let wrapper = dep
+            .settlement_wrapper
+            .context("candidate V1 deployment has no wrapper")?;
+        let signer_env = vec![
+            ("EEZ_REGISTRY_ADDRESS", format!("{:#x}", dep.eez_address)),
+            (
+                "EEZ_ROLLUP_MANAGER_ADDRESS",
+                format!("{:#x}", dep.rollup_manager_address),
+            ),
+            ("EEZ_SETTLEMENT_WRAPPER_ADDRESS", format!("{wrapper:#x}")),
+            ("EEZ_ROLLUP_ID", dep.rollup_id.to_string()),
+            ("EEZ_L1_RPC_URL", anvil.rpc_url.clone()),
+            ("EEZ_L1_CHAIN_ID", DEV_CHAIN_ID.to_string()),
+            (
+                "EEZ_L1_BLOCK_TIME_MS",
+                (L1_BLOCK_TIME_SECS * 1000).to_string(),
+            ),
+            ("EEZ_L2_BLOCK_TIME_MS", "2000".to_string()),
+            (
+                "EEZ_L1_CHAIN_CONFIG",
+                l1_genesis_path.to_string_lossy().into_owned(),
+            ),
+        ];
+        Ok(Self {
+            anvil,
+            stub,
+            dep,
+            l2_genesis,
+            provers: std::sync::Mutex::new(Vec::new()),
+            signer_env,
+            beacon_url: Some(beacon_url.to_owned()),
+            _l1_genesis: Some(l1_genesis_dir),
         })
     }
 
@@ -984,6 +1059,18 @@ impl Harness {
             ),
         ];
 
+        if let Some(wrapper) = self.dep.settlement_wrapper {
+            let beacon = self
+                .beacon_url
+                .as_deref()
+                .context("candidate V1 harness has no beacon stub")?;
+            env.extend([
+                ("EEZ_SETTLEMENT_WRAPPER_ADDRESS", format!("{wrapper:#x}")),
+                ("EEZ_L1_BEACON_URL", beacon.to_owned()),
+                ("EEZ_L1_MAX_FEE_PER_BLOB_GAS", "1000000000000".to_owned()),
+            ]);
+        }
+
         if let Some(poster_key) = opts.poster_key {
             env.extend([
                 ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
@@ -1003,6 +1090,7 @@ impl Harness {
                 // Unauthorized-signer tests still hash the registry's vkey.
                 vkey: signer_address(ANVIL_ATTESTER_KEY)?.into_word(),
                 proof_system: self.dep.proof_system_address,
+                extra_env: &self.signer_env,
             })
             .await?;
             let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
@@ -1040,6 +1128,8 @@ pub struct Deployment {
     pub proof_system_address: Address,
     pub rollup_manager_address: Address,
     pub rollup_id: u64,
+    /// Candidate V1 settlement wrapper. `None` keeps the calldata profile.
+    pub settlement_wrapper: Option<Address>,
     /// The commitment `registerRollup` seeded: the L2 genesis BLOCK HASH.
     /// Recorded so tests compare against what was registered rather than
     /// recomputing a genesis value of the wrong kind.
@@ -1066,6 +1156,11 @@ sol! {
             address[] proofSystems,
             bytes32[] vkeys
         ) external;
+    }
+
+    interface IRollup0Manager {
+        function initialize(address initialOwner, address[] proofSystems, bytes32[] vkeys) external;
+        function setSettlementWrapper(address wrapper) external;
     }
 }
 
@@ -1298,8 +1393,155 @@ async fn deploy_contracts_with_initial(
         proof_system_address,
         rollup_manager_address,
         rollup_id,
+        settlement_wrapper: None,
         initial_commitment: initial_state,
     })
+}
+
+async fn deploy_candidate_v1_with_initial(
+    rpc_url: &str,
+    key: &str,
+    initial_state: B256,
+) -> Result<Deployment> {
+    let signer: PrivateKeySigner = key
+        .strip_prefix("0x")
+        .unwrap_or(key)
+        .parse()
+        .context("parse signer key")?;
+    let signer_addr = signer.address();
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    let out = repo_root().join("contracts/out");
+    let l2_chain_id = fixture_genesis()?.config.chain_id;
+
+    let eez_address = deploy(
+        &provider,
+        signer_addr,
+        &out.join("EEZ.sol/EEZ.json"),
+        signer_addr.abi_encode(),
+    )
+    .await?;
+    let deploy_block = provider.get_block_number().await?;
+    let attester = signer_address(ANVIL_ATTESTER_KEY)?;
+    let proof_system_address = deploy(
+        &provider,
+        signer_addr,
+        &out.join("ECDSAProofSystem.sol/ECDSAProofSystem.json"),
+        attester.abi_encode(),
+    )
+    .await?;
+    let proof_systems = vec![proof_system_address];
+    let vkeys = vec![attester.into_word()];
+    let manager_implementation = deploy(
+        &provider,
+        signer_addr,
+        &out.join("Rollup0Manager.sol/Rollup0Manager.json"),
+        (eez_address, U256::from(l2_chain_id)).abi_encode_params(),
+    )
+    .await?;
+    let initialize = IRollup0Manager::initializeCall {
+        initialOwner: signer_addr,
+        proofSystems: proof_systems,
+        vkeys,
+    }
+    .abi_encode();
+    let rollup_manager_address = deploy(
+        &provider,
+        signer_addr,
+        &out.join("TransparentUpgradeableProxy.sol/TransparentUpgradeableProxy.json"),
+        (manager_implementation, signer_addr, Bytes::from(initialize)).abi_encode_params(),
+    )
+    .await?;
+    let settlement_wrapper = deploy(
+        &provider,
+        signer_addr,
+        &out.join("Rollup0SettlementWrapper.sol/Rollup0SettlementWrapper.json"),
+        (eez_address, rollup_manager_address).abi_encode_params(),
+    )
+    .await?;
+    let activate = IRollup0Manager::setSettlementWrapperCall {
+        wrapper: settlement_wrapper,
+    }
+    .abi_encode();
+    let activation = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .from(signer_addr)
+                .to(rollup_manager_address)
+                .input(activate.into()),
+        )
+        .await?
+        .get_receipt()
+        .await?;
+    if !activation.status() {
+        bail!("setSettlementWrapper reverted");
+    }
+    let calldata = IEEZ::registerRollupCall {
+        rollupContract: rollup_manager_address,
+        initialState: initial_state,
+    }
+    .abi_encode();
+    let receipt = provider
+        .send_transaction(
+            TransactionRequest::default()
+                .from(signer_addr)
+                .to(eez_address)
+                .input(calldata.into()),
+        )
+        .await?
+        .get_receipt()
+        .await?;
+    if !receipt.status() {
+        bail!("registerRollup tx reverted");
+    }
+    let registry = IEEZ::new(eez_address, &provider);
+    let rollup_id = registry.rollupCounter().call().await?.try_into()?;
+    Ok(Deployment {
+        eez_address,
+        deploy_block,
+        proof_system_address,
+        rollup_manager_address,
+        rollup_id,
+        settlement_wrapper: Some(settlement_wrapper),
+        initial_commitment: initial_state,
+    })
+}
+
+fn l1_chain_genesis(chain_id: u64) -> String {
+    format!(
+        r#"{{
+  "config": {{
+    "chainId": {chain_id},
+    "homesteadBlock": 0,
+    "eip150Block": 0,
+    "eip155Block": 0,
+    "eip158Block": 0,
+    "byzantiumBlock": 0,
+    "constantinopleBlock": 0,
+    "petersburgBlock": 0,
+    "istanbulBlock": 0,
+    "muirGlacierBlock": 0,
+    "berlinBlock": 0,
+    "londonBlock": 0,
+    "arrowGlacierBlock": 0,
+    "grayGlacierBlock": 0,
+    "terminalTotalDifficulty": 0,
+    "shanghaiTime": 0,
+    "cancunTime": 0,
+    "pragueTime": 0,
+    "osakaTime": 0
+  }},
+  "nonce": "0x0",
+  "timestamp": "0x0",
+  "gasLimit": "0x1c9c380",
+  "difficulty": "0x0",
+  "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "coinbase": "0x0000000000000000000000000000000000000000",
+  "alloc": {{}},
+  "number": "0x0",
+  "gasUsed": "0x0",
+  "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+}}"#
+    )
 }
 
 async fn deploy<P: Provider>(
@@ -3044,6 +3286,7 @@ pub async fn deploy_protocol_dev(
         proof_system_address,
         rollup_manager_address,
         rollup_id,
+        settlement_wrapper: None,
         initial_commitment: initial_state,
     })
 }
@@ -4585,6 +4828,7 @@ async fn setup_cross_chain_inner(
         signer_key: cfg.attester_key,
         vkey: signer_address(cfg.attester_key)?.into_word(),
         proof_system: cfg.proof_system_address,
+        extra_env: &[],
     })
     .await?;
     let prover_proxy = match mutation {

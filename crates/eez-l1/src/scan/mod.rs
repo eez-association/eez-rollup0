@@ -206,7 +206,12 @@ async fn read_logs(
                 let tx = fetch_log_transaction(logs, number, block_hash, index, hash).await?;
                 let blob_hashes = tx.blob_versioned_hashes().unwrap_or_default().to_vec();
                 carries_blobs |= !blob_hashes.is_empty();
-                if let Some(call) = direct_call(&tx, eez, count) {
+                if let Some(call) = direct_call(
+                    &tx,
+                    eez,
+                    candidate.map(|deployment| deployment.settlement_wrapper),
+                    count,
+                ) {
                     calls.insert(index, (vec![call], count));
                 } else {
                     traced.push((index, hash, blob_hashes));
@@ -402,6 +407,7 @@ mod tests {
         Call {
             input,
             from,
+            tx_sender: from,
             logs,
             blob_hashes: Vec::new(),
         }
@@ -787,6 +793,19 @@ mod tests {
     }
 
     #[test]
+    fn routed_post_preserves_the_outer_transaction_sender() {
+        let input = call(&ours(0, H), ROUTER, 0).input;
+        let mut inner = frame("CALL", EEZ, &input, 1, Vec::new());
+        inner.from = ROUTER;
+        let mut root = frame("CALL", ROUTER, &Bytes::new(), 0, vec![inner]);
+        root.from = EOA;
+        let (calls, _) = calls_in_tx(&root, EEZ, "routed post").unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].from, ROUTER);
+        assert_eq!(calls[0].tx_sender, EOA);
+    }
+
+    #[test]
     fn the_walk_reads_committed_post_calls_only() {
         let (input, other) = (
             call(&ours(0, H), EOA, 0).input,
@@ -827,8 +846,13 @@ mod tests {
         for (to, input, direct) in cases {
             let tx = signed_tx(to, input.clone(), 0);
             let expected = direct.then(|| call(&ours(0, H), EOA, 4));
-            assert_eq!(direct_call(&tx, EEZ, 4), expected, "{to} {input}");
+            assert_eq!(direct_call(&tx, EEZ, None, 4), expected, "{to} {input}");
         }
+        let wrapper = Address::repeat_byte(0x3b);
+        let tx = signed_tx(wrapper, input.clone(), 0);
+        let mut expected = call(&ours(0, H), wrapper, 4);
+        expected.tx_sender = EOA;
+        assert_eq!(direct_call(&tx, EEZ, Some(wrapper), 4), Some(expected));
     }
 
     fn mock() -> (Asserter, impl Provider) {
@@ -1065,7 +1089,8 @@ mod tests {
             .zip(logs)
             .map(|(i, data)| rpc_log(0, i, data))
             .collect();
-        let mut tx_call = call(carried, EOA, logs.len());
+        let mut tx_call = call(carried, DEPLOYMENT.settlement_wrapper, logs.len());
+        tx_call.tx_sender = EOA;
         tx_call.blob_hashes = blob_hashes.to_vec();
         let calls = Calls::from([(0, (vec![tx_call], logs.len()))]);
         read_block(&group_blocks(&logs)?.remove(0), &calls, US, candidate)
@@ -1082,6 +1107,16 @@ mod tests {
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].blob_hashes, hashes);
         assert_eq!(posts[0].settlement, s(&[(0, A)], 0, 1));
+
+        let rotated = Rollup0Deployment {
+            settlement_wrapper: Address::repeat_byte(0x3C),
+            ..DEPLOYMENT
+        };
+        let historical = CandidateBlock {
+            deployment: &rotated,
+            ..ours
+        };
+        assert!(read_v1(&candidate_v1(), &hashes, Some(&historical)).is_ok());
 
         // Without the configured deployment the customData is not reproducible.
         let err = read_v1(&candidate_v1(), &hashes, None).unwrap_err();

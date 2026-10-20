@@ -28,20 +28,7 @@ pub async fn run() -> eyre::Result<()> {
         expected_rollup_id,
         attester: config.attester,
     };
-    let l2_chain_id = backend.chain_id();
-    match eez_proof_signer::BlobServiceConfig::from_env(expected_rollup_id.get(), l2_chain_id)? {
-        Some(blob) => {
-            eez_proof_signer::serve_with_blob_source(
-                server,
-                backend,
-                blob.source,
-                blob.authority,
-                shutdown_signal(),
-            )
-            .await
-        }
-        None => eez_proof_signer::serve(server, backend, shutdown_signal()).await,
-    }
+    eez_proof_signer::serve_from_env(server, backend, shutdown_signal()).await
 }
 
 /// Stop accepting connections on Ctrl-C or SIGTERM.

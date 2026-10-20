@@ -34,7 +34,9 @@ the spec are appropriate in repository documentation.
   detached work rather than terminating it halfway through execution.
 - The active settlement profile accepts an anchor followed by zero or more
   supported outbound effects and then zero or more supported successful inbound
-  effects. Richer or ambiguous shapes fail closed.
+  effects. The candidate-V1 blob profile accepts an anchor followed only by
+  supported successful inbound effects.
+  Richer or ambiguous shapes fail closed.
 - Backends bind/decode inputs, execute them, and construct immutable checked
   blocks before publishing reusable evidence. Both RPCs prepare checkpoints only
   for sync blocks; ordinary blocks use ordinary execution. V2 caches and
@@ -69,6 +71,8 @@ See [architecture](docs/architecture.md),
 - An attestation does not claim canonical ancestry, sequencer authority, live
   L1 applicability, successful future L1 execution, dispatch mode, or the code
   identity and funding mechanism at the pinned EEZL2 address.
+  Candidate V1 additionally checks the settled L1 cursor and active deployment
+  at the posting parent before signing.
 
 ## Reuse canonical implementations
 

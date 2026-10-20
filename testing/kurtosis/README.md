@@ -7,6 +7,19 @@ starts the node, proof signer, private PoS L1, and MEV builder stack.
 The included configuration contains deterministic private-network keys. Never
 use these keys on a public network or fund them with real assets.
 
+## Blob settlement tests
+
+Run `bash testing/kurtosis/run-blob-ci.sh` to start a disposable blob network
+and verify canonical type-3 posts, beacon DA, missed proposals, and multi-blob
+catch-up. To verify an existing blob network, run
+`bash testing/kurtosis/scripts/verify-blob-da.sh`.
+The ordinary CI runner retains outbound and mixed-direction regression coverage.
+
+The `eez-node-e2e` suite `blob_settlement` covers missed slots, fee-cap refusal,
+multi-blob catch-up, L1 reorgs, and independent follower replay using Anvil and
+a beacon stub. Run it with `cargo test -p eez-node-e2e --test blob_settlement`.
+The Kurtosis lane above separately verifies blob retrieval from a real beacon.
+
 ## Quick start
 
 Run every command from the repository root.
@@ -588,6 +601,9 @@ Kurtosis assigns different host ports automatically. Remember that
 - `start.sh` and `stop.sh`: local network lifecycle.
 - `ports.sh`: endpoint discovery, summary, and shell exports.
 - `scripts/verify-eezl2-deployment.sh`: live EEZL2 deployment verification.
+- `scripts/verify-blob-da.sh`: authenticate beacon blobs and compare their
+  decoded payloads with settled L2 block bodies. CI supplies the verifier binary;
+  `EEZ_BLOB_VERIFIER_BIN` selects a host-native build for local runs.
 - `scripts/verify-eezl2-blockscout.sh`: L2 Blockscout source verification for
   the genesis-installed EEZL2 contract.
 - `scripts/cross-chain-wave.sh`: individual cross-chain workload modes.

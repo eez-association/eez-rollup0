@@ -910,9 +910,7 @@ impl SessionRuntime {
                 super::settlement_job::BlobSettlementInput {
                     blobs: &settlement.blobs,
                     context,
-                    kzg_settings: state
-                        .blob_kzg_settings
-                        .expect("blob authority and KZG settings are configured together"),
+                    kzg_settings: eez_blob::EnvKzgSettings::Default.get(),
                 }
             });
             let hash = run_settlement(SettlementInput {
@@ -966,6 +964,7 @@ impl SessionRuntime {
             session_id = %bound.id,
             from = finalize.from_block,
             to = finalize.to_block,
+            recomputed_public_inputs_hash = %hash.into_inner(),
             elapsed_us = started.elapsed().as_micros(),
             "session window signed",
         );

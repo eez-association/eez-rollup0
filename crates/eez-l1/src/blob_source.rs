@@ -20,7 +20,7 @@ struct BeaconTiming {
 }
 
 impl BeaconTiming {
-    /// Slot of an execution block; a timestamp off the grid names another chain.
+    /// Slot of an execution block, checked against the beacon's slot grid.
     fn slot_at(self, timestamp: u64) -> L1Result<u64> {
         let elapsed = timestamp
             .checked_sub(self.genesis_time)
@@ -57,30 +57,42 @@ impl BeaconBlobSource {
         }
         Self {
             base_url,
-            client: reqwest::Client::builder()
-                .timeout(BEACON_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+            client: reqwest::Client::new(),
             timing: OnceCell::new(),
         }
     }
 
-    /// The blobs `versioned_hashes` name, in that order, from the slot of the
-    /// L1 block at `timestamp`.
+    /// The blobs `versioned_hashes` name, in that order, from the beacon slot
+    /// whose execution payload is `block_hash`.
     ///
     /// # Errors
     ///
     /// - [`L1Error::Provider`] on transport failure or a malformed beacon body.
     /// - [`L1Error::SourceIncomplete`] when the slot lacks a committed blob:
     ///   the beacon is behind, or has pruned it past its retention window.
+    /// - [`L1Error::SourceIncomplete`] when the beacon still serves another fork.
     /// - [`L1Error::Config`] when the beacon's slot grid disagrees with L1.
     pub async fn fetch(
         &self,
         block: u64,
+        block_hash: B256,
         timestamp: u64,
         versioned_hashes: &[B256],
     ) -> L1Result<Vec<Vec<u8>>> {
         let slot = self.timing().await?.slot_at(timestamp)?;
+        let beacon_block = self.get(&format!("eth/v2/beacon/blocks/{slot}")).await?;
+        let execution_hash = json_b256(
+            &beacon_block,
+            "/data/message/body/execution_payload/block_hash",
+        )?;
+        if execution_hash != block_hash {
+            return Err(L1Error::SourceIncomplete {
+                block,
+                detail: format!(
+                    "beacon slot {slot} execution block {execution_hash} is not L1 block {block_hash}; retry after beacon synchronization"
+                ),
+            });
+        }
         // Fulu's `blobs` endpoint first; pre-Fulu nodes only serve sidecars.
         let body = match self
             .get_optional(&format!("eth/v1/beacon/blobs/{slot}"))
@@ -139,6 +151,7 @@ impl BeaconBlobSource {
         let response = self
             .client
             .get(url)
+            .timeout(BEACON_TIMEOUT)
             .send()
             .await
             .map_err(|error| L1Error::Provider(format!("beacon {path}: {error}")))?;
@@ -202,7 +215,9 @@ pub(crate) async fn fetch_post_blobs(
         })?
         .header
         .timestamp;
-    beacon.fetch(block, timestamp, &post.blob_hashes).await
+    beacon
+        .fetch(block, post.id.l1_block_hash, timestamp, &post.blob_hashes)
+        .await
 }
 
 /// Blob bodies from either response shape: `blobs` serves hex strings,
@@ -221,6 +236,15 @@ fn parse_blobs(body: &Value) -> L1Result<Vec<Vec<u8>>> {
             hex::decode(raw).map_err(|error| malformed(&format!("invalid blob hex: {error}")))
         })
         .collect()
+}
+
+fn json_b256(value: &Value, pointer: &str) -> L1Result<B256> {
+    let invalid = || L1Error::Provider(format!("beacon response: invalid {pointer}"));
+    let raw = value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    raw.parse().map_err(|_| invalid())
 }
 
 fn json_u64(value: &Value, pointer: &str) -> L1Result<u64> {

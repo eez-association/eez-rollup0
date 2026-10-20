@@ -110,18 +110,17 @@ pub struct CrossChainExecCtx {
     /// `ECDSA.recover(publicInputsHash, proof) == signer`; the remote proof
     /// signer signs that exact hash after validating the batch.
     pub ecdsa_proof_system_address: Address,
-    /// Blob settlement; `None` keeps the calldata
-    /// profile and its type-2 postBatch.
+    /// Blob settlement configuration; `None` uses a calldata type-2 postBatch.
     pub blob_posting: Option<BlobPostingConfig>,
 }
 
-/// Blob posting: the deployment the signed domain binds, the L1 slot
-/// grid and blob schedule shared with the proof signer, and the blob-gas cap.
+/// Blob posting: the deployment the signed domain binds, the embedded L1
+/// chain spec, the L1 block time, and the blob-gas fee cap.
 #[derive(Clone, Debug)]
 pub struct BlobPostingConfig {
     pub deployment: eez_protocol::Rollup0Deployment,
-    pub clock: eez_blob::L1SlotClock,
-    pub schedule: eez_blob::BlobSchedule,
+    pub chain_spec: std::sync::Arc<reth_chainspec::ChainSpec>,
+    pub slot_seconds: u64,
     pub max_fee_per_blob_gas: u128,
 }
 
@@ -1183,6 +1182,7 @@ where
         let submitter_poster = submitter.poster_address();
         let post_batch_signer = cross_chain.exec_ctx.l1_poster_signer.address();
         ensure_submission_identity(submitter_poster, post_batch_signer)?;
+
         Ok(Self {
             inner: Arc::new(Inner {
                 rollups,
@@ -1250,7 +1250,7 @@ where
                 let l1_block_number = post.id.l1_block;
                 let tx_hash = post.tx_hash;
                 let submitter = post.sender;
-                let is_ours = submitter == our_address;
+                let is_ours = post.tx_sender == our_address;
                 if is_ours {
                     event!(
                         name: "eez.composer.batch.confirmed",
@@ -1260,9 +1260,7 @@ where
                         "our batch landed on L1",
                     );
                 } else {
-                    // Only posts listing our rollup arrive here, so this one is
-                    // a peer's. Log level by whether any rollup expects external
-                    // batches.
+                    // Log level depends on whether any rollup expects external batches.
                     let any_expects_external = self
                         .rollups
                         .values()
@@ -1530,8 +1528,8 @@ where
             return self.build_empty_slot_block(rollup, &parent_header, timestamp);
         }
 
-        // Pinned only once a post may follow; a failed read still owes the slot
-        // a block, since None would let commit_one mint a tx-bearing one.
+        // Pin only when a post may follow. On failure, commit an empty Sync
+        // block; returning None would let commit_one include user transactions.
         let (bundle_target, historical_target) = match &cc.exec_ctx.blob_posting {
             Some(config) => {
                 let targets = [bundle_target, historical_target];
@@ -3341,7 +3339,7 @@ where
             .and_then(|raw| {
                 raw.ok_or_else(|| {
                     PreparePostBatchError::Build(format!(
-                        "range exceeds the {} postBatch gas budget; bounded chunks cover it",
+                        "range exceeds the {} postBatch gas or blob budget; bounded chunks cover it",
                         self.inner.emission.max_gas
                     ))
                 })
@@ -3560,8 +3558,10 @@ where
 
         // ── Dispatch the rich L1 bundle and register the optimistic block. ──
         let sync_height = built.header.number();
-        // Recorded in the ledger so the finality audit can look up the receipt.
-        let post_batch_hash = post_batch_tx_hash(&postbatch_raw);
+        // The signed EIP-2718 envelope's hash excludes the blob sidecar —
+        // recorded in the ledger so the finality audit can look up the
+        // postBatch receipt.
+        let post_batch_hash = post_batch_tx_hash(&postbatch_raw)?;
         let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivors.len());
         bundle.push(postbatch_raw);
         // Only INBOUND survivors ride the L1 bundle (L1-signed, execute on L1).
@@ -3667,7 +3667,7 @@ where
             .and_then(|raw| {
                 raw.ok_or_else(|| {
                     PreparePostBatchError::Build(format!(
-                        "range exceeds the {} postBatch gas budget; bounded chunks cover it",
+                        "range exceeds the {} postBatch gas or blob budget; bounded chunks cover it",
                         self.inner.emission.max_gas
                     ))
                 })
@@ -3719,8 +3719,10 @@ where
             }
         };
         let sync_height = empty_built.header.number();
-        // Recorded in the ledger so the finality audit can look up the receipt.
-        let post_batch_hash = post_batch_tx_hash(&minimal_postbatch_raw);
+        // The signed EIP-2718 envelope's hash excludes the blob sidecar —
+        // recorded in the ledger so the finality audit can look up the
+        // postBatch receipt.
+        let post_batch_hash = post_batch_tx_hash(&minimal_postbatch_raw)?;
         event!(
             name: "eez.composer.phase1.bundle.dispatched",
             Level::INFO,
@@ -3862,7 +3864,7 @@ where
                 "settlement backlog exceeds the batch cap; settling a bounded historical chunk",
             );
 
-            let post_batch_hash = post_batch_tx_hash(&raw);
+            let post_batch_hash = post_batch_tx_hash(&raw)?;
             rollup
                 .optimistic
                 .begin(boundary, post_batch_hash, boundary_parent, Vec::new());
@@ -3881,7 +3883,7 @@ where
             return Ok(());
         }
         Err(format!(
-            "every empty on-grid boundary in ({cursor}, {snapped}] exceeds the {} gas budget \
+            "every empty on-grid boundary in ({cursor}, {snapped}] exceeds the {} postBatch gas or blob budget \
              ({over_budget} candidates priced); retrying next slot",
             self.inner.emission.max_gas,
         ))
@@ -4016,8 +4018,7 @@ where
 
         let sync_block_hash = terminal_header.hash();
 
-        // Candidate V1 opens no outbound front, so this only guards against a
-        // batch the settlement wrapper would reject (immediateEntryCount == 1).
+        // Candidate V1 permits only the anchor as an immediate entry.
         if ctx.blob_posting.is_some()
             && (!outbound_entries.is_empty() || !outbound_user_txs.is_empty())
         {
@@ -4378,21 +4379,19 @@ where
             .into());
         }
         // Candidate V1 carries the stream in blobs sized for the target's fork.
-        let blob_fork = match (&ctx.blob_posting, bundle_target) {
+        let blob_limit = match (&ctx.blob_posting, bundle_target) {
             (Some(config), BundleTarget::Exact { timestamp, .. }) => Some(
-                config
-                    .schedule
-                    .fork_at(timestamp)
+                eez_blob::blob_limit_at(&config.chain_spec, timestamp)
                     .ok_or("no blob fork is active at the candidate-V1 target")?,
             ),
             (Some(_), _) => return Err("candidate V1 needs an exact L1 target".into()),
             (None, _) => None,
         };
-        let physical_blobs = if let Some(fork) = blob_fork {
+        let physical_blobs = if let Some(limit) = blob_limit {
             let blobs = eez_payload_codec::encode_blob_container(rollup_id, &blocks, &actions)
                 .map_err(|e| format!("eez_payload_codec::encode_blob_container: {e}"))?;
-            let maximum = fork.max_blobs();
-            if blobs.len() as u64 > maximum {
+            let maximum = limit.max_blobs;
+            if blobs.len() > maximum {
                 event!(
                     name: "eez.composer.emission.candidate_over_blob_limit",
                     Level::DEBUG,
@@ -4408,7 +4407,7 @@ where
             batch.callData = Bytes::new();
             batch.blockNumber = u64::MAX;
             batch.blobIndices = (0..blobs.len()).map(U256::from).collect();
-            Some((blobs, fork.sidecar_encoding))
+            Some((blobs, limit.sidecar_encoding))
         } else {
             let payload = eez_payload_codec::encode_container(rollup_id, &blocks, &actions)
                 .map_err(|e| format!("eez_payload_codec::encode_container: {e}"))?;
@@ -4762,18 +4761,17 @@ async fn observe_bundle_outcome(
     }
 }
 
-/// The signed postBatch's tx hash. A candidate-V1 post is a pooled type-3
-/// wrapper whose bytes also carry the sidecar, so keccak of them is not it.
-fn post_batch_tx_hash(raw: &[u8]) -> B256 {
-    if raw.first() == Some(&3)
-        && let Ok(hash) = eez_blob::pooled_blob_transaction_hash(raw)
-    {
-        return hash;
+/// The signed postBatch's tx hash. A type-3 post's pooled bytes also carry
+/// the sidecar, so keccak of those bytes is a different hash.
+fn post_batch_tx_hash(raw: &[u8]) -> Result<B256, String> {
+    if raw.first() == Some(&3) {
+        return eez_blob::pooled_blob_transaction_hash(raw)
+            .map_err(|error| format!("blob postBatch hash: {error}"));
     }
-    alloy_primitives::keccak256(raw)
+    Ok(alloy_primitives::keccak256(raw))
 }
 
-/// Sign an EIP-1559 L1 transaction used for `postAndVerifyBatch` submission.
+/// Sign an EIP-1559 or blob L1 transaction for `postAndVerifyBatch` submission.
 ///
 /// Sets `max_priority_fee_per_gas` from the caller (so we can order
 /// the postBatch ahead of the held user_tx) and `max_fee_per_gas` to
@@ -4891,10 +4889,8 @@ async fn sign_post_batch_tx(
     Ok(Bytes::from(buf))
 }
 
-/// A blob-settlement signature binds one exact L1 slot and its parent hash,
-/// so a target that is not already exact becomes the slot
-/// after the current L1 head. A missed slot drops the bundle; the next Sync
-/// slot rebuilds and re-signs it.
+/// Pin unresolved targets to the slot after the current L1 head. The blob
+/// signature binds that slot and its parent; a missed slot requires a new proof.
 async fn pin_candidate_targets(
     l1_provider: &alloy_provider::RootProvider,
     config: &BlobPostingConfig,
@@ -4913,8 +4909,16 @@ async fn pin_candidate_targets(
             .map_err(|e| format!("get L1 head: {e}"))?
             .ok_or("L1 head unavailable")?;
         Some(BundleTarget::Exact {
-            block: head.header.number + 1,
-            timestamp: config.clock.next_slot_after(head.header.timestamp),
+            block: head
+                .header
+                .number
+                .checked_add(1)
+                .ok_or("L1 block number overflow")?,
+            timestamp: head
+                .header
+                .timestamp
+                .checked_add(config.slot_seconds)
+                .ok_or("L1 head timestamp overflow")?,
         })
     };
     let [bundle, historical] = targets.map(|target| match (target, next) {
@@ -4930,7 +4934,7 @@ struct BlobCarrier {
     max_fee_per_blob_gas: u128,
 }
 
-/// Fee headroom over the current blob base fee, which rises at most 12.5% a block.
+/// Fee headroom over the observed blob base fee, bounded by the operator's cap.
 const BLOB_FEE_HEADROOM: u128 = 2;
 
 /// Binds a candidate-V1 post to its exact target slot before proving: the
@@ -4962,10 +4966,13 @@ async fn prepare_candidate_v1(
         .await
         .map_err(|e| format!("get candidate-V1 L1 parent {parent_number}: {e}"))?
         .ok_or_else(|| format!("candidate-V1 L1 parent {parent_number} is unavailable"))?;
-    if !config.clock.is_slot_start(target_timestamp) || target_timestamp <= parent.header.timestamp
-    {
+    if !eez_blob::on_later_slot(
+        parent.header.timestamp,
+        target_timestamp,
+        config.slot_seconds,
+    ) {
         return Err(format!(
-            "candidate-V1 target {target_timestamp} is not the slot after L1 parent {parent_number}"
+            "candidate-V1 target {target_timestamp} is not a later L1 slot after parent {parent_number}"
         ));
     }
     // A lagging L1 RPC or slow composition can pin a slot that has already begun.
@@ -5033,14 +5040,18 @@ mod tests {
                     eez_rollup_id: 1,
                     l2_chain_id: 10,
                 },
-                clock: eez_blob::L1SlotClock::new(100, 12).unwrap(),
-                schedule: "0:6:6:eip4844".parse().unwrap(),
+                chain_spec: std::sync::Arc::new(
+                    reth_chainspec::ChainSpecBuilder::mainnet()
+                        .cancun_activated()
+                        .build(),
+                ),
+                slot_seconds: 12,
                 max_fee_per_blob_gas: 50,
             }
         }
 
         fn l1_block(number: u64, timestamp: u64, hash: B256) -> alloy_rpc_types_eth::Block {
-            let mut block = alloy_rpc_types_eth::Block::default();
+            let mut block: alloy_rpc_types_eth::Block = Default::default();
             block.header.hash = hash;
             block.header.inner.number = number;
             block.header.inner.timestamp = timestamp;
@@ -5126,11 +5137,12 @@ mod tests {
                 prepare_candidate_v1(&provider, &config(), target, blobs(), encoding, 0).await;
             assert!(refused.is_err_and(|e| e.contains("deferring")));
 
-            // A target that is not the parent's next slot names no real block.
+            // The target must be later than its parent.
             let (asserter, provider) = mocked();
             asserter.push_success(&l1_block(41, 124, parent_hash));
-            let stale = prepare_candidate_v1(&provider, &config(), target, blobs(), encoding, 0);
-            assert!(stale.await.is_err());
+            let stale =
+                prepare_candidate_v1(&provider, &config(), target, blobs(), encoding, 0).await;
+            assert!(stale.is_err());
             let unpinned = BundleTarget::NextBlock;
             let (_, provider) = mocked();
             let unpinned =
@@ -5140,8 +5152,9 @@ mod tests {
             // A slot that has already begun cannot be hit by a bundle signed now.
             let (asserter, provider) = mocked();
             asserter.push_success(&l1_block(41, 112, parent_hash));
-            let late = prepare_candidate_v1(&provider, &config(), target, blobs(), encoding, 124);
-            assert!(late.await.is_err_and(|e| e.contains("already begun")));
+            let late =
+                prepare_candidate_v1(&provider, &config(), target, blobs(), encoding, 124).await;
+            assert!(late.is_err_and(|e| e.contains("already begun")));
         }
     }
 

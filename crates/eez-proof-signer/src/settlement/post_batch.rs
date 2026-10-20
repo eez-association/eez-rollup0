@@ -31,7 +31,7 @@ pub(crate) enum PostBatchDecodeError {
 pub(crate) struct CanonicalPostBatch(EvmBatch);
 
 impl CanonicalPostBatch {
-    pub(super) const fn as_batch(&self) -> &EvmBatch {
+    pub(crate) const fn as_batch(&self) -> &EvmBatch {
         &self.0
     }
 
@@ -161,52 +161,31 @@ impl<'a> CheckedPublicInputProfile<'a> {
         })
     }
 
-    /// Compute the sole canonical hash from this profile-checked batch.
-    ///
-    /// This type does not prove that state, effects, or DA passed their gates;
-    /// the complete settlement job grants that stronger attestation boundary.
+    /// Compute the sole hash after the settlement gates. Blob profiles require
+    /// verified DA and authenticated manager data; calldata profiles omit them.
     pub(crate) fn recompute_public_inputs_hash(
         &self,
         proof_system_vkey: NonZeroProofSystemVkey,
+        blob_context: Option<(&VerifiedBlobDa, Bytes)>,
     ) -> Result<RecomputedPublicInputsHash, PublicInputError> {
-        let hashes = match self.profile {
-            PublicInputProfile::Calldata => {
+        let hashes = match (self.profile, blob_context) {
+            (PublicInputProfile::Calldata, None) => {
                 public_inputs_hashes(self.canonical_batch.as_batch(), proof_system_vkey.get())
             }
-            PublicInputProfile::Blob => {
+            (PublicInputProfile::Blob, Some((verified_da, custom_data))) => {
+                public_inputs_hashes_with_context(
+                    self.canonical_batch.as_batch(),
+                    proof_system_vkey.get(),
+                    verified_da.versioned_hashes(),
+                    custom_data,
+                )
+            }
+            _ => {
                 return Err(invalid_structure(
-                    "blob profile requires verified DA and authenticated custom data",
+                    "public-input context does not match the checked profile",
                 ));
             }
         }
-        .map_err(|error| PublicInputError::Computation(error.to_string()))?;
-        let [hash] = hashes.as_slice() else {
-            return Err(PublicInputError::HashCount {
-                actual: hashes.len(),
-            });
-        };
-        Ok(RecomputedPublicInputsHash(*hash))
-    }
-
-    /// Compute candidate V1 inputs after DA and L1 authentication have
-    /// produced their non-caller-controlled values.
-    pub(crate) fn recompute_blob_public_inputs_hash(
-        &self,
-        proof_system_vkey: NonZeroProofSystemVkey,
-        verified_da: &VerifiedBlobDa,
-        custom_data: Bytes,
-    ) -> Result<RecomputedPublicInputsHash, PublicInputError> {
-        if !matches!(self.profile, PublicInputProfile::Blob) {
-            return Err(invalid_structure(
-                "blob public-input context supplied to calldata profile",
-            ));
-        }
-        let hashes = public_inputs_hashes_with_context(
-            self.canonical_batch.as_batch(),
-            proof_system_vkey.get(),
-            verified_da.versioned_hashes(),
-            custom_data,
-        )
         .map_err(|error| PublicInputError::Computation(error.to_string()))?;
         let [hash] = hashes.as_slice() else {
             return Err(PublicInputError::HashCount {
@@ -238,7 +217,7 @@ pub(crate) fn recompute_public_input_hash(
 ) -> Result<B256, PublicInputError> {
     let canonical = CanonicalPostBatch(batch.clone());
     CheckedPublicInputProfile::new(&canonical, expected_rollup_id, expected_proof_system)?
-        .recompute_public_inputs_hash(proof_system_vkey)
+        .recompute_public_inputs_hash(proof_system_vkey, None)
         .map(RecomputedPublicInputsHash::into_inner)
 }
 

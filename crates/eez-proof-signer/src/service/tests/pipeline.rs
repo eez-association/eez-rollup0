@@ -658,3 +658,170 @@ fn a_fully_bound_outbound_effect_is_authorized() {
         ))
     ));
 }
+
+#[derive(Debug)]
+struct BlobTestL1Source {
+    deployment: eez_protocol::Rollup0Deployment,
+}
+
+#[async_trait::async_trait]
+impl crate::Rollup0L1Source for BlobTestL1Source {
+    async fn chain_id(&self) -> Result<u64, crate::BlobContextError> {
+        Ok(self.deployment.l1_chain_id)
+    }
+
+    async fn canonical_header(
+        &self,
+        _: u64,
+    ) -> Result<Option<(B256, u64)>, crate::BlobContextError> {
+        Ok(Some((B256::repeat_byte(0xaa), 112)))
+    }
+
+    async fn settlement_state(
+        &self,
+        _: crate::L1PostingContext,
+    ) -> Result<crate::SettlementState, crate::BlobContextError> {
+        Ok(crate::SettlementState {
+            root: block_hash_of(4),
+            manager: self.deployment.manager,
+            settlement_wrapper: self.deployment.settlement_wrapper,
+        })
+    }
+}
+
+#[tokio::test]
+async fn inbound_blob_settlement_binds_execution_da_and_authenticated_domain() {
+    let value = U256::from(7);
+    let (transaction, call_hash, return_data, sidecar) = strict_inbound_transaction(value);
+    let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
+        transactions: vec![transaction],
+        ..Default::default()
+    };
+    let settling = validate::ValidatedBlock::for_test(
+        6,
+        alloy_rlp::encode(eez_primitives::Block::new(
+            alloy_consensus::Header {
+                timestamp: 124,
+                ..Default::default()
+            },
+            body,
+        )),
+        validate::SettlementBlockEvidence::for_test(vec![true], Vec::new()),
+    );
+    let preceding = validate::ValidatedBlock::for_test(
+        5,
+        alloy_rlp::encode(eez_primitives::Block::default()),
+        validate::SettlementBlockEvidence::for_test(Vec::new(), Vec::new()),
+    );
+    let validated = validate::ValidatedWindow::for_test(
+        block_hash_of(4),
+        block_hash_of(6),
+        vec![preceding],
+        validate::testing::settling_block_for_test(
+            settling,
+            vec![true],
+            vec![
+                pre_execution_checkpoint(empty_prefix_candidate()),
+                checkpoint(0, block_hash_of(6)),
+            ],
+        ),
+    );
+    let mut batch = anchor_batch_spanning(5, 6);
+    batch.entries[0].rollupUpdates[0].newRoot = empty_prefix_candidate();
+    batch.entries.push(ExecutionEntrySol {
+        rollupUpdates: vec![RollupUpdateSol {
+            rollupId: 1,
+            currentRoot: empty_prefix_candidate(),
+            newRoot: block_hash_of(6),
+            etherDelta: eez_protocol::abi::u256_to_i192(value).unwrap(),
+        }],
+        proxyEntryHash: call_hash,
+        l2ToL1Calls: Vec::new(),
+        expectedL1ToL2Calls: Vec::new(),
+        rollingHash: B256::ZERO,
+        destinationRollupId: 1,
+        success: true,
+        returnData: return_data,
+    });
+    eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
+    let action =
+        eez_protocol::entries::manifest::action_from_entry(&sidecar, eez_protocol::RollupId(1))
+            .unwrap();
+    let span = vec![eez_payload_codec::SpanBlock::default(); 2];
+    let blobs =
+        eez_payload_codec::encode_blob_container(1, &span, std::slice::from_ref(&action)).unwrap();
+    batch.blockNumber = u64::MAX;
+    batch.callData = Bytes::new();
+    batch.blobIndices = vec![U256::ZERO];
+    let deployment = eez_protocol::Rollup0Deployment {
+        l1_chain_id: 1,
+        l2_chain_id: 1,
+        eez: Address::repeat_byte(1),
+        manager: Address::repeat_byte(2),
+        settlement_wrapper: Address::repeat_byte(3),
+        eez_rollup_id: 1,
+    };
+    let authority = crate::BlobContextAuthority::new(
+        Arc::new(BlobTestL1Source { deployment }),
+        crate::BlobContextConfig {
+            deployment,
+            chain_spec: Arc::new(
+                reth_chainspec::ChainSpecBuilder::mainnet()
+                    .cancun_activated()
+                    .build(),
+            ),
+            slot_seconds: 12,
+            sync_interval: 2,
+        },
+    )
+    .unwrap();
+    let context = authority
+        .authenticate(
+            crate::L1PostingContext {
+                chain_id: 1,
+                target_timestamp: 124,
+                parent_number: 10,
+                parent_hash: B256::repeat_byte(0xaa),
+            },
+            block_hash_of(4),
+        )
+        .await
+        .unwrap();
+    let settings = eez_blob::EnvKzgSettings::Default.get();
+    let hashes = eez_blob::versioned_hashes(&blobs, settings).unwrap();
+    let expected = eez_protocol::public_inputs_hashes_with_context(
+        &batch,
+        test_proof_system_vkey().get(),
+        &hashes,
+        context.custom_data(),
+    )
+    .unwrap()[0];
+    let cancellation = CancellationToken::default();
+    let reconstructor = test_system_transaction_reconstructor(expected_rollup_id(1));
+    let run = |blobs: &[Vec<u8>]| {
+        run_settlement(SettlementInput {
+            submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+            validated_window: &validated,
+            expected_rollup_id: expected_rollup_id(1),
+            expected_l2_system_address: TEST_SYSTEM_ADDRESS,
+            proof_system_vkey: test_proof_system_vkey(),
+            expected_proof_system: test_proof_system(),
+            system_transaction_reconstructor: &reconstructor,
+            cancellation: &cancellation,
+            blob: Some(super::super::settlement_job::BlobSettlementInput {
+                blobs,
+                context: &context,
+                kzg_settings: settings,
+            }),
+        })
+    };
+    assert_eq!(run(&blobs).unwrap().into_inner(), expected);
+
+    let mut wrong_action = action;
+    wrong_action.data.push(0xff);
+    let substituted = eez_payload_codec::encode_blob_container(1, &span, &[wrong_action]).unwrap();
+    assert_eq!(run(&substituted).unwrap_err().gate(), "da_payload");
+    let mut malformed = blobs;
+    malformed[0][0] = 1;
+    assert_eq!(run(&malformed).unwrap_err().gate(), "da_payload");
+}

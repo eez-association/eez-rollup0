@@ -287,10 +287,9 @@ impl Inner {
 
     /// Submit `raw_txs` (postBatch first) and observe the outcome. Try
     /// the relay's `eth_sendBundle`; if it's a plain execution RPC
-    /// ([`L1Error::BundleRpcUnsupported`]), degrade to ordered mempool
-    /// submission — on dev reth / anvil that lands every tx in the next
-    /// block, postBatch first by priority-fee, minus the all-or-nothing
-    /// guarantee (irrelevant without a competing builder).
+    /// ([`L1Error::BundleRpcUnsupported`]), calldata posts may fall back to
+    /// mempool submission. Blob posts require the bundle path so a fallback
+    /// cannot broadcast their triggers without ordering guarantees.
     async fn dispatch_and_observe(
         &self,
         raw_txs: &[alloy_primitives::Bytes],
@@ -317,6 +316,14 @@ impl Inner {
                 // an Exact target's `pin_timestamp` unlocks the early verdict.
                 self.observe(post_batch_hash, target_block, pin_timestamp)
                     .await
+            }
+            Err(L1Error::BundleRpcUnsupported)
+                if raw_txs.first().is_some_and(|raw| raw.first() == Some(&3)) =>
+            {
+                Err(L1Error::Submission(
+                    "blob settlement requires eth_sendBundle; refusing public mempool submission"
+                        .into(),
+                ))
             }
             Err(L1Error::BundleRpcUnsupported) => {
                 // A multi-tx bundle needs its order kept: the deferred entries
@@ -803,6 +810,7 @@ mod tests {
             },
             tx_hash,
             sender: Address::ZERO,
+            tx_sender: Address::ZERO,
             batch: eez_protocol::abi::EvmBatch::default(),
             blob_hashes: Vec::new(),
             settlement: Settlement::new(Vec::new(), root(log_index), None, false),

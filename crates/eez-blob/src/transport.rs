@@ -40,6 +40,7 @@ pub struct BlobTransactionParams {
 }
 
 /// KZG material prepared once per candidate and reused for signing.
+/// Private fields keep the generated sidecar and its hashes together.
 #[derive(Clone, Debug)]
 pub struct PreparedBlobSidecar {
     sidecar: BlobTransactionSidecarVariant,
@@ -110,6 +111,28 @@ pub fn versioned_hashes<B: AsRef<[u8]>>(
 /// [`TransportError::InvalidEncoding`] unless `encoded` is exactly one pooled
 /// EIP-4844 transaction.
 pub fn pooled_blob_transaction_hash(encoded: &[u8]) -> Result<TxHash, TransportError> {
+    Ok(*decode_pooled_blob_transaction(encoded)?.tx_hash())
+}
+
+/// Blob payloads carried by one pooled type-3 transaction, in sidecar order.
+///
+/// # Errors
+///
+/// [`TransportError::InvalidEncoding`] unless `encoded` is exactly one pooled
+/// EIP-4844 transaction.
+pub fn pooled_blob_bytes(encoded: &[u8]) -> Result<Vec<Vec<u8>>, TransportError> {
+    Ok(decode_pooled_blob_transaction(encoded)?
+        .tx()
+        .sidecar
+        .blobs()
+        .iter()
+        .map(|blob| blob.as_slice().to_vec())
+        .collect())
+}
+
+fn decode_pooled_blob_transaction(
+    encoded: &[u8],
+) -> Result<Signed<TxEip4844WithSidecar<BlobTransactionSidecarVariant>>, TransportError> {
     let mut input = encoded;
     let signed =
         Signed::<TxEip4844WithSidecar<BlobTransactionSidecarVariant>>::decode_2718(&mut input)
@@ -120,7 +143,7 @@ pub fn pooled_blob_transaction_hash(encoded: &[u8]) -> Result<TxHash, TransportE
             input.len()
         )));
     }
-    Ok(*signed.tx_hash())
+    Ok(signed)
 }
 
 /// Build the propagation sidecar in the wrapper the target fork expects.
@@ -160,12 +183,11 @@ pub fn prepare_blob_sidecar<B: AsRef<[u8]>>(
     })
 }
 
-/// Bind, validate, sign and pool-encode a type-3 transaction.
+/// Bind a prepared sidecar, sign and pool-encode a type-3 transaction.
 ///
 /// # Errors
 ///
-/// [`TransportError`] when the sidecar does not match the transaction or
-/// signing fails.
+/// [`TransportError::Signing`] when signing fails.
 pub fn sign_blob_transaction<S: TxSignerSync<Signature>>(
     params: BlobTransactionParams,
     prepared: PreparedBlobSidecar,
@@ -188,8 +210,6 @@ pub fn sign_blob_transaction<S: TxSignerSync<Signature>>(
         max_fee_per_blob_gas: params.max_fee_per_blob_gas,
         input: params.input,
     };
-    tx.validate_blob(&sidecar, EnvKzgSettings::Default.get())
-        .map_err(|error| TransportError::Sidecar(error.to_string()))?;
     let mut pooled = TxEip4844WithSidecar { tx, sidecar };
     let signature = signer
         .sign_transaction_sync(&mut pooled)
@@ -250,19 +270,30 @@ mod tests {
     #[test]
     fn signed_pooled_transaction_hash_round_trips() {
         let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x01)).unwrap();
-        let prepared =
-            prepare_blob_sidecar(&[vec![0_u8; BYTES_PER_BLOB]], BlobSidecarEncoding::Eip4844)
+        for encoding in [BlobSidecarEncoding::Eip4844, BlobSidecarEncoding::Eip7594] {
+            let prepared = prepare_blob_sidecar(&[vec![0_u8; BYTES_PER_BLOB]], encoding).unwrap();
+            let signed = sign_blob_transaction(params(), prepared, &signer).unwrap();
+            let decoded = decode_pooled_blob_transaction(&signed.pooled_transaction).unwrap();
+            decoded
+                .tx()
+                .tx
+                .validate_blob(&decoded.tx().sidecar, EnvKzgSettings::Default.get())
                 .unwrap();
-        let signed = sign_blob_transaction(params(), prepared, &signer).unwrap();
-        assert_eq!(signed.pooled_transaction[0], 3, "type-3 envelope");
-        assert_eq!(
-            pooled_blob_transaction_hash(&signed.pooled_transaction).unwrap(),
-            signed.transaction_hash,
-        );
+            assert_eq!(signed.pooled_transaction[0], 3, "type-3 envelope");
+            assert_eq!(
+                pooled_blob_transaction_hash(&signed.pooled_transaction).unwrap(),
+                signed.transaction_hash,
+            );
+            assert_eq!(
+                pooled_blob_bytes(&signed.pooled_transaction).unwrap(),
+                [vec![0_u8; BYTES_PER_BLOB]],
+            );
 
-        let mut trailing = signed.pooled_transaction.to_vec();
-        trailing.push(0);
-        assert!(pooled_blob_transaction_hash(&trailing).is_err());
+            let mut trailing = signed.pooled_transaction.to_vec();
+            trailing.push(0);
+            assert!(pooled_blob_transaction_hash(&trailing).is_err());
+            assert!(pooled_blob_bytes(&trailing).is_err());
+        }
     }
 
     #[test]

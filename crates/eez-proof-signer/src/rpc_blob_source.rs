@@ -1,17 +1,20 @@
 //! Canonical execution-RPC source for blob-settlement authorization.
 
-use std::{env, sync::Arc};
+use std::{env, fs, sync::Arc};
 
 use alloy_eips::{BlockId, BlockNumberOrTag};
+use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_sol_types::sol;
 use async_trait::async_trait;
 use eez_protocol::Rollup0Deployment;
+use reth_chainspec::{ChainSpec, EthChainSpec as _};
 use url::Url;
 
 use crate::{
-    BlobContextConfig, BlobContextError, L1PostingContext, Rollup0L1Source, SettlementState,
+    BlobContextAuthority, BlobContextConfig, BlobContextError, L1PostingContext, Rollup0L1Source,
+    SettlementState,
 };
 
 sol! {
@@ -37,22 +40,17 @@ pub struct RpcRollup0L1Source {
     rollup_id: u64,
 }
 
-/// Candidate-V1 signer configuration, selected like the node's by
-/// `EEZ_SETTLEMENT_WRAPPER_ADDRESS`.
-#[derive(Debug)]
-pub struct BlobServiceConfig {
-    pub source: Arc<RpcRollup0L1Source>,
-    pub authority: BlobContextConfig,
-}
-
-impl BlobServiceConfig {
+impl BlobContextAuthority {
     /// `None` keeps the calldata profile. The L2 chain id comes from the
     /// backend's chain configuration; the rest from the node's `EEZ_*` names.
     ///
     /// # Errors
     ///
     /// A partially configured or inconsistent candidate-V1 profile.
-    pub fn from_env(expected_rollup_id: u64, l2_chain_id: u64) -> eyre::Result<Option<Self>> {
+    pub(crate) fn from_env(
+        expected_rollup_id: u64,
+        l2_chain_id: u64,
+    ) -> eyre::Result<Option<Self>> {
         if !Rollup0Deployment::is_configured() {
             return Ok(None);
         }
@@ -84,12 +82,12 @@ impl BlobServiceConfig {
             l2_block_ms > 0 && l1_block_ms.is_multiple_of(l2_block_ms),
             "EEZ_L1_BLOCK_TIME_MS {l1_block_ms} must be a multiple of EEZ_L2_BLOCK_TIME_MS {l2_block_ms}",
         );
-        let (clock, schedule) = eez_blob::l1_schedule_from_env()?;
+        let slot_seconds = l1_block_ms / 1000;
         eyre::ensure!(
-            l1_block_ms == clock.slot_seconds.saturating_mul(1000),
-            "EEZ_L1_BLOCK_TIME_MS {l1_block_ms} disagrees with EEZ_L1_SLOT_SECONDS {}",
-            clock.slot_seconds,
+            slot_seconds > 0 && slot_seconds.saturating_mul(1000) == l1_block_ms,
+            "EEZ_L1_BLOCK_TIME_MS {l1_block_ms} must be a positive whole number of seconds",
         );
+        let chain_spec = load_l1_chain_spec(l1_chain_id)?;
         let rpc_url = Url::parse(&required("EEZ_L1_RPC_URL")?)?;
         let source = Arc::new(RpcRollup0L1Source::new(
             rpc_url,
@@ -98,13 +96,36 @@ impl BlobServiceConfig {
         ));
         let authority = BlobContextConfig {
             deployment,
-            clock,
-            schedule,
+            chain_spec,
+            slot_seconds,
             sync_interval: l1_block_ms / l2_block_ms,
         };
-        crate::BlobContextAuthority::new(source.clone(), authority.clone())?;
-        Ok(Some(Self { source, authority }))
+        Ok(Some(Self::new(source, authority)?))
     }
+}
+
+fn load_l1_chain_spec(expected_chain_id: u64) -> eyre::Result<Arc<ChainSpec>> {
+    if expected_chain_id == 10200
+        && env::var("EEZ_L1_CHAIN_CONFIG")
+            .ok()
+            .is_none_or(|path| path.trim().is_empty())
+    {
+        let spec = reth_gnosis::spec::gnosis_spec::GnosisChainSpec::from(
+            reth_gnosis::spec::chains::CHIADO_GENESIS.clone(),
+        );
+        return Ok(Arc::new(spec.inner.clone()));
+    }
+    let path = env::var("EEZ_L1_CHAIN_CONFIG")
+        .map_err(|_| eyre::eyre!("EEZ_L1_CHAIN_CONFIG is required for candidate V1"))?;
+    let genesis: Genesis = serde_json::from_str(&fs::read_to_string(path.trim())?)
+        .map_err(|error| eyre::eyre!("EEZ_L1_CHAIN_CONFIG: {error}"))?;
+    let spec = ChainSpec::from_genesis(genesis);
+    eyre::ensure!(
+        spec.chain_id() == expected_chain_id,
+        "EEZ_L1_CHAIN_CONFIG chain {} differs from EEZ_L1_CHAIN_ID {expected_chain_id}",
+        spec.chain_id(),
+    );
+    Ok(Arc::new(spec))
 }
 
 impl RpcRollup0L1Source {

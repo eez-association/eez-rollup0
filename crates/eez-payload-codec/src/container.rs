@@ -176,9 +176,14 @@ fn pack_blobs(mut stream: Vec<u8>) -> Vec<Vec<u8>> {
     stream.resize(blob_count * LOGICAL_BYTES_PER_BLOB, 0);
 
     let mut blobs = Vec::with_capacity(blob_count);
-    for logical_blob in stream.chunks_exact(LOGICAL_BYTES_PER_BLOB) {
+    for logical_blob in stream.as_chunks::<LOGICAL_BYTES_PER_BLOB>().0 {
         let mut blob = vec![0; BYTES_PER_BLOB];
-        for (field_index, logical) in logical_blob.chunks_exact(LOGICAL_FIELD_BYTES).enumerate() {
+        for (field_index, logical) in logical_blob
+            .as_chunks::<LOGICAL_FIELD_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let start = field_index * FIELD_ELEMENT_BYTES;
             for (offset, byte) in logical.iter().enumerate() {
                 blob[start + FIELD_ELEMENT_BYTES - 1 - offset] = *byte;
@@ -216,7 +221,7 @@ pub fn decode_blob_container(blobs: &[Vec<u8>]) -> CodecResult<DecodedContainer>
                 expected: BYTES_PER_BLOB,
             });
         }
-        for (field_index, field) in blob.chunks_exact(FIELD_ELEMENT_BYTES).enumerate() {
+        for (field_index, field) in blob.as_chunks::<FIELD_ELEMENT_BYTES>().0.iter().enumerate() {
             if field[0] != 0 {
                 return Err(CodecError::NonCanonicalFieldElement {
                     blob_index,
@@ -298,8 +303,13 @@ fn decode_stream(payload: &[u8], require_close: bool) -> CodecResult<DecodedCont
 fn decode_action(cur: &mut Cursor<'_>, rollup_id: u64) -> CodecResult<Action> {
     expect_message(cur, MSG_INITIATE)?;
     let source_rollup_id = u64::from_le_bytes(cur.take_array::<8>("initiate chain_id")?);
+<<<<<<< HEAD
     // Generic EEZ leaves `tx_data` chain-defined; Rollup0 V1 requires empty.
     if !take_bytes(cur, "tx_data")?.is_empty() {
+=======
+    // Candidate V1 requires empty tx_data; calldata profiles leave it opaque.
+    if !take_bytes(cur, "tx_data")?.is_empty() && require_empty_tx_data {
+>>>>>>> 9fcf620 (fix: harden blob settlement and add end-to-end coverage)
         return Err(CodecError::NonEmptyTransactionData);
     }
 
@@ -497,6 +507,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn blob_decoder_rejects_forbidden_action_routes_and_failure_suffixes() {
+        let mut outbound = action(true);
+        outbound.source_rollup_id = ROLLUP;
+        outbound.target_rollup_id = 0;
+        let mut foreign = action(true);
+        foreign.target_rollup_id = ROLLUP + 1;
+        for actions in [
+            vec![outbound],
+            vec![foreign],
+            vec![action(false), action(true)],
+        ] {
+            // Bypass the profile encoder: untrusted peers can publish any stream.
+            let mut stream = encode_container(ROLLUP, &span(), &actions).unwrap();
+            stream.push(MSG_CLOSE_BLOB_STREAM);
+            assert!(decode_blob_container(&pack_blobs(stream)).is_err());
+        }
+    }
+
+    #[test]
+    fn blob_decoder_requires_close_and_rejects_a_second_chain_operation() {
+        let stream = encode_container(ROLLUP, &span(), &[]).unwrap();
+        assert!(decode_blob_container(&pack_blobs(stream.clone())).is_err());
+        let mut doubled = stream.clone();
+        doubled.extend_from_slice(&stream[1..]);
+        doubled.push(MSG_CLOSE_BLOB_STREAM);
+        assert!(decode_blob_container(&pack_blobs(doubled)).is_err());
+    }
+
+    #[test]
+    fn blob_actions_continue_across_field_and_blob_boundaries() {
+        for length in [
+            30,
+            31,
+            32,
+            LOGICAL_BYTES_PER_BLOB - 1,
+            LOGICAL_BYTES_PER_BLOB + 1,
+        ] {
+            let mut expected = action(true);
+            expected.data = (0..length).map(|i| i as u8).collect();
+            expected.return_data = vec![0xab; length];
+            let blobs = encode_blob_container(ROLLUP, &span(), &[expected.clone()]).unwrap();
+            assert_eq!(
+                decode_blob_container(&blobs).unwrap().actions,
+                vec![expected]
+            );
+        }
+    }
+
+    #[test]
+    fn blob_decoder_rejects_empty_and_truncated_physical_blobs() {
+        assert_eq!(decode_blob_container(&[]), Err(CodecError::NoBlobs));
+        let mut blobs = encode_blob_container(ROLLUP, &span(), &[]).unwrap();
+        blobs[0].pop();
+        assert!(matches!(
+            decode_blob_container(&blobs),
+            Err(CodecError::InvalidBlobLength { index: 0, .. })
+        ));
+    }
+
     /// The stream opens exactly as the spec defines: protocol version byte,
     /// then a ChainOperation whose chain_id is little-endian.
     #[test]
@@ -633,7 +703,12 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD
     /// Rollup0 V1 rejects the whole container when `tx_data` is non-empty.
+=======
+    /// `tx_data` is chain-defined, so a peer's calldata must still
+    /// decode; candidate V1's blob profile rejects it.
+>>>>>>> 9fcf620 (fix: harden blob settlement and add end-to-end coverage)
     #[test]
     fn a_non_empty_tx_data_is_rejected() {
         let clean = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();

@@ -14,7 +14,7 @@ CMD ["--help"]
 
 FROM ubuntu:24.04 AS proof-signer
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        netcat-openbsd \
+        ca-certificates netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 COPY --chmod=0555 eez-proof-signer /usr/local/bin/eez-proof-signer
 WORKDIR /app

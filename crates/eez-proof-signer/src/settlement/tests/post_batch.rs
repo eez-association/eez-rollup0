@@ -70,6 +70,18 @@ fn blob_profile_checks_shape_and_trusted_limit_before_da() {
     batch.blockNumber = u64::MAX;
     batch.blobIndices = vec![U256::ZERO, U256::from(1)];
     assert!(blob_profile(&batch, 2, 2));
+    let checked = CheckedPublicInputProfile::new_blob(
+        &batch,
+        expected_rollup_id(),
+        EXPECTED_PROOF_SYSTEM,
+        2,
+        2,
+    )
+    .unwrap();
+    assert!(matches!(
+        checked.recompute_public_inputs_hash(test_proof_system_vkey(), None),
+        Err(PublicInputError::InvalidStructure(_))
+    ));
 
     let mut wrong_block = batch.clone();
     wrong_block.blockNumber = 0;
