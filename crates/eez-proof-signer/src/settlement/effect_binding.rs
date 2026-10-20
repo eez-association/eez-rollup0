@@ -132,9 +132,7 @@ pub(crate) enum EffectPrefixError {
         "the leading state checkpoint is at {actual}; the anchor's candidate is sealed before transaction 0"
     )]
     AnchorCheckpointPositionMismatch { actual: CheckpointAt },
-    #[error(
-        "settlement effects require {expected} transaction state checkpoints, but received {actual}"
-    )]
+    #[error("settlement binding requires {expected} state checkpoints, but received {actual}")]
     TransactionStateCheckpointCountMismatch { expected: usize, actual: usize },
     #[error(
         "state checkpoint {checkpoint_index} is at {actual}; expected effect-candidate transaction {expected}"
@@ -221,24 +219,7 @@ pub(crate) fn bind_effects_to_execution<'batch, 'settling>(
             claimed: anchor_update.etherDelta,
         });
     }
-    // With no effects the anchor is the batch's only entry, so it carries the
-    // endpoint rather than a prefix; the state-update-chain gate binds it to the
-    // final root. Such a settling block holds no transactions, so nothing was
-    // requested and any checkpoint is a backend fault.
-    if claimed == 0 {
-        if !computed_transaction_state_checkpoints.is_empty() {
-            return Err(EffectPrefixError::TransactionStateCheckpointCountMismatch {
-                expected: 0,
-                actual: computed_transaction_state_checkpoints.len(),
-            });
-        }
-        return Ok(BoundEffectSequence {
-            effects: Vec::new(),
-            settling_observations,
-        });
-    }
-
-    // With effects, the anchor's candidate leads the checkpoint list: the
+    // The anchor's candidate leads the checkpoint list: the
     // settling block sealed over no transactions. Effects follow, one per
     // candidate position, so every commitment names a block at this height and
     // a short settlement is a sibling swap rather than a retreat.

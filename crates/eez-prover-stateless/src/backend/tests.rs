@@ -751,7 +751,15 @@ fn checkpoint_plan_is_empty_or_ends_at_the_final_transaction() {
             let (plan, _) = CheckpointPlan::for_block(&recovered, TEST_SYSTEM_ADDRESS);
 
             if mask == 0 {
-                assert!(plan.positions().is_empty(), "ordinary shape {shape:?}");
+                assert_eq!(
+                    plan.positions(),
+                    if width == 0 {
+                        &[CheckpointAt::PreExecution][..]
+                    } else {
+                        &[]
+                    },
+                    "ordinary shape {shape:?}",
+                );
                 continue;
             }
 
@@ -885,7 +893,15 @@ fn validates_the_golden_block_through_stateless() {
         b256!("f09d8f7da5bc5036f8dd9536c953e2212390a46fb3e553ece2b7d419131537b1")
     );
     assert!(block.receipt_successes().is_empty());
-    assert!(block.transaction_state_checkpoints().is_empty());
+    assert_eq!(
+        block.transaction_state_checkpoints(),
+        [StateCheckpoint {
+            at: CheckpointAt::PreExecution,
+            state_root: block.as_anchor().state_root,
+            block_hash: block.hash(),
+        }],
+        "an empty terminal's Prague checkpoint must seal the validated block",
+    );
     assert!(block.settlement_evidence().system_sender_flags.is_empty());
     assert!(
         block
@@ -1072,10 +1088,26 @@ fn execution_must_produce_the_state_root_committed_by_the_header() {
 #[test]
 fn corrupt_witness_data_is_rejected_by_stateless() {
     let mut input = fixture_input();
+    let parent_hash = input.claimed_parent_hash();
     let parts = admitted_block_parts_mut(&mut input);
-    let mut node = parts.witness.state[0].to_vec();
+    let parent = parts
+        .witness
+        .headers
+        .iter()
+        .map(|raw| alloy_rlp::decode_exact::<Header>(raw).unwrap())
+        .find(|header| header.hash_slow() == parent_hash)
+        .unwrap();
+    // Corrupt a required node, not an arbitrary proof branch that was only
+    // accessed by the now-disabled Ethereum consensus-layer system calls.
+    let root = parts
+        .witness
+        .state
+        .iter_mut()
+        .find(|node| alloy_primitives::keccak256(node.as_ref()) == parent.state_root)
+        .unwrap();
+    let mut node = root.to_vec();
     node[0] ^= 0x01;
-    parts.witness.state[0] = node.into();
+    *root = node.into();
     assert!(matches!(
         Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(vec![input]),
         Err(ValidationError::Rejected(_))

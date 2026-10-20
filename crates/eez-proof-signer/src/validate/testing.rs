@@ -271,15 +271,21 @@ pub(crate) fn backend_output_for(blocks: &[AdmittedBlock]) -> TestBackendWindowO
     TestBackendWindowOutput {
         blocks: blocks
             .iter()
-            .map(|block| {
+            .enumerate()
+            .map(|(index, block)| {
                 let decoded_transaction_count =
                     alloy_rlp::decode_exact::<EthereumBlock>(block.rlp())
                         .map(|block| block.body.transactions.len())
                         .unwrap_or_default();
+                let transaction_state_checkpoints = (index + 1 == blocks.len()
+                    && decoded_transaction_count == 0)
+                    .then(|| crate::testkit::pre_execution_checkpoint(block.claimed_hash))
+                    .into_iter()
+                    .collect();
                 BackendBlockOutput {
                     computed_hash: block.claimed_hash,
                     receipt_successes: vec![true; decoded_transaction_count],
-                    transaction_state_checkpoints: Vec::new(),
+                    transaction_state_checkpoints,
                     post_state_root: B256::ZERO,
                     settlement_evidence: SettlementBlockEvidence::from_rlp_for_test(&block.rlp),
                 }

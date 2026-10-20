@@ -287,6 +287,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             eez_l2: l2_chain_id,
         },
     );
+    let front_composer_info = Arc::new(serde_json::to_value(&composer_info)?);
     let handle = builder
         .node(EezNode)
         .extend_rpc_modules(move |ctx| {
@@ -338,7 +339,15 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     // Build the Composer and Sequencer around the same binary-owned
     // BlockCommitter handle. The Deriver receives another clone below, so all
     // engine traffic shares one actor, reconcile lock, and head mirror.
-    let (sequencer, composer, held_pool, system_tx_cfg, l1_source_chain_id) = {
+    let (
+        sequencer,
+        composer,
+        held_pool,
+        system_tx_cfg,
+        l1_source_chain_id,
+        l1_cap_source,
+        l2_cap_source,
+    ) = {
         let rollup_id = rollup_config.rollup_id;
         let l1_variant = &embedded_l1;
         // Share the SAME HeldPool the ingress middleware pushes into.
@@ -369,7 +378,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         let l1_rollup_id = RollupId(l1_rollup_id_u64);
         let l2_rollup_id_typed = RollupId(rollup_id);
 
-        // Source simulation shares the Ethereum EVM rules through EezEvmConfig.
+        // Source simulation uses EezEvmConfig's transaction EVM, not its L2 block executor.
         // L1 consensus still uses the upstream Ethereum/Gnosis node executor;
         // the EEZ envelope is used here only by the local composition client.
         let l1_entry_client: Arc<LocalChainClient> = match l1_variant {
@@ -529,8 +538,8 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             rollups: wired_rollups,
             exec_ctx,
             local: eez_composer::LocalComposeClients {
-                l1_entry: l1_entry_client,
-                l2_entry: l2_entry_client,
+                l1_entry: Arc::clone(&l1_entry_client),
+                l2_entry: Arc::clone(&l2_entry_client),
             },
         };
 
@@ -621,8 +630,21 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             held_pool,
             deriver_system_tx_cfg,
             l1_source_chain_id,
+            l1_entry_client,
+            l2_entry_client,
         )
     };
+
+    if let Some(cap) = l2_cap_source
+        .current_declared_tx_gas_limit_cap()
+        .map_err(|error| eyre::eyre!("resolve active L2 declared gas cap: {error}"))?
+        && eez_primitives::SYSTEM_TX_GAS_LIMIT > cap
+    {
+        return Err(eyre::eyre!(
+            "L2 system transaction gas limit {} exceeds the active transaction gas limit cap {cap}",
+            eez_primitives::SYSTEM_TX_GAS_LIMIT,
+        ));
+    }
 
     let l2_source_chain_id = chain_spec.chain().id();
     // Resolve both required fronts now. Their upstream chain-id checks run
@@ -660,6 +682,13 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     for (spec, port, url, validation_provider) in xchain_fronts {
         let pool = Arc::clone(&held_pool);
         let ready = Arc::clone(&xchain_ready);
+        let cap_source = match spec.direction {
+            eez_composer::Direction::Inbound => Arc::clone(&l1_cap_source),
+            eez_composer::Direction::Outbound => Arc::clone(&l2_cap_source),
+        };
+        let tx_gas_limit_cap: ingress::TxGasLimitCapResolver =
+            Arc::new(move || cap_source.current_declared_tx_gas_limit_cap());
+        let front_info = Arc::clone(&front_composer_info);
         task_executor.spawn_critical_task(spec.task, async move {
             ingress::run_cross_chain_front(
                 port,
@@ -668,7 +697,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 pool,
                 validation_provider,
                 spec.expected_source_chain_id,
+                tx_gas_limit_cap,
                 ready,
+                front_info,
             )
             .await
             .unwrap_or_else(|e| panic!("configured cross-chain front exited: {e:#}"));
@@ -705,12 +736,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                     "boot-time deriver catch_up gave up after {transport_failures} L1 transport failures: {err}"
                 ));
             }
-            Err(err)
-                if matches!(
-                    &err,
-                    DeriverError::L1Scan(L1Error::SourceIncomplete { .. } | L1Error::Provider(_))
-                ) =>
-            {
+            Err(err) if matches!(&err, DeriverError::L1Scan(l1) if l1.is_retryable()) => {
                 catch_up_attempts += 1;
                 event!(
                     name: "eez.node.deriver.boot_catch_up.source_incomplete",

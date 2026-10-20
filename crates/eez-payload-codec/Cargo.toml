@@ -8,9 +8,14 @@ description            = "Batch payload encode/decode shared by the Submitter an
 
 [dependencies]
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 alloy-primitives.workspace = true
+hex.workspace = true
+proptest = "1"
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

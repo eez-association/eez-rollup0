@@ -11,10 +11,9 @@ fn validated_single_block(
     receipt_successes: Vec<bool>,
     transaction_state_checkpoints: Vec<validate::StateCheckpoint>,
 ) -> validate::ValidatedWindow {
-    let (window_pre, settling_pre, window_post) = window_endpoints(5, 5);
+    let (window_pre, _, window_post) = window_endpoints(5, 5);
     validate::ValidatedWindow::for_test(
         window_pre,
-        settling_pre,
         window_post,
         Vec::new(),
         validate::testing::settling_block_for_test(
@@ -381,9 +380,14 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     );
     let mut wrong_source = action.clone();
     wrong_source.source_rollup_id = 2;
-    let mut wrong_destination = action;
-    wrong_destination.target_rollup_id = 2;
     let span = [eez_payload_codec::SpanBlock::default()];
+    let action_offset = eez_payload_codec::encode_container(1, &span, &[])
+        .unwrap()
+        .len();
+    let mut wrong_destination =
+        eez_payload_codec::encode_container(1, &span, std::slice::from_ref(&action)).unwrap();
+    let to_chain_offset = action_offset + 11;
+    wrong_destination[to_chain_offset..to_chain_offset + 8].copy_from_slice(&2_u64.to_le_bytes());
     for (name, replacement, expected_code) in [
         (
             "L1 settlement ABI substituted for DA",
@@ -397,8 +401,8 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         ),
         (
             "different destination rollup",
-            eez_payload_codec::encode_container(1, &span, &[wrong_destination]).unwrap(),
-            Code::FailedPrecondition,
+            wrong_destination,
+            Code::InvalidArgument,
         ),
     ] {
         let mut substituted = batch.clone();

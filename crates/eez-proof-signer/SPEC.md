@@ -8,7 +8,7 @@ EEZ protocol.
 
 The protocol source used by this profile is the `eez-core-protocol`
 submodule at commit
-`855fe0602484750861b4c31502a1a91355d33ed6`. The stateless backend uses
+`143d87e62cade98bfc122d612638dcaaf1c85633`. The stateless backend uses
 `AdityaSripal/stateless` branch `aditya/generic-recovered-validation`,
 with the exact commit pinned in `Cargo.lock`.
 
@@ -347,10 +347,10 @@ An absent `system[i + 1]` at block end is treated as `true`. Thus an outbound
 `[system-load, user]` pair ends at the user transaction, while a standalone
 inbound system transaction ends at itself.
 
-For a nonempty plan, first request the pre-execution position: the block sealed after its pre-block system calls
-and before transaction 0, which is the anchor's candidate. The positions in `C`
-follow in order. An empty terminal requests nothing, since it already is that
-candidate.
+The plan first requests the pre-execution position: the terminal sealed after
+its pre-block system calls and before transaction 0, which is the anchor's
+candidate. The positions in `C` follow in order. For an empty terminal, that
+single checkpoint seals the complete terminal block.
 
 The Composer MUST NOT nominate checkpoint positions. The plan MUST be derived
 locally before replay. The backend MUST return exactly the requested positions
@@ -550,11 +550,10 @@ Every later entry MUST be one of:
 
 A second anchor or any other shape MUST be rejected.
 
-The anchor's `etherDelta` MUST be zero. If at least one effect exists, the
-anchor's `newRoot` MUST equal the block hash of the leading pre-execution
-checkpoint: the terminal block sealed over no transactions. Every commitment
-then names a block at the terminal's height. If no effects exist, the anchor
-alone covers the complete window transition, and no checkpoint may be returned.
+The anchor's `etherDelta` MUST be zero. Its `newRoot` MUST equal the block hash
+of the leading pre-execution checkpoint: the terminal block sealed over no
+transactions. Every commitment then names a block at the terminal's height. If
+no effects exist, the empty terminal is its own empty prefix.
 
 For every effect at candidate position `C[i]`, the backend checkpoint MUST
 target `C[i]`, and the effect's `RollupUpdate.newRoot` MUST equal the hash of

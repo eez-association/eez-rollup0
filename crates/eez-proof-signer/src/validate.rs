@@ -417,10 +417,6 @@ impl ValidatedWindow {
     pub const fn window_pre_block_hash(&self) -> B256 {
         self.window_pre_block_hash
     }
-    #[cfg(test)]
-    pub(crate) fn settling_pre_block_hash(&self) -> B256 {
-        self.settling_block.parent_hash
-    }
     pub fn window_post_block_hash(&self) -> B256 {
         self.settling_block.hash
     }
@@ -454,7 +450,6 @@ impl ValidatedWindow {
     #[cfg(test)]
     pub(crate) fn for_test(
         window_pre_block_hash: B256,
-        _settling_pre_block_hash: B256,
         window_post_block_hash: B256,
         preceding_blocks: Vec<ValidatedBlock>,
         mut settling_block: ValidatedBlock,
