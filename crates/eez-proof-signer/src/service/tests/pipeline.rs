@@ -11,10 +11,9 @@ fn validated_single_block(
     receipt_successes: Vec<bool>,
     transaction_state_checkpoints: Vec<validate::StateCheckpoint>,
 ) -> validate::ValidatedWindow {
-    let (window_pre, _, window_post) = window_endpoints(5, 5);
     validate::ValidatedWindow::for_test(
-        window_pre,
-        window_post,
+        block_hash_of(4),
+        block_hash_of(5),
         Vec::new(),
         validate::testing::settling_block_for_test(
             block,

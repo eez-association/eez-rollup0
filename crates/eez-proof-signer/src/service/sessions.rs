@@ -1071,7 +1071,8 @@ mod tests {
     use crate::service::tests::TestServer;
     use crate::testkit::TEST_SYSTEM_ADDRESS;
     use crate::validate::{
-        BackendBlockOutput, BackendWindowOutput, SettlementBlockEvidence, ValidationBackend,
+        BackendBlockOutput, BackendWindowOutput, CheckpointAt, SettlementBlockEvidence,
+        StateCheckpoint, ValidationBackend,
     };
     use tokio_stream::wrappers::ReceiverStream as TokioReceiverStream;
 
@@ -1137,10 +1138,21 @@ mod tests {
                 .map_err(|_| ValidationError::DeadlineExceeded)?;
             let decoded = alloy_rlp::decode_exact::<eez_primitives::Block>(block.rlp()).unwrap();
             let post_root = decoded.header.state_root;
+            let transaction_state_checkpoints = decoded
+                .body
+                .transactions
+                .is_empty()
+                .then_some(StateCheckpoint {
+                    at: CheckpointAt::PreExecution,
+                    state_root: post_root,
+                    block_hash: block.claimed_hash(),
+                })
+                .into_iter()
+                .collect();
             let output = BackendBlockOutput {
                 computed_hash: block.claimed_hash(),
                 receipt_successes: Vec::new(),
-                transaction_state_checkpoints: Vec::new(),
+                transaction_state_checkpoints,
                 post_state_root: post_root,
                 settlement_evidence: SettlementBlockEvidence {
                     system_sender_flags: Vec::new(),

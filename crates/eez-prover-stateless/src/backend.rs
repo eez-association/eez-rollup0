@@ -256,8 +256,9 @@ impl Backend {
             // execution receipts, and the recomputed post-state commitment all
             // passed. Empty and system-transaction candidates include the anchor checkpoint.
             let witness = std::mem::take(witness);
+            let checkpoint_plan = checkpoint_plan.filter(|plan| !plan.positions().is_empty());
             let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
-                Some(plan) if !plan.positions().is_empty() => {
+                Some(plan) => {
                     let output = stateless_validation_recovered_with_state_checkpoints(
                         recovered_block.execution_input(),
                         witness,
@@ -279,7 +280,7 @@ impl Backend {
                     plan.verify_returned(&checkpoints)?;
                     (output.validation, checkpoints)
                 }
-                _ => {
+                None => {
                     let output = stateless_validation_recovered(
                         recovered_block.execution_input(),
                         witness,
