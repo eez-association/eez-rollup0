@@ -124,7 +124,9 @@ sol! {
         bytes32 indexed crossChainCallHash, uint64 indexed rollupId, uint256 indexed entryQueueIndex
     );
 
-    event L2TxSkipped(uint256 indexed transientIdx, bytes revertData);
+    event L2TxSkipped(uint256 indexed entryIndex, bytes revertData);
+
+    event EntryExecuted(uint256 indexed entryIndex, bytes32 rollingHash);
 
     event CrossChainCallExecuted(
         bytes32 indexed crossChainCallHash,
@@ -141,6 +143,15 @@ sol! {
 /// entries. Downstream settlement may merge them and attach state updates,
 /// proof-system metadata, and proofs.
 pub type EvmBatch = ProofSystemBatchPerVerificationEntriesSol;
+
+/// Topic0 of the EEZ events in the L1 batch-scan log grammar (`docs/l1-batch-scan.md`).
+pub const SCANNED_TOPICS: [alloy_primitives::B256; 5] = [
+    <BatchPosted as alloy_sol_types::SolEvent>::SIGNATURE_HASH,
+    <ExecutionConsumed as alloy_sol_types::SolEvent>::SIGNATURE_HASH,
+    <L2ExecutionPerformed as alloy_sol_types::SolEvent>::SIGNATURE_HASH,
+    <EntryExecuted as alloy_sol_types::SolEvent>::SIGNATURE_HASH,
+    <L2TxSkipped as alloy_sol_types::SolEvent>::SIGNATURE_HASH,
+];
 
 /// Events whose ABI differs specifically on `EEZL2`.
 pub mod eez_l2_events {
@@ -312,10 +323,11 @@ mod selector_locks {
         );
     }
 
-    /// Attribution reads these three by topic0, and drift is silent: `get_logs`
+    /// Log scans select by these topic0s, and drift is silent: `get_logs`
     /// returns nothing and the scan reports "no entries applied".
     #[test]
     fn consumption_event_topics_match_upstream() {
+        use alloy_primitives::b256;
         use alloy_sol_types::SolEvent;
         assert_eq!(
             L2ExecutionPerformed::SIGNATURE_HASH,
@@ -337,6 +349,18 @@ mod selector_locks {
                 "31dea3928d6f7bb415eb371434f719dfc337c078c82d58146f2b8a4726002e40"
             ),
             "L2TxSkipped topic0 drifted; a skipped immediate would read as applied"
+        );
+        // Pins the two other scanned topics and the order of `SCANNED_TOPICS`.
+        assert_eq!(
+            SCANNED_TOPICS,
+            [
+                b256!("70159c08b708a43c8e97ba2da7378cf59ee0b44dab6d764121b8079183ea477f"),
+                ExecutionConsumed::SIGNATURE_HASH,
+                L2ExecutionPerformed::SIGNATURE_HASH,
+                b256!("2e1562030784fdfac2cf8bb062751bb5c6d19b8e45cc3ba103a8728fb3c4281d"),
+                L2TxSkipped::SIGNATURE_HASH,
+            ],
+            "SCANNED_TOPICS drifted (a topic or its order); posts or applied entries would misread"
         );
     }
 }

@@ -8,7 +8,7 @@ use alloy_rpc_types_eth::Filter;
 
 use crate::config::L1ReaderConfig;
 use crate::error::{L1Error, L1Result};
-use crate::scan::{BatchLogChunks, ScannedBatch, scan_next_batch_log_chunk};
+use crate::scan::{BatchLogChunks, Post, scan_next_batch_log_chunk};
 
 /// Read-only L1 client for historical batch scans and canonicality checks.
 /// Cheaply [`Clone`]able.
@@ -58,20 +58,29 @@ impl L1Reader {
         Ok(BatchLogChunks::new(from_block, latest))
     }
 
-    /// Scans and returns the next `BatchPosted` log chunk, or `None` when
-    /// the chunks are exhausted.
+    /// Scans and returns our rollup's `Post`s from the next log chunk, or
+    /// `None` when the chunks are exhausted.
     ///
     /// # Errors
     ///
-    /// - [`L1Error::Provider`] on RPC failure (log fetch, tx fetch).
+    /// - [`L1Error::Provider`] on RPC failure (log, tx or trace fetch).
     /// - [`L1Error::SourceIncomplete`] when a canonical batch tx is not
     ///   served by the L1 source yet — retryable once the source syncs.
+    /// - A terminal error (see [`L1Error::is_terminal`]) when L1 breaks the protocol.
     pub async fn next_batch_log_chunk(
         &self,
         chunks: &mut BatchLogChunks,
-    ) -> L1Result<Option<Vec<ScannedBatch>>> {
+    ) -> L1Result<Option<Vec<Post>>> {
         let provider = self.build_provider();
-        scan_next_batch_log_chunk(&provider, self.config.eez, self.config.rollup_id, chunks).await
+        let trace = self.build_trace_provider();
+        scan_next_batch_log_chunk(
+            &provider,
+            &trace,
+            self.config.eez,
+            self.config.rollup_id,
+            chunks,
+        )
+        .await
     }
 
     /// Hash of the canonical L1 block at `number`, or `None` if none. Used by
@@ -190,5 +199,12 @@ impl L1Reader {
         ProviderBuilder::new()
             .disable_recommended_fillers()
             .connect_http(self.config.rpc_url.clone())
+    }
+
+    /// Provider for block traces, at [`L1ReaderConfig::trace_rpc_url`].
+    pub(crate) fn build_trace_provider(&self) -> impl Provider + use<> {
+        ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(self.config.trace_rpc_url.clone())
     }
 }
