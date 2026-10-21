@@ -3551,6 +3551,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-debug",
+ "alloy-rpc-types-engine",
  "async-trait",
  "eez-driver",
  "eez-evm",

@@ -40,6 +40,7 @@ tracing.workspace = true
 workspace = true
 
 [dev-dependencies]
+alloy-rpc-types-engine.workspace = true
 eez-proof-signer = { workspace = true, features = ["test-utils"] }
 reth-chain-state.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }

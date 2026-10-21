@@ -5,8 +5,10 @@ use alloy_consensus::constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH};
 use alloy_consensus::{BlockBody, Header, SignableTransaction as _, TxLegacy};
 use alloy_eips::{BlockNumHash, BlockNumberOrTag};
 use alloy_primitives::{Bytes, Signature, TxKind, U256};
+use alloy_rpc_types_engine::{PayloadStatus, PayloadStatusEnum};
 use eez_proof_signer::window::testing::admitted_block_from_consensus_rlp;
 use reth_chainspec::ChainInfo;
+use reth_engine_primitives::{BeaconEngineMessage, OnForkChoiceUpdated};
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
 use reth_storage_api::StateProviderBox;
 use reth_storage_api::errors::provider::ProviderResult;
@@ -268,6 +270,154 @@ async fn block_validation_deadline_bounds_waiting_for_reconciliation() {
             .unwrap()
             .1
     );
+}
+
+fn mock_engine(
+    backend: &mut Backend<MockEthProvider<EezPrimitives>>,
+    anchor: BlockAnchor,
+) -> tokio::sync::mpsc::UnboundedReceiver<BeaconEngineMessage<EezEngineTypes>> {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (payload_sender, _) = tokio::sync::mpsc::unbounded_channel();
+    let parent = SealedHeader::new(
+        backend.provider.header(anchor.hash).unwrap().unwrap(),
+        anchor.hash,
+    );
+    backend.committer = Some(BlockCommitterHandle::spawn(
+        parent.clone(),
+        parent,
+        B256::ZERO,
+        reth_engine_primitives::ConsensusEngineHandle::new(sender),
+        reth_payload_builder::PayloadBuilderHandle::new(payload_sender),
+        None,
+    ));
+    backend.provider.receipts.lock().clear(); // Force the real import path.
+    receiver
+}
+
+#[tokio::test]
+async fn pending_engine_validation_is_retryable_but_invalid_blocks_are_rejected() {
+    for (payload_status, forkchoice_status) in [
+        (PayloadStatusEnum::Syncing, PayloadStatusEnum::Valid),
+        (PayloadStatusEnum::Accepted, PayloadStatusEnum::Valid),
+        (
+            PayloadStatusEnum::Invalid {
+                validation_error: "bad payload".into(),
+            },
+            PayloadStatusEnum::Valid,
+        ),
+        (PayloadStatusEnum::Valid, PayloadStatusEnum::Syncing),
+        (
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Invalid {
+                validation_error: "bad forkchoice".into(),
+            },
+        ),
+        (PayloadStatusEnum::Valid, PayloadStatusEnum::Valid),
+    ] {
+        let invalid = payload_status.is_invalid() || forkchoice_status.is_invalid();
+        let valid = payload_status.is_valid() && forkchoice_status.is_valid();
+        let (mut backend, anchor, input) = cached_engine("empty");
+        let mut engine = mock_engine(&mut backend, anchor);
+        let provider = backend.provider.clone();
+        let responder = tokio::spawn(async move {
+            let Some(BeaconEngineMessage::NewPayload { tx, .. }) = engine.recv().await else {
+                panic!("expected newPayload");
+            };
+            let imported = payload_status.is_valid();
+            tx.send(Ok(PayloadStatus::from_status(payload_status)))
+                .unwrap();
+            if imported {
+                let Some(BeaconEngineMessage::ForkchoiceUpdated { tx, .. }) = engine.recv().await
+                else {
+                    panic!("expected forkchoice update");
+                };
+                provider.add_receipts(1, Vec::new());
+                tx.send(Ok(OnForkChoiceUpdated::valid(PayloadStatus::from_status(
+                    forkchoice_status,
+                ))))
+                .unwrap();
+            }
+        });
+        let result = backend
+            .validate_next(
+                anchor,
+                &input,
+                ExecutionWitness::default(),
+                Duration::from_secs(1),
+            )
+            .await;
+        if invalid {
+            assert!(
+                matches!(result, Err(ValidationError::Rejected(_))),
+                "{result:?}"
+            );
+        } else if valid {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(
+                matches!(result, Err(ValidationError::Unavailable(_))),
+                "{result:?}"
+            );
+        }
+        responder.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn timed_out_import_holds_reconciliation_until_engine_finishes() {
+    for stall_at_forkchoice in [false, true] {
+        let (mut backend, anchor, input) = cached_engine("empty");
+        let mut engine = mock_engine(&mut backend, anchor);
+        let committer = backend.committer.as_ref().unwrap().clone();
+        let request = tokio::spawn(async move {
+            backend
+                .validate_next(
+                    anchor,
+                    &input,
+                    ExecutionWitness::default(),
+                    Duration::from_millis(100),
+                )
+                .await
+        });
+        let Some(BeaconEngineMessage::NewPayload { tx, .. }) = engine.recv().await else {
+            panic!("expected newPayload");
+        };
+        // Withhold the engine reply until the request has actually timed out.
+        if stall_at_forkchoice {
+            tx.send(Ok(PayloadStatus::from_status(PayloadStatusEnum::Valid)))
+                .unwrap();
+            let Some(BeaconEngineMessage::ForkchoiceUpdated { tx, .. }) = engine.recv().await
+            else {
+                panic!("expected forkchoice update");
+            };
+            assert!(matches!(
+                request.await.unwrap(),
+                Err(ValidationError::DeadlineExceeded)
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), committer.begin_reconcile())
+                    .await
+                    .is_err()
+            );
+            tx.send(Ok(OnForkChoiceUpdated::syncing())).unwrap();
+        } else {
+            assert!(matches!(
+                request.await.unwrap(),
+                Err(ValidationError::DeadlineExceeded)
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), committer.begin_reconcile())
+                    .await
+                    .is_err()
+            );
+            tx.send(Ok(PayloadStatus::from_status(PayloadStatusEnum::Syncing)))
+                .unwrap();
+        }
+        // The next reconciler can run once the outstanding mutation has returned.
+        let _guard = tokio::time::timeout(Duration::from_secs(1), committer.begin_reconcile())
+            .await
+            .unwrap();
+    }
 }
 
 fn provider_with_anchor(number: u64, hash: B256, state_root: B256) -> MockEthProvider {
