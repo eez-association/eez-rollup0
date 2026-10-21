@@ -26,7 +26,7 @@ use eez_primitives::{Block, engine::EezEngineTypes};
 use eez_seq_sig::{Envelope, HeadDomain, HeadTracker, Observation, VerifiedHead, decode_block};
 use reth_payload_primitives::PayloadTypes as _;
 use reth_primitives_traits::{SealedBlock, SealedHeader};
-use reth_storage_api::{BlockIdReader, HeaderProvider};
+use reth_storage_api::{BlockIdReader, BlockNumReader, HeaderProvider};
 use thiserror::Error;
 use tracing::{Level, event};
 
@@ -229,8 +229,9 @@ where
             let missing = match self.fetch(head).await {
                 Ok(missing) => missing,
                 Err(err) => {
+                    // Unknown ancestry is not a conflict, so a lower version must not win.
                     self.rejections.warn(number, hash, &err.to_string());
-                    continue;
+                    return Ok(());
                 }
             };
             // Held from the safe check through import, so the Deriver can't move safe in between.
@@ -244,7 +245,10 @@ where
                     fork_point.hash()
                 );
                 self.rejections.warn(number, hash, &reason);
-                continue;
+                if verdict == SafeCompat::Conflicts {
+                    continue;
+                }
+                return Ok(());
             }
             let imported = missing.blocks.len();
             if self.import(missing).await? {
@@ -359,9 +363,18 @@ async fn fetch_missing<P, S>(
     target: &SealedBlock<Block>,
 ) -> Result<Missing, FollowerError>
 where
-    P: HeaderProvider<Header = Header>,
+    P: HeaderProvider<Header = Header> + BlockNumReader,
     S: BlockSource,
 {
+    // The fork point is local, so at or below the local head: no walk could fit the cap.
+    let best = local
+        .best_block_number()
+        .map_err(|e| FollowerError::Provider(format!("best_block_number: {e}")))?;
+    if target.number > best.saturating_add(MAX_ANCESTRY_WALK) {
+        return Err(FollowerError::Unverifiable {
+            depth: MAX_ANCESTRY_WALK,
+        });
+    }
     let mut blocks = Vec::new();
     let mut hash = target.hash();
     loop {
@@ -467,7 +480,7 @@ mod tests {
 
     use alloy_primitives::{BlockHash, BlockNumber};
     use reth_chainspec::ChainInfo;
-    use reth_storage_api::{BlockHashReader, BlockNumReader, errors::provider::ProviderResult};
+    use reth_storage_api::{BlockHashReader, errors::provider::ProviderResult};
 
     use super::*;
 
@@ -799,8 +812,24 @@ mod tests {
         }
         let remote: HashMap<_, _> = chain.iter().map(|b| (b.hash(), rlp(b))).collect();
         let target = chain.last().unwrap();
+        // An unrelated local head at the target's height lets the walk start.
+        let mut local = MockLocal::default();
+        local.insert_canonical(hash(0xee), header(target.number, hash(0xed)));
 
-        let err = fetch_missing(&MockLocal::default(), &remote, target)
+        let err = fetch_missing(&local, &remote, target).await.unwrap_err();
+
+        assert!(matches!(err, FollowerError::Unverifiable { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_skips_walk_when_target_is_beyond_cap() {
+        let b0 = block(0, B256::ZERO, 0);
+        let mut local = MockLocal::default();
+        local.insert_canonical(b0.hash(), b0.header().clone());
+        let target = block(MAX_ANCESTRY_WALK + 1, hash(0xaa), 0);
+
+        // Any fetch from the empty remote would fail as "not served" instead.
+        let err = fetch_missing(&local, &HashMap::new(), &target)
             .await
             .unwrap_err();
 
