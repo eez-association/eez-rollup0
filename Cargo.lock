@@ -3604,6 +3604,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "eez-seq-sig"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-serde",
+ "alloy-signer",
+ "alloy-signer-local",
+ "alloy-sol-types",
+ "eez-primitives",
+ "reth-primitives-traits",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "eez-testkit"
 version = "0.1.0"
 dependencies = [
