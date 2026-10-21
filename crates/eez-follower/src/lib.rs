@@ -236,6 +236,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
             block_committer,
             RootProvider::new_http(sequencer_rpc),
             provider,
+            l1_head,
             head_domain,
             sequencer_address,
             timing.l2_block_time(),

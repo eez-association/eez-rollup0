@@ -14,6 +14,7 @@
 
 use std::{
     collections::HashSet,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,6 +23,7 @@ use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, RootProvider};
 use eez_driver::BlockCommitterHandle;
+use eez_l1::L1CanonicalHead;
 use eez_primitives::{Block, engine::EezEngineTypes};
 use eez_seq_sig::{Envelope, HeadDomain, HeadTracker, Observation, VerifiedHead, decode_block};
 use reth_payload_primitives::PayloadTypes as _;
@@ -58,6 +60,12 @@ pub(crate) enum FollowerError {
     /// No locally known ancestor within [`MAX_ANCESTRY_WALK`] blocks.
     #[error("no local ancestor within {depth} blocks")]
     Unverifiable { depth: u64 },
+
+    /// The target is too far ahead of the local head to walk back from.
+    #[error(
+        "target {target} is more than {MAX_ANCESTRY_WALK} ahead of local head {local}; waiting for L1 derivation"
+    )]
+    Ahead { target: u64, local: u64 },
 
     /// The source answered a block request with a different block.
     #[error("requested block {requested}, got {got}")]
@@ -106,6 +114,8 @@ pub(crate) struct UnsafeHeadFollower<P> {
     /// Local chain reader: resolves the current safe anchor and the
     /// candidate head's ancestry for the compatibility check.
     local: P,
+    /// The Deriver's L1 batch index, which can run ahead of reth's safe block.
+    l1_head: Arc<L1CanonicalHead>,
     domain: HeadDomain,
     /// The only signer whose heads are followed.
     sequencer_address: Address,
@@ -123,6 +133,7 @@ where
         committer: BlockCommitterHandle<EezEngineTypes>,
         sequencer_rpc: RootProvider,
         local: P,
+        l1_head: Arc<L1CanonicalHead>,
         domain: HeadDomain,
         sequencer_address: Address,
         poll_interval: Duration,
@@ -131,6 +142,7 @@ where
             committer,
             sequencer_rpc,
             local,
+            l1_head,
             domain,
             sequencer_address,
             poll_interval,
@@ -225,19 +237,59 @@ where
     /// Adopt the highest-version candidate that descends from safe.
     async fn follow_best(&mut self) -> Result<(), FollowerError> {
         for head in self.tracker.candidates() {
-            let (number, hash) = (head.claim.number, head.claim.block_hash);
+            let claim = &head.claim;
+            let (number, hash) = (claim.number, claim.block_hash);
+            // The claim alone can prove a conflict, so a source whose ancestors
+            // nobody serves stops blocking lower candidates once safe passes it.
+            let at = BlockNumHash::new(number, hash);
+            if check_extends_safe(&self.local, at, claim.parent_hash)? == SafeCompat::Conflicts {
+                self.rejections.warn(number, hash, "conflicts with safe");
+                continue;
+            }
             let missing = match self.fetch(head).await {
                 Ok(missing) => missing,
+                Err(err @ FollowerError::Ahead { .. }) => {
+                    if self.rejections.first(hash, "ahead") {
+                        event!(
+                            name: "eez.node.follower.head.ahead",
+                            Level::INFO,
+                            block.number = number,
+                            block.hash = %hash,
+                            reason = %err,
+                            "signed head not followed yet",
+                        );
+                    }
+                    return Ok(());
+                }
                 Err(err) => {
                     // Unknown ancestry is not a conflict, so a lower version must not win.
                     self.rejections.warn(number, hash, &err.to_string());
                     return Ok(());
                 }
             };
-            // Held from the safe check through import, so the Deriver can't move safe in between.
+            // Held from the safe check through import, so no Deriver batch reconcile interleaves.
             let _guard = self.committer.begin_reconcile().await;
+            // The Deriver indexes a batch before moving safe to it, so the heights
+            // in between are L1-settled and must not be rewritten.
+            let indexed = self.l1_head.last_indexed_l2();
+            let safe = self
+                .local
+                .safe_block_num_hash()
+                .map_err(|e| FollowerError::Provider(format!("safe_block_num_hash: {e}")))?
+                .map_or(0, |s| s.number);
+            if indexed > safe {
+                event!(
+                    name: "eez.node.follower.head.held",
+                    Level::DEBUG,
+                    indexed,
+                    safe,
+                    "safe lags the L1 batch index; holding the head",
+                );
+                return Ok(());
+            }
             let fork_point = &missing.fork_point;
-            let verdict = check_extends_safe(&self.local, fork_point, fork_point.hash())?;
+            let verdict =
+                check_extends_safe(&self.local, fork_point.num_hash(), fork_point.parent_hash)?;
             if verdict != SafeCompat::Extends {
                 let reason = format!(
                     "fork point {} ({}) does not extend safe: {verdict:?}",
@@ -371,8 +423,9 @@ where
         .best_block_number()
         .map_err(|e| FollowerError::Provider(format!("best_block_number: {e}")))?;
     if target.number > best.saturating_add(MAX_ANCESTRY_WALK) {
-        return Err(FollowerError::Unverifiable {
-            depth: MAX_ANCESTRY_WALK,
+        return Err(FollowerError::Ahead {
+            target: target.number,
+            local: best,
         });
     }
     let mut blocks = Vec::new();
@@ -408,11 +461,11 @@ where
 /// lookup usually resolves or misses (unverifiable).
 fn check_extends_safe<P>(
     local: &P,
-    candidate: &alloy_consensus::Header,
-    candidate_hash: alloy_primitives::B256,
+    candidate: BlockNumHash,
+    parent_hash: B256,
 ) -> Result<SafeCompat, FollowerError>
 where
-    P: HeaderProvider<Header = alloy_consensus::Header> + BlockIdReader,
+    P: HeaderProvider<Header = Header> + BlockIdReader,
 {
     let Some(safe) = local
         .safe_block_num_hash()
@@ -429,7 +482,7 @@ where
     // A head at the safe height must be the safe block; below it,
     // it can never extend it.
     if candidate.number == safe_number {
-        return Ok(if candidate_hash == safe_hash {
+        return Ok(if candidate.hash == safe_hash {
             SafeCompat::Extends
         } else {
             SafeCompat::Conflicts
@@ -445,12 +498,12 @@ where
     if local
         .sealed_header(candidate.number)
         .map_err(|e| FollowerError::Provider(format!("sealed_header({}): {e}", candidate.number)))?
-        .is_some_and(|local| local.hash() == candidate_hash)
+        .is_some_and(|local| local.hash() == candidate.hash)
     {
         return Ok(SafeCompat::Extends);
     }
 
-    let mut cursor_hash = candidate.parent_hash;
+    let mut cursor_hash = parent_hash;
     let mut cursor_number = candidate.number - 1;
     let mut reads = 0;
     while cursor_number > safe_number {
@@ -631,10 +684,9 @@ mod tests {
     #[test]
     fn candidate_extends_when_no_safe_anchor() {
         let local = MockLocal::default();
-        let candidate = header(1, hash(0));
 
         assert_eq!(
-            check_extends_safe(&local, &candidate, hash(1)).unwrap(),
+            check_extends_safe(&local, BlockNumHash::new(1, hash(1)), hash(0)).unwrap(),
             SafeCompat::Extends
         );
     }
@@ -643,14 +695,13 @@ mod tests {
     fn candidate_at_safe_height_must_match_safe_hash() {
         let safe_hash = hash(10);
         let local = MockLocal::with_safe(10, safe_hash);
-        let candidate = header(10, hash(9));
 
         assert_eq!(
-            check_extends_safe(&local, &candidate, safe_hash).unwrap(),
+            check_extends_safe(&local, BlockNumHash::new(10, safe_hash), hash(9)).unwrap(),
             SafeCompat::Extends
         );
         assert_eq!(
-            check_extends_safe(&local, &candidate, hash(99)).unwrap(),
+            check_extends_safe(&local, BlockNumHash::new(10, hash(99)), hash(9)).unwrap(),
             SafeCompat::Conflicts
         );
     }
@@ -658,10 +709,9 @@ mod tests {
     #[test]
     fn candidate_below_safe_conflicts() {
         let local = MockLocal::with_safe(10, hash(10));
-        let candidate = header(9, hash(8));
 
         assert_eq!(
-            check_extends_safe(&local, &candidate, hash(9)).unwrap(),
+            check_extends_safe(&local, BlockNumHash::new(9, hash(9)), hash(8)).unwrap(),
             SafeCompat::Conflicts
         );
     }
@@ -670,13 +720,14 @@ mod tests {
     fn candidate_directly_above_safe_checks_parent_hash() {
         let safe_hash = hash(10);
         let local = MockLocal::with_safe(10, safe_hash);
+        let candidate = BlockNumHash::new(11, hash(11));
 
         assert_eq!(
-            check_extends_safe(&local, &header(11, safe_hash), hash(11)).unwrap(),
+            check_extends_safe(&local, candidate, safe_hash).unwrap(),
             SafeCompat::Extends
         );
         assert_eq!(
-            check_extends_safe(&local, &header(11, hash(99)), hash(11)).unwrap(),
+            check_extends_safe(&local, candidate, hash(99)).unwrap(),
             SafeCompat::Conflicts
         );
     }
@@ -684,11 +735,10 @@ mod tests {
     #[test]
     fn canonical_candidate_extends_without_parent_walk() {
         let mut local = MockLocal::with_safe(10, hash(10));
-        let candidate = header(12, hash(99));
-        local.insert_canonical(hash(12), candidate.clone());
+        local.insert_canonical(hash(12), header(12, hash(99)));
 
         assert_eq!(
-            check_extends_safe(&local, &candidate, hash(12)).unwrap(),
+            check_extends_safe(&local, BlockNumHash::new(12, hash(12)), hash(99)).unwrap(),
             SafeCompat::Extends
         );
     }
@@ -699,10 +749,8 @@ mod tests {
         local.insert_known(hash(12), header(12, hash(11)));
         local.insert_known(hash(11), header(11, hash(10)));
 
-        let candidate = header(13, hash(12));
-
         assert_eq!(
-            check_extends_safe(&local, &candidate, hash(13)).unwrap(),
+            check_extends_safe(&local, BlockNumHash::new(13, hash(13)), hash(12)).unwrap(),
             SafeCompat::Extends
         );
     }
@@ -713,10 +761,8 @@ mod tests {
         local.insert_known(hash(12), header(12, hash(11)));
         local.insert_known(hash(11), header(11, hash(99)));
 
-        let candidate = header(13, hash(12));
-
         assert_eq!(
-            check_extends_safe(&local, &candidate, hash(13)).unwrap(),
+            check_extends_safe(&local, BlockNumHash::new(13, hash(13)), hash(12)).unwrap(),
             SafeCompat::Conflicts
         );
     }
@@ -724,10 +770,9 @@ mod tests {
     #[test]
     fn missing_ancestry_is_unverifiable() {
         let local = MockLocal::with_safe(10, hash(10));
-        let candidate = header(12, hash(11));
 
         assert_eq!(
-            check_extends_safe(&local, &candidate, hash(12)).unwrap(),
+            check_extends_safe(&local, BlockNumHash::new(12, hash(12)), hash(11)).unwrap(),
             SafeCompat::Unverifiable
         );
     }
@@ -833,6 +878,6 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, FollowerError::Unverifiable { .. }), "{err}");
+        assert!(matches!(err, FollowerError::Ahead { .. }), "{err}");
     }
 }
