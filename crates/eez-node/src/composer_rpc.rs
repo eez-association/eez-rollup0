@@ -82,7 +82,7 @@ pub struct ComposerContracts {
 /// Returns an error if the method name is already registered or the module
 /// cannot be merged into the configured transports.
 pub fn install_composer_rpc<Node, EthApi>(
-    ctx: RpcContext<'_, Node, EthApi>,
+    ctx: &mut RpcContext<'_, Node, EthApi>,
     info: ComposerInfo,
 ) -> eyre::Result<()>
 where

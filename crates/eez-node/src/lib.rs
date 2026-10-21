@@ -7,6 +7,7 @@
 //!
 mod bundle_rpc;
 mod composer_rpc;
+mod head_rpc;
 mod ingress;
 mod l1_embedded;
 mod witness_source;
@@ -114,6 +115,18 @@ fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
     })
 }
 
+/// `EEZ_SEQUENCER_KEY`: the key that signs this composer's heads; unset disables signing.
+fn sequencer_key_from_env() -> eyre::Result<Option<PrivateKeySigner>> {
+    match env::var("EEZ_SEQUENCER_KEY") {
+        // The parse error is dropped on purpose: it must never echo the key.
+        Ok(value) => PrivateKeySigner::from_str(value.trim())
+            .map(Some)
+            .map_err(|_| eyre::eyre!("EEZ_SEQUENCER_KEY is not a valid private key")),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(eyre::eyre!("EEZ_SEQUENCER_KEY is not valid unicode")),
+    }
+}
+
 fn optional_address_from_env(name: &str) -> eyre::Result<Option<Address>> {
     match env::var(name) {
         Ok(value) => Address::from_str(value.trim())
@@ -134,6 +147,14 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     );
 
     warn_on_deprecated_env();
+    let sequencer_key = sequencer_key_from_env()?;
+    if sequencer_key.is_none() {
+        event!(
+            name: "eez.node.head_signer.disabled",
+            Level::WARN,
+            "EEZ_SEQUENCER_KEY not set; this composer does not sign heads",
+        );
+    }
     // Fail before launching either reth if no usable prover is configured.
     let ComposerProving {
         prover,
@@ -287,10 +308,16 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         },
     );
     let front_composer_info = Arc::new(serde_json::to_value(&composer_info)?);
+    let head_store = head_rpc::SignedHeadStore::default();
+    let rpc_head_store = sequencer_key.is_some().then(|| head_store.clone());
     let handle = builder
         .node(EezNode)
-        .extend_rpc_modules(move |ctx| {
-            composer_rpc::install_composer_rpc(ctx, composer_info.clone())
+        .extend_rpc_modules(move |mut ctx| {
+            composer_rpc::install_composer_rpc(&mut ctx, composer_info.clone())?;
+            if let Some(store) = rpc_head_store {
+                head_rpc::install_head_rpc(&mut ctx, store)?;
+            }
+            Ok(())
         })
         .launch_with_debug_capabilities()
         .await?;
@@ -326,6 +353,27 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     let rollup_config = RollupConfig::from_env(
         eez_evm::fee_collector(&chain_spec.genesis.config)?.unwrap_or_default(),
     )?;
+    if let Some(key) = sequencer_key {
+        let domain = eez_seq_sig::HeadDomain {
+            l2_chain_id,
+            registry: eez_registry,
+            rollup_id: rollup_config.rollup_id,
+        };
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?;
+        task_executor.spawn_critical_task(
+            "eez-head-signer",
+            head_rpc::run_head_signer(
+                block_committer.subscribe_head(),
+                provider.clone(),
+                eez_seq_sig::HeadSigner::new(key, domain, now_ms),
+                head_store,
+            ),
+        );
+    }
     let attributes = EthAttributesBuilder::new(chain_spec.clone())
         .with_fee_recipient(rollup_config.fee_recipient);
     let l1_watcher_config = L1WatcherConfig::from_env()?;
