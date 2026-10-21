@@ -62,9 +62,9 @@ fn block_input(mut block: AdmittedBlock) -> (AdmittedBlock, ExecutionWitness, Bl
 }
 
 #[tokio::test]
-async fn block_validation_ordinal_execution_keeps_candidate_checkpoints_and_checks_cache_hits() {
+async fn block_validation_ordinal_execution_skips_checkpoints_and_checks_cache_hits() {
     // A real three-user-transaction block, not an empty block that would skip
-    // transaction checkpoint work even before the v2 selection fix.
+    // checkpoint work even before the v2 selection fix.
     let (input, config) = checkpoint_fixture();
     let (input, witness, parent) = block_input(input);
     let backend = Backend::new(config, TEST_SYSTEM_ADDRESS);
@@ -95,19 +95,7 @@ async fn block_validation_ordinal_execution_keeps_candidate_checkpoints_and_chec
     assert!(!reused);
     assert_eq!(fresh.decoded().body.transactions.len(), 3);
     assert_eq!(fresh.settlement_evidence().system_sender_flags, [false; 3]);
-    assert_eq!(
-        fresh
-            .transaction_state_checkpoints()
-            .iter()
-            .map(|checkpoint| checkpoint.at)
-            .collect::<Vec<_>>(),
-        [
-            CheckpointAt::PreExecution,
-            CheckpointAt::Transaction(0),
-            CheckpointAt::Transaction(1),
-            CheckpointAt::Transaction(2),
-        ]
-    );
+    assert!(fresh.transaction_state_checkpoints().is_empty());
     // No witness is available to re-execute, so success proves backend cache reuse.
     let (cached, reused) = backend
         .validate_next(parent, &input, ExecutionWitness::default(), deadline)
@@ -729,10 +717,10 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
     );
 }
 
-/// Every plan includes the anchor candidate. Nonempty blocks also include the
-/// final transaction, activating Stateless's post-execution-neutrality check.
+/// Every nonempty plan includes the final transaction, which activates
+/// Stateless's post-execution-neutrality check. Ordinary blocks need no plan.
 #[test]
-fn checkpoint_plan_has_anchor_and_ends_at_the_final_transaction() {
+fn checkpoint_plan_is_empty_or_ends_at_the_final_transaction() {
     let system = || {
         <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(
             &hex::decode(SYSTEM_TX).unwrap(),
@@ -924,7 +912,7 @@ fn validates_the_golden_block_through_stateless() {
 }
 
 #[test]
-fn ordinary_v1_terminal_executes_with_candidate_checkpoints() {
+fn ordinary_v1_terminal_executes_without_checkpoints() {
     let (mut input, chain_config) = checkpoint_fixture();
     let expected_hash = input.claimed_hash();
 
@@ -949,19 +937,7 @@ fn ordinary_v1_terminal_executes_with_candidate_checkpoints() {
     );
     assert_eq!(block.hash(), expected_hash);
 
-    assert_eq!(
-        block
-            .transaction_state_checkpoints()
-            .iter()
-            .map(|checkpoint| checkpoint.at)
-            .collect::<Vec<_>>(),
-        [
-            CheckpointAt::PreExecution,
-            CheckpointAt::Transaction(0),
-            CheckpointAt::Transaction(1),
-            CheckpointAt::Transaction(2),
-        ]
-    );
+    assert!(block.transaction_state_checkpoints().is_empty());
 }
 
 #[test]

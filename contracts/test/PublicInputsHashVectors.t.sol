@@ -303,14 +303,12 @@ contract PublicInputsHashVectorsTest is Test {
         bytes32 anchorState = bytes32(uint256(0x2222));
 
         EEZ canonicalEez = new EEZ(address(0xDEAD));
-        uint64 canonicalRollup =
-            _registerRollup(canonicalEez, _singleton(proofSystem), _singleton(vkey), initialState);
+        uint64 canonicalRollup = _registerRollup(canonicalEez, _singleton(proofSystem), _singleton(vkey), initialState);
         ProofSystemBatchPerVerificationEntries memory canonical =
             _schedulerBatch(proofSystem, canonicalRollup, initialState, anchorState, 1);
 
         EEZ mutatedEez = new EEZ(address(0xDEAD));
-        uint64 mutatedRollup =
-            _registerRollup(mutatedEez, _singleton(proofSystem), _singleton(vkey), initialState);
+        uint64 mutatedRollup = _registerRollup(mutatedEez, _singleton(proofSystem), _singleton(vkey), initialState);
         ProofSystemBatchPerVerificationEntries memory mutated =
             _schedulerBatch(proofSystem, mutatedRollup, initialState, anchorState, 2);
 
@@ -319,11 +317,8 @@ contract PublicInputsHashVectorsTest is Test {
 
         bytes32 canonicalShared = _shared(canonical, _emptyCustomData(1), address(0));
         bytes32 mutatedShared = _shared(mutated, _emptyCustomData(1), address(0));
-        bytes32 canonicalPublicInput = _publicInput(
-            canonicalShared, _singleton(canonicalRollup), _singleton(vkey)
-        );
-        bytes32 mutatedPublicInput =
-            _publicInput(mutatedShared, _singleton(mutatedRollup), _singleton(vkey));
+        bytes32 canonicalPublicInput = _publicInput(canonicalShared, _singleton(canonicalRollup), _singleton(vkey));
+        bytes32 mutatedPublicInput = _publicInput(mutatedShared, _singleton(mutatedRollup), _singleton(vkey));
         assertEq(canonicalShared, mutatedShared);
         assertEq(canonicalPublicInput, mutatedPublicInput);
 
@@ -446,9 +441,7 @@ contract PublicInputsHashVectorsTest is Test {
         batch = _emptyBatch();
         batch.entries = new ExecutionEntry[](2);
         batch.entries[0] = _schedulerEntry(rollupId, initialState, anchorState, bytes32(0));
-        batch.entries[1] = _schedulerEntry(
-            rollupId, anchorState, bytes32(uint256(0x3333)), bytes32(uint256(0x4444))
-        );
+        batch.entries[1] = _schedulerEntry(rollupId, anchorState, bytes32(uint256(0x3333)), bytes32(uint256(0x4444)));
         batch.immediateEntryCount = immediateEntryCount;
         batch.proofSystems = _addresses(_singleton(proofSystem));
         batch.proofs = _proofs(1);
@@ -466,12 +459,8 @@ contract PublicInputsHashVectorsTest is Test {
         returns (ExecutionEntry memory entry)
     {
         entry.rollupUpdates = new RollupUpdate[](1);
-        entry.rollupUpdates[0] = RollupUpdate({
-            rollupId: rollupId,
-            currentRoot: currentRoot,
-            newRoot: newRoot,
-            etherDelta: 0
-        });
+        entry.rollupUpdates[0] =
+            RollupUpdate({rollupId: rollupId, currentRoot: currentRoot, newRoot: newRoot, etherDelta: 0});
         entry.proxyEntryHash = proxyEntryHash;
         entry.l2ToL1Calls = new L2ToL1Call[](0);
         entry.expectedL1ToL2Calls = new ExpectedL1ToL2Call[](0);

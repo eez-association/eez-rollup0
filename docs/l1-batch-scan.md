@@ -110,7 +110,7 @@ must match its entry, else `Decode`: `callHash` and `queue` (`:1304-1320`),
 | Variant | Class | Raised for |
 |---|---|---|
 | `Provider` | retryable | transport; a malformed `get_logs` answer; a trace failure other than `-32601`, including a post's transaction failing or missing |
-| `SourceIncomplete` | retryable | two hashes for one block; a missing or replaced transaction; a trace endpoint that lacks the block |
+| `SourceIncomplete` | retryable | two hashes for one block; a transaction or block the endpoint does not serve yet; unavailable blob data |
 | `Decode` | terminal | undecodable bytes; a `rollupIds` or commitment mismatch; a grammar, pairing, ownership or entry-match violation |
 | `Unsupported` | terminal | the shapes below; a multi-rollup commitment mismatch; a post not made by a selector `CALL` |
 | `TraceUnavailable` | terminal | `-32601` (no `debug` namespace) on a block that needs a trace |

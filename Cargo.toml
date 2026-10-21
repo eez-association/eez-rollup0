@@ -409,7 +409,6 @@ map_unwrap_or                    = "allow"
 clone_on_ref_ptr                 = "allow"
 # New in clippy 1.99; `assert!(v.is_empty())` reads better in tests than `[] as [T; 0]`.
 assert_is_empty                  = "allow"
-# constructors / handlers (Deriver::new wires 9 deps,
-# on_batch_posted 10, compose_via_evm_composer 8) need these params;
+# constructors (Deriver::new wires 9 deps) need these params;
 # a refactor or dediacted crates would reduce some of this
 too_many_arguments               = "allow"

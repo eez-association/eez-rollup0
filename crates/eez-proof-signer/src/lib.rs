@@ -13,9 +13,9 @@ use eyre::WrapErr as _;
 use tracing::{info, warn};
 
 pub mod attest;
-pub mod blob_profile;
+mod blob_profile;
 pub mod cancel;
-pub mod rpc_blob_source;
+mod rpc_blob_source;
 pub mod service;
 mod settlement;
 pub mod validate;
@@ -29,10 +29,9 @@ pub use eez_protocol::EEZL2_ADDRESS;
 
 pub use attest::{Attester, NonZeroProofSystemVkey};
 pub use blob_profile::{
-    AuthenticatedBlobContext, BlobContextAuthority, BlobContextConfig, BlobContextError,
-    L1PostingContext, Rollup0L1Source, SettlementState,
+    BlobContextAuthority, BlobContextConfig, BlobContextError, L1PostingContext, Rollup0L1Source,
+    SettlementState,
 };
-pub use rpc_blob_source::RpcRollup0L1Source;
 pub use service::{ProveSvc, ServiceLimits, ServiceLimitsParams, ServiceState};
 pub use validate::ValidationBackend;
 
@@ -51,41 +50,21 @@ pub async fn serve(
     backend: impl ValidationBackend,
     shutdown: impl Future<Output = ()>,
 ) -> eyre::Result<()> {
-    serve_inner(config, backend, None, shutdown).await
-}
-
-/// Serve either settlement profile, selected by `EEZ_SETTLEMENT_WRAPPER_ADDRESS`.
-pub async fn serve_from_env(
-    config: ServerConfig,
-    backend: impl ValidationBackend,
-    shutdown: impl Future<Output = ()>,
-) -> eyre::Result<()> {
-    let authority =
+    let blob_context_authority =
         BlobContextAuthority::from_env(config.expected_rollup_id.get(), backend.chain_id())?
             .map(Arc::new);
-    serve_inner(config, backend, authority, shutdown).await
-}
-
-async fn serve_inner(
-    config: ServerConfig,
-    backend: impl ValidationBackend,
-    blob_context_authority: Option<Arc<BlobContextAuthority>>,
-    shutdown: impl Future<Output = ()>,
-) -> eyre::Result<()> {
     let ServerConfig {
         listen_addr,
         limits,
         expected_rollup_id,
         attester,
     } = config;
-    let blob_profile_enabled = blob_context_authority.is_some();
     log_server_config(
         listen_addr,
         limits,
         &backend,
         expected_rollup_id.get(),
         &attester,
-        blob_profile_enabled,
     );
     let mut state = ServiceState::new(backend, expected_rollup_id, attester)?;
     if let Some(authority) = blob_context_authority {
@@ -115,7 +94,6 @@ fn log_server_config(
     backend: &dyn ValidationBackend,
     expected_rollup_id: u64,
     attester: &Attester,
-    blob_profile_enabled: bool,
 ) {
     let window_limits = limits.window_limits();
     info!(
@@ -134,11 +112,7 @@ fn log_server_config(
         proof_system_vkey = %attester.proof_system_vkey(),
         l2_chain_id = backend.chain_id(),
         expected_l2_system_address = %backend.expected_l2_system_address(),
-        profile = if blob_profile_enabled {
-            "candidate_v1"
-        } else {
-            "calldata_anchor_outbound_then_inbound"
-        },
+        profile = "anchor_single_call_outbound_then_inbound",
         "serving Prove — waiting for composer windows",
     );
 }

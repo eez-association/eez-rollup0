@@ -3,7 +3,7 @@
 //! Committed blocks are prevalidated through resumable `prove.v2` sessions.
 //! Finalization backfills any missing suffix, binds the exact settlement
 //! calldata, verifies the returned attestation, and returns its 65-byte
-//! signature. `prove.v1` remains the compatibility fallback.
+//! signature. `prove.v1` remains the compatibility fallback for calldata settlement.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
@@ -19,7 +19,8 @@ use eez_control_rpc::v1::{
 };
 use eez_control_rpc::v2::{
     Begin as StreamBegin, Block as StreamBlock, ClientFrame, Finalize as StreamFinalize,
-    Resume as StreamResume, Rewind as StreamRewind, ServerFrame, client_frame,
+    Resume as StreamResume, Rewind as StreamRewind, ServerFrame,
+    SettlementInput as StreamSettlement, client_frame,
     prover_client::ProverClient as StreamingProverClient, server_frame,
 };
 use eez_prover::{
@@ -33,7 +34,7 @@ use tracing::{Level, event};
 // Rollup0 clients require bounded pipelining support from the streaming server.
 const MAX_IN_FLIGHT: usize = 8;
 
-/// A [`Prover`] backed by the v2 streaming service, with v1 fallback.
+/// A [`Prover`] backed by the v2 streaming service, with v1 fallback for calldata.
 /// Cheap to clone (`Arc<Inner>`).
 #[derive(Debug, Clone)]
 pub struct RemoteProver {
@@ -422,7 +423,7 @@ impl RemoteProver {
         rollup_id: u64,
         anchor: ProvingAnchor,
         blocks: &[BlockWitness],
-        finalize: Option<(u64, u64, eez_control_rpc::v2::SettlementInput)>,
+        finalize: Option<(u64, u64, StreamSettlement)>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>, StreamingError> {
         // One deadline covers lock acquisition, connect, both stream directions and EOF.
         // Dropping the exchange releases its lock; a later Resume recovers accepted work.
@@ -712,6 +713,11 @@ impl Prover for RemoteProver {
 
     async fn prove(&self, ctx: ProvingContext) -> ProverResult<Bytes> {
         let Some(anchor) = ctx.anchor else {
+            if ctx.blob.is_some() {
+                return Err(ProverError::Backend(
+                    "blob settlement requires a streaming anchor".into(),
+                ));
+            }
             return self.prove_v1(ctx).await;
         };
         let abi_calldata = eez_protocol::abi::postAndVerifyBatchCall {
@@ -723,7 +729,7 @@ impl Prover for RemoteProver {
                 "Rollup0 streaming does not support L1-bound settlement".into(),
             ));
         }
-        let settlement = eez_control_rpc::v2::SettlementInput {
+        let settlement = StreamSettlement {
             abi_calldata,
             blobs: ctx
                 .blob
@@ -750,7 +756,21 @@ impl Prover for RemoteProver {
             .await
         {
             Ok(Some((hash, proof))) => {
-                let expected = expected_public_inputs(&ctx, self.vkey())?;
+                let expected = if let Some(blob) = &ctx.blob {
+                    let hashes = eez_blob::versioned_hashes(&blob.blobs)
+                        .map_err(|error| ProverError::Backend(format!("request blobs: {error}")))?;
+                    eez_protocol::public_inputs::public_inputs_hashes_with_context(
+                        &ctx.batch,
+                        self.vkey(),
+                        &hashes,
+                        blob.expected_custom_data.clone(),
+                    )
+                } else {
+                    eez_protocol::public_inputs::public_inputs_hashes(&ctx.batch, self.vkey())
+                }
+                .map_err(|error| {
+                    ProverError::Backend(format!("cannot verify requested public inputs: {error}"))
+                })?;
                 if expected.len() != 1 || hash != expected[0].as_slice() {
                     return Err(ProverError::Backend(
                         "ProveStream proof does not bind the requested batch".into(),
@@ -773,27 +793,6 @@ impl Prover for RemoteProver {
         // Left-zero-pad the 20-byte attester into a B256 (the registry vkey).
         self.inner.attester.into_word()
     }
-}
-
-/// The hash the signer must have signed, recomputed from the request alone:
-/// blob hashes from the physical blobs, never from a claim.
-fn expected_public_inputs(ctx: &ProvingContext, vkey: B256) -> ProverResult<Vec<B256>> {
-    let result = if let Some(blob) = &ctx.blob {
-        let hashes =
-            eez_blob::versioned_hashes(&blob.blobs, eez_blob::EnvKzgSettings::Default.get())
-                .map_err(|error| ProverError::Backend(format!("request blobs: {error}")))?;
-        eez_protocol::public_inputs::public_inputs_hashes_with_context(
-            &ctx.batch,
-            vkey,
-            &hashes,
-            blob.expected_custom_data.clone(),
-        )
-    } else {
-        eez_protocol::public_inputs::public_inputs_hashes(&ctx.batch, vkey)
-    };
-    result.map_err(|error| {
-        ProverError::Backend(format!("cannot verify requested public inputs: {error}"))
-    })
 }
 
 /// Preserve the Composer profile's closed retryable-status allowlist across
@@ -1040,7 +1039,7 @@ mod tests {
                     1,
                     test_anchor(),
                     std::slice::from_ref(&input),
-                    Some((11, 11, eez_control_rpc::v2::SettlementInput::default())),
+                    Some((11, 11, StreamSettlement::default())),
                 )
                 .await
                 .map_err(ProverError::from)
@@ -1385,6 +1384,29 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn blob_settlement_requires_a_streaming_anchor() {
+        let prover = RemoteProver::new("http://127.0.0.1:1", Address::ZERO);
+        let error = prover
+            .prove(ProvingContext {
+                blob: Some(eez_prover::BlobProvingContext {
+                    blobs: Vec::new(),
+                    posting_context: eez_prover::L1PostingContext {
+                        chain_id: 1,
+                        target_timestamp: 1,
+                        parent_number: 0,
+                        parent_hash: B256::repeat_byte(1),
+                    },
+                    expected_custom_data: Bytes::new(),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("requires a streaming anchor"));
     }
 
     /// An attestation that ecrecovers to the REGISTERED attester is accepted and

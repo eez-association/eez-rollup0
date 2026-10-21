@@ -27,7 +27,7 @@ supported public-input hash, and signs that hash. The supported backends are
 witness-backed Stateless/Reth execution and node-backed execution over an
 L1-derived follower's canonical L2 database.
 
-The deployed calldata profile supports this execution-entry sequence:
+The only supported execution-entry sequence is:
 
 ```text
 anchor, outbound*, inbound*
@@ -41,12 +41,15 @@ where:
 - each inbound effect represents one successful mutable L1-to-L2 delivery.
 
 Both profiles support exactly one nonzero rollup ID, one nonzero proof-system
-address, and one nonzero proof-system verification key. It does not support
+address, and one nonzero proof-system verification key. They do not support
 static entries, nested calls, multiple calls per effect, explicit call gas,
 force-revert spans, sender binding, or multiple proof systems.
 
-`EEZ_SETTLEMENT_WRAPPER_ADDRESS` selects the blob-settlement profile for
-both daemons. Each `Finalize` must then carry the complete physical blobs and an
+`EEZ_SETTLEMENT_PROFILE=blob` selects the blob-settlement profile for both
+daemons; unset or `calldata` keeps the calldata profile. The profile must match
+the deployment: `blob` requires `EEZ_SETTLEMENT_WRAPPER_ADDRESS`, and `calldata`
+refuses it, since the candidate-V1 manager rejects calldata posts. Each blob
+`Finalize` must then carry the complete physical blobs and an
 `L1PostingContext`, and the signer additionally requires:
 
 - the posting parent canonical on its own `EEZ_L1_RPC_URL`, read again after the
@@ -57,7 +60,8 @@ both daemons. Each `Finalize` must then carry the complete physical blobs and an
 - at most the active L1 chain-spec blob limit, with `blobIndices == [0, n)` and
   empty `callData` (the signer reads that spec from `EEZ_L1_CHAIN_CONFIG`, or
   uses the built-in Chiado spec when `EEZ_L1_CHAIN_ID` is 10200);
-- `blockNumber == uint64.max`, one immediate anchor, and a span of whole
+- `blockNumber == uint64.max`, the same `anchor, outbound*, inbound*` sequence
+  as the calldata profile, and a span of whole
   `K = EEZ_L1_BLOCK_TIME_MS / EEZ_L2_BLOCK_TIME_MS` intervals ending at a Sync
   height. A batch with actions ends at the target timestamp; an anchor-only
   catch-up batch may end earlier, and no batch may end later; and
@@ -77,10 +81,10 @@ locally recomputed public-input hash only under all rules in this document.
 
 In the calldata profile, both the window RPC and streaming Finalize retain
 conditional-proof semantics: the signer proves the transition from the selected
-execution parent, not that the parent was already accepted on L1. The L1 contract checks each update's
-`currentRoot` against the live rollup root when consuming the entry. Streaming,
-subrange selection and cache reuse do not add an L1-history requirement to the
-stateless signer. The stateful backend's safe-anchor and fork-choice checks
+execution parent, not that the parent was already accepted on L1. The L1
+contract checks each update's `currentRoot` against the live rollup root when
+consuming the entry. Streaming, subrange selection and cache reuse do not add
+an L1-history requirement to the stateless signer. The stateful backend's safe-anchor and fork-choice checks
 remain additional backend policy, not a different meaning for the signature.
 
 The blob profile additionally authenticates the selected parent against the
@@ -498,7 +502,7 @@ is responsible for inserting the returned signature into the correct proof
 carrier and satisfying the on-chain `proofSystems.length == proofs.length`
 requirement.
 
-This profile assumes the deployed rollup manager returns empty `customData` for
+The calldata profile assumes the deployed rollup manager returns empty `customData` for
 `getCustomData(0)`, as the pinned reference `Rollup` does. The configured vkey
 and proof-system address MUST match the deployed manager configuration; the
 signer does not query L1 to confirm them.

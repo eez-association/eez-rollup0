@@ -111,8 +111,7 @@ pub struct L1WatcherConfig {
     /// bound. Configurable so dev / testnet operators can tighten or
     /// loosen.
     pub reorg_max_depth: usize,
-    /// Candidate-V1 deployment whose blob posts the scan reproduces; see
-    /// [`L1ReaderConfig::candidate`](crate::L1ReaderConfig::candidate).
+    /// Blob deployment used to reproduce scanned commitments; `None` reads calldata only.
     pub candidate: Option<eez_protocol::Rollup0Deployment>,
 }
 

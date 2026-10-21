@@ -135,15 +135,7 @@ pub struct ProvingAnchor {
     pub state_root: B256,
 }
 
-/// L1 target proposed by the composer and independently authenticated by a
-/// blob-enabled proof signer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct L1PostingContext {
-    pub chain_id: u64,
-    pub target_timestamp: u64,
-    pub parent_number: u64,
-    pub parent_hash: B256,
-}
+pub use eez_protocol::candidate_domain::L1PostingContext;
 
 /// Candidate-V1 data that accompanies the proofless EEZ batch.
 #[derive(Debug, Clone)]

@@ -195,7 +195,9 @@ where
     }
 
     /// Record the last indexed batch so the next boot resumes there. Best
-    /// effort: a write failure costs a slow boot, never correctness.
+    /// effort: a write failure costs a slow boot, never correctness. Any tail
+    /// is safe, even one sharing its block or tx with earlier posts, because
+    /// `is_processed` compares positions (block, hash, log index).
     fn save_checkpoint(&self) {
         let Some(dir) = self.inner.checkpoint_dir.as_deref() else {
             return;
@@ -863,8 +865,8 @@ where
             .await?)
     }
 
-    /// Decode a post's DA payload — its blobs under candidate V1, else its
-    /// calldata — or `None` when it is not ours.
+    /// Decode a posted DA payload, or `None` when it is not ours.
+    /// Blob posts fetch their committed blobs; calldata posts decode `callData`.
     ///
     /// Skipped rather than fatal: we read one `ChainOperation`, so a legitimate
     /// multi-rollup batch reads as foreign, and halting would hand a peer a
@@ -927,10 +929,13 @@ where
             "deriver loop started",
         );
         loop {
-            // A missing blob can become available without another batch being posted.
-            let received = receive_l1_event(&mut rx, recovery_pending).await;
-            let recover = match received {
-                None => true,
+            // Beacon DA may recover without another L1 batch event.
+            match receive_l1_event(&mut rx, recovery_pending).await {
+                None => {
+                    if !self.try_recover(&mut recovery_pending).await {
+                        return;
+                    }
+                }
                 Some(Ok(event)) => {
                     if let Err(err) = self.handle_event(event).await {
                         if matches!(&err, DeriverError::CommitterClosed) {
@@ -952,9 +957,9 @@ where
                             error = %err,
                             "deriver failed to handle event; resyncing from L1",
                         );
-                        true
-                    } else {
-                        false
+                        if !self.try_recover(&mut recovery_pending).await {
+                            return;
+                        }
                     }
                 }
                 Some(Err(broadcast::error::RecvError::Lagged(skipped))) => {
@@ -964,7 +969,9 @@ where
                         skipped,
                         "L1 event stream lagged; resyncing from L1",
                     );
-                    true
+                    if !self.try_recover(&mut recovery_pending).await {
+                        return;
+                    }
                 }
                 Some(Err(broadcast::error::RecvError::Closed)) => {
                     event!(
@@ -974,23 +981,18 @@ where
                     );
                     return;
                 }
-            };
-            if recover {
-                match self.try_recover().await {
-                    Ok(()) => recovery_pending = false,
-                    Err(DeriverError::CommitterClosed) => return,
-                    Err(_) => recovery_pending = true,
-                }
             }
         }
     }
 
-    /// Post-failure recovery via [`Self::catch_up`]. Failed scans are retried
-    /// even when the L1 event stream is idle; a closed committer stops the loop.
-    async fn try_recover(&self) -> DeriverResult<()> {
-        let result = self.catch_up().await;
-        match &result {
+    /// Post-failure recovery via [`Self::catch_up`]. Returns `false` only
+    /// when the committer is gone and the loop must exit; a failed resync is
+    /// logged and retried at the next L1 event or idle retry.
+    async fn try_recover(&self, recovery_pending: &mut bool) -> bool {
+        *recovery_pending = true;
+        match self.catch_up().await {
             Ok(()) => {
+                *recovery_pending = false;
                 event!(
                     name: "eez.deriver.resync.recovered",
                     Level::INFO,
@@ -998,6 +1000,7 @@ where
                     cursor = self.cursor(),
                     "resync complete; cursor re-anchored to L1",
                 );
+                true
             }
             Err(err) if matches!(&err, DeriverError::CommitterClosed) => {
                 event!(
@@ -1007,6 +1010,7 @@ where
                     error = %err,
                     "block committer gone; deriver exiting",
                 );
+                false
             }
             Err(err) => {
                 event!(
@@ -1014,11 +1018,11 @@ where
                     Level::ERROR,
                     event_name = "eez.deriver.resync.failed",
                     error = %err,
-                    "resync failed; retrying while the source recovers",
+                    "resync failed; will retry after the next L1 event or idle delay",
                 );
+                true
             }
         }
-        result
     }
 
     async fn handle_event(&self, event: L1Event) -> DeriverResult<()> {

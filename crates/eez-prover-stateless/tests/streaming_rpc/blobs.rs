@@ -9,7 +9,7 @@ use eez_proof_signer::{
     ProveSvc, Rollup0L1Source, ServiceLimits, ServiceLimitsParams, ServiceState, SettlementState,
 };
 use eez_protocol::Rollup0Deployment;
-use eez_prover::{BlobProvingContext, L1PostingContext as PostingContext};
+use eez_prover::BlobProvingContext;
 use eez_prover_stateless::Backend;
 use tokio_stream::wrappers::TcpListenerStream;
 
@@ -82,7 +82,7 @@ fn blob_context(
     eez_protocol::entries::finalize_l1_rolling_hashes(&mut selected.batch).unwrap();
     selected.blob = Some(BlobProvingContext {
         blobs: blobs.into_iter().map(Bytes::from).collect(),
-        posting_context: PostingContext {
+        posting_context: L1PostingContext {
             chain_id: 1,
             target_timestamp: target,
             parent_number: 10,
@@ -95,9 +95,8 @@ fn blob_context(
 
 async fn check_proof(prover: &RemoteProver, context: ProvingContext, vkey: B256, signer: Address) {
     let blob = context.blob.as_ref().unwrap();
-    let hashes =
-        eez_blob::versioned_hashes(&blob.blobs, eez_blob::EnvKzgSettings::Default.get()).unwrap();
-    let expected = eez_protocol::public_inputs_hashes_with_context(
+    let hashes = eez_blob::versioned_hashes(&blob.blobs).unwrap();
+    let expected = eez_protocol::public_inputs::public_inputs_hashes_with_context(
         &context.batch,
         vkey,
         &hashes,

@@ -98,10 +98,24 @@ contract Rollup0SettlementTest is Test {
         assertEq(manager.lastSettlementBlock(), block.number);
     }
 
-    function testWrapperRejectsOutboundImmediatePrefix() external {
+    function testWrapperRejectsImmediateCountPastTheLeadingRun() external {
         ProofSystemBatchPerVerificationEntries memory batch = _batch(2);
         vm.expectRevert(Rollup0SettlementWrapper.InvalidImmediateEntryCount.selector);
         wrapper.postAndVerifyBatch(batch);
+    }
+
+    function testWrapperSettlesOutboundImmediateAndStoresItsRoot() external {
+        _setBlob();
+        bytes32 mid = keccak256("mid");
+        bytes32 settled = keccak256("settled");
+        ProofSystemBatchPerVerificationEntries memory batch = _batch(2);
+        batch.entries = new ExecutionEntry[](2);
+        batch.entries[0] = _anchor(PARENT, mid);
+        batch.entries[1] = _anchor(mid, settled);
+
+        wrapper.postAndVerifyBatch(batch);
+
+        assertEq(_liveRoot, settled);
     }
 
     function testWrapperRejectsNonCandidateCarrierFields() external {
@@ -229,7 +243,8 @@ contract Rollup0SettlementTest is Test {
         wrapper.postAndVerifyBatch(batch);
         batch = _batch(1);
         batch.entries[0].proxyEntryHash = bytes32(uint256(1));
-        vm.expectRevert(Rollup0SettlementWrapper.InvalidAnchor.selector);
+        // A deferred first entry leaves no leading immediate run for the anchor.
+        vm.expectRevert(Rollup0SettlementWrapper.InvalidImmediateEntryCount.selector);
         wrapper.postAndVerifyBatch(batch);
     }
 
@@ -249,7 +264,9 @@ contract Rollup0SettlementTest is Test {
         assertEq(msg.sender, address(wrapper));
         _observedCustomData = manager.getCustomData(batch.blockNumber);
         if (_reenter) wrapper.postAndVerifyBatch(batch);
-        if (!_skipAnchor) _liveRoot = batch.entries[0].rollupUpdates[0].newRoot;
+        if (!_skipAnchor) {
+            _liveRoot = batch.entries[batch.immediateEntryCount - 1].rollupUpdates[0].newRoot;
+        }
     }
 
     function _batch(uint256 immediateCount) private pure returns (ProofSystemBatchPerVerificationEntries memory batch) {
@@ -267,5 +284,13 @@ contract Rollup0SettlementTest is Test {
         batch.entries[0].rollupUpdates = new RollupUpdate[](1);
         batch.entries[0].rollupUpdates[0] =
             RollupUpdate({rollupId: ROLLUP_ID, etherDelta: 0, currentRoot: PARENT, newRoot: NEXT});
+    }
+
+    function _anchor(bytes32 currentRoot, bytes32 newRoot) private pure returns (ExecutionEntry memory entry) {
+        entry.destinationRollupId = ROLLUP_ID;
+        entry.success = true;
+        entry.rollupUpdates = new RollupUpdate[](1);
+        entry.rollupUpdates[0] =
+            RollupUpdate({rollupId: ROLLUP_ID, etherDelta: 0, currentRoot: currentRoot, newRoot: newRoot});
     }
 }

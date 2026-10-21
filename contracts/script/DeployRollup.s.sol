@@ -42,12 +42,7 @@ import {deployRollup} from "eez-core-protocol/deployment/RollupDeployment.sol";
 contract DeployRollup is Script {
     error InvalidProofSystem();
 
-    function run(
-        address eez,
-        address proofSystem,
-        address authorizedSigner,
-        address owner
-    ) external {
+    function run(address eez, address proofSystem, address authorizedSigner, address owner) external {
         if (proofSystem == address(0)) revert InvalidProofSystem();
 
         address[] memory proofSystems = new address[](1);
@@ -67,7 +62,8 @@ contract DeployRollup is Script {
         Rollup rollup = deployRollup(
             eez,
             owner,
-            /* threshold */ 1,
+            /* threshold */
+            1,
             proofSystems,
             vkeys
         );

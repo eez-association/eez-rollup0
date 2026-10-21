@@ -209,11 +209,11 @@ impl Submitter {
                 L1Error::Submission(format!("send_bundle: decode blob postBatch: {error}"))
             })?
         } else {
-            let envelope = alloy_consensus::TxEnvelope::decode_2718(&mut raw_txs[0].as_ref())
-                .map_err(|error| {
-                    L1Error::Submission(format!("send_bundle: decode postBatch envelope: {error}"))
-                })?;
-            *envelope.tx_hash()
+            let post_batch_envelope =
+                alloy_consensus::TxEnvelope::decode_2718(&mut raw_txs[0].as_ref()).map_err(
+                    |e| L1Error::Submission(format!("send_bundle: decode postBatch envelope: {e}")),
+                )?;
+            *post_batch_envelope.tx_hash()
         };
         // Dispatch breadcrumb: correlate this postBatch tx to the L1 block we
         // aim it at. `SendOutcome::Included` later carries the ACTUAL inclusion
@@ -287,9 +287,11 @@ impl Inner {
 
     /// Submit `raw_txs` (postBatch first) and observe the outcome. Try
     /// the relay's `eth_sendBundle`; if it's a plain execution RPC
-    /// ([`L1Error::BundleRpcUnsupported`]), calldata posts may fall back to
-    /// mempool submission. Blob posts require the bundle path so a fallback
-    /// cannot broadcast their triggers without ordering guarantees.
+    /// ([`L1Error::BundleRpcUnsupported`]), degrade to ordered mempool
+    /// submission — on dev reth / anvil that lands every tx in the next
+    /// block, postBatch first by priority-fee, minus the all-or-nothing
+    /// guarantee (irrelevant without a competing builder).
+    /// This fallback is limited to calldata; blob posts require ordered bundles.
     async fn dispatch_and_observe(
         &self,
         raw_txs: &[alloy_primitives::Bytes],

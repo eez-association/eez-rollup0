@@ -70,6 +70,8 @@ async fn start_signer(
                 "30",
             ])
             .args(extra_args)
+            .env_remove("EEZ_SETTLEMENT_WRAPPER_ADDRESS")
+            .env_remove("EEZ_SETTLEMENT_PROFILE")
             .env("RUST_LOG", "info")
             .spawn()
             .unwrap(),

@@ -34,9 +34,7 @@ the spec are appropriate in repository documentation.
   detached work rather than terminating it halfway through execution.
 - The active settlement profile accepts an anchor followed by zero or more
   supported outbound effects and then zero or more supported successful inbound
-  effects. The candidate-V1 blob profile accepts an anchor followed only by
-  supported successful inbound effects.
-  Richer or ambiguous shapes fail closed.
+  effects. Richer or ambiguous shapes fail closed.
 - Backends bind/decode inputs, execute them, and construct immutable checked
   blocks before publishing reusable evidence. Both RPCs prepare checkpoints only
   for sync blocks; ordinary blocks use ordinary execution. V2 caches and

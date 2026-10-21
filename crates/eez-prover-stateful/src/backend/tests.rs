@@ -10,8 +10,7 @@ use reth_chainspec::ChainInfo;
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
 use reth_storage_api::errors::provider::ProviderResult;
 use reth_storage_api::{
-    AccountReader, BlockIdReader, BytecodeReader, StateProofProvider, StateProviderBox,
-    StorageRootProvider,
+    AccountReader, BytecodeReader, StateProofProvider, StateProviderBox, StorageRootProvider,
 };
 use reth_trie_common::updates::TrieUpdates;
 use reth_trie_common::{

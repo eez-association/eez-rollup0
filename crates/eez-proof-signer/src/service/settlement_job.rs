@@ -148,7 +148,6 @@ pub(super) struct SettlementInput<'a> {
 pub(super) struct BlobSettlementInput<'a> {
     pub(super) blobs: &'a [Vec<u8>],
     pub(super) context: &'a crate::blob_profile::AuthenticatedBlobContext,
-    pub(super) kzg_settings: &'a eez_blob::KzgSettings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -424,14 +423,12 @@ pub(super) fn run_settlement(
     // including the reconstructed Sync-block transaction sequence.
     let recomputed_public_inputs_hash = if let Some(blob) = blob {
         let verified_da = settlement::verify_blob_da_payload(
-            &canonical_batch,
             blob.blobs,
             validated_window,
             &authorized_outbound_effects,
             &authorized_inbound_effects,
             system_transaction_reconstructor,
             expected_rollup_id.get(),
-            blob.kzg_settings,
         )?;
         checked_public_input_profile.recompute_public_inputs_hash(
             proof_system_vkey,

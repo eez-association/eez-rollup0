@@ -8,8 +8,7 @@ use alloy_eips::{
     Decodable2718 as _, Encodable2718 as _,
     eip2930::AccessList,
     eip4844::{
-        AsCkzg as _, Blob, BlobTransactionSidecar,
-        env_settings::{EnvKzgSettings, KzgSettings},
+        AsCkzg as _, Blob, BlobTransactionSidecar, env_settings::EnvKzgSettings,
         kzg_to_versioned_hash,
     },
     eip7594::{BlobTransactionSidecarEip7594, BlobTransactionSidecarVariant},
@@ -54,13 +53,6 @@ impl PreparedBlobSidecar {
     }
 }
 
-/// Signed transaction-pool encoding, including its complete sidecar.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SignedBlobTransaction {
-    pub transaction_hash: TxHash,
-    pub pooled_transaction: Bytes,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("a blob transaction requires at least one blob")]
@@ -77,17 +69,15 @@ pub enum TransportError {
     InvalidEncoding(String),
 }
 
-/// Derive each blob's EIP-4844 versioned hash from its bytes. This is the only
-/// source of blob hashes any component may fold into a public input.
+/// Derive each blob's EIP-4844 versioned hash from its bytes. The signer and
+/// client derive these locally rather than trusting request-supplied hashes.
 ///
 /// # Errors
 ///
 /// [`TransportError::InvalidBlobLength`] or [`TransportError::Kzg`] for a blob
 /// that is not a full canonical EIP-4844 blob.
-pub fn versioned_hashes<B: AsRef<[u8]>>(
-    blobs: &[B],
-    settings: &KzgSettings,
-) -> Result<Vec<B256>, TransportError> {
+pub fn versioned_hashes<B: AsRef<[u8]>>(blobs: &[B]) -> Result<Vec<B256>, TransportError> {
+    let settings = EnvKzgSettings::Default.get();
     blobs
         .iter()
         .enumerate()
@@ -112,22 +102,6 @@ pub fn versioned_hashes<B: AsRef<[u8]>>(
 /// EIP-4844 transaction.
 pub fn pooled_blob_transaction_hash(encoded: &[u8]) -> Result<TxHash, TransportError> {
     Ok(*decode_pooled_blob_transaction(encoded)?.tx_hash())
-}
-
-/// Blob payloads carried by one pooled type-3 transaction, in sidecar order.
-///
-/// # Errors
-///
-/// [`TransportError::InvalidEncoding`] unless `encoded` is exactly one pooled
-/// EIP-4844 transaction.
-pub fn pooled_blob_bytes(encoded: &[u8]) -> Result<Vec<Vec<u8>>, TransportError> {
-    Ok(decode_pooled_blob_transaction(encoded)?
-        .tx()
-        .sidecar
-        .blobs()
-        .iter()
-        .map(|blob| blob.as_slice().to_vec())
-        .collect())
 }
 
 fn decode_pooled_blob_transaction(
@@ -192,7 +166,7 @@ pub fn sign_blob_transaction<S: TxSignerSync<Signature>>(
     params: BlobTransactionParams,
     prepared: PreparedBlobSidecar,
     signer: &S,
-) -> Result<SignedBlobTransaction, TransportError> {
+) -> Result<Bytes, TransportError> {
     let PreparedBlobSidecar {
         sidecar,
         versioned_hashes,
@@ -215,13 +189,9 @@ pub fn sign_blob_transaction<S: TxSignerSync<Signature>>(
         .sign_transaction_sync(&mut pooled)
         .map_err(|error| TransportError::Signing(error.to_string()))?;
     let signed = pooled.into_signed(signature);
-    let transaction_hash = *signed.tx_hash();
     let mut encoded = Vec::with_capacity(signed.encode_2718_len());
     signed.encode_2718(&mut encoded);
-    Ok(SignedBlobTransaction {
-        transaction_hash,
-        pooled_transaction: encoded.into(),
-    })
+    Ok(encoded.into())
 }
 
 fn to_blob(index: usize, bytes: &[u8]) -> Result<Blob, TransportError> {
@@ -256,7 +226,7 @@ mod tests {
     #[test]
     fn sidecar_hashes_match_independent_derivation_in_both_wrappers() {
         let blobs = [vec![0_u8; BYTES_PER_BLOB], vec![0_u8; BYTES_PER_BLOB]];
-        let expected = versioned_hashes(&blobs, EnvKzgSettings::Default.get()).unwrap();
+        let expected = versioned_hashes(&blobs).unwrap();
         assert!(
             expected.iter().all(|hash| hash[0] == 1),
             "EIP-4844 version byte"
@@ -273,26 +243,26 @@ mod tests {
         for encoding in [BlobSidecarEncoding::Eip4844, BlobSidecarEncoding::Eip7594] {
             let prepared = prepare_blob_sidecar(&[vec![0_u8; BYTES_PER_BLOB]], encoding).unwrap();
             let signed = sign_blob_transaction(params(), prepared, &signer).unwrap();
-            let decoded = decode_pooled_blob_transaction(&signed.pooled_transaction).unwrap();
+            let decoded = decode_pooled_blob_transaction(&signed).unwrap();
             decoded
                 .tx()
                 .tx
                 .validate_blob(&decoded.tx().sidecar, EnvKzgSettings::Default.get())
                 .unwrap();
-            assert_eq!(signed.pooled_transaction[0], 3, "type-3 envelope");
+            assert_eq!(signed[0], 3, "type-3 envelope");
             assert_eq!(
-                pooled_blob_transaction_hash(&signed.pooled_transaction).unwrap(),
-                signed.transaction_hash,
+                pooled_blob_transaction_hash(&signed).unwrap(),
+                *decoded.tx_hash(),
             );
+            assert_eq!(decoded.tx().sidecar.blobs().len(), 1);
             assert_eq!(
-                pooled_blob_bytes(&signed.pooled_transaction).unwrap(),
-                [vec![0_u8; BYTES_PER_BLOB]],
+                decoded.tx().sidecar.blobs()[0].as_slice(),
+                vec![0_u8; BYTES_PER_BLOB].as_slice(),
             );
 
-            let mut trailing = signed.pooled_transaction.to_vec();
+            let mut trailing = signed.to_vec();
             trailing.push(0);
             assert!(pooled_blob_transaction_hash(&trailing).is_err());
-            assert!(pooled_blob_bytes(&trailing).is_err());
         }
     }
 
@@ -303,7 +273,7 @@ mod tests {
             Err(TransportError::EmptyBlobs),
         ));
         assert!(matches!(
-            versioned_hashes(&[vec![0_u8; 31]], EnvKzgSettings::Default.get()),
+            versioned_hashes(&[vec![0_u8; 31]]),
             Err(TransportError::InvalidBlobLength {
                 index: 0,
                 actual: 31
@@ -313,7 +283,7 @@ mod tests {
         let mut invalid = vec![0_u8; BYTES_PER_BLOB];
         invalid[0] = 0xff;
         assert!(matches!(
-            versioned_hashes(&[invalid], EnvKzgSettings::Default.get()),
+            versioned_hashes(&[invalid]),
             Err(TransportError::Kzg { index: 0, .. }),
         ));
     }

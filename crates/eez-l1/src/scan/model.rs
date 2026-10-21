@@ -9,16 +9,14 @@ use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rpc_types_eth::{Log, Transaction};
 use alloy_rpc_types_trace::geth::CallFrame;
 use alloy_sol_types::{SolCall, SolEvent};
-use eez_protocol::Rollup0Deployment;
 use eez_protocol::abi::{
     BatchPosted, EntryExecuted, EvmBatch, ExecutionConsumed, ExecutionEntrySol,
     L2ExecutionPerformed, L2TxSkipped, SCANNED_TOPICS, postAndVerifyBatchCall,
 };
 use eez_protocol::entries::{EntryRole, entry_roles};
-use eez_protocol::public_inputs::{
-    SettlementContext, batch_shared_public_input, batch_shared_public_input_with,
-};
+use eez_protocol::public_inputs::batch_shared_public_input;
 
+use super::blob::CandidateBlock;
 use super::types::{AppliedEntry, Post, PostId, Settlement};
 use crate::error::{L1Error, L1Result};
 
@@ -70,8 +68,7 @@ pub(super) struct Consumed {
 }
 
 /// A committed `postAndVerifyBatch` call into EEZ: the exact bytes, EEZ's
-/// `msg.sender`, the scanned logs of its committed subtree, and the versioned
-/// hashes of its tx, which `BLOBHASH` reads for every call in it.
+/// `msg.sender`, and the scanned logs of its committed subtree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Call {
     pub input: Bytes,
@@ -81,20 +78,12 @@ pub(super) struct Call {
     pub blob_hashes: Vec<B256>,
 }
 
-/// What a blob post binds beyond its bytes: the manager
-/// deployment, and the block whose timestamp and parent `getCustomData` read.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct CandidateBlock<'a> {
-    pub deployment: &'a Rollup0Deployment,
-    pub timestamp: u64,
-    pub parent_hash: B256,
-}
-
+/// Names a log's position for error messages.
 fn at(block: u64, log: &ScannedLog) -> String {
     format!("block {block} tx {} log {}", log.tx_hash, log.log_index)
 }
 
-/// A log whose position checked out, before it is decoded.
+/// A log and its position, before it is decoded.
 #[derive(Debug)]
 struct Placed<'a> {
     log_index: u64,
@@ -103,8 +92,8 @@ struct Placed<'a> {
     log: &'a Log,
 }
 
-/// Groups a `get_logs` answer into ascending blocks in log order. Position
-/// faults are found before any log is decoded, so they are retried.
+/// Groups a `get_logs` answer into ascending blocks in log order. The answer is
+/// trusted to be one consistent view; only one mixing forks of a block is retried (#184).
 pub(super) fn group_blocks(raw: &[Log]) -> L1Result<Vec<Block>> {
     let mut blocks: BTreeMap<u64, (B256, Vec<Placed<'_>>)> = BTreeMap::new();
     for log in raw {
@@ -115,7 +104,7 @@ pub(super) fn group_blocks(raw: &[Log]) -> L1Result<Vec<Block>> {
             log.transaction_hash,
             log.log_index,
         ) else {
-            // Mined logs always carry these; dropping one could hide an entry.
+            // alloy leaves these optional for pending logs; a mined log has them.
             return Err(L1Error::Provider(format!(
                 "EEZ log without its position: {log:?}"
             )));
@@ -133,20 +122,8 @@ pub(super) fn group_blocks(raw: &[Log]) -> L1Result<Vec<Block>> {
             log,
         });
     }
-    for (block, (_, placed)) in &mut blocks {
+    for (_, placed) in blocks.values_mut() {
         placed.sort_unstable_by_key(|placed| placed.log_index);
-        for pair in placed.windows(2) {
-            let (a, b) = (&pair[0], &pair[1]);
-            let same_tx = a.tx_index == b.tx_index;
-            let duplicate = a.log_index == b.log_index;
-            if duplicate || b.tx_index < a.tx_index || (same_tx && a.tx_hash != b.tx_hash) {
-                let detail = format!(
-                    "block {block}: log {} (tx {} {}) and log {} (tx {} {}) are out of order",
-                    a.log_index, a.tx_index, a.tx_hash, b.log_index, b.tx_index, b.tx_hash
-                );
-                return Err(L1Error::Provider(detail));
-            }
-        }
     }
     let mut decoded = Vec::with_capacity(blocks.len());
     for (number, (hash, placed)) in blocks {
@@ -284,8 +261,11 @@ fn parse_tx(block: u64, logs: &[ScannedLog]) -> L1Result<Tx<'_>> {
                 };
                 (first, Kind::Record(record))
             }
+            // A post's last log, outside any entry (EEZ.sol:470-475).
             (Event::Posted(spi, ids), None) => (position, Kind::Posted(*spi, ids.clone())),
+            // A leading-run entry that reverted and applied nothing (EEZ.sol:414-436).
             (&Event::Skipped(index), None) => (position, Kind::Skipped(index)),
+            // `EntryExecuted` with no entry open.
             (event, None) => {
                 return Err(L1Error::Decode(format!(
                     "{here}: {event:?} with no entry open"
@@ -311,7 +291,8 @@ fn parse_tx(block: u64, logs: &[ScannedLog]) -> L1Result<Tx<'_>> {
     Ok(Tx { logs, items })
 }
 
-/// Read a transaction whose calldata reaches EEZ unchanged.
+/// The call of a tx sent straight to EEZ or its wrapper with the selector:
+/// the whole tx, sent by its signer. For wrapper posts, EEZ's caller is the wrapper.
 pub(super) fn direct_call(
     tx: &Transaction,
     eez: Address,
@@ -361,6 +342,7 @@ pub(super) fn calls_in_tx(
                 blob_hashes: Vec::new(),
             });
         }
+        // Count this frame's own scanned EEZ logs, for the tx and the post it runs in.
         let scanned = frame.logs.iter().filter(|log| {
             let topic0 = log.topics.as_ref().and_then(|topics| topics.first());
             log.address == Some(eez) && topic0.is_some_and(|topic| SCANNED_TOPICS.contains(topic))
@@ -394,28 +376,30 @@ enum Place {
     Untraced,
 }
 
-/// Every post in `block` that lists `us`, in log order. `calls` holds the
-/// committed calls and scanned-log count of each tx whose `BatchPosted` lists
-/// `us`; `candidate` is set when the block may hold a candidate-V1 post.
+/// Every post in `block` that lists `us`, in log order. `calls_by_tx` holds, by
+/// tx index, the committed calls and scanned-log count of each tx whose
+/// `BatchPosted` lists `us`.
 pub(super) fn read_block(
     block: &Block,
-    calls: &BTreeMap<u64, (Vec<Call>, usize)>,
+    calls_by_tx: &BTreeMap<u64, (Vec<Call>, usize)>,
     us: u64,
     candidate: Option<&CandidateBlock<'_>>,
 ) -> L1Result<Vec<Post>> {
-    let mut txs = Vec::new();
+    let mut parsed = Vec::new();
     for logs in block.logs.chunk_by(|a, b| a.tx_index == b.tx_index) {
-        txs.push(parse_tx(block.number, logs)?);
+        parsed.push(parse_tx(block.number, logs)?);
     }
+    // Place every item, and start reading each post that lists us.
     let mut posts = Vec::new();
-    let mut places = Vec::with_capacity(txs.len());
-    for tx in &txs {
-        let calls = calls.get(&tx.logs[0].tx_index);
-        places.push(label(block, tx, calls, us, candidate, &mut posts)?);
+    let mut places_by_tx = Vec::with_capacity(parsed.len());
+    for tx in &parsed {
+        let tx_calls = calls_by_tx.get(&tx.logs[0].tx_index);
+        places_by_tx.push(label(block, tx, tx_calls, us, candidate, &mut posts)?);
     }
-    // A queue belongs to the latest post in the block that listed it (EEZ.sol:804-811, :1578-1582).
+    // Walk the block in log order. A queue belongs to the latest post that
+    // listed it (EEZ.sol:804-811, :1578-1582).
     let mut owners = BTreeMap::new();
-    for (tx, places) in txs.iter().zip(&places) {
+    for (tx, places) in parsed.iter().zip(&places_by_tx) {
         for (item, &place) in tx.items.iter().zip(places) {
             let here = at(block.number, &tx.logs[item.last]);
             let ours = |record: &Record| record.roots.iter().any(|&(rollup, _)| rollup == us);
@@ -427,7 +411,9 @@ pub(super) fn read_block(
                     ensure!(reported, "{here}: leading run unreported");
                     owners.extend(ids.iter().map(|&queue| (queue, Some(i))));
                 }
+                // Any other post resets the queues it listed to an owner that is not ours.
                 (Kind::Posted(_, ids), _) => owners.extend(ids.iter().map(|&queue| (queue, None))),
+                // Our post skipped its next leading-run entry.
                 (&Kind::Skipped(index), Place::Ours(i)) => {
                     let next = posts[i].leading(&here)?;
                     ensure!(index == next as u64, "{here}: skip of {index}, not {next}");
@@ -442,7 +428,9 @@ pub(super) fn read_block(
                 (Kind::Record(record), Place::Foreign) => {
                     ensure!(!ours(record), "{here}: our entry in a foreign post");
                 }
+                // An entry run outside every post's call.
                 (Kind::Record(record), place) => match record.consumed {
+                    // Unconsumed entries run only in a leading run: another rollup's, untraced.
                     None => {
                         let fine = place == Place::Untraced && !ours(record);
                         ensure!(fine, "{here}: leading-run entry outside a call");
@@ -471,12 +459,13 @@ pub(super) fn read_block(
 fn label(
     block: &Block,
     tx: &Tx<'_>,
-    calls: Option<&(Vec<Call>, usize)>,
+    tx_calls: Option<&(Vec<Call>, usize)>,
     us: u64,
     candidate: Option<&CandidateBlock<'_>>,
     posts: &mut Vec<Reading>,
 ) -> L1Result<Vec<Place>> {
-    let Some((calls, committed)) = calls else {
+    // No post in this tx lists us, so its calls are not read.
+    let Some((calls, committed)) = tx_calls else {
         return Ok(vec![Place::Untraced; tx.items.len()]);
     };
     let head = &tx.logs[0];
@@ -551,8 +540,7 @@ fn label(
     Ok(tx.items.iter().map(place).collect())
 }
 
-/// The batch `call` carried, checked against its own `BatchPosted`, and the
-/// versioned hashes it selected (none for the calldata profile).
+/// The batch `call` carried, checked against its own `BatchPosted`.
 fn verify(
     call: &Call,
     spi: B256,
@@ -573,6 +561,8 @@ fn verify(
         log_index: id.log_index,
         detail,
     };
+    // Refuses blobs and a non-zero blockNumber, whose customData may read any
+    // state (IRollup.sol:41-54), unless the configured candidate domain applies.
     let (commitment, blob_hashes) = if batch.blockNumber == 0 && batch.blobIndices.is_empty() {
         let commitment = batch_shared_public_input(&batch, call.from);
         (
@@ -580,13 +570,14 @@ fn verify(
             Vec::new(),
         )
     } else {
-        // Any other blockNumber's customData may read any state (IRollup.sol:41-54);
-        // only the configured candidate-V1 domain is reproducible.
         let Some(candidate) = candidate.filter(|c| ids == [c.deployment.eez_rollup_id]) else {
             let detail = format!("{here}: an L1-bound post outside the configured candidate V1");
             return Err(unsupported(detail));
         };
-        candidate_commitment(&batch, call, candidate, here)?
+        (
+            candidate.commitment(&batch, &call.blob_hashes, call.from, here)?,
+            call.blob_hashes.clone(),
+        )
     };
     let mismatch = format!("{here}: call hashes to {commitment}, not {spi}");
     // Only a co-listed rollup's block-zero customData can explain a mismatch (EEZ.sol:753-762).
@@ -595,39 +586,6 @@ fn verify(
         return Err(unsupported(mismatch));
     }
     Ok((batch, blob_hashes))
-}
-
-/// The commitment of a post admitted by the settlement wrapper:
-/// latest-context sentinel, no calldata tail, and every blob of the tx selected
-/// once, in order. A committed Rollup0 post cannot break these, so any break is `Decode`.
-fn candidate_commitment(
-    batch: &EvmBatch,
-    call: &Call,
-    candidate: &CandidateBlock<'_>,
-    here: &str,
-) -> L1Result<(B256, Vec<B256>)> {
-    let selected = (0..call.blob_hashes.len()).map(U256::from);
-    let canonical = !call.blob_hashes.is_empty()
-        && batch.blobIndices.iter().copied().eq(selected)
-        && batch.callData.is_empty();
-    ensure!(
-        batch.blockNumber == u64::MAX && canonical,
-        "{here}: not a canonical candidate-V1 carrier"
-    );
-    // A historical post may precede a wrapper rotation. Its committed EEZ
-    // caller is the wrapper that forwarded it, not today's configured wrapper.
-    let deployment = Rollup0Deployment {
-        settlement_wrapper: call.from,
-        ..*candidate.deployment
-    };
-    let custom_data = deployment.custom_data(candidate.timestamp, candidate.parent_hash);
-    let context = SettlementContext {
-        blob_hashes: &call.blob_hashes,
-        custom_data: std::slice::from_ref(&custom_data),
-    };
-    let commitment = batch_shared_public_input_with(batch, call.from, context)
-        .map_err(|e| L1Error::Decode(format!("{here}: {e}")))?;
-    Ok((commitment, call.blob_hashes.clone()))
 }
 
 /// A post listing us, while its block is read.

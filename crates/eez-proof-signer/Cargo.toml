@@ -24,7 +24,6 @@ alloy-eips.workspace = true
 alloy-genesis = { workspace = true, features = ["std"] }
 alloy-primitives = { workspace = true, features = ["k256"] }
 alloy-provider.workspace = true
-alloy-rpc-types-eth.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-debug.workspace = true
 alloy-sol-types.workspace = true
@@ -50,7 +49,6 @@ stateless-reth.workspace = true
 [dev-dependencies]
 # Recorded calldata fixture decoding.
 hex.workspace = true
-serde_json.workspace = true
 # Client-side of the in-process Prove round-trip tests.
 eez-prover.workspace = true
 eez-prover-client.workspace = true

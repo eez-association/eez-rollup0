@@ -8,9 +8,8 @@ import {Rollup0Manager} from "../src/Rollup0Manager.sol";
 import {Rollup0SettlementWrapper} from "../src/Rollup0SettlementWrapper.sol";
 
 /// @title DeployRollup0CandidateV1
-/// @notice Deploys the blob-settlement manager and wrapper for integration work.
-/// @dev Do not use this deployment with the calldata composer. Candidate V1
-///      requires blob batches posted through the wrapper.
+/// @notice Deploys the Rollup0 manager and wrapper for blob settlement.
+/// @dev Use EEZ_SETTLEMENT_PROFILE=blob with this deployment.
 contract DeployRollup0CandidateV1 is Script {
     error InvalidProofSystem();
 

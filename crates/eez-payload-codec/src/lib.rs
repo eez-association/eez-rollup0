@@ -39,8 +39,8 @@
 mod container;
 
 pub use container::{
-    Action, BYTES_PER_BLOB, DecodedContainer, STREAM_VERSION, decode_blob_container,
-    decode_container, encode_blob_container, encode_container,
+    Action, AnchorOnlyBlobSizer, DecodedContainer, STREAM_VERSION, decode_blob_container,
+    decode_container, encode_blob_container, encode_container, logical_blob_capacity,
 };
 
 /// A raw EIP-2718 signed transaction, exactly as it enters the block's
@@ -814,7 +814,7 @@ mod tests {
         use super::*;
         use alloy_primitives::hex;
 
-        /// Six empty blocks fit in 31 bytes.
+        /// D.4.2 Vector 1 — six empty blocks, 31 bytes.
         #[test]
         fn vector_1_six_empty_blocks() {
             let bytes =
@@ -836,7 +836,7 @@ mod tests {
             );
         }
 
-        /// One EIP-1559 transaction with multiple metadata runs.
+        /// D.4.2 Vector 2 — one EIP-1559 transaction, multiple metadata runs.
         #[test]
         fn vector_2_one_transaction_and_multiple_runs() {
             let bytes = hex::decode(
@@ -884,7 +884,7 @@ mod tests {
             );
         }
 
-        /// These malformed inputs must be rejected, and for the stated
+        /// D.4.2 Vectors 3-7 — every one must be rejected, and for the stated
         /// reason.
         #[test]
         fn vectors_3_to_7_are_rejected() {

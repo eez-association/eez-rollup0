@@ -158,29 +158,14 @@ EEZ_ECDSA_PROOF_SYSTEM_ADDRESS="$(extract ECDSA_PS "$OUT")"
 echo "      ECDSA_PS   = $EEZ_ECDSA_PROOF_SYSTEM_ADDRESS"
 
 # ── 3/5 DeployRollup ────────────────────────────────────────────────
-# EEZ_DEPLOY_CANDIDATE_V1=1 deploys the blob-settlement manager and
-# wrapper; the written wrapper address then selects blob settlement everywhere.
-EEZ_SETTLEMENT_WRAPPER_ADDRESS=""
-if [[ "${EEZ_DEPLOY_CANDIDATE_V1:-0}" == "1" ]]; then
-    l2_chain_id="$(jq -er '.config.chainId' "$GENESIS_BASE")"
-    echo "[3/5] DeployRollup0CandidateV1"
-    run_forge "DeployRollup0CandidateV1" forge script script/DeployRollup0CandidateV1.s.sol:DeployRollup0CandidateV1 \
-        --sig "run(address,address,address,address,uint256)" \
-        "$EEZ_REGISTRY_ADDRESS" "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" "$AUTHORIZED_SIGNER" "$OWNER" "$l2_chain_id" \
-        $RPC $KEY --broadcast
-    EEZ_SETTLEMENT_WRAPPER_ADDRESS="$(extract SETTLEMENT_WRAPPER "$OUT")"
-    [[ -n "$EEZ_SETTLEMENT_WRAPPER_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture SETTLEMENT_WRAPPER address" >&2; exit 1; }
-else
-    echo "[3/5] DeployRollup"
-    run_forge "DeployRollup" forge script script/DeployRollup.s.sol:DeployRollup \
-        --sig "run(address,address,address,address)" \
-        "$EEZ_REGISTRY_ADDRESS" "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" "$AUTHORIZED_SIGNER" "$OWNER" \
-        $RPC $KEY --broadcast
-fi
+echo "[3/5] DeployRollup"
+run_forge "DeployRollup" forge script script/DeployRollup.s.sol:DeployRollup \
+    --sig "run(address,address,address,address)" \
+    "$EEZ_REGISTRY_ADDRESS" "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" "$AUTHORIZED_SIGNER" "$OWNER" \
+    $RPC $KEY --broadcast
 EEZ_ROLLUP_MANAGER_ADDRESS="$(extract ROLLUP_CONTRACT "$OUT")"
 [[ -n "$EEZ_ROLLUP_MANAGER_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture ROLLUP_CONTRACT address" >&2; exit 1; }
 echo "      rollupMgr  = $EEZ_ROLLUP_MANAGER_ADDRESS"
-[[ -z "$EEZ_SETTLEMENT_WRAPPER_ADDRESS" ]] || echo "      wrapper    = $EEZ_SETTLEMENT_WRAPPER_ADDRESS"
 
 # ── Generate deployment-bound L2 genesis ────────────────────────────
 # This deploy creates a fresh registry, so the first L2 rollup ID is 1.
@@ -323,7 +308,6 @@ EEZ_PROOF_SYSTEM=$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS
 EEZ_VKEY=$PROOF_SYSTEM_VKEY
 EEZ_ATTESTER_ADDRESS=$AUTHORIZED_SIGNER
 EEZ_ROLLUP_MANAGER_ADDRESS=$EEZ_ROLLUP_MANAGER_ADDRESS
-EEZ_SETTLEMENT_WRAPPER_ADDRESS=$EEZ_SETTLEMENT_WRAPPER_ADDRESS
 EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID
 EEZ_INITIAL_STATE_ROOT=$EEZ_INITIAL_STATE_ROOT
 # The value actually registered on L1: the finalized genesis block hash.

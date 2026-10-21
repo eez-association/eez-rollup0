@@ -18,8 +18,7 @@
 //! - **Canonical public inputs.** [`public_inputs::public_inputs_hashes`] is the
 //!   reconstruction used by the proof signer; another encoding changes the
 //!   signed inputs. The supported profiles require one uniform verification
-//!   key and no sender binding. Blob settlement additionally binds versioned
-//!   hashes and the configured [`Rollup0Deployment`] domain.
+//!   key and no sender binding.
 //! - **Settlement root.** Before signing, the proof signer checks
 //!   `RollupUpdate.newRoot` against the root reth produced for the block.
 //!
@@ -68,7 +67,7 @@ pub use authorized_proxies::{
     decode_proxy_value, proxy_mapping_key,
 };
 #[doc(inline)]
-pub use candidate_domain::{DeploymentError, ROLLUP0_CANDIDATE_V1_TAG, Rollup0Deployment};
+pub use candidate_domain::Rollup0Deployment;
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Rollup, TargetConfig};
 #[doc(inline)]
@@ -84,9 +83,8 @@ pub use executor::{ChainClient, ExecutionRequest, SessionSnapshot, TargetExecuti
 pub use proof_plan::{ProofPlan, ProofPlanInvariantError, RollupProofAssignment};
 #[doc(inline)]
 pub use public_inputs::{
-    PublicInputsError, SettlementContext, all_per_ps_hashes, batch_shared_public_input,
-    batch_shared_public_input_with, entry_hash, public_inputs_hashes,
-    public_inputs_hashes_with_context, shared_public_input, static_entry_hash,
+    PublicInputsError, all_per_ps_hashes, batch_shared_public_input, entry_hash,
+    public_inputs_hashes, shared_public_input, static_entry_hash,
 };
 #[doc(inline)]
 pub use rolling_hash::{EntryRollingHash, StaticCallRollingHash};

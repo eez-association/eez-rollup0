@@ -323,7 +323,7 @@ mod selector_locks {
         );
     }
 
-    /// Attribution reads these five by topic0, and drift is silent: `get_logs`
+    /// Log scans select by these topic0s, and drift is silent: `get_logs`
     /// returns nothing and the scan reports "no entries applied".
     #[test]
     fn consumption_event_topics_match_upstream() {

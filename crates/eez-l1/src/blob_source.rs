@@ -1,7 +1,4 @@
-//! Consensus-layer blob retrieval for Candidate-V1 posts.
-//!
-//! The beacon node is untrusted: every returned body is hashed locally and
-//! only blobs matching the posting transaction's versioned hashes are kept.
+//! Beacon blob retrieval, checked against the posting transaction's versioned hashes.
 
 use std::{collections::HashMap, time::Duration};
 
@@ -41,7 +38,7 @@ const BEACON_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Beacon REST client for the blobs a settlement transaction committed to.
 #[derive(Debug)]
-pub struct BeaconBlobSource {
+pub(crate) struct BeaconBlobSource {
     base_url: Url,
     client: reqwest::Client,
     timing: OnceCell<BeaconTiming>,
@@ -49,7 +46,7 @@ pub struct BeaconBlobSource {
 
 impl BeaconBlobSource {
     #[must_use]
-    pub fn new(mut base_url: Url) -> Self {
+    pub(crate) fn new(mut base_url: Url) -> Self {
         // `Url::join` replaces the last segment unless the path ends in `/`.
         if !base_url.path().ends_with('/') {
             let path = format!("{}/", base_url.path());
@@ -62,23 +59,24 @@ impl BeaconBlobSource {
         }
     }
 
-    /// The blobs `versioned_hashes` name, in that order, from the beacon slot
-    /// whose execution payload is `block_hash`.
-    ///
-    /// # Errors
-    ///
-    /// - [`L1Error::Provider`] on transport failure or a malformed beacon body.
-    /// - [`L1Error::SourceIncomplete`] when the slot lacks a committed blob:
-    ///   the beacon is behind, or has pruned it past its retention window.
-    /// - [`L1Error::SourceIncomplete`] when the beacon still serves another fork.
-    /// - [`L1Error::Config`] when the beacon's slot grid disagrees with L1.
-    pub async fn fetch(
+    /// Fetch a post's committed blobs in transaction order, pinned to its L1 block.
+    pub(crate) async fn fetch(
         &self,
-        block: u64,
-        block_hash: B256,
-        timestamp: u64,
-        versioned_hashes: &[B256],
+        provider: &impl Provider,
+        post: &Post,
     ) -> L1Result<Vec<Vec<u8>>> {
+        let block = post.id.l1_block;
+        let block_hash = post.id.l1_block_hash;
+        let timestamp = provider
+            .get_block_by_hash(block_hash)
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block({block_hash}): {e}")))?
+            .ok_or_else(|| L1Error::SourceIncomplete {
+                block,
+                detail: format!("block {block_hash} is not served; retry"),
+            })?
+            .header
+            .timestamp;
         let slot = self.timing().await?.slot_at(timestamp)?;
         let beacon_block = self.get(&format!("eth/v2/beacon/blocks/{slot}")).await?;
         let execution_hash = json_b256(
@@ -109,11 +107,10 @@ impl BeaconBlobSource {
             detail: format!("beacon serves no blobs for slot {slot}: behind or pruned"),
         })?;
         let served = parse_blobs(&body)?;
-        let hashes = eez_blob::versioned_hashes(&served, eez_blob::EnvKzgSettings::Default.get())
-            .map_err(|error| {
+        let hashes = eez_blob::versioned_hashes(&served).map_err(|error| {
             L1Error::Provider(format!("beacon served an invalid blob: {error}"))
         })?;
-        select_blobs(hashes, served, versioned_hashes).ok_or_else(|| L1Error::SourceIncomplete {
+        select_blobs(hashes, served, &post.blob_hashes).ok_or_else(|| L1Error::SourceIncomplete {
             block,
             detail: format!("beacon slot {slot} does not serve every transaction blob"),
         })
@@ -178,46 +175,11 @@ fn select_blobs(
     blobs: Vec<Vec<u8>>,
     requested: &[B256],
 ) -> Option<Vec<Vec<u8>>> {
-    let mut by_hash: HashMap<B256, Vec<Vec<u8>>> = HashMap::new();
-    for (hash, blob) in hashes.into_iter().zip(blobs) {
-        by_hash.entry(hash).or_default().push(blob);
-    }
+    let by_hash: HashMap<_, _> = hashes.into_iter().zip(blobs).collect();
     requested
         .iter()
-        .map(|hash| by_hash.get_mut(hash)?.pop())
+        .map(|hash| by_hash.get(hash).cloned())
         .collect()
-}
-
-/// The blobs `post` committed to, in its `blob_hashes` order.
-///
-/// # Errors
-///
-/// [`L1Error::Config`] without `EEZ_L1_BEACON_URL`; otherwise as
-/// [`BeaconBlobSource::fetch`].
-pub(crate) async fn fetch_post_blobs(
-    provider: &impl Provider,
-    beacon: Option<&BeaconBlobSource>,
-    post: &Post,
-) -> L1Result<Vec<Vec<u8>>> {
-    let block = post.id.l1_block;
-    let beacon = beacon.ok_or_else(|| {
-        L1Error::Config(format!(
-            "block {block}: a candidate-V1 post needs EEZ_L1_BEACON_URL to read its blobs"
-        ))
-    })?;
-    let timestamp = provider
-        .get_block_by_hash(post.id.l1_block_hash)
-        .await
-        .map_err(|e| L1Error::Provider(format!("get_block({block}): {e}")))?
-        .ok_or_else(|| L1Error::SourceIncomplete {
-            block,
-            detail: format!("block {} is not served; retry", post.id.l1_block_hash),
-        })?
-        .header
-        .timestamp;
-    beacon
-        .fetch(block, post.id.l1_block_hash, timestamp, &post.blob_hashes)
-        .await
 }
 
 /// Blob bodies from either response shape: `blobs` serves hex strings,
@@ -307,11 +269,10 @@ mod tests {
     }
 
     #[test]
-    fn repeated_blob_hashes_consume_repeated_bodies() {
+    fn repeated_blob_hashes_reuse_the_matching_body() {
         let hash = B256::repeat_byte(1);
-        let selected =
-            select_blobs(vec![hash, hash], vec![vec![1], vec![2]], &[hash, hash]).unwrap();
-        assert_eq!(selected.len(), 2);
-        assert!(select_blobs(vec![hash], vec![vec![1]], &[hash, hash]).is_none());
+        let selected = select_blobs(vec![hash], vec![vec![1]], &[hash, hash]).unwrap();
+        assert_eq!(selected, [vec![1], vec![1]]);
+        assert!(select_blobs(vec![hash], vec![vec![1]], &[B256::repeat_byte(2)]).is_none());
     }
 }

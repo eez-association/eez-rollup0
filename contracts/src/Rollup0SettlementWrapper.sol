@@ -18,6 +18,7 @@ contract Rollup0SettlementWrapper {
 
     bool private transient _entered;
 
+    error InvalidConfig();
     error ReentrantSettlement();
     error Rollup0NotIncluded();
     error InvalidBlockNumber();
@@ -34,7 +35,7 @@ contract Rollup0SettlementWrapper {
     error AnchorNotApplied(bytes32 expectedRoot, bytes32 liveRoot);
 
     constructor(address eez, address rollupManager) {
-        if (eez == address(0) || rollupManager == address(0)) revert InvalidAnchor();
+        if (eez == address(0) || rollupManager == address(0)) revert InvalidConfig();
         EEZ = IRollup0EEZ(eez);
         manager = Rollup0Manager(rollupManager);
     }
@@ -54,7 +55,14 @@ contract Rollup0SettlementWrapper {
         }
         if (!included) revert Rollup0NotIncluded();
         if (batch.blockNumber != type(uint64).max) revert InvalidBlockNumber();
-        if (batch.immediateEntryCount != 1) revert InvalidImmediateEntryCount();
+        uint256 immediate = batch.immediateEntryCount;
+        if (immediate == 0 || immediate > batch.entries.length) revert InvalidImmediateEntryCount();
+        uint256 leading = 0;
+        while (leading < batch.entries.length && batch.entries[leading].proxyEntryHash == bytes32(0)) {
+            leading++;
+        }
+        // Anchor, then any outbound entries. Inbound entries follow that run.
+        if (immediate != leading) revert InvalidImmediateEntryCount();
         if (batch.immediateStaticEntryCount != 0) revert InvalidImmediateStaticEntryCount();
         if (batch.bindMsgSenderInPublicInput) revert SenderBindingUnsupported();
         if (batch.callData.length != 0) revert NonEmptyCallData();
@@ -67,7 +75,6 @@ contract Rollup0SettlementWrapper {
         }
         if (blobhash(blobCount) != bytes32(0)) revert ExtraBlob(blobCount);
 
-        if (batch.entries.length == 0) revert InvalidAnchor();
         ExecutionEntry calldata anchor = batch.entries[0];
         // EEZ verifies the anchor's seeded rolling hash; the root checks below bound the rest.
         if (
@@ -83,10 +90,19 @@ contract Rollup0SettlementWrapper {
         if (liveRoot != currentRoot) revert StaleAnchor(liveRoot, currentRoot);
         if (newRoot == liveRoot) revert UnchangedAnchorRoot();
 
+        // EEZ applies every immediate update in this transaction, so the live
+        // root becomes the last of that run, not the anchor, once an outbound
+        // entry follows it.
+        ExecutionEntry calldata settled = batch.entries[immediate - 1];
+        if (settled.rollupUpdates.length != 1 || settled.rollupUpdates[0].rollupId != rollupId) {
+            revert InvalidAnchor();
+        }
+        bytes32 settledRoot = settled.rollupUpdates[0].newRoot;
+
         manager.beginSettlement();
         EEZ.postAndVerifyBatch(batch);
         (, liveRoot,) = EEZ.rollups(rollupId);
-        if (liveRoot != newRoot) revert AnchorNotApplied(newRoot, liveRoot);
+        if (liveRoot != settledRoot) revert AnchorNotApplied(settledRoot, liveRoot);
         manager.endSettlement();
 
         _entered = false;

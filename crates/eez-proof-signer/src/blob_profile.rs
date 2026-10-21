@@ -9,14 +9,7 @@ use eez_protocol::Rollup0Deployment;
 use reth_chainspec::{ChainSpec, EthChainSpec as _};
 use thiserror::Error;
 
-/// Caller-proposed L1 target before authentication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct L1PostingContext {
-    pub chain_id: u64,
-    pub target_timestamp: u64,
-    pub parent_number: u64,
-    pub parent_hash: B256,
-}
+pub use eez_protocol::candidate_domain::L1PostingContext;
 
 /// Rollup0's EEZ entry and the manager's active wrapper at one L1 block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,10 +21,9 @@ pub struct SettlementState {
     pub settlement_wrapper: Address,
 }
 
-/// Values derived from one coherent, canonical L1 snapshot. Only
-/// [`BlobContextAuthority::authenticate`] constructs one.
+/// L1 context constructed only after canonical snapshot authentication.
 #[derive(Debug, Clone)]
-pub struct AuthenticatedBlobContext {
+pub(crate) struct AuthenticatedBlobContext {
     custom_data: Bytes,
     max_blobs: usize,
     sync_interval: u64,
@@ -87,9 +79,7 @@ pub trait Rollup0L1Source: Send + Sync + fmt::Debug {
     ) -> Result<SettlementState, BlobContextError>;
 }
 
-/// Trusted blob-settlement configuration. Blob limits come from `chain_spec`.
-/// The slot length is the L1 block time. The composer uses its own embedded
-/// copy of that spec.
+/// Trusted deployment, fork schedule and timing for blob settlement.
 #[derive(Debug, Clone)]
 pub struct BlobContextConfig {
     pub deployment: Rollup0Deployment,
@@ -99,7 +89,7 @@ pub struct BlobContextConfig {
     pub sync_interval: u64,
 }
 
-/// Blob-settlement authority built over an independently configured canonical L1 source.
+/// Authenticates posting context against the signer's configured L1 source.
 #[derive(Debug)]
 pub struct BlobContextAuthority {
     source: Arc<dyn Rollup0L1Source>,

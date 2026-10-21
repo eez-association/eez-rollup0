@@ -6,7 +6,7 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::Filter;
 
-use crate::blob_source::{BeaconBlobSource, fetch_post_blobs};
+use crate::blob_source::BeaconBlobSource;
 use crate::config::L1ReaderConfig;
 use crate::error::{L1Error, L1Result};
 use crate::scan::{BatchLogChunks, Post, scan_next_batch_log_chunk};
@@ -92,15 +92,18 @@ impl L1Reader {
         .await
     }
 
-    /// The blobs a candidate-V1 post committed to, in `blob_hashes` order.
-    /// Fetched only when derivation needs them, so a processed post whose
-    /// blobs the beacon has pruned never blocks a rescan.
+    /// Fetch a post's blobs in commitment order, only when derivation needs them.
     ///
     /// # Errors
     ///
-    /// As [`BeaconBlobSource::fetch`]; [`L1Error::Config`] without a beacon.
+    /// [`L1Error::Config`] without a beacon, [`L1Error::Provider`] on RPC or
+    /// malformed data, and [`L1Error::SourceIncomplete`] for missing or stale DA.
     pub async fn post_blobs(&self, post: &Post) -> L1Result<Vec<Vec<u8>>> {
-        fetch_post_blobs(&self.build_provider(), self.beacon.as_deref(), post).await
+        let beacon = self
+            .beacon
+            .as_ref()
+            .ok_or_else(|| L1Error::Config("blob derivation requires EEZ_L1_BEACON_URL".into()))?;
+        beacon.fetch(&self.build_provider(), post).await
     }
 
     /// The configured candidate-V1 deployment, if any.

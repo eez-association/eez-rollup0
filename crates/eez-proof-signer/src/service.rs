@@ -148,8 +148,6 @@ impl ServiceState {
         authority: Arc<crate::BlobContextAuthority>,
     ) -> Self {
         self.blob_context_authority = Some(authority);
-        // Loads the trusted setup now rather than on the first blob request.
-        eez_blob::EnvKzgSettings::Default.get();
         self
     }
 }

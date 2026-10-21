@@ -97,7 +97,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         None,
     )?;
 
-    // Candidate-V1 posts are read when a settlement wrapper is configured.
+    // Candidate-V1 posts are read when EEZ_SETTLEMENT_PROFILE=blob.
     let candidate =
         eez_protocol::Rollup0Deployment::from_env(read_l1_chain_id()?, chain_spec.chain().id())?;
     let l1_reader_config = L1ReaderConfig::from_env()?.with_candidate(candidate)?;

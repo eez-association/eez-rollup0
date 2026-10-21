@@ -21,14 +21,17 @@ pub async fn run() -> eyre::Result<()> {
     let expected_l2_system_address = config.expected_l2_system_address;
     let backend =
         Backend::from_chain_document_file(&config.chain_document_path, expected_l2_system_address)?;
-    let expected_rollup_id = config.expected_rollup_id;
-    let server = ServerConfig {
-        listen_addr,
-        limits,
-        expected_rollup_id,
-        attester: config.attester,
-    };
-    eez_proof_signer::serve_from_env(server, backend, shutdown_signal()).await
+    eez_proof_signer::serve(
+        ServerConfig {
+            listen_addr,
+            limits,
+            expected_rollup_id: config.expected_rollup_id,
+            attester: config.attester,
+        },
+        backend,
+        shutdown_signal(),
+    )
+    .await
 }
 
 /// Stop accepting connections on Ctrl-C or SIGTERM.

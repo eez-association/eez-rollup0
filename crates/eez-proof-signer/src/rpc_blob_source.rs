@@ -34,26 +34,27 @@ sol! {
 
 /// L1 source used by the proof signer, independent of Composer-supplied data.
 #[derive(Debug)]
-pub struct RpcRollup0L1Source {
+struct RpcRollup0L1Source {
     provider: RootProvider,
     eez: Address,
     rollup_id: u64,
 }
 
 impl BlobContextAuthority {
-    /// `None` keeps the calldata profile. The L2 chain id comes from the
-    /// backend's chain configuration; the rest from the node's `EEZ_*` names.
+    /// `None` keeps calldata settlement. The L2 chain id comes from the
+    /// backend's chain configuration; the remaining values come from `EEZ_*`.
     ///
     /// # Errors
     ///
-    /// A partially configured or inconsistent candidate-V1 profile.
+    /// An invalid or mismatched profile, or a partially configured or
+    /// inconsistent candidate-V1 profile.
     pub(crate) fn from_env(
         expected_rollup_id: u64,
         l2_chain_id: u64,
     ) -> eyre::Result<Option<Self>> {
-        if !Rollup0Deployment::is_configured() {
+        let Some(deployment) = Rollup0Deployment::from_process_env(l2_chain_id)? else {
             return Ok(None);
-        }
+        };
         let required = |name: &'static str| {
             env::var(name).map_err(|_| eyre::eyre!("{name} is required for candidate-V1 signing"))
         };
@@ -63,11 +64,6 @@ impl BlobContextAuthority {
                 .parse()
                 .map_err(|error| eyre::eyre!("{name} is invalid: {error}"))
         };
-        let l1_chain_id = number("EEZ_L1_CHAIN_ID")?;
-        let deployment =
-            Rollup0Deployment::from_env(l1_chain_id, l2_chain_id)?.ok_or_else(|| {
-                eyre::eyre!("candidate-V1 deployment disappeared from the environment")
-            })?;
         eyre::ensure!(
             deployment.eez_rollup_id == expected_rollup_id,
             "EEZ_ROLLUP_ID {} differs from the signer's rollup {expected_rollup_id}",
@@ -87,20 +83,22 @@ impl BlobContextAuthority {
             slot_seconds > 0 && slot_seconds.saturating_mul(1000) == l1_block_ms,
             "EEZ_L1_BLOCK_TIME_MS {l1_block_ms} must be a positive whole number of seconds",
         );
-        let chain_spec = load_l1_chain_spec(l1_chain_id)?;
+        let chain_spec = load_l1_chain_spec(deployment.l1_chain_id)?;
         let rpc_url = Url::parse(&required("EEZ_L1_RPC_URL")?)?;
-        let source = Arc::new(RpcRollup0L1Source::new(
-            rpc_url,
-            deployment.eez,
-            expected_rollup_id,
-        ));
-        let authority = BlobContextConfig {
+        let source = Arc::new(RpcRollup0L1Source {
+            provider: ProviderBuilder::new()
+                .disable_recommended_fillers()
+                .connect_http(rpc_url),
+            eez: deployment.eez,
+            rollup_id: expected_rollup_id,
+        });
+        let config = BlobContextConfig {
             deployment,
             chain_spec,
             slot_seconds,
             sync_interval: l1_block_ms / l2_block_ms,
         };
-        Ok(Some(Self::new(source, authority)?))
+        Ok(Some(Self::new(source, config)?))
     }
 }
 
@@ -126,19 +124,6 @@ fn load_l1_chain_spec(expected_chain_id: u64) -> eyre::Result<Arc<ChainSpec>> {
         spec.chain_id(),
     );
     Ok(Arc::new(spec))
-}
-
-impl RpcRollup0L1Source {
-    #[must_use]
-    pub fn new(rpc_url: Url, eez: Address, rollup_id: u64) -> Self {
-        Self {
-            provider: ProviderBuilder::new()
-                .disable_recommended_fillers()
-                .connect_http(rpc_url),
-            eez,
-            rollup_id,
-        }
-    }
 }
 
 #[async_trait]

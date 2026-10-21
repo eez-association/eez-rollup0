@@ -806,21 +806,21 @@ impl SessionRuntime {
             .settlement
             .take()
             .ok_or_else(|| Status::invalid_argument("Finalize carries no settlement input"))?;
-        if (!settlement.blobs.is_empty() || settlement.posting_context.is_some())
-            && self.state.blob_context_authority.is_none()
-        {
-            return Err(Status::unimplemented("blob settlement is not configured"));
-        }
         let requested_blob_context = match (
+            self.state.blob_context_authority.as_deref(),
             settlement.blobs.is_empty(),
             settlement.posting_context.take(),
         ) {
-            (true, None) if self.state.blob_context_authority.is_none() => None,
-            (false, Some(context)) => Some(
-                crate::blob_profile::parse_posting_context(context)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?,
-            ),
-            _ => {
+            (None, true, None) => None,
+            (None, _, _) => {
+                return Err(Status::unimplemented("blob settlement is not configured"));
+            }
+            (Some(authority), false, Some(context)) => {
+                let requested = crate::blob_profile::parse_posting_context(context)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                Some((authority, requested))
+            }
+            (Some(_), _, _) => {
                 return Err(Status::invalid_argument(
                     "blob settlement requires both blobs and posting_context",
                 ));
@@ -839,34 +839,30 @@ impl SessionRuntime {
             (anchor, window, start_index, session.cancellation.clone())
         };
 
-        let authenticated_blob_context = if let Some(requested) = requested_blob_context {
-            let authority = self
-                .state
-                .blob_context_authority
-                .as_ref()
-                .expect("checked above");
-            let remaining = self
-                .limits
-                .request_timeout()
-                .saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return Err(Status::deadline_exceeded(
-                    "Finalize posting-context authentication deadline exceeded",
-                ));
-            }
-            Some(
-                timeout(remaining, authority.authenticate(requested, anchor.hash))
-                    .await
-                    .map_err(|_| {
-                        Status::deadline_exceeded(
-                            "Finalize posting-context authentication deadline exceeded",
-                        )
-                    })?
-                    .map_err(blob_context_status)?,
-            )
-        } else {
-            None
-        };
+        let authenticated_blob_context =
+            if let Some((authority, requested)) = requested_blob_context {
+                let remaining = self
+                    .limits
+                    .request_timeout()
+                    .saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(Status::deadline_exceeded(
+                        "Finalize posting-context authentication deadline exceeded",
+                    ));
+                }
+                Some(
+                    timeout(remaining, authority.authenticate(requested, anchor.hash))
+                        .await
+                        .map_err(|_| {
+                            Status::deadline_exceeded(
+                                "Finalize posting-context authentication deadline exceeded",
+                            )
+                        })?
+                        .map_err(blob_context_status)?,
+                )
+            } else {
+                None
+            };
 
         let state = Arc::clone(&self.state);
         let remaining = self
@@ -910,7 +906,6 @@ impl SessionRuntime {
                 super::settlement_job::BlobSettlementInput {
                     blobs: &settlement.blobs,
                     context,
-                    kzg_settings: eez_blob::EnvKzgSettings::Default.get(),
                 }
             });
             let hash = run_settlement(SettlementInput {
@@ -964,7 +959,6 @@ impl SessionRuntime {
             session_id = %bound.id,
             from = finalize.from_block,
             to = finalize.to_block,
-            recomputed_public_inputs_hash = %hash.into_inner(),
             elapsed_us = started.elapsed().as_micros(),
             "session window signed",
         );
@@ -987,7 +981,7 @@ impl Prover for ProveSvc {
         let (sender, receiver) = mpsc::channel(8);
         self.sessions
             .active_streams
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_ACTIVE_STREAMS).then_some(active + 1)
             })
             .map_err(|_| Status::resource_exhausted("too many active prover streams"))?;

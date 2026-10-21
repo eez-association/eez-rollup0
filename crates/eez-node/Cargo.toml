@@ -9,7 +9,6 @@ default-run            = "eez-composer"
 
 [dependencies]
 eez-primitives.workspace = true
-eez-blob.workspace = true
 eez-evm.workspace = true
 eez-composer.workspace      = true
 eez-deriver.workspace       = true

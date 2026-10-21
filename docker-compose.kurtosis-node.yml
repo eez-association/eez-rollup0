@@ -29,17 +29,11 @@ services:
     env_file:
       - ./deployments.env
     environment:
-      EEZ_L1_CHAIN_CONFIG: /l1/genesis.json
-      EEZ_L1_RPC_URL: "${EEZ_PROOF_SIGNER_L1_RPC_URL:-http://127.0.0.1:18645}"
-      EEZ_L1_CHAIN_ID: "7331"
-      EEZ_L1_BLOCK_TIME_MS: "12000"
-      EEZ_L2_BLOCK_TIME_MS: "2000"
       EEZ_PROOF_SIGNER_ADDR: 127.0.0.1:${EEZ_SIGNER_PORT:-50081}
       EEZ_CHAIN_CONFIG: /app/genesis.json
       EEZ_PROOF_SIGNER_KEY: "${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY}"
       RUST_LOG: "${EEZ_PROOF_SIGNER_RUST_LOG:-info}"
     volumes:
-      - ${L1_GENESIS_DIR:?point at the enclave's l1-genesis artifact}:/l1:ro
       - ${FRESH_GENESIS:?deploy writes ./datadir/genesis.json}:/app/genesis.json:ro
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "${EEZ_SIGNER_PORT:-50081}"]

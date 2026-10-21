@@ -161,15 +161,15 @@ fn per_ps_hashes(plan: &ProofPlan, shared: B256) -> Vec<B256> {
     out
 }
 
-/// Errors produced while reconstructing public inputs from the initial
-/// supported batch profile.
+/// Errors produced while reconstructing public inputs from the
+/// supported batch profiles.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PublicInputsError {
     /// The proof plan reconstructed from the batch is malformed.
     #[error(transparent)]
     InvalidPlan(#[from] ProofPlanInvariantError),
-    /// The calldata profile binds no L1 context.
-    #[error("public-input hashing currently requires blockNumber == 0, got {block_number}")]
+    /// The block number does not match the selected settlement profile.
+    #[error("unsupported public-input blockNumber {block_number}")]
     UnsupportedBlockNumber {
         /// Unsupported `batch.blockNumber` value.
         block_number: u64,
@@ -201,20 +201,10 @@ pub enum PublicInputsError {
     },
 }
 
-/// What the manager and the DA carrier add to `sharedPublicInput`: the
-/// selected blobs' versioned hashes and `getCustomData(blockNumber)` per listed
-/// rollup, in listing order. Callers derive both independently of the batch.
-#[derive(Debug, Clone, Copy)]
-pub struct SettlementContext<'a> {
-    /// Versioned hashes selected by the batch's blob indices.
-    pub blob_hashes: &'a [B256],
-    /// Per-rollup manager data in `rollupIds` order.
-    pub custom_data: &'a [Bytes],
-}
-
-/// `sharedPublicInput` as `EEZ._verifyProofSystemBatch` computes it for the
-/// calldata profile: block zero binds empty `customData` per rollup, and the
-/// sender is bound only when the batch asks.
+/// `sharedPublicInput` as `EEZ._verifyProofSystemBatch` computes it for `batch`
+/// sent by `sender`. Block zero binds empty `customData` per rollup, and the
+/// sender is bound only when the batch asks. `public_inputs_hashes` builds on
+/// it, so the scan checks exactly what the signer signs.
 pub fn batch_shared_public_input(
     batch: &EvmBatch,
     sender: Address,
@@ -230,37 +220,30 @@ pub fn batch_shared_public_input(
         });
     }
     let custom_data = vec![Bytes::new(); batch.rollupIdsWithProofSystems.len()];
-    batch_shared_public_input_with(
-        batch,
-        sender,
-        SettlementContext {
-            blob_hashes: &[],
-            custom_data: &custom_data,
-        },
-    )
+    batch_shared_public_input_with(batch, sender, &[], &custom_data)
 }
 
-/// `sharedPublicInput` for `batch` under an independently derived `context`.
-/// The scan and the signer both build on it, so they check what is signed.
+/// Computes `sharedPublicInput` with independently derived settlement data.
 ///
 /// # Errors
 ///
-/// [`PublicInputsError`] when `context` does not cover the batch's blobs and rollups.
+/// [`PublicInputsError`] when the supplied values do not cover the batch.
 pub fn batch_shared_public_input_with(
     batch: &EvmBatch,
     sender: Address,
-    context: SettlementContext<'_>,
+    blob_hashes: &[B256],
+    custom_data: &[Bytes],
 ) -> Result<B256, PublicInputsError> {
-    if context.blob_hashes.len() != batch.blobIndices.len() {
+    if blob_hashes.len() != batch.blobIndices.len() {
         return Err(PublicInputsError::BlobHashCount {
             expected: batch.blobIndices.len(),
-            actual: context.blob_hashes.len(),
+            actual: blob_hashes.len(),
         });
     }
-    if context.custom_data.len() != batch.rollupIdsWithProofSystems.len() {
+    if custom_data.len() != batch.rollupIdsWithProofSystems.len() {
         return Err(PublicInputsError::CustomDataCount {
             expected: batch.rollupIdsWithProofSystems.len(),
-            actual: context.custom_data.len(),
+            actual: custom_data.len(),
         });
     }
     let entry_hashes: Vec<B256> = batch.entries.iter().map(entry_hash).collect();
@@ -269,7 +252,7 @@ pub fn batch_shared_public_input_with(
     let custom_data_hashes: Vec<B256> = batch
         .rollupIdsWithProofSystems
         .iter()
-        .zip(context.custom_data)
+        .zip(custom_data)
         .map(|(rollup, data)| custom_data_hash(RollupId(rollup.rollupId), data))
         .collect();
     let bound_sender = if batch.bindMsgSenderInPublicInput {
@@ -280,15 +263,15 @@ pub fn batch_shared_public_input_with(
     Ok(shared_public_input(
         &entry_hashes,
         &static_entry_hashes,
-        context.blob_hashes,
+        blob_hashes,
         &batch.callData,
         &custom_data_hashes,
         bound_sender,
     ))
 }
 
-/// Compute every per-proof-system hash for the calldata profile: block number
-/// zero, no sender binding, and no blobs.
+/// Compute every per-proof-system hash for the calldata batch
+/// profile: block number zero, no sender binding, and no blobs.
 ///
 /// The reference manager returns empty `customData` for block zero, so this
 /// helper supplies one empty custom-data value per rollup and binds `address(0)`.
@@ -302,6 +285,7 @@ pub fn public_inputs_hashes(batch: &EvmBatch, vkey: B256) -> Result<Vec<B256>, P
     if batch.bindMsgSenderInPublicInput {
         return Err(PublicInputsError::UnsupportedSenderBinding);
     }
+    // Refuses a nonzero block number and blobs.
     let shared = batch_shared_public_input(batch, Address::ZERO)?;
     let custom_data = vec![Bytes::new(); batch.rollupIdsWithProofSystems.len()];
     per_ps_hashes_for(batch, vkey, custom_data, shared)
@@ -329,14 +313,7 @@ pub fn public_inputs_hashes_with_context(
         return Err(PublicInputsError::UnsupportedSenderBinding);
     }
     let custom_data = vec![custom_data];
-    let shared = batch_shared_public_input_with(
-        batch,
-        Address::ZERO,
-        SettlementContext {
-            blob_hashes,
-            custom_data: &custom_data,
-        },
-    )?;
+    let shared = batch_shared_public_input_with(batch, Address::ZERO, blob_hashes, &custom_data)?;
     per_ps_hashes_for(batch, vkey, custom_data, shared)
 }
 
@@ -616,8 +593,6 @@ mod tests {
         }
     }
 
-    /// Blob settlement binds its derived blob hashes and manager data exactly
-    /// where the calldata profile binds empty values, through one composition.
     #[test]
     fn candidate_v1_binds_blob_hashes_and_custom_data() {
         let vkey = B256::repeat_byte(0x42);
@@ -665,12 +640,8 @@ mod tests {
             public_inputs_hashes_with_context(&bound, vkey, &blob_hashes, custom_data.clone()),
             Err(PublicInputsError::UnsupportedSenderBinding),
         );
-        let context = SettlementContext {
-            blob_hashes: &blob_hashes,
-            custom_data: &[],
-        };
         assert_eq!(
-            batch_shared_public_input_with(&batch, Address::ZERO, context),
+            batch_shared_public_input_with(&batch, Address::ZERO, &blob_hashes, &[]),
             Err(PublicInputsError::CustomDataCount {
                 expected: 1,
                 actual: 0

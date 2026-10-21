@@ -48,11 +48,15 @@ where
     } = config;
     let backend =
         Backend::with_committer(provider, chain_spec, expected_l2_system_address, committer);
-    let server = ServerConfig {
-        listen_addr,
-        limits,
-        expected_rollup_id,
-        attester,
-    };
-    eez_proof_signer::serve_from_env(server, backend, shutdown).await
+    eez_proof_signer::serve(
+        ServerConfig {
+            listen_addr,
+            limits,
+            expected_rollup_id,
+            attester,
+        },
+        backend,
+        shutdown,
+    )
+    .await
 }

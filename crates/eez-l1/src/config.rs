@@ -40,10 +40,9 @@ pub struct L1ReaderConfig {
     /// L1 block where `EEZ` was deployed. Lower bound for historical batch
     /// scans and boot-time source-readiness checks.
     pub deploy_block: u64,
-    /// Candidate-V1 deployment whose blob posts the scan reproduces. Set by
-    /// the binary once both chain ids are known; `None` reads calldata only.
+    /// Blob deployment used to reproduce scanned commitments; `None` reads calldata only.
     pub candidate: Option<Rollup0Deployment>,
-    /// Beacon REST endpoint serving candidate-V1 blobs (`EEZ_L1_BEACON_URL`).
+    /// Beacon REST endpoint, required when a blob deployment is configured.
     pub beacon_url: Option<Url>,
 }
 
@@ -55,8 +54,6 @@ impl std::fmt::Debug for L1ReaderConfig {
             .field("eez", &self.eez)
             .field("rollup_id", &self.rollup_id)
             .field("deploy_block", &self.deploy_block)
-            .field("candidate", &self.candidate)
-            .field("beacon_url", &self.beacon_url.as_ref().map(Url::as_str))
             .finish()
     }
 }
@@ -77,7 +74,7 @@ impl L1ReaderConfig {
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
             deploy_block: parse_u64(ENV_REGISTRY_DEPLOY_BLOCK)?,
             candidate: None,
-            beacon_url: beacon_url()?,
+            beacon_url: None,
         })
     }
 
@@ -85,13 +82,11 @@ impl L1ReaderConfig {
     ///
     /// # Errors
     ///
-    /// [`L1Error::Config`] for a candidate without `EEZ_L1_BEACON_URL`, which
-    /// its first settled post would otherwise stall on.
+    /// [`L1Error::Config`] for a missing or malformed `EEZ_L1_BEACON_URL`
+    /// when a candidate deployment is configured.
     pub fn with_candidate(mut self, candidate: Option<Rollup0Deployment>) -> L1Result<Self> {
         if candidate.is_some() && self.beacon_url.is_none() {
-            return Err(L1Error::Config(format!(
-                "{ENV_BEACON_URL} is required to derive candidate-V1 blob posts"
-            )));
+            self.beacon_url = Some(parse_url(ENV_BEACON_URL)?);
         }
         self.candidate = candidate;
         Ok(self)
@@ -181,16 +176,6 @@ fn resolve_trace_rpc_url(rpc_url: &Url, raw: Option<String>) -> L1Result<Url> {
             Url::parse(&raw).map_err(|e| L1Error::Config(format!("{ENV_TRACE_RPC_URL}: {e}")))
         }
         _ => Ok(rpc_url.clone()),
-    }
-}
-
-/// Optional `EEZ_L1_BEACON_URL`; required with a candidate-V1 deployment.
-fn beacon_url() -> L1Result<Option<Url>> {
-    match env::var(ENV_BEACON_URL) {
-        Ok(raw) if !raw.is_empty() => Url::parse(&raw)
-            .map(Some)
-            .map_err(|e| L1Error::Config(format!("{ENV_BEACON_URL}: {e}"))),
-        _ => Ok(None),
     }
 }
 

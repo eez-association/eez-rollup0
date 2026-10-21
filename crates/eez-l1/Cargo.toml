@@ -32,9 +32,6 @@ tracing.workspace     = true
 url.workspace         = true
 
 [dev-dependencies]
-eez-payload-codec.workspace = true
-eez-primitives.workspace = true
-alloy-rlp.workspace = true
 alloy-json-rpc  = { version = "2", default-features = false }
 alloy-transport = { version = "2", default-features = false }
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::settlement::CheckedPublicInputProfile;
 
 fn assert_structure_rejected(name: &str, batch: &EvmBatch) {
     assert!(
@@ -106,7 +107,11 @@ fn blob_profile_checks_shape_and_trusted_limit_before_da() {
     let second_immediate = outbound_prefix.entries[0].clone();
     outbound_prefix.entries.push(second_immediate);
     outbound_prefix.immediateEntryCount = U256::from(2);
-    assert!(!blob_profile(&outbound_prefix, 2, 2));
+    assert!(blob_profile(&outbound_prefix, 2, 2));
+
+    let mut deferred_in_the_immediate_run = outbound_prefix.clone();
+    deferred_in_the_immediate_run.entries[1].proxyEntryHash = B256::repeat_byte(0x11);
+    assert!(!blob_profile(&deferred_in_the_immediate_run, 2, 2));
 
     let mut sender_bound = batch;
     sender_bound.bindMsgSenderInPublicInput = true;
