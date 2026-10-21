@@ -154,3 +154,16 @@ A trace costs milliseconds against a 12 s slot.
   state, so the call alone cannot reproduce it.
 - **`upgradeToAndCall` posts.** They run by `DELEGATECALL` into a proxied EEZ;
   ours is not proxied.
+
+## Blob deployment and recovery
+
+The inbound and outbound blob profile uses the
+`EEZ_ROLLUP0_CANDIDATE_V1` domain. Deploy matching manager, wrapper and signer
+versions.
+
+Payload construction reserves enough blob capacity for a complete Sync interval,
+including metadata and empty blocks. It also accounts for scheduled capacity
+reductions. This prevents new oversized intervals; it does not repair history
+already produced without that size guard. If retained history exceeds the
+allowance, sequencing fails closed. Recover the unsafe branch from the settled
+cursor before resuming; preserve settled history.

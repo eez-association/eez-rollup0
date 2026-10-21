@@ -302,6 +302,11 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     };
     let l2_chain_id = builder.config().chain.chain().id();
     let candidate = eez_protocol::Rollup0Deployment::from_env(l1_source_chain_id, l2_chain_id)?;
+    let data_guard = candidate.map(|deployment| {
+        Arc::new(eez_node_common::SequencingDataGuard::new(
+            deployment.eez_rollup_id,
+        ))
+    });
     let composer_info = composer_rpc::ComposerInfo::new(
         composer_rpc::ComposerContracts {
             registry: eez_registry,
@@ -317,7 +322,13 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     );
     let front_composer_info = Arc::new(serde_json::to_value(&composer_info)?);
     let handle = builder
-        .node(EezNode)
+        .with_types::<EezNode>()
+        .with_components(EezNode::components().payload(
+            reth_node_builder::components::BasicPayloadServiceBuilder::new(
+                eez_node_common::EezPayloadBuilder::with_data_guard(data_guard.clone()),
+            ),
+        ))
+        .with_add_ons(eez_node_common::eez_add_ons())
         .extend_rpc_modules(move |ctx| {
             composer_rpc::install_composer_rpc(ctx, composer_info.clone())
         })
@@ -654,6 +665,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             timing,
         )?;
         let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
+        if let Some(guard) = &data_guard {
+            guard.bind(&sync_slot_handle)?;
+        }
 
         let schedule_rx = spawn_l1_anchored(
             L1HeadStream::from_watcher(&l1_watcher),

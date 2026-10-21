@@ -1419,6 +1419,101 @@ where
         + 'static,
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
+    fn ordinary_da_budget(
+        &self,
+        rollup_id: u64,
+        parent: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
+        timestamp: u64,
+    ) -> Result<Option<usize>, String> {
+        let Some(config) = &self.inner.cross_chain.exec_ctx.blob_posting else {
+            return Ok(None);
+        };
+        let k = u64::from(self.inner.emission.timing.k());
+        let next = parent
+            .number()
+            .checked_add(1)
+            .ok_or("sequencing height overflow")?;
+        let base = (next - 1) / k * k;
+        let boundary = base.checked_add(k).ok_or("sequencing boundary overflow")?;
+        let target = timestamp
+            .checked_add(
+                k.checked_mul(self.inner.emission.timing.l2_block_time().as_secs())
+                    .ok_or("sequencing timestamp overflow")?,
+            )
+            .ok_or("sequencing timestamp overflow")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_secs();
+        let target = target.max(now);
+        let spec = &config.chain_spec;
+        let mut blobs = eez_blob::blob_limit_at(spec, target)
+            .ok_or("no active blob allowance for sequencing")?
+            .max_blobs;
+        // Backlogged data must still fit after an announced capacity reduction.
+        let activations = spec
+            .blob_params
+            .scheduled
+            .iter()
+            .map(|(time, _)| *time)
+            .chain(
+                spec.hardforks
+                    .forks_iter()
+                    .filter_map(|(_, fork)| fork.as_timestamp()),
+            );
+        for time in activations.filter(|time| *time > target) {
+            blobs = blobs.min(
+                eez_blob::blob_limit_at(spec, time)
+                    .ok_or("future fork has no blob allowance")?
+                    .max_blobs,
+            );
+        }
+        let mut budget = blob::ordinary_interval_budget(k, blobs)?;
+        let rollup = self
+            .inner
+            .rollups
+            .get(&rollup_id)
+            .ok_or("unknown sequencing rollup")?;
+        let mut hash = parent.hash();
+        let mut number = parent.number();
+        while number > base {
+            let block = rollup
+                .l2_provider
+                .find_block_by_hash(hash, BlockSource::Any)
+                .map_err(|error| error.to_string())?
+                .ok_or("sequencing ancestor unavailable")?;
+            if block.header().number() != number {
+                return Err("sequencing ancestor number mismatch".into());
+            }
+            for tx in block.body().transactions() {
+                budget = budget.checked_sub(tx.encode_2718_len().saturating_add(5))
+                    .ok_or("retained interval exceeds the blob allowance; recover from the settled cursor")?;
+            }
+            hash = block.header().parent_hash();
+            number -= 1;
+        }
+        if base > rollup.l1_head.cursor() {
+            let header = if hash == parent.hash() {
+                parent.clone()
+            } else {
+                rollup
+                    .l2_provider
+                    .sealed_header_by_hash(hash)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("sequencing boundary unavailable")?
+            };
+            if header.transactions_root() != alloy_consensus::constants::EMPTY_ROOT_HASH
+                && rollup.optimistic.blocking_height(rollup.l1_head.cursor()) != Some(base)
+            {
+                return Err("nonempty Sync boundary has no settlement ownership".into());
+            }
+        }
+        if next == boundary {
+            budget = 0;
+        }
+        Ok(Some(budget))
+    }
+
     /// Drain `rollup_id`'s cross-chain `HeldPool`, compose its transactions,
     /// and hand the resulting Sync block back for the Sequencer to commit.
     /// Returns `None` (→ vanilla pool-driven Sync commit) when cross-chain
@@ -3733,7 +3828,7 @@ where
         } else {
             bundle_target
         };
-        // Candidate V1 signs for the pinned slot; elsewhere a past terminal carries no pin.
+        // Blob settlement signs for the pinned slot; elsewhere a past terminal carries no pin.
         let historical_target = if ctx.blob_posting.is_some() {
             bundle_target
         } else {
@@ -4510,7 +4605,7 @@ where
             )
             .into());
         }
-        // Candidate V1 carries the stream in blobs sized for the target's fork.
+        // Blob settlement carries the stream in blobs sized for the target's fork.
         let physical_blobs = if let Some(config) = &ctx.blob_posting {
             let BundleTarget::Exact { timestamp, .. } = bundle_target else {
                 return Err("candidate V1 needs an exact L1 target".into());

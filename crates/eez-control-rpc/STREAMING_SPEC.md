@@ -1,7 +1,7 @@
 # Composer-to-prover streaming RPC
 
-The Rollup0 runtime implements this contract for its current calldata-only,
-timeless settlement profile. The existing [window RPC specification](SPEC.md)
+The Rollup0 runtime implements this contract for its calldata and blob
+settlement profiles. The existing [window RPC specification](SPEC.md)
 and endpoint remain available for compatibility.
 [prove_stream.proto](proto/prove_stream.proto) is the canonical schema.
 

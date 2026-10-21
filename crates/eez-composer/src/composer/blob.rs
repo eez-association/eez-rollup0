@@ -3,6 +3,38 @@
 use alloy_primitives::{B256, Bytes};
 use eez_l1::BundleTarget;
 
+pub(super) fn ordinary_interval_budget(k: u64, blobs: usize) -> Result<usize, String> {
+    let capacity = eez_payload_codec::logical_blob_capacity(blobs);
+    let k = usize::try_from(k)
+        .ok()
+        .filter(|k| *k != 0 && *k <= capacity)
+        .ok_or("blob allowance cannot carry an empty Sync interval")?;
+    let mut sizer = eez_payload_codec::AnchorOnlyBlobSizer::default();
+    let mut block = eez_payload_codec::SpanBlock {
+        extra_data: vec![0; eez_payload_codec::MAX_EXTRA_DATA],
+        ..Default::default()
+    };
+    let mut overhead = 0;
+    for index in 0..k {
+        // Alternating maximum-size metadata prevents run-length compression.
+        block.beneficiary[0] = (index % 2) as u8;
+        block.extra_data[0] = (index % 2) as u8;
+        overhead = sizer.push(&block).map_err(|error| error.to_string())?;
+        if overhead > capacity {
+            return Err("blob allowance cannot carry an empty Sync interval".into());
+        }
+    }
+    // Each block's transaction count and the operations length may grow to a u32 varint.
+    let growth = k
+        .checked_add(1)
+        .and_then(|fields| fields.checked_mul((u32::BITS as usize).div_ceil(7) - 1))
+        .ok_or("sequencing size overflow")?;
+    capacity
+        .checked_sub(overhead)
+        .and_then(|bytes| bytes.checked_sub(growth))
+        .ok_or_else(|| "blob allowance cannot carry an empty Sync interval".into())
+}
+
 /// Deployment, fork schedule, slot duration, and fee cap for blob posting.
 #[derive(Clone, Debug)]
 pub struct BlobPostingConfig {
@@ -108,7 +140,7 @@ async fn next_candidate_target(
     })
 }
 
-/// Type-3 carrier of a candidate-V1 post: its sidecar and blob-gas fee cap.
+/// Type-3 carrier of a blob post: its sidecar and blob-gas fee cap.
 pub(super) struct BlobCarrier {
     pub(super) sidecar: eez_blob::PreparedBlobSidecar,
     pub(super) max_fee_per_blob_gas: u128,
@@ -203,6 +235,42 @@ mod tests {
     use alloy_transport::mock::Asserter;
 
     use super::*;
+
+    #[test]
+    fn interval_budget_reserves_all_blocks_and_envelope() {
+        for k in [2, 5, 6, 128] {
+            for blobs in [1, 2, 6] {
+                let budget = ordinary_interval_budget(k, blobs).unwrap();
+                let mut blocks = (0..k)
+                    .map(|index| eez_payload_codec::SpanBlock {
+                        beneficiary: [index as u8; 20],
+                        extra_data: vec![index as u8; 32],
+                        transactions: Vec::new(),
+                    })
+                    .collect::<Vec<_>>();
+                blocks[0].transactions.push(vec![0xaa; budget - 5]);
+                assert!(
+                    eez_payload_codec::encode_blob_container(1, &blocks, &[])
+                        .unwrap()
+                        .len()
+                        <= blobs
+                );
+                blocks[0].transactions.clear();
+                for index in 0..budget / 6 {
+                    blocks[index % k as usize].transactions.push(vec![0xaa]);
+                }
+                assert!(
+                    eez_payload_codec::encode_blob_container(1, &blocks, &[])
+                        .unwrap()
+                        .len()
+                        <= blobs
+                );
+            }
+        }
+        assert!(ordinary_interval_budget(6, 0).is_err());
+        assert!(ordinary_interval_budget(0, 2).is_err());
+        assert!(ordinary_interval_budget(u64::MAX, 2).is_err());
+    }
 
     fn config() -> BlobPostingConfig {
         BlobPostingConfig {
