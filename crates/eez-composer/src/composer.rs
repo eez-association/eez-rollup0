@@ -1233,13 +1233,11 @@ where
         our_address: alloy_primitives::Address,
     ) {
         match event {
-            Ok(L1Event::BatchPosted {
-                l1_block_number,
-                tx_hash,
-                submitter,
-                ..
-            }) => {
-                let is_ours = *submitter == our_address;
+            Ok(L1Event::BatchPosted { post, .. }) => {
+                let l1_block_number = post.id.l1_block;
+                let tx_hash = post.tx_hash;
+                let submitter = post.sender;
+                let is_ours = submitter == our_address;
                 if is_ours {
                     event!(
                         name: "eez.composer.batch.confirmed",
@@ -1249,9 +1247,9 @@ where
                         "our batch landed on L1",
                     );
                 } else {
-                    // Log level by whether any rollup expects external
-                    // batches. Per-rollup attribution can refine once the
-                    // BatchPosted event carries rollup_id.
+                    // Only posts listing our rollup arrive here, so this one is
+                    // a peer's. Log level by whether any rollup expects external
+                    // batches.
                     let any_expects_external = self
                         .rollups
                         .values()
@@ -1800,7 +1798,7 @@ where
         rollup: &RollupState<L2>,
         txs: &[HeldTx],
     ) -> Option<HashMap<(Address, Direction), u64>> {
-        let l1_block = rollup.l1_head.last_indexed()?.l1_block_hash;
+        let l1_block = rollup.l1_head.last_indexed()?.post.l1_block_hash;
         let head = self.inner.committer.last_header().hash();
         let mut nonces = match rollup.l2_provider.state_by_block_hash(head) {
             Ok(state) => outbound_source_nonces_for_drain(state.as_ref(), rollup_id, txs),
@@ -2246,7 +2244,7 @@ where
         // ── PHASE 1 — OUTBOUND (L2→L1) ───────────────────────────────
         // Source-sim runs on a fork of the Sync block against the L2 ENTRY
         // client (the L2 follower errors `Unavailable`); the L1 side executes
-        // real `_processNCalls` frames on a fork of the state. On accept the
+        // real `_processL2ToL1Calls` frames on a fork of the state. On accept the
         // canonical `[load, user]` pair extends the block and the L1 frames
         // commit to the state.
         let mut out_iter = outbounds.into_iter();

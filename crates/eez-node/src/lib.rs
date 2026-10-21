@@ -286,6 +286,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             eez_l2: l2_chain_id,
         },
     );
+    let front_composer_info = Arc::new(serde_json::to_value(&composer_info)?);
     let handle = builder
         .node(EezNode)
         .extend_rpc_modules(move |ctx| {
@@ -677,6 +678,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         };
         let tx_gas_limit_cap: ingress::TxGasLimitCapResolver =
             Arc::new(move || cap_source.current_declared_tx_gas_limit_cap());
+        let front_info = Arc::clone(&front_composer_info);
         task_executor.spawn_critical_task(spec.task, async move {
             ingress::run_cross_chain_front(
                 port,
@@ -687,6 +689,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 spec.expected_source_chain_id,
                 tx_gas_limit_cap,
                 ready,
+                front_info,
             )
             .await
             .unwrap_or_else(|e| panic!("configured cross-chain front exited: {e:#}"));
@@ -723,12 +726,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                     "boot-time deriver catch_up gave up after {transport_failures} L1 transport failures: {err}"
                 ));
             }
-            Err(err)
-                if matches!(
-                    &err,
-                    DeriverError::L1Scan(L1Error::SourceIncomplete { .. } | L1Error::Provider(_))
-                ) =>
-            {
+            Err(err) if matches!(&err, DeriverError::L1Scan(l1) if l1.is_retryable()) => {
                 catch_up_attempts += 1;
                 event!(
                     name: "eez.node.deriver.boot_catch_up.source_incomplete",
