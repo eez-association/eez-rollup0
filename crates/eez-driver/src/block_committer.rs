@@ -1,7 +1,7 @@
 //! Single-task actor that serializes every engine-API call to reth.
 //!
 //! Owns the `ConsensusEngineHandle`, the `PayloadBuilderHandle`,
-//! `last_header`, and the unsafe / safe / finalized hash cursors.
+//! the `last_header` watch, and the unsafe / safe / finalized hash cursors.
 //! [`BlockCommitterHandle`] is a clone-cheap `mpsc::Sender` wrapper —
 //! both the Sequencer and the Deriver hold clones, so all engine
 //! traffic stays strictly ordered.
@@ -17,7 +17,7 @@
 //! (reth's persisted safe/finalized, or genesis on a fresh chain).
 
 use core::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ForkchoiceState, ForkchoiceUpdateError, ForkchoiceUpdated};
@@ -27,7 +27,7 @@ use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{BuiltPayload, ExecutionPayload, PayloadKind, PayloadTypes};
 use reth_primitives_traits::{HeaderTy, NodePrimitives, SealedHeader, SealedHeaderFor};
 use reth_storage_api::{BlockIdReader, BlockReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{Level, event};
 
 use crate::error::{DriverError, DriverResult};
@@ -110,13 +110,13 @@ pub struct DeriveOutcome {
 }
 
 /// Clone-cheap handle to the spawned block-committer actor. Carries
-/// an `Arc<RwLock<SealedHeader>>` head mirror the actor writes on every
-/// Sequence/Derive — fixes the `invalid payload attributes` race
+/// a `watch` head mirror the actor writes on every head change
+/// ([`Self::subscribe_head`] observes each one) — fixes the `invalid payload attributes` race
 /// (Sequencer reads the post-Derive head without `CanonStateNotification`
 /// lag).
 pub struct BlockCommitterHandle<T: PayloadTypes> {
     sender: mpsc::Sender<CommitCommand<T>>,
-    last_header: Arc<RwLock<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>>>,
+    last_header: watch::Receiver<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>>,
     /// Held by Deriver across a whole batch reconcile; blocks
     /// `commit_sequenced` so sequencer ticks can't interleave
     reconcile_lock: Arc<tokio::sync::Mutex<()>>,
@@ -126,7 +126,7 @@ impl<T: PayloadTypes> Clone for BlockCommitterHandle<T> {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
-            last_header: Arc::clone(&self.last_header),
+            last_header: self.last_header.clone(),
             reconcile_lock: Arc::clone(&self.reconcile_lock),
         }
     }
@@ -160,12 +160,12 @@ where
     ) -> Self {
         let (sender, receiver) = mpsc::channel(COMMAND_BUFFER);
         let initial_hash = initial_header.hash();
-        let last_header = Arc::new(RwLock::new(initial_header));
+        let (head_tx, last_header) = watch::channel(initial_header);
         let actor = Actor {
             receiver,
             to_engine,
             payload_builder,
-            last_header: Arc::clone(&last_header),
+            head_tx,
             unsafe_head_hash: initial_hash,
             safe_header,
             finalized_hash,
@@ -250,15 +250,21 @@ where
     /// Clone of the actor's current canonical head mirror. Reflects the
     /// most recent successful Sequence or Derive — no broadcast lag.
     ///
-    /// # Panics
-    ///
-    /// If the mirror's `RwLock` is poisoned.
     #[must_use]
     pub fn last_header(&self) -> SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>
     where
         SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>: Clone,
     {
-        self.last_header.read().unwrap().clone()
+        self.last_header.borrow().clone()
+    }
+
+    /// Receiver whose current value is the head now; `changed()` fires on
+    /// every later head write. Keeps only the latest, so it never blocks the actor.
+    #[must_use]
+    pub fn subscribe_head(
+        &self,
+    ) -> watch::Receiver<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>> {
+        self.last_header.clone()
     }
 
     /// Builds a payload with the given attributes if the actor's head
@@ -275,12 +281,6 @@ where
     /// - [`DriverError::StaleParent`] on snapshot mismatch.
     /// - Engine-API failures or `committer_closed`.
     ///
-    /// # Panics
-    ///
-    /// If the `last_header` lock is poisoned (a prior holder panicked
-    /// while writing). The `BlockCommitter` actor is the only writer; a
-    /// poisoned lock means the actor itself has died and the node
-    /// should shut down anyway.
     pub async fn commit_sequenced(
         &self,
         parent_hash: B256,
@@ -295,7 +295,7 @@ where
         // for issued id".
         {
             let _guard = self.reconcile_lock.lock().await;
-            let current_head = self.last_header.read().unwrap().hash();
+            let current_head = self.last_header.borrow().hash();
             if current_head != parent_hash {
                 return Err(DriverError::StaleParent {
                     expected: parent_hash,
@@ -465,14 +465,14 @@ struct Actor<T: PayloadTypes> {
     receiver: mpsc::Receiver<CommitCommand<T>>,
     to_engine: ConsensusEngineHandle<T>,
     payload_builder: PayloadBuilderHandle<T>,
-    /// Shared with the `BlockCommitterHandle`. The actor is the sole writer;
-    /// Updated synchronously inside `process_sequence` and `process_derive`
-    last_header: Arc<RwLock<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>>>,
+    /// Head mirror read by the handles. The actor is the sole writer, only via
+    /// [`Self::set_head`].
+    head_tx: watch::Sender<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>>,
     /// Last head accepted by forkchoice. May point at a syncing unsafe head
     /// before reth has imported the canonical header.
     unsafe_head_hash: B256,
     /// Current safe anchor. The full header (not just the hash) so a
-    /// head demotion can rewrite `last_header` to a valid parent.
+    /// head demotion can rewrite the head mirror to a valid parent.
     safe_header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
     finalized_hash: B256,
     /// Prover-feed trigger (prover-chain P1): after a PRODUCED block
@@ -580,9 +580,14 @@ where
         // BatchPosted via `process_advance_safe_finalized`, and a stale
         // `unsafe_head_hash` would re-canonicalize the orphan we just
         // reorged away — silently undoing this recovery.
-        self.unsafe_head_hash = target_hash;
-        *self.last_header.write().unwrap() = target_header;
+        self.set_head(target_header);
         Ok(())
+    }
+
+    /// The only head write: keeps `unsafe_head_hash` in lockstep and publishes.
+    fn set_head(&mut self, header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>) {
+        self.unsafe_head_hash = header.hash();
+        self.head_tx.send_replace(header);
     }
 
     fn forkchoice_state(&self) -> ForkchoiceState {
@@ -595,13 +600,10 @@ where
 
     /// Sends `state` via FCU; on an inconsistent-forkchoice rejection where
     /// the unsafe head (≠ safe) is the suspect, demote it to the safe anchor
-    /// and retry once, rewriting both `unsafe_head_hash` and `last_header` so
+    /// and retry once, rewriting both `unsafe_head_hash` and the head mirror so
     /// later ticks don't re-send the same bad triplet. `safe_header`'s hash
     /// must equal `state.safe_block_hash`.
     ///
-    /// # Panics
-    ///
-    /// If the `last_header` lock is poisoned.
     async fn forkchoice_or_demote_head(
         &mut self,
         mut state: ForkchoiceState,
@@ -620,8 +622,7 @@ where
                     "engine rejected forkchoice as inconsistent; demoting unsafe head to the safe anchor",
                 );
                 debug_assert_eq!(safe_header.hash(), state.safe_block_hash);
-                self.unsafe_head_hash = state.safe_block_hash;
-                *self.last_header.write().unwrap() = safe_header.clone();
+                self.set_head(safe_header.clone());
                 state.head_block_hash = state.safe_block_hash;
                 self.to_engine
                     .fork_choice_updated(state, None)
@@ -673,14 +674,10 @@ where
             Err(err) => return Err(DriverError::EngineRpc(err.to_string())),
         };
         let outcome = classify_advance_head_response(&res)?;
-        if matches!(
-            outcome,
-            ForkchoiceOutcome::Valid | ForkchoiceOutcome::Syncing
-        ) {
-            self.unsafe_head_hash = header.hash();
-        }
         if outcome == ForkchoiceOutcome::Valid {
-            *self.last_header.write().unwrap() = header;
+            self.set_head(header);
+        } else if outcome == ForkchoiceOutcome::Syncing {
+            self.unsafe_head_hash = header.hash();
         }
         Ok(outcome)
     }
@@ -716,9 +713,7 @@ where
         if !fcu.is_valid() {
             return Err(DriverError::InvalidForkchoice(format!("{fcu:?}")));
         }
-        // Mirror the new head into the shared `RwLock`.
-        self.unsafe_head_hash = block_hash;
-        *self.last_header.write().unwrap() = header;
+        self.set_head(header);
 
         // Prover-feed (prover-chain P1): a PRODUCED Sync/settling block reaches
         // canonicalization via this path (commit_one_prebuilt → commit_derived),
@@ -741,7 +736,7 @@ where
         &mut self,
         attrs: EthPayloadAttributes,
     ) -> DriverResult<CommitOutcome<T>> {
-        let head_block_hash = self.last_header.read().unwrap().hash();
+        let head_block_hash = self.head_tx.borrow().hash();
         let state = ForkchoiceState {
             head_block_hash,
             safe_block_hash: self.safe_header.hash(),
@@ -792,8 +787,7 @@ where
             return Err(DriverError::InvalidForkchoice(format!("{fcu:?}")));
         }
 
-        self.unsafe_head_hash = header.hash();
-        *self.last_header.write().unwrap() = header.clone();
+        self.set_head(header.clone());
         // Prover-feed trigger (prover-chain P1): the block is now canonical, so
         // the witness task's `recovered_block(hash)` resolves on the first try.
         self.feed_witness(header.hash());
@@ -808,5 +802,72 @@ fn classify_advance_head_response(res: &ForkchoiceUpdated) -> DriverResult<Forkc
         Ok(ForkchoiceOutcome::Syncing)
     } else {
         Err(DriverError::InvalidForkchoice(format!("{res:?}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::Header;
+    use reth_engine_primitives::BeaconEngineMessage;
+    use reth_ethereum_engine_primitives::EthEngineTypes;
+    use reth_ethereum_primitives::BlockBody;
+    use reth_primitives_traits::SealedBlock;
+
+    fn sealed(number: u64) -> SealedHeader {
+        SealedHeader::seal_slow(Header {
+            number,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn head_subscribers_see_every_head_write() {
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(msg) = engine_rx.recv().await {
+                match msg {
+                    BeaconEngineMessage::ForkchoiceUpdated { tx, .. } => {
+                        let _ = tx.send(Ok(reth_engine_primitives::OnForkChoiceUpdated::valid(
+                            alloy_rpc_types_engine::PayloadStatus::from_status(
+                                alloy_rpc_types_engine::PayloadStatusEnum::Valid,
+                            ),
+                        )));
+                    }
+                    BeaconEngineMessage::NewPayload { tx, .. } => {
+                        let _ = tx.send(Ok(alloy_rpc_types_engine::PayloadStatus::from_status(
+                            alloy_rpc_types_engine::PayloadStatusEnum::Valid,
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let (h0, h1, h2) = (sealed(0), sealed(1), sealed(2));
+        let handle = BlockCommitterHandle::<EthEngineTypes>::spawn(
+            h0.clone(),
+            h0,
+            B256::ZERO,
+            ConsensusEngineHandle::new(engine_tx),
+            PayloadBuilderHandle::new(mpsc::unbounded_channel().0),
+            None,
+        );
+        let mut rx = handle.subscribe_head();
+
+        handle.reorg_to(h1.clone()).await.unwrap();
+        rx.changed().await.unwrap();
+        assert_eq!(rx.borrow_and_update().hash(), h1.hash());
+
+        let block: SealedBlock<reth_ethereum_primitives::Block> =
+            SealedBlock::from_sealed_parts(h2.clone(), BlockBody::default());
+        let payload = <EthEngineTypes as PayloadTypes>::block_to_payload(block, None);
+        handle
+            .commit_derived(payload, h2.clone(), false)
+            .await
+            .unwrap();
+        rx.changed().await.unwrap();
+        assert_eq!(rx.borrow_and_update().hash(), h2.hash());
+        assert_eq!(handle.last_header().hash(), h2.hash());
     }
 }
