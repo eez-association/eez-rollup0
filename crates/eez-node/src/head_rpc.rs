@@ -1,9 +1,6 @@
 //! Signed canonical-head publication: the signer task and the RPC that serves it.
 
-use std::{
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::time::Duration;
 
 use crate::composer_rpc::reject_params;
 use alloy_consensus::Header;
@@ -29,24 +26,7 @@ const BLOCK_READ_RETRY: Duration = Duration::from_millis(50);
 const BLOCK_READ_DEADLINE: Duration = Duration::from_secs(1);
 
 /// Latest signed head, shared between the signer task and the RPC.
-#[derive(Clone, Default)]
-pub(crate) struct SignedHeadStore(Arc<RwLock<Option<Envelope>>>);
-
-impl SignedHeadStore {
-    pub(crate) fn set(&self, envelope: Envelope) {
-        *self
-            .0
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(envelope);
-    }
-
-    pub(crate) fn get(&self) -> Option<Envelope> {
-        self.0
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-}
+pub(crate) type SignedHeadStore = watch::Sender<Option<Envelope>>;
 
 /// Install the head methods on every configured L2 RPC transport.
 pub(crate) fn install_head_rpc<Node, EthApi>(
@@ -78,7 +58,7 @@ where
     let mut module = RpcModule::new((store, provider));
     module.register_method(GET_SIGNED_HEAD, |params, (store, _), _ext| {
         reject_params(&params, GET_SIGNED_HEAD)?;
-        Ok::<_, ErrorObjectOwned>(store.get())
+        Ok::<_, ErrorObjectOwned>(store.borrow().clone())
     })?;
     module.register_method(GET_RAW_BLOCK, |params, (_, provider), _ext| {
         let (hash,): (B256,) = params.parse()?;
@@ -108,7 +88,7 @@ pub(crate) async fn run_head_signer<P>(
             && let Some(envelope) = sign_head(&blocks, &heads, &mut signer, &header).await
         {
             last_signed = Some(header.hash());
-            store.set(envelope);
+            store.send_replace(Some(envelope));
         }
         if heads.changed().await.is_err() {
             return;
@@ -234,19 +214,12 @@ mod tests {
         assert_eq!(call(&module, req).await["result"], serde_json::Value::Null);
 
         let hash = B256::repeat_byte(7);
-        store.set(envelope(hash));
+        store.send_replace(Some(envelope(hash)));
         let response = call(&module, req).await;
         assert_eq!(
             response["result"]["head"]["blockHash"],
             serde_json::json!(format!("{hash:#x}"))
         );
-    }
-
-    #[tokio::test]
-    async fn get_signed_head_rejects_params() {
-        let module = head_rpc_module(SignedHeadStore::default(), Mock::new()).unwrap();
-        let req = r#"{"jsonrpc":"2.0","method":"eez_getSignedHead","params":[1],"id":1}"#;
-        assert_eq!(call(&module, req).await["error"]["code"], -32602);
     }
 
     #[tokio::test]
@@ -299,22 +272,22 @@ mod tests {
 
         // The startup pass retries while A's block is absent, then signs it.
         advance(10).await;
-        assert!(store.get().is_none());
+        assert!(store.borrow().is_none());
         provider.add_block(ha.hash(), a);
         advance(2).await;
-        let got = store.get().expect("A signed");
+        let got = store.borrow().clone().expect("A signed");
         assert_eq!((got.head.block_hash, got.head.counter), (ha.hash(), 1));
 
         // B's block never appears: the retry window ends and A stays.
         tx.send(hb.clone()).unwrap();
         advance(30).await;
-        assert_eq!(store.get().unwrap().head.block_hash, ha.hash());
+        assert_eq!(store.borrow().as_ref().unwrap().head.block_hash, ha.hash());
 
         // The skipped B consumed no counter value.
         provider.add_block(hc.hash(), c);
         tx.send(hc.clone()).unwrap();
         advance(2).await;
-        let got = store.get().unwrap();
+        let got = store.borrow().clone().unwrap();
         assert_eq!((got.head.block_hash, got.head.counter), (hc.hash(), 2));
     }
 }

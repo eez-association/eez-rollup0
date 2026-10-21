@@ -138,19 +138,13 @@ mod tests {
     fn sign_then_verify_round_trips() {
         let mut s = signer();
         let (header, rlp) = block(7);
-        let env = s.sign(&header, rlp).unwrap();
+        let env = s.sign(&header, rlp.clone()).unwrap();
+        assert_eq!(env.head.counter, 1);
         let claim = env.head.clone();
         let v = env.verify(&domain(), s.address()).unwrap();
         assert_eq!(v.claim, claim);
         assert_eq!(v.signer, s.address());
         assert_eq!(v.block.unwrap().hash(), header.hash());
-    }
-
-    #[test]
-    fn first_envelope_has_counter_one_and_counts_up() {
-        let mut s = signer();
-        let (header, rlp) = block(7);
-        assert_eq!(s.sign(&header, rlp.clone()).unwrap().head.counter, 1);
         assert_eq!(s.sign(&header, rlp).unwrap().head.counter, 2);
     }
 

@@ -799,10 +799,6 @@ mod tests {
         Bytes::from(alloy_rlp::encode(block.clone_block()))
     }
 
-    fn hashes(blocks: &[SealedBlock<Block>]) -> Vec<B256> {
-        blocks.iter().map(SealedBlock::hash).collect()
-    }
-
     #[tokio::test]
     async fn fetch_stops_at_first_local_block() {
         let b0 = block(0, B256::ZERO, 0);
@@ -815,7 +811,8 @@ mod tests {
         let missing = fetch_missing(&local, &remote, &b2).await.unwrap();
 
         assert_eq!(missing.fork_point.hash(), b0.hash());
-        assert_eq!(hashes(&missing.blocks), vec![b1.hash(), b2.hash()]);
+        let hashes: Vec<_> = missing.blocks.iter().map(SealedBlock::hash).collect();
+        assert_eq!(hashes, vec![b1.hash(), b2.hash()]);
     }
 
     #[tokio::test]

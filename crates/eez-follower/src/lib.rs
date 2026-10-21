@@ -324,17 +324,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rpc_without_address_is_rejected() {
+    fn rpc_and_address_must_be_set_together() {
         let rpc = url::Url::parse("http://127.0.0.1:8545").unwrap();
         let err = signed_head_source(Some(rpc), None).unwrap_err();
         assert_eq!(
             err.to_string(),
             "EEZ_SEQUENCER_RPC requires EEZ_SEQUENCER_ADDRESS"
         );
-    }
-
-    #[test]
-    fn address_without_rpc_is_rejected() {
         let err = signed_head_source(None, Some(Address::repeat_byte(1))).unwrap_err();
         assert_eq!(
             err.to_string(),

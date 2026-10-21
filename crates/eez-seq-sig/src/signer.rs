@@ -24,12 +24,6 @@ impl std::fmt::Debug for HeadSigner {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum SignError {
-    #[error("signing failed: {0}")]
-    Signer(String),
-}
-
 impl HeadSigner {
     pub fn new(key: PrivateKeySigner, domain: HeadDomain, epoch_ms: u64) -> Self {
         Self {
@@ -49,7 +43,7 @@ impl HeadSigner {
         &mut self,
         header: &SealedHeader<Header>,
         block_rlp: Bytes,
-    ) -> Result<Envelope, SignError> {
+    ) -> Result<Envelope, alloy_signer::Error> {
         self.counter += 1;
         let head = HeadClaim {
             rollup_id: self.domain.rollup_id,
@@ -59,10 +53,7 @@ impl HeadSigner {
             epoch_ms: self.epoch_ms,
             counter: self.counter,
         };
-        let sig = self
-            .key
-            .sign_hash_sync(&head.signing_hash(&self.domain))
-            .map_err(|e| SignError::Signer(e.to_string()))?;
+        let sig = self.key.sign_hash_sync(&head.signing_hash(&self.domain))?;
         Ok(Envelope {
             head,
             signature: Bytes::from(sig.as_bytes().to_vec()),

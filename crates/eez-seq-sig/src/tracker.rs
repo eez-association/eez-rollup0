@@ -57,7 +57,7 @@ impl HeadTracker {
             let oldest = *self
                 .latest
                 .keys()
-                .min_by_key(|s| s.epoch_ms)
+                .min_by_key(|s| (s.epoch_ms, s.signer))
                 .expect("non-empty");
             self.latest.remove(&oldest);
             if oldest == source {
