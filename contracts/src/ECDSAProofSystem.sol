@@ -42,7 +42,11 @@ contract ECDSAProofSystem is IProofSystem {
     /// @dev Recovers against `publicInputsHash` (the batch binding). Returns
     ///      false on malformed proofs (wrong length, bad signature) without
     ///      reverting, so the EEZ quorum surfaces `InvalidProof` uniformly.
-    function verify(bytes calldata proof, bytes32 publicInputsHash) external view returns (bool valid) {
+    function verify(bytes calldata proof, bytes32 publicInputsHash)
+        external
+        view
+        returns (bool valid)
+    {
         if (proof.length != 65) return false;
 
         bytes32 r;

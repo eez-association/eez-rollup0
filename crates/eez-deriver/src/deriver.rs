@@ -987,7 +987,7 @@ where
 
     /// Post-failure recovery via [`Self::catch_up`]. Returns `false` only
     /// when the committer is gone and the loop must exit; a failed resync is
-    /// logged and retried at the next L1 event or idle retry.
+    /// logged and retried at the next L1 event.
     async fn try_recover(&self, recovery_pending: &mut bool) -> bool {
         *recovery_pending = true;
         match self.catch_up().await {
@@ -1018,7 +1018,7 @@ where
                     Level::ERROR,
                     event_name = "eez.deriver.resync.failed",
                     error = %err,
-                    "resync failed; will retry after the next L1 event or idle delay",
+                    "resync failed; will retry after the next L1 event",
                 );
                 true
             }
