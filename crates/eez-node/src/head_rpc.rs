@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use crate::composer_rpc::reject_params;
 use alloy_consensus::Header;
 use alloy_primitives::{B256, Bytes};
 use eez_seq_sig::{Envelope, HeadSigner};
@@ -23,7 +24,7 @@ use tracing::{Level, event};
 pub(crate) const GET_SIGNED_HEAD: &str = "eez_getSignedHead";
 pub(crate) const GET_RAW_BLOCK: &str = "eez_getRawBlock";
 
-/// A head becomes visible on the watch before its block is always readable.
+/// A head can reach the watch before its block is readable.
 const BLOCK_READ_RETRY: Duration = Duration::from_millis(50);
 const BLOCK_READ_DEADLINE: Duration = Duration::from_secs(1);
 
@@ -54,7 +55,7 @@ pub(crate) fn install_head_rpc<Node, EthApi>(
 ) -> eyre::Result<()>
 where
     Node: FullNodeComponents,
-    Node::Provider: BlockReader<Block = eez_primitives::Block> + Clone,
+    Node::Provider: BlockReader<Block = eez_primitives::Block>,
     EthApi: FullEthApiServer + Clone + Send + Sync + 'static,
 {
     let module = head_rpc_module(store, ctx.provider().clone())?;
@@ -72,23 +73,11 @@ fn head_rpc_module<P>(
     provider: P,
 ) -> eyre::Result<RpcModule<(SignedHeadStore, P)>>
 where
-    P: BlockReader<Block = eez_primitives::Block> + Clone + Send + Sync + 'static,
+    P: BlockReader<Block = eez_primitives::Block> + Send + Sync + 'static,
 {
     let mut module = RpcModule::new((store, provider));
     module.register_method(GET_SIGNED_HEAD, |params, (store, _), _ext| {
-        // Reject arguments instead of silently ignoring a client mistake.
-        if let Some(raw) = params.as_str() {
-            let value: serde_json::Value = params.parse()?;
-            let empty = matches!(&value, serde_json::Value::Array(v) if v.is_empty())
-                || matches!(&value, serde_json::Value::Object(v) if v.is_empty());
-            if !empty {
-                return Err(ErrorObject::owned(
-                    -32602,
-                    "eez_getSignedHead takes no parameters",
-                    Some(raw),
-                ));
-            }
-        }
+        reject_params(&params, GET_SIGNED_HEAD)?;
         Ok::<_, ErrorObjectOwned>(store.get())
     })?;
     module.register_method(GET_RAW_BLOCK, |params, (_, provider), _ext| {
@@ -116,7 +105,7 @@ pub(crate) async fn run_head_signer<P>(
         // The boot head is already marked seen, so it is signed here rather than on a change.
         let header = heads.borrow_and_update().clone();
         if last_signed != Some(header.hash())
-            && let Some(envelope) = sign_head(&blocks, &mut signer, &header).await
+            && let Some(envelope) = sign_head(&blocks, &heads, &mut signer, &header).await
         {
             last_signed = Some(header.hash());
             store.set(envelope);
@@ -129,6 +118,7 @@ pub(crate) async fn run_head_signer<P>(
 
 async fn sign_head<P>(
     blocks: &P,
+    heads: &watch::Receiver<SealedHeader<Header>>,
     signer: &mut HeadSigner,
     header: &SealedHeader<Header>,
 ) -> Option<Envelope>
@@ -139,6 +129,17 @@ where
     let block = loop {
         match blocks.block_by_hash(header.hash()) {
             Ok(Some(block)) => break block,
+            // A replaced head is never readable (canonical-only lookup), so stop waiting.
+            Ok(None) if heads.has_changed().unwrap_or(true) => {
+                event!(
+                    name: "eez.node.head_signer.superseded",
+                    Level::INFO,
+                    number = header.number,
+                    hash = %header.hash(),
+                    "head replaced before its block was readable; skipping it",
+                );
+                return None;
+            }
             Ok(None) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(BLOCK_READ_RETRY).await;
             }
@@ -278,9 +279,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn signer_skips_unreadable_head() {
         let provider = Mock::new();
-        let a = block(1);
-        let b = block(2);
-        let (ha, hb) = (sealed(&a), sealed(&b));
+        let (a, b, c) = (block(1), block(2), block(3));
+        let (ha, hb, hc) = (sealed(&a), sealed(&b), sealed(&c));
         let (tx, rx) = watch::channel(ha.clone());
         let store = SignedHeadStore::default();
         let domain = HeadDomain {
@@ -289,23 +289,32 @@ mod tests {
             rollup_id: 1,
         };
         let signer = HeadSigner::new(PrivateKeySigner::random(), domain, 1);
-        let task = tokio::spawn(run_head_signer(rx, provider.clone(), signer, store.clone()));
-
-        // A's block is absent: the startup pass exhausts its retry window.
+        tokio::spawn(run_head_signer(rx, provider.clone(), signer, store.clone()));
         // Step in retry-sized slices so the task runs between timer wake-ups.
-        for _ in 0..30 {
-            tokio::time::advance(BLOCK_READ_RETRY).await;
-        }
-        assert!(store.get().is_none());
+        let advance = |steps: u32| async move {
+            for _ in 0..steps {
+                tokio::time::advance(BLOCK_READ_RETRY).await;
+            }
+        };
 
-        provider.add_block(hb.hash(), b);
+        // The startup pass retries while A's block is absent, then signs it.
+        advance(10).await;
+        assert!(store.get().is_none());
+        provider.add_block(ha.hash(), a);
+        advance(2).await;
+        let got = store.get().expect("A signed");
+        assert_eq!((got.head.block_hash, got.head.counter), (ha.hash(), 1));
+
+        // B's block never appears: the retry window ends and A stays.
         tx.send(hb.clone()).unwrap();
-        for _ in 0..4 {
-            tokio::time::advance(BLOCK_READ_RETRY).await;
-        }
-        let got = store.get().expect("B signed");
-        assert_eq!(got.head.block_hash, hb.hash());
-        assert_eq!(got.head.counter, 1);
-        assert!(!task.is_finished());
+        advance(30).await;
+        assert_eq!(store.get().unwrap().head.block_hash, ha.hash());
+
+        // The skipped B consumed no counter value.
+        provider.add_block(hc.hash(), c);
+        tx.send(hc.clone()).unwrap();
+        advance(2).await;
+        let got = store.get().unwrap();
+        assert_eq!((got.head.block_hash, got.head.counter), (hc.hash(), 2));
     }
 }
