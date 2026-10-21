@@ -1004,23 +1004,25 @@ async fn happy_case_follower_sequencer_rpc() {
         .await
         .expect("follower safe block never matched the sequencer chain");
 
+    let from = follower.signal_cursor().unwrap();
     seq.run_tx_spammer(ANVIL_KEY_1);
-    let follower_rpc = follower.l2_rpc_url();
-    // A sequencer block above the follower's safe head came from a signed head,
-    // not L1. Compare at one height: `latest` on both sides races new blocks.
+    // Only the signed-head path records `head.advanced`, after verifying and
+    // importing the head; the sequencer must hold that exact block.
     wait_for(DEFAULT_TIMEOUT, || async {
-        let Some((n, hash)) =
-            block_number_and_hash_at(&follower_rpc, BlockNumberOrTag::Latest).await?
-        else {
-            return Ok(None);
-        };
-        let at_seq = block_number_and_hash_at(&seq_rpc, BlockNumberOrTag::Number(n)).await?;
-        let safe = block_number_and_hash_at(&follower_rpc, BlockNumberOrTag::Safe).await?;
-        let above_safe = safe.is_some_and(|(safe, _)| safe < n);
-        Ok((at_seq == Some((n, hash)) && above_safe).then_some(()))
+        for s in follower.signals_since(from)? {
+            if s.name != signals::FOLLOWER_HEAD_ADVANCED {
+                continue;
+            }
+            let n = s.u64("block.number")?;
+            let at_seq = block_number_and_hash_at(&seq_rpc, BlockNumberOrTag::Number(n)).await?;
+            if at_seq == Some((n, s.b256("block.hash")?)) {
+                return Ok(Some(()));
+            }
+        }
+        Ok(None)
     })
     .await
-    .expect("follower never held a sequencer block above its safe head");
+    .expect("follower never adopted a signed sequencer head");
 
     follower.assert_no_process_death();
     seq.assert_no_process_death();

@@ -3560,7 +3560,8 @@ pub struct CrossChainWorld {
     /// Present only in signer-mutation tests.
     pub prover_proxy: Option<ProverProxyHandle>,
     pub proof_signer: ProofSignerHandle,
-    builder: BundleStub,
+    /// Present only in worlds from [`setup_cross_chain_with_builder_stub`].
+    builder: Option<BundleStub>,
     _witness_dir: tempfile::TempDir,
     _datadir: FailureDatadir,
 }
@@ -3733,7 +3734,13 @@ impl CrossChainWorld {
 
     /// Select how the relay stub treats the composer's next bundles.
     pub async fn set_builder_mode(&self, mode: BuilderStubMode) -> Result<()> {
-        self.builder.set_mode(mode).await
+        self.builder
+            .as_ref()
+            .context(
+                "world has no builder stub; start it with setup_cross_chain_with_builder_stub",
+            )?
+            .set_mode(mode)
+            .await
     }
 }
 
@@ -4404,14 +4411,20 @@ pub async fn run_scenarios(
 
 /// Start the shared cross-chain fixture.
 pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(None, None, &[]).await
+    setup_cross_chain_inner(None, None, &[], false).await
+}
+
+/// Start the fixture with the composer's bundles routed through the relay stub.
+/// The stub forwards only single-transaction bundles, so inbound calls cannot settle here.
+pub async fn setup_cross_chain_with_builder_stub() -> Result<CrossChainWorld> {
+    setup_cross_chain_inner(None, None, &[], true).await
 }
 
 /// Start the fixture with additional node environment variables.
 pub async fn setup_cross_chain_with_env(
     extra_env: &[(&'static str, String)],
 ) -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(None, None, extra_env).await
+    setup_cross_chain_inner(None, None, extra_env, false).await
 }
 
 /// Starts the fixture with a mutation proxy and expected attester override.
@@ -4419,7 +4432,7 @@ pub async fn setup_cross_chain_proxied(
     mutation: ProverMutation,
     attester: Address,
 ) -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(Some(mutation), Some(attester), &[]).await
+    setup_cross_chain_inner(Some(mutation), Some(attester), &[], false).await
 }
 
 pub async fn setup_cross_chain_empty_call() -> Result<CrossChainEmptyCallWorld> {
@@ -4566,6 +4579,7 @@ async fn setup_cross_chain_inner(
     mutation: Option<ProverMutation>,
     attester_override: Option<Address>,
     extra_env: &[(&'static str, String)],
+    builder_stub: bool,
 ) -> Result<CrossChainWorld> {
     let mut cfg = CrossChainConfig::new()?;
     let signer_attester = signer_address(cfg.attester_key)?;
@@ -4589,7 +4603,11 @@ async fn setup_cross_chain_inner(
     let attester = attester_override.unwrap_or(signer_attester);
     let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
     let mut datadir = FailureDatadir::new("eez-cross-chain")?;
-    let builder = BundleStub::spawn(PortLease::tcp(), &cfg.l1_rpc_url()).await?;
+    let builder = if builder_stub {
+        Some(BundleStub::spawn(PortLease::tcp(), &cfg.l1_rpc_url()).await?)
+    } else {
+        None
+    };
     let mut env = cfg.env();
     env.extend([
         ("EEZ_PROVER_URL", prover_url.to_string()),
@@ -4598,8 +4616,10 @@ async fn setup_cross_chain_inner(
             "EEZ_WITNESS_DB_PATH",
             witness_dir.path().to_string_lossy().into_owned(),
         ),
-        ("EEZ_L1_BUILDER_RPC_URL", builder.url.clone()),
     ]);
+    if let Some(builder) = &builder {
+        env.push(("EEZ_L1_BUILDER_RPC_URL", builder.url.clone()));
+    }
     // Before the assertion below, so caller-supplied vars are checked too.
     env.extend_from_slice(extra_env);
     assert!(

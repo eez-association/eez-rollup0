@@ -16,12 +16,13 @@ use eez_testkit::{
     block_number_and_hash_at, call_read, call_revert_data, completed_proxy_calls, count_events,
     create_l2_cross_chain_proxy, cross_chain_source_proxy, deploy_nested_setter_inner,
     deploy_nested_setter_outer, events_since, l2_balance, l2_value, last_proxy_result,
-    onchain_nonce, read_state_word, receipt_ok, rollup_commitment, run_scenarios, safe_block_hash,
-    setter_call, setup_cross_chain, setup_cross_chain_codeless, setup_cross_chain_empty_call,
-    setup_cross_chain_nested_setter, setup_cross_chain_outbound_return_data,
-    setup_cross_chain_proxied, setup_cross_chain_return_data, setup_cross_chain_reverting,
-    sign_and_send, signer_address, value_no_ret, value_read, wait_for,
-    wait_for_safe_chain_contains,
+    onchain_nonce, override_env, read_state_word, receipt_ok, rollup_commitment, run_scenarios,
+    safe_block_hash, setter_call, setup_cross_chain, setup_cross_chain_codeless,
+    setup_cross_chain_empty_call, setup_cross_chain_nested_setter,
+    setup_cross_chain_outbound_return_data, setup_cross_chain_proxied,
+    setup_cross_chain_return_data, setup_cross_chain_reverting,
+    setup_cross_chain_with_builder_stub, sign_and_send, signer_address, value_no_ret, value_read,
+    wait_for, wait_for_safe_chain_contains,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -1166,13 +1167,17 @@ async fn follower_replays_settled_inbound_safe_block() {
 /// settles that height.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn follower_adopts_replaced_sync_block() {
-    let w = setup_cross_chain().await.unwrap();
+    let w = setup_cross_chain_with_builder_stub().await.unwrap();
     let l2_rpc = w.l2_rpc();
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(w.cfg.l2_genesis.0.as_path()),
     };
-    let follower_env = w.follower_env(Some(&l2_rpc));
+    let follower_env = override_env(
+        w.follower_env(Some(&l2_rpc)),
+        "RUST_LOG",
+        "warn,eez_follower::unsafe_head=info",
+    );
     let follower = NodeHandle::start("replaced-sync-follower", &follower_cfg, &follower_env)
         .await
         .unwrap();
@@ -1191,6 +1196,7 @@ async fn follower_adopts_replaced_sync_block() {
     .expect("composer did not report a fresh sync-slot drain boundary");
     // Outbound: its rich bundle is the lone postBatch the stub can forward later.
     let sent_from = w.node.signal_cursor().unwrap();
+    let follower_from = follower.signal_cursor().unwrap();
     let nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
     sign_and_send(
         &w.l2_xchain(),
@@ -1236,28 +1242,43 @@ async fn follower_adopts_replaced_sync_block() {
     // Restore before MAX_BUNDLE_ATTEMPTS evicts the outbound call.
     w.set_builder_mode(BuilderStubMode::Forward).await.unwrap();
 
-    // Hashes before safe: a safe head still below `n` was below it at the hash reads.
-    let adopted = wait_for(SETTLE_TIMEOUT, || async {
-        let at_follower =
-            block_number_and_hash_at(&follower_rpc, BlockNumberOrTag::Number(n)).await?;
-        let at_composer = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(n)).await?;
-        let safe = block_number_and_hash_at(&follower_rpc, BlockNumberOrTag::Safe).await?;
-        if let Some((safe, _)) = safe.filter(|(safe, _)| *safe >= n) {
-            return Ok(Some(Err(safe)));
+    let replacement = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(n))
+        .await
+        .unwrap()
+        .expect("composer has a block at the replaced height")
+        .1;
+    assert_ne!(
+        replacement, rich,
+        "the composer must replace the dropped rich block at {n}"
+    );
+
+    // A signed-head import covering `n`, ending at a head the composer holds,
+    // carried the replacement. Records are read before safe, so safe < n held at the import.
+    let outcome = wait_for(SETTLE_TIMEOUT, || async {
+        let mut adopted = false;
+        for s in follower.signals_since(follower_from)? {
+            if s.name != signals::FOLLOWER_HEAD_ADVANCED {
+                continue;
+            }
+            let (m, imported) = (s.u64("block.number")?, s.u64("imported")?);
+            if m < n || m.saturating_sub(imported) >= n {
+                continue;
+            }
+            let at_composer =
+                block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(m)).await?;
+            adopted |= at_composer == Some((m, s.b256("block.hash")?));
         }
-        Ok(at_follower
-            .filter(|_| at_follower == at_composer)
-            .map(|(_, hash)| Ok(hash)))
+        let safe = block_number_and_hash_at(&follower_rpc, BlockNumberOrTag::Safe).await?;
+        Ok(match safe {
+            Some((safe, _)) if safe >= n => Some(Err(safe)),
+            _ => adopted.then_some(Ok(())),
+        })
     })
     .await
-    .expect("follower did not adopt the composer's block at the replaced height")
-    .unwrap_or_else(|safe| {
-        panic!("follower safe reached {safe} before it adopted the replacement at {n}")
-    });
-    assert_ne!(
-        adopted, rich,
-        "the composer's block at {n} must be the replacement, not the dropped rich block",
-    );
+    .expect("follower never adopted the replacement through a signed head");
+    if let Err(safe) = outcome {
+        panic!("follower safe reached {safe} before it adopted the replacement at {n}");
+    }
 
     follower.assert_no_process_death();
     w.node.assert_no_divergence_failure_logs();

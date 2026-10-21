@@ -4,10 +4,9 @@
 Real Flashbots-style relays accept bundles and try to include them in a
 specific L1 block. They don't consume the poster's nonce on miss.
 
-This stub fakes a relay. An upstream with its own `eth_sendBundle` gets
-bundles unchanged. For one without it (anvil), the stub accepts
-single-transaction bundles and forwards the signed tx via
-`eth_sendRawTransaction`. Bundles containing zero or multiple transactions are
+This stub fakes a relay: it accepts single-transaction `eth_sendBundle`
+requests and forwards the signed tx via `eth_sendRawTransaction` to a
+backing anvil. Bundles containing zero or multiple transactions are
 rejected explicitly because forwarding them individually would not preserve
 bundle atomicity. The nonce IS consumed on miss (anvil doesn't replay-
 protect), but the Composer's cursor-race guard + pending-nonce read keeps it
@@ -29,16 +28,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *_):
         pass
-
-    def _proxy(self, body):
-        return urllib.request.urlopen(
-            urllib.request.Request(
-                self.upstream,
-                data=json.dumps(body).encode(),
-                headers={"Content-Type": "application/json"},
-            ),
-            timeout=10,
-        ).read()
 
     def _wait_for_block(self, target):
         if target <= 0:
@@ -65,35 +54,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 pass
             time.sleep(0.1)
-
-    def _emulate_bundle(self, body):
-        params = body["params"][0]
-        txs = params.get("txs", [])
-        if len(txs) != 1:
-            return json.dumps({
-                "jsonrpc": "2.0",
-                "id": body.get("id"),
-                "error": {
-                    "code": -32602,
-                    "message": "builder stub accepts exactly one transaction per bundle",
-                    "data": {"transactionCount": len(txs)},
-                },
-            }).encode()
-        raw = txs[0]
-        target_hex = params.get("blockNumber", "0x0")
-        target = int(target_hex, 16) if isinstance(target_hex, str) else int(target_hex)
-
-        # Wait until anvil's tip is one short of `target` so the
-        # forwarded tx lands *in* `target` (anvil mines a block as
-        # soon as a tx arrives at >= block_time cadence).
-        self._wait_for_block(target - 1)
-
-        return self._proxy({
-            "jsonrpc": "2.0",
-            "id": body.get("id"),
-            "method": "eth_sendRawTransaction",
-            "params": [raw],
-        })
 
     def do_POST(self):
         try:
@@ -123,12 +83,56 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "result": {"bundleHash": "0x" + "00" * 32},
             }).encode()
         elif body.get("method") == "eth_sendBundle":
-            resp = self._proxy(body)
-            # -32601: the upstream has no bundle API, so emulate one.
-            if json.loads(resp).get("error", {}).get("code") == -32601:
-                resp = self._emulate_bundle(body)
+            params = body["params"][0]
+            txs = params.get("txs", [])
+            if len(txs) != 1:
+                resp = json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": body.get("id"),
+                    "error": {
+                        "code": -32602,
+                        "message": "builder stub accepts exactly one transaction per bundle",
+                        "data": {"transactionCount": len(txs)},
+                    },
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+                return
+            raw = txs[0]
+            target_hex = params.get("blockNumber", "0x0")
+            target = int(target_hex, 16) if isinstance(target_hex, str) else int(target_hex)
+
+            # Wait until anvil's tip is one short of `target` so the
+            # forwarded tx lands *in* `target` (anvil mines a block as
+            # soon as a tx arrives at >= block_time cadence).
+            self._wait_for_block(target - 1)
+
+            forwarded = {
+                "jsonrpc": "2.0",
+                "id": body.get("id"),
+                "method": "eth_sendRawTransaction",
+                "params": [raw],
+            }
+            resp = urllib.request.urlopen(
+                urllib.request.Request(
+                    self.upstream,
+                    data=json.dumps(forwarded).encode(),
+                    headers={"Content-Type": "application/json"},
+                ),
+                timeout=10,
+            ).read()
         else:
-            resp = self._proxy(body)
+            resp = urllib.request.urlopen(
+                urllib.request.Request(
+                    self.upstream,
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"},
+                ),
+                timeout=10,
+            ).read()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(resp)))
