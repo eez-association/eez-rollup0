@@ -248,7 +248,7 @@ where
     }
 
     /// Clone of the actor's current canonical head mirror. Reflects the
-    /// most recent successful Sequence or Derive — no broadcast lag.
+    /// latest head write of any command — no broadcast lag.
     #[must_use]
     pub fn last_header(&self) -> SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>
     where
