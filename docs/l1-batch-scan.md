@@ -167,3 +167,18 @@ reductions. This prevents new oversized intervals; it does not repair history
 already produced without that size guard. If retained history exceeds the
 allowance, sequencing fails closed. Recover the unsafe branch from the settled
 cursor before resuming; preserve settled history.
+
+Blob preparation, proving and signing share one deadline: the target timestamp
+minus `EEZ_SUBMISSION_SLACK_MS`. Proving reserves
+`EEZ_BLOB_POST_PROOF_RESERVE_MS` for fee and nonce reads, signing and passing
+the bundle to the submitter. The reserve defaults to the submission slack and
+is deducted separately. Expired attempts retain pending work for a later slot.
+
+`eez.composer.blob.proof_window` reports preparation time and the remaining
+window; `eez.composer.blob.ready_to_submit` reports proof and signing time.
+
+After a blob proof or signing deadline miss, the next attempt is capped at half
+the failed range, rounded down to whole Sync intervals. Only empty historical
+Sync blocks can end these anchor-only prefixes. The cap resets when the L1
+cursor changes; pending work is retained. A single interval cannot be split
+further and must fit the configured timing window.

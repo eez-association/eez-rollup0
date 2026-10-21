@@ -22,11 +22,6 @@
 //! structured is up to the chain" — so Rollup0's `0x00 ‖ native_block_span_v0`
 //! rides inside it verbatim. Nothing here extends it: the span's start comes
 //! from the settled parent EEZ names, not from a field of our own.
-//!
-//! INTERIM CALLDATA PROFILE, not full blob-format compliance: §2.1 and §5
-//! cond. 2 want `CloseBlobStream` in the blob portion, cond. 3 forbids it in
-//! the tail, and a zero-blob stream has nowhere legal to put it. Blob batches
-//! include the close marker in the blob portion.
 
 use crate::{CodecError, CodecResult, Cursor, DecodedSpan, SpanBlock};
 use tracing::warn;
