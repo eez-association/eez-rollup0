@@ -13,7 +13,7 @@ interface IRollup0EEZ {
 /// @title Rollup0SettlementWrapper
 /// @notice On-chain carrier and anchor gate for Rollup0 blob settlement.
 contract Rollup0SettlementWrapper {
-    IRollup0EEZ public immutable EEZ;
+    IRollup0EEZ public immutable eez;
     Rollup0Manager public immutable manager;
 
     bool private transient _entered;
@@ -34,9 +34,9 @@ contract Rollup0SettlementWrapper {
     error UnchangedAnchorRoot();
     error AnchorNotApplied(bytes32 expectedRoot, bytes32 liveRoot);
 
-    constructor(address eez, address rollupManager) {
-        if (eez == address(0) || rollupManager == address(0)) revert InvalidConfig();
-        EEZ = IRollup0EEZ(eez);
+    constructor(address registry, address rollupManager) {
+        if (registry == address(0) || rollupManager == address(0)) revert InvalidConfig();
+        eez = IRollup0EEZ(registry);
         manager = Rollup0Manager(rollupManager);
     }
 
@@ -84,7 +84,7 @@ contract Rollup0SettlementWrapper {
                 || anchor.expectedL1ToL2Calls.length != 0 || anchor.returnData.length != 0 || !anchor.success
         ) revert InvalidAnchor();
 
-        (, bytes32 liveRoot,) = EEZ.rollups(rollupId);
+        (, bytes32 liveRoot,) = eez.rollups(rollupId);
         bytes32 currentRoot = anchor.rollupUpdates[0].currentRoot;
         bytes32 newRoot = anchor.rollupUpdates[0].newRoot;
         if (liveRoot != currentRoot) revert StaleAnchor(liveRoot, currentRoot);
@@ -100,8 +100,8 @@ contract Rollup0SettlementWrapper {
         bytes32 settledRoot = settled.rollupUpdates[0].newRoot;
 
         manager.beginSettlement();
-        EEZ.postAndVerifyBatch(batch);
-        (, liveRoot,) = EEZ.rollups(rollupId);
+        eez.postAndVerifyBatch(batch);
+        (, liveRoot,) = eez.rollups(rollupId);
         if (liveRoot != settledRoot) revert AnchorNotApplied(settledRoot, liveRoot);
         manager.endSettlement();
 

@@ -42,6 +42,8 @@ pub struct BlobPostingConfig {
     pub chain_spec: std::sync::Arc<reth_chainspec::ChainSpec>,
     pub slot_seconds: u64,
     pub max_fee_per_blob_gas: u128,
+    /// Time reserved after proving for fee/nonce reads, signing and submission handoff.
+    pub post_proof_reserve: std::time::Duration,
 }
 
 /// The signed postBatch's tx hash. A type-3 post's pooled bytes also carry
@@ -85,8 +87,8 @@ pub(super) async fn refresh_candidate_target(
     now_ms: u64,
 ) -> Result<BundleTarget, String> {
     let reserve_ms = u64::try_from(
-        timing
-            .proof_time()
+        config
+            .post_proof_reserve
             .saturating_add(timing.submission_slack())
             .as_millis(),
     )
@@ -289,6 +291,7 @@ mod tests {
             ),
             slot_seconds: 12,
             max_fee_per_blob_gas: 50,
+            post_proof_reserve: std::time::Duration::from_millis(500),
         }
     }
 
@@ -340,10 +343,21 @@ mod tests {
         };
         let (_, provider) = mocked();
         assert_eq!(
-            refresh_candidate_target(&provider, &config(), timing, target, 118_499)
+            refresh_candidate_target(&provider, &config(), timing, target, 121_999)
                 .await
                 .unwrap(),
             target,
+        );
+        let (asserter, provider) = mocked();
+        asserter.push_success(&l1_block(41, 112, B256::repeat_byte(1)));
+        assert_eq!(
+            refresh_candidate_target(&provider, &config(), timing, target, 122_000)
+                .await
+                .unwrap(),
+            BundleTarget::Exact {
+                block: 42,
+                timestamp: 136
+            },
         );
         let (asserter, provider) = mocked();
         asserter.push_success(&l1_block(41, 112, B256::repeat_byte(1)));
@@ -353,7 +367,7 @@ mod tests {
                 .unwrap(),
             BundleTarget::Exact {
                 block: 42,
-                timestamp: 148,
+                timestamp: 136,
             },
         );
     }

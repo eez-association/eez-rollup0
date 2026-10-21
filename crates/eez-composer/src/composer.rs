@@ -49,7 +49,8 @@ use crate::local::{
 };
 use crate::optimistic::OptimisticallyIncluded;
 use crate::prover_retry::{
-    actionable_held_tx, partition_retryable, prove_with_retry, validate_actionable_prover_failure,
+    BlobPipelineDeadline, actionable_held_tx, partition_retryable, prove_with_retry,
+    validate_actionable_prover_failure,
 };
 use crate::rollup::RollupState;
 
@@ -531,6 +532,15 @@ enum PreparePostBatchError {
     Actionable(ActionableProverFailure),
     #[error("selected cross-chain work needs {required} blobs, maximum {maximum}")]
     CompositionBlobLimit { required: usize, maximum: usize },
+}
+
+impl PreparePostBatchError {
+    fn retryable_kind(&self) -> Option<eez_prover::RetryableProverError> {
+        match self {
+            Self::Prover(error) => error.retryable_kind(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1144,6 +1154,8 @@ struct Inner<L2: BlockReader> {
     /// the emission decision, the boundary math, and the span guard in
     /// `prepare_post_batch_raw` can never disagree about the cap mid-run.
     emission: EmissionLimits,
+    /// Smaller blob prefixes after deadline misses, scoped to the unsettled cursor.
+    deadline_prefixes: std::sync::Mutex<HashMap<u64, (u64, u64)>>,
 }
 
 impl<L2: BlockReader> std::fmt::Debug for Composer<L2> {
@@ -1191,6 +1203,7 @@ where
                 committer,
                 witness_source,
                 emission: EmissionLimits::from_env(timing),
+                deadline_prefixes: Default::default(),
             }),
         })
     }
@@ -1648,7 +1661,10 @@ where
         // ── Bounded emission ─────────────────────────────────────────
         // A stall holds `cursor` still while the head keeps cadence, growing the
         // range by K a slot until the signer's window wedges it.
-        if sync_height.saturating_sub(cursor) > self.inner.emission.max_blocks {
+        if sync_height.saturating_sub(cursor) > self.inner.emission.max_blocks
+            || (cc.exec_ctx.blob_posting.is_some()
+                && self.deadline_prefix(rollup_id, cursor).is_some())
+        {
             if let Err(err) = self
                 .emit_historical_chunk(
                     &cc.exec_ctx,
@@ -3633,6 +3649,14 @@ where
                 };
             }
             Err(PreparePostBatchError::Prover(error)) => {
+                if ctx.blob_posting.is_some() {
+                    self.shrink_after_deadline(
+                        rollup_id,
+                        rollup.l1_head.cursor(),
+                        parent_header.number() + 1,
+                        error.retryable_kind(),
+                    );
+                }
                 let retryable = error.retryable_kind().is_some();
                 if retryable {
                     event!(
@@ -3756,6 +3780,46 @@ where
         }))
     }
 
+    fn deadline_prefix(&self, rollup_id: u64, cursor: u64) -> Option<u64> {
+        let mut prefixes = self.inner.deadline_prefixes.lock().unwrap();
+        match prefixes.get(&rollup_id).copied() {
+            Some((at, span)) if at == cursor => Some(span),
+            _ => {
+                prefixes.remove(&rollup_id);
+                None
+            }
+        }
+    }
+
+    fn shrink_after_deadline(
+        &self,
+        rollup_id: u64,
+        cursor: u64,
+        terminal: u64,
+        failure: Option<eez_prover::RetryableProverError>,
+    ) {
+        if failure != Some(eez_prover::RetryableProverError::DeadlineExceeded) {
+            return;
+        }
+        let k = u64::from(self.inner.emission.timing.k());
+        let intervals = terminal.saturating_sub(cursor) / k;
+        if intervals > 1 {
+            let span = (intervals / 2) * k;
+            self.inner
+                .deadline_prefixes
+                .lock()
+                .unwrap()
+                .insert(rollup_id, (cursor, span));
+            event!(
+                Level::WARN,
+                rollup_id,
+                cursor,
+                span,
+                "blob deadline missed; retrying a smaller complete prefix next slot"
+            );
+        }
+    }
+
     /// Build an empty Sync block, sign a leading-immediate-only postBatch
     /// covering `posted+1..=sync_height`, dispatch it to the background
     /// observer, and return the block for immediate commit. The Sync block is
@@ -3834,6 +3898,25 @@ where
         } else {
             BundleTarget::NextBlock
         };
+        if ctx.blob_posting.is_some() && self.deadline_prefix(rollup_id, cursor).is_some() {
+            if let Err(error) = self
+                .emit_historical_chunk(
+                    ctx,
+                    rollup_id,
+                    rollup,
+                    cursor,
+                    sync_height,
+                    historical_target,
+                )
+                .await
+            {
+                event!(Level::WARN, rollup_id, %error, "deadline prefix emission failed");
+            }
+            return Ok(Some(SyncSlotBlock {
+                payload: empty_built.payload,
+                header: empty_built.header,
+            }));
+        }
         let minimal_postbatch_raw = match self
             .prepare_post_batch_raw(
                 ctx,
@@ -3884,6 +3967,14 @@ where
                 }));
             }
             Err(err) => {
+                if ctx.blob_posting.is_some() {
+                    self.shrink_after_deadline(
+                        rollup_id,
+                        cursor,
+                        sync_height,
+                        err.retryable_kind(),
+                    );
+                }
                 event!(
                     name: "eez.composer.phase1.prepare_failed",
                     Level::ERROR,
@@ -4018,6 +4109,12 @@ where
             .timing
             .historical_chunk_boundary(cursor, sync_height, limits.max_blocks)
             .unwrap_or_else(|| sync_height.saturating_sub(k));
+        let snapped = if ctx.blob_posting.is_some() {
+            self.deadline_prefix(rollup_id, cursor)
+                .map_or(snapped, |span| snapped.min(cursor.saturating_add(span)))
+        } else {
+            snapped
+        };
         if snapped <= cursor {
             return Err(format!(
                 "no on-grid boundary above cursor {cursor} below sync height {sync_height}"
@@ -4078,7 +4175,17 @@ where
                     historical_target,
                 )
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|error| {
+                    if ctx.blob_posting.is_some() {
+                        self.shrink_after_deadline(
+                            rollup_id,
+                            cursor,
+                            boundary,
+                            error.retryable_kind(),
+                        );
+                    }
+                    error.to_string()
+                })?
             else {
                 over_budget += 1;
                 continue;
@@ -4250,6 +4357,18 @@ where
         use alloy_sol_types::SolCall;
         use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
 
+        let preparation_started = std::time::Instant::now();
+        let deadline = ctx
+            .blob_posting
+            .as_ref()
+            .map(|config| {
+                BlobPipelineDeadline::new(
+                    self.inner.emission.timing,
+                    bundle_target,
+                    config.post_proof_reserve,
+                )
+            })
+            .transpose()?;
         let sync_block_hash = terminal_header.hash();
 
         // Merge inbound compositions' L1 source batches, or start empty so an
@@ -4684,6 +4803,7 @@ where
         // Prove the assembled window (proofs[] empty — not part of the
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
         // `blocks`. Settlement path, off block production.
+        let witness_started = std::time::Instant::now();
         let block_witnesses = match self.inner.witness_source.as_ref() {
             // Remote-prover mode. Intermediate blocks `[from..sync)` are committed
             // (served by the witness store); a freshly-built endpoint isn't, so
@@ -4741,6 +4861,8 @@ where
             // Tests may use a lightweight prover without a witness source.
             None => Vec::new(),
         };
+        let witness_ms = witness_started.elapsed().as_millis();
+        let blob_preparation_started = std::time::Instant::now();
         let (blob, carrier) = if let Some((config, blobs, encoding)) = physical_blobs {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4758,6 +4880,7 @@ where
         } else {
             (None, None)
         };
+        let blob_preparation_ms = blob_preparation_started.elapsed().as_millis();
         let proving_ctx = ProvingContext {
             rollup_id,
             from_block: from,
@@ -4772,11 +4895,22 @@ where
             l1_block_hash: None, // timeless calldata; blobs bind posting_context
             blob,
         };
+        let preparation_ms = preparation_started.elapsed().as_millis();
+        if let (Some(deadline), Some(config)) = (deadline, &ctx.blob_posting) {
+            event!(name: "eez.composer.blob.proof_window", Level::INFO,
+                event_name = "eez.composer.blob.proof_window", rollup_id,
+                from, to = sync_block_number, preparation_ms, witness_ms, blob_preparation_ms,
+                remaining_ms = deadline.remaining().as_millis(),
+                post_proof_reserve_ms = config.post_proof_reserve.as_millis(),
+                "blob preparation complete; proving within the remaining target window");
+        }
+        let proof_started = std::time::Instant::now();
         let proof = match prove_with_retry(
             self.inner.prover.as_ref(),
             proving_ctx,
             self.inner.emission.timing,
             bundle_target,
+            deadline,
         )
         .await
         {
@@ -4801,6 +4935,7 @@ where
                 return Err(PreparePostBatchError::Actionable(failure));
             }
         };
+        let proof_ms = proof_started.elapsed().as_millis();
         batch.proofs = vec![proof];
 
         let calldata = postAndVerifyBatchCall {
@@ -4838,7 +4973,8 @@ where
             .blob_posting
             .as_ref()
             .map_or(eez_address, |config| config.deployment.settlement_wrapper);
-        Ok(sign_post_batch_tx(
+        let signing_started = std::time::Instant::now();
+        let signing = sign_post_batch_tx(
             &ctx.l1_poster_signer,
             &ctx.l1_provider,
             to,
@@ -4847,9 +4983,34 @@ where
             ctx.l1_post_batch_priority_fee,
             self.inner.emission.max_gas,
             carrier,
-        )
-        .await
-        .map(Some)?)
+        );
+        let raw = if let Some(deadline) = deadline {
+            tokio::time::timeout(deadline.remaining(), signing)
+                .await
+                .map_err(|_| {
+                    PreparePostBatchError::Prover(ProverError::Retryable {
+                        kind: eez_prover::RetryableProverError::DeadlineExceeded,
+                        message: "blob settlement window exhausted while signing".into(),
+                    })
+                })??
+        } else {
+            signing.await?
+        };
+        if deadline.is_some_and(|deadline| deadline.remaining().is_zero()) {
+            return Err(PreparePostBatchError::Prover(ProverError::Retryable {
+                kind: eez_prover::RetryableProverError::DeadlineExceeded,
+                message: "blob settlement window exhausted before submission".into(),
+            }));
+        }
+        if let Some(deadline) = deadline {
+            event!(name: "eez.composer.blob.ready_to_submit", Level::INFO,
+                event_name = "eez.composer.blob.ready_to_submit", rollup_id,
+                from, to = sync_block_number, preparation_ms, proof_ms,
+                signing_ms = signing_started.elapsed().as_millis(),
+                remaining_ms = deadline.remaining().as_millis(),
+                "blob transaction signed within the target window");
+        }
+        Ok(Some(raw))
     }
 }
 

@@ -120,6 +120,7 @@ fn blob_posting_from_env(
     candidate: Option<eez_protocol::Rollup0Deployment>,
     chain_spec: Arc<reth_chainspec::ChainSpec>,
     slot_duration: Duration,
+    submission_slack: Duration,
 ) -> eyre::Result<Option<eez_composer::BlobPostingConfig>> {
     let Some(deployment) = candidate else {
         return Ok(None);
@@ -134,11 +135,24 @@ fn blob_posting_from_env(
         .ok()
         .filter(|cap| *cap > 0)
         .ok_or_else(|| eyre::eyre!("EEZ_L1_MAX_FEE_PER_BLOB_GAS must be a nonzero wei amount"))?;
+    let post_proof_reserve = match env::var("EEZ_BLOB_POST_PROOF_RESERVE_MS") {
+        Ok(value) => Duration::from_millis(value.parse::<u64>().map_err(|_| {
+            eyre::eyre!("EEZ_BLOB_POST_PROOF_RESERVE_MS must be a nonnegative integer")
+        })?),
+        Err(env::VarError::NotPresent) => submission_slack,
+        Err(error) => return Err(eyre::eyre!("EEZ_BLOB_POST_PROOF_RESERVE_MS: {error}")),
+    };
+    eyre::ensure!(
+        !post_proof_reserve.is_zero()
+            && post_proof_reserve < slot_duration.saturating_sub(submission_slack),
+        "EEZ_BLOB_POST_PROOF_RESERVE_MS must be positive and leave time before the submission deadline",
+    );
     Ok(Some(eez_composer::BlobPostingConfig {
         deployment,
         chain_spec,
         slot_seconds: slot_duration.as_secs(),
         max_fee_per_blob_gas,
+        post_proof_reserve,
     }))
 }
 
@@ -579,6 +593,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 candidate,
                 posting_chain_spec,
                 timing.l1_block_time(),
+                timing.submission_slack(),
             )?,
         });
         event!(
@@ -1117,8 +1132,13 @@ mod tests {
         };
         let spec = Arc::new(reth_chainspec::ChainSpecBuilder::mainnet().build());
         for duration in [Duration::ZERO, Duration::from_millis(1500)] {
-            let error =
-                blob_posting_from_env(Some(deployment), spec.clone(), duration).unwrap_err();
+            let error = blob_posting_from_env(
+                Some(deployment),
+                spec.clone(),
+                duration,
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
             assert!(
                 error
                     .to_string()
