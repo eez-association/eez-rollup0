@@ -111,7 +111,7 @@ pub struct DeriveOutcome {
 
 /// Clone-cheap handle to the spawned block-committer actor. Carries
 /// a `watch` head mirror the actor writes on every head change
-/// ([`Self::subscribe_head`] observes each one) — fixes the `invalid payload attributes` race
+/// ([`Self::subscribe_head`] observes the latest) — fixes the `invalid payload attributes` race
 /// (Sequencer reads the post-Derive head without `CanonStateNotification`
 /// lag).
 pub struct BlockCommitterHandle<T: PayloadTypes> {
@@ -249,7 +249,6 @@ where
 
     /// Clone of the actor's current canonical head mirror. Reflects the
     /// most recent successful Sequence or Derive — no broadcast lag.
-    ///
     #[must_use]
     pub fn last_header(&self) -> SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>
     where
@@ -259,12 +258,15 @@ where
     }
 
     /// Receiver whose current value is the head now; `changed()` fires on
-    /// every later head write. Keeps only the latest, so it never blocks the actor.
+    /// every later head write. Keeps only the latest, so a slow subscriber never lags the actor.
     #[must_use]
     pub fn subscribe_head(
         &self,
     ) -> watch::Receiver<SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>> {
-        self.last_header.clone()
+        let mut rx = self.last_header.clone();
+        // The clone inherits this handle's stale seen-version; start from now.
+        rx.mark_unchanged();
+        rx
     }
 
     /// Builds a payload with the given attributes if the actor's head
@@ -280,7 +282,6 @@ where
     ///
     /// - [`DriverError::StaleParent`] on snapshot mismatch.
     /// - Engine-API failures or `committer_closed`.
-    ///
     pub async fn commit_sequenced(
         &self,
         parent_hash: B256,
@@ -575,7 +576,7 @@ where
         // Mirror the head only AFTER reth accepted the FCU — writing it
         // first then erroring would leave every later compose building
         // on a head reth never adopted (permanent stale-parent loop).
-        // Keep `unsafe_head_hash` in lockstep with `last_header`: a bare
+        // `set_head` keeps `unsafe_head_hash` current: a bare
         // FCU (forkchoice_state reads `unsafe_head_hash`) fires on every
         // BatchPosted via `process_advance_safe_finalized`, and a stale
         // `unsafe_head_hash` would re-canonicalize the orphan we just
@@ -584,7 +585,7 @@ where
         Ok(())
     }
 
-    /// The only head write: keeps `unsafe_head_hash` in lockstep and publishes.
+    /// The only head-mirror write: keeps `unsafe_head_hash` in lockstep and publishes.
     fn set_head(&mut self, header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>) {
         self.unsafe_head_hash = header.hash();
         self.head_tx.send_replace(header);
@@ -603,7 +604,6 @@ where
     /// and retry once, rewriting both `unsafe_head_hash` and the head mirror so
     /// later ticks don't re-send the same bad triplet. `safe_header`'s hash
     /// must equal `state.safe_block_hash`.
-    ///
     async fn forkchoice_or_demote_head(
         &mut self,
         mut state: ForkchoiceState,
@@ -869,5 +869,6 @@ mod tests {
         rx.changed().await.unwrap();
         assert_eq!(rx.borrow_and_update().hash(), h2.hash());
         assert_eq!(handle.last_header().hash(), h2.hash());
+        assert!(!handle.subscribe_head().has_changed().unwrap());
     }
 }
