@@ -1,24 +1,31 @@
-//! Sequencer-RPC unsafe-head follower.
+//! Signed-head unsafe-head follower.
 //!
 //! Safe and finalized are owned by the L1 deriver through
-//! `BlockCommitterHandle::advance_safe_finalized`. This task only asks
-//! reth to point unsafe head at the sequencer's latest block while that
-//! head remains compatible with the L1-derived anchors.
+//! `BlockCommitterHandle::advance_safe_finalized`. This task polls the
+//! sequencer's `eez_getSignedHead`, keeps the latest verified head of each
+//! signing source, and moves the unsafe head to the highest-version candidate
+//! that descends from the L1-derived safe block. Missing ancestors are fetched
+//! by hash, checked against the requested hash, and imported through the
+//! committer under the reconcile lock.
 //!
-//! Compatibility is enforced here, not by reth: the engine only requires
+//! Descent from safe is enforced here, not by reth: the engine only requires
 //! safe/finalized to be *known*, so it would canonicalize a head whose
-//! ancestry conflicts with our safe block. Before each FCU we accept heads
-//! already on the local canonical chain, otherwise walk the candidate's local
-//! ancestry to the safe height and reject proven conflicts; unverifiable
-//! (unsynced) ancestry stays optimistic.
+//! ancestry conflicts with our safe block.
 
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use alloy_eips::{BlockNumHash, BlockNumberOrTag};
+use alloy_consensus::Header;
+use alloy_eips::BlockNumHash;
+use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, RootProvider};
-use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome};
-use eez_primitives::engine::EezEngineTypes;
-use reth_primitives_traits::SealedHeader;
+use eez_driver::BlockCommitterHandle;
+use eez_primitives::{Block, engine::EezEngineTypes};
+use eez_seq_sig::{Envelope, HeadDomain, HeadTracker, Observation, VerifiedHead, decode_block};
+use reth_payload_primitives::PayloadTypes as _;
+use reth_primitives_traits::{SealedBlock, SealedHeader};
 use reth_storage_api::{BlockIdReader, HeaderProvider};
 use thiserror::Error;
 use tracing::{Level, event};
@@ -27,13 +34,16 @@ use tracing::{Level, event};
 /// engine view does not drift during quiet periods.
 const FCU_REFRESH: Duration = Duration::from_secs(1);
 
-/// Upper bound on the candidate→safe ancestry walk. Beyond this, a fully
-/// local gap is treated as unverifiable rather than scanned unboundedly.
+/// Upper bound on each ancestry walk (fetching back to a local block, and the
+/// local walk down to safe); beyond it the candidate is unverifiable.
 const MAX_ANCESTRY_WALK: u64 = 1024;
 
+/// Bound on remembered rejections: a rogue signer can mint new hashes forever.
+const MAX_LOGGED_REJECTIONS: usize = 256;
+
 #[derive(Debug, Error)]
-enum FollowerError {
-    /// Sequencer JSON-RPC transport or decode failure.
+pub(crate) enum FollowerError {
+    /// Sequencer JSON-RPC transport, decode or missing-block failure.
     #[error("sequencer RPC error: {0}")]
     Rpc(String),
 
@@ -44,6 +54,14 @@ enum FollowerError {
     /// Shared driver/committer error.
     #[error("driver error: {0}")]
     Driver(String),
+
+    /// No locally known ancestor within [`MAX_ANCESTRY_WALK`] blocks.
+    #[error("no local ancestor within {depth} blocks")]
+    Unverifiable { depth: u64 },
+
+    /// The source answered a block request with a different block.
+    #[error("requested block {requested}, got {got}")]
+    BadAncestor { requested: B256, got: B256 },
 }
 
 /// Verdict of checking a candidate head against the local safe anchor.
@@ -53,11 +71,33 @@ enum SafeCompat {
     Extends,
     /// The candidate provably does not descend from the safe block.
     Conflicts,
-    /// Ancestry is not locally known yet, so keep it optimistic.
+    /// Ancestry down to the safe height is not locally known.
     Unverifiable,
 }
 
-/// Polls the sequencer RPC for unsafe heads and routes every engine call
+/// Serves consensus-RLP blocks by hash.
+pub(crate) trait BlockSource {
+    async fn raw_block(&self, hash: B256) -> Result<Option<Bytes>, FollowerError>;
+}
+
+impl BlockSource for RootProvider {
+    async fn raw_block(&self, hash: B256) -> Result<Option<Bytes>, FollowerError> {
+        self.raw_request("eez_getRawBlock".into(), (hash,))
+            .await
+            .map_err(|e| FollowerError::Rpc(format!("eez_getRawBlock({hash}): {e}")))
+    }
+}
+
+/// What a target needs before import.
+#[derive(Debug)]
+pub(crate) struct Missing {
+    /// First locally known block on the target's ancestry.
+    pub fork_point: SealedHeader,
+    /// Unknown blocks, oldest first; empty if the target is local.
+    pub blocks: Vec<SealedBlock<Block>>,
+}
+
+/// Polls the sequencer RPC for signed heads and routes every engine call
 /// through the shared [`BlockCommitterHandle`].
 #[derive(Debug)]
 pub(crate) struct UnsafeHeadFollower<P> {
@@ -66,27 +106,36 @@ pub(crate) struct UnsafeHeadFollower<P> {
     /// Local chain reader: resolves the current safe anchor and the
     /// candidate head's ancestry for the compatibility check.
     local: P,
-    /// Cadence for polling the sequencer RPC for new unsafe heads.
+    domain: HeadDomain,
+    /// The only signer whose heads are followed.
+    sequencer_address: Address,
+    /// Cadence for polling the sequencer RPC for new signed heads.
     poll_interval: Duration,
-    last_head: Option<alloy_primitives::B256>,
+    tracker: HeadTracker,
+    rejections: Rejections,
 }
 
 impl<P> UnsafeHeadFollower<P>
 where
-    P: HeaderProvider<Header = alloy_consensus::Header> + BlockIdReader,
+    P: HeaderProvider<Header = Header> + BlockIdReader,
 {
     pub(crate) fn new(
         committer: BlockCommitterHandle<EezEngineTypes>,
         sequencer_rpc: RootProvider,
         local: P,
+        domain: HeadDomain,
+        sequencer_address: Address,
         poll_interval: Duration,
     ) -> Self {
         Self {
             committer,
             sequencer_rpc,
             local,
+            domain,
+            sequencer_address,
             poll_interval,
-            last_head: None,
+            tracker: HeadTracker::default(),
+            rejections: Rejections::default(),
         }
     }
 
@@ -120,76 +169,223 @@ where
     }
 
     async fn advance(&mut self) -> Result<(), FollowerError> {
-        let Some(block) = self
+        let envelope: Option<Envelope> = self
             .sequencer_rpc
-            .get_block_by_number(BlockNumberOrTag::Latest)
+            .raw_request("eez_getSignedHead".into(), ())
             .await
-            .map_err(|e| FollowerError::Rpc(e.to_string()))?
-        else {
-            event!(
-                name: "eez.node.follower.block.not_yet_produced",
+            .map_err(|e| FollowerError::Rpc(format!("eez_getSignedHead: {e}")))?;
+        match envelope {
+            Some(envelope) => self.observe(envelope),
+            None => event!(
+                name: "eez.node.follower.head.unsigned",
                 Level::DEBUG,
-                "sequencer reports no latest block yet",
-            );
-            return Ok(());
-        };
-
-        let number = block.header.number;
-        let hash = block.header.hash;
-        if self.last_head == Some(hash) {
-            return Ok(());
+                "sequencer has not signed a head yet",
+            ),
         }
+        self.follow_best().await
+    }
 
-        // Reject candidates whose ancestry provably conflicts with the
-        // L1-derived safe anchor before they reach the engine.
-        if check_extends_safe(&self.local, &block.header.inner, hash)? == SafeCompat::Conflicts {
-            event!(
-                name: "eez.node.follower.head.conflicts_safe",
-                Level::WARN,
+    fn observe(&mut self, envelope: Envelope) {
+        let (number, hash) = (envelope.head.number, envelope.head.block_hash);
+        let head = match envelope.verify(&self.domain, self.sequencer_address) {
+            Ok(head) => head,
+            Err(err) => {
+                self.rejections.warn(number, hash, &err.to_string());
+                return;
+            }
+        };
+        match self.tracker.observe(head, now_ms()) {
+            Observation::New => {}
+            Observation::Duplicate | Observation::Stale => event!(
+                name: "eez.node.follower.head.ignored",
+                Level::DEBUG,
                 block.number = number,
                 block.hash = %hash,
-                "sequencer head does not descend from the L1-derived safe block; skipping",
-            );
-            return Ok(());
+                "signed head is not newer than its source's latest",
+            ),
+            Observation::Future => {
+                self.rejections
+                    .warn(number, hash, "epoch is ahead of the local clock");
+            }
+            Observation::Equivocation { kept } => {
+                if self.rejections.first(hash, "equivocation") {
+                    event!(
+                        name: "eez.node.follower.head.equivocation",
+                        Level::ERROR,
+                        block.number = number,
+                        block.hash = %hash,
+                        kept = %kept,
+                        "sequencer signed two heads with one version; keeping the first",
+                    );
+                }
+            }
         }
+    }
 
-        let header = SealedHeader::new(block.header.inner, hash);
-        match self.committer.advance_unsafe_head(header).await {
-            Ok(ForkchoiceOutcome::Valid) => {
-                self.last_head = Some(hash);
+    /// Adopt the highest-version candidate that descends from safe.
+    async fn follow_best(&mut self) -> Result<(), FollowerError> {
+        for head in self.tracker.candidates() {
+            let (number, hash) = (head.claim.number, head.claim.block_hash);
+            let missing = match self.fetch(head).await {
+                Ok(missing) => missing,
+                Err(err) => {
+                    self.rejections.warn(number, hash, &err.to_string());
+                    continue;
+                }
+            };
+            // Held from the safe check through import, so the Deriver can't move safe in between.
+            let _guard = self.committer.begin_reconcile().await;
+            let fork_point = &missing.fork_point;
+            let verdict = check_extends_safe(&self.local, fork_point, fork_point.hash())?;
+            if verdict != SafeCompat::Extends {
+                let reason = format!(
+                    "fork point {} ({}) does not extend safe: {verdict:?}",
+                    fork_point.number,
+                    fork_point.hash()
+                );
+                self.rejections.warn(number, hash, &reason);
+                continue;
+            }
+            let imported = missing.blocks.len();
+            if self.import(missing).await? {
                 event!(
                     name: "eez.node.follower.head.advanced",
                     Level::INFO,
                     event_name = "eez.node.follower.head.advanced",
                     block.number = number,
                     block.hash = %hash,
-                    "follower advanced unsafe head to sequencer block",
+                    imported,
+                    "follower adopted the signed head",
                 );
-                Ok(())
             }
-            Ok(ForkchoiceOutcome::Syncing) => {
-                event!(
-                    name: "eez.node.follower.head.syncing",
-                    Level::INFO,
-                    event_name = "eez.node.follower.head.syncing",
-                    block.number = number,
-                    block.hash = %hash,
-                    "reth accepted sequencer head as a sync target",
-                );
-                Ok(())
-            }
-            Ok(ForkchoiceOutcome::InvalidState) => {
-                event!(
-                    name: "eez.node.follower.head.inconsistent",
-                    Level::WARN,
-                    block.number = number,
-                    block.hash = %hash,
-                    "sequencer head is incompatible with current L1-derived anchors; dropping unsafe head",
-                );
-                Ok(())
-            }
-            Err(err) => Err(FollowerError::Driver(err.to_string())),
+            return Ok(());
         }
+        Ok(())
+    }
+
+    async fn fetch(&self, head: &VerifiedHead) -> Result<Missing, FollowerError> {
+        let fetched;
+        let target = match &head.block {
+            Some(block) => block,
+            None => {
+                fetched = fetch_block(&self.sequencer_rpc, head.claim.block_hash).await?;
+                &fetched
+            }
+        };
+        fetch_missing(&self.local, &self.sequencer_rpc, target).await
+    }
+
+    /// Returns whether the head moved.
+    async fn import(&self, missing: Missing) -> Result<bool, FollowerError> {
+        let driver = |e: eez_driver::DriverError| FollowerError::Driver(e.to_string());
+        if missing.blocks.is_empty() {
+            if missing.fork_point.hash() == self.committer.last_header().hash() {
+                return Ok(false);
+            }
+            self.committer
+                .reorg_to(missing.fork_point)
+                .await
+                .map_err(driver)?;
+            return Ok(true);
+        }
+        for block in missing.blocks {
+            let header = block.clone_sealed_header();
+            self.committer
+                .commit_derived(EezEngineTypes::block_to_payload(block, None), header, false)
+                .await
+                .map_err(driver)?;
+        }
+        Ok(true)
+    }
+}
+
+/// Rejections already logged, so a head the RPC keeps returning warns once.
+#[derive(Debug, Default)]
+struct Rejections(HashSet<(B256, String)>);
+
+impl Rejections {
+    fn first(&mut self, hash: B256, reason: &str) -> bool {
+        if self.0.len() >= MAX_LOGGED_REJECTIONS {
+            self.0.clear();
+        }
+        self.0.insert((hash, reason.to_owned()))
+    }
+
+    fn warn(&mut self, number: u64, hash: B256, reason: &str) {
+        if self.first(hash, reason) {
+            event!(
+                name: "eez.node.follower.head.rejected",
+                Level::WARN,
+                event_name = "eez.node.follower.head.rejected",
+                block.number = number,
+                block.hash = %hash,
+                reason,
+                "signed head not followed",
+            );
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Fetches one block by hash, refusing any block but the one requested.
+async fn fetch_block<S: BlockSource>(
+    source: &S,
+    hash: B256,
+) -> Result<SealedBlock<Block>, FollowerError> {
+    let rlp = source
+        .raw_block(hash)
+        .await?
+        .ok_or_else(|| FollowerError::Rpc(format!("block {hash} not served")))?;
+    let block = decode_block(&rlp).map_err(|e| FollowerError::Rpc(format!("block {hash}: {e}")))?;
+    if block.hash() != hash {
+        return Err(FollowerError::BadAncestor {
+            requested: hash,
+            got: block.hash(),
+        });
+    }
+    Ok(block)
+}
+
+/// Walks `target`'s parent hashes back to the first locally known block,
+/// fetching each unknown one from `source`.
+async fn fetch_missing<P, S>(
+    local: &P,
+    source: &S,
+    target: &SealedBlock<Block>,
+) -> Result<Missing, FollowerError>
+where
+    P: HeaderProvider<Header = Header>,
+    S: BlockSource,
+{
+    let mut blocks = Vec::new();
+    let mut hash = target.hash();
+    loop {
+        if let Some(header) = local
+            .header(hash)
+            .map_err(|e| FollowerError::Provider(format!("header({hash}): {e}")))?
+        {
+            blocks.reverse();
+            return Ok(Missing {
+                fork_point: SealedHeader::new(header, hash),
+                blocks,
+            });
+        }
+        let depth = blocks.len() as u64;
+        if depth >= MAX_ANCESTRY_WALK {
+            return Err(FollowerError::Unverifiable { depth });
+        }
+        let block = if depth == 0 {
+            target.clone()
+        } else {
+            fetch_block(source, hash).await?
+        };
+        hash = block.parent_hash;
+        blocks.push(block);
     }
 }
 
@@ -269,8 +465,7 @@ where
 mod tests {
     use std::collections::{BTreeMap, HashMap};
 
-    use alloy_consensus::Header;
-    use alloy_primitives::{B256, BlockHash, BlockNumber};
+    use alloy_primitives::{BlockHash, BlockNumber};
     use reth_chainspec::ChainInfo;
     use reth_storage_api::{BlockHashReader, BlockNumReader, errors::provider::ProviderResult};
 
@@ -522,5 +717,93 @@ mod tests {
             check_extends_safe(&local, &candidate, hash(12)).unwrap(),
             SafeCompat::Unverifiable
         );
+    }
+
+    impl BlockSource for HashMap<B256, Bytes> {
+        async fn raw_block(&self, hash: B256) -> Result<Option<Bytes>, FollowerError> {
+            Ok(self.get(&hash).cloned())
+        }
+    }
+
+    fn block(number: BlockNumber, parent_hash: B256, salt: u8) -> SealedBlock<Block> {
+        SealedBlock::seal_slow(Block {
+            header: Header {
+                number,
+                parent_hash,
+                extra_data: Bytes::from(vec![salt]),
+                ..Default::default()
+            },
+            body: Default::default(),
+        })
+    }
+
+    fn rlp(block: &SealedBlock<Block>) -> Bytes {
+        Bytes::from(alloy_rlp::encode(block.clone_block()))
+    }
+
+    fn hashes(blocks: &[SealedBlock<Block>]) -> Vec<B256> {
+        blocks.iter().map(SealedBlock::hash).collect()
+    }
+
+    #[tokio::test]
+    async fn fetch_stops_at_first_local_block() {
+        let b0 = block(0, B256::ZERO, 0);
+        let b1 = block(1, b0.hash(), 0);
+        let b2 = block(2, b1.hash(), 0);
+        let mut local = MockLocal::default();
+        local.insert_canonical(b0.hash(), b0.header().clone());
+        let remote = HashMap::from([(b1.hash(), rlp(&b1))]);
+
+        let missing = fetch_missing(&local, &remote, &b2).await.unwrap();
+
+        assert_eq!(missing.fork_point.hash(), b0.hash());
+        assert_eq!(hashes(&missing.blocks), vec![b1.hash(), b2.hash()]);
+    }
+
+    #[tokio::test]
+    async fn fetch_known_target_has_no_blocks() {
+        let b0 = block(0, B256::ZERO, 0);
+        let mut local = MockLocal::default();
+        local.insert_canonical(b0.hash(), b0.header().clone());
+
+        let missing = fetch_missing(&local, &HashMap::new(), &b0).await.unwrap();
+
+        assert_eq!(missing.fork_point.hash(), b0.hash());
+        assert!(missing.blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_ancestor_with_wrong_hash() {
+        let b0 = block(0, B256::ZERO, 0);
+        let b1 = block(1, b0.hash(), 0);
+        let bx = block(1, b0.hash(), 0xff);
+        let b2 = block(2, b1.hash(), 0);
+        let mut local = MockLocal::default();
+        local.insert_canonical(b0.hash(), b0.header().clone());
+        let remote = HashMap::from([(b1.hash(), rlp(&bx))]);
+
+        let err = fetch_missing(&local, &remote, &b2).await.unwrap_err();
+
+        assert!(
+            matches!(err, FollowerError::BadAncestor { requested, got }
+                if requested == b1.hash() && got == bx.hash()),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_is_unverifiable_past_walk_cap() {
+        let mut chain = vec![block(0, B256::ZERO, 0)];
+        for number in 1..MAX_ANCESTRY_WALK + 2 {
+            chain.push(block(number, chain[chain.len() - 1].hash(), 0));
+        }
+        let remote: HashMap<_, _> = chain.iter().map(|b| (b.hash(), rlp(b))).collect();
+        let target = chain.last().unwrap();
+
+        let err = fetch_missing(&MockLocal::default(), &remote, target)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, FollowerError::Unverifiable { .. }), "{err}");
     }
 }
