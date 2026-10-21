@@ -1004,21 +1004,23 @@ async fn happy_case_follower_sequencer_rpc() {
         .await
         .expect("follower safe block never matched the sequencer chain");
 
-    let follower_head_signals = [
-        signals::FOLLOWER_HEAD_ADVANCED,
-        signals::FOLLOWER_HEAD_SYNCING,
-    ];
-    let unsafe_head_events_before = follower.count_signals(&follower_head_signals).unwrap();
     seq.run_tx_spammer(ANVIL_KEY_1);
-    wait_for(DEFAULT_TIMEOUT, || {
-        std::future::ready(
-            follower
-                .count_signals(&follower_head_signals)
-                .map(|n| (n > unsafe_head_events_before).then_some(())),
-        )
+    let follower_rpc = follower.l2_rpc_url();
+    // A sequencer block above the follower's safe head came from a signed head,
+    // not L1. Compare at one height: `latest` on both sides races new blocks.
+    wait_for(DEFAULT_TIMEOUT, || async {
+        let Some((n, hash)) =
+            block_number_and_hash_at(&follower_rpc, BlockNumberOrTag::Latest).await?
+        else {
+            return Ok(None);
+        };
+        let at_seq = block_number_and_hash_at(&seq_rpc, BlockNumberOrTag::Number(n)).await?;
+        let safe = block_number_and_hash_at(&follower_rpc, BlockNumberOrTag::Safe).await?;
+        let above_safe = safe.is_some_and(|(safe, _)| safe < n);
+        Ok((at_seq == Some((n, hash)) && above_safe).then_some(()))
     })
     .await
-    .expect("follower never reported a sequencer-RPC unsafe-head FCU outcome");
+    .expect("follower never held a sequencer block above its safe head");
 
     follower.assert_no_process_death();
     seq.assert_no_process_death();
@@ -1116,8 +1118,8 @@ async fn happy_case_follower_cross_safe_parity() {
     seq.assert_no_process_death();
 }
 
-/// A rogue unsafe source cannot move the follower's L1-derived safe head.
-/// A structured signal proves the follower polled the rogue source.
+/// Heads signed by a key other than the configured sequencer's are rejected:
+/// the follower's head never takes them and its L1-derived safe head holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     let harness = Harness::fresh().await.unwrap();
@@ -1133,11 +1135,14 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         .unwrap();
     seq.run_tx_spammer(ANVIL_KEY_1);
 
-    // The already-running L1 Anvil is an incompatible Ethereum chain and is
-    // sufficient to exercise unsafe-head rejection without another L2 node.
-    let rogue_rpc = harness.anvil.rpc_url.clone();
+    // The real sequencer, trusted under another address: every head it signs is rogue.
     let follower_env = override_env(
-        harness.follower_env(Some(&rogue_rpc)).await.unwrap(),
+        harness.follower_env(Some(&seq.l2_rpc_url())).await.unwrap(),
+        "EEZ_SEQUENCER_ADDRESS",
+        &format!("{ANVIL_ADDR:#x}"),
+    );
+    let follower_env = override_env(
+        follower_env,
         "RUST_LOG",
         "warn,eez_follower::unsafe_head=info",
     );
@@ -1158,21 +1163,24 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     .await
     .expect("follower safe head did not reach a non-genesis attested root while on the rogue");
 
-    // Stop canonical batch production and let any already-submitted batch land
-    // before fixing the safe anchor used by this assertion.
-    drop(seq);
+    // Stop settlement but keep the rogue signing, and let any already-submitted
+    // batch land before fixing the safe anchor used by this assertion.
+    harness
+        .set_builder_mode(BuilderStubMode::Drop)
+        .await
+        .expect("stop settlement");
     chain
         .wait_for_l1_blocks(1, Duration::from_secs(15))
         .await
-        .expect("L1 did not flush after stopping the composer");
+        .expect("L1 did not flush after stopping settlement");
     let final_state = chain
         .snapshot()
         .await
         .unwrap()
         .latest_execution_root
-        .expect("composer settled a batch before stopping");
+        .expect("composer settled a batch before settlement stopped");
     // An arbitrary historical attestation is insufficient here: a final batch
-    // may have landed while the composer was shutting down.
+    // may have landed while settlement was stopping.
     wait_for(DEFAULT_TIMEOUT, || async {
         Ok((safe_block_hash(&follower.l2_rpc_url()).await? == Some(final_state)).then_some(()))
     })
@@ -1183,34 +1191,38 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         .unwrap()
         .expect("follower has a safe head");
 
-    // The rogue RPC is Anvil. Force its unrelated block number above the L2
-    // safe height, making its ancestry locally unknown rather than a
-    // timing-dependent equal-height/below-safe conflict.
-    while chain.block_number().await.unwrap() <= safe_before.0 {
-        chain.mine().await.unwrap();
-    }
-    let syncing_pattern = ["reth accepted sequencer head as a sync target"];
-    let syncing_before = follower.log_count_matching(&syncing_pattern).unwrap();
-    wait_for(DEFAULT_TIMEOUT, || {
-        std::future::ready(
-            follower
-                .log_count_matching(&syncing_pattern)
-                .map(|count| (count > syncing_before).then_some(())),
-        )
-    })
-    .await
-    .expect("follower did not offer the unknown rogue head as a sync target");
-
+    let rejected_before = follower
+        .count_signal(signals::FOLLOWER_HEAD_REJECTED)
+        .unwrap();
+    chain
+        .wait_for_l1_blocks(3, Duration::from_secs(30))
+        .await
+        .expect("L1 did not advance three blocks");
+    assert!(
+        follower
+            .count_signal(signals::FOLLOWER_HEAD_REJECTED)
+            .unwrap()
+            > rejected_before,
+        "follower must reject the heads the rogue keeps signing",
+    );
+    assert_eq!(
+        follower
+            .count_signal(signals::FOLLOWER_HEAD_ADVANCED)
+            .unwrap(),
+        0,
+        "a rogue head must never move the follower's head",
+    );
     let safe_after = block_number_and_hash_at(&follower.l2_rpc_url(), BlockNumberOrTag::Safe)
         .await
         .unwrap();
     assert_eq!(
         safe_after,
         Some(safe_before),
-        "processing the rogue sync target must not move the L1-derived safe head",
+        "rogue heads must not move the L1-derived safe head",
     );
 
     follower.assert_no_process_death();
+    seq.assert_no_process_death();
 }
 
 /// A late follower backfills the complete pre-existing batch history.

@@ -1911,6 +1911,7 @@ where
                 event!(
                     name: "eez.composer.recovery.rolled_back",
                     Level::WARN,
+                    event_name = "eez.composer.recovery.rolled_back",
                     rollup_id,
                     sync_height,
                     head = head.number(),
@@ -1952,6 +1953,7 @@ where
                             event!(
                                 name: "eez.composer.recovery.substituted",
                                 Level::WARN,
+                                event_name = "eez.composer.recovery.substituted",
                                 rollup_id,
                                 sync_height,
                                 timestamp,
