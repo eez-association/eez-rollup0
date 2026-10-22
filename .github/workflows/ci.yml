@@ -154,7 +154,7 @@ jobs:
       - name: Archive integration test executables
         run: |
           mkdir -p artifacts/e2e-build
-          cargo nextest archive --locked --cargo-profile ci-e2e -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test durability --test partial_consumption --test resumption --test resumption_append --test native_system --archive-file artifacts/e2e-build/tests.tar.zst
+          cargo nextest archive --locked --cargo-profile ci-e2e -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test durability --test partial_consumption --test resumption --test resumption_append --test native_system --test contract_post --archive-file artifacts/e2e-build/tests.tar.zst
       - name: Build E2E runtime binaries
         run: |
           cargo build --locked \
