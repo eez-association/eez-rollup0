@@ -335,9 +335,9 @@ system[i] = type(tx[i]) == 0x76
             && tx[i].to == EEZL2_ADDRESS
 ```
 
-If no transaction satisfies `system[i]`, the checkpoint plan is empty, even
-when this is the terminal block. Otherwise the locally selected candidate
-positions are:
+If a nonempty block has no transaction satisfying `system[i]`, the checkpoint
+plan is empty, even when this is the terminal block. Otherwise the locally
+selected candidate positions are:
 
 ```text
 C = { i | !system[i] || system[i + 1] || i is the last transaction }

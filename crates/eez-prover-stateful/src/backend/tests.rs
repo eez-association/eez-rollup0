@@ -12,8 +12,7 @@ use reth_engine_primitives::{BeaconEngineMessage, OnForkChoiceUpdated};
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
 use reth_storage_api::errors::provider::ProviderResult;
 use reth_storage_api::{
-    AccountReader, BlockIdReader, BytecodeReader, StateProofProvider, StateProviderBox,
-    StorageRootProvider,
+    AccountReader, BytecodeReader, StateProofProvider, StateProviderBox, StorageRootProvider,
 };
 use reth_trie_common::updates::TrieUpdates;
 use reth_trie_common::{
@@ -78,7 +77,7 @@ fn cached_engine(
         hash: parent.hash_slow(),
         state_root: parent.state_root,
     };
-    let with_checkpoints = kind == "sync";
+    let with_checkpoints = kind != "ordinal";
     let transactions = match kind {
         "sync" => vec![
             SystemTransaction {
@@ -191,7 +190,7 @@ async fn block_validation_reuses_reth_and_backend_checkpoints_without_execution(
             Err(ValidationError::Rejected(_))
         ));
         engine.validate_anchor(anchor).unwrap();
-        let with_checkpoints = kind == "sync";
+        let with_checkpoints = kind != "ordinal";
         let (output, reused) = engine
             .validate_next(
                 anchor,
@@ -208,10 +207,10 @@ async fn block_validation_reuses_reth_and_backend_checkpoints_without_execution(
                 .iter()
                 .map(|checkpoint| checkpoint.at)
                 .collect::<Vec<_>>(),
-            if with_checkpoints {
-                vec![CheckpointAt::PreExecution, CheckpointAt::Transaction(0)]
-            } else {
-                Vec::new()
+            match kind {
+                "sync" => vec![CheckpointAt::PreExecution, CheckpointAt::Transaction(0)],
+                "empty" => vec![CheckpointAt::PreExecution],
+                _ => Vec::new(),
             },
         );
         assert_eq!(output.hash(), input.claimed_hash());

@@ -717,8 +717,8 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
     );
 }
 
-/// Every nonempty plan includes the final transaction, which activates
-/// Stateless's post-execution-neutrality check. Ordinary blocks need no plan.
+/// Nonempty Sync blocks include the final transaction, activating Stateless's
+/// post-execution-neutrality check. Empty blocks need only the anchor checkpoint.
 #[test]
 fn checkpoint_plan_is_empty_or_ends_at_the_final_transaction() {
     let system = || {
@@ -750,6 +750,10 @@ fn checkpoint_plan_is_empty_or_ends_at_the_final_transaction() {
             let recovered = RecoveredBlock::new_unhashed(block, vec![TEST_SYSTEM_ADDRESS; width]);
             let (plan, _) = CheckpointPlan::for_block(&recovered, TEST_SYSTEM_ADDRESS);
 
+            if width == 0 {
+                assert_eq!(plan.positions(), [CheckpointAt::PreExecution]);
+                continue;
+            }
             if mask == 0 {
                 assert!(plan.positions().is_empty(), "ordinary shape {shape:?}");
                 continue;

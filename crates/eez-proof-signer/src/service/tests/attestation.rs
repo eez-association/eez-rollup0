@@ -238,7 +238,7 @@ async fn an_anchor_only_batch_rejects_a_different_empty_prefix() {
     let mut backend_output = backend_output_for(&inputs);
     backend_output.blocks[2].transaction_state_checkpoints =
         vec![pre_execution_checkpoint(B256::repeat_byte(0xee))];
-    let server = TestServer::new(inner(Validator::stub(vec![Ok(backend_output)]))).await;
+    let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output)]))).await;
 
     let status = server.prove(happy_window()).await;
 
