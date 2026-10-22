@@ -78,6 +78,8 @@ async fn await_counter(rx: &mut mpsc::Receiver<Envelope>) {
 struct Node {
     secret: [u8; 32],
     port: u16,
+    /// Index of the key this node's validator authorizes.
+    authorized: u8,
 }
 
 impl Node {
@@ -90,6 +92,7 @@ impl Node {
         Self {
             secret: [n; 32],
             port,
+            authorized: 0,
         }
     }
 
@@ -114,7 +117,7 @@ impl Node {
         let overlay = Overlay::new(
             config,
             keypair(&self.secret).unwrap(),
-            Validator::new(DOMAIN, key(0).address()),
+            Validator::new(DOMAIN, key(self.authorized).address()),
             Box::new(Vec::new),
         )
         .unwrap();
@@ -137,11 +140,22 @@ async fn heads_relay_through_a_middle_node() {
 #[tokio::test]
 async fn rogue_flood_does_not_stall_the_publisher() {
     let (a, b, r) = (Node::new(1), Node::new(2), Node::new(3));
+    // Accepts R's heads, so anything A relays from R would reach it.
+    let probe = Node {
+        authorized: 1,
+        ..Node::new(4)
+    };
     let (b_tx, mut b_rx) = mpsc::channel(64);
+    let (probe_tx, mut probe_rx) = mpsc::channel(64);
     a.spawn(&[], Some(heads(0, HONEST_EVERY, u64::MAX)), None);
     b.spawn(&[&a], None, Some(b_tx));
+    probe.spawn(&[&a], None, Some(probe_tx));
     r.spawn(&[&a], Some(heads(1, Duration::from_millis(2), 500)), None);
     await_counter(&mut b_rx).await;
+    assert!(
+        probe_rx.try_recv().is_err(),
+        "A relayed a rejected key-1 head"
+    );
 }
 
 #[tokio::test]
