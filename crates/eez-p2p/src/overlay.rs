@@ -36,6 +36,9 @@ const PEERS_ENV: &str = "EEZ_P2P_PEERS";
 const DIAL_INTERVAL: Duration = Duration::from_secs(5);
 /// Gossipsub keeps only mesh connections alive; this gives a new peer time to be grafted.
 const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
+/// Discovered peers are dialed only below this many connections; past gossipsub's
+/// `mesh_n_high` (12) more peers add churn, not reach. Static peers are always dialed.
+const DISCOVERY_PEER_LIMIT: usize = 16;
 
 /// Overlay settings: where to listen, whom to dial, which topic to join.
 #[derive(Clone, Debug)]
@@ -175,69 +178,42 @@ impl Overlay {
     }
 
     fn dial_peers(&mut self) {
-        let mut addrs = self.peers.clone();
-        addrs.extend((self.discover)());
-        for addr in addrs {
-            let Some(peer) = peer_of(&addr) else {
-                event!(
-                    name: "eez.p2p.dial.no_peer_id",
-                    Level::WARN,
-                    %addr,
-                    "overlay peer {{addr}} does not end in /p2p/<id>; not dialing",
-                );
-                continue;
-            };
-            // A bare multiaddr dial would open a new connection on every tick.
-            let opts = DialOpts::peer_id(peer)
-                .addresses(vec![addr])
-                .condition(PeerCondition::DisconnectedAndNotDialing)
-                .build();
-            match self.swarm.dial(opts) {
-                Ok(()) | Err(DialError::DialPeerConditionFalse(_)) => {}
-                Err(error) => event!(
-                    name: "eez.p2p.dial.failed",
-                    Level::DEBUG,
-                    %peer,
-                    %error,
-                    "overlay dial of {{peer}} failed: {{error}}",
-                ),
-            }
+        let discovered = if self.swarm.network_info().num_peers() < DISCOVERY_PEER_LIMIT {
+            (self.discover)()
+        } else {
+            Vec::new()
+        };
+        for addr in self.peers.iter().chain(&discovered) {
+            dial(&mut self.swarm, addr);
         }
     }
 
     fn publish(&mut self, head: &Envelope) {
-        let data = match wire::encode(head) {
-            Ok(data) => data,
-            Err(error) => {
-                event!(
-                    name: "eez.p2p.publish.encode_failed",
-                    Level::WARN,
-                    number = head.head.number,
-                    %error,
-                    "head {{number}} not published: {{error}}",
-                );
-                return;
-            }
+        let number = head.head.number;
+        let error = match wire::encode(head) {
+            Ok(data) => match self.swarm.behaviour_mut().publish(self.topic.clone(), data) {
+                Ok(_) => return,
+                Err(error @ (PublishError::Duplicate | PublishError::NoPeersSubscribedToTopic)) => {
+                    event!(
+                        name: "eez.p2p.publish.skipped",
+                        Level::DEBUG,
+                        number,
+                        %error,
+                        "head {{number}} not published: {{error}}",
+                    );
+                    return;
+                }
+                Err(error) => error.to_string(),
+            },
+            Err(error) => error.to_string(),
         };
-        match self.swarm.behaviour_mut().publish(self.topic.clone(), data) {
-            Ok(_) => {}
-            Err(error @ (PublishError::Duplicate | PublishError::NoPeersSubscribedToTopic)) => {
-                event!(
-                    name: "eez.p2p.publish.skipped",
-                    Level::DEBUG,
-                    number = head.head.number,
-                    %error,
-                    "head {{number}} not published: {{error}}",
-                );
-            }
-            Err(error) => event!(
-                name: "eez.p2p.publish.failed",
-                Level::WARN,
-                number = head.head.number,
-                %error,
-                "head {{number}} not published: {{error}}",
-            ),
-        }
+        event!(
+            name: "eez.p2p.publish.failed",
+            Level::WARN,
+            number,
+            %error,
+            "head {{number}} not published: {{error}}",
+        );
     }
 
     fn on_event(
@@ -294,6 +270,23 @@ impl Overlay {
                 %error,
                 "overlay connection to {{peer}} failed: {{error}}",
             ),
+            SwarmEvent::ListenerClosed {
+                addresses,
+                reason: Err(error),
+                ..
+            } => event!(
+                name: "eez.p2p.listener.closed",
+                Level::WARN,
+                addresses = ?addresses,
+                %error,
+                "overlay listener on {{addresses}} closed: {{error}}",
+            ),
+            SwarmEvent::ListenerError { error, .. } => event!(
+                name: "eez.p2p.listener.error",
+                Level::WARN,
+                %error,
+                "overlay listener error: {{error}}",
+            ),
             _ => {}
         }
     }
@@ -321,6 +314,11 @@ async fn next_head(publish: &mut Option<watch::Receiver<Option<Envelope>>>) -> O
         return std::future::pending().await;
     };
     if rx.changed().await.is_err() {
+        event!(
+            name: "eez.p2p.publish.closed",
+            Level::WARN,
+            "head store dropped; overlay stops publishing",
+        );
         *publish = None;
         return None;
     }
@@ -341,7 +339,41 @@ fn forward(inbound: &mut Option<mpsc::Sender<Envelope>>, envelope: Envelope) {
             counter = envelope.head.counter,
             "inbound head channel full; dropped head {{number}}",
         ),
-        Err(TrySendError::Closed(_)) => *inbound = None,
+        Err(TrySendError::Closed(_)) => {
+            event!(
+                name: "eez.p2p.inbound.closed",
+                Level::WARN,
+                "inbound head consumer closed; overlay stops forwarding",
+            );
+            *inbound = None;
+        }
+    }
+}
+
+fn dial(swarm: &mut Swarm<gossipsub::Behaviour>, addr: &Multiaddr) {
+    let Some(peer) = peer_of(addr) else {
+        event!(
+            name: "eez.p2p.dial.no_peer_id",
+            Level::WARN,
+            %addr,
+            "overlay peer {{addr}} does not end in /p2p/<id>; not dialing",
+        );
+        return;
+    };
+    // A bare multiaddr dial would open a new connection on every tick.
+    let opts = DialOpts::peer_id(peer)
+        .addresses(vec![addr.clone()])
+        .condition(PeerCondition::DisconnectedAndNotDialing)
+        .build();
+    match swarm.dial(opts) {
+        Ok(()) | Err(DialError::DialPeerConditionFalse(_)) => {}
+        Err(error) => event!(
+            name: "eez.p2p.dial.failed",
+            Level::DEBUG,
+            %peer,
+            %error,
+            "overlay dial of {{peer}} failed: {{error}}",
+        ),
     }
 }
 
