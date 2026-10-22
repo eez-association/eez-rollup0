@@ -140,7 +140,8 @@ impl Overlay {
         let limits = connection_limits::Behaviour::new(
             ConnectionLimits::default()
                 .with_max_established_incoming(Some(MAX_INBOUND_PEERS))
-                .with_max_established_per_peer(Some(1)),
+                // A simultaneous dial can leave each side a different connection; two keeps both.
+                .with_max_established_per_peer(Some(2)),
         );
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
