@@ -16,7 +16,7 @@ use reth_transaction_pool::{PoolPooledTx, PoolTransaction, TransactionPool};
 use tracing::{Level, event};
 
 /// ENR key of the overlay entry; its value is the RLP of the overlay TCP port.
-pub const ENR_KEY: &[u8] = b"eez";
+const ENR_KEY: &[u8] = b"eez";
 
 /// Same as `EthereumNetworkBuilder`, plus the `eez` ENR entry when `EEZ_P2P_LISTEN` is set.
 #[derive(Debug, Default, Clone, Copy)]
@@ -69,7 +69,7 @@ fn advertise(config: reth_discv5::Config, port: u16) -> reth_discv5::Config {
 }
 
 /// Overlay address of a discv5 entry, if it carries our entry and our fork id.
-pub fn overlay_addr<K: EnrKey>(enr: &Enr<K>, our_fork: Option<ForkId>) -> Option<Multiaddr> {
+fn overlay_addr<K: EnrKey>(enr: &Enr<K>, our_fork: Option<ForkId>) -> Option<Multiaddr> {
     if fork_id(enr)? != our_fork? {
         return None;
     }

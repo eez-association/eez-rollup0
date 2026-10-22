@@ -1533,9 +1533,9 @@ impl NodeHandle {
                 std::env::var("CARGO_HOME").unwrap_or_default(),
             );
         if cfg.discovery {
-            // discv5 only, as discv4 would give every node one default port. `--addr`
-            // and `--disable-nat` keep 127.0.0.1 in the ENR for peers to dial, and
-            // 1 s bootstrap lookups find them within seconds.
+            // discv4 would bind its default UDP port on every node, so only discv5 runs, on
+            // a leased port. `--addr` and `--disable-nat` keep 127.0.0.1 in the ENR for
+            // peers to dial, and 1 s bootstrap lookups find them within seconds.
             cmd.args([
                 "--addr",
                 "127.0.0.1",

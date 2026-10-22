@@ -65,10 +65,6 @@ impl P2pConfig {
             topic: topic(l2_chain_id, rollup_id),
         }))
     }
-
-    pub fn tcp_port(&self) -> eyre::Result<u16> {
-        tcp_port_of(&self.listen)
-    }
 }
 
 /// TCP port of `EEZ_P2P_LISTEN`; `None` when unset.
@@ -171,10 +167,6 @@ impl Overlay {
             rejected: 0,
             last_reject: None,
         })
-    }
-
-    pub fn peer_id(&self) -> PeerId {
-        *self.swarm.local_peer_id()
     }
 
     /// Publishes each head from `publish` and forwards accepted heads to `inbound`.

@@ -260,7 +260,6 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         // With the overlay on, blocks come only from peers; the RPC, if any, only polls heads.
         if let Some(cfg) = p2p_config {
             let network = handle.node.network.clone();
-            let listen = cfg.listen.clone();
             let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_BUFFER);
             let overlay = eez_p2p::Overlay::new(
                 cfg,
@@ -268,13 +267,6 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
                 eez_p2p::Validator::new(head_domain, sequencer_address),
                 eez_node_common::discover(network.clone()),
             )?;
-            event!(
-                name: "eez.node.p2p.started",
-                Level::INFO,
-                peer_id = %overlay.peer_id(),
-                listen = %listen,
-                "p2p overlay started",
-            );
             task_executor.spawn_critical_task("eez-p2p", overlay.run(None, Some(gossip_tx)));
             let follower = UnsafeHeadFollower::new(
                 block_committer,

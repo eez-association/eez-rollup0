@@ -366,20 +366,12 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         };
         if let Some(cfg) = p2p_config {
             let network = handle.node.network.clone();
-            let listen = cfg.listen.clone();
             let overlay = eez_p2p::Overlay::new(
                 cfg,
                 eez_p2p::keypair(&network.secret_key().secret_bytes())?,
                 eez_p2p::Validator::new(domain, key.address()),
                 eez_node_common::discover(network),
             )?;
-            event!(
-                name: "eez.node.p2p.started",
-                Level::INFO,
-                peer_id = %overlay.peer_id(),
-                listen = %listen,
-                "p2p overlay started",
-            );
             task_executor
                 .spawn_critical_task("eez-p2p", overlay.run(Some(head_store.subscribe()), None));
         }

@@ -1029,8 +1029,8 @@ async fn happy_case_follower_sequencer_rpc() {
     seq.assert_no_process_death();
 }
 
-/// Three nodes find each other from one bootnode. A follower without the
-/// sequencer's RPC adopts gossiped heads and fetches their ancestors from devp2p peers.
+/// Follower B, with no sequencer RPC, finds the network from the seed's bootnode,
+/// receives heads over gossip, and fetches their ancestors from devp2p peers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn follower_follows_over_p2p() {
     // Fixed so the seed's enode is known before it starts.

@@ -10,7 +10,7 @@ use reth_node_builder::{NodeBuilder, WithLaunchContext};
 use tracing::{Level, event};
 
 mod discovery;
-pub use discovery::{ENR_KEY, EezNetworkBuilder, discover, overlay_addr};
+pub use discovery::{EezNetworkBuilder, discover};
 mod node;
 pub use node::EezNode;
 mod rpc;
