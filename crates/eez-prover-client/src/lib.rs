@@ -333,28 +333,31 @@ impl RemoteProver {
             .await
             .map_err(|status| map_rpc_status(ctx.from_block, ctx.to_block, status))?
             .into_inner();
-        self.verify_proof(
-            ctx.from_block,
-            ctx.to_block,
-            response.public_inputs_hash,
-            response.signature,
-        )
+        self.verify_proof(&ctx, response.public_inputs_hash, response.signature)
     }
 
     fn verify_proof(
         &self,
-        from_block: u64,
-        to_block: u64,
+        ctx: &ProvingContext,
         public_inputs_hash: Vec<u8>,
         signature: Vec<u8>,
     ) -> ProverResult<Bytes> {
         let hash = verify_attestation(&signature, &public_inputs_hash, self.inner.attester)?;
+        let expected = eez_protocol::public_inputs::public_inputs_hashes(&ctx.batch, self.vkey())
+            .map_err(|error| {
+            ProverError::Backend(format!("cannot verify requested public inputs: {error}"))
+        })?;
+        if expected.len() != 1 || hash != expected[0] {
+            return Err(ProverError::Backend(
+                "prover proof does not bind the requested batch".into(),
+            ));
+        }
         event!(
             name: "eez.prover_client.attested",
             Level::INFO,
             event_name = "eez.prover_client.attested",
-            from = from_block,
-            to = to_block,
+            from = ctx.from_block,
+            to = ctx.to_block,
             %hash,
             "remote prover attested the window",
         );
@@ -508,6 +511,11 @@ impl RemoteProver {
                 match self.open_stream(&mut state, begin, range.0, range.1).await {
                     Ok(opened) => opened,
                     Err(StreamingError::Unsupported) => {
+                        event!(
+                            name: "eez.prover_client.streaming_unsupported",
+                            Level::WARN,
+                            "remote prover does not support streaming; using v1 until client restart",
+                        );
                         state.supported = Some(false);
                         state.session = None;
                         return Err(StreamingError::Unsupported);
@@ -566,6 +574,12 @@ impl RemoteProver {
                 && (ready.validated_through.checked_add(1) != Some(first.number)
                     || ready.validated_hash != first.parent_hash.as_slice())
             {
+                if finalize.is_none() && first.number <= ready.validated_through {
+                    // Late captures must not rewind newer progress. Only prove()
+                    // reconciles a replacement fork at an already checked height.
+                    state.connection = Some((requests, responses, cursor));
+                    return Ok(None);
+                }
                 if finalize.is_none()
                     && first.number > ready.validated_through.saturating_add(1)
                 {
@@ -780,21 +794,7 @@ impl Prover for RemoteProver {
             )
             .await
         {
-            Ok(Some((hash, proof))) => {
-                let expected =
-                    eez_protocol::public_inputs::public_inputs_hashes(&ctx.batch, self.vkey())
-                        .map_err(|error| {
-                            ProverError::Backend(format!(
-                                "cannot verify requested public inputs: {error}"
-                            ))
-                        })?;
-                if expected.len() != 1 || hash != expected[0].as_slice() {
-                    return Err(ProverError::Backend(
-                        "ProveStream proof does not bind the requested batch".into(),
-                    ));
-                }
-                self.verify_proof(ctx.from_block, ctx.to_block, hash, proof)
-            }
+            Ok(Some((hash, proof))) => self.verify_proof(&ctx, hash, proof),
             Ok(None) => Err(ProverError::Backend(
                 "ProveStream Finalize returned no proof".into(),
             )),
@@ -1406,21 +1406,49 @@ mod tests {
         }
     }
 
-    /// An attestation that ecrecovers to the REGISTERED attester is accepted and
-    /// returned verbatim (65 bytes).
+    /// Both direct v1 and fallback require the registered signer and requested batch.
     #[tokio::test]
-    async fn attestation_recovering_to_registered_attester_is_accepted() {
-        let key = test_key();
-        let attester = key.address();
-        let hash = B256::repeat_byte(0x7c);
-        let url = spawn_stub(key, hash).await;
-
-        let prover = RemoteProver::new(url, attester);
-        let proof = prover
-            .prove(ProvingContext::default())
-            .await
-            .expect("attestation recovering to the registered attester must be accepted");
-        assert_eq!(proof.len(), 65, "returned proof is the 65-byte r||s||v");
+    async fn v1_and_fallback_bind_the_attestation_to_the_requested_batch() {
+        for fallback in [false, true] {
+            for wrong_batch in [false, true] {
+                let key = test_key();
+                let attester = key.address();
+                let ctx = ProvingContext {
+                    rollup_id: 1,
+                    from_block: 11,
+                    to_block: 11,
+                    anchor: fallback.then(test_anchor),
+                    blocks: vec![test_block(11, test_anchor().hash, 0x22)],
+                    batch: test_batch(),
+                    l1_block_hash: None,
+                };
+                let hash = if wrong_batch {
+                    B256::repeat_byte(0x7c)
+                } else {
+                    eez_protocol::public_inputs::public_inputs_hashes(
+                        &ctx.batch,
+                        attester.into_word(),
+                    )
+                    .unwrap()[0]
+                };
+                let prover = RemoteProver::new(spawn_stub(key, hash).await, attester);
+                let result = prover.prove(ctx).await;
+                assert_eq!(
+                    prover.inner.streaming.lock().await.supported,
+                    fallback.then_some(false)
+                );
+                if wrong_batch {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("does not bind the requested batch")
+                    );
+                } else {
+                    assert_eq!(result.unwrap().len(), 65);
+                }
+            }
+        }
     }
 
     /// An attestation signed by a DIFFERENT key does not recover to the registered
@@ -1483,14 +1511,20 @@ mod tests {
     async fn remote_prover_reconnects_after_server_restart() {
         let key = test_key();
         let attester = key.address();
-        let hash = B256::repeat_byte(0x7c);
+        let ctx = ProvingContext {
+            batch: test_batch(),
+            ..Default::default()
+        };
+        let hash =
+            eez_protocol::public_inputs::public_inputs_hashes(&ctx.batch, attester.into_word())
+                .unwrap()[0];
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let first_server = serve_stub(listener, key.clone(), hash);
         let prover = RemoteProver::new(format!("http://{addr}"), attester);
 
         prover
-            .prove(ProvingContext::default())
+            .prove(ctx.clone())
             .await
             .expect("first signer instance must attest");
 
@@ -1500,7 +1534,7 @@ mod tests {
         let replacement_server = serve_stub(replacement_listener, key, hash);
 
         prover
-            .prove(ProvingContext::default())
+            .prove(ctx)
             .await
             .expect("client must reconnect to the replacement signer");
         replacement_server.abort();
@@ -1704,7 +1738,7 @@ mod tests {
             cursor: Arc::clone(&cursor),
             begins: Arc::clone(&begins),
             stall_first_block: None,
-            baseline_only: true,
+            baseline_only: false,
             cross_wire_block_response: false,
         })
         .await;
@@ -1727,7 +1761,7 @@ mod tests {
                 from_block: 11,
                 to_block: 13,
                 anchor: Some(anchor),
-                blocks: vec![first, second, third.clone()],
+                blocks: vec![first.clone(), second, third.clone()],
                 batch: test_batch(),
                 l1_block_hash: None,
             })
@@ -1740,6 +1774,9 @@ mod tests {
             3,
             "only 12 and 13 need backfill"
         );
+        assert_eq!(*cursor.lock().await, (13, third.hash));
+        // Capture can finish an older block after prove() has advanced the session.
+        prover.prevalidate(1, anchor, first).await.unwrap();
         assert_eq!(*cursor.lock().await, (13, third.hash));
     }
 
@@ -1834,7 +1871,15 @@ mod tests {
             match operation {
                 "rewind" => {
                     prover
-                        .prevalidate(1, anchor, test_block(11, anchor.hash, 0x99))
+                        .prove(ProvingContext {
+                            rollup_id: 1,
+                            from_block: 11,
+                            to_block: 11,
+                            anchor: Some(anchor),
+                            blocks: vec![test_block(11, anchor.hash, 0x99)],
+                            batch: test_batch(),
+                            l1_block_hash: None,
+                        })
                         .await
                         .unwrap();
                 }

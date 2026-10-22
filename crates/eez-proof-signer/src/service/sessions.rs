@@ -1481,22 +1481,25 @@ mod tests {
             .unwrap();
         assert_eq!(session.lock().await.anchor.hash, promoted.hash);
 
-        // A delayed prevalidation can resend an older block without local history.
+        // A delayed prevalidation must leave newer acknowledged progress intact.
         prover
             .prevalidate(1, promoted, second.clone())
             .await
             .unwrap();
-        assert_eq!(session.lock().await.tip().hash, second.hash);
+        assert_eq!(session.lock().await.tip().hash, third.hash);
         {
             let session = session.lock().await;
-            // Rewinding to a promoted anchor must retain its root, not Begin's.
+            // The promoted anchor retains its root, not Begin's.
             assert_eq!(session.anchor.state_root, promoted.state_root);
             assert_eq!(
                 session.blocks[0].validated.pre_state_root(),
                 promoted.state_root
             );
         }
-        prover.prevalidate(1, promoted, third).await.unwrap();
+        prover
+            .prevalidate(1, promoted, third.clone())
+            .await
+            .unwrap();
         assert_eq!(validations.load(Ordering::SeqCst), 3);
 
         // Replace a suffix whose hash disagrees with the server's current tip.
@@ -1505,12 +1508,13 @@ mod tests {
             .prevalidate(1, promoted, replacement.clone())
             .await
             .unwrap();
-        assert_eq!(session.lock().await.tip().hash, replacement.hash);
-        assert_eq!(session.lock().await.blocks.len(), 2);
+        assert_eq!(session.lock().await.tip().hash, third.hash);
         prover
-            .prove(remote_context(promoted, vec![second, replacement]))
+            .prove(remote_context(promoted, vec![second, replacement.clone()]))
             .await
             .unwrap();
+        assert_eq!(session.lock().await.tip().hash, replacement.hash);
+        assert_eq!(session.lock().await.blocks.len(), 2);
         assert_eq!(validations.load(Ordering::SeqCst), 4);
 
         // The old anchor was pruned by Finalize. A request needing it starts anew.

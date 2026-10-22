@@ -197,8 +197,13 @@ async fn stateful_sessions_can_extend_and_finalize_an_unselected_branch() -> Res
         ..Default::default()
     };
     // Neither source can post to L1 while we deliberately switch the prover's unsafe fork.
-    let env = harness.env_for(STAGING_USER_KEY, true).await?;
+    let mut env = harness.env_for(STAGING_USER_KEY, true).await?;
     let a = NodeHandle::start("fork-source-a", &config, &env).await?;
+    let witness_b = tempfile::tempdir()?;
+    env.push((
+        "EEZ_WITNESS_DB_PATH",
+        witness_b.path().to_string_lossy().into_owned(),
+    ));
     let b = NodeHandle::start("fork-source-b", &config, &env).await?;
     let tx =
         send_l2_value_transfer(&a.l2_rpc_url(), ANVIL_KEY_1, ANVIL_ADDR_3, U256::from(1)).await?;
