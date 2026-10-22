@@ -778,8 +778,11 @@ mod tests {
     }
 
     impl BlockSource for HashMap<B256, Bytes> {
-        async fn raw_block(&self, hash: B256) -> Result<Option<Bytes>, FollowerError> {
-            Ok(self.get(&hash).cloned())
+        fn raw_block(
+            &self,
+            hash: B256,
+        ) -> impl Future<Output = Result<Option<Bytes>, FollowerError>> {
+            std::future::ready(Ok(self.get(&hash).cloned()))
         }
     }
 
