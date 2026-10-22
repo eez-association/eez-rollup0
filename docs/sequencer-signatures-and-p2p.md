@@ -304,11 +304,14 @@ discv5 uses.
 - **Relay rule:** gossipsub forwards a message only after the node reports a
   verdict (`validate_messages`):
   - **Accept:** a valid envelope from the authorized address whose counter is
-    at or above its source's latest.
-    - An exact copy is accepted, so a head the node learned first over RPC
-      still propagates. Gossipsub's seen-cache drops true duplicates.
-    - Every source's heads propagate, not only the preferred one's.
-  - **Ignore:** a head older than its source's latest, or a future epoch.
+    above its source's latest. Every source's heads propagate, not only the
+    preferred one's.
+  - **Ignore:** a head at or below its source's latest, or a future epoch.
+    - A head the node has already seen is ignored however it is encoded.
+    - Snappy has many encodings of one payload, so accepting copies would let
+      a peer flood the mesh with re-encodings of one valid head.
+    - The overlay keeps its own tracker, so this never hides a head the
+      follower learned over RPC.
   - **Reject:** undecodable, the wrong signer, or an equivocation. v0 does not
     score peers, so Reject only stops the message; penalties come with peer
     scoring.
