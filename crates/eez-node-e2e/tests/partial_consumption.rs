@@ -217,7 +217,7 @@ async fn assert_follower_reaches(w: &eez_testkit::CrossChainWorld, expected: (u6
     let follower = NodeHandle::start(
         "partial-settlement-follower",
         &follower_cfg,
-        &w.follower_env(),
+        &w.follower_env(None),
     )
     .await
     .unwrap();
