@@ -27,7 +27,7 @@ use eez_prover::{
     ActionableProverFailure, BlockWitness, Prover, ProverError, ProverResult, ProvingAnchor,
     ProvingContext, RetryableProverError,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tonic::{Code, Status};
 use tracing::{Level, event};
 
@@ -50,7 +50,17 @@ struct Inner {
     /// rejected (a wrong/malicious prover cannot forge an attestation).
     attester: Address,
     streaming: Mutex<StreamingState>,
+    // Counts queued/active proofs so best-effort prevalidation yields to all of them.
+    proving: watch::Sender<usize>,
     exchange_timeout: Duration,
+}
+
+struct ProofPriority<'a>(&'a watch::Sender<usize>);
+
+impl Drop for ProofPriority<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count -= 1);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -85,6 +95,7 @@ impl RemoteProver {
                 url: url.into(),
                 attester,
                 streaming: Mutex::new(StreamingState::default()),
+                proving: watch::channel(0).0,
                 // Bound a stalled transport even outside Composer's shorter proof budget.
                 exchange_timeout: Duration::from_secs(5),
             }),
@@ -552,6 +563,13 @@ impl RemoteProver {
                 {
                     // Best-effort prevalidation can skip blocks while capture is busy.
                     // Keep the checked prefix; a complete prove() will backfill the gap.
+                    event!(
+                        name: "eez.prover_client.prevalidation_gap",
+                        Level::DEBUG,
+                        number = first.number,
+                        validated_through = ready.validated_through,
+                        "prevalidation skipped a gap; proof submission will backfill it",
+                    );
                     state.connection = Some((requests, responses, cursor));
                     return Ok(None);
                 }
@@ -699,10 +717,26 @@ impl Prover for RemoteProver {
         anchor: ProvingAnchor,
         block: BlockWitness,
     ) -> ProverResult<()> {
-        match self
-            .stream_exchange(rollup_id, anchor, &[block], None)
-            .await
-        {
+        let mut proving = self.inner.proving.subscribe();
+        let blocks = [block];
+        // Yield the shared stream to proofs. Backend work may still finish;
+        // prove() resumes accepted progress or backfills missing blocks.
+        let result = tokio::select! {
+            // Prefer proof priority when both branches are ready.
+            biased;
+            _ = proving.wait_for(|count| *count != 0) => {
+                event!(
+                    name: "eez.prover_client.prevalidation_yielded",
+                    Level::DEBUG,
+                    number = blocks[0].number,
+                    "prevalidation yielded to a proof request; proof submission will recover or backfill progress",
+                );
+                // Skipping this optimization is success, not a validation acknowledgement.
+                return Ok(());
+            }
+            result = self.stream_exchange(rollup_id, anchor, &blocks, None) => result,
+        };
+        match result {
             Ok(None) | Err(StreamingError::Unsupported) => Ok(()),
             Ok(Some(_)) => Err(ProverError::Backend(
                 "ProveStream returned a proof without Finalize".into(),
@@ -712,6 +746,8 @@ impl Prover for RemoteProver {
     }
 
     async fn prove(&self, ctx: ProvingContext) -> ProverResult<Bytes> {
+        self.inner.proving.send_modify(|count| *count += 1);
+        let _priority = ProofPriority(&self.inner.proving);
         let Some(anchor) = ctx.anchor else {
             if ctx.blob.is_some() {
                 return Err(ProverError::Backend(
@@ -1082,6 +1118,7 @@ mod tests {
         cross_wire_block_response: bool,
         baseline_only: bool,
         begins: Arc<AtomicUsize>,
+        stall_first_block: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[tonic::async_trait]
@@ -1126,9 +1163,14 @@ mod tests {
                         }
                         Some(client_frame::Kind::Block(block)) => {
                             let block = block.data.unwrap();
-                            this.blocks.fetch_add(1, Ordering::SeqCst);
+                            let first = this.blocks.fetch_add(1, Ordering::SeqCst) == 0;
                             let hash = B256::from_slice(&block.hash);
                             *this.cursor.lock().await = (block.number, hash);
+                            if first && let Some(reached) = &this.stall_first_block {
+                                reached.notify_one();
+                                sender.closed().await; // Accepted, but its ACK never reaches the client.
+                                return;
+                            }
                             server_frame::Kind::Validated(StreamValidated {
                                 number: block.number,
                                 hash: block.hash,
@@ -1528,6 +1570,7 @@ mod tests {
             cross_wire_block_response: false,
             baseline_only: false,
             begins: Arc::default(),
+            stall_first_block: None,
         })
         .await;
         let prover = RemoteProver::new(url, attester);
@@ -1582,6 +1625,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proof_interrupts_stalled_prevalidation_and_recovers_accepted_progress() {
+        for baseline_only in [false, true] {
+            let key = test_key();
+            let attester = key.address();
+            let hash = eez_protocol::public_inputs::public_inputs_hashes(
+                &test_batch(),
+                attester.into_word(),
+            )
+            .unwrap()[0];
+            let reached = Arc::new(tokio::sync::Notify::new());
+            let begins = Arc::new(AtomicUsize::new(0));
+            let blocks = Arc::new(AtomicUsize::new(0));
+            let endpoint = spawn_streaming_stub(StreamingStub {
+                signer: key,
+                hash,
+                blocks: Arc::clone(&blocks),
+                cursor: Arc::new(Mutex::new((0, B256::ZERO))),
+                cross_wire_block_response: false,
+                baseline_only,
+                begins: Arc::clone(&begins),
+                stall_first_block: Some(Arc::clone(&reached)),
+            })
+            .await;
+            let prover = RemoteProver::new(endpoint, attester);
+            let anchor = test_anchor();
+            let block = test_block(11, anchor.hash, 0x22);
+            let prevalidation = tokio::spawn({
+                let prover = prover.clone();
+                let block = block.clone();
+                async move { prover.prevalidate(1, anchor, block).await }
+            });
+            tokio::time::timeout(Duration::from_secs(1), reached.notified())
+                .await
+                .unwrap();
+            let proof = tokio::time::timeout(
+                Duration::from_secs(1),
+                prover.prove(ProvingContext {
+                    rollup_id: 1,
+                    from_block: 11,
+                    to_block: 11,
+                    anchor: Some(anchor),
+                    blocks: vec![block],
+                    batch: test_batch(),
+                    l1_block_hash: None,
+                }),
+            )
+            .await
+            .expect("proof must not wait for the stalled prevalidation's five-second timeout")
+            .unwrap();
+            assert_eq!(proof.len(), 65);
+            prevalidation.await.unwrap().unwrap();
+            assert_eq!(*prover.inner.proving.borrow(), 0);
+            // Resume recovers the lost ACK; baseline-only servers receive the complete window.
+            assert_eq!(
+                begins.load(Ordering::SeqCst),
+                if baseline_only { 2 } else { 1 }
+            );
+            assert_eq!(
+                blocks.load(Ordering::SeqCst),
+                if baseline_only { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_proof_suppresses_prevalidation_and_cancellation_releases_priority() {
+        let prover = RemoteProver::new("http://127.0.0.1:1", Address::ZERO);
+        let mut priority = prover.inner.proving.subscribe();
+        let lock = prover.inner.streaming.lock().await;
+        let request = tokio::spawn({
+            let prover = prover.clone();
+            async move {
+                prover
+                    .prove(ProvingContext {
+                        anchor: Some(test_anchor()),
+                        ..Default::default()
+                    })
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            priority.wait_for(|count| *count == 1),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            prover.prevalidate(1, test_anchor(), test_block(11, test_anchor().hash, 0x22)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        drop(lock);
+        // Once the proof is cancelled, prevalidation must try the endpoint again,
+        // not silently return success because priority was left permanently set.
+        let error = prover
+            .prevalidate(1, test_anchor(), test_block(11, test_anchor().hash, 0x22))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.retryable_kind(),
+            Some(RetryableProverError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
     async fn skipped_prevalidation_preserves_progress_for_proof_backfill() {
         let key = test_key();
         let attester = key.address();
@@ -1597,6 +1750,7 @@ mod tests {
             blocks: Arc::clone(&blocks),
             cursor: Arc::clone(&cursor),
             begins: Arc::clone(&begins),
+            stall_first_block: None,
             baseline_only: true,
             cross_wire_block_response: false,
         })
@@ -1661,6 +1815,7 @@ mod tests {
                 begins: Arc::clone(&begins),
                 baseline_only: true,
                 cross_wire_block_response: false,
+                stall_first_block: None,
             })
             .await;
             let prover = RemoteProver::new(endpoint, attester);
@@ -1716,6 +1871,7 @@ mod tests {
                 begins: Arc::clone(&begins),
                 baseline_only: true,
                 cross_wire_block_response: false,
+                stall_first_block: None,
             })
             .await;
             let prover = RemoteProver::new(endpoint, attester);
@@ -1827,6 +1983,7 @@ mod tests {
             cross_wire_block_response: true,
             baseline_only: false,
             begins: Arc::default(),
+            stall_first_block: None,
         })
         .await;
         let prover = RemoteProver::new(url, key.address());

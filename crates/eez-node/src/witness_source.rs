@@ -374,6 +374,13 @@ pub async fn run_capture<P, E, F, G>(
                         error = %error,
                         "witness persisted without prevalidation; Finalize will backfill it",
                     ),
+                    Ok(anchor) if number > anchor.number => event!(
+                        name: "eez.node.witness_capture.prevalidate_busy",
+                        Level::DEBUG,
+                        number,
+                        anchor = anchor.number,
+                        "prevalidation busy; persisted witness will be backfilled by proof submission",
+                    ),
                     Ok(_) => {}
                 }
                 // Drop finalized witnesses; cheap when nothing is below the floor.

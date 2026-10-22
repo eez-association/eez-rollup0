@@ -195,16 +195,29 @@ where
     }
 
     async fn prepare_attestation(&self, window: &ValidatedWindow) -> Result<(), ValidationError> {
-        let committer = self.committer()?;
-        let _forkchoice_guard = committer.begin_reconcile().await;
+        let committer = self.committer()?.clone();
+        let forkchoice_guard = Arc::new(committer.begin_reconcile().await);
         let terminal = window.settling_block();
         let terminal = SealedHeader::new(terminal.decoded().header.clone(), terminal.hash());
         // Blocks were imported and executed before their Validated frames.
         // Select the known terminal with one FCU; Reth enforces safe/finalized ancestry.
         // Replaying the prefix through newPayload would race Reth's persistence pipeline.
-        match committer
-            .advance_unsafe_head(terminal.clone())
+        let selection = tokio::spawn({
+            let guard = Arc::clone(&forkchoice_guard);
+            let terminal = terminal.clone();
+            async move {
+                // The actor keeps running if the request times out.
+                let _guard = guard;
+                committer.advance_unsafe_head(terminal).await
+            }
+        });
+        match selection
             .await
+            .map_err(|error| {
+                ValidationError::InternalInvariant(format!(
+                    "stateful forkchoice worker failed: {error}"
+                ))
+            })?
             .map_err(|error| {
                 if matches!(error, eez_driver::DriverError::InvalidForkchoice(_)) {
                     ValidationError::Aborted(format!(
@@ -253,12 +266,6 @@ where
         tokio::time::timeout(request_timeout, async {
             admitted.check_parent(parent)?;
 
-            // The engine sees retained forks; the provider only sees the selected
-            // branch. On a miss, select the child before reading its parent/evidence.
-            // Hold selection and reads together against other sessions/L1 reconciliation.
-            let committer = self.committer()?;
-            let _forkchoice_guard = committer.begin_reconcile().await;
-
             let block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
             let number = block.header().number();
             let consensus = EthBeaconConsensus::new(Arc::clone(&self.chain_spec));
@@ -271,6 +278,11 @@ where
                     ))
                 })?;
 
+            // The engine sees retained forks; the provider only sees the selected
+            // branch. On a miss, select the child before reading its parent/evidence.
+            // Hold selection and reads together against other sessions/L1 reconciliation.
+            let committer = self.committer()?;
+            let forkchoice_guard = Arc::new(committer.begin_reconcile().await);
             let reused = if self
                 .provider
                 .find_block_by_hash(block.hash(), reth_storage_api::BlockSource::Any)
@@ -290,9 +302,22 @@ where
                 let sealed_block = block.sealed_block().clone();
                 let header = sealed_block.clone_sealed_header();
                 let payload = EezEngineTypes::block_to_payload(sealed_block, None);
-                committer
-                    .commit_derived(payload, header, false)
+                let import = tokio::spawn({
+                    let committer = committer.clone();
+                    let guard = Arc::clone(&forkchoice_guard);
+                    async move {
+                        // Keep reconciliation excluded until the actor finishes, even on timeout.
+                        let _guard = guard;
+                        committer.commit_derived(payload, header, false).await
+                    }
+                });
+                import
                     .await
+                    .map_err(|error| {
+                        ValidationError::InternalInvariant(format!(
+                            "stateful import worker failed: {error}"
+                        ))
+                    })?
                     .map_err(|error| {
                         if matches!(
                             error,
@@ -368,7 +393,7 @@ where
                     let block = block.clone();
                     let checked = tokio::task::spawn_blocking(move || {
                     // Keep reconciliation serialized until replay really finishes, including on timeout.
-                    let _forkchoice_guard = _forkchoice_guard;
+                    let _forkchoice_guard = forkchoice_guard;
                     let parent_state =
                         provider.state_by_block_hash(parent.hash).map_err(|error| {
                             ValidationError::Unavailable(format!(

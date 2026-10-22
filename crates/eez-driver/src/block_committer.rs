@@ -20,7 +20,9 @@ use core::fmt;
 use std::sync::{Arc, RwLock};
 
 use alloy_primitives::B256;
-use alloy_rpc_types_engine::{ForkchoiceState, ForkchoiceUpdateError, ForkchoiceUpdated};
+use alloy_rpc_types_engine::{
+    ForkchoiceState, ForkchoiceUpdateError, ForkchoiceUpdated, PayloadStatusEnum,
+};
 use reth_engine_primitives::{BeaconForkChoiceUpdateError, ConsensusEngineHandle};
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_payload_builder::PayloadBuilderHandle;
@@ -436,7 +438,7 @@ where
     ///
     /// # Errors
     ///
-    /// `invalid_payload`, `invalid_forkchoice`, or `committer_closed`.
+    /// `engine_not_ready`, `invalid_payload`, `invalid_forkchoice`, or `committer_closed`.
     ///
     /// [`ExecutionData`]: reth_payload_primitives::PayloadTypes::ExecutionData
     pub async fn commit_derived(
@@ -699,6 +701,12 @@ where
             .new_payload(payload)
             .await
             .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
+        if matches!(
+            np.status,
+            PayloadStatusEnum::Syncing | PayloadStatusEnum::Accepted
+        ) {
+            return Err(DriverError::EngineNotReady(format!("{np:?}")));
+        }
         if !np.is_valid() {
             return Err(DriverError::InvalidPayload(format!("{np:?}")));
         }
@@ -713,6 +721,9 @@ where
             .fork_choice_updated(state, None)
             .await
             .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
+        if fcu.is_syncing() {
+            return Err(DriverError::EngineNotReady(format!("{fcu:?}")));
+        }
         if !fcu.is_valid() {
             return Err(DriverError::InvalidForkchoice(format!("{fcu:?}")));
         }
