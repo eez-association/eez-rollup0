@@ -2,7 +2,10 @@
 
 use clap::Parser as _;
 use mimalloc::MiMalloc;
-use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
+use reth_ethereum_cli::{
+    chainspec::EthereumChainSpecParser,
+    interface::{Cli, Commands},
+};
 use reth_node_builder::{NodeBuilder, WithLaunchContext};
 use tracing::{Level, event};
 
@@ -51,12 +54,14 @@ where
         }
     }
 
-    let argv = l2_args(std::env::args().collect())?;
-    Ok(Cli::<EthereumChainSpecParser, Ext>::try_parse_from(argv)?)
+    l2_cli(std::env::args().collect())
 }
 
-/// Appends the flags every L2 node runs with and refuses reth's mainnet bootnodes.
-fn l2_args(mut argv: Vec<String>) -> eyre::Result<Vec<String>> {
+/// Parses the CLI with the flags every L2 node runs with and refuses reth's mainnet bootnodes.
+fn l2_cli<Ext>(mut argv: Vec<String>) -> eyre::Result<Cli<EthereumChainSpecParser, Ext>>
+where
+    Ext: clap::Args + std::fmt::Debug,
+{
     // Engine API FCUs may intentionally unwind the L2 head during recovery.
     // Transactions enter only through the sequencer's ingress, never devp2p gossip.
     for flag in [
@@ -64,25 +69,22 @@ fn l2_args(mut argv: Vec<String>) -> eyre::Result<Vec<String>> {
         "--engine.allow-unwind-canonical-header",
         "--disable-tx-gossip",
     ] {
-        if !has_flag(&argv, flag) {
+        if !argv.iter().any(|a| a == flag) {
             argv.push(flag.to_owned());
         }
     }
-    // reth turns discovery off under --dev; otherwise it falls back to mainnet bootnodes.
-    let discovery = !has_flag(&argv, "--disable-discovery") && !has_flag(&argv, "--dev");
-    if discovery && !has_flag(&argv, "--bootnodes") {
+    let cli = Cli::<EthereumChainSpecParser, Ext>::try_parse_from(argv)?;
+    // Parsed flags include reth's aliases and its `--dev` default. Without bootnodes,
+    // reth dials mainnet's for a custom chain.
+    if let Commands::Node(node) = &cli.command
+        && !node.network.discovery.disable_discovery
+        && node.network.bootnodes.is_none()
+    {
         eyre::bail!(
             "discovery is on but --bootnodes is not set; reth would dial Ethereum mainnet bootnodes"
         );
     }
-    Ok(argv)
-}
-
-fn has_flag(argv: &[String], flag: &str) -> bool {
-    argv.iter().any(|a| {
-        a.strip_prefix(flag)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
-    })
+    Ok(cli)
 }
 
 /// Warn about obsolete runtime role selectors now replaced by explicit binaries.
@@ -218,42 +220,47 @@ pub async fn wait_for_l1_ready(
 mod tests {
     use super::*;
 
-    fn args(extra: &[&str]) -> Vec<String> {
-        ["eez", "node"]
-            .iter()
-            .chain(extra)
-            .map(ToString::to_string)
-            .collect()
+    fn parse(argv: &[&str]) -> eyre::Result<Cli<EthereumChainSpecParser, NoRoleArgs>> {
+        l2_cli(
+            ["eez"]
+                .iter()
+                .chain(argv)
+                .map(ToString::to_string)
+                .collect(),
+        )
     }
 
     #[test]
     fn cli_requires_bootnodes_with_discovery() {
-        let err = l2_args(args(&[])).unwrap_err();
+        let err = parse(&["node"]).unwrap_err();
         assert_eq!(
             err.to_string(),
             "discovery is on but --bootnodes is not set; reth would dial Ethereum mainnet bootnodes"
         );
+        let enode = format!("enode://{}@127.0.0.1:30303", "11".repeat(64));
         for ok in [
-            &["--bootnodes", "enode://x@127.0.0.1:30303"][..],
-            &["--bootnodes=enode://x@127.0.0.1:30303"],
+            &["--bootnodes", enode.as_str()][..],
             &["--disable-discovery"],
+            &["-d"],
             &["--dev"],
+            &["--auto-mine"],
         ] {
-            assert!(l2_args(args(ok)).is_ok(), "{ok:?}");
+            assert!(parse(&[&["node"], ok].concat()).is_ok(), "{ok:?}");
+        }
+        // Only a running node is guarded; help and version still print.
+        for argv in [&["node", "--help"][..], &["--version"]] {
+            let err = parse(argv).unwrap_err();
+            assert!(err.downcast_ref::<clap::Error>().is_some(), "{argv:?}");
         }
     }
 
     #[test]
     fn cli_adds_disable_tx_gossip() {
-        for extra in [
-            &["--disable-discovery"][..],
-            &["--disable-discovery", "--disable-tx-gossip"],
-        ] {
-            let argv = l2_args(args(extra)).unwrap();
-            assert_eq!(
-                argv.iter().filter(|a| *a == "--disable-tx-gossip").count(),
-                1
-            );
+        for argv in [&["node", "-d"][..], &["node", "-d", "--disable-tx-gossip"]] {
+            let Commands::Node(node) = parse(argv).unwrap().command else {
+                panic!("not the node command");
+            };
+            assert!(node.network.disable_tx_gossip);
         }
     }
 }

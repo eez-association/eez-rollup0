@@ -72,6 +72,7 @@ run-node:
 	cargo run -p eez-node -- node \
 		--chain $(EEZ_L2_GENESIS_PATH) \
 		--datadir $(EEZ_L2_DATADIR) \
+		--disable-discovery \
 
 clean-l2:
 	@test -n "$(EEZ_L2_DATADIR)" || (echo "EEZ_L2_DATADIR not set" && exit 1)
