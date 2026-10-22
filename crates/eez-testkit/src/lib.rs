@@ -267,7 +267,7 @@ impl BuilderStubMode {
 }
 
 impl BundleStub {
-    async fn spawn(port_lease: PortLease, upstream: &str) -> Result<Self> {
+    async fn spawn(port_lease: PortLease, upstream: &str, passthrough: bool) -> Result<Self> {
         let port = port_lease.port();
         let script = repo_root().join("scripts/builder-stub.py");
         let listen = format!("127.0.0.1:{port}");
@@ -279,7 +279,12 @@ impl BundleStub {
             .arg(script)
             .args(["--listen", &listen, "--upstream", upstream])
             .arg("--block-time")
-            .arg(L1_BLOCK_TIME_SECS.to_string())
+            .arg(L1_BLOCK_TIME_SECS.to_string());
+        if passthrough {
+            // The L1 is a reth node, not Anvil: relay bundles instead of mining them.
+            command.arg("--passthrough");
+        }
+        command
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err_log));
         drop(port_lease);
@@ -814,7 +819,7 @@ impl Harness {
         l2_genesis: (PathBuf, tempfile::TempDir),
     ) -> Result<Self> {
         let mut anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
-        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url).await?;
+        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url, false).await?;
         // Route every harness client through the builder so its snapshot-based
         // block assembly cannot race direct mutations of the backing Anvil.
         anvil.rpc_url.clone_from(&stub.url);
@@ -4614,7 +4619,7 @@ async fn setup_cross_chain_inner(
     let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
     let mut datadir = FailureDatadir::new("eez-cross-chain")?;
     let builder = if builder_stub {
-        Some(BundleStub::spawn(PortLease::tcp(), &cfg.l1_rpc_url()).await?)
+        Some(BundleStub::spawn(PortLease::tcp(), &cfg.l1_rpc_url(), true).await?)
     } else {
         None
     };
