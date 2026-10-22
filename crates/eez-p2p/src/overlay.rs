@@ -4,10 +4,11 @@ use std::{
 };
 
 use eez_seq_sig::Envelope;
-use eyre::{WrapErr, eyre};
+use eyre::{WrapErr, bail, eyre};
 use futures_util::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder,
+    connection_limits::{self, ConnectionLimits},
     gossipsub::{
         self, IdentTopic, MessageAcceptance, MessageAuthenticity, MessageId, PublishError,
         ValidationMode,
@@ -16,7 +17,7 @@ use libp2p::{
     multiaddr::Protocol,
     noise,
     swarm::{
-        DialError, SwarmEvent,
+        DialError, NetworkBehaviour, SwarmEvent,
         dial_opts::{DialOpts, PeerCondition},
     },
     tcp, yamux,
@@ -34,11 +35,14 @@ const LISTEN_ENV: &str = "EEZ_P2P_LISTEN";
 const PEERS_ENV: &str = "EEZ_P2P_PEERS";
 /// Peers are redialed, and rejects summarised, on this tick.
 const DIAL_INTERVAL: Duration = Duration::from_secs(5);
-/// Gossipsub keeps only mesh connections alive; this gives a new peer time to be grafted.
+/// Gossipsub's open substreams keep every connection alive, so this only closes
+/// connections that never open one, such as peers without gossipsub.
 const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 /// Discovered peers are dialed only below this many connections; past gossipsub's
 /// `mesh_n_high` (12) more peers add churn, not reach. Static peers are always dialed.
 const DISCOVERY_PEER_LIMIT: usize = 16;
+/// Caps how many peers the sequencer flood-publishes each head to.
+const MAX_INBOUND_PEERS: u32 = 64;
 
 /// Overlay settings: where to listen, whom to dial, which topic to join.
 #[derive(Clone, Debug)]
@@ -50,21 +54,14 @@ pub struct P2pConfig {
 }
 
 impl P2pConfig {
-    /// `None` when `EEZ_P2P_LISTEN` is unset; Err on a peer without `/p2p/<id>`.
+    /// `None` when `EEZ_P2P_LISTEN` is unset; Err on a bad listen address or peer.
     pub fn from_env(l2_chain_id: u64, rollup_id: u64) -> eyre::Result<Option<Self>> {
         let Some(listen) = listen_from_env()? else {
             return Ok(None);
         };
-        let peers = var(PEERS_ENV)?
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|raw| !raw.is_empty())
-            .map(parse_peer)
-            .collect::<eyre::Result<_>>()?;
         Ok(Some(Self {
             listen,
-            peers,
+            peers: peers_from_env()?,
             topic: topic(l2_chain_id, rollup_id),
         }))
     }
@@ -79,6 +76,17 @@ pub fn listen_port_from_env() -> eyre::Result<Option<u16>> {
     listen_from_env()?.as_ref().map(tcp_port_of).transpose()
 }
 
+/// Static peers from `EEZ_P2P_PEERS`, each ending in `/p2p/<id>`.
+pub fn peers_from_env() -> eyre::Result<Vec<Multiaddr>> {
+    var(PEERS_ENV)?
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(parse_peer)
+        .collect()
+}
+
 pub fn topic(l2_chain_id: u64, rollup_id: u64) -> String {
     format!("/eez/{l2_chain_id}/{rollup_id}/heads/0")
 }
@@ -86,13 +94,22 @@ pub fn topic(l2_chain_id: u64, rollup_id: u64) -> String {
 /// Overlay addresses of discovered peers, each ending in `/p2p/<id>`.
 pub type Discover = Box<dyn Fn() -> Vec<Multiaddr> + Send>;
 
+/// Gossipsub, plus a cap on inbound connections.
+#[derive(NetworkBehaviour)]
+struct Behaviour {
+    gossip: gossipsub::Behaviour,
+    limits: connection_limits::Behaviour,
+}
+
 /// Gossipsub swarm that validates every head before relaying it.
 pub struct Overlay {
-    swarm: Swarm<gossipsub::Behaviour>,
+    swarm: Swarm<Behaviour>,
     topic: IdentTopic,
     peers: Vec<Multiaddr>,
     validator: Validator,
     discover: Discover,
+    /// Where the next tick starts in the discovered list.
+    discovered_cursor: usize,
     rejected: u64,
     last_reject: Option<(PeerId, String)>,
 }
@@ -124,6 +141,11 @@ impl Overlay {
             .build()?;
         let gossip = gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossip_config)
             .map_err(|e| eyre!("gossipsub: {e}"))?;
+        let limits = connection_limits::Behaviour::new(
+            ConnectionLimits::default()
+                .with_max_established_incoming(Some(MAX_INBOUND_PEERS))
+                .with_max_established_per_peer(Some(1)),
+        );
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
@@ -131,11 +153,11 @@ impl Overlay {
                 noise::Config::new,
                 yamux::Config::default,
             )?
-            .with_behaviour(|_| gossip)?
+            .with_behaviour(|_| Behaviour { gossip, limits })?
             .with_swarm_config(|c| c.with_idle_connection_timeout(IDLE_TIMEOUT))
             .build();
         let topic = IdentTopic::new(config.topic);
-        swarm.behaviour_mut().subscribe(&topic)?;
+        swarm.behaviour_mut().gossip.subscribe(&topic)?;
         swarm
             .listen_on(config.listen.clone())
             .wrap_err_with(|| format!("listen on {}", config.listen))?;
@@ -145,6 +167,7 @@ impl Overlay {
             peers: config.peers,
             validator,
             discover,
+            discovered_cursor: 0,
             rejected: 0,
             last_reject: None,
         })
@@ -178,20 +201,30 @@ impl Overlay {
     }
 
     fn dial_peers(&mut self) {
-        let discovered = if self.swarm.network_info().num_peers() < DISCOVERY_PEER_LIMIT {
-            (self.discover)()
-        } else {
-            Vec::new()
-        };
-        for addr in self.peers.iter().chain(&discovered) {
+        for addr in &self.peers {
             dial(&mut self.swarm, addr);
+        }
+        let connected = self.swarm.network_info().num_peers();
+        let budget = DISCOVERY_PEER_LIMIT.saturating_sub(connected);
+        if budget == 0 {
+            return;
+        }
+        let mut discovered = (self.discover)();
+        discovered.retain(|addr| !peer_of(addr).is_some_and(|p| self.swarm.is_connected(&p)));
+        for addr in next_batch(discovered, &mut self.discovered_cursor, budget) {
+            dial(&mut self.swarm, &addr);
         }
     }
 
     fn publish(&mut self, head: &Envelope) {
         let number = head.head.number;
         let error = match wire::encode(head) {
-            Ok(data) => match self.swarm.behaviour_mut().publish(self.topic.clone(), data) {
+            Ok(data) => match self
+                .swarm
+                .behaviour_mut()
+                .gossip
+                .publish(self.topic.clone(), data)
+            {
                 Ok(_) => return,
                 Err(error @ (PublishError::Duplicate | PublishError::NoPeersSubscribedToTopic)) => {
                     event!(
@@ -218,15 +251,15 @@ impl Overlay {
 
     fn on_event(
         &mut self,
-        event: SwarmEvent<gossipsub::Event>,
+        event: SwarmEvent<BehaviourEvent>,
         inbound: &mut Option<mpsc::Sender<Envelope>>,
     ) {
         match event {
-            SwarmEvent::Behaviour(gossipsub::Event::Message {
+            SwarmEvent::Behaviour(BehaviourEvent::Gossip(gossipsub::Event::Message {
                 propagation_source,
                 message_id,
                 message,
-            }) => {
+            })) => {
                 let verdict = self.validator.check(&message.data, now_ms());
                 let acceptance = match &verdict {
                     Verdict::Accept(_) => MessageAcceptance::Accept,
@@ -235,11 +268,10 @@ impl Overlay {
                 };
                 // Reported before forwarding, so relay never depends on the local consumer;
                 // gossipsub expires an unreported message from its cache within seconds.
-                self.swarm.behaviour_mut().report_message_validation_result(
-                    &message_id,
-                    &propagation_source,
-                    acceptance,
-                );
+                self.swarm
+                    .behaviour_mut()
+                    .gossip
+                    .report_message_validation_result(&message_id, &propagation_source, acceptance);
                 match verdict {
                     Verdict::Accept(envelope) => forward(inbound, envelope),
                     Verdict::Ignore => {}
@@ -350,7 +382,19 @@ fn forward(inbound: &mut Option<mpsc::Sender<Envelope>>, envelope: Envelope) {
     }
 }
 
-fn dial(swarm: &mut Swarm<gossipsub::Behaviour>, addr: &Multiaddr) {
+/// Up to `budget` of `items` from `cursor` on, wrapping, and moves `cursor` past them,
+/// so unreachable entries cannot take the whole budget on every tick.
+fn next_batch<T>(mut items: Vec<T>, cursor: &mut usize, budget: usize) -> Vec<T> {
+    if !items.is_empty() {
+        let start = *cursor % items.len();
+        items.rotate_left(start);
+        items.truncate(budget);
+        *cursor = cursor.wrapping_add(items.len());
+    }
+    items
+}
+
+fn dial(swarm: &mut Swarm<Behaviour>, addr: &Multiaddr) {
     let Some(peer) = peer_of(addr) else {
         event!(
             name: "eez.p2p.dial.no_peer_id",
@@ -389,19 +433,30 @@ fn parse_peer(raw: &str) -> eyre::Result<Multiaddr> {
         .parse()
         .wrap_err_with(|| format!("{PEERS_ENV}: {raw}"))?;
     peer_of(&addr).ok_or_else(|| eyre!("{PEERS_ENV}: {raw} does not end in /p2p/<id>"))?;
+    // The transport has no DNS resolver, so such a peer would fail every dial.
+    if !addr
+        .iter()
+        .any(|p| matches!(p, Protocol::Ip4(_) | Protocol::Ip6(_)))
+    {
+        bail!("{PEERS_ENV}: {raw}: DNS multiaddrs are not supported; use an IP");
+    }
     Ok(addr)
 }
 
 fn listen_from_env() -> eyre::Result<Option<Multiaddr>> {
-    let Some(raw) = var(LISTEN_ENV)? else {
-        return Ok(None);
-    };
+    var(LISTEN_ENV)?.map(|raw| parse_listen(&raw)).transpose()
+}
+
+fn parse_listen(raw: &str) -> eyre::Result<Multiaddr> {
     let addr = raw
         .trim()
         .parse()
         .wrap_err_with(|| format!("{LISTEN_ENV}: {raw}"))?;
-    tcp_port_of(&addr)?;
-    Ok(Some(addr))
+    // The ENR advertises this port before the listener binds, so it must be fixed.
+    if tcp_port_of(&addr)? == 0 {
+        bail!("{LISTEN_ENV}: {raw} has TCP port 0; set a fixed port");
+    }
+    Ok(addr)
 }
 
 fn tcp_port_of(addr: &Multiaddr) -> eyre::Result<u16> {
@@ -425,4 +480,36 @@ fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listen_port_zero_is_rejected() {
+        assert!(parse_listen("/ip4/127.0.0.1/tcp/9100").is_ok());
+        let err = parse_listen("/ip4/127.0.0.1/tcp/0").unwrap_err();
+        assert!(err.to_string().contains("EEZ_P2P_LISTEN"), "{err}");
+    }
+
+    #[test]
+    fn dns_peer_is_rejected() {
+        let peer = crate::keypair(&[1; 32]).unwrap().public().to_peer_id();
+        assert!(parse_peer(&format!("/ip4/10.0.0.1/tcp/9100/p2p/{peer}")).is_ok());
+        let err = parse_peer(&format!("/dns4/seq.example/tcp/9100/p2p/{peer}")).unwrap_err();
+        assert!(
+            err.to_string().contains("DNS multiaddrs are not supported"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn discovered_batches_rotate() {
+        let mut cursor = 0;
+        assert_eq!(next_batch(vec![1, 2, 3], &mut cursor, 2), [1, 2]);
+        assert_eq!(next_batch(vec![1, 2, 3], &mut cursor, 2), [3, 1]);
+        assert_eq!(next_batch(vec![1, 2, 3], &mut cursor, 2), [2, 3]);
+        assert!(next_batch(Vec::<u8>::new(), &mut cursor, 2).is_empty());
+    }
 }

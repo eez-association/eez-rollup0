@@ -40,10 +40,15 @@ where
         let mut config = ctx.network_config()?;
         if let Some(port) = eez_p2p::listen_port_from_env()? {
             // No discv5 config means discovery is off; static EEZ_P2P_PEERS still work.
-            config.discovery_v5_config = config
-                .discovery_v5_config
-                .take()
-                .map(|c| advertise(c, port));
+            match config.discovery_v5_config.take() {
+                Some(discv5) => config.discovery_v5_config = Some(advertise(discv5, port)),
+                None if eez_p2p::peers_from_env()?.is_empty() => event!(
+                    name: "eez.p2p.no_peers",
+                    Level::WARN,
+                    "p2p overlay has no peers: discovery disabled and EEZ_P2P_PEERS empty",
+                ),
+                None => {}
+            }
         }
         let handle = ctx.start_network(NetworkManager::builder(config).await?, pool);
         event!(
