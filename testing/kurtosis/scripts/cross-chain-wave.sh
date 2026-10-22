@@ -20,7 +20,7 @@ export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 K="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="$(cd "$K/../.." && pwd)"
 ENCLAVE="${KURTOSIS_ENCLAVE:-eez-ci}"
-LOG_DIR="$REPO/datadir/smoke-logs"
+LOG_DIR="${EEZ_WAVE_LOG_DIR:-$REPO/datadir/smoke-logs}"
 mkdir -p "$LOG_DIR"
 
 MODE="${EEZ_WAVE_MODE:-mixed}"
@@ -370,6 +370,9 @@ run_waves() {
             else OUT_HASHES+=("$hash"); OUT_NONCE=$((OUT_NONCE + 1)); fi
         fi
         TX_META+=("$hash|$side|$kind|$arg")
+        if [[ -n "${EEZ_WAVE_TX_MANIFEST:-}" && "$kind" != rev ]]; then
+            printf '%s|%s\n' "$hash" "$side" >>"$EEZ_WAVE_TX_MANIFEST"
+        fi
     }
 
     submit_pure_filler() {

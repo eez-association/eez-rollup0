@@ -30,6 +30,12 @@ def run(plan, args):
     if prover_backend not in ["stateless", "stateful"]:
         fail("eez.prover_backend must be 'stateless' or 'stateful'")
 
+    settlement_profile = eez.get("settlement_profile", "calldata")
+    if settlement_profile not in ["calldata", "blob"]:
+        fail("eez.settlement_profile must be 'calldata' or 'blob'")
+    if settlement_profile == "blob" and prover_backend != "stateless":
+        fail("the blob E2E lane requires the stateless proof signer")
+
     poster_key = eez.get("poster_key", "")
     proof_signer_key = eez.get("proof_signer_key", "")
     recovery_address = eez.get("recovery_address", "")
@@ -93,6 +99,7 @@ def run(plan, args):
             "EEZ_L2_RECOVERY_ADDRESS": recovery_address,
             "EEZ_DEPLOYMENTS_FILE": "/out/deployments.env",
             "EEZ_GENESIS_OUT": "/out/l2-genesis.json",
+            "EEZ_SETTLEMENT_PROFILE": settlement_profile,
         },
         run="mkdir -p /out && bash /repo/scripts/deploy.sh && cp -R /repo/contracts/broadcast /out/foundry-broadcast",
         store=[StoreSpec(src="/out", name="eez-deployments")],
@@ -110,6 +117,21 @@ def run(plan, args):
         ]
     )
 
+    signer_env = {
+        "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+        "RUST_LOG": eez.get("proof_signer_rust_log", "info"),
+    }
+    signer_files = {"/out": deploy.files_artifacts[0]}
+    if settlement_profile == "blob":
+        signer_files["/genesis"] = "el_cl_genesis_data"
+        signer_env.update({
+            "EEZ_L1_RPC_URL": l1_el.rpc_http_url,
+            "EEZ_L1_CHAIN_ID": chain_id,
+            "EEZ_L1_CHAIN_CONFIG": "/genesis/genesis.json",
+            "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
+            "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 2000)),
+        })
+
     prover_service = "eez-proof-signer"
     if prover_backend == "stateless":
         plan.add_service(
@@ -123,13 +145,8 @@ def run(plan, args):
                         wait="2m",
                     ),
                 },
-                files={
-                    "/out": deploy.files_artifacts[0],
-                },
-                env_vars={
-                    "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
-                    "RUST_LOG": eez.get("proof_signer_rust_log", "info"),
-                },
+                files=signer_files,
+                env_vars=signer_env,
                 entrypoint=["/bin/sh", "-c"],
                 cmd=[signer_cmd],
             ),
@@ -224,6 +241,12 @@ def run(plan, args):
         "EEZ_L2_P2P_PORT": str(L2_P2P_PORT),
         "EEZL2_ADDRESS": "0x4200000000000000000000000000000000000007",
     }
+
+    if settlement_profile == "blob":
+        eez_env.update({
+            "EEZ_L1_BEACON_URL": participants[0].cl_context.beacon_http_url,
+            "EEZ_L1_MAX_FEE_PER_BLOB_GAS": str(eez.get("max_fee_per_blob_gas", 1000000000)),
+        })
 
     node_cmd = " ".join(
         [
