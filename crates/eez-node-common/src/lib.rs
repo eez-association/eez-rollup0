@@ -6,6 +6,8 @@ use reth_ethereum_cli::{chainspec::EthereumChainSpecParser, interface::Cli};
 use reth_node_builder::{NodeBuilder, WithLaunchContext};
 use tracing::{Level, event};
 
+mod discovery;
+pub use discovery::{ENR_KEY, EezNetworkBuilder, discover, overlay_addr};
 mod node;
 pub use node::EezNode;
 mod rpc;
@@ -33,7 +35,8 @@ pub struct NoRoleArgs {}
 ///
 /// # Errors
 ///
-/// Returns an error when command-line arguments are invalid.
+/// Returns an error when command-line arguments are invalid, or when discovery
+/// is on without `--bootnodes`.
 pub fn node_cli<Ext>() -> eyre::Result<Cli<EthereumChainSpecParser, Ext>>
 where
     Ext: clap::Args + std::fmt::Debug,
@@ -48,18 +51,38 @@ where
         }
     }
 
+    let argv = l2_args(std::env::args().collect())?;
+    Ok(Cli::<EthereumChainSpecParser, Ext>::try_parse_from(argv)?)
+}
+
+/// Appends the flags every L2 node runs with and refuses reth's mainnet bootnodes.
+fn l2_args(mut argv: Vec<String>) -> eyre::Result<Vec<String>> {
     // Engine API FCUs may intentionally unwind the L2 head during recovery.
-    let mut argv: Vec<String> = std::env::args().collect();
+    // Transactions enter only through the sequencer's ingress, never devp2p gossip.
     for flag in [
         "--engine.always-process-payload-attributes-on-canonical-head",
         "--engine.allow-unwind-canonical-header",
+        "--disable-tx-gossip",
     ] {
-        if !argv.iter().any(|a| a == flag) {
+        if !has_flag(&argv, flag) {
             argv.push(flag.to_owned());
         }
     }
+    // reth turns discovery off under --dev; otherwise it falls back to mainnet bootnodes.
+    let discovery = !has_flag(&argv, "--disable-discovery") && !has_flag(&argv, "--dev");
+    if discovery && !has_flag(&argv, "--bootnodes") {
+        eyre::bail!(
+            "discovery is on but --bootnodes is not set; reth would dial Ethereum mainnet bootnodes"
+        );
+    }
+    Ok(argv)
+}
 
-    Ok(Cli::<EthereumChainSpecParser, Ext>::try_parse_from(argv)?)
+fn has_flag(argv: &[String], flag: &str) -> bool {
+    argv.iter().any(|a| {
+        a.strip_prefix(flag)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
+    })
 }
 
 /// Warn about obsolete runtime role selectors now replaced by explicit binaries.
@@ -188,5 +211,49 @@ pub async fn wait_for_l1_ready(
             ));
         }
         tokio::time::sleep(POLL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(extra: &[&str]) -> Vec<String> {
+        ["eez", "node"]
+            .iter()
+            .chain(extra)
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn cli_requires_bootnodes_with_discovery() {
+        let err = l2_args(args(&[])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "discovery is on but --bootnodes is not set; reth would dial Ethereum mainnet bootnodes"
+        );
+        for ok in [
+            &["--bootnodes", "enode://x@127.0.0.1:30303"][..],
+            &["--bootnodes=enode://x@127.0.0.1:30303"],
+            &["--disable-discovery"],
+            &["--dev"],
+        ] {
+            assert!(l2_args(args(ok)).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn cli_adds_disable_tx_gossip() {
+        for extra in [
+            &["--disable-discovery"][..],
+            &["--disable-discovery", "--disable-tx-gossip"],
+        ] {
+            let argv = l2_args(args(extra)).unwrap();
+            assert_eq!(
+                argv.iter().filter(|a| *a == "--disable-tx-gossip").count(),
+                1
+            );
+        }
     }
 }
