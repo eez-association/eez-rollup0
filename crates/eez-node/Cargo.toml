@@ -19,6 +19,7 @@ eez-protocol.workspace      = true
 eez-prover.workspace        = true
 eez-prover-client.workspace = true
 eez-seq-sig.workspace       = true
+eez-p2p.workspace            = true
 
 # reth
 reth-chainspec.workspace                  = true
