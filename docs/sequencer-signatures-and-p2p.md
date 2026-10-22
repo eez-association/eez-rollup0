@@ -274,43 +274,95 @@ in `docker-compose.chiado-node.yml:156`).
 
 ## p2p-v0 (PR 2)
 
-**Overlay (consensus layer).** libp2p gossipsub over TCP/Noise/Yamux. The
-setup is reused from the closed #119.
+**Overlay (consensus layer).** Crate `eez-p2p`: libp2p 0.56 gossipsub over
+TCP/Noise/Yamux. The transport setup is reused from the closed #119. 0.56
+rather than 0.57 keeps libp2p-identity and multiaddr at the versions reth's
+discv5 uses.
 
+- **Switch:** a node joins the overlay when `EEZ_P2P_LISTEN`, a TCP
+  multiaddr, is set. A composer with `EEZ_P2P_LISTEN` but no
+  `EEZ_SEQUENCER_KEY` refuses to start.
+- **Identity:** the overlay uses the node's reth secp256k1 key, the same one
+  as its devp2p identity. Each node therefore has one identity, and the peer
+  id follows from the ENR public key.
+- **Discovery:** through reth's discv5.
+  - Each node adds an `eez` entry, the RLP of its overlay TCP port, to its
+    ENR at network build time, through a custom network builder.
+  - Every 5 s the overlay reads the discv5 table, and dials ENRs that carry
+    the entry and our fork id.
+  - `EEZ_P2P_PEERS` adds static `/…/p2p/<id>` peers, for nodes that run with
+    discovery off, e.g. a sequencer behind relays.
+- **Publishing:** the composer publishes from the signed-head store's
+  `watch`. It accepts heads signed by its own key, since several composers
+  may share it. Every node relays.
 - **Topic:** `/eez/<l2 chain id>/<rollup id>/heads/0`.
-- **Message:** Snappy-compressed RLP of the envelope, capped at 10 MiB.
-- **Publishing:** the sequencer publishes from the `watch`. Every node relays.
-- **Relay rule:** gossipsub relays only after the node validates the message
-  (`validate_messages`):
-  - Accept for a signature from the configured address whose counter is at or
-    above its source's latest. An exact copy is accepted, so a head the node
-    learned first over RPC still propagates; gossipsub's seen-cache drops
-    true duplicates. Every source's heads propagate, not only the preferred
-    one's.
-  - Ignore for a head older than its source's latest, or a future epoch.
-  - Reject, with a peer penalty, for bad encoding, a signature from any other
-    address, or an equivocation.
-- **Identity:** a persistent libp2p identity key in the datadir, so bootnode
-  addresses survive restarts. The listen address and bootnodes come from env.
-- **Never blocking:** inbound envelopes reach the fork choice via a bounded
-  `try_send`; overflow is dropped, counted and WARNed. Nothing in the swarm
-  loop awaits a full channel.
+- **Message:** raw Snappy of the RLP envelope `[head, signature, block]`,
+  where an empty `block` means none, capped at 10 MiB.
+- **Authentication:** gossipsub runs anonymous (`ValidationMode::Anonymous`),
+  because the sequencer signature is the authentication. The message id is
+  the SHA-256 of the data.
+- **Relay rule:** gossipsub forwards a message only after the node reports a
+  verdict (`validate_messages`):
+  - **Accept:** a valid envelope from the authorized address whose counter is
+    at or above its source's latest.
+    - An exact copy is accepted, so a head the node learned first over RPC
+      still propagates. Gossipsub's seen-cache drops true duplicates.
+    - Every source's heads propagate, not only the preferred one's.
+  - **Ignore:** a head older than its source's latest, or a future epoch.
+  - **Reject:** undecodable, the wrong signer, or an equivocation. v0 does not
+    score peers, so Reject only stops the message; penalties come with peer
+    scoring.
+- **Never blocking:** accepted heads reach the follower through a bounded
+  channel with `try_send`; overflow is dropped and WARNed. The swarm loop
+  never awaits a channel.
 
-**Block fetch (execution layer).** L2 reth nodes peer over devp2p, using
-trusted peers or bootnodes instead of today's `--disable-discovery`.
+**Block fetch (execution layer).** L2 reth nodes find each other over discv5
+with our own `--bootnodes`. Discovered peers open eth sessions with each
+other.
 
-- **Transaction gossip:** `--disable-tx-gossip` is mandatory. Otherwise a
-  transaction sent to a follower reaches the sequencer's pool without passing
-  the IngressLayer.
-- **Fetching:** missing blocks are fetched by hash through reth's
-  `FetchClient`: headers in reverse from the hash, then bodies, checked by
-  hash before import.
+- **Mainnet fallback guard:** `node_cli` refuses to start with discovery on
+  and no `--bootnodes`. Otherwise reth falls back to Ethereum mainnet's
+  bootnodes for a custom chain.
+- **Discovery off:** `--trusted-peers` still works.
+- **Transaction gossip:** every L2 node runs with `--disable-tx-gossip`, which
+  `node_cli` adds itself. Transactions therefore enter only through the
+  sequencer's IngressLayer. Followers forwarding `eth_sendRawTransaction` to
+  the sequencer is a separate feature.
+- **Fetching:** with the overlay on, a follower fetches missing blocks only
+  from peers, through reth's `FetchClient`. It checks the header hash and the
+  body against the header. The RPC block source exists only in RPC mode.
 - **Peers:** a fetch runs only when `num_connected_peers() > 0`, and it is
-  time-boxed, because reth's fetcher queues forever without peers.
-- **Configs:** testkit, docker-compose and kurtosis are updated.
+  time-boxed, because reth queues requests forever without peers.
+- **`advance_unsafe_head`** (used only by #206's stateful backend) still
+  accepts SYNCING. With devp2p peers, reth could then sync an unknown target
+  itself while the committer's head stays stale. #206's integration owns
+  that call.
 
 **Follower.** Heads arrive from gossip and from the RPC poller. Both feed the
-same machine, and the highest version wins.
+same tracker, and the highest version wins.
+
+**Configs.** The testkit gains per-node extra CLI args and leased devp2p and
+discv5 ports. Deployment configs have no L2 follower service yet, so they
+don't change.
+
+**Multi-client.** Signatures are checked in our consensus layer, which drives
+the execution client over the engine API. Block data uses the standard eth
+protocol, and discovery is standard discv5. Nethermind or Erigon would run as
+execution clients behind an eez node, whose own discv5 carries the same `eez`
+entry. They would need eez block support, such as the native `0x76` system
+transaction, but no part of this overlay.
+
+**Tests:**
+- **Unit:** codec, verdicts.
+- **Crate integration** (static peers):
+  - heads relay through a middle node that never drains its inbound channel;
+  - a rogue flood doesn't stall the publisher;
+  - a peer started late is dialed.
+- **e2e:** three nodes find each other from the seed's bootnode alone.
+  Follower B has no RPC, starts late, and fetches its missing ancestors from
+  peers.
+
+**Budget:** about 1.4k lines.
 
 ## Follower modes
 
@@ -322,7 +374,7 @@ and moves the unsafe head itself (#206), so it must be the only unsafe writer.
 |---|---|---|---|
 | main today | `EEZ_SEQUENCER_RPC` | the RPC | startup error (`eez-follower/src/lib.rs:70-75`) |
 | seq-sig-v0 | `EEZ_SEQUENCER_RPC`; it now also requires `EEZ_SEQUENCER_ADDRESS` | the RPC | startup error, as before |
-| p2p-v0 | `EEZ_SEQUENCER_ADDRESS` | `EEZ_SEQUENCER_RPC` and/or `EEZ_P2P_BOOTNODES` | startup error |
+| p2p-v0 | `EEZ_SEQUENCER_ADDRESS` | `EEZ_SEQUENCER_RPC` and/or `EEZ_P2P_LISTEN` | startup error |
 
 Startup rules:
 - **Neither switch:** an L1-derived-only follower.
@@ -330,21 +382,6 @@ Startup rules:
   - an address without a source is a startup error;
   - a source without an address is a startup error;
   - a stateful-prover follower doesn't join the overlay.
-
-**Multi-client.** Signatures are checked in our consensus layer, which drives
-the execution client over the engine API. Block data uses the standard eth
-protocol. Nethermind or Erigon would run as execution clients behind an eez
-node. They would need eez block support, such as the native `0x76` system
-transaction, but no part of this overlay.
-
-**Tests:**
-- **Unit:** codec and validation outcomes.
-- **e2e, relay:** sequencer plus two followers, with follower B peered only to
-  follower A. Heads and a replacement reach B.
-- **e2e, junk flood:** more than 128 junk messages at the composer; it keeps
-  producing. This is the negative control for the back-pressure anti-goal.
-
-**Budget:** about 1.8k lines.
 
 ## sync-v0 (PR 3, to be designed)
 
@@ -387,6 +424,23 @@ derivation time (measure first).
 - The head follower is enabled by address plus a source, and the stateful
   exclusion keys on it.
 - Nethermind/Erigon as execution clients behind an eez node.
+
+**Owner, for p2p-v0:**
+- Overlay discovery runs through reth's discv5.
+- There is no RPC fallback for blocks in p2p mode.
+- Discovery is on.
+- Sequencer promote/demote is manual, in its own later PR.
+
+**Mine, for p2p-v0:**
+- Anonymous gossipsub, with the sequencer signature as the only
+  authentication.
+- Reject without peer penalties until peer scoring lands.
+- `EEZ_P2P_LISTEN` as the overlay switch, and a startup error for a composer
+  that sets it without a key.
+- The reth node key as the overlay identity.
+- `--disable-tx-gossip` forced, and the mainnet-bootnode fallback refused, by
+  `node_cli`.
+- Deployment configs unchanged until an L2 follower service exists.
 
 **Left to the builder:**
 - Module layout inside the crates.
