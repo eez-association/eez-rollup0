@@ -444,6 +444,8 @@ derivation time (measure first).
 - `--disable-tx-gossip` forced, and the mainnet-bootnode fallback refused, by
   `node_cli`.
 - Deployment configs unchanged until an L2 follower service exists.
+- Discovered peers are dialed only while fewer than 16 are connected.
+- Inbound overlay connections are capped at 64, one per peer.
 
 **Left to the builder:**
 - Module layout inside the crates.
