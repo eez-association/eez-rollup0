@@ -6,11 +6,11 @@ use crate::wire;
 /// Gossip verdict for one received message.
 #[derive(Debug)]
 pub enum Verdict {
-    /// Valid and not stale; forward it.
+    /// Newer than its source's latest head; forward it.
     Accept(Envelope),
-    /// Harmless but not worth forwarding (stale or future).
+    /// Already seen, stale or future: harmless but not worth forwarding.
     Ignore,
-    /// Invalid; the sender is penalised.
+    /// Invalid; not forwarded. v0 does not score peers.
     Reject(String),
 }
 
@@ -41,8 +41,10 @@ impl Validator {
             Err(e) => return Verdict::Reject(e.to_string()),
         };
         match self.tracker.observe(verified, now_ms) {
-            Observation::New | Observation::Duplicate => Verdict::Accept(envelope),
-            Observation::Stale | Observation::Future => Verdict::Ignore,
+            Observation::New => Verdict::Accept(envelope),
+            // A seen head is ignored however it is encoded: Snappy has many encodings
+            // of one payload, and relaying each would let a peer flood the mesh.
+            Observation::Duplicate | Observation::Stale | Observation::Future => Verdict::Ignore,
             Observation::Equivocation { kept } => {
                 Verdict::Reject(format!("equivocation, kept {kept}"))
             }
@@ -86,6 +88,23 @@ mod tests {
         wire::encode(&envelope).unwrap()
     }
 
+    /// The same payload as `data`, Snappy-encoded as one-byte literals.
+    fn reencode(data: &[u8]) -> Vec<u8> {
+        let raw = snap::raw::Decoder::new().decompress_vec(data).unwrap();
+        let mut out = Vec::new();
+        let mut len = raw.len();
+        while len >= 0x80 {
+            out.push((len as u8) | 0x80);
+            len >>= 7;
+        }
+        out.push(len as u8);
+        for byte in raw {
+            // Tag 0 is a literal of length 1.
+            out.extend([0, byte]);
+        }
+        out
+    }
+
     #[test]
     fn garbage_is_rejected() {
         let mut v = Validator::new(DOMAIN, key(1).address());
@@ -98,7 +117,10 @@ mod tests {
         let mut v = Validator::new(DOMAIN, k0.address());
         let first = msg(&k0, 100, 1, 1);
         assert!(matches!(v.check(&first, 1_000), Verdict::Accept(_)));
-        assert!(matches!(v.check(&first, 1_000), Verdict::Accept(_)));
+        assert!(matches!(v.check(&first, 1_000), Verdict::Ignore));
+        let copy = reencode(&first);
+        assert_ne!(copy, first);
+        assert!(matches!(v.check(&copy, 1_000), Verdict::Ignore));
         assert!(matches!(
             v.check(&msg(&k0, 100, 0, 1), 1_000),
             Verdict::Ignore
