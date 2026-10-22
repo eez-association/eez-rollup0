@@ -16,13 +16,18 @@ pub enum WireError {
 }
 
 #[derive(RlpEncodable, RlpDecodable)]
-struct WireEnvelope {
+struct WireHead {
     rollup_id: u64,
     number: u64,
     block_hash: B256,
     parent_hash: B256,
     epoch_ms: u64,
     counter: u64,
+}
+
+#[derive(RlpEncodable, RlpDecodable)]
+struct WireEnvelope {
+    head: WireHead,
     signature: Bytes,
     // Empty means no block.
     block: Bytes,
@@ -32,12 +37,14 @@ struct WireEnvelope {
 pub fn encode(envelope: &Envelope) -> Result<Vec<u8>, WireError> {
     let h = &envelope.head;
     let wire = WireEnvelope {
-        rollup_id: h.rollup_id,
-        number: h.number,
-        block_hash: h.block_hash,
-        parent_hash: h.parent_hash,
-        epoch_ms: h.epoch_ms,
-        counter: h.counter,
+        head: WireHead {
+            rollup_id: h.rollup_id,
+            number: h.number,
+            block_hash: h.block_hash,
+            parent_hash: h.parent_hash,
+            epoch_ms: h.epoch_ms,
+            counter: h.counter,
+        },
         signature: envelope.signature.clone(),
         block: envelope.block.clone().unwrap_or_default(),
     };
@@ -46,9 +53,13 @@ pub fn encode(envelope: &Envelope) -> Result<Vec<u8>, WireError> {
     if rlp.len() > MAX_MESSAGE_SIZE {
         return Err(WireError::TooLarge(rlp.len()));
     }
-    snap::raw::Encoder::new()
+    let compressed = snap::raw::Encoder::new()
         .compress_vec(&rlp)
-        .map_err(|e| WireError::Snappy(e.to_string()))
+        .map_err(|e| WireError::Snappy(e.to_string()))?;
+    if compressed.len() > MAX_MESSAGE_SIZE {
+        return Err(WireError::TooLarge(compressed.len()));
+    }
+    Ok(compressed)
 }
 
 /// Inverse of [`encode`]; never panics on malformed input.
@@ -67,12 +78,12 @@ pub fn decode(data: &[u8]) -> Result<Envelope, WireError> {
     }
     Ok(Envelope {
         head: HeadClaim {
-            rollup_id: w.rollup_id,
-            number: w.number,
-            block_hash: w.block_hash,
-            parent_hash: w.parent_hash,
-            epoch_ms: w.epoch_ms,
-            counter: w.counter,
+            rollup_id: w.head.rollup_id,
+            number: w.head.number,
+            block_hash: w.head.block_hash,
+            parent_hash: w.head.parent_hash,
+            epoch_ms: w.head.epoch_ms,
+            counter: w.head.counter,
         },
         signature: w.signature,
         block: (!w.block.is_empty()).then_some(w.block),
@@ -104,6 +115,22 @@ mod tests {
             let e = envelope(block);
             assert_eq!(decode(&encode(&e).unwrap()).unwrap(), e);
         }
+    }
+
+    #[test]
+    fn layout_is_head_signature_block() {
+        let rlp = snap::raw::Decoder::new()
+            .decompress_vec(&encode(&envelope(None)).unwrap())
+            .unwrap();
+        let outer = alloy_rlp::Header::decode(&mut rlp.as_slice()).unwrap();
+        assert!(outer.list);
+        let mut payload = &rlp[rlp.len() - outer.payload_length..];
+        let head = alloy_rlp::Header::decode(&mut payload).unwrap();
+        assert!(head.list);
+        payload = &payload[head.payload_length..];
+        assert_eq!(Bytes::decode(&mut payload).unwrap().len(), 65);
+        assert_eq!(Bytes::decode(&mut payload).unwrap().len(), 0);
+        assert!(payload.is_empty());
     }
 
     #[test]
