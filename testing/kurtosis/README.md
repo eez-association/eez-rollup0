@@ -4,6 +4,13 @@ This package runs a disposable local EEZ network for development and testing.
 It deploys the protocol contracts, generates a deployment-bound L2 genesis, and
 starts the node, proof signer, private PoS L1, and MEV builder stack.
 
+Both CI profiles intentionally use 12-second L1 slots and 2-second L2 blocks.
+They set the Gnosis blob target/maximum to 1/2 and the fee update fraction to
+1112826, with Ethereum's default BPO increase disabled. The L1 is still a
+private Ethereum network: it does not reproduce Gnosis consensus, reward
+contracts, or its 1-gwei minimum blob fee. Use the Chiado deployment path for
+validation against an actual Gnosis chain.
+
 The included configuration contains deterministic private-network keys. Never
 use these keys on a public network or fund them with real assets.
 
@@ -595,3 +602,57 @@ Kurtosis assigns different host ports automatically. Remember that
 - `scripts/verify-state-chaining.sh`: ordered same-Sync-block state-chaining regression.
 - `scripts/verify-fault-recovery.sh`: proof-signer outage, node restart, and exact safe-prefix replay.
 - `scripts/verify-ingress-admission.sh`: live L1 front nonce-gap rejection and contiguous recovery.
+
+### Shared settlement scenarios
+
+Both lanes call `scripts/verify-cross-chain-waves.sh` for inbound, outbound,
+mixed, mixed-pure, and state-chaining workloads. They also call the existing
+nonce-gap admission and fault-recovery scripts directly. Deployment and
+carrier-specific checks stay in each lane's runner.
+
+The wave suite optionally records L1 block ranges and submitted transaction
+manifests when `EEZ_SETTLEMENT_SCENARIOS` is set. The blob lane uses this evidence
+for its carrier checks. The calldata lane keeps its existing workload order
+and counts.
+
+### Blob settlement E2E
+
+The calldata lane remains `bash testing/kurtosis/run-ci.sh` with `ci-args.yaml`.
+Run the separate blob lane with:
+
+```bash
+bash testing/kurtosis/run-blob-ci.sh
+```
+
+`blob-args.yaml` selects the candidate-V1 manager and settlement wrapper,
+chain 7332, and a Lighthouse supernode for full blob retrieval. The runner uses
+`eez-blob-ci`, `:blob-ci` images, enclave-local deployment artifacts and datadirs,
+and `artifacts/kurtosis-blob-e2e` for results and wave logs. It refuses to reuse
+an existing enclave or the default calldata enclave. Both lanes can run on the
+same host with their defaults.
+
+The blob lane runs the shared settlement scenarios, then the explicitly
+selected `blob_settlement` integration target. For each wave's L1 block range,
+that target checks successful type-3 wrapper transactions, empty batch
+calldata, exact ordered blob hashes, beacon data pinned to the execution block,
+KZG-derived commitments, decoded actions bound to the on-chain entries,
+outbound transaction bytes in DA, and inbound receipt consumption events
+matching the applied blob entries.
+The shared waves check transaction effects and convergence of the L1 commitment
+with the L2 safe block hash. `blob-evidence.json` records the verified carriers.
+These waves do not guarantee multi-blob coverage or exercise malformed wrapper
+submissions; those require dedicated workloads beyond this lane.
+
+The target is excluded from ordinary integration runs by `required-features`.
+To check an already running blob enclave, source its deployment artifact and set
+`EEZ_L1_RPC_URL`, `EEZ_L1_CHAIN_ID`, `EEZ_L1_BEACON_URL`, `EEZ_SETTLEMENT_SCENARIOS`
+(the runner's `scenarios.json`) and `EEZ_BLOB_EVIDENCE` (an output path), then run:
+
+```bash
+cargo test --locked -p eez-node-e2e --features blob-e2e --test blob_settlement
+```
+
+CI uses the existing nextest archive mechanism, with a separate blob archive
+so the calldata test selection stays unchanged. Only the blob Kurtosis job
+installs Rust and nextest. `EEZ_BLOB_TEST_ARCHIVE` selects the prebuilt archive;
+a missing archive fails rather than rebuilding during the run.
