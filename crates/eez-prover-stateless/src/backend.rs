@@ -254,11 +254,11 @@ impl Backend {
             // Before this call the decoded block and witness remain untrusted.
             // Successful Stateless output means consensus, witness pre-state,
             // execution receipts, and the recomputed post-state commitment all
-            // passed. Empty and system-transaction candidates include the anchor checkpoint.
+            // passed. Only Sync candidates use the checkpoint path.
             let witness = std::mem::take(witness);
             let checkpoint_plan = checkpoint_plan.filter(|plan| !plan.positions().is_empty());
             let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
-                Some(plan) => {
+                Some(plan) if !plan.positions().is_empty() => {
                     let output = stateless_validation_recovered_with_state_checkpoints(
                         recovered_block.execution_input(),
                         witness,
@@ -280,7 +280,7 @@ impl Backend {
                     plan.verify_returned(&checkpoints)?;
                     (output.validation, checkpoints)
                 }
-                None => {
+                _ => {
                     let output = stateless_validation_recovered(
                         recovered_block.execution_input(),
                         witness,

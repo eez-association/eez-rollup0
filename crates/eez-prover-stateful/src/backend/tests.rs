@@ -207,12 +207,10 @@ async fn block_validation_reuses_reth_and_backend_checkpoints_without_execution(
                 .iter()
                 .map(|checkpoint| checkpoint.at)
                 .collect::<Vec<_>>(),
-            if kind == "sync" {
-                vec![CheckpointAt::PreExecution, CheckpointAt::Transaction(0)]
-            } else if kind == "empty" {
-                vec![CheckpointAt::PreExecution]
-            } else {
-                Vec::new()
+            match kind {
+                "sync" => vec![CheckpointAt::PreExecution, CheckpointAt::Transaction(0)],
+                "empty" => vec![CheckpointAt::PreExecution],
+                _ => Vec::new(),
             },
         );
         assert_eq!(output.hash(), input.claimed_hash());

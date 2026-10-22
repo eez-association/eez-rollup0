@@ -717,8 +717,8 @@ fn checkpoint_plan_is_derived_from_recovered_transactions() {
     );
 }
 
-/// Every nonempty plan includes the final transaction, which activates
-/// Stateless's post-execution-neutrality check. Ordinary blocks need no plan.
+/// Nonempty Sync blocks include the final transaction, activating Stateless's
+/// post-execution-neutrality check. Empty blocks need only the anchor checkpoint.
 #[test]
 fn checkpoint_plan_is_empty_or_ends_at_the_final_transaction() {
     let system = || {
@@ -750,6 +750,10 @@ fn checkpoint_plan_is_empty_or_ends_at_the_final_transaction() {
             let recovered = RecoveredBlock::new_unhashed(block, vec![TEST_SYSTEM_ADDRESS; width]);
             let (plan, _) = CheckpointPlan::for_block(&recovered, TEST_SYSTEM_ADDRESS);
 
+            if width == 0 {
+                assert_eq!(plan.positions(), [CheckpointAt::PreExecution]);
+                continue;
+            }
             if mask == 0 {
                 assert_eq!(
                     plan.positions(),
@@ -897,7 +901,7 @@ fn validates_the_golden_block_through_stateless() {
         block.transaction_state_checkpoints(),
         [StateCheckpoint {
             at: CheckpointAt::PreExecution,
-            state_root: block.as_anchor().state_root,
+            state_root: block.post_state_root(),
             block_hash: block.hash(),
         }],
         "an empty terminal's Prague checkpoint must seal the validated block",

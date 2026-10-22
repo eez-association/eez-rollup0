@@ -86,11 +86,11 @@ and sender coverage against the retained decoded transactions, outbound-event
 bounds/order, checkpoint bounds/order, and empty checkpoint selections for v1
 preceding blocks. A malformed success is an internal contract failure and never
 becomes a reusable checked block. In v2, the shared planner requests checkpoints
-only for blocks containing native system transactions: every valid nonempty
-Sync has those transactions, and an empty Sync needs no checkpoints. Ordinal
-blocks use ordinary execution (or reuse Reth's receipts) without checkpoint
-generation. This is only execution planning; settlement still verifies the
-selected terminal's full effect layout and rejects an Ordinal block presented
+for blocks containing native system transactions and for empty blocks: every
+valid nonempty Sync has those transactions, while an empty Sync needs its
+anchor checkpoint. Nonempty ordinary blocks use regular execution without
+checkpoint generation. This is only execution planning; settlement still
+verifies the selected terminal's full effect layout and rejects an Ordinal block presented
 as a nonempty Sync. The decision depends on block bytes, not on a caller flag,
 so cached results have the same checkpoint policy across sessions.
 Stateless stores checked blocks; stateful leaves blocks/receipts in

@@ -5,10 +5,10 @@
 //! `eth_sendBundle` pins inclusion to one L1 block. If the bundle
 //! isn't in that block we report [`SendOutcome::Dropped`] and the
 //! Composer rebuilds on the next tick with a fresh target + nonce.
-//! Real Flashbots-style relays don't consume the nonce on miss; the
-//! anvil-side `scripts/builder-stub.py` does (it forwards via
-//! `eth_sendRawTransaction`), but the cursor-race guard +
-//! `pending` nonce read keep both paths correct.
+//! Real Flashbots-style relays don't consume the nonce on miss; nor does
+//! the anvil-side `scripts/builder-stub.py` (it mines bundles
+//! atomically), and the cursor-race guard + `pending` nonce read keep
+//! both paths correct.
 
 use std::sync::Arc;
 use std::time::Duration;
