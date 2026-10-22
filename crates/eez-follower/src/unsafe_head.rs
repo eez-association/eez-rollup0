@@ -30,7 +30,7 @@ use eez_primitives::{Block, BlockBody, engine::EezEngineTypes};
 use eez_seq_sig::{Envelope, HeadDomain, HeadTracker, Observation, decode_block};
 use reth_consensus_common::validation::validate_body_against_header;
 use reth_network_p2p::{
-    BodiesClient, HeadersClient, error::PeerRequestResult, headers::client::HeadersRequest,
+    BodiesClient, HeadersClient, error::RequestResult, headers::client::HeadersRequest,
     priority::Priority,
 };
 use reth_payload_primitives::PayloadTypes as _;
@@ -170,20 +170,22 @@ where
         count: u64,
     ) -> Result<Vec<SealedBlock<Block>>, FollowerError> {
         if self.client.num_connected_peers() == 0 {
-            return Ok(Vec::new());
+            return Err(FollowerError::Peer("no connected devp2p peers".into()));
         }
         let request = HeadersRequest::falling(from.into(), count);
-        let headers = peer_request(
+        let (peer, headers) = peer_request(
             self.client
                 .get_headers_with_priority(request, Priority::High),
         )
-        .await?;
+        .await?
+        .split();
         // Keep the run that links back from `from`, so bodies are asked only for it.
         let mut chain: Vec<SealedHeader> = Vec::new();
         let mut expected = from;
         for header in headers.into_iter().take(count as usize) {
             let header = SealedHeader::seal_slow(header);
             if header.hash() != expected {
+                self.client.report_bad_message(peer);
                 break;
             }
             expected = header.parent_hash;
@@ -197,13 +199,17 @@ where
                 .take(FETCH_BATCH as usize)
                 .map(SealedHeader::hash)
                 .collect();
-            let bodies = peer_request(self.client.get_block_bodies(hashes)).await?;
+            let (peer, bodies) = peer_request(self.client.get_block_bodies(hashes))
+                .await?
+                .split();
             if bodies.is_empty() {
                 break;
             }
             for (header, body) in pending.iter().zip(bodies) {
-                validate_body_against_header(&body, header.header())
-                    .map_err(|e| FollowerError::Peer(format!("body {}: {e}", header.hash())))?;
+                if let Err(e) = validate_body_against_header(&body, header.header()) {
+                    self.client.report_bad_message(peer);
+                    return Err(FollowerError::Peer(format!("body {}: {e}", header.hash())));
+                }
                 blocks.push(SealedBlock::from_sealed_parts(header.clone(), body));
             }
         }
@@ -213,10 +219,10 @@ where
 
 /// One peer request, time-boxed by [`PEER_TIMEOUT`].
 async fn peer_request<T>(
-    request: impl Future<Output = PeerRequestResult<T>>,
+    request: impl Future<Output = RequestResult<T>>,
 ) -> Result<T, FollowerError> {
     match tokio::time::timeout(PEER_TIMEOUT, request).await {
-        Ok(Ok(response)) => Ok(response.into_data()),
+        Ok(Ok(response)) => Ok(response),
         Ok(Err(e)) => Err(FollowerError::Peer(e.to_string())),
         Err(_) => Err(FollowerError::Peer(format!(
             "no answer within {PEER_TIMEOUT:?}"
@@ -252,7 +258,7 @@ pub(crate) struct UnsafeHeadFollower<P, S> {
     domain: HeadDomain,
     /// The only signer whose heads are followed.
     sequencer_address: Address,
-    /// Cadence for polling the sequencer RPC for new signed heads.
+    /// Cadence for polling the sequencer RPC, if any, and retrying the target.
     poll_interval: Duration,
     tracker: HeadTracker,
     rejections: Rejections,
@@ -291,12 +297,21 @@ where
 
     pub(crate) async fn run(mut self) {
         let mut poll = tokio::time::interval(self.poll_interval);
+        // A slow fetch must not queue a burst of catch-up retries.
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut fcu_interval = tokio::time::interval(FCU_REFRESH);
         loop {
             let advanced = tokio::select! {
-                _ = poll.tick(), if self.sequencer_rpc.is_some() => self.poll_rpc().await,
+                // Ticks without an RPC too, so a gossip-only follower retries its target.
+                _ = poll.tick() => self.poll_rpc().await,
                 Some(envelope) = next_gossip(self.gossip.as_mut()) => {
                     self.observe(envelope);
+                    // Take the whole burst first, so one fetch serves the newest head.
+                    while let Some(envelope) =
+                        self.gossip.as_mut().and_then(|rx| rx.try_recv().ok())
+                    {
+                        self.observe(envelope);
+                    }
                     self.follow_best().await
                 }
                 _ = fcu_interval.tick() => {
@@ -672,7 +687,10 @@ mod tests {
     };
 
     use alloy_primitives::{BlockHash, BlockNumber};
+    use eez_primitives::{EezPrimitives, EezTxEnvelope};
     use reth_chainspec::ChainInfo;
+    use reth_network::primitives::BasicNetworkPrimitives;
+    use reth_network_p2p::NoopFullBlockClient;
     use reth_storage_api::{BlockHashReader, errors::provider::ProviderResult};
 
     use super::*;
@@ -1082,5 +1100,15 @@ mod tests {
         let hashes: Vec<_> = missing.blocks.iter().map(SealedBlock::hash).collect();
         let walked: Vec<_> = chain[1..].iter().map(SealedBlock::hash).collect();
         assert_eq!(hashes, walked);
+    }
+
+    #[tokio::test]
+    async fn peer_source_without_peers_errors() {
+        type Net = BasicNetworkPrimitives<EezPrimitives, EezTxEnvelope>;
+        let source = PeerBlocks::new(NoopFullBlockClient::<Net>::default());
+
+        let err = source.blocks_back(B256::ZERO, 1).await.unwrap_err();
+
+        assert_eq!(err.to_string(), "peer error: no connected devp2p peers");
     }
 }
