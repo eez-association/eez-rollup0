@@ -3844,6 +3844,8 @@ dependencies = [
  "reqwest 0.12.28",
  "reth-chainspec",
  "reth-ethereum-primitives",
+ "reth-network-peers",
+ "secp256k1 0.30.0",
  "serde_json",
  "tempfile",
  "tokio",
