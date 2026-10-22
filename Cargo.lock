@@ -3596,15 +3596,21 @@ dependencies = [
 name = "eez-p2p"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-signer",
  "alloy-signer-local",
  "eez-seq-sig",
+ "eyre",
+ "futures-util",
  "libp2p",
+ "reth-primitives-traits",
  "sha2 0.10.9",
  "snap",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
