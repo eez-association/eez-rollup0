@@ -293,10 +293,10 @@ where
             }
         }
 
-        // `sync_to` leaves the committer's mirrors alone; point them at the root.
-        let root_header = header_by_hash(provider, root)?;
-        committer.reorg_to(root_header.clone()).await?;
-        committer.advance_safe_finalized(root_header, root).await?;
+        // reth is at the root; an FCU here would still carry the old safe `f`.
+        committer
+            .adopt_synced(header_by_hash(provider, root)?)
+            .await?;
 
         // `f`'s parent, not `f`: a resume can replace `f` with an L1-settled sibling.
         if f.number > 0 && provider.block_hash(f.number - 1)? != Some(f.parent_hash) {

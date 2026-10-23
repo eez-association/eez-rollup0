@@ -85,6 +85,10 @@ enum CommitCommand<T: PayloadTypes> {
         target: B256,
         response: oneshot::Sender<DriverResult<ForkchoiceOutcome>>,
     },
+    AdoptSynced {
+        header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        response: oneshot::Sender<DriverResult<()>>,
+    },
     Derive {
         payload: <T as PayloadTypes>::ExecutionData,
         header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
@@ -457,6 +461,30 @@ where
             .map_err(|_| DriverError::CommitterClosed)?
     }
 
+    /// Points the head, safe and finalized mirrors at `header`, with no FCU.
+    /// Call only after [`Self::sync_to`] returned `Valid` for this header: reth
+    /// already holds head = safe = finalized = it.
+    ///
+    /// # Errors
+    ///
+    /// `committer_closed` if the actor is gone.
+    pub async fn adopt_synced(
+        &self,
+        header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+    ) -> DriverResult<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(CommitCommand::AdoptSynced {
+                header,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| DriverError::CommitterClosed)?;
+        response_rx
+            .await
+            .map_err(|_| DriverError::CommitterClosed)?
+    }
+
     /// Commit a Deriver-built [`ExecutionData`] via `newPayloadV3` +
     /// head-FCU. `safe` / `finalized` are unchanged; move them via
     /// [`Self::advance_safe_finalized`].
@@ -560,6 +588,12 @@ where
                 CommitCommand::SyncTo { target, response } => {
                     let result = self.process_sync_to(target).await;
                     let _ = response.send(result);
+                }
+                CommitCommand::AdoptSynced { header, response } => {
+                    self.finalized_hash = header.hash();
+                    self.safe_header = header.clone();
+                    self.set_head(header);
+                    let _ = response.send(Ok(()));
                 }
                 CommitCommand::Derive {
                     payload,
@@ -1000,6 +1034,28 @@ mod tests {
         assert_eq!(
             handle.sync_to(B256::repeat_byte(7)).await.unwrap(),
             ForkchoiceOutcome::Valid
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_synced_moves_every_mirror_without_an_fcu() {
+        let (engine, seen) = mock_engine(false);
+        let handle = spawn_committer(engine, sealed(0));
+        let synced = sealed(5);
+
+        handle.adopt_synced(synced.clone()).await.unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(handle.last_header().hash(), synced.hash());
+
+        handle.refresh_forkchoice().await.unwrap();
+        let next = seen.lock().unwrap()[0];
+        assert_eq!(
+            (
+                next.head_block_hash,
+                next.safe_block_hash,
+                next.finalized_block_hash
+            ),
+            (synced.hash(), synced.hash(), synced.hash())
         );
     }
 
