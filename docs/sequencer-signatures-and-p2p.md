@@ -519,10 +519,14 @@ bundle is rolled back. That is fixed on its own branch off main, not here.
     batch in between.
 
 **BlockCommitter.**
-- **New `sync_to(hash)`:** sends FCU(hash, hash, hash).
-  - SYNCING returns Syncing and changes nothing. The target is not kept for
-    later FCUs.
-  - VALID sets the head, safe and finalized mirrors from the provider.
+- **New `sync_to(hash)`:** sends FCU(hash, hash, hash) and changes no state.
+  - SYNCING returns Syncing. The target is not kept for later FCUs.
+  - After VALID, `adopt_synced(header)` sets the head, safe and finalized
+    mirrors to that block without another FCU; reth is already there.
+- **Boot waits for an idle engine.** A node killed mid-backfill restarts with
+  reth resuming it, and reth answers SYNCING to every FCU until it finishes.
+  Boot repeats a plain forkchoice refresh until reth is idle, logging a WARN,
+  before it sends anything else.
 - **SYNCING never counts as success** for a command that moves safe or
   finalized. `advance_safe_finalized` stores its cursors only on VALID; today
   it accepts SYNCING (`block_committer.rs:655-659`).
