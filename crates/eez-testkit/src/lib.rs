@@ -323,6 +323,16 @@ impl BundleStub {
         }
         Ok(())
     }
+
+    async fn set_ack_delay(&self, delay: Duration) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.url.parse()?);
+        let _: f64 = provider
+            .client()
+            .request("eez_setBundleAckDelay", (delay.as_secs_f64(),))
+            .await
+            .context("set builder stub ack delay")?;
+        Ok(())
+    }
 }
 
 impl Drop for BundleStub {
@@ -3770,6 +3780,18 @@ impl CrossChainWorld {
                 "world has no builder stub; start it with setup_cross_chain_with_builder_stub",
             )?
             .set_mode(mode)
+            .await
+    }
+
+    /// Delay the relay stub's answer to each bundle, so the composer's verdict
+    /// on it lags the L1 block it targets.
+    pub async fn set_builder_ack_delay(&self, delay: Duration) -> Result<()> {
+        self.builder
+            .as_ref()
+            .context(
+                "world has no builder stub; start it with setup_cross_chain_with_builder_stub",
+            )?
+            .set_ack_delay(delay)
             .await
     }
 }
