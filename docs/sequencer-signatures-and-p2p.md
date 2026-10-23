@@ -525,8 +525,10 @@ bundle is rolled back. That is fixed on its own branch off main, not here.
     mirrors to that block without another FCU; reth is already there.
 - **Boot waits for an idle engine.** A node killed mid-backfill restarts with
   reth resuming it, and reth answers SYNCING to every FCU until it finishes.
-  Boot repeats a plain forkchoice refresh until reth is idle, logging a WARN,
-  before it sends anything else.
+  `--debug.startup-sync-state-idle` (forced by `node_cli`) makes reth's network
+  sync state exact. Boot polls it, logging a WARN, and sends no FCU until reth
+  is idle. Then it moves the committer's head to reth's head: an FCU carrying
+  the stale spawn-time head would unwind what the backfill synced.
 - **SYNCING never counts as success** for a command that moves safe or
   finalized. `advance_safe_finalized` stores its cursors only on VALID; today
   it accepts SYNCING (`block_committer.rs:655-659`).
