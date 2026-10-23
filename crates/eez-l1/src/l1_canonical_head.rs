@@ -69,11 +69,8 @@ impl L1CanonicalHead {
     }
 
     /// The seed's post, or `None` if the index was never seeded.
-    ///
-    /// # Panics
-    ///
-    /// If the `floor` mutex is poisoned.
-    pub fn floor(&self) -> Option<PostId> {
+    #[cfg(test)]
+    fn floor(&self) -> Option<PostId> {
         *self.floor.lock().unwrap()
     }
 

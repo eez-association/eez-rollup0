@@ -61,7 +61,7 @@ pub enum DeriverError {
 
 /// `true` for errors no resync can fix; the deriver stops the node on them.
 #[must_use]
-pub fn is_fatal(err: &DeriverError) -> bool {
+pub(crate) fn is_fatal(err: &DeriverError) -> bool {
     matches!(
         err,
         DeriverError::BelowSeedFloor { .. }

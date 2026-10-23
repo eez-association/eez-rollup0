@@ -31,11 +31,7 @@ pub struct FinalizedCommitment {
 
 /// Interprets the registry's `rollups(id)` answer at `l1_block`. A registered
 /// rollup with a zero root is a broken registry, not "not registered".
-///
-/// # Errors
-///
-/// [`L1Error::Config`] when the rollup is registered with root zero.
-pub fn registered_root(
+fn registered_root(
     code_is_empty: bool,
     rollup_contract: Address,
     root: B256,

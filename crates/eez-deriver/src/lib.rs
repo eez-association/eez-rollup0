@@ -22,4 +22,4 @@ pub use checkpoint::ReconcileCheckpoint;
 #[doc(inline)]
 pub use deriver::{Deriver, DeriverBoot};
 #[doc(inline)]
-pub use error::{DeriverError, DeriverResult, is_fatal};
+pub use error::{DeriverError, DeriverResult};

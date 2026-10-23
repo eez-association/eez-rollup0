@@ -943,7 +943,7 @@ where
     ///
     /// # Panics
     ///
-    /// On an [`is_fatal`] error, to stop the node.
+    /// On a fatal error (`is_fatal`), to stop the node.
     pub async fn run(self, mut rx: broadcast::Receiver<L1Event>) {
         // Defensive re-anchor: a cheap no-op in the normal boot order;
         // load-bearing for any caller that subscribed rx late.
