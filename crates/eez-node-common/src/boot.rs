@@ -267,7 +267,7 @@ where
             // Read before the scan: the scan must end up holding this root.
             let before = match l1_reader.finalized_commitment().await {
                 Ok(before) => before,
-                Err(error) => {
+                Err(error) if error.is_retryable() => {
                     event!(
                         name: "eez.node.sync.history_check_skipped",
                         Level::WARN,
@@ -275,6 +275,9 @@ where
                         "L1's finalized root is unreadable; boot skips checking that the local chain holds it",
                     );
                     None
+                }
+                Err(error) => {
+                    return Err(eyre::eyre!("reading the L1-finalized rollup root: {error}"));
                 }
             };
             let seed = boot_catch_up(deriver, l1_reader, mode, role).await?;

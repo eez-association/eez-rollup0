@@ -225,6 +225,7 @@ impl L1Reader {
     /// # Errors
     ///
     /// - [`L1Error::Provider`] on RPC failure (retryable).
+    /// - [`L1Error::Decode`] when the registry's answer isn't an EEZ `rollups` return.
     /// - [`L1Error::Config`] when the rollup is registered with root zero.
     pub async fn finalized_commitment(&self) -> L1Result<Option<FinalizedCommitment>> {
         let Some((l1_block, l1_hash)) = self.finalized_block().await? else {
@@ -256,8 +257,12 @@ impl L1Reader {
             let out = provider.call(req).block(at).await.map_err(|e| {
                 L1Error::Provider(format!("rollups({rollup_id}) at {l1_hash}: {e}"))
             })?;
-            let r = rollupsCall::abi_decode_returns(&out)
-                .map_err(|e| L1Error::Provider(format!("decode rollups({rollup_id}): {e}")))?;
+            // The block is pinned, so an undecodable answer stays wrong: a wrong registry address.
+            let r = rollupsCall::abi_decode_returns(&out).map_err(|e| {
+                L1Error::Decode(format!(
+                    "{eez} answered rollups({rollup_id}) with bytes that don't decode; is it an EEZ registry? {e}"
+                ))
+            })?;
             (r.rollupContract, r.root)
         };
         let root = registered_root(code.is_empty(), rollup_contract, root, rollup_id, l1_block)?;
