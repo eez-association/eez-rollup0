@@ -1375,24 +1375,26 @@ async fn fresh_follower_syncs_history_from_peers() {
         .unwrap();
     composer.run_tx_spammer(ANVIL_KEY_1);
 
-    // Past reth's 32-block threshold, so the follower syncs with the pipeline.
+    // reth backfills with its pipeline only past DEFAULT_BACKFILL_RUN_THRESHOLD = EPOCH_SLOTS = 32
+    // (engine/primitives/src/config.rs:28); a shorter gap is downloaded block by block.
     let l1 = ProviderBuilder::new().connect_http(harness.anvil.rpc_url.parse().unwrap());
     let l2 = ProviderBuilder::new().connect_http(composer.l2_rpc_url().parse().unwrap());
-    let (height, root) = wait_for(DEFAULT_TIMEOUT, || async {
+    let (finalized_l1, height, root) = wait_for(DEFAULT_TIMEOUT, || async {
         let Some(finalized) = l1.get_block_by_number(BlockNumberOrTag::Finalized).await? else {
             return Ok(None);
         };
+        let f = finalized.header.number;
         let root = rollup_root_at(
             &harness.anvil.rpc_url,
             harness.dep.eez_address,
             harness.dep.rollup_id,
-            Some(finalized.header.number),
+            Some(f),
         )
         .await?;
         let Some(block) = l2.get_block_by_hash(root).await? else {
             return Ok(None);
         };
-        Ok((block.header.number > 32).then_some((block.header.number, root)))
+        Ok((block.header.number > 32).then_some((f, block.header.number, root)))
     })
     .await
     .expect("L1 never finalized a root above L2 block 32");
@@ -1407,26 +1409,38 @@ async fn fresh_follower_syncs_history_from_peers() {
     let lonely = NodeHandle::start("follower-no-peers", &follower_cfg(vec![]), &follower_env)
         .await
         .unwrap();
-    wait_for(Duration::from_secs(40), || async {
-        Ok((lonely.count_signal(signals::NODE_SYNC_WAITING_FOR_PEERS)? >= 1).then_some(()))
+    let waiting = wait_for(Duration::from_secs(40), || async {
+        Ok(lonely
+            .signals_since(0)?
+            .into_iter()
+            .find(|s| s.name == signals::NODE_SYNC_WAITING_FOR_PEERS))
     })
     .await
     .expect("a follower without peers never reported waiting for them");
-    let latest = block_number_and_hash_at(&lonely.l2_rpc_url(), BlockNumberOrTag::Latest)
-        .await
-        .unwrap();
     assert_eq!(
-        latest.map(|(n, _)| n),
-        Some(0),
-        "follower without peers left genesis"
-    );
-    assert_eq!(
-        lonely
-            .count_signal(signals::DERIVER_CATCH_UP_START)
-            .unwrap(),
+        waiting.u64("peers").unwrap(),
         0,
-        "follower without peers derived from L1",
+        "the lonely follower has a peer"
     );
+    // Checked again at the end, after it has waited through the other follower's sync.
+    let still_waiting = || async {
+        let latest = block_number_and_hash_at(&lonely.l2_rpc_url(), BlockNumberOrTag::Latest)
+            .await
+            .unwrap();
+        assert_eq!(
+            latest.map(|(n, _)| n),
+            Some(0),
+            "follower without peers left genesis"
+        );
+        assert_eq!(
+            lonely
+                .count_signal(signals::DERIVER_CATCH_UP_START)
+                .unwrap(),
+            0,
+            "follower without peers derived from L1",
+        );
+    };
+    still_waiting().await;
 
     let trusted = vec![
         "--trusted-peers".into(),
@@ -1447,14 +1461,21 @@ async fn fresh_follower_syncs_history_from_peers() {
     })
     .await
     .expect("synced follower never scanned L1");
+    // The seeded scan starts at the follower's own F, never below the one read here.
     assert!(
-        first_scan.u64("from_l1_block").unwrap() > harness.dep.deploy_block,
-        "synced follower scanned L1 from the deploy block",
+        first_scan.u64("from_l1_block").unwrap() >= finalized_l1,
+        "synced follower scanned L1 from below L1-finalized",
     );
-    wait_for_safe_prefix_convergence(&[&composer, &synced], height, DEFAULT_TIMEOUT)
+    // No head source moves safe now, so passing it takes a batch the Deriver reconciled from L1.
+    let (seeded_safe, _) = block_number_and_hash_at(&synced.l2_rpc_url(), BlockNumberOrTag::Safe)
         .await
-        .expect("synced follower's safe chain did not converge with the composer");
+        .unwrap()
+        .expect("synced follower has a safe block");
+    wait_for_safe_prefix_convergence(&[&composer, &synced], seeded_safe + 1, DEFAULT_TIMEOUT)
+        .await
+        .expect("synced follower never reconciled an L1 batch past its seed");
 
+    still_waiting().await;
     for node in [&composer, &lonely, &synced] {
         node.assert_no_process_death();
     }
