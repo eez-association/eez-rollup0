@@ -6,7 +6,7 @@ use alloy_consensus::Header;
 use alloy_eips::Encodable2718;
 use alloy_primitives::B256;
 use eez_deriver::{Deriver, DeriverError};
-use eez_driver::{BlockCommitterHandle, DriverError, DriverResult, ForkchoiceOutcome};
+use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome};
 use eez_l1::{BatchRecord, FinalizedCommitment, L1Error, L1Reader, L1Result, PostId};
 use eez_primitives::engine::EezEngineTypes;
 use reth_primitives_traits::SealedHeader;
@@ -184,32 +184,40 @@ where
         .ok_or_else(|| eyre::eyre!("no local header for L2 block {hash}"))
 }
 
-/// Repeats `refresh` every [`SYNC_POLL`] while reth answers SYNCING. A node
-/// killed mid-backfill restarts with reth resuming it, and until it finishes
-/// every FCU gets SYNCING, which boot's anchor moves treat as fatal.
-async fn wait_for_idle_engine<F, Fut>(mut refresh: F) -> eyre::Result<()>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = DriverResult<()>>,
-{
+/// Polls `is_syncing` every [`SYNC_POLL`] until it is false, sending nothing to reth.
+async fn until_idle(is_syncing: impl Fn() -> bool) {
     let mut busy = StatusEvery::default();
-    loop {
-        match refresh().await {
-            Ok(()) => return Ok(()),
-            Err(DriverError::EngineNotReady(status)) => {
-                if busy.due() {
-                    event!(
-                        name: "eez.node.sync.engine_busy",
-                        Level::WARN,
-                        status,
-                        "waiting for reth to finish its own sync before boot moves any anchor",
-                    );
-                }
-                tokio::time::sleep(SYNC_POLL).await;
-            }
-            Err(err) => return Err(err.into()),
+    while is_syncing() {
+        if busy.due() {
+            event!(
+                name: "eez.node.sync.engine_busy",
+                Level::WARN,
+                "waiting for reth to finish its own sync before boot sends a forkchoice update",
+            );
         }
+        tokio::time::sleep(SYNC_POLL).await;
     }
+}
+
+/// Waits until reth stops syncing, then points the committer's head at reth's.
+/// Call before boot in either mode: a restart can resume a backfill, which
+/// answers SYNCING to every FCU and leaves reth's head above the committer's.
+///
+/// # Errors
+///
+/// A local provider read or the engine rejecting reth's own head.
+pub async fn wait_for_idle_engine<P>(
+    provider: &P,
+    committer: &BlockCommitterHandle<EezEngineTypes>,
+    is_syncing: impl Fn() -> bool,
+) -> eyre::Result<()>
+where
+    P: BlockNumReader + HeaderProvider<Header = Header>,
+{
+    until_idle(is_syncing).await;
+    let head = header_by_number(provider, provider.best_block_number()?)?;
+    committer.reorg_to(head).await?;
+    Ok(())
 }
 
 /// Syncs the local chain to L1's finalized root through peers; returns the Deriver's seed.
@@ -225,11 +233,12 @@ pub async fn boot_from_peers<P>(
     committer: &BlockCommitterHandle<EezEngineTypes>,
     l1_reader: &L1Reader,
     peer_count: impl Fn() -> usize,
+    is_syncing: impl Fn() -> bool,
 ) -> eyre::Result<BatchRecord>
 where
     P: BlockIdReader + HeaderProvider<Header = Header>,
 {
-    wait_for_idle_engine(|| committer.refresh_forkchoice()).await?;
+    wait_for_idle_engine(provider, committer, is_syncing).await?;
     let mut waiting = StatusEvery::default();
     let mut waiting_for_peers = StatusEvery::default();
     // The first sync rewinds to the local finalized block; later top-ups build on it.
@@ -545,23 +554,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn boot_waits_out_a_busy_engine() {
-        let calls = std::cell::Cell::new(0);
-        let refresh = || {
-            calls.set(calls.get() + 1);
-            let busy = calls.get() < 3;
-            async move {
-                if busy {
-                    Err(DriverError::EngineNotReady("SYNCING".into()))
-                } else {
-                    Ok(())
-                }
-            }
-        };
-        wait_for_idle_engine(refresh).await.unwrap();
-        assert_eq!(calls.get(), 3);
-
-        let rejected = || async { Err(DriverError::InvalidForkchoice("INVALID".into())) };
-        assert!(wait_for_idle_engine(rejected).await.is_err());
+        let polls = std::cell::Cell::new(0);
+        until_idle(|| {
+            polls.set(polls.get() + 1);
+            polls.get() < 3
+        })
+        .await;
+        assert_eq!(polls.get(), 3);
     }
 
     /// Knows `block` at `number`; the canonical chain holds `canonical` there.

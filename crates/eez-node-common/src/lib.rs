@@ -15,6 +15,7 @@ mod boot;
 pub use boot::{
     BootStep, L1_HISTORY_MISSING_DEPTH, SyncMode, boot_catch_up, boot_from_peers, decide,
     ensure_l1_history, l1_history_missing, parse_sync_mode, sync_mode_from_env,
+    wait_for_idle_engine,
 };
 mod discovery;
 pub use discovery::{EezNetworkBuilder, discover};
@@ -71,10 +72,12 @@ where
 {
     // Engine API FCUs may intentionally unwind the L2 head during recovery.
     // Transactions enter only through the sequencer's ingress, never devp2p gossip.
+    // Sync state reads Syncing only while reth backfills, so boot can wait it out.
     for flag in [
         "--engine.always-process-payload-attributes-on-canonical-head",
         "--engine.allow-unwind-canonical-header",
         "--disable-tx-gossip",
+        "--debug.startup-sync-state-idle",
     ] {
         if !argv.iter().any(|a| a == flag) {
             argv.push(flag.to_owned());
@@ -303,12 +306,17 @@ mod tests {
     }
 
     #[test]
-    fn cli_adds_disable_tx_gossip() {
-        for argv in [&["node", "-d"][..], &["node", "-d", "--disable-tx-gossip"]] {
+    fn cli_adds_forced_flags() {
+        for argv in [
+            &["node", "-d"][..],
+            &["node", "-d", "--disable-tx-gossip"],
+            &["node", "-d", "--debug.startup-sync-state-idle"],
+        ] {
             let Commands::Node(node) = parse(argv).unwrap().command else {
                 panic!("not the node command");
             };
-            assert!(node.network.disable_tx_gossip);
+            assert!(node.network.disable_tx_gossip, "{argv:?}");
+            assert!(node.debug.startup_sync_state_idle, "{argv:?}");
         }
     }
 }
