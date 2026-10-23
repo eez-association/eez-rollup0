@@ -413,7 +413,10 @@ are to `fa9e76a`.
   Once its scan passes L1-finalized, the local chain must hold that block's
   `root`. A restart from the checkpoint keeps reth's stored finalized block,
   capped at the checkpoint's L2 block, so the finalized tag doesn't fall back to
-  genesis while L1 finality is still below the checkpoint.
+  genesis while L1 finality is still below the checkpoint. A boot without a
+  checkpoint re-verifies from the deploy block, so its safe and finalized climb
+  from genesis again; starting finalized higher would refuse the replay of an
+  old resumed Sync block below it.
 - **Values:** `1` or `true` selects L1-only; unset, empty, `0` or `false`
   selects peers; anything else is a startup error.
 
