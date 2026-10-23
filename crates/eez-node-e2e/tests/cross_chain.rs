@@ -2058,6 +2058,20 @@ async fn failed_rich_bundle_keeps_live_l2_txs() {
         "rolled back Sync block {n} from head {rolled_from}; sender nonce {base_nonce} before, \
          {nonce_after_rollback} right after the rollback"
     );
+    let reinjected = wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(sent_from)?;
+        let reinjected = emitted.into_iter().find(|s| {
+            s.name == signals::COMPOSER_RECOVERY_REINJECTED && s.u64("sync_height").ok() == Some(n)
+        });
+        Ok(reinjected)
+    })
+    .await
+    .expect("the composer never re-added the rolled-back L2 txs to the pool");
+    let reinjected = reinjected.u64("count").unwrap();
+    assert!(
+        reinjected >= L2_ONLY_TRANSFERS,
+        "the rollback of {n} re-added {reinjected} txs, fewer than the {L2_ONLY_TRANSFERS} transfers it dropped",
+    );
 
     // Restore before MAX_BUNDLE_ATTEMPTS evicts the outbound call.
     w.set_builder_ack_delay(Duration::ZERO).await.unwrap();
