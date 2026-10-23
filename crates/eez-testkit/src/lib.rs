@@ -263,7 +263,7 @@ impl BuilderStubMode {
 }
 
 impl BundleStub {
-    async fn spawn(port_lease: PortLease, upstream: &str) -> Result<Self> {
+    async fn spawn(port_lease: PortLease, upstream: &str, passthrough: bool) -> Result<Self> {
         let port = port_lease.port();
         let script = repo_root().join("scripts/builder-stub.py");
         let listen = format!("127.0.0.1:{port}");
@@ -275,7 +275,12 @@ impl BundleStub {
             .arg(script)
             .args(["--listen", &listen, "--upstream", upstream])
             .arg("--block-time")
-            .arg(L1_BLOCK_TIME_SECS.to_string())
+            .arg(L1_BLOCK_TIME_SECS.to_string());
+        if passthrough {
+            // The L1 is a reth node, not Anvil: relay bundles instead of mining them.
+            command.arg("--passthrough");
+        }
+        command
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err_log));
         drop(port_lease);
@@ -316,6 +321,16 @@ impl BundleStub {
         if result != mode.as_str() {
             bail!("builder stub returned unexpected mode {result}");
         }
+        Ok(())
+    }
+
+    async fn set_ack_delay(&self, delay: Duration) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.url.parse()?);
+        let _: f64 = provider
+            .client()
+            .request("eez_setBundleAckDelay", (delay.as_secs_f64(),))
+            .await
+            .context("set builder stub ack delay")?;
         Ok(())
     }
 }
@@ -809,7 +824,7 @@ impl Harness {
         l2_genesis: (PathBuf, tempfile::TempDir),
     ) -> Result<Self> {
         let mut anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
-        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url).await?;
+        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url, false).await?;
         // Route every harness client through the builder so its snapshot-based
         // block assembly cannot race direct mutations of the backing Anvil.
         anvil.rpc_url.clone_from(&stub.url);
@@ -3593,6 +3608,8 @@ pub struct CrossChainWorld {
     /// Present only in signer-mutation tests.
     pub prover_proxy: Option<ProverProxyHandle>,
     pub proof_signer: ProofSignerHandle,
+    /// Present only in worlds from [`setup_cross_chain_with_builder_stub`].
+    builder: Option<BundleStub>,
     _witness_dir: tempfile::TempDir,
     _datadir: FailureDatadir,
 }
@@ -3753,6 +3770,29 @@ impl CrossChainWorld {
                 (key, value)
             })
             .collect()
+    }
+
+    /// Select how the relay stub treats the composer's next bundles.
+    pub async fn set_builder_mode(&self, mode: BuilderStubMode) -> Result<()> {
+        self.builder
+            .as_ref()
+            .context(
+                "world has no builder stub; start it with setup_cross_chain_with_builder_stub",
+            )?
+            .set_mode(mode)
+            .await
+    }
+
+    /// Delay the relay stub's answer to each bundle, so the composer's verdict
+    /// on it lags the L1 block it targets.
+    pub async fn set_builder_ack_delay(&self, delay: Duration) -> Result<()> {
+        self.builder
+            .as_ref()
+            .context(
+                "world has no builder stub; start it with setup_cross_chain_with_builder_stub",
+            )?
+            .set_ack_delay(delay)
+            .await
     }
 }
 
@@ -4423,14 +4463,20 @@ pub async fn run_scenarios(
 
 /// Start the shared cross-chain fixture.
 pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(None, None, &[]).await
+    setup_cross_chain_inner(None, None, &[], false).await
+}
+
+/// Start the fixture with the composer's bundles routed through the relay stub.
+/// The stub forwards only single-transaction bundles, so inbound calls cannot settle here.
+pub async fn setup_cross_chain_with_builder_stub() -> Result<CrossChainWorld> {
+    setup_cross_chain_inner(None, None, &[], true).await
 }
 
 /// Start the fixture with additional node environment variables.
 pub async fn setup_cross_chain_with_env(
     extra_env: &[(&'static str, String)],
 ) -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(None, None, extra_env).await
+    setup_cross_chain_inner(None, None, extra_env, false).await
 }
 
 /// Starts the fixture with a mutation proxy and expected attester override.
@@ -4438,7 +4484,7 @@ pub async fn setup_cross_chain_proxied(
     mutation: ProverMutation,
     attester: Address,
 ) -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(Some(mutation), Some(attester), &[]).await
+    setup_cross_chain_inner(Some(mutation), Some(attester), &[], false).await
 }
 
 pub async fn setup_cross_chain_empty_call() -> Result<CrossChainEmptyCallWorld> {
@@ -4585,6 +4631,7 @@ async fn setup_cross_chain_inner(
     mutation: Option<ProverMutation>,
     attester_override: Option<Address>,
     extra_env: &[(&'static str, String)],
+    builder_stub: bool,
 ) -> Result<CrossChainWorld> {
     let mut cfg = CrossChainConfig::new()?;
     let signer_attester = signer_address(cfg.attester_key)?;
@@ -4608,6 +4655,11 @@ async fn setup_cross_chain_inner(
     let attester = attester_override.unwrap_or(signer_attester);
     let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
     let mut datadir = FailureDatadir::new("eez-cross-chain")?;
+    let builder = if builder_stub {
+        Some(BundleStub::spawn(PortLease::tcp(), &cfg.l1_rpc_url(), true).await?)
+    } else {
+        None
+    };
     let mut env = cfg.env();
     env.extend([
         ("EEZ_PROVER_URL", prover_url.to_string()),
@@ -4617,6 +4669,9 @@ async fn setup_cross_chain_inner(
             witness_dir.path().to_string_lossy().into_owned(),
         ),
     ]);
+    if let Some(builder) = &builder {
+        env.push(("EEZ_L1_BUILDER_RPC_URL", builder.url.clone()));
+    }
     // Before the assertion below, so caller-supplied vars are checked too.
     env.extend_from_slice(extra_env);
     assert!(
@@ -4734,6 +4789,7 @@ async fn setup_cross_chain_inner(
         outbound_wrapper,
         prover_proxy,
         proof_signer,
+        builder,
         _witness_dir: witness_dir,
         _datadir: datadir,
     })
