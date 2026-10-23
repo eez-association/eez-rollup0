@@ -21,7 +21,7 @@ ethereum_package:
   mev_type: flashbots
   mev_params:
     mev_builder_image: ethpandaops/reth-rbuilder:develop
-    mev_relay_image: ethpandaops/mev-boost-relay:main
+    mev_relay_image: ethpandaops/mev-boost-relay@sha256:3600f04fcaf0bbb231f4737470f094fdf2314db54b4853197fa369aea90f8b19
     mev_boost_image: ethpandaops/mev-boost:develop
     mev_builder_cl_image: sigp/lighthouse:v8.1.2
     mev_builder_subsidy: 1
@@ -43,6 +43,7 @@ eez:
   # Deterministic private-network keys only; never use these on a public chain.
   poster_key: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
   proof_signer_key: "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+  recovery_address: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076"
   l1_block_time_ms: 12000
   l2_block_time_ms: 2000
   proof_time_ms: 5000

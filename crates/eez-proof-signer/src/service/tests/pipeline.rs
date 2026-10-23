@@ -11,10 +11,9 @@ fn validated_single_block(
     receipt_successes: Vec<bool>,
     transaction_state_checkpoints: Vec<validate::StateCheckpoint>,
 ) -> validate::ValidatedWindow {
-    let (window_pre, settling_pre, window_post) = window_endpoints(5, 5);
+    let (window_pre, _, window_post) = window_endpoints(5, 5);
     validate::ValidatedWindow::for_test(
         window_pre,
-        settling_pre,
         window_post,
         Vec::new(),
         validate::ValidatedSettlingBlock::for_test(
@@ -64,8 +63,8 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
             "block_inspection",
         ),
         (
-            SettlementPipelineError::StateUpdateChain(
-                crate::settlement::StateUpdateChainError::NoEntries,
+            SettlementPipelineError::RollupUpdateChain(
+                crate::settlement::RollupUpdateChainError::NoEntries,
             ),
             "state_update_chain",
         ),
@@ -321,14 +320,14 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
 
     let (window_pre, _settling_pre, window_post) = window_endpoints(5, 5);
     let mut batch = anchor_batch();
-    batch.entries[0].stateUpdates[0].currentState = window_pre;
-    batch.entries[0].stateUpdates[0].newState = empty_prefix_candidate();
+    batch.entries[0].rollupUpdates[0].currentRoot = window_pre;
+    batch.entries[0].rollupUpdates[0].newRoot = empty_prefix_candidate();
     batch.entries.push(ExecutionEntrySol {
-        stateUpdates: vec![StateUpdateSol {
+        rollupUpdates: vec![RollupUpdateSol {
             rollupId: 1,
-            currentState: empty_prefix_candidate(),
-            newState: window_post,
-            etherDelta: I256::try_from(value).unwrap(),
+            currentRoot: empty_prefix_candidate(),
+            newRoot: window_post,
+            etherDelta: eez_protocol::abi::u256_to_i192(value).unwrap(),
         }],
         proxyEntryHash: call_hash,
         l2ToL1Calls: Vec::new(),
@@ -383,9 +382,14 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     );
     let mut wrong_source = action.clone();
     wrong_source.source_rollup_id = 2;
-    let mut wrong_destination = action;
-    wrong_destination.target_rollup_id = 2;
     let span = [eez_payload_codec::SpanBlock::default()];
+    let action_offset = eez_payload_codec::encode_container(1, &span, &[])
+        .unwrap()
+        .len();
+    let mut wrong_destination =
+        eez_payload_codec::encode_container(1, &span, std::slice::from_ref(&action)).unwrap();
+    let to_chain_offset = action_offset + 11;
+    wrong_destination[to_chain_offset..to_chain_offset + 8].copy_from_slice(&2_u64.to_le_bytes());
     for (name, replacement, expected_code) in [
         (
             "L1 settlement ABI substituted for DA",
@@ -399,8 +403,8 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         ),
         (
             "different destination rollup",
-            eez_payload_codec::encode_container(1, &span, &[wrong_destination]).unwrap(),
-            Code::FailedPrecondition,
+            wrong_destination,
+            Code::InvalidArgument,
         ),
     ] {
         let mut substituted = batch.clone();

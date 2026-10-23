@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import {Script, console} from "forge-std/Script.sol";
 
 import {Rollup} from "eez-core-protocol/src/rollupContract/Rollup.sol";
+import {deployRollup} from "eez-core-protocol/deployment/RollupDeployment.sol";
 
 /// @title DeployRollup
 /// @notice Deploys the per-rollup `IRollupContract` manager (reference
@@ -63,7 +64,7 @@ contract DeployRollup is Script {
         vkeys[0] = bytes32(uint256(uint160(authorizedSigner)));
 
         vm.startBroadcast();
-        Rollup rollup = new Rollup(
+        Rollup rollup = deployRollup(
             eez,
             owner,
             /* threshold */ 1,

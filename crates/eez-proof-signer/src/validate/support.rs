@@ -43,13 +43,9 @@ impl CheckpointPlan {
             system_sender_flags.push(is_system_sender);
             sync_system_transaction_flags.push(is_system_tx(&transaction));
         }
-        // The anchor's candidate leads: the block sealed after the pre-block
-        // system calls, holding no transactions. With no transactions at all the
-        // block already IS that candidate, so sealing it again is redundant.
-        let mut positions = Vec::new();
-        if transaction_count > 0 {
-            positions.push(CheckpointAt::PreExecution);
-        }
+        // The anchor's candidate always leads: the block sealed after the
+        // pre-block system calls, holding no transactions.
+        let mut positions = vec![CheckpointAt::PreExecution];
         positions.extend(
             pair_end_positions(&sync_system_transaction_flags)
                 .into_iter()

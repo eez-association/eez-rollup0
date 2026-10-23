@@ -7,7 +7,7 @@
 //! suffix runs. That suffix carries system transactions the deriver must append
 //! to the Sync block the prefix built.
 //!
-//! The prefix cannot be synthesised from nothing. Its `newState` has to be a
+//! The prefix cannot be synthesised from nothing. Its `newRoot` has to be a
 //! candidate block hash the composer actually computed for that transaction
 //! prefix; any other value names a block the deriver cannot build, so it would
 //! diverge instead of appending. So the prefix is cut from a real batch while
@@ -100,16 +100,15 @@ async fn post_ahead(
 /// Only the leading `proxyEntryHash == 0` run is taken: those settle on their
 /// own, whereas a deferred entry waits on a bundled user transaction this
 /// synthetic peer does not have.
-fn strict_prefix(batch: &EvmBatch) -> eyre::Result<EvmBatch> {
+fn strict_prefix(batch: &EvmBatch) -> EvmBatch {
     let mut prefix = batch.clone();
     prefix.entries.truncate(2);
     prefix.immediateEntryCount = U256::from(prefix.entries.len());
     prefix.proofs = Vec::new();
-    // The begin hash binds the starting state and identity, so it is never zero;
-    // without recomputing it `_executeEntry` refuses the entry for a rolling
-    // hash mismatch and the post unwinds with AllImmediateL2TxsFailed.
-    eez_protocol::entries::finalize_l1_rolling_hashes(&mut prefix)?;
-    Ok(prefix)
+    // Truncation keeps each entry's seed and call, so the posted rolling hashes
+    // stay valid. Never re-finalize: L1 entries no longer carry the outbound
+    // return data those hashes fold.
+    prefix
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -154,10 +153,15 @@ async fn a_resumed_batch_appends_the_l2_content_of_the_entries_it_settled() {
         // Poll tightly: the batch is only pending for part of one L1 slot.
         for _ in 0..80 {
             if let Some((batch, _)) = pending_batch_with_producing_entries(&l1, eez).await {
-                if let Ok(prefix) = strict_prefix(&batch)
-                    && post_ahead(&l1, eez, w.cfg.deployer_key, w.cfg.attester_key, prefix)
-                        .await
-                        .is_ok()
+                if post_ahead(
+                    &l1,
+                    eez,
+                    w.cfg.deployer_key,
+                    w.cfg.attester_key,
+                    strict_prefix(&batch),
+                )
+                .await
+                .is_ok()
                 {
                     raced += 1;
                 }

@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_eips::BlockNumberOrTag;
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, ProviderBuilder};
 use tokio::sync::broadcast;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
@@ -34,7 +34,7 @@ use tracing::{Level, event};
 use url::Url;
 
 use crate::error::{L1Error, L1Result};
-use crate::scan::ScannedBatch;
+use crate::scan::Post;
 
 /// [`L1Watcher`] polling cadence. 2s gives prompt detection without
 /// burning RPC quota — half of gnosis's 5s L1 block time, a sixth of
@@ -82,27 +82,9 @@ pub enum L1Event {
         new_head_number: u64,
         new_head_hash: B256,
     },
-    /// `EEZ.BatchPosted` log observed. `call_data` is the raw payload
-    /// from the originating tx's `ProofSystemBatch.callData` field; the
-    /// Deriver decodes via `eez-payload-codec`. The Composer typically
-    /// uses only the metadata (`l1_block_number`, `tx_hash`, `submitter`).
+    /// One post listing our rollup, read from its `EEZ.BatchPosted` log.
     BatchPosted {
-        l1_block_number: u64,
-        l1_block_hash: B256,
-        tx_hash: B256,
-        /// Tx originator — the address that sent the postBatch.
-        /// Composer uses this to detect external batches (based mode).
-        submitter: Address,
-        call_data: Bytes,
-        /// `true` iff the same L1 tx emitted `L2ExecutionPerformed` —
-        /// the contract's state delta applied. `false` = loser
-        /// (`ImmediateEntrySkipped`). Deriver reads this directly.
-        state_applied: bool,
-        /// Which of this batch's claimed steps L1 actually ran, attributed
-        /// from the `L2ExecutionPerformed` events in the batch's own window
-        /// (its postBatch tx up to the next postBatch verifying our rollup).
-        /// `is_empty()` = nothing settled → Deriver skips the batch.
-        settlement: crate::scan::Settlement,
+        post: Arc<Post>,
         /// `true` for the LAST batch of its L1 block. The Deriver waits for it to
         /// move safe: two batches in one L1 block can rewrite the same L2 height.
         last_in_l1_block: bool,
@@ -117,11 +99,12 @@ pub struct L1WatcherConfig {
     /// L1 RPC endpoint (HTTP / HTTPS). Uses the same `EEZ_L1_RPC_URL` as
     /// [`L1ReaderConfig`](crate::L1ReaderConfig).
     pub rpc_url: Url,
+    /// L1 RPC serving `debug_traceBlockByHash`: `EEZ_L1_TRACE_RPC_URL`, else `rpc_url`.
+    pub trace_rpc_url: Url,
     /// Deployed `EEZ` (rollups registry) address. Used to filter
     /// `BatchPosted` log events.
     pub eez: Address,
-    /// Our rollup's id. Used to filter `L2ExecutionPerformed`
-    /// by topic so each `BatchPosted` can be tagged winner / loser.
+    /// Our rollup's id: only posts listing it are emitted.
     pub rollup_id: u64,
     /// Max L1 reorg depth tolerated before halting with
     /// [`L1Error::ReorgTooDeep`]. Default 62 — Ethereum's finality
@@ -148,6 +131,7 @@ impl L1WatcherConfig {
             .map_err(|_| L1Error::Config("EEZ_L1_RPC_URL is required (see .env.example)".into()))?;
         let rpc_url = Url::parse(&rpc_url_raw)
             .map_err(|e| L1Error::Config(format!("EEZ_L1_RPC_URL: {e}")))?;
+        let trace_rpc_url = crate::config::trace_rpc_url(&rpc_url)?;
 
         let eez_raw = env::var("EEZ_REGISTRY_ADDRESS").map_err(|_| {
             L1Error::Config("EEZ_REGISTRY_ADDRESS is required (see .env.example)".into())
@@ -180,6 +164,7 @@ impl L1WatcherConfig {
         }
         Ok(Self {
             rpc_url,
+            trace_rpc_url,
             eez,
             rollup_id,
             reorg_max_depth,
@@ -243,6 +228,8 @@ impl L1Watcher {
 
     async fn run(self, seed_number: u64, seed_hash: B256) {
         let provider = ProviderBuilder::new().connect_http(self.inner.config.rpc_url.clone());
+        // Contract posts are read from block traces, pinned by block hash.
+        let trace = ProviderBuilder::new().connect_http(self.inner.config.trace_rpc_url.clone());
         let mut state = WatcherState::new(self.inner.config.reorg_max_depth);
         // Seed fully before polling: a one-entry ring can't walk back a
         // reorg, trading a retryable error now for ReorgTooDeep later.
@@ -319,7 +306,10 @@ impl L1Watcher {
         loop {
             ticker.tick().await;
             tick_count += 1;
-            if let Err(err) = self.poll_cycle(&provider, &mut state, tick_count).await {
+            if let Err(err) = self
+                .poll_cycle(&provider, &trace, &mut state, tick_count)
+                .await
+            {
                 // Retrying a deterministic error is an infinite silent stall.
                 // PANIC, don't return: reth's critical-task wrapper reports
                 // only panics, so a return exits just as quietly.
@@ -351,6 +341,7 @@ impl L1Watcher {
     async fn poll_cycle(
         &self,
         provider: &impl Provider,
+        trace: &impl Provider,
         state: &mut WatcherState,
         tick_count: u64,
     ) -> L1Result<()> {
@@ -375,9 +366,23 @@ impl L1Watcher {
         } else if tip_hash == latest_parent && latest_number == tip_number + 1 {
             // Normal extension by exactly one block — scan before the
             // ring advances so a failed scan retries this block.
-            let scanned = self
-                .fetch_batch_logs(provider, latest_number, latest_number)
-                .await?;
+            event!(
+                name: "eez.l1_watcher.scan_batch_posted",
+                Level::INFO,
+                from = latest_number,
+                to = latest_number,
+                "scanning L1 range for BatchPosted logs",
+            );
+            let (eez, rollup_id) = (self.inner.config.eez, self.inner.config.rollup_id);
+            let scanned = crate::scan::scan_range(
+                provider,
+                trace,
+                eez,
+                rollup_id,
+                latest_number,
+                latest_number,
+            )
+            .await?;
             state.push_canonical(latest_number, latest_hash);
             self.emit(L1Event::NewHead {
                 block_number: latest_number,
@@ -448,7 +453,7 @@ impl L1Watcher {
                 //
                 // Reorg tolerance here is boundary-only: a reorg above it
                 // needs no retraction, since the next chunk re-scans and
-                // re-delivered batches dedup by tx hash downstream.
+                // re-delivered batches dedup by position downstream.
                 let scan_from = old_tip_number + 1;
                 let chunk_to = scan_from
                     .saturating_add(crate::scan::LOG_SCAN_CHUNK_BLOCKS - 1)
@@ -482,6 +487,7 @@ impl L1Watcher {
                 // claim to have scanned blocks we never read.
                 let (scanned, reached) = crate::scan::scan_batch_logs_range_adaptive(
                     provider,
+                    trace,
                     self.inner.config.eez,
                     self.inner.config.rollup_id,
                     scan_from,
@@ -584,6 +590,7 @@ impl L1Watcher {
             let scan_from = common.number + 1;
             let (scanned, reached) = crate::scan::scan_batch_logs_range_adaptive(
                 provider,
+                trace,
                 self.inner.config.eez,
                 self.inner.config.rollup_id,
                 scan_from,
@@ -657,35 +664,7 @@ impl L1Watcher {
         Ok(())
     }
 
-    /// Fetches `BatchPosted` logs in `[from, to]` without emitting —
-    /// callers commit ring state only after this succeeds.
-    ///
-    /// Non-adaptive by design: the only caller passes a single block. Wider
-    /// ranges go through [`scan_batch_logs_range_adaptive`] instead.
-    async fn fetch_batch_logs(
-        &self,
-        provider: &impl Provider,
-        from: u64,
-        to: u64,
-    ) -> L1Result<Vec<ScannedBatch>> {
-        event!(
-            name: "eez.l1_watcher.scan_batch_posted",
-            Level::INFO,
-            from,
-            to,
-            "scanning L1 range for BatchPosted logs",
-        );
-        crate::scan::scan_batch_logs_range(
-            provider,
-            self.inner.config.eez,
-            self.inner.config.rollup_id,
-            from,
-            to,
-        )
-        .await
-    }
-
-    fn emit_scanned_batches(&self, from: u64, to: u64, scanned: Vec<ScannedBatch>) {
+    fn emit_scanned_batches(&self, from: u64, to: u64, scanned: Vec<Post>) {
         if !scanned.is_empty() {
             event!(
                 name: "eez.l1_watcher.scan_batch_posted.found",
@@ -696,21 +675,15 @@ impl L1Watcher {
                 "emitting BatchPosted events to subscribers",
             );
         }
-        // A scan range never splits an L1 block and `get_logs` returns ascending by
-        // (block, tx index), so a block's batches are adjacent and peeking is enough.
+        // A scan range never splits an L1 block and the scan sorts posts by
+        // (block, log index), so a block's batches are adjacent and peeking is enough.
         let mut batches = scanned.into_iter().peekable();
         while let Some(b) = batches.next() {
             let last_in_l1_block = batches
                 .peek()
-                .is_none_or(|next| next.l1_block_number != b.l1_block_number);
+                .is_none_or(|next| next.id.l1_block != b.id.l1_block);
             self.emit(L1Event::BatchPosted {
-                l1_block_number: b.l1_block_number,
-                l1_block_hash: b.l1_block_hash,
-                tx_hash: b.tx_hash,
-                submitter: b.submitter,
-                call_data: b.call_data,
-                state_applied: b.state_applied,
-                settlement: b.settlement,
+                post: Arc::new(b),
                 last_in_l1_block,
             });
         }
@@ -943,6 +916,7 @@ mod tests {
             inner: std::sync::Arc::new(Inner {
                 config: L1WatcherConfig {
                     rpc_url: "http://127.0.0.1:0".parse().expect("static url"),
+                    trace_rpc_url: "http://127.0.0.1:0".parse().expect("static url"),
                     eez: alloy_primitives::Address::ZERO,
                     rollup_id: 1,
                     reorg_max_depth: 3,
@@ -993,7 +967,7 @@ mod tests {
         asserter.push_success(&serde_json::json!([])); // BatchPosted logs
 
         watcher
-            .poll_cycle(&provider, &mut state, 1)
+            .poll_cycle(&provider, &provider, &mut state, 1)
             .await
             .expect("chunk step succeeds");
 
@@ -1039,7 +1013,7 @@ mod tests {
         asserter.push_success(&mock_block(199_998, ancestor2_hash, ancestor1_hash, 4_998));
 
         watcher
-            .poll_cycle(&provider, &mut state, 2)
+            .poll_cycle(&provider, &provider, &mut state, 2)
             .await
             .expect("final chunk succeeds");
 
@@ -1097,7 +1071,7 @@ mod tests {
         ));
 
         watcher
-            .poll_cycle(&provider, &mut state, 1)
+            .poll_cycle(&provider, &provider, &mut state, 1)
             .await
             .expect("catch-up chunk succeeds");
 
@@ -1127,7 +1101,7 @@ mod tests {
         asserter.push_success(&mock_block(50_000, replacement_hash, latest_parent, 5_001)); // fill_forward by-hash
 
         watcher
-            .poll_cycle(&provider, &mut state, 2)
+            .poll_cycle(&provider, &provider, &mut state, 2)
             .await
             .expect("shallow reorg recovers, not ReorgTooDeep");
 
@@ -1190,7 +1164,7 @@ mod tests {
         asserter.push_failure_msg("injected: range scan failed"); // first get_logs
 
         watcher
-            .poll_cycle(&provider, &mut state, 1)
+            .poll_cycle(&provider, &provider, &mut state, 1)
             .await
             .expect_err("injected failure must propagate");
 
@@ -1233,7 +1207,7 @@ mod tests {
         asserter.push_success(&mock_block(9, ancestor_hash, B256::with_last_byte(8), 9));
 
         watcher
-            .poll_cycle(&provider, &mut state, 1)
+            .poll_cycle(&provider, &provider, &mut state, 1)
             .await
             .expect("reorg tick succeeds");
 
@@ -1280,7 +1254,7 @@ mod tests {
         asserter.push_failure_msg("injected: log scan failed"); // first get_logs
 
         watcher
-            .poll_cycle(&provider, &mut state, 1)
+            .poll_cycle(&provider, &provider, &mut state, 1)
             .await
             .expect_err("injected failure must propagate");
 
@@ -1296,7 +1270,7 @@ mod tests {
         asserter.push_success(&serde_json::json!([])); // BatchPosted logs
 
         watcher
-            .poll_cycle(&provider, &mut state, 2)
+            .poll_cycle(&provider, &provider, &mut state, 2)
             .await
             .expect("retry succeeds");
 
@@ -1338,7 +1312,7 @@ mod tests {
         asserter.push_failure_msg("injected: log scan failed"); // first get_logs
 
         watcher
-            .poll_cycle(&provider, &mut state, 1)
+            .poll_cycle(&provider, &provider, &mut state, 1)
             .await
             .expect_err("injected failure must propagate");
 
@@ -1358,7 +1332,7 @@ mod tests {
         asserter.push_success(&mock_block(11, h11, tip_hash, 110)); // fill_forward: by-hash h11
 
         watcher
-            .poll_cycle(&provider, &mut state, 2)
+            .poll_cycle(&provider, &provider, &mut state, 2)
             .await
             .expect("retry succeeds");
 
@@ -1401,7 +1375,7 @@ mod tests {
         asserter.push_success(&mock_block(11, h11, tip_hash, 1_100)); // fill_forward: by-hash h11
 
         watcher
-            .poll_cycle(&provider, &mut state, 1)
+            .poll_cycle(&provider, &provider, &mut state, 1)
             .await
             .expect("narrowed scan must not propagate — reseeding at reached is the remedy");
 
@@ -1440,7 +1414,7 @@ mod tests {
         asserter.push_success(&mock_block(100, hash, B256::with_last_byte(0x63), 1_000));
 
         watcher
-            .poll_cycle(&provider, &mut state, 1)
+            .poll_cycle(&provider, &provider, &mut state, 1)
             .await
             .expect("no-op cycle succeeds");
 
@@ -1448,16 +1422,16 @@ mod tests {
         assert!(rx.try_recv().is_err(), "no events on unchanged tip");
     }
 
-    fn scanned_batch(l1_block_number: u64, tx: u8) -> ScannedBatch {
-        ScannedBatch {
-            l1_block_number,
-            l1_block_hash: B256::with_last_byte(
-                u8::try_from(l1_block_number).expect("test block numbers fit in u8"),
-            ),
+    fn scanned_batch(l1_block_number: u64, tx: u8) -> Post {
+        Post {
+            id: crate::scan::PostId {
+                l1_block: l1_block_number,
+                l1_block_hash: B256::with_last_byte(l1_block_number as u8),
+                log_index: tx.into(),
+            },
             tx_hash: B256::with_last_byte(tx),
-            submitter: Address::ZERO,
-            call_data: Bytes::new(),
-            state_applied: true,
+            sender: Address::ZERO,
+            batch: eez_protocol::abi::EvmBatch::default(),
             settlement: crate::scan::Settlement::NONE,
         }
     }
@@ -1467,10 +1441,9 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             match event {
                 L1Event::BatchPosted {
-                    tx_hash,
+                    post,
                     last_in_l1_block,
-                    ..
-                } => out.push((tx_hash, last_in_l1_block)),
+                } => out.push((post.tx_hash, last_in_l1_block)),
                 other => panic!("expected BatchPosted, got {other:?}"),
             }
         }
@@ -1666,25 +1639,6 @@ mod tests {
         let mut state = WatcherState::new(0);
         state.push_canonical(9, B256::with_last_byte(9));
         assert_eq!(state.tip(), Some((9, B256::with_last_byte(9))));
-    }
-
-    /// Deterministic errors stop the loop; retryable ones must not.
-    #[test]
-    fn only_deterministic_errors_are_terminal() {
-        let depth = L1Error::ReorgTooDeep {
-            walked: 62,
-            max: 62,
-        };
-        let incomplete = L1Error::SourceIncomplete {
-            block: 1,
-            tx_hash: B256::ZERO,
-            detail: "warming up".into(),
-        };
-        assert!(L1Error::Decode("bad abi".into()).is_terminal());
-        assert!(depth.is_terminal());
-        // A malformed RPC response is retryable — re-requesting can succeed.
-        assert!(!L1Error::Provider("log missing block_hash".into()).is_terminal());
-        assert!(!incomplete.is_terminal());
     }
 
     #[test]

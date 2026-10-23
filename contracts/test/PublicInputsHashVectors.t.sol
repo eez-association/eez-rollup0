@@ -5,12 +5,13 @@ import {Test} from "forge-std/Test.sol";
 
 import {EEZ, ProofSystemBatchPerVerificationEntries, RollupIdWithProofSystems} from "eez-core-protocol/src/EEZ.sol";
 import {Rollup} from "eez-core-protocol/src/rollupContract/Rollup.sol";
+import {deployRollup} from "eez-core-protocol/deployment/RollupDeployment.sol";
 import {
     ExecutionEntry,
-    ExpectedStateRootPerRollup,
+    ExpectedRootPerRollup,
     ExpectedL1ToL2Call,
     L2ToL1Call,
-    StateUpdate,
+    RollupUpdate,
     StaticExecutionEntry
 } from "eez-core-protocol/src/interfaces/IEEZ.sol";
 import {MockProofSystem} from "eez-core-protocol/test/mocks/MockProofSystem.sol";
@@ -23,10 +24,10 @@ contract PublicInputsHashVectorsTest is Test {
     bytes32 private constant EMPTY_ENTRY_SHARED = 0x9cb76f48824c4b86548d571badcc9a0542b46deb1bcbff5ecfa63b60d113a3dd;
     bytes32 private constant EMPTY_ENTRY_PUBLIC_INPUT =
         0xd27632863985c23ae62bb5420b9b1b8d01ac1e64e31d4367cc61b46db364b49f;
-    bytes32 private constant FULL_ENTRY_HASH = 0x2c4c8cbc9b39743790f04a13406c6c0e3ab6ca0bf5acb3b923f5549d3aabb759;
-    bytes32 private constant FULL_ENTRY_SHARED = 0xe5764fb1e66c094d0e624344415ffaf8d42687ef904dc61ea5b587f5d3e8b6a0;
+    bytes32 private constant FULL_ENTRY_HASH = 0x752aa6c5ddc53a6bfdfec261248ee29246f6e831c59d3567d2c22d80dbf93dc1;
+    bytes32 private constant FULL_ENTRY_SHARED = 0x597638a46f222dfe739dea95acb35f302b6339639ff4d707aadc4455ba54fa62;
     bytes32 private constant FULL_ENTRY_PUBLIC_INPUT =
-        0x122a843ef260afd29aac762668d6f0c0f6f0a19c48734107ba770a8b81e1b8b0;
+        0x1433641dadf5afe5f9fec99ab1c9e61d1ab2a9c09d091a86d93575aa4f2de850;
     bytes32 private constant MULTI_PS_SHARED = 0x58a63c74be1cc3cbd8a0dc74bf4c862a0b18e5013ef0eacec2bf2e319398d718;
     bytes32 private constant MULTI_PS_PUBLIC_INPUT_0 =
         0xb2121e16632ffd6860732ebe2af1a91ac4225b674667b95b3c8d5631598a7cb9;
@@ -145,8 +146,8 @@ contract PublicInputsHashVectorsTest is Test {
             _registerRollup(eez, _singleton(proofSystem), _singleton(bytes32(uint256(0x42))), initialState);
 
         StaticExecutionEntry memory staticEntry;
-        staticEntry.expectedStateRoots = new ExpectedStateRootPerRollup[](1);
-        staticEntry.expectedStateRoots[0] = ExpectedStateRootPerRollup({rollupId: rollupId, stateRoot: initialState});
+        staticEntry.expectedRoots = new ExpectedRootPerRollup[](1);
+        staticEntry.expectedRoots[0] = ExpectedRootPerRollup({rollupId: rollupId, root: initialState});
         staticEntry.proxyEntryHash = bytes32(uint256(0x5555));
         staticEntry.l2ToL1Calls = new L2ToL1Call[](0);
         staticEntry.rollingHash = bytes32(uint256(0x6666));
@@ -197,7 +198,7 @@ contract PublicInputsHashVectorsTest is Test {
         address[] memory proofSystems = new address[](1);
         proofSystems[0] = address(proofSystem);
         bytes32[] memory vkeys = _singleton(vkey);
-        Rollup rollup = new Rollup(address(eez), address(this), 1, proofSystems, vkeys);
+        Rollup rollup = deployRollup(address(eez), address(this), 1, proofSystems, vkeys);
         uint64 rollupId = eez.registerRollup(address(rollup), bytes32(uint256(0x1111)));
 
         ProofSystemBatchPerVerificationEntries memory batch = _emptyBatch();
@@ -258,7 +259,6 @@ contract PublicInputsHashVectorsTest is Test {
         canonicalEez.postAndVerifyBatch(canonical);
         assertEq(canonicalEez.queueLength(canonicalRollup), 1);
 
-        vm.prank(poster);
         mutatedEez.postAndVerifyBatch(mutated);
         assertEq(mutatedEez.queueLength(mutatedRollup), 0);
 
@@ -267,6 +267,10 @@ contract PublicInputsHashVectorsTest is Test {
         assertEq(canonicalState, anchorState);
         assertEq(mutatedState, anchorState);
     }
+
+    /// Receives the protocol's meta-transaction hook for the mutated scheduling
+    /// case above. The test intentionally leaves the transient entry unconsumed.
+    function executeMetaCrossChainTransactions() external {}
 
     function _shared(
         ProofSystemBatchPerVerificationEntries memory batch,
@@ -331,7 +335,7 @@ contract PublicInputsHashVectorsTest is Test {
     }
 
     function _emptyBatch() private pure returns (ProofSystemBatchPerVerificationEntries memory batch) {
-        batch.expectedStateRootPerRollup = new ExpectedStateRootPerRollup[](0);
+        batch.expectedRootPerRollup = new ExpectedRootPerRollup[](0);
         batch.entries = new ExecutionEntry[](0);
         batch.staticEntries = new StaticExecutionEntry[](0);
         batch.blobIndices = new uint256[](0);
@@ -339,10 +343,10 @@ contract PublicInputsHashVectorsTest is Test {
         batch.bindMsgSenderInPublicInput = false;
     }
 
-    function _entry(uint64 rollupId, bytes32 currentState) private pure returns (ExecutionEntry memory entry) {
-        entry.stateUpdates = new StateUpdate[](1);
-        entry.stateUpdates[0] = StateUpdate({
-            rollupId: rollupId, currentState: currentState, newState: bytes32(uint256(0x2222)), etherDelta: 0
+    function _entry(uint64 rollupId, bytes32 currentRoot) private pure returns (ExecutionEntry memory entry) {
+        entry.rollupUpdates = new RollupUpdate[](1);
+        entry.rollupUpdates[0] = RollupUpdate({
+            rollupId: rollupId, currentRoot: currentRoot, newRoot: bytes32(uint256(0x2222)), etherDelta: 0
         });
         entry.proxyEntryHash = bytes32(uint256(0x3333));
         entry.l2ToL1Calls = new L2ToL1Call[](0);
@@ -378,25 +382,25 @@ contract PublicInputsHashVectorsTest is Test {
 
     function _schedulerEntry(
         uint64 rollupId,
-        bytes32 currentState,
-        bytes32 newState,
+        bytes32 currentRoot,
+        bytes32 newRoot,
         bytes32 proxyEntryHash
     )
         private
         pure
         returns (ExecutionEntry memory entry)
     {
-        entry.stateUpdates = new StateUpdate[](1);
-        entry.stateUpdates[0] = StateUpdate({
+        entry.rollupUpdates = new RollupUpdate[](1);
+        entry.rollupUpdates[0] = RollupUpdate({
             rollupId: rollupId,
-            currentState: currentState,
-            newState: newState,
+            currentRoot: currentRoot,
+            newRoot: newRoot,
             etherDelta: 0
         });
         entry.proxyEntryHash = proxyEntryHash;
         entry.l2ToL1Calls = new L2ToL1Call[](0);
         entry.expectedL1ToL2Calls = new ExpectedL1ToL2Call[](0);
-        bytes32 statesHash = keccak256(abi.encodePacked(bytes32(0), rollupId, currentState));
+        bytes32 statesHash = keccak256(abi.encodePacked(bytes32(0), rollupId, currentRoot));
         entry.rollingHash = keccak256(abi.encodePacked(statesHash, proxyEntryHash));
         entry.destinationRollupId = rollupId;
         entry.success = true;
@@ -423,7 +427,7 @@ contract PublicInputsHashVectorsTest is Test {
         private
         returns (uint64)
     {
-        Rollup rollup = new Rollup(address(eez), address(this), 1, _addresses(systems), vkeys);
+        Rollup rollup = deployRollup(address(eez), address(this), 1, _addresses(systems), vkeys);
         return eez.registerRollup(address(rollup), initialState);
     }
 

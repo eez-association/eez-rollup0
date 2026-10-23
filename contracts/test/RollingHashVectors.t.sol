@@ -5,7 +5,7 @@ import {Test} from "forge-std/Test.sol";
 
 import {EEZ} from "eez-core-protocol/src/EEZ.sol";
 import {EEZL2} from "eez-core-protocol/src/L2/EEZL2.sol";
-import {StateUpdate} from "eez-core-protocol/src/interfaces/IEEZ.sol";
+import {RollupUpdate} from "eez-core-protocol/src/interfaces/IEEZ.sol";
 
 /// Exposes the pinned protocol's internal folds so the constants below come
 /// from the Solidity implementation rather than from the Rust code under test.
@@ -13,7 +13,7 @@ contract L1RollingHashHarness is EEZ {
     constructor() EEZ(address(0xDEAD)) {}
 
     function foldEntry(
-        StateUpdate[] memory updates,
+        RollupUpdate[] memory updates,
         bytes32 proxyEntryHash,
         bytes32 callHash
     )
@@ -49,7 +49,7 @@ contract L1RollingHashHarness is EEZ {
 }
 
 contract L2RollingHashHarness is EEZL2 {
-    constructor() EEZL2(1, address(0xBEEF), false) {}
+    constructor() EEZL2(1, address(0xBEEF), false, address(0xBEEF)) {}
 
     function entryBegin(bytes32 proxyEntryHash) external returns (bytes32 result) {
         _seedRollingHash(proxyEntryHash);
@@ -68,16 +68,16 @@ contract RollingHashVectorsTest is Test {
     }
 
     function testRollingHashVectors() external {
-        StateUpdate[] memory updates = new StateUpdate[](2);
-        // The entry seed binds rollupId + currentState, but deliberately not
-        // newState or etherDelta. The latter fields remain bound by entryHash.
-        updates[0] = StateUpdate({
-            rollupId: 1, currentState: bytes32(uint256(0x11)), newState: bytes32(uint256(0xAA)), etherDelta: 1
+        RollupUpdate[] memory updates = new RollupUpdate[](2);
+        // The entry seed binds rollupId + currentRoot, but deliberately not
+        // newRoot or etherDelta. The latter fields remain bound by entryHash.
+        updates[0] = RollupUpdate({
+            rollupId: 1, currentRoot: bytes32(uint256(0x11)), newRoot: bytes32(uint256(0xAA)), etherDelta: 1
         });
-        updates[1] = StateUpdate({
+        updates[1] = RollupUpdate({
             rollupId: type(uint64).max,
-            currentState: bytes32(uint256(0x22)),
-            newState: bytes32(uint256(0xBB)),
+            currentRoot: bytes32(uint256(0x22)),
+            newRoot: bytes32(uint256(0xBB)),
             etherDelta: -1
         });
 

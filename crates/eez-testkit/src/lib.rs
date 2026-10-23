@@ -25,6 +25,8 @@ use std::{
 };
 
 use alloy_consensus::Transaction as _;
+use alloy_consensus::transaction::SignerRecoverable as _;
+use alloy_eips::eip2718::Decodable2718 as _;
 use alloy_primitives::{Address, B256, Bytes, Signature, U256, address, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumHash, BlockNumberOrTag, TransactionReceipt, TransactionRequest};
@@ -40,6 +42,7 @@ use eez_control_rpc::{
     },
 };
 use eez_protocol::EEZL2_ADDRESS;
+use eez_protocol::abi::postAndVerifyBatchCall;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -126,7 +129,6 @@ pub struct Anvil {
 }
 
 struct AnvilConfig {
-    block_time_secs: u64,
     gas_limit: u64,
     genesis_timestamp: u64,
 }
@@ -134,7 +136,6 @@ struct AnvilConfig {
 impl AnvilConfig {
     fn standard(genesis_timestamp: u64) -> Self {
         Self {
-            block_time_secs: L1_BLOCK_TIME_SECS,
             gas_limit: 30_000_000,
             genesis_timestamp,
         }
@@ -153,8 +154,11 @@ impl Anvil {
             &port.to_string(),
             "--chain-id",
             &DEV_CHAIN_ID.to_string(),
-            "--block-time",
-            &cfg.block_time_secs.to_string(),
+            // The builder stub mines every block on the L1 slot cadence; FIFO
+            // keeps each bundle's transactions in submission order.
+            "--no-mining",
+            "--order",
+            "fifo",
             "--silent",
         ]);
         cmd.args(["--gas-limit", &cfg.gas_limit.to_string()]);
@@ -234,10 +238,7 @@ impl Drop for Anvil {
     }
 }
 
-/// Forwards single-transaction `eth_sendBundle` payloads to Anvil.
-///
-/// Anvil has no builder API, so the stub explicitly rejects bundles containing
-/// zero or multiple transactions instead of pretending to preserve atomicity.
+/// Mines Anvil's blocks and applies `eth_sendBundle` payloads atomically.
 struct BundleStub {
     child: Child,
     url: String,
@@ -273,6 +274,8 @@ impl BundleStub {
         command
             .arg(script)
             .args(["--listen", &listen, "--upstream", upstream])
+            .arg("--block-time")
+            .arg(L1_BLOCK_TIME_SECS.to_string())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err_log));
         drop(port_lease);
@@ -806,8 +809,11 @@ impl Harness {
         initial_state: B256,
         l2_genesis: (PathBuf, tempfile::TempDir),
     ) -> Result<Self> {
-        let anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
+        let mut anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
         let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url).await?;
+        // Route every harness client through the builder so its snapshot-based
+        // block assembly cannot race direct mutations of the backing Anvil.
+        anvil.rpc_url.clone_from(&stub.url);
         let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
         Ok(Self {
             anvil,
@@ -1019,12 +1025,21 @@ sol! {
     interface IEEZ {
         error InvalidProof();
         error InvalidProofSystemConfig();
-        event BatchPosted(uint256 rollupCount);
-        event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newState);
-        event L2TxSkipped(uint256 indexed transientIdx, bytes revertData);
-        function rollups(uint64 rollupId) external view returns (address rollupContract, bytes32 stateRoot, uint256 etherBalance);
+        event BatchPosted(bytes32 sharedPublicInput, uint64[] rollupIds);
+        event L2ExecutionPerformed(uint64 indexed rollupId, bytes32 newRoot, uint256 etherBalance);
+        event L2TxSkipped(uint256 indexed entryIndex, bytes revertData);
+        function rollups(uint64 rollupId) external view returns (address rollupContract, bytes32 root, uint256 etherBalance);
         function rollupCounter() external view returns (uint256);
         function registerRollup(address rollupContract, bytes32 initialState) external returns (uint64 rollupId);
+    }
+
+    interface IRollupManager {
+        function initialize(
+            address initialOwner,
+            uint256 initialThreshold,
+            address[] proofSystems,
+            bytes32[] vkeys
+        ) external;
     }
 }
 
@@ -1200,24 +1215,31 @@ async fn deploy_contracts_with_initial(
     )
     .await?;
 
-    // Rollup(address eez, address owner, uint256 threshold,
+    // Rollup(address eez) behind a proxy; initialize(address owner, uint256 threshold,
     //        address[] proofSystems, bytes32[] vkeys)
     let proof_systems: Vec<Address> = vec![proof_system_address];
     // vkey embeds the authorized signer address; the registry treats vkey as
     // opaque but checks non-zero + membership (see DeployRollup.s.sol:60).
     let vkeys: Vec<B256> = vec![attester.into_word()];
-    let rollup_manager_address = deploy(
+    let rollup_implementation = deploy(
         &provider,
         signer_addr,
         &out.join("Rollup.sol/Rollup.json"),
-        (
-            eez_address,
-            signer_addr,
-            U256::from(1u64),
-            proof_systems,
-            vkeys,
-        )
-            .abi_encode_params(),
+        eez_address.abi_encode(),
+    )
+    .await?;
+    let initialize = IRollupManager::initializeCall {
+        initialOwner: signer_addr,
+        initialThreshold: U256::from(1u64),
+        proofSystems: proof_systems,
+        vkeys,
+    }
+    .abi_encode();
+    let rollup_manager_address = deploy(
+        &provider,
+        signer_addr,
+        &out.join("TransparentUpgradeableProxy.sol/TransparentUpgradeableProxy.json"),
+        (rollup_implementation, signer_addr, Bytes::from(initialize)).abi_encode_params(),
     )
     .await?;
 
@@ -1941,7 +1963,7 @@ pub struct ChainSnapshot {
     pub entries_skipped: usize,
     /// What L1 stores for the rollup: a candidate block hash.
     pub rollup_commitment: B256,
-    pub latest_execution_state: Option<B256>,
+    pub latest_execution_root: Option<B256>,
 }
 
 pub struct Chain<'a> {
@@ -1982,15 +2004,16 @@ impl<'a> Chain<'a> {
         self.rollup_id
     }
 
-    /// Anvil uses `--block-time`, so `evm_setAutomine` does not stop it.
-    /// Interval 0 pauses block production; restore with `L1_BLOCK_TIME_SECS`.
+    /// The builder stub produces L1 blocks, so it is paused there rather than
+    /// in Anvil. Interval 0 pauses block production; any other value resumes
+    /// it on the `L1_BLOCK_TIME_SECS` cadence.
     pub async fn set_interval_mining(&self, secs: u64) -> Result<()> {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
         let _: serde_json::Value = provider
             .client()
-            .request("anvil_setIntervalMining", (secs,))
+            .request("eez_setMining", (secs != 0,))
             .await
-            .context("anvil_setIntervalMining")?;
+            .context("eez_setMining")?;
         Ok(())
     }
 
@@ -1999,9 +2022,9 @@ impl<'a> Chain<'a> {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
         let _: serde_json::Value = provider
             .client()
-            .request("evm_mine", ())
+            .request("eez_mine", ())
             .await
-            .context("evm_mine")?;
+            .context("eez_mine")?;
         Ok(())
     }
 
@@ -2073,14 +2096,14 @@ impl<'a> Chain<'a> {
                 Some(block),
             )
             .await?,
-            rollup_commitment: state_root_at(
+            rollup_commitment: rollup_root_at(
                 self.rpc_url,
                 self.eez_address,
                 self.rollup_id,
                 Some(block),
             )
             .await?,
-            latest_execution_state: latest_l2_execution_state_at(
+            latest_execution_root: latest_l2_execution_root_at(
                 self.rpc_url,
                 self.eez_address,
                 self.rollup_id,
@@ -2142,7 +2165,7 @@ impl<'a> Chain<'a> {
     }
 
     /// Assert that a submitted `postAndVerifyBatch` for `expected_rollup_id`
-    /// was mined, reverted, and reproduces `expected_revert_selector` via
+    /// was rejected atomically and reproduces `expected_revert_selector` via
     /// `eth_call` against the resulting chain state.
     pub async fn assert_failed_post_and_verify_batch(
         &self,
@@ -2150,74 +2173,56 @@ impl<'a> Chain<'a> {
         expected_revert_selector: [u8; 4],
     ) -> Result<()> {
         let provider = ProviderBuilder::new().connect_http(self.rpc_url.parse()?);
-        let latest = provider.get_block_number().await?;
+        let rejected: Vec<Bytes> = provider
+            .client()
+            .request("eez_getRejectedTransactions", ())
+            .await
+            .context("eez_getRejectedTransactions")?;
 
-        for block_number in self.deploy_block..=latest {
-            let Some(block) = provider
-                .get_block_by_number(BlockNumberOrTag::Number(block_number))
-                .full()
-                .await?
-            else {
+        for raw in rejected {
+            let transaction = TxEnvelope::decode_2718(&mut raw.as_ref())?;
+            if transaction.to() != Some(self.eez_address)
+                || !transaction
+                    .input()
+                    .starts_with(&eez_protocol::abi::postAndVerifyBatchCall::SELECTOR)
+            {
                 continue;
-            };
-            for transaction in block.transactions.txns() {
-                if transaction.inner.to() != Some(self.eez_address)
-                    || !transaction
-                        .inner
-                        .input()
-                        .starts_with(&eez_protocol::abi::postAndVerifyBatchCall::SELECTOR)
-                {
-                    continue;
-                }
-                let call = eez_protocol::abi::postAndVerifyBatchCall::abi_decode(
-                    transaction.inner.input(),
-                )?;
-                if !call
-                    .batch
-                    .rollupIdsWithProofSystems
-                    .iter()
-                    .any(|rollup| rollup.rollupId == expected_rollup_id)
-                {
-                    continue;
-                }
-
-                let tx_hash = *transaction.inner.tx_hash();
-                let receipt = provider
-                    .get_transaction_receipt(tx_hash)
-                    .await?
-                    .ok_or_else(|| anyhow!("postAndVerifyBatch receipt {tx_hash} is missing"))?;
-                if receipt.status() {
-                    bail!(
-                        "postAndVerifyBatch transaction {tx_hash} for rollup {expected_rollup_id} succeeded"
-                    );
-                }
-
-                let replay = TransactionRequest::default()
-                    .from(transaction.inner.signer())
-                    .to(self.eez_address)
-                    .input(transaction.inner.input().clone().into());
-                let err = provider
-                    .call(replay)
-                    .await
-                    .expect_err("failed postAndVerifyBatch replay unexpectedly succeeded");
-                let expected = format!("0x{}", hex::encode(expected_revert_selector));
-                let error_response = err.as_error_resp().ok_or_else(|| {
-                    anyhow!("postAndVerifyBatch replay returned non-RPC error: {err}")
-                })?;
-                let observed = error_response.data.as_ref().map_or_else(
-                    || error_response.message.to_string(),
-                    |data| format!("{} {}", error_response.message, data.get()),
-                );
-                if !observed.contains(&expected) {
-                    bail!(
-                        "postAndVerifyBatch replay returned {observed}, expected selector {expected}"
-                    );
-                }
-                return Ok(());
             }
+            let call = eez_protocol::abi::postAndVerifyBatchCall::abi_decode(transaction.input())?;
+            if !call
+                .batch
+                .rollupIdsWithProofSystems
+                .iter()
+                .any(|rollup| rollup.rollupId == expected_rollup_id)
+            {
+                continue;
+            }
+
+            let replay = TransactionRequest::default()
+                .from(transaction.recover_signer()?)
+                .to(self.eez_address)
+                .input(transaction.input().clone().into());
+            let err = provider
+                .call(replay)
+                .await
+                .expect_err("failed postAndVerifyBatch replay unexpectedly succeeded");
+            let expected = format!("0x{}", hex::encode(expected_revert_selector));
+            let error_response = err.as_error_resp().ok_or_else(|| {
+                anyhow!("postAndVerifyBatch replay returned non-RPC error: {err}")
+            })?;
+            let observed = error_response.data.as_ref().map_or_else(
+                || error_response.message.to_string(),
+                |data| format!("{} {}", error_response.message, data.get()),
+            );
+            if !observed.contains(&expected) {
+                bail!(
+                    "postAndVerifyBatch replay returned {observed}, expected selector {expected}"
+                );
+            }
+            return Ok(());
         }
 
-        bail!("no mined postAndVerifyBatch transaction found for rollup {expected_rollup_id}")
+        bail!("no rejected postAndVerifyBatch transaction found for rollup {expected_rollup_id}")
     }
 }
 
@@ -2234,13 +2239,14 @@ pub async fn wait_for_l1_blocks(rpc_url: &str, target: u64, timeout: Duration) -
     .await
 }
 
-/// The commitment L1 stores for `rollup_id`. A candidate block hash, not a
-/// state root — the ABI field is still named `stateRoot`.
+/// The commitment L1 stores for `rollup_id`. A candidate block hash, not an
+/// EVM state root.
 pub async fn rollup_commitment(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<B256> {
-    state_root_at(rpc_url, eez, rollup_id, None).await
+    rollup_root_at(rpc_url, eez, rollup_id, None).await
 }
 
-async fn state_root_at(
+/// [`rollup_commitment`] as of L1 block `block`, or latest for `None`.
+pub async fn rollup_root_at(
     rpc_url: &str,
     eez: Address,
     rollup_id: u64,
@@ -2252,7 +2258,7 @@ async fn state_root_at(
     if let Some(block) = block {
         call = call.block(BlockNumberOrTag::Number(block).into());
     }
-    Ok(call.call().await?.stateRoot)
+    Ok(call.call().await?.root)
 }
 
 pub async fn rollup_ether_balance(rpc_url: &str, eez: Address, rollup_id: u64) -> Result<U256> {
@@ -2411,7 +2417,7 @@ pub async fn assert_latest_batch_signature(
     Ok(())
 }
 
-async fn latest_l2_execution_state_at(
+async fn latest_l2_execution_root_at(
     rpc_url: &str,
     contract: Address,
     rollup_id: u64,
@@ -2433,7 +2439,7 @@ async fn latest_l2_execution_state_at(
         return Ok(None);
     };
     let decoded = IEEZ::L2ExecutionPerformed::decode_log(&last.inner)?;
-    Ok(Some(decoded.newState))
+    Ok(Some(decoded.newRoot))
 }
 
 pub async fn all_l2_execution_states(
@@ -2446,14 +2452,14 @@ pub async fn all_l2_execution_states(
         all_l2_execution_events(rpc_url, contract, rollup_id, from_block)
             .await?
             .into_iter()
-            .map(|event| event.state)
+            .map(|event| event.root)
             .collect(),
     )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct L2ExecutionEvent {
-    state: B256,
+    root: B256,
     block_number: u64,
     transaction_hash: B256,
     log_index: u64,
@@ -2486,7 +2492,7 @@ async fn all_l2_execution_events(
                 .ok_or_else(|| anyhow!("L2ExecutionPerformed log is missing log_index"))?;
             let decoded = IEEZ::L2ExecutionPerformed::decode_log(&log.inner)?;
             Ok(L2ExecutionEvent {
-                state: decoded.newState,
+                root: decoded.newRoot,
                 block_number,
                 transaction_hash,
                 log_index,
@@ -2499,7 +2505,7 @@ async fn all_l2_execution_events(
 /// Using the full history avoids racing an advancing on-chain head.
 /// Waits until the node's safe block is one L1 attested, and is past genesis.
 ///
-/// Compares BLOCK HASHES: `executed_states` are the `newState` values L1
+/// Compares BLOCK HASHES: `executed_states` are the `newRoot` values L1
 /// emitted, which are candidate block hashes, so a state root could never
 /// appear in that set.
 pub async fn wait_for_safe_state(
@@ -2533,7 +2539,7 @@ pub async fn wait_for_safe_state(
 /// Waits for a safe block L1 attested after `previous_states`.
 ///
 /// `previous_states` and `executed_states` are both `L2ExecutionPerformed`
-/// `newState` values — candidate block hashes — so the safe block is matched by
+/// `newRoot` values — candidate block hashes — so the safe block is matched by
 /// its hash. Its state root is not a commitment and would never appear there.
 pub async fn wait_for_new_attested_safe_block(
     node: &NodeHandle,
@@ -2944,19 +2950,27 @@ pub async fn deploy_protocol_dev(
         padded[12..].copy_from_slice(attester.as_slice());
         padded
     })];
-    let rollup_manager_address = deploy_raw(
+    let rollup_implementation = deploy_raw(
         l1_rpc,
         deployer_key,
         DEV_CHAIN_ID,
         &out.join("Rollup.sol/Rollup.json"),
-        (
-            eez_address,
-            signer_addr,
-            U256::from(1u64),
-            vec![proof_system_address],
-            vkeys,
-        )
-            .abi_encode_params(),
+        eez_address.abi_encode(),
+    )
+    .await?;
+    let initialize = IRollupManager::initializeCall {
+        initialOwner: signer_addr,
+        initialThreshold: U256::from(1u64),
+        proofSystems: vec![proof_system_address],
+        vkeys,
+    }
+    .abi_encode();
+    let rollup_manager_address = deploy_raw(
+        l1_rpc,
+        deployer_key,
+        DEV_CHAIN_ID,
+        &out.join("TransparentUpgradeableProxy.sol/TransparentUpgradeableProxy.json"),
+        (rollup_implementation, signer_addr, Bytes::from(initialize)).abi_encode_params(),
     )
     .await?;
 
@@ -2999,6 +3013,28 @@ async fn deploy_value(rpc_url: &str, key: &str, chain_id: u64, initial: U256) ->
         chain_id,
         &out.join("Value.sol/Value.json"),
         initial.abi_encode(),
+    )
+    .await
+}
+
+/// Deploy a `ParityGate` forwarding to `target`.
+///
+/// # Errors
+///
+/// Propagates deployment and receipt failures.
+pub async fn deploy_parity_gate(
+    rpc_url: &str,
+    key: &str,
+    chain_id: u64,
+    target: Address,
+) -> Result<Address> {
+    let out = repo_root().join("contracts/out");
+    deploy_raw(
+        rpc_url,
+        key,
+        chain_id,
+        &out.join("ParityGate.sol/ParityGate.json"),
+        target.abi_encode(),
     )
     .await
 }
@@ -3138,6 +3174,18 @@ pub async fn deploy_setter_wrapper(
         ISetterWrapper::setSameValueTwiceCall::SELECTOR,
     )?;
     deploy_raw(rpc_url, key, chain_id, &artifact, proxy.abi_encode()).await
+}
+
+/// Deploy the protocol's `EEZPostBatcher` for `eez` on the dev L1. Forge emits
+/// its artifact because `contracts/test/DeploymentSmoke.t.sol` imports it.
+pub async fn deploy_eez_post_batcher(rpc_url: &str, key: &str, eez: Address) -> Result<Address> {
+    let artifact = repo_root().join("contracts/out/EEZPostBatcher.sol/EEZPostBatcher.json");
+    require_artifact_method(
+        &artifact,
+        postAndVerifyBatchCall::SIGNATURE,
+        postAndVerifyBatchCall::SELECTOR,
+    )?;
+    deploy_raw(rpc_url, key, DEV_CHAIN_ID, &artifact, eez.abi_encode()).await
 }
 
 /// Wait until the outbound fixture is readable and Composer observes an L2
@@ -3364,7 +3412,7 @@ impl CrossChainConfig {
         // These CREATE nonces must match `deploy_protocol_dev`.
         let eez_address = deployer.create(0);
         let proof_system_address = deployer.create(1);
-        let rollup_manager_address = deployer.create(2);
+        let rollup_manager_address = deployer.create(3);
         let ts = now_unix_secs();
         let initial_state = l2_genesis_block_hash_at(ts)?;
         let l1_http_lease = PortLease::http_pair();
@@ -4044,7 +4092,7 @@ impl StandardOracleSnapshot {
             let endpoint = execution_events
                 .iter()
                 .rfind(|event| {
-                    event.block_number == l1_block_number && event.state == l1_settled
+                    event.block_number == l1_block_number && event.root == l1_settled
                 })
                 .ok_or_else(|| {
                     anyhow!(

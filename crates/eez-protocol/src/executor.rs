@@ -84,7 +84,7 @@ pub trait TargetExecutionSession: Send {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Encoding`](crate::error::ExecutorErrorKind::Encoding)
+    /// Returns [`ExecutorError::Encoding`](crate::error::ExecutorError::Encoding)
     /// when the snapshot has the wrong concrete type for this session.
     fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()>;
 }

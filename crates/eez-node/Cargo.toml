@@ -33,6 +33,7 @@ reth-node-builder.workspace               = true
 reth-node-core.workspace                  = true
 reth-node-ethereum.workspace              = true
 reth-rpc-eth-api.workspace                = true
+reth-rpc-server-types.workspace           = true
 reth-storage-api.workspace                = true
 reth-tasks.workspace                      = true
 # Persistent witness store: dedicated mdbx env, separate from reth's node DB.

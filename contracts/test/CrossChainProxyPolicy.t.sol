@@ -16,7 +16,7 @@ contract DelegateProxyCaller {
 /// @notice Reject-policy scenarios that do not alter protocol behavior.
 contract CrossChainProxyPolicyTest is Test {
     function testDelegatecallToProxyIsRejectedBeforeDestinationExecution() external {
-        EEZL2 manager = new EEZL2(1, address(0xBEEF), false);
+        EEZL2 manager = new EEZL2(1, address(0xBEEF), false, address(0xBEEF));
         address proxy = manager.createCrossChainProxy(address(0xCAFE), 0);
         DelegateProxyCaller caller = new DelegateProxyCaller();
 

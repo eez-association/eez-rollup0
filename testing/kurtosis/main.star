@@ -16,6 +16,7 @@ L2_XCHAIN_PORT = 18998
 BUILDER_FLASHBOTS_RPC_PORT = 8645
 PROOF_SIGNER_GRPC_PORT = 50061
 L2_CHAIN_ID = "6290"
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 
 def run(plan, args):
@@ -25,13 +26,14 @@ def run(plan, args):
 
     poster_key = eez.get("poster_key", "")
     proof_signer_key = eez.get("proof_signer_key", "")
+    recovery_address = eez.get("recovery_address", "")
     if (
         poster_key in ["", "0xCHANGE_ME"]
         or proof_signer_key in ["", "0xCHANGE_ME"]
+        or recovery_address in ["", "0xCHANGE_ME", ZERO_ADDRESS]
     ):
         fail(
-            "set eez.poster_key and eez.proof_signer_key in the args file "
-            + "(set deterministic test keys in the selected args file)"
+            "set eez.poster_key, eez.proof_signer_key, and eez.recovery_address in the args file"
         )
 
     # Pair B: canonical L1, validators, and MEV stack.
@@ -82,6 +84,7 @@ def run(plan, args):
             "EEZ_L1_RPC_URL": l1_el.rpc_http_url,
             "EEZ_L1_POSTER_KEY": poster_key,
             "EEZ_PROOF_SIGNER_KEY": proof_signer_key,
+            "EEZ_L2_RECOVERY_ADDRESS": recovery_address,
             "EEZ_DEPLOYMENTS_FILE": "/out/deployments.env",
             "EEZ_GENESIS_OUT": "/out/l2-genesis.json",
         },

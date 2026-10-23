@@ -12,7 +12,7 @@ pub fn is_system_tx(tx: &eez_primitives::EezTxEnvelope) -> bool {
 /// in tx order. A position ends a pair iff it is a USER tx (the `user` half of
 /// an outbound `[load | user]` pair) OR a SYSTEM tx followed by a system tx / the
 /// block end (a standalone inbound system tx). Single source of truth shared by
-/// the composer (per-effect `StateUpdate.newState` stitch) and proof signer
+/// the composer (per-effect `RollupUpdate.newRoot` stitch) and proof signer
 /// (effect/checkpoint binding), so the settled roots line up entry-for-entry.
 #[must_use]
 pub fn pair_end_positions(is_system: &[bool]) -> Vec<usize> {

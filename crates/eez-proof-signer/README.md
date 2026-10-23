@@ -15,7 +15,14 @@ recomputed public-input hash.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) records contributor constraints and verification
   commands.
 
+The streaming service described in [PR #206](https://github.com/eez-association/eez-rollup0/pull/206)
+supports isolated sessions, bounded pipelining, Resume, Rewind, Cancel, and
+subrange finalization. Its current Rollup0 profile is calldata-only and timeless:
+proofs bind the transition from the selected parent without attesting that
+parent's L1 acceptance. Blobs and posting context are rejected as unsupported.
+The [shared streaming contract](../eez-control-rpc/STREAMING_SPEC.md) distinguishes
+required behavior from optional capabilities and other settlement profiles.
+
 The service fails closed: any admission, validation, settlement, deadline, or
-signing failure returns no signature. Backend
-implementations live in [`eez-prover-stateless`](../eez-prover-stateless) and
+signing failure returns no signature. Backend implementations live in [`eez-prover-stateless`](../eez-prover-stateless) and
 [`eez-prover-stateful`](../eez-prover-stateful).

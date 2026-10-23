@@ -25,7 +25,7 @@ use tracing::{Level, event};
 const FILE_NAME: &str = "eez-reconcile-checkpoint";
 
 /// Bumped when the field set changes; an older file is discarded, not guessed.
-const VERSION: &str = "eez-reconcile-checkpoint v2";
+const VERSION: &str = "eez-reconcile-checkpoint v3";
 
 /// Last batch whose effects are committed to local L2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,9 @@ pub struct ReconcileCheckpoint {
     pub l1_block: u64,
     /// Hash of that L1 block, so a reorg below it is detectable.
     pub l1_block_hash: B256,
-    /// The batch's L1 tx hash; lets the rescan dedup the seeded record.
+    /// Index of the batch's `BatchPosted` log in that block.
+    pub log_index: u64,
+    /// The batch's L1 tx hash; display only.
     pub tx_hash: B256,
     /// Highest L2 block this batch confirmed.
     pub l2_cursor: u64,
@@ -133,8 +135,13 @@ impl ReconcileCheckpoint {
 
     fn encode(&self) -> String {
         format!(
-            "{VERSION}\nl1_block={}\nl1_block_hash={:#x}\ntx_hash={:#x}\nl2_cursor={}\nl2_block_hash={:#x}\n",
-            self.l1_block, self.l1_block_hash, self.tx_hash, self.l2_cursor, self.l2_block_hash,
+            "{VERSION}\nl1_block={}\nl1_block_hash={:#x}\nlog_index={}\ntx_hash={:#x}\nl2_cursor={}\nl2_block_hash={:#x}\n",
+            self.l1_block,
+            self.l1_block_hash,
+            self.log_index,
+            self.tx_hash,
+            self.l2_cursor,
+            self.l2_block_hash,
         )
     }
 
@@ -145,6 +152,7 @@ impl ReconcileCheckpoint {
         }
         let mut l1_block = None;
         let mut l1_block_hash = None;
+        let mut log_index = None;
         let mut tx_hash = None;
         let mut l2_cursor = None;
         let mut l2_block_hash = None;
@@ -157,6 +165,7 @@ impl ReconcileCheckpoint {
             match key {
                 "l1_block" => l1_block = Some(value.parse().ok()?),
                 "l1_block_hash" => l1_block_hash = Some(value.parse().ok()?),
+                "log_index" => log_index = Some(value.parse().ok()?),
                 "tx_hash" => tx_hash = Some(value.parse().ok()?),
                 "l2_cursor" => l2_cursor = Some(value.parse().ok()?),
                 "l2_block_hash" => l2_block_hash = Some(value.parse().ok()?),
@@ -168,6 +177,7 @@ impl ReconcileCheckpoint {
         Some(Self {
             l1_block: l1_block?,
             l1_block_hash: l1_block_hash?,
+            log_index: log_index?,
             tx_hash: tx_hash?,
             l2_cursor: l2_cursor?,
             l2_block_hash: l2_block_hash?,
@@ -183,6 +193,7 @@ mod tests {
         ReconcileCheckpoint {
             l1_block: 27_081,
             l1_block_hash: B256::repeat_byte(0xa1),
+            log_index: 7,
             tx_hash: B256::repeat_byte(0xb2),
             l2_cursor: 111_540,
             l2_block_hash: B256::repeat_byte(0xc3),
@@ -227,11 +238,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = ReconcileCheckpoint::path(dir.path());
         let body = valid_body();
+        let without_log_index = body.replace("log_index=7\n", "");
         let bad = [
             // truncated mid-write: header only
             VERSION.to_owned(),
             // missing a field
             format!("{VERSION}\nl1_block=1\nl2_cursor=2\n"),
+            // missing only the log index: a block alone does not name a batch
+            format!("{VERSION}\n{without_log_index}"),
+            // a v2 file names a tx, not a batch: discarded, so boot rescans once
+            format!("eez-reconcile-checkpoint v2\n{without_log_index}"),
             // unparseable number
             format!("{VERSION}\nl1_block=abc\n"),
             // empty
@@ -397,6 +413,7 @@ mod tests {
                 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
                 0x89, 0xab, 0xcd, 0xef,
             ]),
+            log_index: u64::MAX,
             tx_hash: B256::ZERO,
             l2_cursor: u64::MAX,
             l2_block_hash: B256::repeat_byte(0xff),

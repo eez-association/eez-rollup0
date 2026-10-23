@@ -4,7 +4,7 @@ Status: reviewed with the protocol owners; intentional dispatch policy
 
 ## Executive conclusion
 
-At protocol revision `6fcc90b65063831cb7797e9fa361004064d28f9f`,
+At protocol revision `855fe0602484750861b4c31502a1a91355d33ed6`,
 `immediateEntryCount` and `immediateStaticEntryCount` are not included in the
 public-input hash. They can therefore be changed after a proof or ECDSA
 attestation has been created without invalidating that proof or signature.
@@ -123,7 +123,7 @@ Consider two proved entries for one rollup:
 | `1` | Cross-chain entry, `proxyEntryHash != 0` | Persistent queue |
 
 The canonical batch has `immediateEntryCount = 1`. A poster changes only that
-field to `2` and submits from an EOA:
+field to `2` and submits from a contract with a no-op meta callback:
 
 1. The changed value remains within `entries.length`.
 2. The leading-L2Tx boundary guard passes: the value was increased, and there
@@ -131,13 +131,16 @@ field to `2` and submits from an EOA:
 3. The public-input hash is unchanged, so the same proof remains valid.
 4. Entry `0` executes and advances the loop cursor to `1`.
 5. Entry `1` stops the leading L2Tx loop because its hash is nonzero.
-6. The meta hook does not run because the EOA has no code.
+6. The poster's `executeMetaCrossChainTransactions()` callback runs but
+   intentionally leaves entry `1` unconsumed.
 7. Persistent publication starts at index `2`, so entry `1` is not queued.
 
 The proved content was not changed, but entry `1` is no longer available for
 consumption.
 
-The adversarial test
+An EOA cannot exercise this path: the contract reverts with
+`MetaEntriesWithoutReceiver` when meta entries remain but the poster has no
+code. The adversarial test
 [`testImmediateEntryCountCanDropADeferredEntryWithoutChangingPublicInput`](../../../contracts/test/PublicInputsHashVectors.t.sol)
 constructs the canonical and mutated batches on separate `EEZ` instances and
 checks that:
@@ -176,7 +179,7 @@ The trace supplies the same public-input hash to both verifier calls:
 | Count bounds | Counts cannot exceed their corresponding arrays | A valid in-range count is proof-authorized |
 | `ImmediateCountStrandsLeadingL2Tx` | A poster cannot under-count and queue a leading zero-hash L2Tx | A poster cannot over-count a later nonzero-hash entry |
 | Full entry hashes | Entry content cannot be replaced without invalidating the proof | The entry remains executable or queued |
-| `StateUpdate.currentState` | An executed entry must apply to the live pre-state | Every proved entry is eventually attempted |
+| `RollupUpdate.currentRoot` | An executed entry must apply to the live pre-state | Every proved entry is eventually attempted |
 | Rolling-hash and ether checks | Executed effects must match their proved effect chain and value flow | Omitted effects must be dispatched |
 | Sender binding | With binding enabled, a different address cannot reuse the proof | The authorized poster cannot change an unbound count |
 

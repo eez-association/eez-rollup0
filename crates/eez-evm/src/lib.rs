@@ -3,9 +3,12 @@
 //! The pinned `EthEvmConfig` fixes its primitives to Ethereum types, which cannot
 //! represent native type `0x76`. This wrapper selects `EezPrimitives`, preserves
 //! the native receipt type, and decodes native transactions in Engine payloads.
-//! Ethereum's executor, gas accounting, system calls, block assembly, and header
-//! environment are reused. `eez-primitives` defines the zero-fee native TxEnv;
-//! `evm` adds deposit minting, rollback, and genesis-configured fee collection.
+//! Ethereum transaction execution, gas accounting, block assembly, and header
+//! environment are reused. L2 block processing keeps EIP-2935 but disables
+//! beacon-root updates and consensus-layer requests. L1 composition only uses
+//! transaction simulation, bypassing block processing. `eez-primitives` defines
+//! the zero-fee native TxEnv; `evm` adds deposit minting, rollback, and
+//! genesis-configured fee collection.
 //!
 //! Configuration adapted from reth's `EthEvmConfig` at the pinned revision:
 //! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/evm/src/lib.rs>.
@@ -34,7 +37,9 @@ use reth_primitives_traits::{
 use reth_storage_errors::any::AnyError;
 use std::{borrow::Cow, fmt, sync::Arc};
 
+mod block;
 mod evm;
+pub use block::EezBlockExecutorFactory;
 pub use evm::EezEvmFactory;
 
 /// Read the consensus fee destination. Absence retains historical Ethereum fee
@@ -47,6 +52,19 @@ pub fn fee_collector(config: &alloy_genesis::ChainConfig) -> Result<Option<Addre
         .transpose()
 }
 
+/// Maximum declared `tx.gas` accepted by the current EVM rules.
+/// Amsterdam allows the envelope limit to include separately metered state gas,
+/// so only its regular-gas accounting uses the configured cap.
+#[must_use]
+pub fn declared_tx_gas_limit_cap(cfg: &impl revm::context_interface::Cfg) -> Option<u64> {
+    if cfg.is_amsterdam_eip8037_enabled() {
+        None
+    } else {
+        let cap = cfg.tx_gas_limit_cap();
+        (cap != u64::MAX).then_some(cap)
+    }
+}
+
 /// Enforce L2 transaction support during construction and replay. The underlying
 /// EVM is also used for L1 simulation, where blob transactions remain valid.
 pub fn ensure_supported_transaction(tx: &EezTxEnvelope) -> Result<(), AnyError> {
@@ -56,9 +74,15 @@ pub fn ensure_supported_transaction(tx: &EezTxEnvelope) -> Result<(), AnyError> 
     Ok(())
 }
 
-#[derive(Debug)]
 struct L2WithdrawalsUnsupported {
     count: usize,
+}
+
+// Debug matches Display because stateless formats checkpoint executor errors with `{:?}`.
+impl fmt::Debug for L2WithdrawalsUnsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
 }
 
 impl fmt::Display for L2WithdrawalsUnsupported {
@@ -105,15 +129,18 @@ impl ReceiptBuilder for EezReceiptBuilder {
 #[derive(Debug, Clone)]
 pub struct EezEvmConfig<C = ChainSpec> {
     ethereum: EthEvmConfig<C>,
-    executor: EthBlockExecutorFactory<EezReceiptBuilder, Arc<C>, EezEvmFactory>,
+    executor: EezBlockExecutorFactory<C>,
 }
 
 impl<C: EthChainSpec> EezEvmConfig<C> {
+    /// Construct the shared Rollup0 execution configuration.
     pub fn new(chain_spec: Arc<C>) -> Result<Self, AnyError> {
         let factory = EezEvmFactory::new(fee_collector(&chain_spec.genesis().config)?);
         Ok(Self {
             ethereum: EthEvmConfig::new(chain_spec.clone()),
-            executor: EthBlockExecutorFactory::new(EezReceiptBuilder, chain_spec, factory),
+            executor: EezBlockExecutorFactory {
+                ethereum: EthBlockExecutorFactory::new(EezReceiptBuilder, chain_spec, factory),
+            },
         })
     }
 
@@ -128,7 +155,7 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
     type Primitives = EezPrimitives;
     type Error = AnyError;
     type NextBlockEnvCtx = NextBlockEnvAttributes;
-    type BlockExecutorFactory = EthBlockExecutorFactory<EezReceiptBuilder, Arc<C>, EezEvmFactory>;
+    type BlockExecutorFactory = EezBlockExecutorFactory<C>;
     type BlockAssembler = EthBlockAssembler<C>;
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {

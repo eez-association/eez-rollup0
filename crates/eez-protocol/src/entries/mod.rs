@@ -30,7 +30,7 @@ const SELF_CALL: &str = "same-chain cross-chain calls are not supported";
 pub(crate) fn ensure_materializable_calls(calls: &[ExecutedAction]) -> ProtocolResult<()> {
     for call in calls {
         if call.source_rollup_id == call.target_rollup_id {
-            return Err(crate::ProtocolErrorKind::Unsupported(SELF_CALL).into());
+            return Err(crate::ProtocolError::Unsupported(SELF_CALL));
         }
         supported_return_data(call)?;
     }
@@ -46,7 +46,7 @@ pub(crate) fn ensure_source_side_calls<'a>(
         .into_iter()
         .any(|call| call.source_rollup_id != source_rollup_id)
     {
-        return Err(crate::ProtocolErrorKind::Unsupported(NESTED_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(NESTED_CALL));
     }
     Ok(())
 }
@@ -56,7 +56,7 @@ pub(crate) fn ensure_source_side_calls<'a>(
 ///
 /// L2 source entries are seed-only: the user transaction performs the outer
 /// call, so the table stores its precomputed result without re-executing it.
-/// L1 entries remain unfinalized until their `StateUpdate`s are attached and
+/// L1 entries remain unfinalized until their `RollupUpdate`s are attached and
 /// [`finalize_l1_rolling_hashes`] is called.
 ///
 /// # Errors
@@ -84,14 +84,14 @@ pub fn build_batch(
             let return_data = Bytes::copy_from_slice(supported_return_data(call)?);
             let proxy_entry_hash = source_side_call_hash(call);
             let rolling_hash = if source_rollup_id.is_mainnet() {
-                // The L1 seed depends on StateUpdates that are attached later.
+                // The L1 seed depends on RollupUpdates that are attached later.
                 B256::ZERO
             } else {
                 EntryRollingHash::seed_for_l2(proxy_entry_hash).current()
             };
 
             Ok(ExecutionEntrySol {
-                stateUpdates: Vec::new(),
+                rollupUpdates: Vec::new(),
                 proxyEntryHash: proxy_entry_hash,
                 l2ToL1Calls: Vec::new(),
                 expectedL1ToL2Calls: Vec::new(),
@@ -118,7 +118,7 @@ pub fn build_batch(
 ///
 /// The entries intentionally carry an unfinished zero `rollingHash`: their L1
 /// seed cannot be computed until the Composer attaches the final ordered
-/// `StateUpdate`s and calls [`finalize_l1_rolling_hashes`].
+/// `RollupUpdate`s and calls [`finalize_l1_rolling_hashes`].
 pub(crate) fn build_l1_postbatch(
     calls: &[ExecutedAction],
     source_rollup_id: RollupId,
@@ -127,18 +127,17 @@ pub(crate) fn build_l1_postbatch(
     for call in calls {
         let return_data = supported_top_level_return_data(call, source_rollup_id)?;
         if !call.target_rollup_id.is_mainnet() {
-            return Err(crate::ProtocolErrorKind::Unsupported(
+            return Err(crate::ProtocolError::Unsupported(
                 "L1 post-batch entries only support L2-to-L1 calls",
-            )
-            .into());
+            ));
         }
 
         entries.push(ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: B256::ZERO,
             l2ToL1Calls: vec![l1_call_from_action(call)],
             expectedL1ToL2Calls: Vec::new(),
-            // Finalized only after StateUpdates are stitched by the Composer.
+            // Finalized only after RollupUpdates are stitched by the Composer.
             rollingHash: B256::ZERO,
             destinationRollupId: source_rollup_id.0,
             success: true,
@@ -159,43 +158,43 @@ pub(crate) fn build_l1_postbatch(
 /// Finalize every mutable L1 entry after the Composer has attached its ordered
 /// state updates.
 ///
-/// Every entry must be successful, have at least one `StateUpdate`, contain no
+/// Every entry must be successful, have at least one `RollupUpdate`, contain no
 /// reentrant expected calls, and contain at most one flat mutable call with no
-/// gas limit or revert span.
+/// gas limit or revert span. Immediate entries retain their simulated call
+/// result only until it has been folded into the rolling hash, so finalize an
+/// entry exactly once.
 ///
 /// # Errors
 ///
 /// Returns an error when any entry is incomplete or outside that profile.
 pub fn finalize_l1_rolling_hashes(batch: &mut EvmBatch) -> ProtocolResult<()> {
     if !batch.staticEntries.is_empty() {
-        return Err(crate::ProtocolErrorKind::Unsupported(STATIC_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(STATIC_CALL));
     }
 
     for (entry_index, entry) in batch.entries.iter_mut().enumerate() {
-        if entry.stateUpdates.is_empty() {
-            return Err(crate::ProtocolErrorKind::InvalidEncoding(format!(
-                "L1 entry {entry_index} has no StateUpdates"
-            ))
-            .into());
+        if entry.rollupUpdates.is_empty() {
+            return Err(crate::ProtocolError::InvalidEncoding(format!(
+                "L1 entry {entry_index} has no RollupUpdates"
+            )));
         }
         if !entry.success {
-            return Err(crate::ProtocolErrorKind::Unsupported(UNSUCCESSFUL_CALL).into());
+            return Err(crate::ProtocolError::Unsupported(UNSUCCESSFUL_CALL));
         }
         if !entry.expectedL1ToL2Calls.is_empty() {
-            return Err(crate::ProtocolErrorKind::Unsupported(NESTED_CALL).into());
+            return Err(crate::ProtocolError::Unsupported(NESTED_CALL));
         }
         if entry.l2ToL1Calls.len() > 1 {
-            return Err(crate::ProtocolErrorKind::Unsupported(
+            return Err(crate::ProtocolError::Unsupported(
                 "multiple flat calls in one L1 entry are not supported",
-            )
-            .into());
+            ));
         }
 
         let mut rolling_hash = EntryRollingHash::seed_for_l1(
             entry
-                .stateUpdates
+                .rollupUpdates
                 .iter()
-                .map(|update| (update.rollupId, update.currentState)),
+                .map(|update| (update.rollupId, update.currentRoot)),
             entry.proxyEntryHash,
         );
 
@@ -215,6 +214,9 @@ pub fn finalize_l1_rolling_hashes(batch: &mut EvmBatch) -> ProtocolResult<()> {
         }
 
         entry.rollingHash = rolling_hash.current();
+        if entry.proxyEntryHash == B256::ZERO {
+            entry.returnData = Bytes::new();
+        }
     }
 
     Ok(())
@@ -276,16 +278,15 @@ impl InboundSidecar {
     /// Derive the canonical sidecar for one successful incoming L2 call.
     pub fn new(entry: IncomingEntry) -> ProtocolResult<Self> {
         if entry.l2_rollup_id.is_mainnet() || entry.source_rollup_id == entry.l2_rollup_id {
-            return Err(crate::ProtocolErrorKind::Unsupported(
+            return Err(crate::ProtocolError::Unsupported(
                 "inbound sidecars require a different, non-L1 destination rollup",
-            )
-            .into());
+            ));
         }
         let destination = entry.l2_rollup_id.0;
         let l2_entry = build_l2_incoming_entry(entry)?;
         let call = &l2_entry.incomingCalls[0];
         Ok(Self(ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: l2_entry.proxyEntryHash,
             l2ToL1Calls: vec![L2ToL1CallSol {
                 revertNextNCalls: 0,
@@ -336,10 +337,9 @@ impl TryFrom<&ExecutionEntrySol> for InboundSidecar {
 
     fn try_from(entry: &ExecutionEntrySol) -> ProtocolResult<Self> {
         let [call] = entry.l2ToL1Calls.as_slice() else {
-            return Err(crate::ProtocolErrorKind::InvalidEncoding(
+            return Err(crate::ProtocolError::InvalidEncoding(
                 "inbound sidecar must contain exactly one incoming call".into(),
-            )
-            .into());
+            ));
         };
         let sidecar = Self::new(IncomingEntry {
             target: call.targetAddress,
@@ -352,10 +352,9 @@ impl TryFrom<&ExecutionEntrySol> for InboundSidecar {
             success: entry.success,
         })?;
         if sidecar.encoded() != entry.abi_encode() {
-            return Err(crate::ProtocolErrorKind::InvalidEncoding(
+            return Err(crate::ProtocolError::InvalidEncoding(
                 "noncanonical inbound sidecar (shape or L2 hashes differ)".into(),
-            )
-            .into());
+            ));
         }
         Ok(sidecar)
     }
@@ -386,7 +385,7 @@ pub fn build_l2_incoming_entry(entry: IncomingEntry) -> ProtocolResult<L2Executi
         success,
     } = entry;
     if !success {
-        return Err(crate::ProtocolErrorKind::Unsupported(UNSUCCESSFUL_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(UNSUCCESSFUL_CALL));
     }
 
     let call_hash = common_cross_chain_call_hash(CallHashInput {
@@ -459,7 +458,7 @@ pub fn build_l2_outbound_entry(entry: OutboundEntry) -> ProtocolResult<L2Executi
         success,
     } = entry;
     if !success {
-        return Err(crate::ProtocolErrorKind::Unsupported(UNSUCCESSFUL_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(UNSUCCESSFUL_CALL));
     }
 
     let proxy_entry_hash = l2_outbound_call_hash(
@@ -510,7 +509,7 @@ pub fn build_l1_inbound_entry(
 
     batch_with_entries(
         vec![ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: proxy_entry_hash,
             l2ToL1Calls: Vec::new(),
             expectedL1ToL2Calls: Vec::new(),
@@ -536,10 +535,9 @@ pub(crate) fn build_inbound_target_entries(
     for call in calls {
         let return_data = supported_return_data(call)?;
         if call.target_rollup_id != target_rollup_id || call.source_rollup_id == target_rollup_id {
-            return Err(crate::ProtocolErrorKind::Unsupported(
+            return Err(crate::ProtocolError::Unsupported(
                 "inbound sidecars only support top-level calls from another rollup",
-            )
-            .into());
+            ));
         }
 
         let sidecar = InboundSidecar::new(IncomingEntry {
@@ -566,7 +564,7 @@ pub(crate) fn build_inbound_target_entries(
 pub fn build_l1_settlement_only(rollup_id: RollupId) -> EvmBatch {
     batch_with_entries(
         vec![ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: B256::ZERO,
             l2ToL1Calls: Vec::new(),
             expectedL1ToL2Calls: Vec::new(),
@@ -581,20 +579,8 @@ pub fn build_l1_settlement_only(rollup_id: RollupId) -> EvmBatch {
 
 /// Encode one L2 incoming execution call.
 #[must_use]
-pub fn encode_execute_incoming(
-    destination: Address,
-    value: U256,
-    data: Bytes,
-    source: Address,
-    source_rollup_id: RollupId,
-    entry: L2ExecutionEntrySol,
-) -> Vec<u8> {
+pub fn encode_execute_incoming(entry: L2ExecutionEntrySol) -> Vec<u8> {
     crate::abi::executeIncomingCrossChainCallCall {
-        destination,
-        value,
-        data,
-        sourceAddress: source,
-        sourceRollup: source_rollup_id.0,
         _entries: vec![entry],
         _staticEntries: Vec::new(),
     }
@@ -648,15 +634,7 @@ pub fn decode_inbound(calldata: &[u8]) -> Option<DecodedInbound> {
         return None;
     }
     let incoming = entry.incomingCalls.first()?;
-    if incoming.revertNextNCalls != 0
-        || incoming.isStatic
-        || incoming.gas != 0
-        || incoming.sourceAddress != call.sourceAddress
-        || incoming.sourceRollupId != call.sourceRollup
-        || incoming.targetAddress != call.destination
-        || incoming.value != call.value
-        || incoming.data != call.data
-    {
+    if incoming.revertNextNCalls != 0 || incoming.isStatic || incoming.gas != 0 {
         return None;
     }
 
@@ -668,10 +646,10 @@ pub fn decode_inbound(calldata: &[u8]) -> Option<DecodedInbound> {
     }
 
     Some(DecodedInbound {
-        target: call.destination,
-        value: call.value,
-        data: call.data,
-        source: call.sourceAddress,
+        target: incoming.targetAddress,
+        value: incoming.value,
+        data: incoming.data.clone(),
+        source: incoming.sourceAddress,
         return_data: entry.returnData,
         success: entry.success,
     })
@@ -691,18 +669,63 @@ pub fn decode_postbatch(calldata: &[u8]) -> alloy_sol_types::Result<EvmBatch> {
     Ok(postAndVerifyBatchCall::abi_decode(calldata)?.batch)
 }
 
+/// What an applied entry contributes to the Sync block. `ordinal` ranks within
+/// its own direction — the DA layout — so a skipped entry never shifts the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryRole {
+    /// State-only: moves the commitment but signs no system tx.
+    Anchor,
+    /// L2→L1 settlement — its DA slot and its Sync-block user tx.
+    Outbound {
+        /// Rank among the rollup's outbound entries.
+        ordinal: usize,
+    },
+    /// L1→L2 delivery.
+    Inbound {
+        /// Rank among the rollup's inbound entries.
+        ordinal: usize,
+    },
+}
+
+/// Role of each entry for `rollup_id`, `None` where it updates only other
+/// rollups; ordinals count only `rollup_id`'s entries. `proxyEntryHash`
+/// decides first: inbound entries carry no `l2ToL1Calls`.
+#[must_use]
+pub fn entry_roles(entries: &[ExecutionEntrySol], rollup_id: u64) -> Vec<Option<EntryRole>> {
+    let (mut outbound, mut inbound) = (0, 0);
+    entries
+        .iter()
+        .map(|entry| {
+            if !entry.rollupUpdates.iter().any(|u| u.rollupId == rollup_id) {
+                return None;
+            }
+            let role = if entry.proxyEntryHash != B256::ZERO {
+                let ordinal = inbound;
+                inbound += 1;
+                EntryRole::Inbound { ordinal }
+            } else if entry.l2ToL1Calls.is_empty() {
+                EntryRole::Anchor
+            } else {
+                let ordinal = outbound;
+                outbound += 1;
+                EntryRole::Outbound { ordinal }
+            };
+            Some(role)
+        })
+        .collect()
+}
+
 fn supported_return_data(call: &ExecutedAction) -> ProtocolResult<&[u8]> {
     if call.outcome.is_pending() {
-        return Err(crate::ProtocolErrorKind::InvalidEncoding(
+        return Err(crate::ProtocolError::InvalidEncoding(
             "recorded cross-chain call still has a pending outcome".to_owned(),
-        )
-        .into());
+        ));
     }
     if call.call_mode == CallMode::Static {
-        return Err(crate::ProtocolErrorKind::Unsupported(STATIC_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(STATIC_CALL));
     }
     if call.revert_span.is_some() {
-        return Err(crate::ProtocolErrorKind::Unsupported(REVERT_SPAN).into());
+        return Err(crate::ProtocolError::Unsupported(REVERT_SPAN));
     }
     match &call.outcome {
         crate::ExecutionOutcome::Resolved {
@@ -711,7 +734,7 @@ fn supported_return_data(call: &ExecutedAction) -> ProtocolResult<&[u8]> {
             ..
         } => Ok(return_data),
         crate::ExecutionOutcome::Resolved { success: false, .. } => {
-            Err(crate::ProtocolErrorKind::Unsupported(UNSUCCESSFUL_CALL).into())
+            Err(crate::ProtocolError::Unsupported(UNSUCCESSFUL_CALL))
         }
         crate::ExecutionOutcome::Pending => unreachable!("pending outcome rejected above"),
     }
@@ -723,23 +746,22 @@ fn supported_top_level_return_data(
 ) -> ProtocolResult<&[u8]> {
     let return_data = supported_return_data(call)?;
     if call.source_rollup_id != source_rollup_id {
-        return Err(crate::ProtocolErrorKind::Unsupported(NESTED_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(NESTED_CALL));
     }
     Ok(return_data)
 }
 
 fn ensure_supported_flat_call(call: &L2ToL1CallSol) -> ProtocolResult<()> {
     if call.revertNextNCalls != 0 {
-        return Err(crate::ProtocolErrorKind::Unsupported(REVERT_SPAN).into());
+        return Err(crate::ProtocolError::Unsupported(REVERT_SPAN));
     }
     if call.isStatic {
-        return Err(crate::ProtocolErrorKind::Unsupported(STATIC_CALL).into());
+        return Err(crate::ProtocolError::Unsupported(STATIC_CALL));
     }
     if call.gas != 0 {
-        return Err(crate::ProtocolErrorKind::Unsupported(
+        return Err(crate::ProtocolError::Unsupported(
             "explicit cross-chain call gas limits are not supported",
-        )
-        .into());
+        ));
     }
     Ok(())
 }
@@ -779,11 +801,11 @@ fn batch_with_entries(entries: Vec<ExecutionEntrySol>, immediate_count: usize) -
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::{I256, address};
+    use alloy_primitives::address;
 
     use super::*;
     use crate::ExecutionOutcome;
-    use crate::abi::StateUpdateSol;
+    use crate::abi::RollupUpdateSol;
 
     fn record(target: RollupId, source: RollupId) -> ExecutedAction {
         ExecutedAction {
@@ -803,12 +825,12 @@ mod tests {
         }
     }
 
-    fn state_update(rollup_id: u64, current_state: B256) -> StateUpdateSol {
-        StateUpdateSol {
+    fn state_update(rollup_id: u64, current_root: B256) -> RollupUpdateSol {
+        RollupUpdateSol {
             rollupId: rollup_id,
-            currentState: current_state,
-            newState: B256::with_last_byte(0xff),
-            etherDelta: I256::ZERO,
+            currentRoot: current_root,
+            newRoot: B256::with_last_byte(0xff),
+            etherDelta: alloy_primitives::aliases::I192::ZERO,
         }
     }
 
@@ -822,7 +844,7 @@ mod tests {
         rolling.call_end(true, &return_data);
         // The original entry representation, independent of InboundSidecar's encoder.
         let wire = ExecutionEntrySol {
-            stateUpdates: Vec::new(),
+            rollupUpdates: Vec::new(),
             proxyEntryHash: hash,
             l2ToL1Calls: vec![l1_call_from_action(&call)],
             expectedL1ToL2Calls: Vec::new(),
@@ -841,7 +863,7 @@ mod tests {
         );
 
         let mutations: [fn(&mut ExecutionEntrySol); 11] = [
-            |e| e.stateUpdates.push(state_update(7, B256::ZERO)),
+            |e| e.rollupUpdates.push(state_update(7, B256::ZERO)),
             |e| e.l2ToL1Calls.clear(),
             |e| e.l2ToL1Calls.push(e.l2ToL1Calls[0].clone()),
             |e| e.l2ToL1Calls[0].isStatic = true,
@@ -939,7 +961,7 @@ mod tests {
         let entry = &batch.entries[0];
 
         assert_eq!(batch.immediateEntryCount, U256::from(1));
-        assert!(entry.stateUpdates.is_empty());
+        assert!(entry.rollupUpdates.is_empty());
         assert_eq!(entry.rollingHash, B256::ZERO);
         assert_eq!(entry.destinationRollupId, 7);
         assert!(entry.success);
@@ -953,9 +975,10 @@ mod tests {
     #[test]
     fn l1_finalizer_folds_state_seed_and_flat_call() {
         let action = record(RollupId::MAINNET, RollupId(7));
+        let return_data = Bytes::copy_from_slice(supported_return_data(&action).unwrap());
         let mut batch = build_l1_postbatch(&[action], RollupId(7)).unwrap();
         batch.entries[0]
-            .stateUpdates
+            .rollupUpdates
             .push(state_update(7, B256::with_last_byte(0x11)));
 
         finalize_l1_rolling_hashes(&mut batch).unwrap();
@@ -974,8 +997,9 @@ mod tests {
         let mut expected =
             EntryRollingHash::seed_for_l1([(7, B256::with_last_byte(0x11))], B256::ZERO);
         expected.call_begin(call_hash);
-        expected.call_end(true, &entry.returnData);
+        expected.call_end(true, &return_data);
         assert_eq!(entry.rollingHash, expected.current());
+        assert!(entry.returnData.is_empty());
     }
 
     #[test]
@@ -987,7 +1011,7 @@ mod tests {
 
         let mut multi_call = build_l1_postbatch(&[action], RollupId(7)).unwrap();
         multi_call.entries[0]
-            .stateUpdates
+            .rollupUpdates
             .push(state_update(7, B256::ZERO));
         let extra_call = multi_call.entries[0].l2ToL1Calls[0].clone();
         multi_call.entries[0].l2ToL1Calls.push(extra_call);
@@ -1114,14 +1138,7 @@ mod tests {
             success: true,
         })
         .unwrap();
-        let calldata = encode_execute_incoming(
-            target,
-            U256::ZERO,
-            data.clone(),
-            source,
-            RollupId::MAINNET,
-            entry.clone(),
-        );
+        let calldata = encode_execute_incoming(entry.clone());
 
         assert_eq!(
             decode_inbound(&calldata),
@@ -1137,14 +1154,7 @@ mod tests {
 
         let mut failed = entry;
         failed.success = false;
-        let failed_calldata = encode_execute_incoming(
-            target,
-            U256::ZERO,
-            Bytes::from_static(&[1, 2]),
-            source,
-            RollupId::MAINNET,
-            failed,
-        );
+        let failed_calldata = encode_execute_incoming(failed);
         assert_eq!(decode_inbound(&failed_calldata), None);
     }
 
@@ -1154,5 +1164,44 @@ mod tests {
         let encoded = encode_postbatch(&batch);
         assert_eq!(&encoded[..4], &postAndVerifyBatchCall::SELECTOR);
         assert_eq!(decode_postbatch(&encoded).unwrap().entries.len(), 0);
+    }
+
+    /// The composer's builders in Sync order (anchor, outbound immediates, inbound
+    /// deferred) with rollup 8's entries interleaved: ordinals count per rollup.
+    #[test]
+    fn entry_roles_rank_each_rollups_own_entries_per_direction() {
+        use EntryRole::{Anchor, Inbound, Outbound};
+        let rollup = RollupId(7);
+        let eoa = Address::repeat_byte(0xcc);
+        let anchor = build_l1_settlement_only(rollup);
+        let outbound = build_l1_postbatch(&[record(RollupId::MAINNET, rollup)], rollup).unwrap();
+        let inbound =
+            build_l1_inbound_entry(eoa, U256::ZERO, Bytes::new(), eoa, rollup, Bytes::new());
+        let updating = |batch: &EvmBatch, rollups: &[u64]| ExecutionEntrySol {
+            rollupUpdates: rollups
+                .iter()
+                .map(|&r| state_update(r, B256::ZERO))
+                .collect(),
+            ..batch.entries[0].clone()
+        };
+        let entries = [
+            updating(&anchor, &[7]),
+            updating(&outbound, &[7]),
+            updating(&outbound, &[7]),
+            updating(&inbound, &[8]),
+            updating(&inbound, &[7, 8]),
+            updating(&outbound, &[8]),
+            updating(&inbound, &[7]),
+        ];
+        let anc = Some(Anchor);
+        let out = |ordinal| Some(Outbound { ordinal });
+        let inb = |ordinal| Some(Inbound { ordinal });
+        for (id, roles) in [
+            (7, [anc, out(0), out(1), None, inb(0), None, inb(1)]),
+            (8, [None, None, None, inb(0), inb(1), out(0), None]),
+            (9, [None; 7]),
+        ] {
+            assert_eq!(entry_roles(&entries, id), roles, "rollup {id}");
+        }
     }
 }

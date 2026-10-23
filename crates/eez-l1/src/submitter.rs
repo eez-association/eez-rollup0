@@ -5,10 +5,10 @@
 //! `eth_sendBundle` pins inclusion to one L1 block. If the bundle
 //! isn't in that block we report [`SendOutcome::Dropped`] and the
 //! Composer rebuilds on the next tick with a fresh target + nonce.
-//! Real Flashbots-style relays don't consume the nonce on miss; the
-//! anvil-side `scripts/builder-stub.py` does (it forwards via
-//! `eth_sendRawTransaction`), but the cursor-race guard +
-//! `pending` nonce read keep both paths correct.
+//! Real Flashbots-style relays don't consume the nonce on miss; nor does
+//! the anvil-side `scripts/builder-stub.py` (it mines bundles
+//! atomically), and the cursor-race guard + `pending` nonce read keep
+//! both paths correct.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,6 +40,10 @@ pub enum BundleTarget {
     /// Resolved to `latest + NEXT_BLOCK_SLACK` at send time. Unpinned —
     /// used for off-cadence catch-up.
     NextBlock,
+    /// Land in exactly L1 block `block`, without pinning its timestamp.
+    /// Cap-triggered historical batches use this to target the slot that
+    /// caused their composition while allowing a past L2 terminal timestamp.
+    ExactBlock { block: u64 },
     /// Land in exactly L1 block `block`, and only if its timestamp equals
     /// `timestamp`. The timestamp pin makes the settlement slot match the
     /// L2 Sync block's anchored slot by construction: a gnosis block's
@@ -56,7 +60,7 @@ pub enum SendOutcome {
     Included {
         tx_hash: TxHash,
         l1_block: u64,
-        /// Which entries L1 applied, from the same windowed pass the deriver
+        /// Which entries L1 applied, from the same scan the deriver
         /// uses; `final_state` distinguishes "settled partially" from "nothing".
         settlement: crate::scan::Settlement,
     },
@@ -182,14 +186,14 @@ impl Submitter {
             ));
         }
         // Exact targets carry the L2 Sync block's anchored timestamp; pin
-        // the bundle to land only in a block at that exact time. NextBlock
-        // (catch-up) is off-cadence, so it stays unpinned.
+        // the bundle to land only in a block at that exact time. ExactBlock
+        // and NextBlock deliberately stay unpinned.
         let pin_timestamp = match target {
             BundleTarget::Exact { timestamp, .. } => Some(timestamp),
-            BundleTarget::NextBlock => None,
+            BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => None,
         };
         let target_block = match target {
-            BundleTarget::Exact { block, .. } => block,
+            BundleTarget::Exact { block, .. } | BundleTarget::ExactBlock { block } => block,
             BundleTarget::NextBlock => {
                 let target_provider = self.inner.build_target_provider();
                 target_provider
@@ -212,7 +216,7 @@ impl Submitter {
             Level::INFO,
             tx_hash = %post_batch_hash,
             target_block,
-            exact = matches!(target, BundleTarget::Exact { .. }),
+            exact = !matches!(target, BundleTarget::NextBlock),
             tx_count = raw_txs.len(),
             "dispatching bundle to builder",
         );
@@ -510,17 +514,8 @@ impl Inner {
         }
     }
 
-    /// Did L1's stored stateRoot for our rollup reach the claimed state
-    /// in `l1_block`?
-    ///
-    /// - `Some(root)`: true iff some `L2ExecutionPerformed(rollupId,
-    ///   newState)` in the block has `newState == root`. The leading
-    ///   immediate entry always emits this event, so matching "any
-    ///   event" would report settled even with every deferred entry
-    ///   unconsumed; requiring the FINAL root means L1 reached exactly
-    ///   the state the Sync block claims.
-    /// How far L1 got with our batch, via the shared windowed pass in
-    /// [`crate::scan`] — one reading of these logs, not a bespoke block scan.
+    /// How far L1 got with our batch, via the shared scan in [`crate::scan`] —
+    /// one reading of these logs, not a bespoke block scan.
     async fn observe_settlement<P: Provider>(
         &self,
         provider: &P,
@@ -528,25 +523,16 @@ impl Inner {
         tx_hash: TxHash,
         posted: bool,
     ) -> L1Result<crate::scan::Settlement> {
-        let batches = crate::scan::scan_batch_logs_range(
+        let posts = crate::scan::scan_range(
             provider,
+            &self.reader.build_trace_provider(),
             self.reader.eez(),
             self.reader.rollup_id(),
             l1_block,
             l1_block,
         )
         .await?;
-        match batches.into_iter().find(|batch| batch.tx_hash == tx_hash) {
-            Some(batch) => Ok(batch.settlement),
-            // The receipt shows a BatchPosted the scan lacks: a log index
-            // lagging the receipt, not a batch that applied nothing.
-            None if posted => Err(L1Error::SourceIncomplete {
-                block: l1_block,
-                tx_hash,
-                detail: "postBatch receipt has a BatchPosted log the scan lacks; retry".into(),
-            }),
-            None => Ok(crate::scan::Settlement::NONE),
-        }
+        settlement_of_our_post(posts, l1_block, tx_hash, posted)
     }
 }
 
@@ -703,9 +689,32 @@ fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutc
     }
 }
 
+/// Our tx posts directly, and the scan rejects a direct tx with two posts, so
+/// at most one post carries our hash.
+fn settlement_of_our_post(
+    posts: Vec<crate::scan::Post>,
+    l1_block: u64,
+    tx_hash: TxHash,
+    posted: bool,
+) -> L1Result<crate::scan::Settlement> {
+    match posts.into_iter().find(|post| post.tx_hash == tx_hash) {
+        Some(post) => Ok(post.settlement),
+        // The receipt shows a post the scan lacks: the logs lag the receipt,
+        // not a post that applied nothing.
+        None if posted => Err(L1Error::SourceIncomplete {
+            block: l1_block,
+            detail: format!("postBatch {tx_hash}: receipt lists a post the scan lacks; retry"),
+        }),
+        None => Ok(crate::scan::Settlement::NONE),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PinnedVerdict, pinned_verdict, reverting_whitelist};
+    use super::{PinnedVerdict, pinned_verdict, reverting_whitelist, settlement_of_our_post};
+    use crate::error::L1Error;
+    use crate::scan::{Post, PostId, Settlement};
+    use alloy_primitives::{Address, B256, TxHash};
 
     const PIN: u64 = 1_700_000_012;
 
@@ -769,6 +778,39 @@ mod tests {
             ),
         ] {
             assert_eq!(pinned_verdict(block, PIN), want, "{case}");
+        }
+    }
+
+    /// The post under our hash settles, and none is a lagging scan only when
+    /// the receipt posted.
+    #[test]
+    fn our_tx_settles_through_its_post() {
+        let ours = TxHash::repeat_byte(0x0A);
+        let root = |byte| Some(B256::repeat_byte(byte));
+        let post = |tx_hash, log_index: u8| Post {
+            id: PostId {
+                l1_block: 7,
+                l1_block_hash: B256::ZERO,
+                log_index: log_index.into(),
+            },
+            tx_hash,
+            sender: Address::ZERO,
+            batch: eez_protocol::abi::EvmBatch::default(),
+            settlement: Settlement::new(Vec::new(), root(log_index), None, false),
+        };
+        let theirs = post(TxHash::repeat_byte(0x0B), 1);
+        for (posts, posted, want) in [
+            (vec![theirs.clone(), post(ours, 3)], true, Ok(root(3))),
+            (vec![theirs.clone()], true, Err("SourceIncomplete")),
+            (vec![theirs], false, Ok(None)),
+        ] {
+            let got = settlement_of_our_post(posts, 7, ours, posted)
+                .map(|settlement| settlement.final_state)
+                .map_err(|err| match err {
+                    L1Error::SourceIncomplete { .. } => "SourceIncomplete",
+                    other => panic!("unexpected {other}"),
+                });
+            assert_eq!(got, want, "posted={posted}");
         }
     }
 }

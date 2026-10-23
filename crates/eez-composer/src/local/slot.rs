@@ -3,14 +3,17 @@
 //! Both implement [`TargetExecutionSession`], but neither approximates the
 //! protocol: each runs the real contract path the chain will run.
 //!
-//! - [`L1TargetSession`] replays `EEZ._processNCalls`' frames
-//!   (`EEZ.sol:1149-1178`) over an [`L1SlotState`] pinned at drain start,
+//! - [`L1TargetSession`] replays `EEZ._processL2ToL1Calls`' frames
+//!   (`EEZ.sol:1143-1222`) over an [`L1SlotState`] pinned at drain start,
 //!   committing every surviving effect so later simulations in the same slot
 //!   observe it.
 //! - [`InboundL2TargetSession`] executes the canonical delivery system tx on
 //!   a fork of the Sync block under construction and reads the claim off the
-//!   real `EEZL2 → proxy` frame (`EEZL2.sol:547-552`) captured by
+//!   real `EEZL2 → proxy` frame (`EEZL2.sol:615-618`) captured by
 //!   [`ProbeInspector`].
+//!
+//! Both reject a call that targets their own manager before running it, as
+//! `EEZBase._validateCallDestination` (`EEZBase.sol:404-406`) does on chain.
 
 use std::sync::Arc;
 
@@ -37,7 +40,7 @@ use eez_protocol::entries::{InboundSidecar, IncomingEntry};
 use eez_protocol::system_tx::{SystemTxContext, build_inbound_system_txs};
 use eez_protocol::{
     CallMode, CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError,
-    ExecutorErrorKind, ExecutorResult, RollupId, SessionSnapshot, TargetExecutionSession,
+    ExecutorResult, RollupId, SessionSnapshot, TargetExecutionSession,
 };
 
 use super::build::{BuildError, ForkSnapshot, SyncBlockFork};
@@ -76,21 +79,33 @@ const VIEW_CALL_GAS_LIMIT: u64 = 1_000_000;
 const ZERO_CALL_GAS: u64 = 0;
 
 fn encoding_err(msg: impl Into<String>) -> ExecutorError {
-    ExecutorError::from(ExecutorErrorKind::Encoding(msg.into()))
+    ExecutorError::Encoding(msg.into())
+}
+
+/// `EEZBase._validateCallDestination`: a forwarded call must not target its own
+/// manager, which would re-enter it with the proxy's authorized identity.
+fn reject_manager_destination(target: Address, manager: Address) -> ExecutorResult<()> {
+    if target == manager {
+        // `Encoding` so `sim_error_is_poison` evicts the tx: the chain rejects
+        // this call on every attempt.
+        return Err(encoding_err(format!(
+            "cross-chain call targets its own manager {manager}; the protocol rejects it with EEZDestinationForbidden"
+        )));
+    }
+    Ok(())
 }
 
 /// Classify a `transact` failure. A database read failure is transient, and an
 /// insufficient target balance is state-dependent; other validation failures
 /// are properties of the transaction (`Evm` ⇒ poison).
-fn transact_err(e: EVMError<EvmDatabaseError<ProviderError>>) -> ExecutorError {
+pub(super) fn transact_err(e: EVMError<EvmDatabaseError<ProviderError>>) -> ExecutorError {
     match e {
         EVMError::Database(db) => provider_err(db),
         EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { fee, balance }) => {
-            ExecutorErrorKind::InsufficientFunds {
+            ExecutorError::InsufficientFunds {
                 available: *balance,
                 required: *fee,
             }
-            .into()
         }
         other => evm_err(other),
     }
@@ -99,10 +114,9 @@ fn transact_err(e: EVMError<EvmDatabaseError<ProviderError>>) -> ExecutorError {
 /// The same split for the block-fork path: `BuildError::Provider` is the store,
 /// everything else is the tx.
 fn fork_err(e: BuildError) -> ExecutorError {
-    if e.is_provider() {
-        provider_err(e)
-    } else {
-        evm_err(e)
+    match e {
+        provider @ BuildError::Provider(_) => provider_err(provider),
+        other => evm_err(other),
     }
 }
 
@@ -128,8 +142,8 @@ impl L1SlotState {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] when the head number or header
-    /// cannot be read, [`ExecutorErrorKind::Missing`] when the header is absent.
+    /// Returns [`ExecutorError::Provider`] when the head number or header
+    /// cannot be read, [`ExecutorError::Missing`] when the header is absent.
     pub fn open(client: &LocalChainClient) -> ExecutorResult<Self> {
         let provider = client.chain_provider();
         let num = provider.headers.best_block_number().map_err(provider_err)?;
@@ -137,7 +151,7 @@ impl L1SlotState {
             .headers
             .header_by_number(num)
             .map_err(provider_err)?
-            .ok_or_else(|| ExecutorError::from(ExecutorErrorKind::Missing("L1 anchor header")))?;
+            .ok_or(ExecutorError::Missing("L1 anchor header"))?;
         let anchor = SealedHeader::seal_slow(header);
         tracing::debug!(
             block = num,
@@ -186,8 +200,8 @@ impl L1SlotState {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] when the anchor state cannot be
-    /// opened, [`ExecutorErrorKind::Evm`] when env construction fails.
+    /// Returns [`ExecutorError::Provider`] when the anchor state cannot be
+    /// opened, [`ExecutorError::Evm`] when env construction fails.
     pub fn fork_state(
         &self,
         client: &LocalChainClient,
@@ -201,7 +215,7 @@ impl L1SlotState {
 
 // ── L1 manager execution ─────────────────────────────────────────
 
-/// Target-chain session that replays `EEZ._processNCalls`' frames on a fork of
+/// Target-chain session that replays `EEZ._processL2ToL1Calls`' frames on a fork of
 /// the [`L1SlotState`].
 ///
 /// ## Checkpoint payload contract
@@ -238,8 +252,8 @@ impl L1TargetSession {
     ///
     /// # Errors
     ///
-    /// Returns [`ExecutorErrorKind::Provider`] when the anchor state cannot be
-    /// opened, [`ExecutorErrorKind::Evm`] when env construction fails.
+    /// Returns [`ExecutorError::Provider`] when the anchor state cannot be
+    /// opened, [`ExecutorError::Evm`] when env construction fails.
     pub fn new(state: &L1SlotState, client: Arc<LocalChainClient>) -> ExecutorResult<Self> {
         let (state, mut evm_env) = state.open_state(&client, state.cache.clone())?;
         let chain_id = evm_env.cfg_env.chain_id;
@@ -312,7 +326,7 @@ impl L1TargetSession {
         self.manager_frame(data, VIEW_CALL_GAS_LIMIT, false)
     }
 
-    /// `EEZ.sol:1150` — `computeCrossChainProxyAddress(source, sourceRollup)`.
+    /// `EEZBase.sol:250` — `computeCrossChainProxyAddress(source, sourceRollup)`.
     fn proxy_address(
         &mut self,
         source: Address,
@@ -329,7 +343,7 @@ impl L1TargetSession {
             .map_err(|e| encoding_err(format!("decode computeCrossChainProxyAddress: {e}")))
     }
 
-    /// `EEZ.sol:1151` — `authorizedProxies[proxy].isProxy`.
+    /// `EEZBase.sol:222` — `authorizedProxies[proxy].isProxy`.
     fn is_authorized_proxy(&mut self, proxy: Address) -> ExecutorResult<bool> {
         let out = self.view_call(authorizedProxiesCall { proxy }.abi_encode())?;
         authorizedProxiesCall::abi_decode_returns(&out)
@@ -337,7 +351,7 @@ impl L1TargetSession {
             .map_err(|e| encoding_err(format!("decode authorizedProxies: {e}")))
     }
 
-    /// `EEZ.sol:1152` — the permissionless CREATE2 deployment + registration
+    /// `EEZBase.sol:231` — the permissionless CREATE2 deployment + registration
     /// the manager performs itself when the proxy is missing.
     fn create_proxy(&mut self, source: Address, source_rollup: RollupId) -> ExecutorResult<()> {
         let calldata = createCrossChainProxyCall {
@@ -365,11 +379,11 @@ impl TargetExecutionSession for L1TargetSession {
         // `Encoding` because `sim_error_is_poison` classifies it POISON: a call
         // mode is fixed by the tx, so retrying it re-fails forever.
         if req.call_mode == CallMode::Static {
-            return Err(ExecutorErrorKind::Encoding(
+            return Err(ExecutorError::Encoding(
                 "static target execution is not supported".into(),
-            )
-            .into());
+            ));
         }
+        reject_manager_destination(req.target_address, self.manager)?;
 
         let proxy = self.proxy_address(req.source_address, req.source_rollup_id)?;
         if !self.is_authorized_proxy(proxy)? {
@@ -437,8 +451,8 @@ impl TargetExecutionSession for L1TargetSession {
             "L1 manager frame executed"
         );
 
-        // The frame's raw output IS what `_processNCalls` folds into CALL_END
-        // (`EEZ.sol:1181`) — revert data included on failure.
+        // The frame's raw output IS what `_processL2ToL1Calls` folds into CALL_END
+        // (`EEZ.sol:1197`) — revert data included on failure.
         Ok(ExecutionOutcome::Resolved {
             return_data: return_data.to_vec(),
             gas_used,
@@ -515,7 +529,7 @@ struct ProbeSnapshot {
 /// Two runs per call: a PROBE with a placeholder rolling hash, whose only
 /// purpose is to capture the real `EEZL2 → proxy` frame outcome, and the REAL
 /// run with that outcome folded in, which must succeed — the same on-chain
-/// compare (`EEZL2.sol:466`) the proof signer enforces; running it here turns a
+/// compare (`EEZL2.sol:526`) the proof signer enforces; running it here turns a
 /// claim mismatch into a one-tx eviction instead of a rejected window.
 pub struct InboundL2TargetSession {
     fork: SyncBlockFork,
@@ -591,11 +605,12 @@ impl TargetExecutionSession for InboundL2TargetSession {
         _dispatcher: &mut CompositionBuilder,
     ) -> ExecutorResult<ExecutionOutcome> {
         if req.call_mode == CallMode::Static {
-            return Err(ExecutorErrorKind::Encoding(
+            return Err(ExecutorError::Encoding(
                 "static target execution is not supported".into(),
-            )
-            .into());
+            ));
         }
+        // EEZL2 rejects it too, but before the probed frame: name the cause.
+        reject_manager_destination(req.target_address, self.cfg.eezl2_address)?;
 
         // ── PROBE ────────────────────────────────────────────────
         // Placeholder return data: the entry hash is exact (it is computable a
@@ -696,15 +711,15 @@ impl TargetExecutionSession for InboundL2TargetSession {
 /// One captured `EEZL2 → proxy` `executeOnBehalf` frame.
 #[derive(Clone, Debug)]
 pub struct ProbeCapture {
-    /// Frame outcome as `_processNCalls` sees it (`EEZL2.sol:547-550`).
+    /// Frame outcome as `_processIncomingCalls` sees it (`EEZL2.sol:615`).
     pub success: bool,
     /// Raw frame output — return data on success, revert data on failure.
     pub output: Bytes,
 }
 
 /// Captures, in order, every non-static `executeOnBehalf` CALL the L2 manager
-/// makes — the exact `(success, retData)` pair `_processNCalls` folds into
-/// CALL_END (`EEZL2.sol:551`).
+/// makes — the exact `(success, retData)` pair `_processIncomingCalls` folds into
+/// CALL_END (`EEZL2.sol:618`).
 ///
 /// Pass it to the EVM by `&mut` and read `captures` after the run.
 pub struct ProbeInspector {
@@ -766,6 +781,17 @@ mod tests {
     use alloy_primitives::U256;
 
     #[test]
+    fn a_call_targeting_its_manager_is_poison() {
+        let manager = Address::repeat_byte(0x11);
+        let error = reject_manager_destination(manager, manager).unwrap_err();
+        assert!(
+            matches!(&error, ExecutorError::Encoding(message) if message.contains("EEZDestinationForbidden")),
+            "{error}"
+        );
+        assert!(reject_manager_destination(Address::repeat_byte(0x22), manager).is_ok());
+    }
+
+    #[test]
     fn lack_of_funds_is_classified_as_state_dependent() {
         let error = transact_err(EVMError::Transaction(
             InvalidTransaction::LackOfFundForMaxFee {
@@ -775,11 +801,11 @@ mod tests {
         ));
 
         assert!(matches!(
-            error.kind(),
-            ExecutorErrorKind::InsufficientFunds {
+            error,
+            ExecutorError::InsufficientFunds {
                 available,
                 required,
-            } if *available == U256::from(3) && *required == U256::from(10)
+            } if available == U256::from(3) && required == U256::from(10)
         ));
     }
 }

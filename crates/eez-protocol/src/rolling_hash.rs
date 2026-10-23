@@ -5,7 +5,7 @@
 //! `abi.encodePacked` encoding:
 //!
 //! ```text
-//! L1 state fold  : keccak256(prev[32] || rollupId[8] || currentState[32])
+//! L1 state fold  : keccak256(prev[32] || rollupId[8] || currentRoot[32])
 //! L1 entry seed  : keccak256(statesHash[32] || proxyEntryHash[32])
 //! L2 entry seed  : keccak256(bytes32(0) || proxyEntryHash[32])
 //! CALL_BEGIN     : keccak256(prev[32] || 0x01 || callHash[32])
@@ -45,7 +45,7 @@ pub struct EntryRollingHash {
 }
 
 impl EntryRollingHash {
-    /// Seed an L1 entry from its ordered `(rollup_id, current_state)` updates
+    /// Seed an L1 entry from its ordered `(rollup_id, current_root)` updates
     /// and proxy entry hash.
     ///
     /// `rollup_id` is encoded as an 8-byte big-endian `uint64`, matching
@@ -58,11 +58,11 @@ impl EntryRollingHash {
         let states_hash =
             state_updates
                 .into_iter()
-                .fold(B256::ZERO, |previous, (rollup_id, current_state)| {
+                .fold(B256::ZERO, |previous, (rollup_id, current_root)| {
                     hash_parts(&[
                         previous.as_slice(),
                         &rollup_id.to_be_bytes(),
-                        current_state.as_slice(),
+                        current_root.as_slice(),
                     ])
                 });
 
