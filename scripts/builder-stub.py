@@ -17,7 +17,8 @@ with `--order fifo` so a block keeps each bundle's transactions in order.
 Suitable for tests; not for production.
 
 Extra methods for tests: `eez_setBuilderMode` ("forward" | "drop"),
-`eez_setMining` (pause or resume the ticker) and `eez_mine` (mine one block).
+`eez_setMining` (pause or resume the ticker), `eez_mine` (mine one block) and
+`eez_setBundleAckDelay` (seconds each `eth_sendBundle` waits before answering).
 
 Usage:
     builder-stub.py --listen 127.0.0.1:9001 --upstream http://127.0.0.1:8545
@@ -77,6 +78,8 @@ class Builder:
     mining = True
     # Relay bundles to the upstream instead of mining them; no ticker.
     passthrough = False
+    # Seconds eth_sendBundle waits before answering, like a slow relay.
+    ack_delay = 0.0
     # Serialises every block the stub mines; Anvil mines nothing else.
     lock = threading.Lock()
     # Target block number -> queued bundle params, in arrival order.
@@ -274,10 +277,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # Like evm_mine: now, or just after the tip if that is later.
                 Builder.mine_slot(max(latest_ts + 1, int(time.time())))
             return self._result(body, True)
+        if method == "eez_setBundleAckDelay":
+            Builder.ack_delay = float(params[0]) if params else 0.0
+            return self._result(body, Builder.ack_delay)
         if method == "eez_getRejectedTransactions":
             with Builder.lock:
                 return self._result(body, list(Builder.rejected))
         if method == "eth_sendBundle":
+            time.sleep(Builder.ack_delay)
             if Builder.passthrough and Builder.mode == "forward":
                 return None
             try:
