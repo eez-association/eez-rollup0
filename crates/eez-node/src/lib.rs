@@ -882,6 +882,10 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
         sync_mode.deriver_boot(),
+        Some(Arc::new({
+            let pool = Arc::clone(&held_pool);
+            move |hashes, height| pool.refuse(hashes, height)
+        })),
     );
 
     let l1_reader = submitter.reader();

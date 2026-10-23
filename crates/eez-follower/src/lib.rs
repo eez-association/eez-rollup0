@@ -140,6 +140,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
         sync_mode.deriver_boot(),
+        None,
     );
 
     let probe = sync_mode.readiness_probe(deploy_block);
