@@ -1046,6 +1046,23 @@ async fn happy_case_follower_l1_reorg_recovers() {
         .await
         .expect("pre-reorg batches");
     let pre_reorg_states = chain.executed_states().await.unwrap();
+    // Mined above the cursor the reorg retreats to, so the retreat drops it.
+    let dropped = send_l2_value_transfer_confirmed(
+        &seq.l2_rpc_url(),
+        ANVIL_KEY_2,
+        ANVIL_ADDR_3,
+        U256::from(1u64),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("pre-reorg L2 tx did not land on sequencer");
+    let l2 = ProviderBuilder::new().connect_http(seq.l2_rpc_url().parse().unwrap());
+    let mined_in = l2
+        .get_transaction_receipt(dropped)
+        .await
+        .unwrap()
+        .unwrap()
+        .block_hash;
     harness.anvil.reorg(3).await.unwrap();
     send_l2_value_transfer_confirmed(
         &seq.l2_rpc_url(),
@@ -1069,6 +1086,21 @@ async fn happy_case_follower_l1_reorg_recovers() {
         .expect("follower did not converge on the composer's replacement safe suffix");
 
     follower.wait_for_reorg_seen(DEFAULT_TIMEOUT).await.unwrap();
+    // The retreat hands the dropped tx back to the pool, so it is mined again.
+    wait_for(DEFAULT_TIMEOUT, || async {
+        let Some(receipt) = l2.get_transaction_receipt(dropped).await? else {
+            return Ok(None);
+        };
+        let number = receipt
+            .block_number
+            .expect("mined receipt has a block number");
+        let canonical =
+            block_number_and_hash_at(&seq.l2_rpc_url(), BlockNumberOrTag::Number(number)).await?;
+        let moved = receipt.block_hash != mined_in;
+        Ok((moved && canonical.map(|(_, hash)| hash) == receipt.block_hash).then_some(()))
+    })
+    .await
+    .expect("the L2 tx the L1 reorg dropped was not mined again");
     follower.assert_no_process_death();
     seq.assert_no_process_death();
 }
