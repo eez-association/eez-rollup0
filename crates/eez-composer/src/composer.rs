@@ -914,6 +914,30 @@ fn push_poison_root(
     poison.push(tx);
 }
 
+fn evict_blob_limit_violation(
+    pool: &HeldPool,
+    rollup_id: u64,
+    tx: &HeldTx,
+    required: usize,
+    maximum: usize,
+) {
+    let evicted = pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce);
+    event!(
+        name: "eez.composer.emission.blob_limit_evicted",
+        Level::WARN,
+        event_name = "eez.composer.emission.blob_limit_evicted",
+        rollup_id,
+        tx_hash = %tx.hash,
+        sender = %tx.sender,
+        direction = ?tx.direction,
+        nonce = tx.nonce,
+        required,
+        maximum,
+        queued_evicted = evicted.len(),
+        "held transaction alone exceeds blob capacity; evicting it and its nonce-chain suffix (resubmit a smaller call)",
+    );
+}
+
 fn evict_gas_limit_violation(
     rollup_id: u64,
     tx_idx: usize,
@@ -3465,7 +3489,7 @@ where
                     maximum,
                     selected = survivors.len(),
                     first_transaction = ?survivors.first().map(|tx| tx.hash),
-                    "selected cross-chain work exceeds blob capacity; deferring complete transactions",
+                    "selected cross-chain work exceeds blob capacity",
                 );
                 if survivors.len() > 1 {
                     // Remove the FIFO tail, preserving every retained nonce prefix.
@@ -3496,9 +3520,11 @@ where
                         }
                     };
                 }
-                // An indivisible transaction stays held without charging a failed attempt.
-                pool.push_front_batch(survivors);
-                return self
+                // Even without history this tx cannot fit. Evict its nonce
+                // suffix rather than blocking later slots.
+                let tx = survivors.first().expect("a composition has survivors");
+                evict_blob_limit_violation(pool, rollup_id, tx, required, maximum);
+                let fallback = self
                     .dispatch_minimal_postbatch(
                         ctx,
                         rollup_id,
@@ -3508,7 +3534,19 @@ where
                         suggested_fee_recipient,
                         bundle_target,
                     )
-                    .await;
+                    .await
+                    .unwrap_or_else(|error| {
+                        event!(
+                            Level::WARN,
+                            rollup_id,
+                            %error,
+                            "minimal settlement after blob-limit eviction failed; committing an empty Sync block",
+                        );
+                        self.build_empty_slot_block(rollup, parent_header, timestamp)
+                    });
+                // Outer callers requeue their candidates on Err, so a failed
+                // fallback must not return the evicted tx to the pool.
+                return Ok(fallback);
             }
             Err(PreparePostBatchError::Actionable(failure)) => {
                 let Some(poison) = actionable_held_tx(
@@ -5508,6 +5546,35 @@ mod tests {
             nonce,
             direction,
         }
+    }
+
+    #[test]
+    fn oversized_blob_transaction_eviction_preserves_unrelated_traffic() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(0xa);
+        let oversized = held(sender, Direction::Outbound, 0, 1);
+        let dependent = held(sender, Direction::Outbound, 1, 2);
+        let inbound = held(sender, Direction::Inbound, 0, 3);
+        let outbound = held(Address::repeat_byte(0xb), Direction::Outbound, 0, 4);
+        for tx in [&oversized, &dependent, &inbound, &outbound] {
+            pool.push_contiguous(tx.clone(), 0).unwrap();
+        }
+
+        // Model recomposition with only the oversized tx in flight and its
+        // dependent nonce queued.
+        let selected = pool.pop_n(1);
+        assert_eq!(selected[0].hash, oversized.hash);
+        evict_blob_limit_violation(&pool, 1, &selected[0], 3, 2);
+
+        let remaining = pool.pop_all();
+        assert_eq!(
+            remaining.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![inbound.hash, outbound.hash],
+        );
+        pool.release_in_flight_batch(&remaining);
+        // Both reservations must be released to allow resubmission from nonce 0.
+        pool.push_contiguous(oversized, 0).unwrap();
+        pool.push_contiguous(dependent, 0).unwrap();
     }
 
     fn signed_user_tx(gas_limit: u64) -> Bytes {
