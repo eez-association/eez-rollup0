@@ -98,9 +98,8 @@ pub fn sync_mode_from_env() -> eyre::Result<SyncMode> {
 enum BootStep {
     /// L1 can't name the anchor yet; the cause.
     Wait(String),
-    /// The rollup isn't registered at `l1_block`, so no post predates it.
-    SeedGenesis { l1_block: u64, l1_hash: B256 },
-    /// The local canonical chain holds the root at `l2_block`.
+    /// The local canonical chain holds the root at `l2_block`. An unregistered
+    /// rollup seeds at block 0: no post predates registration.
     Seed {
         l1_block: u64,
         l1_hash: B256,
@@ -127,7 +126,11 @@ fn decide(
         Err(err) => return Err(eyre::eyre!("reading the L1-finalized rollup root: {err}")),
     };
     let Some(root) = root else {
-        return Ok(BootStep::SeedGenesis { l1_block, l1_hash });
+        return Ok(BootStep::Seed {
+            l1_block,
+            l1_hash,
+            l2_block: 0,
+        });
     };
     Ok(match local_root_number(root) {
         Some(l2_block) => BootStep::Seed {
@@ -330,14 +333,12 @@ where
                 tokio::time::sleep(SYNC_POLL).await;
                 continue;
             }
-            BootStep::SeedGenesis { l1_block, l1_hash } => {
-                return Ok(seed_record(l1_block, l1_hash, 0));
-            }
             BootStep::Seed {
                 l1_block,
                 l1_hash,
                 l2_block,
             } => {
+                // Safe and finalized start at H_F, block 0 if unregistered, like the Deriver's.
                 let header = header_by_number(provider, l2_block)?;
                 let hash = header.hash();
                 committer.advance_safe_finalized(header, hash).await?;
@@ -561,9 +562,10 @@ mod tests {
         ));
         assert_eq!(
             decide(Ok(Some(commitment(None))), not_local).unwrap(),
-            BootStep::SeedGenesis {
+            BootStep::Seed {
                 l1_block: 40,
-                l1_hash: L1_HASH
+                l1_hash: L1_HASH,
+                l2_block: 0
             }
         );
         assert_eq!(
