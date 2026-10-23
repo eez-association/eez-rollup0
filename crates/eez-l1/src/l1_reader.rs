@@ -2,9 +2,12 @@
 
 use std::sync::Arc;
 
-use alloy_eips::BlockNumberOrTag;
+use alloy_eips::{BlockId, BlockNumberOrTag, RpcBlockHash};
+use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, ProviderBuilder};
-use alloy_rpc_types_eth::Filter;
+use alloy_rpc_types_eth::{Filter, TransactionRequest};
+use alloy_sol_types::SolCall;
+use eez_protocol::abi::rollupsCall;
 
 use crate::config::L1ReaderConfig;
 use crate::error::{L1Error, L1Result};
@@ -15,6 +18,39 @@ use crate::scan::{BatchLogChunks, Post, scan_next_batch_log_chunk};
 #[derive(Clone)]
 pub struct L1Reader {
     config: Arc<L1ReaderConfig>,
+}
+
+/// The rollup's L2 block hash as stored on L1 at its finalized block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalizedCommitment {
+    pub l1_block: u64,
+    pub l1_hash: B256,
+    /// `None` when the rollup is not registered at `l1_block`.
+    pub root: Option<B256>,
+}
+
+/// Interprets the registry's `rollups(id)` answer at `l1_block`. A registered
+/// rollup with a zero root is a broken registry, not "not registered".
+///
+/// # Errors
+///
+/// [`L1Error::Config`] when the rollup is registered with root zero.
+pub fn registered_root(
+    code_is_empty: bool,
+    rollup_contract: Address,
+    root: B256,
+    rollup_id: u64,
+    l1_block: u64,
+) -> L1Result<Option<B256>> {
+    if code_is_empty || rollup_contract.is_zero() {
+        return Ok(None);
+    }
+    if root.is_zero() {
+        return Err(L1Error::Config(format!(
+            "rollup {rollup_id} is registered at L1 block {l1_block} with root 0"
+        )));
+    }
+    Ok(Some(root))
 }
 
 /// What the L1 source can currently serve. See [`L1Reader::readiness`].
@@ -183,6 +219,55 @@ impl L1Reader {
             .map(|b| (b.header.number, b.header.hash)))
     }
 
+    /// The rollup's committed root at L1's finalized block, or `None` while L1
+    /// has no finalized block.
+    ///
+    /// # Errors
+    ///
+    /// - [`L1Error::Provider`] on RPC failure (retryable).
+    /// - [`L1Error::Config`] when the rollup is registered with root zero.
+    pub async fn finalized_commitment(&self) -> L1Result<Option<FinalizedCommitment>> {
+        let Some((l1_block, l1_hash)) = self.finalized_block().await? else {
+            return Ok(None);
+        };
+        let provider = self.build_provider();
+        // Pin both reads to F's hash so a reorg cannot mix two blocks.
+        let at = BlockId::Hash(RpcBlockHash {
+            block_hash: l1_hash,
+            require_canonical: Some(true),
+        });
+        let eez = self.eez();
+        let rollup_id = self.rollup_id();
+        let code = provider
+            .get_code_at(eez)
+            .block_id(at)
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_code({eez}) at {l1_hash}: {e}")))?;
+        let (rollup_contract, root) = if code.is_empty() {
+            (Address::ZERO, B256::ZERO)
+        } else {
+            let req = TransactionRequest::default().to(eez).input(
+                rollupsCall {
+                    rollupId: rollup_id,
+                }
+                .abi_encode()
+                .into(),
+            );
+            let out = provider.call(req).block(at).await.map_err(|e| {
+                L1Error::Provider(format!("rollups({rollup_id}) at {l1_hash}: {e}"))
+            })?;
+            let r = rollupsCall::abi_decode_returns(&out)
+                .map_err(|e| L1Error::Provider(format!("decode rollups({rollup_id}): {e}")))?;
+            (r.rollupContract, r.root)
+        };
+        let root = registered_root(code.is_empty(), rollup_contract, root, rollup_id, l1_block)?;
+        Ok(Some(FinalizedCommitment {
+            l1_block,
+            l1_hash,
+            root,
+        }))
+    }
+
     pub(crate) fn rpc_url(&self) -> url::Url {
         self.config.rpc_url.clone()
     }
@@ -206,5 +291,29 @@ impl L1Reader {
         ProviderBuilder::new()
             .disable_recommended_fillers()
             .connect_http(self.config.trace_rpc_url.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{Address, B256};
+
+    use super::registered_root;
+
+    #[test]
+    fn registered_root_cases() {
+        let root = B256::repeat_byte(7);
+        let rc = Address::repeat_byte(1);
+        assert_eq!(registered_root(true, rc, root, 1, 5).unwrap(), None);
+        assert_eq!(
+            registered_root(false, Address::ZERO, B256::ZERO, 1, 5).unwrap(),
+            None
+        );
+        let err = registered_root(false, rc, B256::ZERO, 1, 5).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("registered at L1 block 5 with root 0")
+        );
+        assert_eq!(registered_root(false, rc, root, 1, 5).unwrap(), Some(root));
     }
 }
