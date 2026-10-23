@@ -392,6 +392,27 @@ where
         }
     }
 
+    /// The Deriver indexes a batch before moving safe to it, so the heights
+    /// in between are L1-settled and must not be rewritten.
+    fn held(&self) -> Result<bool, FollowerError> {
+        let indexed = self.l1_head.last_indexed_l2();
+        let safe = self
+            .local
+            .safe_block_num_hash()
+            .map_err(|e| FollowerError::Provider(format!("safe_block_num_hash: {e}")))?
+            .map_or(0, |s| s.number);
+        if indexed > safe {
+            event!(
+                name: "eez.node.follower.head.held",
+                Level::DEBUG,
+                indexed,
+                safe,
+                "safe lags the L1 batch index; holding the head",
+            );
+        }
+        Ok(indexed > safe)
+    }
+
     /// Adopt the highest-version candidate that descends from safe.
     async fn follow_best(&mut self) -> Result<(), FollowerError> {
         for head in self.tracker.candidates() {
@@ -403,6 +424,10 @@ where
             if check_extends_safe(&self.local, at, claim.parent_hash)? == SafeCompat::Conflicts {
                 self.rejections.warn(number, hash, "conflicts with safe");
                 continue;
+            }
+            // Checked before fetching so a held follower does not download blocks it discards.
+            if self.held()? {
+                return Ok(());
             }
             let fetched = fetch_missing(&self.local, &self.blocks, at, head.block.as_ref()).await;
             let missing = match fetched {
@@ -428,22 +453,8 @@ where
             };
             // Held from the safe check through import, so no Deriver batch reconcile interleaves.
             let _guard = self.committer.begin_reconcile().await;
-            // The Deriver indexes a batch before moving safe to it, so the heights
-            // in between are L1-settled and must not be rewritten.
-            let indexed = self.l1_head.last_indexed_l2();
-            let safe = self
-                .local
-                .safe_block_num_hash()
-                .map_err(|e| FollowerError::Provider(format!("safe_block_num_hash: {e}")))?
-                .map_or(0, |s| s.number);
-            if indexed > safe {
-                event!(
-                    name: "eez.node.follower.head.held",
-                    Level::DEBUG,
-                    indexed,
-                    safe,
-                    "safe lags the L1 batch index; holding the head",
-                );
+            // Re-checked under the lock: the Deriver can index a batch after the pre-check.
+            if self.held()? {
                 return Ok(());
             }
             let fork_point = &missing.fork_point;
