@@ -32,7 +32,10 @@ its settlement effects before signing the recomputed public-input hash.
 a succinct validity proof, but the deployed verifier no longer accepts an
 unbound mock signature. The
 [Composer-to-prover gRPC specification](crates/eez-control-rpc/SPEC.md) defines
-request construction, response validation, and the prove-to-L1 handoff.
+streaming sessions, block prevalidation, recovery, proof verification, and the
+prove-to-L1 handoff implemented in [#206](https://github.com/eez-association/eez-rollup0/pull/206).
+It covers Rollup0's calldata-only conditional proofs and links to the shared
+wire contract's baseline and optional capabilities.
 
 ## Run a chiado L2 (Docker)
 
