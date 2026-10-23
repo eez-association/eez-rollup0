@@ -51,11 +51,13 @@ pub enum DeriverError {
     Unseeded,
     /// A resumed batch appends to a Sync block that is already finalized.
     #[error(
-        "resumed batch would rewrite Sync block {l2_block}, which is at or below the finalized L2 head"
+        "resumed batch would rewrite Sync block {l2_block}, at or below the finalized L2 head {finalized_l2}"
     )]
     FinalizedResume {
         /// Height of the finalized Sync block.
         l2_block: u64,
+        /// The finalized L2 head that refuses it.
+        finalized_l2: u64,
     },
 }
 
@@ -93,7 +95,10 @@ mod tests {
             floor_l1_block: 100,
         }));
         assert!(is_fatal(&DeriverError::Unseeded));
-        assert!(is_fatal(&DeriverError::FinalizedResume { l2_block: 7 }));
+        assert!(is_fatal(&DeriverError::FinalizedResume {
+            l2_block: 7,
+            finalized_l2: 9,
+        }));
         assert!(!is_fatal(&DeriverError::LocalDiverged {
             l2_block: 7,
             detail: None,

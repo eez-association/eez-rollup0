@@ -17,6 +17,8 @@ pub const DERIVER_SYNC_BLOCK_BUILT: &str = "eez.deriver.reconcile.sync_block_bui
 pub const DERIVER_RESYNC_FAILED: &str = "eez.deriver.resync.failed";
 pub const DERIVER_RESYNC_RECOVERED: &str = "eez.deriver.resync.recovered";
 pub const DERIVER_COMMITTER_CLOSED: &str = "eez.deriver.committer.closed";
+/// The deriver stops the node on an error no resync can fix.
+pub const DERIVER_FATAL: &str = "eez.deriver.fatal";
 pub const NODE_BOOT_CATCH_UP_FAILED: &str = "eez.node.deriver.boot_catch_up.failed";
 /// A peers-mode node waits for its peers to serve the L1-finalized root.
 pub const NODE_SYNC_WAITING_FOR_PEERS: &str = "eez.node.sync.waiting_for_peers";
@@ -50,6 +52,7 @@ pub const FATAL: &[&str] = &[
     NODE_BOOT_CATCH_UP_FAILED,
     DERIVER_RESYNC_FAILED,
     DERIVER_COMMITTER_CLOSED,
+    DERIVER_FATAL,
     DERIVER_STATE_DIVERGED_PRE,
     DERIVER_STATE_DIVERGED_POST,
 ];

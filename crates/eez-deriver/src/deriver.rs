@@ -81,6 +81,7 @@ fn stop_if_fatal(err: &DeriverError) {
         event!(
             name: "eez.deriver.fatal",
             Level::ERROR,
+            event_name = "eez.deriver.fatal",
             error = %err,
             "deriver hit an error no resync can fix; stopping the node",
         );
@@ -1796,6 +1797,7 @@ where
                     if from_block <= finalized_l2 {
                         return Err(DeriverError::FinalizedResume {
                             l2_block: from_block,
+                            finalized_l2,
                         });
                     }
                     let parent = self.l2_sealed_header_at(from_block - 1)?;
