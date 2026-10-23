@@ -61,6 +61,8 @@ services:
       - ./deployments.env
       - ./.env.kurtosis
     environment:
+      # The genesis composer has no peers to sync from.
+      EEZ_SYNC_L1_ONLY: "1"
       # ── Embedded L1 = a reth "devnet" node that joins the Kurtosis L1 ──
       EEZ_L1_EMBEDDED: "1"
       EEZ_L1_CHAIN: devnet

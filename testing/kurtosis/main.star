@@ -156,6 +156,7 @@ def run(plan, args):
         "EEZ_L2_AUTH_PORT": str(L2_ENGINE_PORT),
         "EEZ_L2_P2P_PORT": str(L2_P2P_PORT),
         "EEZL2_ADDRESS": "0x4200000000000000000000000000000000000007",
+        "EEZ_SYNC_L1_ONLY": "1",  # the genesis composer has no peers to sync from
     }
 
     node_cmd = " ".join(
