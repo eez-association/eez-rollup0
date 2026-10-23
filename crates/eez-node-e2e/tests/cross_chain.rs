@@ -1,6 +1,9 @@
 //! Cross-chain integration and nonce-gap regression tests.
 
+use std::time::Duration;
+
 use alloy_primitives::{Address, Bytes, TxHash, U256, keccak256};
+use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue};
 
@@ -8,10 +11,10 @@ use eez_protocol::EEZL2_ADDRESS;
 use eez_protocol::abi::computeCrossChainProxyAddressCall;
 use eez_testkit::signals;
 use eez_testkit::{
-    ANVIL_ATTESTER_KEY, DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER, INestedSetterInner,
-    INestedSetterOuter, IReturnData, IReturnDataWrapper, IRevertBubbleWrapper, IRevertingTarget,
-    ISetterWrapper, IValue, IValueNoRet, L1_ROLLUP_ID, NodeBinary, NodeConfig, NodeHandle,
-    OUTBOUND_USER, ProverMutation, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead,
+    ANVIL_ATTESTER_KEY, BuilderStubMode, DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER,
+    INestedSetterInner, INestedSetterOuter, IReturnData, IReturnDataWrapper, IRevertBubbleWrapper,
+    IRevertingTarget, ISetterWrapper, IValue, IValueNoRet, L1_ROLLUP_ID, NodeBinary, NodeConfig,
+    NodeHandle, OUTBOUND_USER, ProverMutation, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead,
     TARGET_DEPLOYER, account_code, assert_latest_batch_signature, batches_posted,
     block_number_and_hash_at, call_read, call_revert_data, completed_proxy_calls, count_events,
     create_l2_cross_chain_proxy, cross_chain_source_proxy, deploy_nested_setter_inner,
@@ -20,8 +23,8 @@ use eez_testkit::{
     setter_call, setup_cross_chain, setup_cross_chain_codeless, setup_cross_chain_empty_call,
     setup_cross_chain_nested_setter, setup_cross_chain_outbound_return_data,
     setup_cross_chain_proxied, setup_cross_chain_return_data, setup_cross_chain_reverting,
-    sign_and_send, signer_address, value_no_ret, value_read, wait_for,
-    wait_for_safe_chain_contains,
+    setup_cross_chain_with_builder_stub, sign_and_send, signer_address, value_no_ret, value_read,
+    wait_for, wait_for_safe_chain_contains,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -1895,4 +1898,124 @@ async fn outbound_call_targeting_the_l1_manager_is_evicted() {
         "the eviction must name EEZDestinationForbidden; log tail:\n{}",
         w.node.log_tail(40),
     );
+}
+
+/// Anvil account #8: funded in the L2 genesis and used by no other role.
+const L2_ONLY_USER: &str = "0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97";
+
+/// Pure L2 transfers mined above a rich Sync block must return to the chain
+/// after its failed bundle is rolled back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_rich_bundle_keeps_live_l2_txs() {
+    let w = setup_cross_chain_with_builder_stub().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let l2 = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+    w.set_builder_mode(BuilderStubMode::Drop).await.unwrap();
+    // A slow relay keeps the bundle in flight while Live blocks build on it.
+    w.set_builder_ack_delay(Duration::from_secs(5))
+        .await
+        .unwrap();
+    // From a fresh drain boundary, the outbound call rides a dropped bundle.
+    let from = w.node.signal_cursor().unwrap();
+    wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(from)?;
+        let drained = emitted
+            .iter()
+            .any(|s| s.name == signals::COMPOSER_SYNC_SLOT_DRAIN);
+        Ok(drained.then_some(()))
+    })
+    .await
+    .unwrap();
+
+    let from = w.node.signal_cursor().unwrap();
+    let outbound = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        ISetterWrapper::setViaProxyCall {
+            v: U256::from(83u64),
+        }
+        .abi_encode(),
+        1_200_000,
+    )
+    .await
+    .unwrap();
+    let n = wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(from)?;
+        let dispatched = emitted
+            .iter()
+            .find(|s| s.name == signals::COMPOSER_BUNDLE_DISPATCHED);
+        dispatched.map(|s| s.u64("sync_height")).transpose()
+    })
+    .await
+    .unwrap();
+
+    let nonce = onchain_nonce(&l2_rpc, L2_ONLY_USER).await.unwrap();
+    let mut transfers = Vec::new();
+    for i in 0..3 {
+        let to = Some(Address::repeat_byte(0x44));
+        let hash = sign_and_send(
+            &l2_rpc,
+            L2_ONLY_USER,
+            w.l2_chain_id,
+            nonce + i,
+            to,
+            U256::from(1u64),
+            Vec::new(),
+            21_000,
+        );
+        transfers.push(hash.await.unwrap());
+    }
+    for &hash in &transfers {
+        let receipt = wait_for(SETTLE_TIMEOUT, || async {
+            Ok(l2.get_transaction_receipt(hash).await?)
+        })
+        .await
+        .unwrap();
+        assert!(
+            receipt.block_number.unwrap() > n,
+            "inconclusive: transfer {hash} landed at or below the rich Sync block {n}",
+        );
+    }
+    let rich = l2.get_block_by_number(n.into()).await.unwrap().unwrap();
+    assert!(
+        rich.transactions.hashes().any(|tx| tx == outbound),
+        "inconclusive: the rich Sync block {n} was rolled back before the transfers landed above it",
+    );
+
+    w.set_builder_ack_delay(Duration::ZERO).await.unwrap();
+    w.set_builder_mode(BuilderStubMode::Forward).await.unwrap();
+    // The outbound call settles, and every transfer is back in the safe chain.
+    let settled = wait_for(SETTLE_TIMEOUT, || async {
+        if l2_value(&l1_rpc, w.outbound_value).await? != U256::from(83u64) {
+            return Ok(None);
+        }
+        let Some((safe, _)) = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe).await?
+        else {
+            return Ok(None);
+        };
+        for &hash in &transfers {
+            let Some(receipt) = l2.get_transaction_receipt(hash).await? else {
+                return Ok(None);
+            };
+            let number = receipt
+                .block_number
+                .expect("mined receipt has a block number");
+            let canonical =
+                block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(number)).await?;
+            if number > safe || canonical.map(|(_, hash)| hash) != receipt.block_hash {
+                return Ok(None);
+            }
+        }
+        Ok(Some(()))
+    })
+    .await;
+    if let Err(err) = settled {
+        panic!("{err:#}{}", w.settlement_diagnostics());
+    }
+    w.node.assert_no_divergence_failure_logs();
 }
