@@ -15,7 +15,7 @@ pub use payload::EezPayloadBuilder;
 mod payload_builder;
 mod pool;
 mod pool_transaction;
-pub use pool::EezPoolBuilder;
+pub use pool::{EezPoolBuilder, HeldTxs};
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]

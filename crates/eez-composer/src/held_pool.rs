@@ -21,6 +21,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::{Address, Bytes, TxHash};
 use tracing::{Level, event};
@@ -91,6 +92,10 @@ fn min_replacement_fee(replaced: u128) -> u128 {
     replaced.saturating_add(required_increase)
 }
 
+/// How long a drained tx stays [held](HeldPool::holds): until L1 finalizes its
+/// block, a reorg can hand it back to the L2 pool, and an hour is past that.
+const DRAINED_RETENTION: Duration = Duration::from_hours(1);
+
 /// All pool state under one lock, so queue membership, hash dedupe and
 /// nonce reservations can never disagree with each other.
 #[derive(Debug, Default)]
@@ -107,6 +112,8 @@ struct PoolState {
     /// or evicted by its caller; a forgotten reservation bricks its nonce
     /// slot (admission forever expects past it).
     in_flight: HashMap<TxHash, (Address, Direction, u64)>,
+    /// When each tx was last drained into a block.
+    last_drained: HashMap<TxHash, Instant>,
 }
 
 impl PoolState {
@@ -355,11 +362,26 @@ impl HeldPool {
         let mut state = self.state.lock().expect("held_pool mutex poisoned");
         let count = max.min(state.txs.len());
         let drained: Vec<_> = state.txs.drain(..count).collect();
+        let now = Instant::now();
+        state
+            .last_drained
+            .retain(|_, at| now.duration_since(*at) < DRAINED_RETENTION);
         for tx in &drained {
             state.by_hash.remove(&tx.hash);
             state.mark_in_flight(tx);
+            state.last_drained.insert(tx.hash, now);
         }
         drained
+    }
+
+    /// Whether `hash` is queued, in flight, or was drained within
+    /// [`DRAINED_RETENTION`]. The L2 pool refuses these: only the composer
+    /// includes a cross-chain tx.
+    pub fn holds(&self, hash: &TxHash) -> bool {
+        let state = self.state.lock().expect("held_pool mutex poisoned");
+        state.by_hash.contains(hash)
+            || state.in_flight.contains_key(hash)
+            || state.last_drained.contains_key(hash)
     }
 
     /// Number of currently-held txs.
@@ -500,6 +522,17 @@ mod tests {
         assert_eq!(drained[0].hash, TxHash::from(B256::repeat_byte(1)));
         assert_eq!(drained[2].hash, TxHash::from(B256::repeat_byte(3)));
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn holds_a_drained_tx_after_its_release() {
+        let pool = HeldPool::new();
+        let held = tx(1);
+        assert!(!pool.holds(&held.hash));
+        insert(&pool, held.clone(), 1);
+        let drained = pool.pop_all();
+        pool.release_in_flight_batch(&drained);
+        assert!(pool.holds(&held.hash));
     }
 
     #[test]
