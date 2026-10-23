@@ -6,7 +6,7 @@ use alloy_consensus::Header;
 use alloy_eips::Encodable2718;
 use alloy_primitives::B256;
 use eez_deriver::{Deriver, DeriverError};
-use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome};
+use eez_driver::{BlockCommitterHandle, DriverError, DriverResult, ForkchoiceOutcome};
 use eez_l1::{BatchRecord, FinalizedCommitment, L1Error, L1Reader, L1Result, PostId};
 use eez_primitives::engine::EezEngineTypes;
 use reth_primitives_traits::SealedHeader;
@@ -37,14 +37,16 @@ pub enum SyncMode {
     L1Only,
 }
 
-/// Parses `EEZ_SYNC_L1_ONLY`; unset reads as [`SyncMode::Peers`].
+/// Parses `EEZ_SYNC_L1_ONLY`; unset or empty reads as [`SyncMode::Peers`].
+///
+/// Empty counts as unset because compose files pass `${VAR:-}`.
 ///
 /// # Errors
 ///
 /// Any value other than `1`, `true`, `0` or `false`.
 pub fn parse_sync_mode(raw: Option<&str>) -> eyre::Result<SyncMode> {
     match raw {
-        None | Some("0" | "false") => Ok(SyncMode::Peers),
+        None | Some("" | "0" | "false") => Ok(SyncMode::Peers),
         Some("1" | "true") => Ok(SyncMode::L1Only),
         Some(other) => Err(eyre::eyre!(
             "EEZ_SYNC_L1_ONLY must be 1, true, 0 or false, got {other:?}"
@@ -182,6 +184,34 @@ where
         .ok_or_else(|| eyre::eyre!("no local header for L2 block {hash}"))
 }
 
+/// Repeats `refresh` every [`SYNC_POLL`] while reth answers SYNCING. A node
+/// killed mid-backfill restarts with reth resuming it, and until it finishes
+/// every FCU gets SYNCING, which boot's anchor moves treat as fatal.
+async fn wait_for_idle_engine<F, Fut>(mut refresh: F) -> eyre::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = DriverResult<()>>,
+{
+    let mut busy = StatusEvery::default();
+    loop {
+        match refresh().await {
+            Ok(()) => return Ok(()),
+            Err(DriverError::EngineNotReady(status)) => {
+                if busy.due() {
+                    event!(
+                        name: "eez.node.sync.engine_busy",
+                        Level::WARN,
+                        status,
+                        "waiting for reth to finish its own sync before boot moves any anchor",
+                    );
+                }
+                tokio::time::sleep(SYNC_POLL).await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
 /// Syncs the local chain to L1's finalized root through peers; returns the Deriver's seed.
 ///
 /// Waits while L1 or the peers can't serve it; never falls back to deriving from L1.
@@ -199,6 +229,7 @@ pub async fn boot_from_peers<P>(
 where
     P: BlockIdReader + HeaderProvider<Header = Header>,
 {
+    wait_for_idle_engine(|| committer.refresh_forkchoice()).await?;
     let mut waiting = StatusEvery::default();
     let mut waiting_for_peers = StatusEvery::default();
     // The first sync rewinds to the local finalized block; later top-ups build on it.
@@ -440,6 +471,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reth_chainspec::ChainInfo;
+    use reth_storage_api::{BlockHashReader, errors::ProviderResult};
 
     const L1_HASH: B256 = B256::repeat_byte(0xf1);
     const ROOT: B256 = B256::repeat_byte(0xa7);
@@ -454,7 +487,7 @@ mod tests {
 
     #[test]
     fn parse_sync_mode_table() {
-        for raw in [None, Some("0"), Some("false")] {
+        for raw in [None, Some(""), Some("0"), Some("false")] {
             assert_eq!(parse_sync_mode(raw).unwrap(), SyncMode::Peers, "{raw:?}");
         }
         for raw in ["1", "true"] {
@@ -508,6 +541,85 @@ mod tests {
             decide(Err(L1Error::Provider("x".into())), |_| None).unwrap(),
             BootStep::Wait(_)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn boot_waits_out_a_busy_engine() {
+        let calls = std::cell::Cell::new(0);
+        let refresh = || {
+            calls.set(calls.get() + 1);
+            let busy = calls.get() < 3;
+            async move {
+                if busy {
+                    Err(DriverError::EngineNotReady("SYNCING".into()))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        wait_for_idle_engine(refresh).await.unwrap();
+        assert_eq!(calls.get(), 3);
+
+        let rejected = || async { Err(DriverError::InvalidForkchoice("INVALID".into())) };
+        assert!(wait_for_idle_engine(rejected).await.is_err());
+    }
+
+    /// Knows `block` at `number`; the canonical chain holds `canonical` there.
+    /// Not `MockEthProvider`: its `block_hash` scans a randomly seeded map, so
+    /// two headers at one height give a random answer.
+    struct Fork {
+        block: B256,
+        number: u64,
+        canonical: B256,
+    }
+
+    impl BlockHashReader for Fork {
+        fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>> {
+            Ok((number == self.number).then_some(self.canonical))
+        }
+
+        fn canonical_hashes_range(&self, _start: u64, _end: u64) -> ProviderResult<Vec<B256>> {
+            unimplemented!()
+        }
+    }
+
+    impl BlockNumReader for Fork {
+        fn chain_info(&self) -> ProviderResult<ChainInfo> {
+            unimplemented!()
+        }
+
+        fn best_block_number(&self) -> ProviderResult<u64> {
+            unimplemented!()
+        }
+
+        fn last_block_number(&self) -> ProviderResult<u64> {
+            unimplemented!()
+        }
+
+        fn block_number(&self, hash: B256) -> ProviderResult<Option<u64>> {
+            Ok((hash == self.block).then_some(self.number))
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_l1_history_needs_the_root_canonical() {
+        let fork = |canonical| Fork {
+            block: ROOT,
+            number: 5,
+            canonical,
+        };
+        let sibling = B256::repeat_byte(0x5b);
+
+        assert!(ensure_l1_history(&fork(sibling), None).await.is_ok());
+        assert!(
+            ensure_l1_history(&fork(ROOT), Some(commitment(Some(ROOT))))
+                .await
+                .is_ok()
+        );
+        let err = ensure_l1_history(&fork(sibling), Some(commitment(Some(ROOT))))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("L1 history incomplete"), "{err}");
     }
 
     #[test]
