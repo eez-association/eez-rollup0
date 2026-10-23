@@ -343,10 +343,12 @@ entries[last].rollupUpdates[0].newRoot = terminal Sync-block hash
 
 The anchor is `entries[0]` and is not counted as a cross-chain effect. Effect
 `i` is `entries[i + 1]`. Let `E` be the hash of the candidate block holding no
-transactions: the terminal Sync block sealed after its pre-block system calls
-(EIP-2935 / EIP-4788). It is not the parent's hash, because an empty block still
-changes state. Let `R[i]` be the hash of the candidate block holding the
-transaction prefix through effect `i`'s effect-ending transaction:
+transactions: the terminal Sync block sealed after its configured pre-block
+system changes. Rollup0 keeps EIP-2935 history storage and disables EIP-4788
+beacon-root updates. This candidate is not the parent's hash: it has its own
+header and may include system state changes even with no transactions.
+Let `R[i]` be the hash of the candidate block holding the transaction prefix
+through effect `i`'s effect-ending transaction:
 
 - for an outbound effect, the effect-ending transaction is the user
   transaction in its `[system load, user]` pair; the system load alone is not a
