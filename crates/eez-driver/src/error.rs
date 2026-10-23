@@ -20,6 +20,9 @@ pub enum DriverError {
     /// `engine_forkchoiceUpdated` returned a non-`VALID` status.
     #[error("engine rejected forkchoice update: {0}")]
     InvalidForkchoice(String),
+    /// The engine answered `SYNCING`: it applied nothing, so no anchor moved.
+    #[error("engine not ready: {0}")]
+    EngineNotReady(String),
     /// `engine_newPayload` returned a non-`VALID` status.
     #[error("engine rejected new payload: {0}")]
     InvalidPayload(String),

@@ -81,6 +81,10 @@ enum CommitCommand<T: PayloadTypes> {
         header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
         response: oneshot::Sender<DriverResult<ForkchoiceOutcome>>,
     },
+    SyncTo {
+        target: B256,
+        response: oneshot::Sender<DriverResult<ForkchoiceOutcome>>,
+    },
     Derive {
         payload: <T as PayloadTypes>::ExecutionData,
         header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
@@ -431,6 +435,28 @@ where
             .map_err(|_| DriverError::CommitterClosed)?
     }
 
+    /// Sends FCU `{head, safe, finalized} = target` so reth syncs to it.
+    /// Changes no mirror, anchor or `unsafe_head_hash`: on `SYNCING` nothing
+    /// is left behind, so the caller can repeat the call until `Valid`.
+    ///
+    /// # Errors
+    ///
+    /// Transport failures, [`DriverError::InvalidForkchoice`] on `INVALID`,
+    /// or `committer_closed`.
+    pub async fn sync_to(&self, target: B256) -> DriverResult<ForkchoiceOutcome> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(CommitCommand::SyncTo {
+                target,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| DriverError::CommitterClosed)?;
+        response_rx
+            .await
+            .map_err(|_| DriverError::CommitterClosed)?
+    }
+
     /// Commit a Deriver-built [`ExecutionData`] via `newPayloadV3` +
     /// head-FCU. `safe` / `finalized` are unchanged; move them via
     /// [`Self::advance_safe_finalized`].
@@ -529,6 +555,10 @@ where
                 }
                 CommitCommand::AdvanceHead { header, response } => {
                     let result = self.process_advance_head(header).await;
+                    let _ = response.send(result);
+                }
+                CommitCommand::SyncTo { target, response } => {
+                    let result = self.process_sync_to(target).await;
                     let _ = response.send(result);
                 }
                 CommitCommand::Derive {
@@ -637,9 +667,7 @@ where
         let state = self.forkchoice_state();
         let safe_header = self.safe_header.clone();
         let res = self.forkchoice_or_demote_head(state, &safe_header).await?;
-        if !res.is_valid() && !res.is_syncing() {
-            return Err(DriverError::InvalidForkchoice(format!("{res:?}")));
-        }
+        require_valid_forkchoice(&res)?;
         Ok(())
     }
 
@@ -652,12 +680,26 @@ where
         state.safe_block_hash = safe.hash();
         state.finalized_block_hash = finalized;
         let res = self.forkchoice_or_demote_head(state, &safe).await?;
-        if !res.is_valid() && !res.is_syncing() {
-            return Err(DriverError::InvalidForkchoice(format!("{res:?}")));
-        }
+        require_valid_forkchoice(&res)?;
         self.safe_header = safe;
         self.finalized_hash = finalized;
         Ok(())
+    }
+
+    async fn process_sync_to(&mut self, target: B256) -> DriverResult<ForkchoiceOutcome> {
+        let state = ForkchoiceState {
+            head_block_hash: target,
+            safe_block_hash: target,
+            finalized_block_hash: target,
+        };
+        let res = match self.to_engine.fork_choice_updated(state, None).await {
+            Ok(res) => res,
+            Err(BeaconForkChoiceUpdateError::ForkchoiceUpdateError(
+                ForkchoiceUpdateError::InvalidState,
+            )) => return Ok(ForkchoiceOutcome::InvalidState),
+            Err(err) => return Err(DriverError::EngineRpc(err.to_string())),
+        };
+        classify_advance_head_response(&res)
     }
 
     async fn process_advance_head(
@@ -795,6 +837,14 @@ where
     }
 }
 
+/// `SYNCING` applied nothing, so it must not move safe/finalized anchors.
+fn require_valid_forkchoice(res: &ForkchoiceUpdated) -> DriverResult<()> {
+    match classify_advance_head_response(res)? {
+        ForkchoiceOutcome::Valid => Ok(()),
+        _ => Err(DriverError::EngineNotReady(format!("{res:?}"))),
+    }
+}
+
 fn classify_advance_head_response(res: &ForkchoiceUpdated) -> DriverResult<ForkchoiceOutcome> {
     if res.is_valid() {
         Ok(ForkchoiceOutcome::Valid)
@@ -870,5 +920,102 @@ mod tests {
         assert_eq!(rx.borrow_and_update().hash(), h2.hash());
         assert_eq!(handle.last_header().hash(), h2.hash());
         assert!(!handle.subscribe_head().has_changed().unwrap());
+    }
+
+    type Seen = Arc<std::sync::Mutex<Vec<ForkchoiceState>>>;
+
+    /// Mock engine answering every FCU with `syncing` or VALID, recording states.
+    fn mock_engine(syncing: bool) -> (ConsensusEngineHandle<EthEngineTypes>, Seen) {
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        let seen: Seen = Arc::default();
+        let rec = seen.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = engine_rx.recv().await {
+                if let BeaconEngineMessage::ForkchoiceUpdated { state, tx, .. } = msg {
+                    rec.lock().unwrap().push(state);
+                    let _ = tx.send(Ok(if syncing {
+                        reth_engine_primitives::OnForkChoiceUpdated::syncing()
+                    } else {
+                        reth_engine_primitives::OnForkChoiceUpdated::valid(
+                            alloy_rpc_types_engine::PayloadStatus::from_status(
+                                alloy_rpc_types_engine::PayloadStatusEnum::Valid,
+                            ),
+                        )
+                    }));
+                }
+            }
+        });
+        (ConsensusEngineHandle::new(engine_tx), seen)
+    }
+
+    fn spawn_committer(
+        engine: ConsensusEngineHandle<EthEngineTypes>,
+        head: SealedHeader,
+    ) -> BlockCommitterHandle<EthEngineTypes> {
+        BlockCommitterHandle::<EthEngineTypes>::spawn(
+            head.clone(),
+            head,
+            B256::ZERO,
+            engine,
+            PayloadBuilderHandle::new(mpsc::unbounded_channel().0),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn sync_to_syncing_changes_nothing() {
+        let (engine, seen) = mock_engine(true);
+        let h0 = sealed(0);
+        let handle = spawn_committer(engine, h0.clone());
+        let target = B256::repeat_byte(7);
+
+        assert_eq!(
+            handle.sync_to(target).await.unwrap(),
+            ForkchoiceOutcome::Syncing
+        );
+        assert_eq!(handle.last_header().hash(), h0.hash());
+        let sent = seen.lock().unwrap()[0];
+        assert_eq!(
+            (
+                sent.head_block_hash,
+                sent.safe_block_hash,
+                sent.finalized_block_hash
+            ),
+            (target, target, target)
+        );
+
+        assert!(matches!(
+            handle.refresh_forkchoice().await,
+            Err(DriverError::EngineNotReady(_))
+        ));
+        let next = seen.lock().unwrap()[1];
+        assert_eq!(next.head_block_hash, h0.hash());
+        assert_eq!(next.safe_block_hash, h0.hash());
+    }
+
+    #[tokio::test]
+    async fn sync_to_valid_reports_valid() {
+        let (engine, _seen) = mock_engine(false);
+        let handle = spawn_committer(engine, sealed(0));
+        assert_eq!(
+            handle.sync_to(B256::repeat_byte(7)).await.unwrap(),
+            ForkchoiceOutcome::Valid
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_safe_finalized_syncing_keeps_anchors() {
+        let (engine, seen) = mock_engine(true);
+        let h0 = sealed(0);
+        let handle = spawn_committer(engine, h0.clone());
+
+        let res = handle
+            .advance_safe_finalized(sealed(1), B256::repeat_byte(9))
+            .await;
+        assert!(matches!(res, Err(DriverError::EngineNotReady(_))));
+        let _ = handle.refresh_forkchoice().await;
+        let next = seen.lock().unwrap()[1];
+        assert_eq!(next.safe_block_hash, h0.hash());
+        assert_eq!(next.finalized_block_hash, B256::ZERO);
     }
 }
