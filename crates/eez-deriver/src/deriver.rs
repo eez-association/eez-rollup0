@@ -456,6 +456,17 @@ where
                         tx_hash: seed.tx_hash,
                         last_l2_block: seed.l2_cursor,
                     });
+                    // L1 finality below the seed maps to no indexed batch, so keep
+                    // reth's stored finalized; otherwise the tag drops to genesis.
+                    let finalized = self
+                        .inner
+                        .l2_provider
+                        .finalized_block_number()
+                        .map_err(|e| DeriverError::L2Provider(e.to_string()))?
+                        .unwrap_or(0);
+                    self.inner
+                        .l1_head
+                        .set_finalized_l2(finalized.min(seed.l2_cursor));
                     self.sync_batches_inner(seed.l1_block, seed.l2_cursor).await
                 }
                 None => self.sync_batches_inner(self.inner.deploy_block, 0).await,

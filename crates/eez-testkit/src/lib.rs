@@ -827,10 +827,15 @@ impl Harness {
 
     /// [`Self::fresh`] with L1 finalized two blocks behind its head, not 64.
     pub async fn fresh_with_fast_finality() -> Result<Self> {
+        Self::fresh_with_slots_in_an_epoch(1).await
+    }
+
+    /// [`Self::fresh`] with L1 finalized `2 * slots` blocks behind its head, not 64.
+    pub async fn fresh_with_slots_in_an_epoch(slots: u64) -> Result<Self> {
         let ts = now_unix_secs();
         let l2_genesis = write_l2_genesis_at(ts)?;
         let cfg = AnvilConfig {
-            slots_in_an_epoch: Some(1),
+            slots_in_an_epoch: Some(slots),
             ..AnvilConfig::standard(ts)
         };
         Self::with_anvil_config(cfg, l2_genesis_block_hash_at(ts)?, l2_genesis).await

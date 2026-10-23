@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use alloy_primitives::U256;
 use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_types_eth::BlockNumberOrTag;
 use eez_testkit::{
     ANVIL_ADDR_3, ANVIL_KEY_1, Harness, NodeBinary, NodeConfig, NodeHandle, STAGING_USER_KEY,
-    send_l2_value_transfer_confirmed, signals, wait_for, wait_for_latest_height,
-    wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
+    block_number_and_hash_at, send_l2_value_transfer_confirmed, signals, wait_for,
+    wait_for_latest_height, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
 };
 
 const TIMEOUT: Duration = Duration::from_mins(5);
@@ -215,4 +216,73 @@ async fn settled_safe_prefix_survives_restart_and_fresh_follower_replay() {
     restarted.assert_no_process_death();
     follower.assert_no_divergence_failure_logs();
     follower.assert_no_process_death();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l1_only_restart_keeps_finalized() {
+    // L1 finalizes 16 blocks behind its head, so after the restart its finality
+    // stays below the boot checkpoint for about a minute.
+    let harness = Harness::fresh_with_slots_in_an_epoch(8).await.unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let cfg = NodeConfig {
+        genesis_path: Some(harness.l2_genesis_path()),
+        extra_args: vec!["--engine.persistence-threshold".into(), "0".into()],
+        ..Default::default()
+    };
+    let env = harness.env().await.unwrap();
+
+    let (finalized, safe) = {
+        let node =
+            NodeHandle::start_with_datadir("finalized-before-restart", datadir.path(), &cfg, &env)
+                .await
+                .unwrap();
+        let rpc = node.l2_rpc_url();
+        let finalized = wait_for(TIMEOUT, || async {
+            Ok(tag_number(&rpc, BlockNumberOrTag::Finalized)
+                .await?
+                .filter(|number| *number > 0))
+        })
+        .await
+        .expect("composer never finalized an L1-settled batch");
+        // reth writes the finalized number to disk only with the next block it saves.
+        let head = wait_for_latest_height(&node, 0, TIMEOUT).await.unwrap();
+        wait_for_latest_height(&node, head.number + 1, TIMEOUT)
+            .await
+            .expect("composer never saved a block after finalizing");
+        let safe = tag_number(&rpc, BlockNumberOrTag::Safe)
+            .await
+            .unwrap()
+            .unwrap();
+        node.assert_no_process_death();
+        (finalized, safe)
+    };
+
+    let restarted =
+        NodeHandle::start_with_datadir("finalized-after-restart", datadir.path(), &cfg, &env)
+            .await
+            .unwrap();
+    let rpc = restarted.l2_rpc_url();
+    // A safe block past the old one comes from a Deriver FCU after the boot.
+    wait_for(TIMEOUT, || async {
+        Ok(tag_number(&rpc, BlockNumberOrTag::Safe)
+            .await?
+            .filter(|number| *number > safe))
+    })
+    .await
+    .expect("restarted composer never settled a new batch");
+    let after = tag_number(&rpc, BlockNumberOrTag::Finalized)
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert!(
+        after >= finalized,
+        "finalized fell from #{finalized} to #{after} after the restart"
+    );
+    restarted.assert_no_process_death();
+}
+
+async fn tag_number(rpc: &str, tag: BlockNumberOrTag) -> anyhow::Result<Option<u64>> {
+    Ok(block_number_and_hash_at(rpc, tag)
+        .await?
+        .map(|(number, _)| number))
 }
