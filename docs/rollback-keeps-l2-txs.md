@@ -38,9 +38,19 @@ transaction except:
 - the failed batch's cross-chain transactions, which the held pool already
   re-queues or releases.
 
-After the rollback and the substitute commit, it adds the kept transactions back
-to reth's pool in block order. The pool re-validates them. One that is no longer
-valid is dropped, and logged with its reason.
+If it can't read those blocks, it doesn't roll back: the batch stays Failed and
+the next slot retries.
+
+Before rolling back, it also waits, for at most one L2 block time, for the pool
+to catch up to the head. A dropped block's commit that reaches the pool after
+the re-add would remove those transactions again. If the pool is still behind
+when the wait ends, the composer logs it and goes on.
+
+After the rollback and the substitute attempt, it adds the kept transactions
+back to reth's pool in block order. It does this even if the substitute commit
+fails, because the transactions are still valid on the parent. The pool
+re-validates them. One that is no longer valid is dropped, and logged with its
+reason.
 
 ## Not covered here
 
