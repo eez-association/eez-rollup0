@@ -36,6 +36,7 @@ reth-rpc-eth-api.workspace                = true
 reth-rpc-server-types.workspace           = true
 reth-storage-api.workspace                = true
 reth-tasks.workspace                      = true
+reth-transaction-pool.workspace           = true
 # Persistent witness store: dedicated mdbx env, separate from reth's node DB.
 reth-libmdbx.workspace                    = true
 
@@ -66,6 +67,7 @@ serde_json.workspace = true
 postcard.workspace   = true
 
 # app
+async-trait.workspace = true
 eyre.workspace    = true
 tokio.workspace   = true
 tracing.workspace = true

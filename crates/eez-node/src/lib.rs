@@ -13,7 +13,8 @@ mod witness_source;
 
 use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
 
-use alloy_primitives::{Address, B256};
+use alloy_consensus::transaction::{Recovered, TxHashRef as _};
+use alloy_primitives::{Address, B256, TxHash};
 use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
 use eez_composer::composer::CrossChainWiring;
@@ -31,8 +32,10 @@ use eez_node_common::{
     L2NodeBuilder, NoRoleArgs, node_cli, read_checkpoint_dir, wait_for_l1_ready,
     warn_on_deprecated_env,
 };
+use eez_primitives::EezTxEnvelope;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_ethereum::EthereumNode;
+use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
@@ -77,6 +80,38 @@ impl WitnessCapture {
 enum EmbeddedL1<Ethereum, Chiado> {
     Ethereum(Ethereum),
     Chiado(Chiado),
+}
+
+/// Composer recovery's handle on reth's L2 transaction pool.
+#[derive(Debug)]
+struct RethL2Pool<P>(P);
+
+#[async_trait::async_trait]
+impl<P> eez_composer::L2TxPool for RethL2Pool<P>
+where
+    P: TransactionPool<Transaction: PoolTransaction<Consensus = EezTxEnvelope>> + 'static,
+{
+    async fn reinject(&self, txs: Vec<Recovered<EezTxEnvelope>>) -> Vec<(TxHash, String)> {
+        let mut rejected = Vec::new();
+        let mut pooled = Vec::with_capacity(txs.len());
+        for tx in txs {
+            let hash = *tx.tx_hash();
+            match P::Transaction::try_from_consensus(tx) {
+                Ok(tx) => pooled.push(tx),
+                Err(err) => rejected.push((hash, err.to_string())),
+            }
+        }
+        let added = self
+            .0
+            .add_transactions(TransactionOrigin::External, pooled)
+            .await;
+        rejected.extend(
+            added
+                .into_iter()
+                .filter_map(|result| result.err().map(|err| (err.hash, err.kind.to_string()))),
+        );
+        rejected
+    }
 }
 
 /// Launch a production composer node.
@@ -357,6 +392,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             l1_head: Arc::clone(&l1_head),
             held_pool: Arc::clone(&held_pool),
             optimistic: Arc::new(eez_composer::OptimisticallyIncluded::new()),
+            l2_pool: Arc::new(RethL2Pool(handle.node.pool.clone())),
         };
         let mut rollups = HashMap::with_capacity(1);
         rollups.insert(rollup_id, rollup_state);

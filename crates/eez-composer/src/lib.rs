@@ -66,4 +66,4 @@ pub use overlay::{
     OverlayChannel, OverlayChannelHandle, OverlayError, apply_overlay_diff, new_overlay_channel,
 };
 #[doc(inline)]
-pub use rollup::{RollupConfig, RollupState};
+pub use rollup::{L2TxPool, RollupConfig, RollupState};

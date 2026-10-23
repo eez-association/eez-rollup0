@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use alloy_consensus::transaction::{Recovered, TxHashRef as _};
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider as _;
@@ -32,11 +33,13 @@ use eez_driver::{
 };
 use eez_evm::EezEvmConfig;
 use eez_l1::{BundleTarget, L1Error, L1Event, SendOutcome, Submitter};
+use eez_primitives::EezTxEnvelope;
 use eez_primitives::engine::EezEngineTypes;
 use eez_prover::{ActionableProverFailure, BlockWitness, Prover, ProverError, ProvingContext};
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
 use reth_storage_api::{
-    BlockReader, BlockSource, StateProvider, StateProviderFactory, TransactionsProvider,
+    BlockReader, BlockSource, StateProvider, StateProviderFactory, TransactionVariant,
+    TransactionsProvider,
 };
 use tokio::sync::broadcast;
 use tracing::{Level, event};
@@ -585,6 +588,41 @@ fn dispose_recovered_txs(
             "batch recovered; user_txs re-queued (front) for the next Sync slot",
         );
     }
+}
+
+/// Every transaction in the canonical L2 blocks `from..=to`, in block order.
+fn canonical_txs<P>(
+    provider: &P,
+    from: u64,
+    to: u64,
+) -> Result<Vec<Recovered<EezTxEnvelope>>, String>
+where
+    P: BlockReader<Transaction = EezTxEnvelope>,
+{
+    let mut txs = Vec::new();
+    for number in from..=to {
+        let block = provider
+            .recovered_block(number.into(), TransactionVariant::WithHash)
+            .map_err(|e| format!("recovered_block({number}): {e}"))?
+            .ok_or_else(|| format!("L2 block {number} missing"))?;
+        txs.extend(block.into_transactions_recovered());
+    }
+    Ok(txs)
+}
+
+/// The rolled-back transactions that go back to the L2 pool, in block order.
+/// System txs are rebuilt from L1, and the held pool owns the batch's own txs.
+fn reinjectable_txs(
+    dropped: Vec<Recovered<EezTxEnvelope>>,
+    batch: &[HeldTx],
+) -> Vec<Recovered<EezTxEnvelope>> {
+    dropped
+        .into_iter()
+        .filter(|tx| {
+            !eez_protocol::settlement::is_system_tx(tx.inner())
+                && !batch.iter().any(|held| held.hash == *tx.tx_hash())
+        })
+        .collect()
 }
 
 /// Split a partially settled batch's txs with the drain's stale test: a tx is
@@ -1401,12 +1439,11 @@ where
 #[async_trait]
 impl<L2> SyncSlotComposer for Composer<L2>
 where
-    L2: BlockReader<Header = alloy_consensus::Header>
+    L2: BlockReader<Header = alloy_consensus::Header, Transaction = EezTxEnvelope>
         + StateProviderFactory
         + Send
         + Sync
         + 'static,
-    <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
     /// Drain `rollup_id`'s cross-chain `HeldPool`, compose its transactions,
     /// and hand the resulting Sync block back for the Sequencer to commit.
@@ -1683,12 +1720,11 @@ where
 // the trait impl so we can use generic bounds independently.
 impl<L2> Composer<L2>
 where
-    L2: BlockReader<Header = alloy_consensus::Header>
+    L2: BlockReader<Header = alloy_consensus::Header, Transaction = EezTxEnvelope>
         + StateProviderFactory
         + Send
         + Sync
         + 'static,
-    <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
     /// How many L2 blocks L1 has yet to record. Flat is healthy; monotonic
     /// growth is what every settlement stall looks like.
@@ -1894,7 +1930,29 @@ where
                 return RecoveryOutcome::HeadUnchanged;
             }
             let head = committer.last_header();
+            let mut dropped = None;
             if head.number() >= sync_height {
+                // The rollback sends reth's pool no reorg, so read the pure L2
+                // txs it drops now and re-add them once the head has moved.
+                let kept = match canonical_txs(
+                    rollup.l2_provider.as_ref(),
+                    sync_height,
+                    head.number(),
+                ) {
+                    Ok(txs) => reinjectable_txs(txs, &failed.txs),
+                    Err(err) => {
+                        event!(
+                            name: "eez.composer.recovery.read_dropped_failed",
+                            Level::ERROR,
+                            rollup_id,
+                            sync_height,
+                            error = %err,
+                            "cannot read the blocks the rollback drops; keeping entry Failed — next slot retries",
+                        );
+                        rollup.optimistic.reinsert_failed(failed);
+                        return RecoveryOutcome::HeadUnchanged;
+                    }
+                };
                 if let Err(err) = committer.reorg_to(failed.parent.clone()).await {
                     event!(
                         name: "eez.composer.recovery.reorg_failed",
@@ -1908,6 +1966,7 @@ where
                     return RecoveryOutcome::HeadUnchanged;
                 }
                 outcome = RecoveryOutcome::HeadMoved;
+                dropped = Some(kept);
                 event!(
                     name: "eez.composer.recovery.rolled_back",
                     Level::WARN,
@@ -1978,6 +2037,31 @@ where
                         "empty-sibling build failed; head stays at the parent and Catchup rebuilds",
                     ),
                 }
+            }
+            if let Some(txs) = dropped {
+                let offered = txs.len();
+                let rejected = rollup.l2_pool.reinject(txs).await;
+                for (tx_hash, reason) in &rejected {
+                    event!(
+                        name: "eez.composer.recovery.reinject_rejected",
+                        Level::WARN,
+                        rollup_id,
+                        sync_height,
+                        tx_hash = %tx_hash,
+                        reason = %reason,
+                        "L2 pool refused a transaction from a rolled-back block",
+                    );
+                }
+                event!(
+                    name: "eez.composer.recovery.reinjected",
+                    Level::INFO,
+                    event_name = "eez.composer.recovery.reinjected",
+                    rollup_id,
+                    sync_height,
+                    count = offered.saturating_sub(rejected.len()),
+                    rejected = rejected.len(),
+                    "rolled-back L2 txs re-added to the pool",
+                );
             }
         }
         dispose_recovered_txs(
@@ -4817,6 +4901,48 @@ mod tests {
         assert_eq!(
             queued[0].attempts, 0,
             "an uncharged disposition leaves attempts alone",
+        );
+    }
+
+    /// A rollback re-adds only the pure L2 txs, in block order: system txs are
+    /// rebuilt from L1 and the held pool owns the batch's cross-chain txs.
+    #[test]
+    fn reinjectable_txs_keep_pure_l2_txs_in_block_order() {
+        let sender = Address::repeat_byte(0x55);
+        let user = |nonce| {
+            let tx = reth_ethereum_primitives::TransactionSigned::new_unhashed(
+                reth_ethereum_primitives::Transaction::Legacy(alloy_consensus::TxLegacy {
+                    nonce,
+                    gas_limit: 21_000,
+                    ..Default::default()
+                }),
+                alloy_primitives::Signature::test_signature(),
+            );
+            Recovered::new_unchecked(EezTxEnvelope::from(tx), sender)
+        };
+        let system = Recovered::new_unchecked(
+            EezTxEnvelope::from(eez_primitives::SystemTransaction {
+                chain_id: 1,
+                nonce: 0,
+                to: eez_primitives::EEZL2_ADDRESS,
+                value: U256::ZERO,
+                input: Bytes::new(),
+            }),
+            eez_primitives::SYSTEM_ADDRESS,
+        );
+        let outbound = user(0);
+        let mut batch_tx = held(sender, Direction::Outbound, 0, 0xEE);
+        batch_tx.hash = *outbound.tx_hash();
+        let (first, second) = (user(1), user(2));
+
+        // The rich Sync block [system, outbound], then a Live block [first, second].
+        let kept = reinjectable_txs(
+            vec![system, outbound, first.clone(), second.clone()],
+            &[batch_tx],
+        );
+        assert_eq!(
+            kept.iter().map(|tx| *tx.tx_hash()).collect::<Vec<_>>(),
+            vec![*first.tx_hash(), *second.tx_hash()],
         );
     }
 

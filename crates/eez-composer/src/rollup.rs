@@ -10,8 +10,10 @@
 
 use std::sync::Arc;
 
-use alloy_primitives::Address;
+use alloy_consensus::transaction::Recovered;
+use alloy_primitives::{Address, TxHash};
 use eez_l1::{L1CanonicalHead, L1Error, L1Result};
+use eez_primitives::EezTxEnvelope;
 
 use crate::held_pool::HeldPool;
 use crate::optimistic::OptimisticallyIncluded;
@@ -164,4 +166,15 @@ pub struct RollupState<L2> {
     /// is in flight or settled-but-unfinalized. Always present (empty
     /// map costs nothing); only the cross-chain compose path writes it.
     pub optimistic: Arc<OptimisticallyIncluded>,
+    /// The rollup's L2 transaction pool, which recovery refills after a rollback.
+    pub l2_pool: Arc<dyn L2TxPool>,
+}
+
+/// The L2 node's transaction pool. A rollback to a canonical ancestor sends the
+/// pool no reorg, so recovery re-adds the dropped blocks' transactions itself.
+#[async_trait::async_trait]
+pub trait L2TxPool: std::fmt::Debug + Send + Sync {
+    /// Add `txs` in order as external transactions; returns each rejected
+    /// transaction's hash and reason.
+    async fn reinject(&self, txs: Vec<Recovered<EezTxEnvelope>>) -> Vec<(TxHash, String)>;
 }
