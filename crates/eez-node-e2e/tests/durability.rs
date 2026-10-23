@@ -229,7 +229,13 @@ async fn l1_only_restart_keeps_finalized() {
         extra_args: vec!["--engine.persistence-threshold".into(), "0".into()],
         ..Default::default()
     };
-    let env = harness.env().await.unwrap();
+    // As in production, the boot checkpoint lives in the datadir; the testkit
+    // default disables it.
+    let mut env = harness.env().await.unwrap();
+    env.push((
+        "EEZ_L2_DATADIR",
+        datadir.path().to_string_lossy().into_owned(),
+    ));
 
     let (finalized, safe) = {
         let node =
