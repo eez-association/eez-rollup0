@@ -20,7 +20,7 @@ use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
 use eez_composer::composer::CrossChainWiring;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
-use eez_deriver::{Deriver, DeriverBoot};
+use eez_deriver::Deriver;
 use eez_driver::{
     BlockCommitterHandle, DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, RollupTiming,
     Sequencer, SyncSlotComposerHandle, spawn_l1_anchored,
@@ -30,8 +30,7 @@ use eez_l1::{
 };
 use eez_node_common::EezNode;
 use eez_node_common::{
-    L2NodeBuilder, NoRoleArgs, ReadinessProbe, SyncMode, boot_catch_up, boot_from_peers,
-    ensure_l1_history, node_cli, read_checkpoint_dir, sync_mode_from_env, wait_for_idle_engine,
+    L2NodeBuilder, NoRoleArgs, boot, node_cli, sync_mode_from_env, wait_for_idle_engine,
     wait_for_l1_ready, warn_on_deprecated_env,
 };
 use eez_primitives::engine::EezEngineTypes;
@@ -337,6 +336,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     let payload_builder_handle = handle.node.payload_builder_handle.clone();
     let beacon_engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
     let task_executor = handle.node.task_executor.clone();
+    let network = handle.node.network.clone();
 
     // Shared L1-confirmed L2 head. Created unconditionally so the
     // Sequencer's speculative-depth limit can be wired even when
@@ -346,6 +346,8 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
 
     let timing = RollupTiming::from_env()?;
 
+    // The committer reads reth's head, which a resumed backfill is still moving.
+    wait_for_idle_engine(|| network.is_syncing()).await;
     let block_committer = BlockCommitterHandle::spawn_from_provider(
         &provider,
         beacon_engine_handle,
@@ -692,12 +694,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
-        match sync_mode {
-            SyncMode::Peers => DeriverBoot::Peers,
-            SyncMode::L1Only => DeriverBoot::L1Only {
-                checkpoint_dir: read_checkpoint_dir(),
-            },
-        },
+        sync_mode.deriver_boot(),
     );
 
     // Bind before the L1 wait so port checks see a live front. Submissions are
@@ -735,49 +732,22 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     }
 
     let l1_reader = submitter.reader();
-    let probe = match sync_mode {
-        SyncMode::Peers => ReadinessProbe::Finalized,
-        SyncMode::L1Only => ReadinessProbe::DeployBlock(deploy_block),
-    };
+    let probe = sync_mode.readiness_probe(deploy_block);
     wait_for_l1_ready(&l1_reader, probe, l1_source_chain_id).await?;
     for (expected_chain_id, provider) in &xchain_checks {
         ingress::validate_cross_chain_front(provider, *expected_chain_id).await?;
     }
 
-    let network = handle.node.network.clone();
-    let (l1_seed_number, l1_seed_hash) = match sync_mode {
-        SyncMode::Peers => {
-            let seed = boot_from_peers(
-                &provider,
-                &block_committer,
-                &l1_reader,
-                || network.num_connected_peers(),
-                || network.is_syncing(),
-            )
-            .await?;
-            deriver.seed(seed);
-            boot_catch_up(&deriver, &l1_reader, sync_mode, "composer").await?
-        }
-        SyncMode::L1Only => {
-            wait_for_idle_engine(&provider, &block_committer, || network.is_syncing()).await?;
-            // Read before the scan: the scan must end up holding this root.
-            let before = match l1_reader.finalized_commitment().await {
-                Ok(before) => before,
-                Err(error) => {
-                    event!(
-                        name: "eez.node.sync.history_check_skipped",
-                        Level::WARN,
-                        %error,
-                        "L1's finalized root is unreadable; boot skips checking that the local chain holds it",
-                    );
-                    None
-                }
-            };
-            let seed = boot_catch_up(&deriver, &l1_reader, sync_mode, "composer").await?;
-            ensure_l1_history(&provider, before).await?;
-            seed
-        }
-    };
+    let (l1_seed_number, l1_seed_hash) = boot(
+        sync_mode,
+        &provider,
+        &block_committer,
+        &deriver,
+        &l1_reader,
+        || network.num_connected_peers(),
+        "composer",
+    )
+    .await?;
     drop_unsettled_tail(&provider, &block_committer, l1_head.cursor()).await?;
 
     event!(

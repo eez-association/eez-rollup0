@@ -6,13 +6,12 @@ use std::{env, str::FromStr, sync::Arc};
 
 use alloy_primitives::Address;
 use alloy_provider::RootProvider;
-use eez_deriver::{Deriver, DeriverBoot};
+use eez_deriver::Deriver;
 use eez_driver::{BlockCommitterHandle, RollupTiming};
 use eez_l1::{L1CanonicalHead, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
 use eez_node_common::EezNode;
 use eez_node_common::{
-    L2NodeBuilder, ReadinessProbe, SyncMode, boot_catch_up, boot_from_peers, ensure_l1_history,
-    node_cli, read_checkpoint_dir, sync_mode_from_env, wait_for_idle_engine, wait_for_l1_ready,
+    L2NodeBuilder, boot, node_cli, sync_mode_from_env, wait_for_idle_engine, wait_for_l1_ready,
     warn_on_deprecated_env,
 };
 use eez_seq_sig::HeadDomain;
@@ -105,9 +104,12 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     let chain_spec: Arc<_> = handle.node.chain_spec();
     let provider = handle.node.provider.clone();
     let task_executor = handle.node.task_executor.clone();
+    let network = handle.node.network.clone();
     let timing = RollupTiming::from_env()?;
     let l1_head = Arc::new(L1CanonicalHead::default());
 
+    // The committer reads reth's head, which a resumed backfill is still moving.
+    wait_for_idle_engine(|| network.is_syncing()).await;
     let block_committer = BlockCommitterHandle::spawn_from_provider(
         &provider,
         handle.node.add_ons_handle.beacon_engine_handle.clone(),
@@ -143,54 +145,21 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
-        match sync_mode {
-            SyncMode::Peers => DeriverBoot::Peers,
-            SyncMode::L1Only => DeriverBoot::L1Only {
-                checkpoint_dir: read_checkpoint_dir(),
-            },
-        },
+        sync_mode.deriver_boot(),
     );
 
-    let probe = match sync_mode {
-        SyncMode::Peers => ReadinessProbe::Finalized,
-        SyncMode::L1Only => ReadinessProbe::DeployBlock(deploy_block),
-    };
+    let probe = sync_mode.readiness_probe(deploy_block);
     wait_for_l1_ready(&l1_reader, probe, read_l1_chain_id()?).await?;
-
-    let network = handle.node.network.clone();
-    let (l1_seed_number, l1_seed_hash) = match sync_mode {
-        SyncMode::Peers => {
-            let seed = boot_from_peers(
-                &provider,
-                &block_committer,
-                &l1_reader,
-                || network.num_connected_peers(),
-                || network.is_syncing(),
-            )
-            .await?;
-            deriver.seed(seed);
-            boot_catch_up(&deriver, &l1_reader, sync_mode, "follower").await?
-        }
-        SyncMode::L1Only => {
-            wait_for_idle_engine(&provider, &block_committer, || network.is_syncing()).await?;
-            // Read before the scan: the scan must end up holding this root.
-            let before = match l1_reader.finalized_commitment().await {
-                Ok(before) => before,
-                Err(error) => {
-                    event!(
-                        name: "eez.node.sync.history_check_skipped",
-                        Level::WARN,
-                        %error,
-                        "L1's finalized root is unreadable; boot skips checking that the local chain holds it",
-                    );
-                    None
-                }
-            };
-            let seed = boot_catch_up(&deriver, &l1_reader, sync_mode, "follower").await?;
-            ensure_l1_history(&provider, before).await?;
-            seed
-        }
-    };
+    let (l1_seed_number, l1_seed_hash) = boot(
+        sync_mode,
+        &provider,
+        &block_committer,
+        &deriver,
+        &l1_reader,
+        || network.num_connected_peers(),
+        "follower",
+    )
+    .await?;
 
     event!(
         name: "eez.node.deriver.spawned",

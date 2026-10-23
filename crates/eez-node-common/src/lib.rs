@@ -12,11 +12,7 @@ use tracing::{Level, event};
 #[cfg(feature = "l1-startup")]
 mod boot;
 #[cfg(feature = "l1-startup")]
-pub use boot::{
-    BootStep, L1_HISTORY_MISSING_DEPTH, SyncMode, boot_catch_up, boot_from_peers, decide,
-    ensure_l1_history, l1_history_missing, parse_sync_mode, sync_mode_from_env,
-    wait_for_idle_engine,
-};
+pub use boot::{SyncMode, boot, sync_mode_from_env, wait_for_idle_engine};
 mod discovery;
 pub use discovery::{EezNetworkBuilder, discover};
 mod node;
@@ -119,8 +115,9 @@ pub fn warn_on_deprecated_env() {
 ///
 /// A missing or unusable directory disables checkpoint persistence for this
 /// process, avoiding a failed write after every settled batch.
+#[cfg(feature = "l1-startup")]
 #[must_use]
-pub fn read_checkpoint_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn read_checkpoint_dir() -> Option<std::path::PathBuf> {
     let dir = std::env::var("EEZ_L2_DATADIR")
         .ok()
         .map(std::path::PathBuf::from)
