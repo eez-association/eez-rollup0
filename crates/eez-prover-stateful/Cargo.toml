@@ -43,7 +43,6 @@ workspace = true
 alloy-rpc-types-engine.workspace = true
 eez-composer.workspace = true
 eez-proof-signer = { workspace = true, features = ["test-utils"] }
-alloy-rpc-types-engine.workspace = true
 reth-chain-state.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-engine-primitives.workspace = true
