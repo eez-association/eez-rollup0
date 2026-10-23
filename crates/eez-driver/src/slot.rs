@@ -152,6 +152,17 @@ pub enum SyncSlotMode {
 /// `eez-composer`, to avoid a dependency cycle.
 #[async_trait]
 pub trait SyncSlotComposer: Send + Sync + 'static {
+    /// Local blob-mode allowance for ordinary transaction bytes plus five bytes
+    /// per transaction for its length. `None` preserves calldata sequencing.
+    fn ordinary_da_budget(
+        &self,
+        _rollup_id: u64,
+        _parent: &SealedHeader<alloy_consensus::Header>,
+        _timestamp: u64,
+    ) -> Result<Option<usize>, String> {
+        Ok(None)
+    }
+
     /// Compose a Sync slot. `target_l1_block`: `Some(n)` supplies the exact L1
     /// target for cap-triggered historical chunks; steady mode also uses it
     /// for the regular postBatch and pins its timestamp. `None` leaves that

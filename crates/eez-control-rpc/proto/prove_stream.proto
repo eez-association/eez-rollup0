@@ -87,7 +87,7 @@ message SettlementInput {
   // Named L1 target, independently authenticated.
   // Manager-specific custom data is derived from trusted profile/deployment rules,
   // not supplied here. Both blob profiles use these same target fields.
-  // Required for the RollupX profile.
+  // Required for the Rollup0 and RollupX blob profiles.
   L1PostingContext posting_context = 3;
 }
 

@@ -1,7 +1,7 @@
 # Composer-to-prover streaming RPC
 
-The Rollup0 runtime implements this contract for its current calldata-only,
-timeless settlement profile. The existing [window RPC specification](SPEC.md)
+The Rollup0 runtime implements this contract for its calldata and blob
+settlement profiles. The existing [window RPC specification](SPEC.md)
 and endpoint remain available for compatibility.
 [prove_stream.proto](proto/prove_stream.proto) is the canonical schema.
 
@@ -124,7 +124,7 @@ Begin at the desired predecessor and backfill the same requested range; it must
 not silently widen the range or change the settlement input.
 
 Parent authorization follows the configured settlement profile, as described in
-[section 3](#parent-authorization-by-profile). Current Rollup0 proofs are
+[section 3](#parent-authorization-by-profile). Calldata Rollup0 proofs are
 conditional on the selected parent; they do not attest its L1 acceptance.
 Profiles requiring prover-side L1 authentication obtain the selected parent's
 evidence from the prover's own L1/L2 sources, including for an intermediate parent.
@@ -410,11 +410,14 @@ transcripts belong with each runtime implementation.
 ### Rollup0 runtime
 
 The stateless signer and the stateful follower signer implement Resume, Rewind,
-Cancel, subrange selection and bounded pipelining. Both reject nonempty blobs
-or any posting context with UNIMPLEMENTED; this is not a blob-profile implementation.
+Cancel, subrange selection and bounded pipelining. In the default calldata
+profile, both reject nonempty blobs or any posting context with UNIMPLEMENTED.
+`EEZ_SETTLEMENT_PROFILE=blob` requires both blobs and posting context.
 Ordinary execution ACKs do not claim L1 acceptance. Final settlement retains
-the current Rollup0 [conditional-proof rules](#parent-authorization-by-profile);
-stateful fork selection additionally obeys Reth's safe/finalized ancestry.
+the [parent-authorization rules](#parent-authorization-by-profile) for the
+configured profile: calldata proofs are conditional on the selected parent;
+blob settlement independently authenticates it against canonical L1.
+Stateful fork selection additionally obeys Reth's safe/finalized ancestry.
 
 Rollup0's Composer requires a pipelining-capable server and retains a live stream,
 limiting outstanding requests to eight while draining responses concurrently.

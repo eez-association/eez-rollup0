@@ -755,7 +755,15 @@ fn checkpoint_plan_is_empty_or_ends_at_the_final_transaction() {
                 continue;
             }
             if mask == 0 {
-                assert!(plan.positions().is_empty(), "ordinary shape {shape:?}");
+                assert_eq!(
+                    plan.positions(),
+                    if width == 0 {
+                        &[CheckpointAt::PreExecution][..]
+                    } else {
+                        &[]
+                    },
+                    "ordinary shape {shape:?}",
+                );
                 continue;
             }
 

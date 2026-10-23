@@ -3100,6 +3100,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eez-blob"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer-local",
+ "reth-chainspec",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "eez-composer"
 version = "0.1.0"
 dependencies = [
@@ -3110,9 +3123,12 @@ dependencies = [
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-types-engine",
+ "alloy-rpc-types-eth",
  "alloy-signer-local",
  "alloy-sol-types",
+ "alloy-transport",
  "async-trait",
+ "eez-blob",
  "eez-driver",
  "eez-evm",
  "eez-l1",
@@ -3273,6 +3289,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "alloy-transport",
+ "eez-blob",
  "eez-protocol",
  "fail",
  "reqwest 0.12.28",
@@ -3471,12 +3488,16 @@ name = "eez-proof-signer"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-contract",
  "alloy-eips",
+ "alloy-genesis",
  "alloy-primitives",
+ "alloy-provider",
  "alloy-rlp",
  "alloy-rpc-types-debug",
  "alloy-sol-types",
  "async-trait",
+ "eez-blob",
  "eez-control-rpc",
  "eez-payload-codec",
  "eez-primitives",
@@ -3489,6 +3510,7 @@ dependencies = [
  "prost",
  "reth-chainspec",
  "reth-primitives-traits",
+ "reth_gnosis",
  "serde_json",
  "stateless",
  "thiserror 2.0.18",
@@ -3496,6 +3518,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -3541,6 +3564,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "async-trait",
+ "eez-blob",
  "eez-control-rpc",
  "eez-protocol",
  "eez-prover",
@@ -3601,6 +3625,7 @@ dependencies = [
  "alloy-sol-types",
  "async-trait",
  "clap",
+ "eez-blob",
  "eez-control-rpc",
  "eez-evm",
  "eez-payload-codec",

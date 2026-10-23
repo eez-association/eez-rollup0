@@ -13,7 +13,9 @@ use eyre::WrapErr as _;
 use tracing::{info, warn};
 
 pub mod attest;
+mod blob_profile;
 pub mod cancel;
+mod rpc_blob_source;
 pub mod service;
 mod settlement;
 pub mod validate;
@@ -26,6 +28,10 @@ mod testkit;
 pub use eez_protocol::EEZL2_ADDRESS;
 
 pub use attest::{Attester, NonZeroProofSystemVkey};
+pub use blob_profile::{
+    BlobContextAuthority, BlobContextConfig, BlobContextError, L1PostingContext, Rollup0L1Source,
+    SettlementState,
+};
 pub use service::{ProveSvc, ServiceLimits, ServiceLimitsParams, ServiceState};
 pub use validate::ValidationBackend;
 
@@ -44,6 +50,9 @@ pub async fn serve(
     backend: impl ValidationBackend,
     shutdown: impl Future<Output = ()>,
 ) -> eyre::Result<()> {
+    let blob_context_authority =
+        BlobContextAuthority::from_env(config.expected_rollup_id.get(), backend.chain_id())?
+            .map(Arc::new);
     let ServerConfig {
         listen_addr,
         limits,
@@ -57,10 +66,11 @@ pub async fn serve(
         expected_rollup_id.get(),
         &attester,
     );
-    let svc = ProveSvc::new(
-        Arc::new(ServiceState::new(backend, expected_rollup_id, attester)?),
-        limits,
-    );
+    let mut state = ServiceState::new(backend, expected_rollup_id, attester)?;
+    if let Some(authority) = blob_context_authority {
+        state = state.with_blob_context_authority(authority);
+    }
+    let svc = ProveSvc::new(Arc::new(state), limits);
     if !listen_addr.ip().is_loopback() {
         warn!(
             listen = %listen_addr,

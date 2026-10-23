@@ -22,6 +22,9 @@ const ATTESTER_KEY: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4
 #[path = "../../eez-control-rpc/conformance/replay.rs"]
 mod replay;
 
+#[path = "streaming_rpc/blobs.rs"]
+mod blobs;
+
 struct SignerProcess(Child);
 
 impl Drop for SignerProcess {
@@ -67,6 +70,8 @@ async fn start_signer(
                 "30",
             ])
             .args(extra_args)
+            .env_remove("EEZ_SETTLEMENT_WRAPPER_ADDRESS")
+            .env_remove("EEZ_SETTLEMENT_PROFILE")
             .env("RUST_LOG", "info")
             .spawn()
             .unwrap(),
@@ -129,27 +134,13 @@ fn recorded_wire_witness(encoded: &str) -> ExecutionWitness {
     }
 }
 
-/// The end-to-end regression anchor: a complete window recorded from a live rig,
-/// replayed through the real service.
-///
-/// `postbatch.hex` is the calldata actually mined on L1, correlated to this
-/// window through the composer's settlement record; the digest is the one the
-/// signer attested; the signature is generated independently, so the assertion
-/// compares against a value this service did not produce. The window endpoints
-/// are block hashes — under state-root commitments those fields held a
-/// different kind of value, which is what this pins.
-///
-/// Regenerate with `scripts/capture-signer-window.sh`.
-#[tokio::test]
-async fn captured_window_is_validated_and_signed_by_the_shared_service() {
-    let oracle: serde_json::Value = serde_json::from_str(&fixture("oracle.json")).unwrap();
-    let expected_hash = fixture_str(&oracle, "public_inputs_hash")
+fn recorded_window(oracle: &serde_json::Value) -> (Vec<ProveChunk>, ProvingContext) {
+    let expected_hash = fixture_str(oracle, "public_inputs_hash")
         .parse::<B256>()
         .unwrap();
-    let expected_signature = fixture_hex(fixture_str(&oracle, "expected_test_signature"));
-    let from = fixture_u64(&oracle, "from_block");
-    let to = fixture_u64(&oracle, "to_block");
-    let rollup_id = NonZeroU64::new(fixture_u64(&oracle, "rollup_id")).unwrap();
+    let from = fixture_u64(oracle, "from_block");
+    let to = fixture_u64(oracle, "to_block");
+    let rollup_id = NonZeroU64::new(fixture_u64(oracle, "rollup_id")).unwrap();
 
     let mut window = vec![ProveChunk {
         kind: Some(prove_chunk::Kind::Header(ProveHeader {
@@ -221,7 +212,33 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
         .batch,
         blocks,
         l1_block_hash: None,
+        blob: None,
     };
+
+    (window, context)
+}
+
+/// The end-to-end regression anchor: a complete window recorded from a live rig,
+/// replayed through the real service.
+///
+/// `postbatch.hex` is the calldata actually mined on L1, correlated to this
+/// window through the composer's settlement record; the digest is the one the
+/// signer attested; the signature is generated independently, so the assertion
+/// compares against a value this service did not produce. The window endpoints
+/// are block hashes — under state-root commitments those fields held a
+/// different kind of value, which is what this pins.
+///
+/// Regenerate with `scripts/capture-signer-window.sh`.
+#[tokio::test]
+async fn captured_window_is_validated_and_signed_by_the_shared_service() {
+    let oracle: serde_json::Value = serde_json::from_str(&fixture("oracle.json")).unwrap();
+    let expected_hash = fixture_str(&oracle, "public_inputs_hash")
+        .parse::<B256>()
+        .unwrap();
+    let expected_signature = fixture_hex(fixture_str(&oracle, "expected_test_signature"));
+    let (window, context) = recorded_window(&oracle);
+    let rollup_id = NonZeroU64::new(context.rollup_id).unwrap();
+    let anchor = context.anchor.unwrap();
 
     let (_server, endpoint) = start_signer(&oracle, &[]).await;
     let mut client = ProverClient::connect(endpoint.clone()).await.unwrap();

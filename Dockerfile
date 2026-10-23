@@ -69,7 +69,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
 
 # CI builds this target after the node image, reusing the same builder layers.
 FROM debian:bookworm-slim AS proof-signer
-RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder --chmod=0555 /build/eez-proof-signer /usr/local/bin/eez-proof-signer
 WORKDIR /app

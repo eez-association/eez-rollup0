@@ -6,6 +6,7 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::Filter;
 
+use crate::blob_source::BeaconBlobSource;
 use crate::config::L1ReaderConfig;
 use crate::error::{L1Error, L1Result};
 use crate::scan::{BatchLogChunks, Post, scan_next_batch_log_chunk};
@@ -15,6 +16,7 @@ use crate::scan::{BatchLogChunks, Post, scan_next_batch_log_chunk};
 #[derive(Clone)]
 pub struct L1Reader {
     config: Arc<L1ReaderConfig>,
+    beacon: Option<Arc<BeaconBlobSource>>,
 }
 
 /// What the L1 source can currently serve. See [`L1Reader::readiness`].
@@ -38,8 +40,14 @@ impl L1Reader {
     /// Build a read-only L1 client from its config.
     #[must_use]
     pub fn new(config: L1ReaderConfig) -> Self {
+        let beacon = config
+            .beacon_url
+            .clone()
+            .map(BeaconBlobSource::new)
+            .map(Arc::new);
         Self {
             config: Arc::new(config),
+            beacon,
         }
     }
 
@@ -78,9 +86,29 @@ impl L1Reader {
             &trace,
             self.config.eez,
             self.config.rollup_id,
+            self.config.candidate.as_ref(),
             chunks,
         )
         .await
+    }
+
+    /// Fetch a post's blobs in commitment order, only when derivation needs them.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Config`] without a beacon, [`L1Error::Provider`] on RPC or
+    /// malformed data, and [`L1Error::SourceIncomplete`] for missing or stale DA.
+    pub async fn post_blobs(&self, post: &Post) -> L1Result<Vec<Vec<u8>>> {
+        let beacon = self
+            .beacon
+            .as_ref()
+            .ok_or_else(|| L1Error::Config("blob derivation requires EEZ_L1_BEACON_URL".into()))?;
+        beacon.fetch(&self.build_provider(), post).await
+    }
+
+    /// The configured candidate-V1 deployment, if any.
+    pub(crate) fn candidate(&self) -> Option<&eez_protocol::Rollup0Deployment> {
+        self.config.candidate.as_ref()
     }
 
     /// Hash of the canonical L1 block at `number`, or `None` if none. Used by

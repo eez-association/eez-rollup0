@@ -9,12 +9,14 @@ use std::{env, str::FromStr};
 
 use alloy_primitives::Address;
 use alloy_signer_local::PrivateKeySigner;
+use eez_protocol::Rollup0Deployment;
 use url::Url;
 
 use crate::error::{L1Error, L1Result};
 
 const ENV_RPC_URL: &str = "EEZ_L1_RPC_URL";
 const ENV_TRACE_RPC_URL: &str = "EEZ_L1_TRACE_RPC_URL";
+const ENV_BEACON_URL: &str = "EEZ_L1_BEACON_URL";
 const ENV_BUILDER_RPC_URL: &str = "EEZ_L1_BUILDER_RPC_URL";
 const ENV_TARGET_RPC_URL: &str = "EEZ_L1_TARGET_RPC_URL";
 const ENV_POSTER_KEY: &str = "EEZ_L1_POSTER_KEY";
@@ -38,6 +40,10 @@ pub struct L1ReaderConfig {
     /// L1 block where `EEZ` was deployed. Lower bound for historical batch
     /// scans and boot-time source-readiness checks.
     pub deploy_block: u64,
+    /// Blob deployment used to reproduce scanned commitments; `None` reads calldata only.
+    pub candidate: Option<Rollup0Deployment>,
+    /// Beacon REST endpoint, required when a blob deployment is configured.
+    pub beacon_url: Option<Url>,
 }
 
 impl std::fmt::Debug for L1ReaderConfig {
@@ -67,7 +73,23 @@ impl L1ReaderConfig {
             eez: parse_address(ENV_EEZ_ADDRESS)?,
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
             deploy_block: parse_u64(ENV_REGISTRY_DEPLOY_BLOCK)?,
+            candidate: None,
+            beacon_url: None,
         })
+    }
+
+    /// Read candidate-V1 posts of `candidate`; `None` keeps the calldata profile.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Config`] for a missing or malformed `EEZ_L1_BEACON_URL`
+    /// when a candidate deployment is configured.
+    pub fn with_candidate(mut self, candidate: Option<Rollup0Deployment>) -> L1Result<Self> {
+        if candidate.is_some() && self.beacon_url.is_none() {
+            self.beacon_url = Some(parse_url(ENV_BEACON_URL)?);
+        }
+        self.candidate = candidate;
+        Ok(self)
     }
 }
 

@@ -115,6 +115,47 @@ fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
     })
 }
 
+/// Blob posting uses the embedded L1 fork schedule and configured slot duration.
+fn blob_posting_from_env(
+    candidate: Option<eez_protocol::Rollup0Deployment>,
+    chain_spec: Arc<reth_chainspec::ChainSpec>,
+    slot_duration: Duration,
+    submission_slack: Duration,
+) -> eyre::Result<Option<eez_composer::BlobPostingConfig>> {
+    let Some(deployment) = candidate else {
+        return Ok(None);
+    };
+    eyre::ensure!(
+        !slot_duration.is_zero() && slot_duration.subsec_nanos() == 0,
+        "EEZ_L1_BLOCK_TIME_MS must be a positive whole number of seconds for candidate V1",
+    );
+    let max_fee_per_blob_gas = env::var("EEZ_L1_MAX_FEE_PER_BLOB_GAS")
+        .map_err(|_| eyre::eyre!("EEZ_L1_MAX_FEE_PER_BLOB_GAS is required for candidate V1"))?
+        .parse::<u128>()
+        .ok()
+        .filter(|cap| *cap > 0)
+        .ok_or_else(|| eyre::eyre!("EEZ_L1_MAX_FEE_PER_BLOB_GAS must be a nonzero wei amount"))?;
+    let post_proof_reserve = match env::var("EEZ_BLOB_POST_PROOF_RESERVE_MS") {
+        Ok(value) => Duration::from_millis(value.parse::<u64>().map_err(|_| {
+            eyre::eyre!("EEZ_BLOB_POST_PROOF_RESERVE_MS must be a nonnegative integer")
+        })?),
+        Err(env::VarError::NotPresent) => submission_slack,
+        Err(error) => return Err(eyre::eyre!("EEZ_BLOB_POST_PROOF_RESERVE_MS: {error}")),
+    };
+    eyre::ensure!(
+        !post_proof_reserve.is_zero()
+            && post_proof_reserve < slot_duration.saturating_sub(submission_slack),
+        "EEZ_BLOB_POST_PROOF_RESERVE_MS must be positive and leave time before the submission deadline",
+    );
+    Ok(Some(eez_composer::BlobPostingConfig {
+        deployment,
+        chain_spec,
+        slot_seconds: slot_duration.as_secs(),
+        max_fee_per_blob_gas,
+        post_proof_reserve,
+    }))
+}
+
 fn optional_address_from_env(name: &str) -> eyre::Result<Option<Address>> {
     match env::var(name) {
         Ok(value) => Address::from_str(value.trim())
@@ -274,6 +315,12 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         EmbeddedL1::Chiado(chiado_handle) => chiado_handle.node.chain_spec().inner.chain().id(),
     };
     let l2_chain_id = builder.config().chain.chain().id();
+    let candidate = eez_protocol::Rollup0Deployment::from_env(l1_source_chain_id, l2_chain_id)?;
+    let data_guard = candidate.map(|deployment| {
+        Arc::new(eez_node_common::SequencingDataGuard::new(
+            deployment.eez_rollup_id,
+        ))
+    });
     let composer_info = composer_rpc::ComposerInfo::new(
         composer_rpc::ComposerContracts {
             registry: eez_registry,
@@ -289,7 +336,13 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     );
     let front_composer_info = Arc::new(serde_json::to_value(&composer_info)?);
     let handle = builder
-        .node(EezNode)
+        .with_types::<EezNode>()
+        .with_components(EezNode::components().payload(
+            reth_node_builder::components::BasicPayloadServiceBuilder::new(
+                eez_node_common::EezPayloadBuilder::with_data_guard(data_guard.clone()),
+            ),
+        ))
+        .with_add_ons(eez_node_common::eez_add_ons())
         .extend_rpc_modules(move |ctx| {
             composer_rpc::install_composer_rpc(ctx, composer_info.clone())
         })
@@ -322,14 +375,15 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MAX_SPECULATIVE_DEPTH);
 
-    let submitter_config = SubmitterConfig::from_env()?;
+    let mut submitter_config = SubmitterConfig::from_env()?;
+    submitter_config.reader = submitter_config.reader.with_candidate(candidate)?;
     let deploy_block = submitter_config.reader.deploy_block;
     let rollup_config = RollupConfig::from_env(
         eez_evm::fee_collector(&chain_spec.genesis.config)?.unwrap_or_default(),
     )?;
     let attributes = EthAttributesBuilder::new(chain_spec.clone())
         .with_fee_recipient(rollup_config.fee_recipient);
-    let l1_watcher_config = L1WatcherConfig::from_env()?;
+    let l1_watcher_config = L1WatcherConfig::from_env()?.with_candidate(candidate);
 
     let submitter = Submitter::new(submitter_config);
     // Handle only — polling starts after boot catch-up fixes the
@@ -378,6 +432,10 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         let l1_rollup_id = RollupId(l1_rollup_id_u64);
         let l2_rollup_id_typed = RollupId(rollup_id);
 
+        let posting_chain_spec: Arc<reth_chainspec::ChainSpec> = match l1_variant {
+            EmbeddedL1::Ethereum(handle) => handle.node.chain_spec(),
+            EmbeddedL1::Chiado(handle) => Arc::new(handle.node.chain_spec().inner.clone()),
+        };
         // Source simulation uses EezEvmConfig's transaction EVM, not its L2 block executor.
         // L1 consensus still uses the upstream Ethereum/Gnosis node executor;
         // the EEZ envelope is used here only by the local composition client.
@@ -489,6 +547,14 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 .await
                 .map_err(|_| eyre::eyre!("timed out reading chain id from EEZ_L1_RPC_URL"))?
                 .map_err(|e| eyre::eyre!("read chain id from EEZ_L1_RPC_URL: {e}"))?;
+        // The signed domain binds the chain where the wrapper executes.
+        if let Some(deployment) = candidate {
+            eyre::ensure!(
+                deployment.l1_chain_id == l1_submission_chain_id,
+                "candidate V1 binds L1 chain {} but EEZ_L1_RPC_URL serves chain {l1_submission_chain_id}",
+                deployment.l1_chain_id,
+            );
+        }
         let l1_poster_key = env::var("EEZ_L1_POSTER_KEY")
             .map_err(|_| eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing"))?;
         let l1_poster_signer =
@@ -523,6 +589,12 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             l1_chain_id: l1_submission_chain_id,
             l1_post_batch_priority_fee,
             ecdsa_proof_system_address,
+            blob_posting: blob_posting_from_env(
+                candidate,
+                posting_chain_spec,
+                timing.l1_block_time(),
+                timing.submission_slack(),
+            )?,
         });
         event!(
             name: "eez.node.evm_composer.ready",
@@ -608,6 +680,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             timing,
         )?;
         let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
+        if let Some(guard) = &data_guard {
+            guard.bind(&sync_slot_handle)?;
+        }
 
         let schedule_rx = spawn_l1_anchored(
             L1HeadStream::from_watcher(&l1_watcher),
@@ -1043,5 +1118,32 @@ mod tests {
         assert_eq!(specs[1].port_env, "EEZ_L2_XCHAIN_PORT");
         assert_eq!(specs[1].direction, eez_composer::Direction::Outbound);
         assert_eq!(specs[1].expected_source_chain_id, 90_210);
+    }
+
+    #[test]
+    fn blob_posting_rejects_fractional_l1_slots() {
+        let deployment = eez_protocol::Rollup0Deployment {
+            l1_chain_id: 1,
+            l2_chain_id: 10,
+            eez: Address::repeat_byte(1),
+            manager: Address::repeat_byte(2),
+            settlement_wrapper: Address::repeat_byte(3),
+            eez_rollup_id: 1,
+        };
+        let spec = Arc::new(reth_chainspec::ChainSpecBuilder::mainnet().build());
+        for duration in [Duration::ZERO, Duration::from_millis(1500)] {
+            let error = blob_posting_from_env(
+                Some(deployment),
+                spec.clone(),
+                duration,
+                Duration::from_millis(100),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("positive whole number of seconds")
+            );
+        }
     }
 }

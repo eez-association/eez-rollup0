@@ -40,31 +40,64 @@ where:
 - each outbound effect represents one successful mutable L2-to-L1 call; and
 - each inbound effect represents one successful mutable L1-to-L2 delivery.
 
-The profile supports exactly one nonzero rollup ID, one nonzero proof-system
-address, and one nonzero proof-system verification key. It does not support
+Both profiles support exactly one nonzero rollup ID, one nonzero proof-system
+address, and one nonzero proof-system verification key. They do not support
 static entries, nested calls, multiple calls per effect, explicit call gas,
-force-revert spans, blobs, L1 block binding, sender binding, or multiple proof
-systems.
+force-revert spans, sender binding, or multiple proof systems.
+
+`EEZ_SETTLEMENT_PROFILE=blob` selects the blob-settlement profile for both
+daemons; unset or `calldata` keeps the calldata profile. The profile must match
+the deployment: `blob` requires `EEZ_SETTLEMENT_WRAPPER_ADDRESS`, and `calldata`
+refuses it, since the candidate-V1 manager rejects calldata posts. Each blob
+`Finalize` must then carry the complete physical blobs and an
+`L1PostingContext`, and the signer additionally requires:
+
+- the posting parent canonical on its own `EEZ_L1_RPC_URL`, read again after the
+  other L1 reads, and a target timestamp one or more `EEZ_L1_BLOCK_TIME_MS`
+  slots after that parent;
+- at that parent, EEZ's Rollup0 manager and that manager's active wrapper equal
+  the configured ones, and the EEZ root equals the selected L2 parent's hash;
+- at most the active L1 chain-spec blob limit, with `blobIndices == [0, n)` and
+  empty `callData` (the signer reads that spec from `EEZ_L1_CHAIN_CONFIG`, or
+  uses the built-in Chiado spec when `EEZ_L1_CHAIN_ID` is 10200);
+- `blockNumber == uint64.max`, the same `anchor, outbound*, inbound*` sequence
+  as the calldata profile, and a span of whole
+  `K = EEZ_L1_BLOCK_TIME_MS / EEZ_L2_BLOCK_TIME_MS` intervals ending at a Sync
+  height. A batch with actions ends at the target timestamp; an anchor-only
+  catch-up batch may end earlier, and no batch may end later; and
+- the decoded blob stream bound to the validated window, with versioned hashes
+  and manager data derived locally from trusted configuration.
+
+Unsupported blobs or context in the calldata profile, and the v1 `Prove` RPC in
+candidate V1, fail `UNIMPLEMENTED`;
+malformed or missing candidate inputs fail `INVALID_ARGUMENT`; a replaced parent
+fails `ABORTED`; an unavailable L1 source fails `UNAVAILABLE`; and a parent other
+than the settled cursor, or another manager or wrapper, fails `FAILED_PRECONDITION`.
 
 No failed stage may produce a signature. A successful signature authorizes the
 locally recomputed public-input hash only under all rules in this document.
 
 ### 1.1 What the signature does not establish
 
-Both the window RPC and streaming Finalize retain conditional-proof semantics:
-the signer proves the transition from the selected execution parent, not that
-the parent was already accepted on L1. The L1 contract checks each update's
-`currentRoot` against the live rollup root when consuming the entry. Streaming,
-subrange selection and cache reuse do not add an L1-history requirement to the
-stateless signer. The stateful backend's safe-anchor and fork-choice checks
+In the calldata profile, both the window RPC and streaming Finalize retain
+conditional-proof semantics: the signer proves the transition from the selected
+execution parent, not that the parent was already accepted on L1. The L1
+contract checks each update's `currentRoot` against the live rollup root when
+consuming the entry. Streaming, subrange selection and cache reuse do not add
+an L1-history requirement to the stateless signer. The stateful backend's safe-anchor and fork-choice checks
 remain additional backend policy, not a different meaning for the signature.
+
+The blob profile additionally authenticates the selected parent against the
+settled L1 cursor and checks the manager and active wrapper at the posting
+parent. Those snapshot checks do not guarantee future on-chain applicability.
 
 The signature does **not** establish:
 
 - canonical L2 ancestry, fork choice, finality, or sequencer authorization;
 - that the witness-backed pre-state is an operator-trusted chain checkpoint, or
   which execution backend produced the validation evidence;
-- current L1 registry state or future on-chain applicability of a state update;
+- L1 registry state after the authenticated snapshot, or future on-chain
+  applicability of a state update;
 - successful future execution of an L1 target call;
 - proof-system registration, threshold configuration, or verification-key
   equality in the deployed rollup manager;
@@ -459,16 +492,17 @@ The decoded batch MUST satisfy all of these profile rules:
 6. `immediateStaticEntryCount == 0`.
 7. `immediateEntryCount` equals the complete leading run of mutable entries
    whose `proxyEntryHash == 0`.
-8. `blockNumber == 0`.
-9. `blobIndices` is empty.
-10. `bindMsgSenderInPublicInput == false`.
+8. Calldata profile: `blockNumber == 0` and `blobIndices` is empty.
+   Blob profile: `blockNumber == uint64.max`, `callData` is empty, and
+   `blobIndices == [0, n)`.
+9. `bindMsgSenderInPublicInput == false`.
 
 `proofs` is not inspected and is absent from the public-input hash. The caller
 is responsible for inserting the returned signature into the correct proof
 carrier and satisfying the on-chain `proofSystems.length == proofs.length`
 requirement.
 
-This profile assumes the deployed rollup manager returns empty `customData` for
+The calldata profile assumes the deployed rollup manager returns empty `customData` for
 `getCustomData(0)`, as the pinned reference `Rollup` does. The configured vkey
 and proof-system address MUST match the deployed manager configuration; the
 signer does not query L1 to confirm them.
@@ -730,7 +764,7 @@ For every mutable entry:
 entryHash[i] = H(abi.encode(batch.entries[i]))
 ```
 
-For the supported profile:
+For the calldata profile:
 
 ```text
 staticEntryHashes = []
@@ -740,6 +774,11 @@ customDataHash    = H(abi.encode(uint64(expected_rollup_id), customData))
 customDataHashes  = dynamic bytes32[] containing only customDataHash
 boundSender       = address(0)
 ```
+
+For the blob profile, `blobHashes` are the versioned hashes of the submitted
+blobs and `customData` is the manager value for the authenticated L1 parent.
+`staticEntryHashes` and `boundSender` stay as above. `callData` is empty, so
+`H(batch.callData)` is the hash of empty bytes.
 
 The shared input is:
 

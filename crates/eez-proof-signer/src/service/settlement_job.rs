@@ -118,6 +118,7 @@ pub(super) fn validate_and_settle(
         expected_proof_system: state.attester.expected_proof_system(),
         system_transaction_reconstructor: &state.system_transaction_reconstructor,
         cancellation,
+        blob: None,
     })?;
 
     Ok(AttestationMaterial {
@@ -140,6 +141,13 @@ pub(super) struct SettlementInput<'a> {
     pub(super) expected_proof_system: Address,
     pub(super) system_transaction_reconstructor: &'a settlement::SystemTransactionReconstructor,
     pub(super) cancellation: &'a CancellationToken,
+    pub(super) blob: Option<BlobSettlementInput<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct BlobSettlementInput<'a> {
+    pub(super) blobs: &'a [Vec<u8>],
+    pub(super) context: &'a crate::blob_profile::AuthenticatedBlobContext,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -254,6 +262,10 @@ impl SettlementPipelineError {
                 tonic::Code::FailedPrecondition,
                 "settlement validation rejected",
             ),
+            Self::PublicInputs(settlement::PublicInputError::InvalidBlobInput(_)) => (
+                tonic::Code::InvalidArgument,
+                "invalid blob settlement input",
+            ),
             Self::DaPayload(error) => match error {
                 settlement::DaPayloadError::Decode { .. }
                 | settlement::DaPayloadError::TrailingBytes { .. } => {
@@ -267,6 +279,10 @@ impl SettlementPipelineError {
                 | settlement::DaPayloadError::InvalidEffectTransactionLayout => (
                     tonic::Code::Internal,
                     "validation backend returned invalid output",
+                ),
+                settlement::DaPayloadError::Kzg { .. } => (
+                    tonic::Code::Internal,
+                    "blob commitment derivation failed",
                 ),
                 settlement::DaPayloadError::BlockCount { .. }
                 | settlement::DaPayloadError::UnexpectedItems { .. }
@@ -321,15 +337,37 @@ pub(super) fn run_settlement(
         expected_proof_system,
         system_transaction_reconstructor,
         cancellation,
+        blob,
     } = input;
     ensure_settlement_active(cancellation)?;
     let settling_block = validated_window.settling_block();
     let canonical_batch = settlement::decode_canonical_post_batch(submitted_post_batch_calldata)?;
-    let checked_public_input_profile = settlement::CheckedPublicInputProfile::new(
-        &canonical_batch,
-        expected_rollup_id,
-        expected_proof_system,
-    )?;
+    let checked_public_input_profile = match blob {
+        Some(blob) => {
+            let block_count = validated_window.blocks().count();
+            let sync_interval = blob.context.sync_interval();
+            validate_blob_window_shape(
+                block_count,
+                settling_block.number(),
+                settling_block.decoded().header.timestamp,
+                blob.context.target_timestamp(),
+                canonical_batch.as_batch().entries.len() == 1,
+                sync_interval,
+            )?;
+            settlement::CheckedPublicInputProfile::new_blob(
+                &canonical_batch,
+                expected_rollup_id,
+                expected_proof_system,
+                blob.blobs.len(),
+                blob.context.max_blobs(),
+            )?
+        }
+        None => settlement::CheckedPublicInputProfile::new(
+            &canonical_batch,
+            expected_rollup_id,
+            expected_proof_system,
+        )?,
+    };
 
     let verified_state_chain = settlement::verify_state_update_chain(
         &canonical_batch,
@@ -383,18 +421,55 @@ pub(super) fn run_settlement(
 
     // Bind posted transactions and effect sidecars to the validated block bytes,
     // including the reconstructed Sync-block transaction sequence.
-    settlement::verify_da_payload(
-        &canonical_batch,
-        validated_window,
-        &authorized_outbound_effects,
-        &authorized_inbound_effects,
-        system_transaction_reconstructor,
-        expected_rollup_id.get(),
-    )?;
-
-    let recomputed_public_inputs_hash =
-        checked_public_input_profile.recompute_public_inputs_hash(proof_system_vkey)?;
+    let recomputed_public_inputs_hash = if let Some(blob) = blob {
+        let verified_da = settlement::verify_blob_da_payload(
+            blob.blobs,
+            validated_window,
+            &authorized_outbound_effects,
+            &authorized_inbound_effects,
+            system_transaction_reconstructor,
+            expected_rollup_id.get(),
+        )?;
+        checked_public_input_profile.recompute_public_inputs_hash(
+            proof_system_vkey,
+            Some((&verified_da, blob.context.custom_data())),
+        )?
+    } else {
+        settlement::verify_da_payload(
+            &canonical_batch,
+            validated_window,
+            &authorized_outbound_effects,
+            &authorized_inbound_effects,
+            system_transaction_reconstructor,
+            expected_rollup_id.get(),
+        )?;
+        checked_public_input_profile.recompute_public_inputs_hash(proof_system_vkey, None)?
+    };
     Ok(AttestablePublicInputsHash(recomputed_public_inputs_hash))
+}
+
+/// A blob settlement covers whole Sync intervals. A batch with user entries
+/// must end at the L1 target time. An anchor-only batch may end earlier, when
+/// an older interval is posted into a later slot.
+fn validate_blob_window_shape(
+    block_count: usize,
+    terminal_block: u64,
+    terminal_timestamp: u64,
+    target_timestamp: u64,
+    anchor_only: bool,
+    sync_interval: u64,
+) -> Result<(), SettlementPipelineError> {
+    let whole = (block_count as u64).is_multiple_of(sync_interval);
+    let timing = terminal_timestamp == target_timestamp
+        || (anchor_only && terminal_timestamp < target_timestamp);
+    if block_count == 0 || !whole || !terminal_block.is_multiple_of(sync_interval) || !timing {
+        return Err(settlement::PublicInputError::InvalidBlobInput(format!(
+            "candidate V1 needs whole {sync_interval}-block Sync intervals ending at a Sync height; \
+             got {block_count} blocks ending at {terminal_block} timestamp {terminal_timestamp}, target {target_timestamp}",
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 fn actionable_block_inspection_failure(
@@ -451,5 +526,27 @@ fn ensure_settlement_active(
         Err(SettlementPipelineError::Cancelled)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod blob_window_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_v1_accepts_only_complete_sync_intervals() {
+        assert!(validate_blob_window_shape(6, 6, 100, 100, false, 6).is_ok());
+        assert!(validate_blob_window_shape(12, 18, 50, 100, true, 6).is_ok());
+        // A slower L1 slot changes the grid, not the rule.
+        assert!(validate_blob_window_shape(5, 10, 100, 100, false, 5).is_ok());
+        assert!(validate_blob_window_shape(6, 6, 100, 100, false, 5).is_err());
+        assert!(validate_blob_window_shape(6, 6, 50, 100, false, 6).is_err());
+
+        for (block_count, terminal) in [(0, 0), (1, 6), (6, 7), (7, 12)] {
+            let error =
+                validate_blob_window_shape(block_count, terminal, 100, 100, true, 6).unwrap_err();
+            assert_eq!(error.gate(), "public_inputs");
+            assert_eq!(error.status().code(), tonic::Code::InvalidArgument);
+        }
     }
 }

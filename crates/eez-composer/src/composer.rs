@@ -49,9 +49,17 @@ use crate::local::{
 };
 use crate::optimistic::OptimisticallyIncluded;
 use crate::prover_retry::{
-    actionable_held_tx, partition_retryable, prove_with_retry, validate_actionable_prover_failure,
+    BlobPipelineDeadline, actionable_held_tx, partition_retryable, prove_with_retry,
+    validate_actionable_prover_failure,
 };
 use crate::rollup::RollupState;
+
+mod blob;
+pub use blob::BlobPostingConfig;
+use blob::{
+    BlobCarrier, pin_candidate_targets, post_batch_tx_hash, prepare_candidate_v1,
+    refresh_candidate_target,
+};
 
 fn bundle_targets_for_slot(
     target_l1_block: Option<u64>,
@@ -110,6 +118,8 @@ pub struct CrossChainExecCtx {
     /// `ECDSA.recover(publicInputsHash, proof) == signer`; the remote proof
     /// signer signs that exact hash after validating the batch.
     pub ecdsa_proof_system_address: Address,
+    /// Blob posting configuration; `None` selects calldata.
+    pub blob_posting: Option<BlobPostingConfig>,
 }
 
 impl std::fmt::Debug for CrossChainExecCtx {
@@ -520,6 +530,17 @@ enum PreparePostBatchError {
     Prover(#[source] ProverError),
     #[error("prover rejected {0}")]
     Actionable(ActionableProverFailure),
+    #[error("selected cross-chain work needs {required} blobs, maximum {maximum}")]
+    CompositionBlobLimit { required: usize, maximum: usize },
+}
+
+impl PreparePostBatchError {
+    fn retryable_kind(&self) -> Option<eez_prover::RetryableProverError> {
+        match self {
+            Self::Prover(error) => error.retryable_kind(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -893,6 +914,30 @@ fn push_poison_root(
     poison.push(tx);
 }
 
+fn evict_blob_limit_violation(
+    pool: &HeldPool,
+    rollup_id: u64,
+    tx: &HeldTx,
+    required: usize,
+    maximum: usize,
+) {
+    let evicted = pool.evict_chain_at_or_above(tx.sender, tx.direction, tx.nonce);
+    event!(
+        name: "eez.composer.emission.blob_limit_evicted",
+        Level::WARN,
+        event_name = "eez.composer.emission.blob_limit_evicted",
+        rollup_id,
+        tx_hash = %tx.hash,
+        sender = %tx.sender,
+        direction = ?tx.direction,
+        nonce = tx.nonce,
+        required,
+        maximum,
+        queued_evicted = evicted.len(),
+        "held transaction alone exceeds blob capacity; evicting it and its nonce-chain suffix (resubmit a smaller call)",
+    );
+}
+
 fn evict_gas_limit_violation(
     rollup_id: u64,
     tx_idx: usize,
@@ -1133,6 +1178,8 @@ struct Inner<L2: BlockReader> {
     /// the emission decision, the boundary math, and the span guard in
     /// `prepare_post_batch_raw` can never disagree about the cap mid-run.
     emission: EmissionLimits,
+    /// Smaller blob prefixes after deadline misses, scoped to the unsettled cursor.
+    deadline_prefixes: std::sync::Mutex<HashMap<u64, (u64, u64)>>,
 }
 
 impl<L2: BlockReader> std::fmt::Debug for Composer<L2> {
@@ -1180,6 +1227,7 @@ where
                 committer,
                 witness_source,
                 emission: EmissionLimits::from_env(timing),
+                deadline_prefixes: Default::default(),
             }),
         })
     }
@@ -1237,7 +1285,7 @@ where
                 let l1_block_number = post.id.l1_block;
                 let tx_hash = post.tx_hash;
                 let submitter = post.sender;
-                let is_ours = submitter == our_address;
+                let is_ours = post.tx_sender == our_address;
                 if is_ours {
                     event!(
                         name: "eez.composer.batch.confirmed",
@@ -1408,6 +1456,101 @@ where
         + 'static,
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
 {
+    fn ordinary_da_budget(
+        &self,
+        rollup_id: u64,
+        parent: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
+        timestamp: u64,
+    ) -> Result<Option<usize>, String> {
+        let Some(config) = &self.inner.cross_chain.exec_ctx.blob_posting else {
+            return Ok(None);
+        };
+        let k = u64::from(self.inner.emission.timing.k());
+        let next = parent
+            .number()
+            .checked_add(1)
+            .ok_or("sequencing height overflow")?;
+        let base = (next - 1) / k * k;
+        let boundary = base.checked_add(k).ok_or("sequencing boundary overflow")?;
+        let target = timestamp
+            .checked_add(
+                k.checked_mul(self.inner.emission.timing.l2_block_time().as_secs())
+                    .ok_or("sequencing timestamp overflow")?,
+            )
+            .ok_or("sequencing timestamp overflow")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_secs();
+        let target = target.max(now);
+        let spec = &config.chain_spec;
+        let mut blobs = eez_blob::blob_limit_at(spec, target)
+            .ok_or("no active blob allowance for sequencing")?
+            .max_blobs;
+        // Backlogged data must still fit after an announced capacity reduction.
+        let activations = spec
+            .blob_params
+            .scheduled
+            .iter()
+            .map(|(time, _)| *time)
+            .chain(
+                spec.hardforks
+                    .forks_iter()
+                    .filter_map(|(_, fork)| fork.as_timestamp()),
+            );
+        for time in activations.filter(|time| *time > target) {
+            blobs = blobs.min(
+                eez_blob::blob_limit_at(spec, time)
+                    .ok_or("future fork has no blob allowance")?
+                    .max_blobs,
+            );
+        }
+        let mut budget = blob::ordinary_interval_budget(k, blobs)?;
+        let rollup = self
+            .inner
+            .rollups
+            .get(&rollup_id)
+            .ok_or("unknown sequencing rollup")?;
+        let mut hash = parent.hash();
+        let mut number = parent.number();
+        while number > base {
+            let block = rollup
+                .l2_provider
+                .find_block_by_hash(hash, BlockSource::Any)
+                .map_err(|error| error.to_string())?
+                .ok_or("sequencing ancestor unavailable")?;
+            if block.header().number() != number {
+                return Err("sequencing ancestor number mismatch".into());
+            }
+            for tx in block.body().transactions() {
+                budget = budget.checked_sub(tx.encode_2718_len().saturating_add(5))
+                    .ok_or("retained interval exceeds the blob allowance; recover from the settled cursor")?;
+            }
+            hash = block.header().parent_hash();
+            number -= 1;
+        }
+        if base > rollup.l1_head.cursor() {
+            let header = if hash == parent.hash() {
+                parent.clone()
+            } else {
+                rollup
+                    .l2_provider
+                    .sealed_header_by_hash(hash)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("sequencing boundary unavailable")?
+            };
+            if header.transactions_root() != alloy_consensus::constants::EMPTY_ROOT_HASH
+                && rollup.optimistic.blocking_height(rollup.l1_head.cursor()) != Some(base)
+            {
+                return Err("nonempty Sync boundary has no settlement ownership".into());
+            }
+        }
+        if next == boundary {
+            budget = 0;
+        }
+        Ok(Some(budget))
+    }
+
     /// Drain `rollup_id`'s cross-chain `HeldPool`, compose its transactions,
     /// and hand the resulting Sync block back for the Sequencer to commit.
     /// Returns `None` (→ vanilla pool-driven Sync commit) when cross-chain
@@ -1517,10 +1660,35 @@ where
             return self.build_empty_slot_block(rollup, &parent_header, timestamp);
         }
 
+        // Pin only when a post may follow. On failure, commit an empty Sync
+        // block; returning None would let commit_one include user transactions.
+        let (bundle_target, historical_target) = match &cc.exec_ctx.blob_posting {
+            Some(config) => {
+                let targets = [bundle_target, historical_target];
+                match pin_candidate_targets(&cc.exec_ctx.l1_provider, config, targets).await {
+                    Ok(pinned) => pinned,
+                    Err(error) => {
+                        event!(
+                            name: "eez.composer.sync_slot.target_unpinned",
+                            Level::WARN,
+                            rollup_id,
+                            error = %error,
+                            "candidate-V1 slot target unavailable; committing Sync block without emission",
+                        );
+                        return self.build_empty_slot_block(rollup, &parent_header, timestamp);
+                    }
+                }
+            }
+            None => (bundle_target, historical_target),
+        };
+
         // ── Bounded emission ─────────────────────────────────────────
         // A stall holds `cursor` still while the head keeps cadence, growing the
         // range by K a slot until the signer's window wedges it.
-        if sync_height.saturating_sub(cursor) > self.inner.emission.max_blocks {
+        if sync_height.saturating_sub(cursor) > self.inner.emission.max_blocks
+            || (cc.exec_ctx.blob_posting.is_some()
+                && self.deadline_prefix(rollup_id, cursor).is_some())
+        {
             if let Err(err) = self
                 .emit_historical_chunk(
                     &cc.exec_ctx,
@@ -1998,7 +2166,7 @@ where
     ///
     /// Cadence: `CompositionBuilder::finalize` runs once per drained tx (via
     /// the phase arms below, each seeded with the slot's live sessions);
-    /// [`Self::prepare_post_batch_raw`] runs once per slot, merging every
+    /// [`Self::prepare_post_batch_raw`] runs once per attempt, merging every
     /// survivor's `Composition`.
     ///
     /// # Errors
@@ -3110,7 +3278,7 @@ where
         }
 
         // Past the drain the pool's order is all that matters again.
-        let survivors: Vec<HeldTx> = restore_pool_order(survivors);
+        let mut survivors: Vec<HeldTx> = restore_pool_order(survivors);
 
         // ── Rebuild the Sync block's system txs via THE canonical builder —
         // deriver-byte-identical two-phase SYSTEM_ADDRESS nonces (outbound loads
@@ -3286,7 +3454,7 @@ where
         // (only the system/load txs are). Empty for inbound-only.
         let outbound_user_txs: Vec<Bytes> =
             pairs.iter().filter_map(|p| p.user_tx.clone()).collect();
-        // Per-slot phase: one merge over all survivor compositions, now that
+        // Per-attempt phase: one merge over all survivor compositions, now that
         // the built block's state root and per-effect roots exist.
         let postbatch_raw = match self
             .prepare_post_batch_raw(
@@ -3305,13 +3473,81 @@ where
             .await
             .and_then(|raw| {
                 raw.ok_or_else(|| {
-                    PreparePostBatchError::Build(format!(
-                        "range exceeds the {} postBatch gas budget; bounded chunks cover it",
-                        self.inner.emission.max_gas
-                    ))
+                    PreparePostBatchError::Build(
+                        "range exceeds the postBatch gas or blob budget; bounded chunks cover it"
+                            .into(),
+                    )
                 })
             }) {
             Ok(r) => r,
+            Err(PreparePostBatchError::CompositionBlobLimit { required, maximum }) => {
+                event!(
+                    name: "eez.composer.emission.composition_over_blob_limit",
+                    Level::WARN,
+                    rollup_id,
+                    required,
+                    maximum,
+                    selected = survivors.len(),
+                    first_transaction = ?survivors.first().map(|tx| tx.hash),
+                    "selected cross-chain work exceeds blob capacity",
+                );
+                if survivors.len() > 1 {
+                    // Remove the FIFO tail, preserving every retained nonce prefix.
+                    let deferred = survivors.pop().expect("more than one survivor");
+                    pool.push_front_batch(vec![deferred]);
+                    let retry_after_error = survivors.clone();
+                    return match Box::pin(self.compose_cross_chain_batch(
+                        cc,
+                        rollup_id,
+                        survivors,
+                        parent_header,
+                        timestamp,
+                        suggested_fee_recipient,
+                        bundle_target,
+                    ))
+                    .await
+                    {
+                        Ok(result) => Ok(result),
+                        Err(error) => {
+                            event!(
+                                Level::WARN,
+                                rollup_id,
+                                %error,
+                                "blob-capacity recomposition failed; retaining remaining transactions",
+                            );
+                            pool.push_front_batch(retry_after_error);
+                            Ok(self.build_empty_slot_block(rollup, parent_header, timestamp))
+                        }
+                    };
+                }
+                // Even without history this tx cannot fit. Evict its nonce
+                // suffix rather than blocking later slots.
+                let tx = survivors.first().expect("a composition has survivors");
+                evict_blob_limit_violation(pool, rollup_id, tx, required, maximum);
+                let fallback = self
+                    .dispatch_minimal_postbatch(
+                        ctx,
+                        rollup_id,
+                        rollup,
+                        parent_header,
+                        timestamp,
+                        suggested_fee_recipient,
+                        bundle_target,
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        event!(
+                            Level::WARN,
+                            rollup_id,
+                            %error,
+                            "minimal settlement after blob-limit eviction failed; committing an empty Sync block",
+                        );
+                        self.build_empty_slot_block(rollup, parent_header, timestamp)
+                    });
+                // Outer callers requeue their candidates on Err, so a failed
+                // fallback must not return the evicted tx to the pool.
+                return Ok(fallback);
+            }
             Err(PreparePostBatchError::Actionable(failure)) => {
                 let Some(poison) = actionable_held_tx(
                     failure,
@@ -3451,6 +3687,14 @@ where
                 };
             }
             Err(PreparePostBatchError::Prover(error)) => {
+                if ctx.blob_posting.is_some() {
+                    self.shrink_after_deadline(
+                        rollup_id,
+                        rollup.l1_head.cursor(),
+                        parent_header.number() + 1,
+                        error.retryable_kind(),
+                    );
+                }
                 let retryable = error.retryable_kind().is_some();
                 if retryable {
                     event!(
@@ -3525,10 +3769,10 @@ where
 
         // ── Dispatch the rich L1 bundle and register the optimistic block. ──
         let sync_height = built.header.number();
-        // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
+        // keccak of the raw EIP-2718 envelope (excluding any blob sidecar) is the tx's hash —
         // recorded in the ledger so the finality audit can look up the
         // postBatch receipt.
-        let post_batch_hash = alloy_primitives::keccak256(&postbatch_raw);
+        let post_batch_hash = post_batch_tx_hash(&postbatch_raw)?;
         let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivors.len());
         bundle.push(postbatch_raw);
         // Only INBOUND survivors ride the L1 bundle (L1-signed, execute on L1).
@@ -3575,6 +3819,46 @@ where
         }))
     }
 
+    fn deadline_prefix(&self, rollup_id: u64, cursor: u64) -> Option<u64> {
+        let mut prefixes = self.inner.deadline_prefixes.lock().unwrap();
+        match prefixes.get(&rollup_id).copied() {
+            Some((at, span)) if at == cursor => Some(span),
+            _ => {
+                prefixes.remove(&rollup_id);
+                None
+            }
+        }
+    }
+
+    fn shrink_after_deadline(
+        &self,
+        rollup_id: u64,
+        cursor: u64,
+        terminal: u64,
+        failure: Option<eez_prover::RetryableProverError>,
+    ) {
+        if failure != Some(eez_prover::RetryableProverError::DeadlineExceeded) {
+            return;
+        }
+        let k = u64::from(self.inner.emission.timing.k());
+        let intervals = terminal.saturating_sub(cursor) / k;
+        if intervals > 1 {
+            let span = (intervals / 2) * k;
+            self.inner
+                .deadline_prefixes
+                .lock()
+                .unwrap()
+                .insert(rollup_id, (cursor, span));
+            event!(
+                Level::WARN,
+                rollup_id,
+                cursor,
+                span,
+                "blob deadline missed; retrying a smaller complete prefix next slot"
+            );
+        }
+    }
+
     /// Build an empty Sync block, sign a leading-immediate-only postBatch
     /// covering `posted+1..=sync_height`, dispatch it to the background
     /// observer, and return the block for immediate commit. The Sync block is
@@ -3614,6 +3898,64 @@ where
             }
         };
 
+        let cursor = rollup.l1_head.cursor();
+        let sync_height = parent_header.number() + 1;
+        let bundle_target = if let Some(config) = &ctx.blob_posting {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            match refresh_candidate_target(
+                &ctx.l1_provider,
+                config,
+                self.inner.emission.timing,
+                bundle_target,
+                u64::try_from(now_ms).unwrap_or(u64::MAX),
+            )
+            .await
+            {
+                Ok(target) => target,
+                Err(error) => {
+                    event!(
+                        Level::WARN,
+                        rollup_id,
+                        %error,
+                        "blob target unavailable; retaining the complete range",
+                    );
+                    return Ok(Some(SyncSlotBlock {
+                        payload: empty_built.payload,
+                        header: empty_built.header,
+                    }));
+                }
+            }
+        } else {
+            bundle_target
+        };
+        // Blob settlement signs for the pinned slot; elsewhere a past terminal carries no pin.
+        let historical_target = if ctx.blob_posting.is_some() {
+            bundle_target
+        } else {
+            BundleTarget::NextBlock
+        };
+        if ctx.blob_posting.is_some() && self.deadline_prefix(rollup_id, cursor).is_some() {
+            if let Err(error) = self
+                .emit_historical_chunk(
+                    ctx,
+                    rollup_id,
+                    rollup,
+                    cursor,
+                    sync_height,
+                    historical_target,
+                )
+                .await
+            {
+                event!(Level::WARN, rollup_id, %error, "deadline prefix emission failed");
+            }
+            return Ok(Some(SyncSlotBlock {
+                payload: empty_built.payload,
+                header: empty_built.header,
+            }));
+        }
         let minimal_postbatch_raw = match self
             .prepare_post_batch_raw(
                 ctx,
@@ -3632,20 +3974,11 @@ where
                 bundle_target,
             )
             .await
-            .and_then(|raw| {
-                raw.ok_or_else(|| {
-                    PreparePostBatchError::Build(format!(
-                        "range exceeds the {} postBatch gas budget; bounded chunks cover it",
-                        self.inner.emission.max_gas
-                    ))
-                })
-            }) {
-            Ok(raw) => raw,
-            Err(err) => {
+        {
+            Ok(Some(raw)) => raw,
+            Ok(None) => {
                 // The whole range will not fit; settle a bounded prefix of it so
                 // the range shrinks and the next slot's rich batch can fit.
-                let cursor = rollup.l1_head.cursor();
-                let sync_height = parent_header.number() + 1;
                 if let Err(chunk_err) = self
                     .emit_historical_chunk(
                         ctx,
@@ -3653,7 +3986,7 @@ where
                         rollup,
                         cursor,
                         sync_height,
-                        BundleTarget::NextBlock,
+                        historical_target,
                     )
                     .await
                 {
@@ -3665,6 +3998,20 @@ where
                         sync_height,
                         error = %chunk_err,
                         "neither the full range nor a bounded prefix could be emitted",
+                    );
+                }
+                return Ok(Some(SyncSlotBlock {
+                    payload: empty_built.payload,
+                    header: empty_built.header,
+                }));
+            }
+            Err(err) => {
+                if ctx.blob_posting.is_some() {
+                    self.shrink_after_deadline(
+                        rollup_id,
+                        cursor,
+                        sync_height,
+                        err.retryable_kind(),
                     );
                 }
                 event!(
@@ -3681,10 +4028,10 @@ where
             }
         };
         let sync_height = empty_built.header.number();
-        // keccak of the raw EIP-2718 envelope IS the typed tx's hash —
+        // keccak of the raw EIP-2718 envelope (excluding any blob sidecar) is the tx's hash —
         // recorded in the ledger so the finality audit can look up the
         // postBatch receipt.
-        let post_batch_hash = alloy_primitives::keccak256(&minimal_postbatch_raw);
+        let post_batch_hash = post_batch_tx_hash(&minimal_postbatch_raw)?;
         event!(
             name: "eez.composer.phase1.bundle.dispatched",
             Level::INFO,
@@ -3748,6 +4095,41 @@ where
         }
     }
 
+    /// Read one committed block for exact sizing; empty roots need no body.
+    fn chunk_span_block(
+        &self,
+        rollup: &RollupState<L2>,
+        number: u64,
+    ) -> Result<eez_payload_codec::SpanBlock, String> {
+        let provider = rollup.l2_provider.as_ref();
+        let header = provider
+            .sealed_header(number)
+            .map_err(|e| format!("sealed_header({number}): {e}"))?
+            .ok_or_else(|| format!("local L2 header at {number} missing"))?;
+        let transactions = if header.transactions_root()
+            == alloy_consensus::constants::EMPTY_ROOT_HASH
+        {
+            Vec::new()
+        } else {
+            let hash = header.hash();
+            let block = provider
+                .find_block_by_hash(hash, BlockSource::Any)
+                .map_err(|e| format!("l2_provider.find_block_by_hash({hash}, n={number}): {e}"))?
+                .ok_or_else(|| format!("local L2 block hash {hash} (n={number}) missing"))?;
+            block
+                .body()
+                .transactions()
+                .iter()
+                .map(Encodable2718::encoded_2718)
+                .collect()
+        };
+        Ok(eez_payload_codec::SpanBlock {
+            beneficiary: header.beneficiary().into(),
+            extra_data: header.extra_data().to_vec(),
+            transactions,
+        })
+    }
+
     /// A leading-immediate-only postBatch ending at a PAST on-grid empty block.
     /// `cursor` must be the emission decision's read, not a fresh one.
     async fn emit_historical_chunk(
@@ -3767,6 +4149,12 @@ where
             .timing
             .historical_chunk_boundary(cursor, sync_height, limits.max_blocks)
             .unwrap_or_else(|| sync_height.saturating_sub(k));
+        let snapped = if ctx.blob_posting.is_some() {
+            self.deadline_prefix(rollup_id, cursor)
+                .map_or(snapped, |span| snapped.min(cursor.saturating_add(span)))
+        } else {
+            snapped
+        };
         if snapped <= cursor {
             return Err(format!(
                 "no on-grid boundary above cursor {cursor} below sync height {sync_height}"
@@ -3774,10 +4162,29 @@ where
         }
         // Candidates highest-first; each is priced exactly by
         // `prepare_post_batch_raw`, which returns `Ok(None)` when the range does
-        // not fit the gas budget — then step back a whole K and re-prepare. The
-        // gate precedes witness assembly and proving, so a rejected candidate
-        // costs one block walk plus one encode.
-        let candidates = self.empty_chunk_boundaries(rollup, cursor, snapped)?;
+        // not fit the gas or blob budget — then step back a whole K and re-prepare.
+        // The gate precedes witness assembly and proving. For blobs, first size
+        // prefixes in one forward scan to skip candidates above the blob limit.
+        let candidates = if let Some(config) = &ctx.blob_posting {
+            let BundleTarget::Exact { timestamp, .. } = historical_target else {
+                return Err("candidate V1 needs an exact L1 target".into());
+            };
+            let limit = eez_blob::blob_limit_at(&config.chain_spec, timestamp)
+                .ok_or("no blob fork is active at the candidate-V1 target")?;
+            let budget = eez_payload_codec::logical_blob_capacity(limit.max_blobs);
+            let blocks = (cursor + 1..=snapped).map(|number| self.chunk_span_block(rollup, number));
+            match scan_fitting_boundary(cursor, snapped, k, budget, blocks)? {
+                Some(boundary) => self.empty_chunk_boundaries(rollup, cursor, boundary)?,
+                None => {
+                    return Err(format!(
+                        "every empty on-grid boundary in ({cursor}, {snapped}] exceeds the blob budget \
+                         (0 candidates priced); retrying next slot"
+                    ));
+                }
+            }
+        } else {
+            self.empty_chunk_boundaries(rollup, cursor, snapped)?
+        };
         let provider = rollup.l2_provider.as_ref();
         let mut over_budget = 0usize;
         for boundary in candidates {
@@ -3808,13 +4215,23 @@ where
                     historical_target,
                 )
                 .await
-                .map_err(|error| error.to_string())?
+                .map_err(|error| {
+                    if ctx.blob_posting.is_some() {
+                        self.shrink_after_deadline(
+                            rollup_id,
+                            cursor,
+                            boundary,
+                            error.retryable_kind(),
+                        );
+                    }
+                    error.to_string()
+                })?
             else {
                 over_budget += 1;
                 continue;
             };
 
-            let post_batch_hash = alloy_primitives::keccak256(&raw);
+            let post_batch_hash = post_batch_tx_hash(&raw)?;
             event!(
                 name: "eez.composer.emission.historical_chunk",
                 Level::INFO,
@@ -3833,8 +4250,9 @@ where
             rollup
                 .optimistic
                 .begin(boundary, post_batch_hash, boundary_parent, Vec::new());
-            // A past terminal cannot carry a timestamp pin, but the bundle can
+            // A past calldata terminal cannot carry a timestamp pin, but the bundle can
             // still target the exact L1 slot that triggered this composition.
+            // Blob posts retain the exact L1 target used to prepare their proof.
             self.spawn_bundle_observer(
                 ctx,
                 rollup_id,
@@ -3848,7 +4266,7 @@ where
             return Ok(());
         }
         Err(format!(
-            "every empty on-grid boundary in ({cursor}, {snapped}] exceeds the {} gas budget \
+            "every empty on-grid boundary in ({cursor}, {snapped}] exceeds postBatch capacity (gas ceiling {}) \
              ({over_budget} candidates priced); retrying next slot",
             self.inner.emission.max_gas,
         ))
@@ -3981,6 +4399,18 @@ where
         use alloy_sol_types::SolCall;
         use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
 
+        let preparation_started = std::time::Instant::now();
+        let deadline = ctx
+            .blob_posting
+            .as_ref()
+            .map(|config| {
+                BlobPipelineDeadline::new(
+                    self.inner.emission.timing,
+                    bundle_target,
+                    config.post_proof_reserve,
+                )
+            })
+            .transpose()?;
         let sync_block_hash = terminal_header.hash();
 
         // Merge inbound compositions' L1 source batches, or start empty so an
@@ -4336,9 +4766,52 @@ where
             )
             .into());
         }
-        let payload = eez_payload_codec::encode_container(rollup_id, &blocks, &actions)
-            .map_err(|e| format!("eez_payload_codec::encode_container: {e}"))?;
-        batch.callData = alloy_primitives::Bytes::from(payload);
+        // Blob settlement carries the stream in blobs sized for the target's fork.
+        let physical_blobs = if let Some(config) = &ctx.blob_posting {
+            let BundleTarget::Exact { timestamp, .. } = bundle_target else {
+                return Err("candidate V1 needs an exact L1 target".into());
+            };
+            let limit = eez_blob::blob_limit_at(&config.chain_spec, timestamp)
+                .ok_or("no blob fork is active at the candidate-V1 target")?;
+            let blobs = eez_payload_codec::encode_blob_container(rollup_id, &blocks, &actions)
+                .map_err(|e| format!("eez_payload_codec::encode_blob_container: {e}"))?;
+            let maximum = limit.max_blobs;
+            if blobs.len() > maximum {
+                // Without history, only the terminal's user transactions and actions remain.
+                let terminal_bytes = eez_payload_codec::encode_container(
+                    rollup_id,
+                    &blocks[blocks.len() - 1..],
+                    &actions,
+                )
+                .map_err(|error| format!("encode cross-chain blob payload: {error}"))?
+                .len()
+                    + 1; // CloseBlobStream
+                let required = terminal_bytes.div_ceil(eez_payload_codec::logical_blob_capacity(1));
+                if required > maximum {
+                    return Err(PreparePostBatchError::CompositionBlobLimit { required, maximum });
+                }
+                event!(
+                    name: "eez.composer.emission.candidate_over_blob_limit",
+                    Level::DEBUG,
+                    rollup_id,
+                    from,
+                    to = sync_block_number,
+                    blobs = blobs.len(),
+                    maximum,
+                    "candidate range needs more blobs than one settlement tx carries",
+                );
+                return Ok(None);
+            }
+            batch.callData = Bytes::new();
+            batch.blockNumber = u64::MAX;
+            batch.blobIndices = (0..blobs.len()).map(U256::from).collect();
+            Some((config, blobs, limit.sidecar_encoding))
+        } else {
+            let payload = eez_payload_codec::encode_container(rollup_id, &blocks, &actions)
+                .map_err(|e| format!("eez_payload_codec::encode_container: {e}"))?;
+            batch.callData = alloy_primitives::Bytes::from(payload);
+            None
+        };
 
         // Priced on the encoded candidate before witnesses and proving; `Ok(None)`
         // is over-budget, not an error, and the caller chooses what to do.
@@ -4372,6 +4845,7 @@ where
         // Prove the assembled window (proofs[] empty — not part of the
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
         // `blocks`. Settlement path, off block production.
+        let witness_started = std::time::Instant::now();
         let block_witnesses = match self.inner.witness_source.as_ref() {
             // Remote-prover mode. Intermediate blocks `[from..sync)` are committed
             // (served by the witness store); a freshly-built endpoint isn't, so
@@ -4429,6 +4903,26 @@ where
             // Tests may use a lightweight prover without a witness source.
             None => Vec::new(),
         };
+        let witness_ms = witness_started.elapsed().as_millis();
+        let blob_preparation_started = std::time::Instant::now();
+        let (blob, carrier) = if let Some((config, blobs, encoding)) = physical_blobs {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs());
+            let (blob, carrier) = prepare_candidate_v1(
+                &ctx.l1_provider,
+                config,
+                bundle_target,
+                blobs,
+                encoding,
+                now,
+            )
+            .await?;
+            (Some(blob), Some(carrier))
+        } else {
+            (None, None)
+        };
+        let blob_preparation_ms = blob_preparation_started.elapsed().as_millis();
         let proving_ctx = ProvingContext {
             rollup_id,
             from_block: from,
@@ -4440,13 +4934,25 @@ where
             }),
             batch: batch.clone(),
             blocks: block_witnesses,
-            l1_block_hash: None, // timeless batch (blockNumber 0)
+            l1_block_hash: None, // timeless calldata; blobs bind posting_context
+            blob,
         };
+        let preparation_ms = preparation_started.elapsed().as_millis();
+        if let (Some(deadline), Some(config)) = (deadline, &ctx.blob_posting) {
+            event!(name: "eez.composer.blob.proof_window", Level::INFO,
+                event_name = "eez.composer.blob.proof_window", rollup_id,
+                from, to = sync_block_number, preparation_ms, witness_ms, blob_preparation_ms,
+                remaining_ms = deadline.remaining().as_millis(),
+                post_proof_reserve_ms = config.post_proof_reserve.as_millis(),
+                "blob preparation complete; proving within the remaining target window");
+        }
+        let proof_started = std::time::Instant::now();
         let proof = match prove_with_retry(
             self.inner.prover.as_ref(),
             proving_ctx,
             self.inner.emission.timing,
             bundle_target,
+            deadline,
         )
         .await
         {
@@ -4471,6 +4977,7 @@ where
                 return Err(PreparePostBatchError::Actionable(failure));
             }
         };
+        let proof_ms = proof_started.elapsed().as_millis();
         batch.proofs = vec![proof];
 
         let calldata = postAndVerifyBatchCall {
@@ -4503,17 +5010,49 @@ where
             .and_then(|s| s.parse::<Address>().ok())
             .ok_or("EEZ_REGISTRY_ADDRESS missing or not a valid address")?;
 
-        Ok(sign_post_batch_tx(
+        // The wrapper keeps EEZ's selector, so the same calldata is posted to it.
+        let to = ctx
+            .blob_posting
+            .as_ref()
+            .map_or(eez_address, |config| config.deployment.settlement_wrapper);
+        let signing_started = std::time::Instant::now();
+        let signing = sign_post_batch_tx(
             &ctx.l1_poster_signer,
             &ctx.l1_provider,
-            eez_address,
+            to,
             calldata,
             ctx.l1_chain_id,
             ctx.l1_post_batch_priority_fee,
             self.inner.emission.max_gas,
-        )
-        .await
-        .map(Some)?)
+            carrier,
+        );
+        let raw = if let Some(deadline) = deadline {
+            tokio::time::timeout(deadline.remaining(), signing)
+                .await
+                .map_err(|_| {
+                    PreparePostBatchError::Prover(ProverError::Retryable {
+                        kind: eez_prover::RetryableProverError::DeadlineExceeded,
+                        message: "blob settlement window exhausted while signing".into(),
+                    })
+                })??
+        } else {
+            signing.await?
+        };
+        if deadline.is_some_and(|deadline| deadline.remaining().is_zero()) {
+            return Err(PreparePostBatchError::Prover(ProverError::Retryable {
+                kind: eez_prover::RetryableProverError::DeadlineExceeded,
+                message: "blob settlement window exhausted before submission".into(),
+            }));
+        }
+        if let Some(deadline) = deadline {
+            event!(name: "eez.composer.blob.ready_to_submit", Level::INFO,
+                event_name = "eez.composer.blob.ready_to_submit", rollup_id,
+                from, to = sync_block_number, preparation_ms, proof_ms,
+                signing_ms = signing_started.elapsed().as_millis(),
+                remaining_ms = deadline.remaining().as_millis(),
+                "blob transaction signed within the target window");
+        }
+        Ok(Some(raw))
     }
 }
 
@@ -4659,7 +5198,7 @@ async fn observe_bundle_outcome(
     }
 }
 
-/// Sign an EIP-1559 L1 transaction used for `postAndVerifyBatch` submission.
+/// Sign an EIP-1559 or blob L1 transaction for `postAndVerifyBatch` submission.
 ///
 /// Sets `max_priority_fee_per_gas` from the caller (so we can order
 /// the postBatch ahead of the held user_tx) and `max_fee_per_gas` to
@@ -4672,11 +5211,12 @@ async fn observe_bundle_outcome(
 async fn sign_post_batch_tx(
     signer: &alloy_signer_local::PrivateKeySigner,
     provider: &alloy_provider::RootProvider,
-    eez_address: Address,
+    to: Address,
     calldata: Vec<u8>,
     chain_id: u64,
     priority_fee: u128,
     max_gas: u64,
+    blob: Option<BlobCarrier>,
 ) -> Result<Bytes, String> {
     use alloy_consensus::TxEip1559;
     use alloy_eips::BlockNumberOrTag;
@@ -4718,7 +5258,14 @@ async fn sign_post_batch_tx(
 
     // Diagnostic only — from the outside a drained poster looks exactly like a
     // dead relay. Don't abort; the tx still lands if the base fee settles.
-    let required = U256::from(gas_limit).saturating_mul(U256::from(max_fee_per_gas));
+    let blob_reserve = blob.as_ref().map_or(U256::ZERO, |blob| {
+        let blob_gas =
+            blob.sidecar.versioned_hashes().len() as u64 * alloy_eips::eip4844::DATA_GAS_PER_BLOB;
+        U256::from(blob_gas).saturating_mul(U256::from(blob.max_fee_per_blob_gas))
+    });
+    let required = U256::from(gas_limit)
+        .saturating_mul(U256::from(max_fee_per_gas))
+        .saturating_add(blob_reserve);
     if let Ok(balance) = provider.get_balance(from).await
         && balance < required
     {
@@ -4734,13 +5281,27 @@ async fn sign_post_batch_tx(
         );
     }
 
+    if let Some(blob) = blob {
+        let params = eez_blob::BlobTransactionParams {
+            chain_id,
+            nonce,
+            gas_limit,
+            max_fee_per_gas,
+            max_priority_fee_per_gas: priority_fee,
+            max_fee_per_blob_gas: blob.max_fee_per_blob_gas,
+            to,
+            input: calldata.into(),
+        };
+        return eez_blob::sign_blob_transaction(params, blob.sidecar, signer)
+            .map_err(|e| format!("sign candidate-V1 postBatch: {e}"));
+    }
     let mut tx = TxEip1559 {
         chain_id,
         nonce,
         gas_limit,
         max_fee_per_gas,
         max_priority_fee_per_gas: priority_fee,
-        to: TxKind::Call(eez_address),
+        to: TxKind::Call(to),
         value: U256::ZERO,
         access_list: alloy_eips::eip2930::AccessList::default(),
         input: calldata.into(),
@@ -4752,6 +5313,47 @@ async fn sign_post_batch_tx(
     let mut buf = Vec::with_capacity(512);
     signed.encode_2718(&mut buf);
     Ok(Bytes::from(buf))
+}
+
+/// Select the largest empty on-grid prefix within the exact blob budget.
+fn scan_fitting_boundary(
+    cursor: u64,
+    snapped: u64,
+    k: u64,
+    budget: usize,
+    blocks: impl IntoIterator<Item = Result<eez_payload_codec::SpanBlock, String>>,
+) -> Result<Option<u64>, String> {
+    if k == 0 {
+        return Err("K is zero".to_string());
+    }
+    let mut best = None;
+    let mut sizer = eez_payload_codec::AnchorOnlyBlobSizer::default();
+    for (offset, block) in blocks.into_iter().enumerate() {
+        let block = block?;
+        let number = cursor
+            .checked_add(1)
+            .and_then(|start| start.checked_add(offset as u64))
+            .ok_or("chunk block number overflow")?;
+        if number > snapped {
+            break;
+        }
+        let bytes = sizer.push(&block).map_err(|error| error.to_string())?;
+        if bytes > budget {
+            return Ok(best);
+        }
+        if (snapped - number).is_multiple_of(k) && block.transactions.is_empty() {
+            best = Some(number);
+        }
+        if number == snapped {
+            if best.is_none() {
+                return Err(format!(
+                    "no empty on-grid boundary in ({cursor}, {snapped}]; retrying next slot"
+                ));
+            }
+            return Ok(best);
+        }
+    }
+    Err(format!("block scan did not reach boundary {snapped}"))
 }
 
 #[cfg(test)]
@@ -4944,6 +5546,35 @@ mod tests {
             nonce,
             direction,
         }
+    }
+
+    #[test]
+    fn oversized_blob_transaction_eviction_preserves_unrelated_traffic() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(0xa);
+        let oversized = held(sender, Direction::Outbound, 0, 1);
+        let dependent = held(sender, Direction::Outbound, 1, 2);
+        let inbound = held(sender, Direction::Inbound, 0, 3);
+        let outbound = held(Address::repeat_byte(0xb), Direction::Outbound, 0, 4);
+        for tx in [&oversized, &dependent, &inbound, &outbound] {
+            pool.push_contiguous(tx.clone(), 0).unwrap();
+        }
+
+        // Model recomposition with only the oversized tx in flight and its
+        // dependent nonce queued.
+        let selected = pool.pop_n(1);
+        assert_eq!(selected[0].hash, oversized.hash);
+        evict_blob_limit_violation(&pool, 1, &selected[0], 3, 2);
+
+        let remaining = pool.pop_all();
+        assert_eq!(
+            remaining.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![inbound.hash, outbound.hash],
+        );
+        pool.release_in_flight_batch(&remaining);
+        // Both reservations must be released to allow resubmission from nonce 0.
+        pool.push_contiguous(oversized, 0).unwrap();
+        pool.push_contiguous(dependent, 0).unwrap();
     }
 
     fn signed_user_tx(gas_limit: u64) -> Bytes {
@@ -5641,5 +6272,117 @@ mod tests {
         let (fresh, stale) = partition_stale(Vec::new(), &HashMap::new());
         assert!(fresh.is_empty());
         assert!(stale.is_empty());
+    }
+
+    fn chunk(empty: bool, tx_bytes: usize) -> eez_payload_codec::SpanBlock {
+        eez_payload_codec::SpanBlock {
+            transactions: if empty {
+                Vec::new()
+            } else {
+                vec![vec![0; tx_bytes]]
+            },
+            ..Default::default()
+        }
+    }
+
+    fn empty_chunk_bytes(count: usize) -> usize {
+        let mut sizer = eez_payload_codec::AnchorOnlyBlobSizer::default();
+        (0..count)
+            .map(|_| sizer.push(&chunk(true, 0)).unwrap())
+            .last()
+            .unwrap()
+    }
+
+    #[test]
+    fn blob_scan_picks_the_highest_boundary_that_fits() {
+        let cursor = 100;
+        let snapped = 112;
+        let k = 6;
+        let blocks: Vec<eez_payload_codec::SpanBlock> = (0..12).map(|_| chunk(true, 0)).collect();
+        let budget = empty_chunk_bytes(12);
+        assert_eq!(
+            scan_fitting_boundary(cursor, snapped, k, budget, blocks.iter().cloned().map(Ok))
+                .unwrap(),
+            Some(112)
+        );
+    }
+
+    #[test]
+    fn blob_scan_stops_when_no_prefix_can_fit() {
+        let cursor = 100;
+        let snapped = 112;
+        let k = 6;
+        // Blocks 101..=105, then empty 106. The bytes before 106 are the span.
+        let mut prefix: Vec<eez_payload_codec::SpanBlock> =
+            (0..5).map(|_| chunk(false, 90_000)).collect();
+        prefix.push(chunk(true, 0));
+        let budget = empty_chunk_bytes(6);
+        assert_eq!(
+            scan_fitting_boundary(
+                cursor,
+                snapped,
+                k,
+                budget,
+                prefix.iter().cloned().map(Ok).chain(std::iter::once(Err(
+                    "must not read past the selected prefix".into(),
+                ))),
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn blob_scan_keeps_the_lower_boundary_when_the_higher_one_does_not_fit() {
+        let cursor = 100;
+        let snapped = 112;
+        let k = 6;
+        let mut blocks: Vec<eez_payload_codec::SpanBlock> =
+            (0..5).map(|_| chunk(true, 0)).collect();
+        blocks.push(chunk(true, 0)); // 106
+        blocks.extend((0..5).map(|_| chunk(false, 90_000)));
+        blocks.push(chunk(true, 0)); // 112
+        let budget = empty_chunk_bytes(6);
+        assert!(
+            scan_fitting_boundary(
+                cursor,
+                snapped,
+                k,
+                budget,
+                blocks[..6].iter().cloned().map(Ok)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            scan_fitting_boundary(cursor, snapped, k, budget, blocks.iter().cloned().map(Ok))
+                .unwrap(),
+            Some(106)
+        );
+    }
+
+    #[test]
+    fn blob_scan_skips_a_tx_bearing_grid_block() {
+        let cursor = 100;
+        let snapped = 112;
+        let k = 6;
+        let mut blocks: Vec<eez_payload_codec::SpanBlock> =
+            (0..5).map(|_| chunk(true, 0)).collect();
+        blocks.push(chunk(false, 32)); // 106 cannot terminate
+        blocks.extend((0..5).map(|_| chunk(true, 0)));
+        blocks.push(chunk(true, 0)); // 112
+        let budget = eez_payload_codec::logical_blob_capacity(1);
+        assert_eq!(
+            scan_fitting_boundary(cursor, snapped, k, budget, blocks.iter().cloned().map(Ok))
+                .unwrap(),
+            Some(112)
+        );
+    }
+
+    #[test]
+    fn blob_scan_errors_when_no_grid_block_is_empty() {
+        let blocks: Vec<eez_payload_codec::SpanBlock> = (0..12).map(|_| chunk(false, 1)).collect();
+        let err = scan_fitting_boundary(100, 112, 6, usize::MAX, blocks.iter().cloned().map(Ok))
+            .unwrap_err();
+        assert!(err.contains("no empty on-grid boundary"), "{err}");
     }
 }

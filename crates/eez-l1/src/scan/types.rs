@@ -32,7 +32,12 @@ pub struct Post {
     pub tx_hash: B256,
     /// EEZ's `msg.sender` for this call.
     pub sender: Address,
+    /// Signer of the outer L1 transaction, including wrapper-mediated posts.
+    pub tx_sender: Address,
     pub batch: EvmBatch,
+    /// Candidate-V1 carrier: the versioned hashes `blobIndices` selected, in
+    /// order. Empty for the calldata profile, whose stream is `batch.callData`.
+    pub blob_hashes: Vec<B256>,
     /// What L1 applied of it for our rollup.
     pub settlement: Settlement,
 }

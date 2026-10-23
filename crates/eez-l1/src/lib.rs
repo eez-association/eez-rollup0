@@ -15,6 +15,7 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+mod blob_source;
 pub mod config;
 pub mod error;
 mod fetch;

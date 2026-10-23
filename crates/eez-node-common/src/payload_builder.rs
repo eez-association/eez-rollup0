@@ -43,12 +43,13 @@ use reth_ethereum_payload_builder::EthereumBuilderConfig;
 type BestTransactionsIter<Tx> = Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<Tx>>>>;
 
 /// Live L2 payload builder.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct NativePayloadBuilder<Pool, Client, EvmConfig = EezEvmConfig> {
     client: Client,
     pool: Pool,
     evm_config: EvmConfig,
     builder_config: EthereumBuilderConfig,
+    data_guard: Option<Arc<crate::SequencingDataGuard>>,
 }
 
 impl<Pool, Client, EvmConfig> NativePayloadBuilder<Pool, Client, EvmConfig> {
@@ -63,7 +64,14 @@ impl<Pool, Client, EvmConfig> NativePayloadBuilder<Pool, Client, EvmConfig> {
             pool,
             evm_config,
             builder_config,
+            data_guard: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_data_guard(mut self, guard: Option<Arc<crate::SequencingDataGuard>>) -> Self {
+        self.data_guard = guard;
+        self
     }
 }
 
@@ -86,6 +94,7 @@ where
             self.builder_config.clone(),
             args,
             |attributes| self.pool.best_transactions_with_attributes(attributes),
+            self.data_guard.as_deref(),
         )
     }
 
@@ -119,6 +128,7 @@ where
             self.builder_config.clone(),
             args,
             |_| -> BestTransactionsIter<Pool::Transaction> { Box::new(std::iter::empty()) },
+            self.data_guard.as_deref(),
         )?
         .into_payload()
         .ok_or_else(|| PayloadBuilderError::MissingPayload)
@@ -136,6 +146,7 @@ pub fn build_payload<EvmConfig, Client, Tx, F>(
     builder_config: EthereumBuilderConfig,
     args: BuildArguments<EthPayloadAttributes, EezBuiltPayload>,
     best_txs: F,
+    data_guard: Option<&crate::SequencingDataGuard>,
 ) -> Result<BuildOutcome<EezBuiltPayload>, PayloadBuilderError>
 where
     EvmConfig: ConfigureEvm<Primitives = EezPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
@@ -149,7 +160,7 @@ where
         mut state_root_handle,
         config,
         cancel,
-        best_payload,
+        mut best_payload,
     } = args;
     let PayloadConfig {
         parent_header,
@@ -157,6 +168,25 @@ where
         payload_id,
         ..
     } = config;
+
+    let da_budget = data_guard
+        .map(|guard| guard.budget(&parent_header, attributes.timestamp()))
+        .transpose()
+        .map_err(|error| PayloadBuilderError::other(std::io::Error::other(error)))?;
+    let mut da_bytes = 0usize;
+    if let (Some(limit), Some(payload)) = (da_budget, best_payload.as_ref()) {
+        let bytes = payload
+            .block()
+            .body()
+            .transactions
+            .iter()
+            .try_fold(0usize, |sum, tx| {
+                sum.checked_add(alloy_eips::Encodable2718::encode_2718_len(tx).saturating_add(5))
+            });
+        if bytes.is_none_or(|bytes| bytes > limit) {
+            best_payload = None;
+        }
+    }
 
     let state_provider = client.state_by_block_hash(parent_header.hash())?;
     let evm_state_provider = (&state_provider).into_evm_state_provider();
@@ -274,6 +304,18 @@ where
         let tx = pool_tx.to_consensus();
 
         let tx_rlp_len = tx.inner().length();
+        let tx_da_bytes = alloy_eips::Encodable2718::encode_2718_len(tx.inner()) + 5;
+        if let Some(limit) = da_budget.filter(|limit| da_bytes.saturating_add(tx_da_bytes) > *limit)
+        {
+            best_txs.mark_invalid(
+                &pool_tx,
+                InvalidPoolTransactionError::OversizedData {
+                    size: da_bytes.saturating_add(tx_da_bytes),
+                    limit,
+                },
+            );
+            continue;
+        }
 
         let estimated_block_size_with_tx =
             block_transactions_rlp_length + tx_rlp_len + withdrawals_rlp_length + 1024; // 1Kb of overhead for the block header
@@ -335,6 +377,7 @@ where
         };
 
         block_transactions_rlp_length += tx_rlp_len;
+        da_bytes += tx_da_bytes;
 
         let gas_used = gas_output.tx_gas_used();
         let miner_fee = miner_fee.expect("fee is always valid; execution succeeded");

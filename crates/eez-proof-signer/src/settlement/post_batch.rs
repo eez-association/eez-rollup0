@@ -2,15 +2,17 @@
 
 use std::num::NonZeroU64;
 
-use alloy_primitives::{Address, B256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, keccak256};
 use alloy_sol_types::SolValue as _;
 use eez_protocol::EvmBatch;
 use eez_protocol::abi::ProofSystemBatchPerVerificationEntriesSol;
 use eez_protocol::entries::decode_postbatch;
-use eez_protocol::public_inputs::public_inputs_hashes;
+use eez_protocol::public_inputs::{public_inputs_hashes, public_inputs_hashes_with_context};
 use thiserror::Error;
 
 use crate::attest::NonZeroProofSystemVkey;
+
+use super::da::VerifiedBlobDa;
 
 #[derive(Debug, Error)]
 pub(crate) enum PostBatchDecodeError {
@@ -29,7 +31,7 @@ pub(crate) enum PostBatchDecodeError {
 pub(crate) struct CanonicalPostBatch(EvmBatch);
 
 impl CanonicalPostBatch {
-    pub(super) const fn as_batch(&self) -> &EvmBatch {
+    pub(crate) const fn as_batch(&self) -> &EvmBatch {
         &self.0
     }
 
@@ -89,6 +91,8 @@ pub(crate) fn decode_canonical_post_batch(
 pub(crate) enum PublicInputError {
     #[error("invalid public-input structure: {0}")]
     InvalidStructure(String),
+    #[error("invalid blob settlement input: {0}")]
+    InvalidBlobInput(String),
     #[error("public-input hash computation failed: {0}")]
     Computation(String),
     #[error("expected one public-input hash, got {actual}")]
@@ -115,20 +119,55 @@ impl<'a> CheckedPublicInputProfile<'a> {
             canonical_batch.as_batch(),
             expected_rollup_id,
             expected_proof_system,
+            None,
+        )?;
+        Ok(Self { canonical_batch })
+    }
+
+    /// Check blob carrier fields against the trusted fork limit before DA or KZG work.
+    pub(crate) fn new_blob(
+        canonical_batch: &'a CanonicalPostBatch,
+        expected_rollup_id: NonZeroU64,
+        expected_proof_system: Address,
+        submitted_blob_count: usize,
+        max_blobs_per_transaction: usize,
+    ) -> Result<Self, PublicInputError> {
+        validate_public_input_structure(
+            canonical_batch.as_batch(),
+            expected_rollup_id,
+            expected_proof_system,
+            Some((submitted_blob_count, max_blobs_per_transaction)),
         )?;
         Ok(Self { canonical_batch })
     }
 
     /// Compute the sole canonical hash from this profile-checked batch.
+    /// Blob batches require verified DA and authenticated manager data.
     ///
     /// This type does not prove that state, effects, or DA passed their gates;
     /// the complete settlement job grants that stronger attestation boundary.
     pub(crate) fn recompute_public_inputs_hash(
         &self,
         proof_system_vkey: NonZeroProofSystemVkey,
+        blob_context: Option<(&VerifiedBlobDa, Bytes)>,
     ) -> Result<RecomputedPublicInputsHash, PublicInputError> {
-        let hashes = public_inputs_hashes(self.canonical_batch.as_batch(), proof_system_vkey.get())
-            .map_err(|error| PublicInputError::Computation(error.to_string()))?;
+        let hashes = match (self.canonical_batch.as_batch().blockNumber, blob_context) {
+            (0, None) => {
+                public_inputs_hashes(self.canonical_batch.as_batch(), proof_system_vkey.get())
+            }
+            (u64::MAX, Some((verified_da, custom_data))) => public_inputs_hashes_with_context(
+                self.canonical_batch.as_batch(),
+                proof_system_vkey.get(),
+                verified_da.versioned_hashes(),
+                custom_data,
+            ),
+            _ => {
+                return Err(invalid_structure(
+                    "public-input context does not match the checked profile",
+                ));
+            }
+        }
+        .map_err(|error| PublicInputError::Computation(error.to_string()))?;
         let [hash] = hashes.as_slice() else {
             return Err(PublicInputError::HashCount {
                 actual: hashes.len(),
@@ -159,7 +198,7 @@ pub(crate) fn recompute_public_input_hash(
 ) -> Result<B256, PublicInputError> {
     let canonical = CanonicalPostBatch(batch.clone());
     CheckedPublicInputProfile::new(&canonical, expected_rollup_id, expected_proof_system)?
-        .recompute_public_inputs_hash(proof_system_vkey)
+        .recompute_public_inputs_hash(proof_system_vkey, None)
         .map(RecomputedPublicInputsHash::into_inner)
 }
 
@@ -170,6 +209,7 @@ fn validate_public_input_structure(
     batch: &EvmBatch,
     expected_rollup_id: NonZeroU64,
     expected_proof_system: Address,
+    blob_counts: Option<(usize, usize)>,
 ) -> Result<(), PublicInputError> {
     let [proof_system] = batch.proofSystems.as_slice() else {
         return Err(invalid_structure(format!(
@@ -247,17 +287,21 @@ fn validate_public_input_structure(
         )));
     }
 
-    if batch.blockNumber != 0 {
-        return Err(invalid_structure(format!(
-            "blockNumber must be zero, got {}",
-            batch.blockNumber
-        )));
-    }
-    if !batch.blobIndices.is_empty() {
-        return Err(invalid_structure(format!(
-            "blobIndices must be empty, got {}",
-            batch.blobIndices.len()
-        )));
+    if let Some((submitted, limit)) = blob_counts {
+        validate_blob_public_input_structure(batch, submitted, limit)?;
+    } else {
+        if batch.blockNumber != 0 {
+            return Err(invalid_structure(format!(
+                "blockNumber must be zero, got {}",
+                batch.blockNumber
+            )));
+        }
+        if !batch.blobIndices.is_empty() {
+            return Err(invalid_structure(format!(
+                "blobIndices must be empty, got {}",
+                batch.blobIndices.len()
+            )));
+        }
     }
     if batch.bindMsgSenderInPublicInput {
         return Err(invalid_structure(
@@ -265,10 +309,50 @@ fn validate_public_input_structure(
         ));
     }
     // `proofs` are verified on-chain but remain outside the signed preimage;
-    // `callData` is bound by both the DA gate and the recomputed hash.
+    // `callData` or blobs are bound by both the DA gate and the recomputed hash.
+    Ok(())
+}
+
+fn validate_blob_public_input_structure(
+    batch: &EvmBatch,
+    submitted_blob_count: usize,
+    max_blobs_per_transaction: usize,
+) -> Result<(), PublicInputError> {
+    if batch.blockNumber != u64::MAX {
+        return Err(invalid_blob_input(format!(
+            "blob profile blockNumber must be uint64 max, got {}",
+            batch.blockNumber
+        )));
+    }
+    if !batch.callData.is_empty() {
+        return Err(invalid_blob_input(format!(
+            "blob profile callData must be empty, got {} bytes",
+            batch.callData.len()
+        )));
+    }
+    if submitted_blob_count == 0 {
+        return Err(invalid_blob_input(
+            "blob profile requires at least one blob",
+        ));
+    }
+    if submitted_blob_count > max_blobs_per_transaction {
+        return Err(invalid_blob_input(format!(
+            "submitted blob count {submitted_blob_count} exceeds configured fork limit {max_blobs_per_transaction}"
+        )));
+    }
+    let expected = (0..submitted_blob_count).map(alloy_primitives::U256::from);
+    if !batch.blobIndices.iter().copied().eq(expected) {
+        return Err(invalid_blob_input(format!(
+            "blobIndices must select all {submitted_blob_count} submitted blobs in order"
+        )));
+    }
     Ok(())
 }
 
 fn invalid_structure(reason: impl Into<String>) -> PublicInputError {
     PublicInputError::InvalidStructure(reason.into())
+}
+
+fn invalid_blob_input(reason: impl Into<String>) -> PublicInputError {
+    PublicInputError::InvalidBlobInput(reason.into())
 }

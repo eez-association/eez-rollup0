@@ -11,6 +11,7 @@ eez-primitives.workspace = true
 eez-evm.workspace = true
 # Internal — protocol, EVM port, and the existing umbrella siblings
 eez-driver = { workspace = true, features = ["witness"] }
+eez-blob.workspace           = true
 eez-l1.workspace             = true
 eez-payload-codec.workspace  = true
 eez-protocol.workspace       = true
@@ -51,6 +52,8 @@ tokio.workspace       = true
 tracing.workspace     = true
 
 [dev-dependencies]
+alloy-rpc-types-eth.workspace = true
+alloy-transport = { version = "2", default-features = false }
 # MockEthProvider: an in-memory StateProviderFactory for the prefix-state
 # equivalence test (no datadir, no engine API).
 reth-provider = { workspace = true, features = ["test-utils"] }

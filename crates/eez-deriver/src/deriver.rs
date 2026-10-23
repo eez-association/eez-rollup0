@@ -33,6 +33,19 @@ use tracing::{Level, event};
 
 use crate::error::{DeriverError, DeriverResult};
 
+async fn receive_l1_event(
+    rx: &mut broadcast::Receiver<L1Event>,
+    recovery_pending: bool,
+) -> Option<Result<L1Event, broadcast::error::RecvError>> {
+    if recovery_pending {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .ok()
+    } else {
+        Some(rx.recv().await)
+    }
+}
+
 /// Per-block header inputs the composer chose, carried in the DA span. Read
 /// from the payload, not assumed — a constant diverges the moment the composer
 /// picks something else.
@@ -571,9 +584,7 @@ where
                 );
                 continue;
             }
-            let Some(container) =
-                self.decode_our_payload(batch.batch.callData.as_ref(), batch.id.l1_block)?
-            else {
+            let Some(container) = self.decode_our_payload(batch).await? else {
                 continue;
             };
             let decoded = &container.span;
@@ -855,16 +866,29 @@ where
     }
 
     /// Decode a posted DA payload, or `None` when it is not ours.
+    /// Blob posts fetch their committed blobs; calldata posts decode `callData`.
     ///
     /// Skipped rather than fatal: we read one `ChainOperation`, so a legitimate
     /// multi-rollup batch reads as foreign, and halting would hand a peer a
     /// stop. Unchecked outside cross-chain mode, which configures no rollup id.
-    fn decode_our_payload(
+    async fn decode_our_payload(
         &self,
-        call_data: &[u8],
-        l1_block_number: u64,
+        post: &Post,
     ) -> DeriverResult<Option<eez_payload_codec::DecodedContainer>> {
-        let container = eez_payload_codec::decode_container(call_data)?;
+        let l1_block_number = post.id.l1_block;
+        let container = if post.blob_hashes.is_empty() {
+            eez_payload_codec::decode_container(&post.batch.callData)?
+        } else {
+            // Fetched only past the processed/settled gates: pruned blobs of an
+            // indexed post never block a rescan.
+            let blobs = self
+                .inner
+                .l1_reader
+                .post_blobs(post)
+                .await
+                .map_err(DeriverError::L1Scan)?;
+            eez_payload_codec::decode_blob_container(&blobs)?
+        };
         let ours = self.inner.system_tx_cfg.as_ref().map(|c| c.this_rollup_id);
         if ours.is_some_and(|ours| container.rollup_id != ours) {
             event!(
@@ -886,7 +910,9 @@ where
     pub async fn run(self, mut rx: broadcast::Receiver<L1Event>) {
         // Defensive re-anchor: a cheap no-op in the normal boot order;
         // load-bearing for any caller that subscribed rx late.
+        let mut recovery_pending = false;
         if let Err(err) = self.catch_up().await {
+            recovery_pending = true;
             event!(
                 name: "eez.deriver.resync.failed",
                 Level::ERROR,
@@ -903,8 +929,14 @@ where
             "deriver loop started",
         );
         loop {
-            match rx.recv().await {
-                Ok(event) => {
+            // Beacon DA may recover without another L1 batch event.
+            match receive_l1_event(&mut rx, recovery_pending).await {
+                None => {
+                    if !self.try_recover(&mut recovery_pending).await {
+                        return;
+                    }
+                }
+                Some(Ok(event)) => {
                     if let Err(err) = self.handle_event(event).await {
                         if matches!(&err, DeriverError::CommitterClosed) {
                             event!(
@@ -925,23 +957,23 @@ where
                             error = %err,
                             "deriver failed to handle event; resyncing from L1",
                         );
-                        if !self.try_recover().await {
+                        if !self.try_recover(&mut recovery_pending).await {
                             return;
                         }
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                Some(Err(broadcast::error::RecvError::Lagged(skipped))) => {
                     event!(
                         name: "eez.deriver.l1_events.lagged",
                         Level::WARN,
                         skipped,
                         "L1 event stream lagged; resyncing from L1",
                     );
-                    if !self.try_recover().await {
+                    if !self.try_recover(&mut recovery_pending).await {
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => {
+                Some(Err(broadcast::error::RecvError::Closed)) => {
                     event!(
                         name: "eez.deriver.l1_events.closed",
                         Level::ERROR,
@@ -956,9 +988,11 @@ where
     /// Post-failure recovery via [`Self::catch_up`]. Returns `false` only
     /// when the committer is gone and the loop must exit; a failed resync is
     /// logged and retried at the next L1 event.
-    async fn try_recover(&self) -> bool {
+    async fn try_recover(&self, recovery_pending: &mut bool) -> bool {
+        *recovery_pending = true;
         match self.catch_up().await {
             Ok(()) => {
+                *recovery_pending = false;
                 event!(
                     name: "eez.deriver.resync.recovered",
                     Level::INFO,
@@ -1021,7 +1055,6 @@ where
         let l1_block_number = post.id.l1_block;
         let tx_hash = post.tx_hash;
         let submitter = post.sender;
-        let call_data = &post.batch.callData;
         let settlement = &post.settlement;
         // At or before the indexed tail: already processed by catch_up or an
         // earlier event; this is a stale live event.
@@ -1056,7 +1089,7 @@ where
 
         // Decode only after the gates above, so a skipped peer batch in a codec
         // we do not read cannot halt us.
-        let Some(container) = self.decode_our_payload(call_data.as_ref(), l1_block_number)? else {
+        let Some(container) = self.decode_our_payload(post).await? else {
             return self.flush_deferred_safe(last_in_l1_block).await;
         };
         let decoded = &container.span;
@@ -2993,5 +3026,41 @@ mod seed_tests {
         // Floor above the endpoint (L1 rewound under an indexed batch).
         assert_eq!(choose_seed(999, 40, Some(20)), 40);
         assert_eq!(choose_seed(0, 0, None), 0);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_scan_retries_without_another_l1_event() {
+        let (_sender, mut receiver) = broadcast::channel(1);
+        assert!(receive_l1_event(&mut receiver, true).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn healthy_idle_stream_does_not_trigger_rescans() {
+        let (_sender, mut receiver) = broadcast::channel(1);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                receive_l1_event(&mut receiver, false),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_stream_stops_even_while_recovering() {
+        for pending in [false, true] {
+            let (sender, mut receiver) = broadcast::channel(1);
+            drop(sender);
+            assert!(matches!(
+                receive_l1_event(&mut receiver, pending).await,
+                Some(Err(broadcast::error::RecvError::Closed))
+            ));
+        }
     }
 }
