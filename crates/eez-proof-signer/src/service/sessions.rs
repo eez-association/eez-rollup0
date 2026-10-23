@@ -900,8 +900,9 @@ impl SessionRuntime {
             Level::INFO,
             event_name = "eez.proof_signer.window_signed",
             session_id = %bound.id,
-            from = finalize.from_block,
-            to = finalize.to_block,
+            validated_from_block = finalize.from_block,
+            validated_to_block = finalize.to_block,
+            recomputed_public_inputs_hash = %hash.into_inner(),
             elapsed_us = started.elapsed().as_micros(),
             "session window signed",
         );

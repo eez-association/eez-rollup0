@@ -398,8 +398,7 @@ struct ProofSignerConfig<'a> {
     chain_config: &'a std::path::Path,
     rollup_id: u64,
     signer_key: &'a str,
-    /// Registry vkey for `proof_system`; it may differ from `signer_key` in
-    /// unauthorized-signer tests.
+    /// Vkey used to hash the proof's public inputs.
     vkey: B256,
     proof_system: Address,
 }
@@ -1005,8 +1004,8 @@ impl Harness {
                 chain_config: genesis,
                 rollup_id: opts.rollup_id,
                 signer_key,
-                // Unauthorized-signer tests still hash the registry's vkey.
-                vkey: signer_address(ANVIL_ATTESTER_KEY)?.into_word(),
+                // Match the client's vkey; L1 still checks its registered signer.
+                vkey: attester.into_word(),
                 proof_system: self.dep.proof_system_address,
             })
             .await?;
