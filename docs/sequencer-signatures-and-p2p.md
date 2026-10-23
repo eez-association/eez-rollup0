@@ -412,6 +412,8 @@ are to `fa9e76a`.
   needs, it fails with "L1 history incomplete" instead of retrying forever.
   Once its scan passes L1-finalized, the local chain must hold that block's
   `root`.
+- **Values:** `1` or `true` selects L1-only; unset, empty, `0` or `false`
+  selects peers; anything else is a startup error.
 
 **Steady state is unchanged.**
 - Unsafe blocks come from gossip and p2p-v0's tail fetcher.
@@ -527,8 +529,9 @@ bundle is rolled back. That is fixed on its own branch off main, not here.
   reth resuming it, and reth answers SYNCING to every FCU until it finishes.
   `--debug.startup-sync-state-idle` (forced by `node_cli`) makes reth's network
   sync state exact. Boot polls it, logging a WARN, and sends no FCU until reth
-  is idle. Then it moves the committer's head to reth's head: an FCU carrying
-  the stale spawn-time head would unwind what the backfill synced.
+  is idle. The committer is spawned only after reth is idle: a head read
+  earlier is stale, and an FCU carrying it would unwind what the backfill
+  synced.
 - **SYNCING never counts as success** for a command that moves safe or
   finalized. `advance_safe_finalized` stores its cursors only on VALID; today
   it accepts SYNCING (`block_committer.rs:655-659`).
@@ -560,6 +563,9 @@ bundle is rolled back. That is fixed on its own branch off main, not here.
   - A follower with the composer as trusted peer syncs to `H_F`, and its first
     scan starts at `F`, not at the deploy block.
   - Negative control: a follower without peers keeps waiting at genesis.
+- **e2e `follower_restart_below_finalized_resyncs_from_peers`:** a follower
+  restarted more than 32 blocks below `H_F` rewinds to its own finalized
+  block, syncs the rest from peers, and scans L1 from `F`.
 - **Durability:** the `durability.rs` restart test is un-ignored, and the
   restarted composer settles again.
 - **Explicit modes:**
