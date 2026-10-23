@@ -411,7 +411,9 @@ are to `fa9e76a`.
   or a node that re-verifies everything from L1. When L1 can't serve a block it
   needs, it fails with "L1 history incomplete" instead of retrying forever.
   Once its scan passes L1-finalized, the local chain must hold that block's
-  `root`.
+  `root`. A restart from the checkpoint keeps reth's stored finalized block,
+  capped at the checkpoint's L2 block, so the finalized tag doesn't fall back to
+  genesis while L1 finality is still below the checkpoint.
 - **Values:** `1` or `true` selects L1-only; unset, empty, `0` or `false`
   selects peers; anything else is a startup error.
 
