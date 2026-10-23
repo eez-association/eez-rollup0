@@ -445,7 +445,8 @@ where
             let (new_cursor, _new_finalized, dropped) = self
                 .inner
                 .l1_head
-                .retreat_on_l1_reorg(tail.post.l1_block.saturating_sub(1));
+                .retreat_on_l1_reorg(tail.post.l1_block.saturating_sub(1))
+                .expect("floor");
             event!(
                 name: "eez.deriver.l1.reorg.retreated",
                 Level::WARN,
@@ -1250,7 +1251,8 @@ where
         let (new_cursor, _new_finalized, dropped) = self
             .inner
             .l1_head
-            .retreat_on_l1_reorg(common_ancestor_number);
+            .retreat_on_l1_reorg(common_ancestor_number)
+            .expect("floor");
         if new_cursor >= old_cursor {
             event!(
                 name: "eez.deriver.l1.reorg.noop",

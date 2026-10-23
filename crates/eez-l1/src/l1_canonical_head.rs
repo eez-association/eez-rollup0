@@ -36,6 +36,9 @@ pub struct L1CanonicalHead {
     /// common ancestor, and by the L1-finality handler to find the
     /// highest L2 block confirmed by an L1-finalized block.
     batches: Mutex<Vec<BatchRecord>>,
+    /// The seed's post, if the index was seeded. Finality can't reorg, so a
+    /// retreat below it is refused.
+    floor: Mutex<Option<PostId>>,
 }
 
 impl L1CanonicalHead {
@@ -47,6 +50,31 @@ impl L1CanonicalHead {
     /// L2 block number currently mirrored as reth's `finalized` head.
     pub fn finalized_l2(&self) -> u64 {
         self.finalized_l2.load(Ordering::Acquire)
+    }
+
+    /// Start an empty index at `record`: cursor and finalized become its L2
+    /// block, and its post becomes the floor.
+    ///
+    /// # Panics
+    ///
+    /// If the index is not empty or a mutex is poisoned.
+    pub fn seed(&self, record: BatchRecord) {
+        let mut batches = self.batches.lock().unwrap();
+        assert!(batches.is_empty(), "seed requires an empty index");
+        batches.push(record);
+        self.cursor.store(record.last_l2_block, Ordering::Release);
+        self.finalized_l2
+            .store(record.last_l2_block, Ordering::Release);
+        *self.floor.lock().unwrap() = Some(record.post);
+    }
+
+    /// The seed's post, or `None` if the index was never seeded.
+    ///
+    /// # Panics
+    ///
+    /// If the `floor` mutex is poisoned.
+    pub fn floor(&self) -> Option<PostId> {
+        *self.floor.lock().unwrap()
     }
 
     /// Highest indexed `last_l2_block`, or 0 if empty.
@@ -122,13 +150,26 @@ impl L1CanonicalHead {
 
     /// Drop indexed batches above `common_ancestor_number`; retreat
     /// `cursor` (and `finalized_l2` if it would cross cursor).
-    /// Returns `(new_cursor, new_finalized, dropped_count)`.
+    /// Returns `(new_cursor, new_finalized, dropped_count)`, or `Err(floor)`
+    /// with the index untouched when the ancestor is below the floor's block.
+    ///
+    /// # Errors
+    ///
+    /// The floor [`PostId`] when `common_ancestor_number` is below it.
     ///
     /// # Panics
     ///
-    /// If the `batches` mutex is poisoned.
-    pub fn retreat_on_l1_reorg(&self, common_ancestor_number: u64) -> (u64, u64, usize) {
+    /// If a mutex is poisoned.
+    pub fn retreat_on_l1_reorg(
+        &self,
+        common_ancestor_number: u64,
+    ) -> Result<(u64, u64, usize), PostId> {
         let mut batches = self.batches.lock().unwrap();
+        if let Some(floor) = *self.floor.lock().unwrap()
+            && common_ancestor_number < floor.l1_block
+        {
+            return Err(floor);
+        }
         let original_len = batches.len();
         batches.retain(|b| b.post.l1_block <= common_ancestor_number);
         let dropped = original_len - batches.len();
@@ -139,7 +180,7 @@ impl L1CanonicalHead {
         if new_finalized != old_finalized {
             self.finalized_l2.store(new_finalized, Ordering::Release);
         }
-        (new_cursor, new_finalized, dropped)
+        Ok((new_cursor, new_finalized, dropped))
     }
 
     /// Highest `last_l2_block` of any batch with `l1_block ≤ bound`.
@@ -253,7 +294,7 @@ mod tests {
         ]);
         assert_eq!(head.cursor(), 70);
         // Retreating past 101 leaves the same-block later-log record as the tail.
-        head.retreat_on_l1_reorg(100);
+        head.retreat_on_l1_reorg(100).unwrap();
         assert_eq!(head.last_indexed().map(|r| r.post), Some(post(100, 0xbb)));
     }
 
@@ -267,7 +308,7 @@ mod tests {
             record(102, 0xdd, 80),
         ]);
         head.set_finalized_l2(60);
-        let (new_cursor, new_finalized, dropped) = head.retreat_on_l1_reorg(100);
+        let (new_cursor, new_finalized, dropped) = head.retreat_on_l1_reorg(100).unwrap();
         assert_eq!(new_cursor, 60); // both batches at L1=100 survive
         assert_eq!(new_finalized, 60);
         assert_eq!(dropped, 2);
@@ -287,5 +328,32 @@ mod tests {
         assert_eq!(head.highest_l2_at_or_below_l1(100), Some(60));
         assert_eq!(head.highest_l2_at_or_below_l1(101), Some(70));
         assert_eq!(head.highest_l2_at_or_below_l1(99), None);
+    }
+
+    #[test]
+    fn seed_marks_its_block_processed() {
+        let head = L1CanonicalHead::default();
+        head.seed(record(100, u64::MAX, 40));
+        assert!(head.is_processed(post(100, 7)), "same block, later log");
+        assert!(!head.is_processed(post(101, 0)));
+        assert_eq!(head.cursor(), 40);
+        assert_eq!(head.finalized_l2(), 40);
+        assert_eq!(head.last_indexed_l2(), 40);
+        assert_eq!(head.highest_l2_at_or_below_l1(100), Some(40));
+        assert_eq!(head.floor(), Some(post(100, u64::MAX)));
+    }
+
+    #[test]
+    fn retreat_below_floor_is_refused() {
+        let head = L1CanonicalHead::default();
+        head.seed(record(100, u64::MAX, 40));
+        head.append(record(105, 1, 50));
+        assert_eq!(head.retreat_on_l1_reorg(103), Ok((40, 40, 1)));
+        assert_eq!(head.retreat_on_l1_reorg(99), Err(post(100, u64::MAX)));
+        assert_eq!(head.cursor(), 40);
+        assert_eq!(
+            head.last_indexed().map(|r| r.post),
+            Some(post(100, u64::MAX))
+        );
     }
 }
