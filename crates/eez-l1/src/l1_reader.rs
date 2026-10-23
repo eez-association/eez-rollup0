@@ -30,22 +30,14 @@ pub struct FinalizedCommitment {
 }
 
 /// Interprets the registry's `rollups(id)` answer at `l1_block`. A registered
-/// rollup with a zero root is a broken registry, not "not registered". Empty
-/// registry code at or after its deploy block is a misconfiguration.
+/// rollup with a zero root is a broken registry, not "not registered".
 fn registered_root(
-    registry: Address,
-    deploy_block: u64,
     code_is_empty: bool,
     rollup_contract: Address,
     root: B256,
     rollup_id: u64,
     l1_block: u64,
 ) -> L1Result<Option<B256>> {
-    if code_is_empty && l1_block >= deploy_block {
-        return Err(L1Error::Config(format!(
-            "no EEZ registry code at {registry} at L1 block {l1_block}, at or after its deploy block {deploy_block}; check EEZ_REGISTRY_ADDRESS and EEZ_REGISTRY_DEPLOY_BLOCK"
-        )));
-    }
     if code_is_empty || rollup_contract.is_zero() {
         return Ok(None);
     }
@@ -269,15 +261,7 @@ impl L1Reader {
             })?;
             (r.rollupContract, r.root)
         };
-        let root = registered_root(
-            eez,
-            self.config.deploy_block,
-            code.is_empty(),
-            rollup_contract,
-            root,
-            rollup_id,
-            l1_block,
-        )?;
+        let root = registered_root(code.is_empty(), rollup_contract, root, rollup_id, l1_block)?;
         Ok(Some(FinalizedCommitment {
             l1_block,
             l1_hash,
@@ -321,22 +305,16 @@ mod tests {
     fn registered_root_cases() {
         let root = B256::repeat_byte(7);
         let rc = Address::repeat_byte(1);
-        assert_eq!(registered_root(rc, 10, true, rc, root, 1, 5).unwrap(), None);
-        let err = registered_root(rc, 5, true, rc, root, 1, 5).unwrap_err();
-        assert!(err.to_string().contains("deploy block 5"));
-        assert!(matches!(err, crate::L1Error::Config(_)));
+        assert_eq!(registered_root(true, rc, root, 1, 5).unwrap(), None);
         assert_eq!(
-            registered_root(rc, 5, false, Address::ZERO, B256::ZERO, 1, 5).unwrap(),
+            registered_root(false, Address::ZERO, B256::ZERO, 1, 5).unwrap(),
             None
         );
-        let err = registered_root(rc, 5, false, rc, B256::ZERO, 1, 5).unwrap_err();
+        let err = registered_root(false, rc, B256::ZERO, 1, 5).unwrap_err();
         assert!(
             err.to_string()
                 .contains("registered at L1 block 5 with root 0")
         );
-        assert_eq!(
-            registered_root(rc, 5, false, rc, root, 1, 5).unwrap(),
-            Some(root)
-        );
+        assert_eq!(registered_root(false, rc, root, 1, 5).unwrap(), Some(root));
     }
 }
