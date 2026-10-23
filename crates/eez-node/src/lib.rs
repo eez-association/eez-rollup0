@@ -112,6 +112,10 @@ where
         );
         rejected
     }
+
+    fn last_seen_block_hash(&self) -> B256 {
+        self.0.block_info().last_seen_block_hash
+    }
 }
 
 /// Launch a production composer node.

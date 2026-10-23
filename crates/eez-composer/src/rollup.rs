@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use alloy_consensus::transaction::Recovered;
-use alloy_primitives::{Address, TxHash};
+use alloy_primitives::{Address, B256, TxHash};
 use eez_l1::{L1CanonicalHead, L1Error, L1Result};
 use eez_primitives::EezTxEnvelope;
 
@@ -177,4 +177,7 @@ pub trait L2TxPool: std::fmt::Debug + Send + Sync {
     /// Add `txs` in order as external transactions; returns each rejected
     /// transaction's hash and reason.
     async fn reinject(&self, txs: Vec<Recovered<EezTxEnvelope>>) -> Vec<(TxHash, String)>;
+
+    /// Hash of the last canonical block the pool has processed.
+    fn last_seen_block_hash(&self) -> B256;
 }

@@ -287,6 +287,9 @@ impl std::fmt::Debug for CrossChainWiring {
 /// bundle's inclusion block.
 pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 
+/// How often recovery checks whether the L2 pool has caught up to the head.
+const POOL_CATCH_UP_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Stand-in for `proofs[0]` when sizing before the prover runs (ECDSA is 65 B).
 const MAX_PROOF_BYTES: usize = 128;
 
@@ -1930,7 +1933,7 @@ where
                 return RecoveryOutcome::HeadUnchanged;
             }
             let head = committer.last_header();
-            let mut dropped = None;
+            let mut to_reinject = None;
             if head.number() >= sync_height {
                 // The rollback sends reth's pool no reorg, so read the pure L2
                 // txs it drops now and re-add them once the head has moved.
@@ -1953,6 +1956,27 @@ where
                         return RecoveryOutcome::HeadUnchanged;
                     }
                 };
+                // A dropped block's commit reaching the pool after the re-add would
+                // prune those txs again; the guard pins the head while we wait.
+                if !kept.is_empty() {
+                    let deadline =
+                        tokio::time::Instant::now() + self.inner.emission.timing.l2_block_time();
+                    while rollup.l2_pool.last_seen_block_hash() != head.hash() {
+                        if tokio::time::Instant::now() >= deadline {
+                            event!(
+                                name: "eez.composer.recovery.pool_lagging",
+                                Level::WARN,
+                                rollup_id,
+                                sync_height,
+                                head = head.number(),
+                                pool_head = %rollup.l2_pool.last_seen_block_hash(),
+                                "L2 pool has not caught up to the head; re-adding the rolled-back txs anyway",
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(POOL_CATCH_UP_POLL).await;
+                    }
+                }
                 if let Err(err) = committer.reorg_to(failed.parent.clone()).await {
                     event!(
                         name: "eez.composer.recovery.reorg_failed",
@@ -1966,7 +1990,7 @@ where
                     return RecoveryOutcome::HeadUnchanged;
                 }
                 outcome = RecoveryOutcome::HeadMoved;
-                dropped = Some(kept);
+                to_reinject = Some(kept);
                 event!(
                     name: "eez.composer.recovery.rolled_back",
                     Level::WARN,
@@ -2038,7 +2062,7 @@ where
                     ),
                 }
             }
-            if let Some(txs) = dropped {
+            if let Some(txs) = to_reinject {
                 let offered = txs.len();
                 let rejected = rollup.l2_pool.reinject(txs).await;
                 for (tx_hash, reason) in &rejected {
