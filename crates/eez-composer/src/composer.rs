@@ -1873,14 +1873,17 @@ where
             // roll it back again, and every postBatch in between
             // anchors against the wrong root.
             if rollup.l1_head.cursor() >= sync_height {
-                pool.release_in_flight_batch(&failed.txs);
+                // The cursor proves the height settled, not that these txs ran: a
+                // rival or partial batch may have settled it. Back in the ledger
+                // below the cursor, the entry goes to nonce disposition.
+                rollup.optimistic.reinsert_failed(failed);
                 event!(
                     name: "eez.composer.recovery.stale_verdict",
                     Level::WARN,
                     rollup_id,
                     sync_height,
                     cursor = rollup.l1_head.cursor(),
-                    "failure verdict is stale — Deriver confirmed the batch from L1; dropping recovery",
+                    "failure verdict is stale — Deriver confirmed the height from L1; its txs go to nonce disposition",
                 );
                 return RecoveryOutcome::HeadUnchanged;
             }
