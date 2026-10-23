@@ -14,7 +14,7 @@ L1 alone decides safe and finalized.
 |---|---|---|
 | seq-sig-v0 | 1 | Signed heads, follower fork choice, delivery over the sequencer RPC |
 | p2p-v0 | 2, stacked on 1 | The same signed heads over libp2p gossip; missing blocks by hash over devp2p |
-| sync-v0 | 3, stacked on 2 | History from peers, verified against L1. To be designed |
+| sync-v0 | 3, stacked on 2 | History from peers through reth's sync, anchored at L1-finalized; L1-only derivation as a flag; restarted composers drop their unsettled tail |
 
 Later versions:
 - read the signer set from L1;
@@ -35,7 +35,8 @@ Later versions:
 
 - Settlement. L1 settlements are trusted as they are, so whatever the prover
   attests is valid. The signature never reaches L1, the DA or the prover.
-- Signer sets read from L1, multisig, and history sync from peers.
+- Signer sets read from L1, and multisig.
+- Blob archives, and persisting the held pool.
 
 ## Anti-goals
 
@@ -328,9 +329,11 @@ other.
   bootnodes for a custom chain.
 - **Discovery off:** `--trusted-peers` still works.
 - **Transaction gossip:** every L2 node runs with `--disable-tx-gossip`, which
-  `node_cli` adds itself. Transactions therefore enter only through the
-  sequencer's IngressLayer. Followers forwarding `eth_sendRawTransaction` to
-  the sequencer is a separate feature.
+  `node_cli` adds itself.
+  - A transaction enters a node only through that node's own RPC.
+  - Cross-chain transactions enter only through the composer's fronts.
+  - So a transaction sent to a follower never reaches the sequencer. How
+    followers accept transactions is still open.
 - **Fetching:** with the overlay on, a follower fetches missing blocks only
   from peers, through reth's `FetchClient`. It checks the header hash and the
   body against the header. The RPC block source exists only in RPC mode.
@@ -386,18 +389,193 @@ Startup rules:
   - a source without an address is a startup error;
   - a stateful-prover follower doesn't join the overlay.
 
-## sync-v0 (PR 3, to be designed)
+## sync-v0 (PR 3)
 
-Starting point:
-- For each L1 settlement, take the blocks L1 named from local, then peers,
-  then DA.
-- Any source passes only if its terminal hash equals L1's `final_state`.
-- When far behind, peers are asked for a large span ahead.
-- The Deriver seeds at L1-finalized.
+L1 does not keep data. Blobs expire after about two weeks, and L1 clients
+prune old history (EIP-4444), so even calldata goes away. Blob archives are out
+of scope. Every node except a new chain's first composer therefore gets its
+history from peers.
 
-reth's pipeline is not used, because it retries forever without peers. Open
-questions: bulk sizes, and whether execution or L1 fetching dominates
-derivation time (measure first).
+L1 stays the only trust anchor. `rollups(id).root` is the L2 block hash of the
+last settled block, and a block hash pins its whole ancestry. Peers can
+withhold history but not forge it.
+
+Citations in this section are to `feat/p2p-v0` at `5108818d`; reth citations
+are to `fa9e76a`.
+
+**Modes.**
+- **Default:** history from peers. A node that needs history and has no peers
+  waits, logging its status. It never falls back to L1 on its own.
+- **`EEZ_SYNC_L1_ONLY=1`:** today's derivation from L1, from the boot
+  checkpoint or else the deploy block. It is for a new chain's first composer,
+  or a node that re-verifies everything from L1. When L1 can't serve a block it
+  needs, it fails with "L1 history incomplete" instead of retrying forever.
+  Once its scan passes L1-finalized, the local chain must hold that block's
+  `root`.
+
+**Steady state is unchanged.**
+- Unsafe blocks come from gossip and p2p-v0's tail fetcher.
+- The Deriver confirms each L1 settlement. It skips when the local terminal
+  block equals L1's settled hash, and replays L1's version otherwise.
+- A head is adopted only if it descends from safe.
+
+**Boot, both binaries, default mode.** Nothing else sends forkchoice updates
+until step 6 ends.
+
+1. **Read the anchor.**
+   - `F` is L1's finalized block, number and hash.
+   - `H_F` is `rollups(EEZ_ROLLUP_ID).root`, read at `F`'s hash (EIP-1898), so
+     both come from the same block.
+   - If L1 has no finalized block yet, or the RPC can't serve state at `F`:
+     wait, with a status line naming the cause.
+   - If the rollup isn't registered at `F` (no registry code, or
+     `rollupContract == 0`): seed at L2 genesis, as (`F`, block 0). No post can
+     predate registration.
+   - If it is registered with root 0: the deployment is misconfigured; fail.
+2. **If the local canonical chain holds `H_F`,** seed at `F`. This is the
+   normal restart.
+3. **Otherwise, sync to `H_F`:**
+   1. Rewind to the node's own finalized block `f`, reth's persisted finalized
+      (genesis on a fresh node). Any local tail above it goes, so reth syncs
+      forward from a block L1 finalized.
+   2. Call `sync_to(H_F)`: an FCU with head = safe = finalized = `H_F`,
+      repeated every 2 s until VALID. reth backfills with its pipeline when the
+      gap is over 32 blocks, and downloads the range otherwise
+      (`crates/engine/tree/src/tree/mod.rs:2768-2840`,
+      `crates/engine/primitives/src/config.rs:28`). While it answers SYNCING,
+      log a WARN every 30 s with the connected peers, the local best block,
+      `F` and `H_F`.
+   3. After VALID, `f`'s parent must still be canonical. Otherwise fail loudly:
+      the datadir is not on L1's chain (a wrong deployment or a wrong L1). The
+      parent, not `f`: a resume can legitimately replace `f` with an
+      L1-settled sibling at the same height.
+   4. Re-read `F` and repeat until `H_F` is local. A long sync then ends with a
+      short top-up instead of a long window to replay from L1.
+4. **Seed the Deriver** with one synthetic index record:
+   - post (`F`, hash of `F`, log index `u64::MAX`), last L2 block = height of
+     `H_F`;
+   - every post at or before `F` reads as processed
+     (`l1_canonical_head.rs:82-88`); the boot-checkpoint seed is the template
+     (`deriver.rs:388-401`);
+   - safe and finalized start at `H_F`, so reth's finalized never resets to
+     genesis after a restart;
+   - the record is a floor. An L1 reorg or an index revalidation below it is
+     fatal (finality broke, or the RPC lied); it never rewinds L2.
+5. **Reconcile `F` → L1 head** with the existing scan and its retry/terminal
+   split.
+   - The window is recent: about 13–19 min on Ethereum and 3–4 min on Gnosis,
+     so its DA is still on L1.
+   - No post straddles `F`: deferred entries settle in the L1 block that
+     verified the batch (`EEZ.sol:1579`).
+6. **Composers only: drop the unsettled tail** (below).
+7. **Open the gate:**
+   - the Deriver loop, then the stateful prover;
+   - followers: the head follower and the overlay;
+   - composers: the sequencer, the head signer and the overlay;
+   - the L1 watcher, from `F`.
+
+   The composer's head signer starts here, not before boot
+   (`eez-node/src/lib.rs:361-394`). Otherwise a syncing composer signs stale
+   heads under the newest epoch, which followers prefer.
+
+Default mode neither reads nor writes the boot checkpoint, and never scans from
+the deploy block. A checkpoint over peer-synced history would let a later
+L1-only boot skip verifying it. L1 readiness probes `F`, not the deploy block
+(`eez-node-common/src/lib.rs:177`).
+
+**Composer restart: drop the unsettled tail.** Today a composer restarted with
+a rich Sync block above L1 safe never posts again. The optimistic ledger lives
+in memory, and emission refuses a range with system transactions in an
+intermediate block (`composer.rs:4254-4285`; the ignored test
+`durability.rs:19-20`).
+
+After step 5, the composer rewinds to L1 safe before the sequencer starts,
+dropping every block L1 has not settled.
+- **Every transaction in the dropped blocks is lost.**
+  - reth's rewind to an ancestor doesn't notify the transaction pool, so
+    nothing is re-added (`mod.rs:985-1004`, `:1068-1084`).
+  - Cross-chain transactions lived only in the held pool, which didn't survive
+    the restart.
+  - The composer logs each dropped hash at WARN, and users resubmit. Persisting
+    the held pool is a separate effort.
+- **A postBatch in flight from before the restart** may still land. The Deriver
+  then replays L1's version over the composer's new blocks, as for any
+  competing batch.
+
+The same rewind loses pure L2 transactions in steady state, when a failed
+bundle is rolled back. That is fixed on its own branch off main, not here.
+
+**Block import.**
+- **Boot (step 3):** reth's own sync. reth makes a synced head canonical before
+  it checks safe and finalized, and a failed check is only a debug log
+  (`mod.rs:2002-2034`). That is harmless only when head, safe and finalized are
+  the same block.
+- **Unsafe tail:** p2p-v0's fetcher stays. It checks descent from safe before
+  import, and it imports under the reconcile lock.
+  - One change: the `last_indexed_l2() > safe` hold (`unsafe_head.rs:433-448`)
+    is also checked before fetching (`:407`). A held follower then stops
+    downloading blocks it would discard.
+  - The check under the lock stays authoritative, since the Deriver can index a
+    batch in between.
+
+**BlockCommitter.**
+- **New `sync_to(hash)`:** sends FCU(hash, hash, hash).
+  - SYNCING returns Syncing and changes nothing. The target is not kept for
+    later FCUs.
+  - VALID sets the head, safe and finalized mirrors from the provider.
+- **SYNCING never counts as success** for a command that moves safe or
+  finalized. `advance_safe_finalized` stores its cursors only on VALID; today
+  it accepts SYNCING (`block_committer.rs:655-659`).
+- It builds on #206's "engine not ready" outcome. #206 merges before this
+  stack.
+
+**Peers and history.**
+- **Peers:** every node that may need history has devp2p peers, either
+  `--trusted-peers` with the composer's enode (a stable node key), or
+  `--bootnodes` with discovery on.
+- **History nodes** keep full block history. That rules out `--minimal`, which
+  prunes bodies older than about 10k blocks.
+  - A network needs at least two independent history nodes.
+  - On a small network the composer is often the only one, and serving syncs
+    competes with block production.
+- **Configs:**
+  - the genesis composer runs `EEZ_SYNC_L1_ONLY=1`;
+  - every other L2 node gets trusted peers: node B, followers, and #206's
+    stateful prover;
+  - compose files and kurtosis change accordingly.
+
+**Tests.**
+- **Spike first.** reth's pipeline has never run on our blocks, which carry
+  native `0x76` system transactions and use a custom executor. Two nodes: B
+  boots more than 32 blocks behind, with the composer as its trusted peer, and
+  must reach VALID with matching hashes.
+- **e2e `fresh_follower_syncs_history_from_peers`:**
+  - Anvil is set to finalize quickly (`--slots-in-an-epoch`).
+  - A follower with the composer as trusted peer syncs to `H_F`, and its first
+    scan starts at `F`, not at the deploy block.
+  - Negative control: a follower without peers keeps waiting at genesis.
+- **Durability:** the `durability.rs` restart test is un-ignored, and the
+  restarted composer settles again.
+- **Explicit modes:**
+  - Every e2e node sets its mode explicitly. Anvil finalizes 64 blocks behind
+    its head, so a node booting more than about 256 s after deploy would
+    otherwise switch paths.
+  - `deep_backfill_late_join` runs with `EEZ_SYNC_L1_ONLY=1`.
+- **Unit:**
+  - the boot decision (steps 1–3);
+  - the seed and floor in `L1CanonicalHead`;
+  - `sync_to` outcomes;
+  - the L1-only "history incomplete" error.
+
+**Known limits.**
+- **A resume at `H_F`'s height after the seed is refused.** It appends to that
+  Sync block, and it is already refused once that height is finalized
+  (`deriver.rs:1719-1731`). It gets its own error instead of a resync loop.
+- **Blob DA**, when it comes, needs a beacon endpoint for the window.
+- **Old history's DA isn't re-checked:** new nodes don't re-check it, because
+  v0 trusts L1 settlements.
+
+**Budget:** about 1.3k lines, tests included.
 
 ## Decisions
 
@@ -446,6 +624,31 @@ derivation time (measure first).
 - Deployment configs unchanged until an L2 follower service exists.
 - Discovered peers are dialed only while fewer than 16 are connected.
 - Inbound overlay connections are capped at 64, two per peer.
+
+**Owner, for sync-v0:**
+- History comes from peers by default. L1-only derivation runs only with
+  `EEZ_SYNC_L1_ONLY`.
+- No automatic fallback: a node without peers waits.
+- Long-range sync uses reth's own sync, triggered by an FCU.
+- One boot path for every boot, anchored at L1-finalized.
+- A restarted composer drops its unsettled tail and the tail's cross-chain
+  transactions. Persisting the held pool is a separate effort.
+- #206 merges before this stack.
+
+**Mine, for sync-v0:**
+- The unsafe tail stays on p2p-v0's fetcher, because reth checks safe only
+  after it canonicalizes a synced head.
+- "Wrong chain" means the parent of the node's own finalized block is gone
+  after the sync, not a different block at `H_F`'s height. A replaced or
+  partially settled tail is a normal restart.
+- The synthetic seed record, and the floor.
+- Rewind to the node's own finalized block before syncing, and re-read `F`
+  until `H_F` is local.
+- Default mode doesn't write checkpoints, and L1 readiness probes `F`.
+- The composer's head signer starts after the gate.
+- On restart, the composer drops every block above L1 safe, and logs the
+  hashes of the transactions lost with them.
+- FCU every 2 s and a WARN status every 30 s while syncing.
 
 **Left to the builder:**
 - Module layout inside the crates.
