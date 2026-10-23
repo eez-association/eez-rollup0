@@ -174,7 +174,18 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         SyncMode::L1Only => {
             wait_for_idle_engine(&provider, &block_committer, || network.is_syncing()).await?;
             // Read before the scan: the scan must end up holding this root.
-            let before = l1_reader.finalized_commitment().await.ok().flatten();
+            let before = match l1_reader.finalized_commitment().await {
+                Ok(before) => before,
+                Err(error) => {
+                    event!(
+                        name: "eez.node.sync.history_check_skipped",
+                        Level::WARN,
+                        %error,
+                        "L1's finalized root is unreadable; boot skips checking that the local chain holds it",
+                    );
+                    None
+                }
+            };
             let seed = boot_catch_up(&deriver, &l1_reader, sync_mode, "follower").await?;
             ensure_l1_history(&provider, before).await?;
             seed
