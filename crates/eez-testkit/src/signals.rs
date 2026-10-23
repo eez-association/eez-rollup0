@@ -47,7 +47,6 @@ pub const COMPOSER_NONCE_BURNED: &str = "eez.composer.recovery.nonce_burned";
 /// The deriver rebuilt only the entries L1 ran.
 pub const DERIVER_PARTIAL_CONSUMPTION: &str = "eez.deriver.reconcile.partial_consumption";
 pub const TX_POISON_EVICTED: &str = "eez.composer.recovery.poison_evicted";
-pub const COMPOSER_RECOVERY_ROLLED_BACK: &str = "eez.composer.recovery.rolled_back";
 pub const COMPOSER_RECOVERY_SUBSTITUTED: &str = "eez.composer.recovery.substituted";
 
 pub const FATAL: &[&str] = &[
