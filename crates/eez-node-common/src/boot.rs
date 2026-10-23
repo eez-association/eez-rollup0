@@ -316,6 +316,7 @@ where
                         event!(
                             name: "eez.node.sync.waiting_for_peers",
                             Level::WARN,
+                            event_name = "eez.node.sync.waiting_for_peers",
                             peers = peer_count(),
                             local_best = provider.best_block_number()?,
                             l1_finalized,

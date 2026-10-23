@@ -543,6 +543,7 @@ where
         event!(
             name: "eez.deriver.catch_up.start",
             Level::INFO,
+            event_name = "eez.deriver.catch_up.start",
             local_head,
             from_l1_block,
             to_l1_block,

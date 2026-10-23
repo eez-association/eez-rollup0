@@ -80,6 +80,10 @@ const L1_BLOCK_TIME_SECS: u64 = 4;
 // Consumed by the launcher as `--chain`; never forwarded to `eez-node`.
 const TEST_L2_GENESIS_ENV: &str = "EEZ_TEST_L2_GENESIS_PATH";
 
+// Every node env names its mode. In the default peers mode, a node booting
+// after L1 finalized a settlement waits for peers to serve the history.
+const SYNC_L1_ONLY_ENV: &str = "EEZ_SYNC_L1_ONLY";
+
 const TX_SPAM_INTERVAL: Duration = Duration::from_secs(1);
 
 static LOG_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -137,6 +141,8 @@ pub struct Anvil {
 struct AnvilConfig {
     gas_limit: u64,
     genesis_timestamp: u64,
+    /// Anvil finalizes two epochs behind its head; `None` keeps its 32 slots.
+    slots_in_an_epoch: Option<u64>,
 }
 
 impl AnvilConfig {
@@ -144,6 +150,7 @@ impl AnvilConfig {
         Self {
             gas_limit: 30_000_000,
             genesis_timestamp,
+            slots_in_an_epoch: None,
         }
     }
 }
@@ -169,6 +176,9 @@ impl Anvil {
         ]);
         cmd.args(["--gas-limit", &cfg.gas_limit.to_string()]);
         cmd.args(["--timestamp", &cfg.genesis_timestamp.to_string()]);
+        if let Some(slots) = cfg.slots_in_an_epoch {
+            cmd.args(["--slots-in-an-epoch", &slots.to_string()]);
+        }
         cmd.stdout(Stdio::from(log)).stderr(Stdio::from(err_log));
         drop(port_lease);
         let mut child = cmd.spawn().context("spawn anvil")?;
@@ -815,6 +825,17 @@ impl Harness {
         Self::with_anvil_config(cfg, l2_genesis_block_hash_at(ts)?, l2_genesis).await
     }
 
+    /// [`Self::fresh`] with L1 finalized two blocks behind its head, not 64.
+    pub async fn fresh_with_fast_finality() -> Result<Self> {
+        let ts = now_unix_secs();
+        let l2_genesis = write_l2_genesis_at(ts)?;
+        let cfg = AnvilConfig {
+            slots_in_an_epoch: Some(1),
+            ..AnvilConfig::standard(ts)
+        };
+        Self::with_anvil_config(cfg, l2_genesis_block_hash_at(ts)?, l2_genesis).await
+    }
+
     async fn with_anvil_config(
         cfg: AnvilConfig,
         initial_state: B256,
@@ -967,6 +988,7 @@ impl Harness {
                 TEST_L2_GENESIS_ENV,
                 self.l2_genesis.0.to_string_lossy().into_owned(),
             ),
+            (SYNC_L1_ONLY_ENV, "1".to_string()),
         ];
 
         if let Some(poster_key) = opts.poster_key {
@@ -2664,6 +2686,12 @@ pub async fn wait_for_safe_chain_contains(
     .await
 }
 
+/// Switches a node env from the testkit's L1-only default to peers mode.
+pub fn peers_mode(env: &mut Vec<(&'static str, String)>) {
+    env.retain(|(key, _)| *key != SYNC_L1_ONLY_ENV);
+    env.push((SYNC_L1_ONLY_ENV, "0".to_string()));
+}
+
 /// Return `env` with `key`'s value replaced by `value`. No-op if `key`
 /// isn't present.
 pub fn override_env(
@@ -3586,6 +3614,7 @@ impl CrossChainConfig {
                 TEST_L2_GENESIS_ENV,
                 self.l2_genesis.0.to_string_lossy().into_owned(),
             ),
+            (SYNC_L1_ONLY_ENV, "1".to_string()),
         ]
     }
 }
