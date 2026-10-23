@@ -1,6 +1,10 @@
 //! Cross-chain integration and nonce-gap regression tests.
 
-use alloy_primitives::{Address, Bytes, TxHash, U256, keccak256};
+use std::fmt::Write as _;
+use std::time::Duration;
+
+use alloy_primitives::{Address, B256, Bytes, TxHash, U256, address, keccak256};
+use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue};
 
@@ -8,10 +12,10 @@ use eez_protocol::EEZL2_ADDRESS;
 use eez_protocol::abi::computeCrossChainProxyAddressCall;
 use eez_testkit::signals;
 use eez_testkit::{
-    ANVIL_ATTESTER_KEY, DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER, INestedSetterInner,
-    INestedSetterOuter, IReturnData, IReturnDataWrapper, IRevertBubbleWrapper, IRevertingTarget,
-    ISetterWrapper, IValue, IValueNoRet, L1_ROLLUP_ID, NodeBinary, NodeConfig, NodeHandle,
-    OUTBOUND_USER, ProverMutation, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead,
+    ANVIL_ATTESTER_KEY, BuilderStubMode, DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER,
+    INestedSetterInner, INestedSetterOuter, IReturnData, IReturnDataWrapper, IRevertBubbleWrapper,
+    IRevertingTarget, ISetterWrapper, IValue, IValueNoRet, L1_ROLLUP_ID, NodeBinary, NodeConfig,
+    NodeHandle, OUTBOUND_USER, ProverMutation, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead,
     TARGET_DEPLOYER, account_code, assert_latest_batch_signature, batches_posted,
     block_number_and_hash_at, call_read, call_revert_data, completed_proxy_calls, count_events,
     create_l2_cross_chain_proxy, cross_chain_source_proxy, deploy_nested_setter_inner,
@@ -20,8 +24,8 @@ use eez_testkit::{
     setter_call, setup_cross_chain, setup_cross_chain_codeless, setup_cross_chain_empty_call,
     setup_cross_chain_nested_setter, setup_cross_chain_outbound_return_data,
     setup_cross_chain_proxied, setup_cross_chain_return_data, setup_cross_chain_reverting,
-    sign_and_send, signer_address, value_no_ret, value_read, wait_for,
-    wait_for_safe_chain_contains,
+    setup_cross_chain_with_builder_stub, sign_and_send, signer_address, value_no_ret, value_read,
+    wait_for, wait_for_safe_chain_contains,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -1895,4 +1899,235 @@ async fn outbound_call_targeting_the_l1_manager_is_evicted() {
         "the eviction must name EEZDestinationForbidden; log tail:\n{}",
         w.node.log_tail(40),
     );
+}
+
+/// Anvil account #8: funded in the L2 genesis and used by no other role, so its
+/// nonce counts only this test's transfers.
+const L2_ONLY_USER: &str = "0xdbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97";
+const L2_ONLY_RECIPIENT: Address = address!("0x4444444444444444444444444444444444444444");
+const L2_ONLY_TRANSFERS: u64 = 3;
+/// The drop verdict otherwise lands before the first Live block above the Sync
+/// block; a slow relay ack keeps the bundle in flight for a few Live blocks.
+const SLOW_RELAY_ACK: Duration = Duration::from_secs(5);
+
+/// Hash at `height` on the branch ending at `tip`. Parents are walked by hash,
+/// so a concurrent rollback cannot substitute another branch's block.
+async fn ancestor_at(rpc: &str, tip: B256, height: u64) -> anyhow::Result<Option<B256>> {
+    let provider = ProviderBuilder::new().connect_http(rpc.parse()?);
+    let mut hash = tip;
+    loop {
+        let Some(block) = provider.get_block_by_hash(hash).await? else {
+            return Ok(None);
+        };
+        if block.header.number <= height {
+            return Ok((block.header.number == height).then_some(hash));
+        }
+        hash = block.header.parent_hash;
+    }
+}
+
+/// Pure L2 transfers mined in Live blocks above a rich Sync block must survive
+/// the rollback that follows its failed bundle: once the relay forwards again,
+/// each is back in the safe chain and its sender's nonce covers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_rich_bundle_keeps_live_l2_txs() {
+    let w = setup_cross_chain_with_builder_stub().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let l2 = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+
+    w.set_builder_mode(BuilderStubMode::Drop).await.unwrap();
+    w.set_builder_ack_delay(SLOW_RELAY_ACK).await.unwrap();
+    let drained_from = w.node.signal_cursor().unwrap();
+    wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(drained_from)?;
+        let drained = emitted
+            .iter()
+            .any(|s| s.name == signals::COMPOSER_SYNC_SLOT_DRAIN);
+        Ok(drained.then_some(()))
+    })
+    .await
+    .expect("composer did not report a fresh sync-slot drain boundary");
+
+    // Outbound: its rich bundle is the lone postBatch the stub forwards later.
+    let sent_from = w.node.signal_cursor().unwrap();
+    let outbound = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        ISetterWrapper::setViaProxyCall {
+            v: U256::from(83u64),
+        }
+        .abi_encode(),
+        1_200_000,
+    )
+    .await
+    .expect("outbound call must be admitted");
+    let n = wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(sent_from)?;
+        let dispatched = emitted
+            .iter()
+            .find(|s| s.name == signals::COMPOSER_BUNDLE_DISPATCHED);
+        dispatched.map(|s| s.u64("sync_height")).transpose()
+    })
+    .await
+    .expect("composer did not dispatch the rich bundle");
+
+    // The rich block is already built, so these land in the Live blocks above
+    // it while its bundle is in flight.
+    let base_nonce = onchain_nonce(&l2_rpc, L2_ONLY_USER).await.unwrap();
+    let mut transfers = Vec::new();
+    for i in 0..L2_ONLY_TRANSFERS {
+        let hash = sign_and_send(
+            &l2_rpc,
+            L2_ONLY_USER,
+            w.l2_chain_id,
+            base_nonce + i,
+            Some(L2_ONLY_RECIPIENT),
+            U256::from(1u64),
+            Vec::new(),
+            21_000,
+        )
+        .await
+        .expect("pure L2 transfer must be admitted");
+        transfers.push(hash);
+    }
+    let mined = wait_for(SETTLE_TIMEOUT, || async {
+        let mut mined = Vec::new();
+        for &hash in &transfers {
+            let Some(receipt) = l2.get_transaction_receipt(hash).await? else {
+                return Ok(None);
+            };
+            anyhow::ensure!(receipt.status(), "pure L2 transfer {hash} reverted");
+            let number = receipt
+                .block_number
+                .expect("mined receipt has a block number");
+            let block = receipt.block_hash.expect("mined receipt has a block hash");
+            mined.push((hash, number, block));
+        }
+        Ok(Some(mined))
+    })
+    .await
+    .expect("pure L2 transfers were not mined");
+
+    // Each transfer must sit on the rich block's branch, above it.
+    let mut rich = None;
+    for &(hash, number, block) in &mined {
+        let at_n = ancestor_at(&l2_rpc, block, n).await.unwrap();
+        let carries_outbound = match at_n {
+            Some(at_n) => l2
+                .get_block_by_hash(at_n)
+                .await
+                .unwrap()
+                .is_some_and(|b| b.transactions.hashes().any(|tx| tx == outbound)),
+            None => false,
+        };
+        assert!(
+            number > n && carries_outbound,
+            "inconclusive: transfer {hash} in block {number} ({block}) is not above the rich \
+             Sync block {n} (ancestor at {n}: {at_n:?}); no Live block was built on the rich \
+             block before its rollback",
+        );
+        rich = at_n;
+    }
+    let rich = rich.expect("at least one transfer");
+    let top = mined.iter().map(|&(_, number, _)| number).max().unwrap();
+    eprintln!("rich Sync block {n} = {rich}; transfers mined above it: {mined:?}");
+
+    let rolled_back = wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(sent_from)?;
+        let rolled_back = emitted.into_iter().find(|s| {
+            s.name == signals::COMPOSER_RECOVERY_ROLLED_BACK && s.u64("sync_height").ok() == Some(n)
+        });
+        Ok(rolled_back)
+    })
+    .await
+    .unwrap_or_else(|err| {
+        panic!("inconclusive: the composer never rolled back the rich Sync block {n}: {err:#}")
+    });
+    let rolled_from = rolled_back.u64("head").unwrap();
+    assert!(
+        rolled_from >= top,
+        "inconclusive: the rollback started at head {rolled_from}, below the transfers' top block {top}",
+    );
+    let nonce_after_rollback = onchain_nonce(&l2_rpc, L2_ONLY_USER).await.unwrap();
+    eprintln!(
+        "rolled back Sync block {n} from head {rolled_from}; sender nonce {base_nonce} before, \
+         {nonce_after_rollback} right after the rollback"
+    );
+
+    // Restore before MAX_BUNDLE_ATTEMPTS evicts the outbound call.
+    w.set_builder_ack_delay(Duration::ZERO).await.unwrap();
+    w.set_builder_mode(BuilderStubMode::Forward).await.unwrap();
+
+    // The chain settles past the rolled-back heights, outbound effect included.
+    let settled = wait_for(SETTLE_TIMEOUT, || async {
+        if let Some(failure) = w.node.progress_failure()? {
+            anyhow::bail!("{failure}");
+        }
+        let applied = l2_value(&l1_rpc, w.outbound_value).await? == U256::from(83u64);
+        let safe = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe).await?;
+        Ok((applied && safe.is_some_and(|(safe, _)| safe > top)).then_some(()))
+    })
+    .await;
+    if let Err(err) = settled {
+        panic!(
+            "chain did not settle after forwarding resumed: {err:#}{}",
+            w.settlement_diagnostics()
+        );
+    }
+
+    let kept = wait_for(SETTLE_TIMEOUT, || async {
+        let Some((safe, _)) = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe).await?
+        else {
+            return Ok(None);
+        };
+        for &hash in &transfers {
+            let Some(receipt) = l2.get_transaction_receipt(hash).await? else {
+                return Ok(None);
+            };
+            let number = receipt
+                .block_number
+                .expect("mined receipt has a block number");
+            let canonical = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(number))
+                .await?
+                .map(|(_, hash)| hash);
+            if number > safe || canonical != receipt.block_hash {
+                return Ok(None);
+            }
+        }
+        let nonce = onchain_nonce(&l2_rpc, L2_ONLY_USER).await?;
+        Ok((nonce >= base_nonce + L2_ONLY_TRANSFERS).then_some(()))
+    })
+    .await;
+    if let Err(err) = kept {
+        let mut state = String::new();
+        for &(hash, number, block) in &mined {
+            let receipt = l2.get_transaction_receipt(hash).await.unwrap();
+            let now = receipt.map(|r| (r.block_number, r.block_hash));
+            let canonical = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(number))
+                .await
+                .unwrap()
+                .map(|(_, hash)| hash);
+            let _ = write!(
+                state,
+                "\n  {hash}: mined in {number} ({block}) above rich {n}; receipt now {now:?}; \
+                 canonical {number} now {canonical:?}"
+            );
+        }
+        panic!(
+            "pure L2 transfers mined above the rolled-back rich Sync block {n} were not \
+             re-included: {err:#}{state}\n  sender nonce: {base_nonce} before, \
+             {nonce_after_rollback} after the rollback, {} now (want >= {}); safe: {:?}",
+            onchain_nonce(&l2_rpc, L2_ONLY_USER).await.unwrap(),
+            base_nonce + L2_ONLY_TRANSFERS,
+            block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe)
+                .await
+                .unwrap(),
+        );
+    }
+    w.node.assert_no_divergence_failure_logs();
 }
