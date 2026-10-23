@@ -2144,5 +2144,15 @@ async fn failed_rich_bundle_keeps_live_l2_txs() {
     if let Err(err) = settled {
         panic!("{err:#}{}", w.settlement_diagnostics());
     }
+    // Checked directly: if the dropped bundle lands late, L1's block hides a
+    // plain-call mining of the outbound tx.
+    let refused =
+        w.node.signals_since(from).unwrap().iter().any(|s| {
+            s.name == signals::POOL_TX_REJECTED && s.b256("tx_hash").ok() == Some(outbound)
+        });
+    assert!(
+        refused,
+        "the L2 pool never refused the rolled-back outbound call"
+    );
     w.node.assert_no_divergence_failure_logs();
 }

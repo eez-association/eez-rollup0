@@ -88,7 +88,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     let system_address = eez_primitives::SYSTEM_ADDRESS;
 
     let handle = builder
-        .node(EezNode)
+        .node(EezNode::default())
         .launch_with_debug_capabilities()
         .await?;
 

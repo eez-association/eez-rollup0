@@ -91,6 +91,10 @@ fn min_replacement_fee(replaced: u128) -> u128 {
     replaced.saturating_add(required_increase)
 }
 
+/// L2 blocks a [refused](HeldPool::refuse) tx stays held. reth re-adds a
+/// reorg's dropped txs right after it, so this is only a margin.
+const REFUSED_BLOCKS: u64 = 64;
+
 /// All pool state under one lock, so queue membership, hash dedupe and
 /// nonce reservations can never disagree with each other.
 #[derive(Debug, Default)]
@@ -107,6 +111,8 @@ struct PoolState {
     /// or evicted by its caller; a forgotten reservation bricks its nonce
     /// slot (admission forever expects past it).
     in_flight: HashMap<TxHash, (Address, Direction, u64)>,
+    /// Txs a reorg drops, held until this L2 height.
+    refused: HashMap<TxHash, u64>,
 }
 
 impl PoolState {
@@ -362,6 +368,27 @@ impl HeldPool {
         drained
     }
 
+    /// Whether `hash` is queued, in flight or refused. The L2 pool refuses
+    /// these: only the composer includes a cross-chain tx.
+    pub fn holds(&self, hash: &TxHash) -> bool {
+        let state = self.state.lock().expect("held_pool mutex poisoned");
+        state.by_hash.contains(hash)
+            || state.in_flight.contains_key(hash)
+            || state.refused.contains_key(hash)
+    }
+
+    /// Hold `hashes` for [`REFUSED_BLOCKS`] L2 blocks past `height`: cross-chain
+    /// txs in blocks a reorg is about to drop, which this pool may release first
+    /// or never have held.
+    pub fn refuse(&self, hashes: impl IntoIterator<Item = TxHash>, height: u64) {
+        let mut state = self.state.lock().expect("held_pool mutex poisoned");
+        state.refused.retain(|_, until| *until > height);
+        let until = height + REFUSED_BLOCKS;
+        state
+            .refused
+            .extend(hashes.into_iter().map(|hash| (hash, until)));
+    }
+
     /// Number of currently-held txs.
     pub fn len(&self) -> usize {
         self.state
@@ -500,6 +527,19 @@ mod tests {
         assert_eq!(drained[0].hash, TxHash::from(B256::repeat_byte(1)));
         assert_eq!(drained[2].hash, TxHash::from(B256::repeat_byte(3)));
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn holds_a_refused_tx_for_its_blocks_only() {
+        let pool = HeldPool::new();
+        let held = tx(1);
+        insert(&pool, held.clone(), 1);
+        let drained = pool.pop_all();
+        pool.refuse([held.hash], 10);
+        pool.release_in_flight_batch(&drained);
+        assert!(pool.holds(&held.hash));
+        pool.refuse([], 10 + REFUSED_BLOCKS);
+        assert!(!pool.holds(&held.hash));
     }
 
     #[test]

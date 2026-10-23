@@ -1,14 +1,14 @@
 //! L2 pool that disables blobs and refuses SYSTEM_ADDRESS txs. Native system
 //! txs ride in Sync blocks over the Engine API; the pool gate also covers reorg
-//! reinjection.
+//! reinjection. A composer's pool also refuses the cross-chain txs it holds.
 //!
 //! Pool setup adapted from reth's `EthereumPoolBuilder` at the pinned revision:
 //! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/node/src/node.rs>.
 
-use std::any::Any;
+use std::{any::Any, fmt, sync::Arc};
 
 use crate::pool_transaction::EezPooledTransaction;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, TxHash};
 use eez_primitives::EezTxEnvelope;
 use reth_chainspec::EthereumHardforks;
 use reth_evm::ConfigureEvm;
@@ -37,14 +37,29 @@ pub type EezTransactionPool<Client, S, Evm> = Pool<
     S,
 >;
 
-#[derive(Debug, thiserror::Error)]
-#[error("SYSTEM_ADDRESS transactions are not accepted via the mempool")]
-struct SystemAddressRejected;
+/// Whether the composer holds a tx. A reorg hands reth such a tx back, and the
+/// next Live block would mine it as a plain L2 call.
+#[derive(Clone)]
+pub struct HeldTxs(pub Arc<dyn Fn(&TxHash) -> bool + Send + Sync>);
 
-impl PoolTransactionError for SystemAddressRejected {
+impl fmt::Debug for HeldTxs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HeldTxs")
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum Refused {
+    #[error("SYSTEM_ADDRESS transactions are not accepted via the mempool")]
+    SystemSender,
+    #[error("held cross-chain transactions are included only by the composer")]
+    Held,
+}
+
+impl PoolTransactionError for Refused {
     fn is_bad_transaction(&self) -> bool {
-        // Never valid from anyone, so the peer that sent it earns a penalty.
-        true
+        // A system tx is never valid from anyone, so its peer earns a penalty.
+        matches!(self, Self::SystemSender)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -52,18 +67,21 @@ impl PoolTransactionError for SystemAddressRejected {
     }
 }
 
-/// Prevents RPC, gossip, and reorg reinjection from admitting the reserved sender.
+/// Prevents RPC, gossip, and reorg reinjection from admitting the reserved
+/// sender or a tx the composer holds.
 #[derive(Debug)]
 pub struct SystemAddressGate<V> {
     inner: V,
     system_address: Address,
+    held: Option<HeldTxs>,
 }
 
 impl<V> SystemAddressGate<V> {
-    pub const fn new(inner: V, system_address: Address) -> Self {
+    pub const fn new(inner: V, system_address: Address, held: Option<HeldTxs>) -> Self {
         Self {
             inner,
             system_address,
+            held,
         }
     }
 }
@@ -72,22 +90,28 @@ impl<V> SystemAddressGate<V>
 where
     V: TransactionValidator,
 {
-    fn is_system_sender(&self, tx: &V::Transaction) -> bool {
-        self.system_address == tx.sender()
+    fn refusal(&self, tx: &V::Transaction) -> Option<Refused> {
+        if self.system_address == tx.sender() {
+            return Some(Refused::SystemSender);
+        }
+        let held = self.held.as_ref().is_some_and(|held| (held.0)(tx.hash()));
+        held.then_some(Refused::Held)
     }
 
-    fn reject(tx: V::Transaction) -> TransactionValidationOutcome<V::Transaction> {
+    fn reject(
+        tx: V::Transaction,
+        refusal: Refused,
+    ) -> TransactionValidationOutcome<V::Transaction> {
         event!(
-            name: "eez.node.pool.system_tx_rejected",
+            name: "eez.node.pool.tx_rejected",
             Level::WARN,
+            event_name = "eez.node.pool.tx_rejected",
             tx_hash = %tx.hash(),
             sender = %tx.sender(),
-            "rejected a SYSTEM_ADDRESS transaction offered to the L2 pool",
+            reason = %refusal,
+            "rejected a transaction offered to the L2 pool",
         );
-        TransactionValidationOutcome::Invalid(
-            tx,
-            InvalidPoolTransactionError::other(SystemAddressRejected),
-        )
+        TransactionValidationOutcome::Invalid(tx, InvalidPoolTransactionError::other(refusal))
     }
 }
 
@@ -103,8 +127,8 @@ where
         origin: TransactionOrigin,
         transaction: Self::Transaction,
     ) -> TransactionValidationOutcome<Self::Transaction> {
-        if self.is_system_sender(&transaction) {
-            return Self::reject(transaction);
+        if let Some(refusal) = self.refusal(&transaction) {
+            return Self::reject(transaction, refusal);
         }
         self.inner.validate_transaction(origin, transaction).await
     }
@@ -119,8 +143,8 @@ where
         let mut slots = Vec::new();
         let mut forwarded = Vec::new();
         for (origin, tx) in transactions {
-            if self.is_system_sender(&tx) {
-                slots.push(Some(Self::reject(tx)));
+            if let Some(refusal) = self.refusal(&tx) {
+                slots.push(Some(Self::reject(tx, refusal)));
             } else {
                 slots.push(None);
                 forwarded.push((origin, tx));
@@ -150,14 +174,18 @@ where
 }
 
 /// Upstream Ethereum pool with the reserved-sender gate and blob support disabled.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct EezPoolBuilder {
     system_address: Address,
+    held: Option<HeldTxs>,
 }
 
 impl EezPoolBuilder {
-    pub const fn new(system_address: Address) -> Self {
-        Self { system_address }
+    pub const fn new(system_address: Address, held: Option<HeldTxs>) -> Self {
+        Self {
+            system_address,
+            held,
+        }
     }
 }
 
@@ -195,8 +223,8 @@ where
                     .build_with_tasks(ctx.task_executor().clone(), blob_store);
 
             let system_address = self.system_address;
-            let validator =
-                eth_validator.map(|inner| SystemAddressGate::new(inner, system_address));
+            let validator = eth_validator
+                .map(|inner| SystemAddressGate::new(inner, system_address, self.held.clone()));
 
             let transaction_pool = TxPoolBuilder::new(ctx)
                 .with_validator(validator)
@@ -269,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_system_sender_and_admits_others() {
-        let gate = SystemAddressGate::new(AcceptAll, SYSTEM);
+        let gate = SystemAddressGate::new(AcceptAll, SYSTEM, None);
 
         let out = gate
             .validate_transaction(TransactionOrigin::External, pooled_tx(SYSTEM, 0))
@@ -287,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_keeps_input_order() {
-        let gate = SystemAddressGate::new(AcceptAll, SYSTEM);
+        let gate = SystemAddressGate::new(AcceptAll, SYSTEM, None);
         let batch = vec![
             (TransactionOrigin::External, pooled_tx(USER, 0)),
             (TransactionOrigin::External, pooled_tx(SYSTEM, 1)),
