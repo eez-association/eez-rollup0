@@ -6,7 +6,7 @@ use std::{env, str::FromStr, sync::Arc, time::Duration};
 
 use alloy_primitives::Address;
 use alloy_provider::RootProvider;
-use eez_deriver::{Deriver, DeriverError};
+use eez_deriver::{Deriver, DeriverBoot, DeriverError};
 use eez_driver::{BlockCommitterHandle, RollupTiming};
 use eez_l1::{L1CanonicalHead, L1Error, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
 use eez_node_common::EezNode;
@@ -145,7 +145,9 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
-        read_checkpoint_dir(),
+        DeriverBoot::L1Only {
+            checkpoint_dir: read_checkpoint_dir(),
+        },
     );
 
     wait_for_l1_ready(&l1_reader, deploy_block, read_l1_chain_id()?).await?;

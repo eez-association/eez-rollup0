@@ -35,6 +35,39 @@ pub enum DeriverError {
         /// Why the divergence was raised.
         detail: Option<String>,
     },
+    /// An L1 reorg or index revalidation reached below the seed floor, an
+    /// L1-finalized block: finality broke or the RPC lied.
+    #[error(
+        "L1 reorg to block {l1_block} is below the seed floor at L1-finalized block {floor_l1_block}"
+    )]
+    BelowSeedFloor {
+        /// Highest L1 block the retreat would keep.
+        l1_block: u64,
+        /// L1 block of the seed record.
+        floor_l1_block: u64,
+    },
+    /// Peers mode found an empty batch index: the boot never seeded it.
+    #[error("batch index is empty in peers mode; boot must seed it before catch-up")]
+    Unseeded,
+    /// A resumed batch appends to a Sync block that is already finalized.
+    #[error(
+        "resumed batch would rewrite Sync block {l2_block}, which is at or below the finalized L2 head"
+    )]
+    FinalizedResume {
+        /// Height of the finalized Sync block.
+        l2_block: u64,
+    },
+}
+
+/// `true` for errors no resync can fix; the deriver stops the node on them.
+#[must_use]
+pub fn is_fatal(err: &DeriverError) -> bool {
+    matches!(
+        err,
+        DeriverError::BelowSeedFloor { .. }
+            | DeriverError::Unseeded
+            | DeriverError::FinalizedResume { .. }
+    )
 }
 
 impl From<eez_driver::DriverError> for DeriverError {
@@ -46,5 +79,27 @@ impl From<eez_driver::DriverError> for DeriverError {
             }
             other => Self::InvalidForkchoice(format!("driver: {other}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DeriverError, is_fatal};
+
+    #[test]
+    fn floor_errors_are_fatal() {
+        assert!(is_fatal(&DeriverError::BelowSeedFloor {
+            l1_block: 99,
+            floor_l1_block: 100,
+        }));
+        assert!(is_fatal(&DeriverError::Unseeded));
+        assert!(is_fatal(&DeriverError::FinalizedResume { l2_block: 7 }));
+        assert!(!is_fatal(&DeriverError::LocalDiverged {
+            l2_block: 7,
+            detail: None,
+        }));
+        assert!(!is_fatal(&DeriverError::L1Scan(eez_l1::L1Error::Provider(
+            "x".into()
+        ))));
     }
 }

@@ -19,7 +19,7 @@ use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
 use eez_composer::composer::CrossChainWiring;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
-use eez_deriver::{Deriver, DeriverError};
+use eez_deriver::{Deriver, DeriverBoot, DeriverError};
 use eez_driver::{
     BlockCommitterHandle, DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, RollupTiming,
     Sequencer, SyncSlotComposerHandle, spawn_l1_anchored,
@@ -723,7 +723,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
-        read_checkpoint_dir(),
+        DeriverBoot::L1Only {
+            checkpoint_dir: read_checkpoint_dir(),
+        },
     );
 
     // Bind before the L1 wait so port checks see a live front. Submissions are
