@@ -393,6 +393,7 @@ where
     /// - an engine-RPC error on transport failure.
     /// - an invalid-forkchoice error if reth rejects the
     ///   target hash (not on its canonical chain).
+    /// - [`DriverError::EngineNotReady`] on `SYNCING`; the head mirror stays.
     /// - `committer_closed` if the actor is gone.
     pub async fn reorg_to(
         &self,
@@ -632,6 +633,11 @@ where
             .fork_choice_updated(state, None)
             .await
             .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
+        if res.is_syncing() {
+            return Err(DriverError::EngineNotReady(format!(
+                "reorg_to({target_hash}): {res:?}"
+            )));
+        }
         if !res.is_valid() {
             return Err(DriverError::InvalidForkchoice(format!(
                 "reorg_to({target_hash}): {res:?}"
@@ -1057,6 +1063,19 @@ mod tests {
             ),
             (synced.hash(), synced.hash(), synced.hash())
         );
+    }
+
+    #[tokio::test]
+    async fn reorg_to_syncing_keeps_the_head() {
+        let (engine, _seen) = mock_engine(true);
+        let h0 = sealed(0);
+        let handle = spawn_committer(engine, h0.clone());
+
+        assert!(matches!(
+            handle.reorg_to(sealed(1)).await,
+            Err(DriverError::EngineNotReady(_))
+        ));
+        assert_eq!(handle.last_header().hash(), h0.hash());
     }
 
     #[tokio::test]
