@@ -11,7 +11,8 @@ use eez_driver::{BlockCommitterHandle, RollupTiming};
 use eez_l1::{L1CanonicalHead, L1Error, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
 use eez_node_common::EezNode;
 use eez_node_common::{
-    L2NodeBuilder, node_cli, read_checkpoint_dir, wait_for_l1_ready, warn_on_deprecated_env,
+    L2NodeBuilder, ReadinessProbe, node_cli, read_checkpoint_dir, wait_for_l1_ready,
+    warn_on_deprecated_env,
 };
 use eez_seq_sig::HeadDomain;
 use reth_chainspec::EthChainSpec as _;
@@ -150,7 +151,12 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         },
     );
 
-    wait_for_l1_ready(&l1_reader, deploy_block, read_l1_chain_id()?).await?;
+    wait_for_l1_ready(
+        &l1_reader,
+        ReadinessProbe::DeployBlock(deploy_block),
+        read_l1_chain_id()?,
+    )
+    .await?;
 
     let mut retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
     let mut attempts = 0_u64;

@@ -3521,6 +3521,7 @@ dependencies = [
  "alloy-rpc-types-eth",
  "clap",
  "dotenvy",
+ "eez-deriver",
  "eez-driver",
  "eez-evm",
  "eez-l1",

@@ -29,7 +29,7 @@ use eez_l1::{
 };
 use eez_node_common::EezNode;
 use eez_node_common::{
-    L2NodeBuilder, NoRoleArgs, node_cli, read_checkpoint_dir, wait_for_l1_ready,
+    L2NodeBuilder, NoRoleArgs, ReadinessProbe, node_cli, read_checkpoint_dir, wait_for_l1_ready,
     warn_on_deprecated_env,
 };
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
@@ -763,7 +763,12 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     }
 
     let l1_reader = submitter.reader();
-    wait_for_l1_ready(&l1_reader, deploy_block, l1_source_chain_id).await?;
+    wait_for_l1_ready(
+        &l1_reader,
+        ReadinessProbe::DeployBlock(deploy_block),
+        l1_source_chain_id,
+    )
+    .await?;
     for (expected_chain_id, provider) in &xchain_checks {
         ingress::validate_cross_chain_front(provider, *expected_chain_id).await?;
     }

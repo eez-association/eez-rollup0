@@ -9,6 +9,13 @@ use reth_ethereum_cli::{
 use reth_node_builder::{NodeBuilder, WithLaunchContext};
 use tracing::{Level, event};
 
+#[cfg(feature = "l1-startup")]
+mod boot;
+#[cfg(feature = "l1-startup")]
+pub use boot::{
+    BootStep, L1_HISTORY_MISSING_DEPTH, SyncMode, boot_catch_up, boot_from_peers, decide,
+    ensure_l1_history, l1_history_missing, parse_sync_mode, sync_mode_from_env,
+};
 mod discovery;
 pub use discovery::{EezNetworkBuilder, discover};
 mod node;
@@ -126,7 +133,27 @@ pub fn read_checkpoint_dir() -> Option<std::path::PathBuf> {
     dir
 }
 
-/// Blocks until L1 serves the configured history and matches the expected chain.
+/// The L1 block that must be served before boot reads L1.
+#[cfg(feature = "l1-startup")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadinessProbe {
+    /// L1-only derivation scans from the deploy block.
+    DeployBlock(u64),
+    /// Peers mode anchors at L1's finalized block.
+    Finalized,
+}
+
+#[cfg(feature = "l1-startup")]
+impl std::fmt::Display for ReadinessProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeployBlock(block) => write!(f, "deploy block {block}"),
+            Self::Finalized => f.write_str("the finalized block"),
+        }
+    }
+}
+
+/// Blocks until L1 serves the `probe` block and matches the expected chain.
 ///
 /// # Errors
 ///
@@ -135,7 +162,7 @@ pub fn read_checkpoint_dir() -> Option<std::path::PathBuf> {
 #[cfg(feature = "l1-startup")]
 pub async fn wait_for_l1_ready(
     l1_reader: &eez_l1::L1Reader,
-    deploy_block: u64,
+    probe: ReadinessProbe,
     expected_l1_chain_id: u64,
 ) -> eyre::Result<()> {
     use std::time::Duration;
@@ -145,6 +172,7 @@ pub async fn wait_for_l1_ready(
     const MAX_POLLS: u32 = 3_600; // 2 h overall, even while it claims to sync
 
     let mut best_remaining = u64::MAX;
+    let mut best_head = 0_u64;
     let mut stalled = 0_u32;
     let mut waited = 0_u32;
     let mut last_err: Option<String> = None;
@@ -168,30 +196,50 @@ pub async fn wait_for_l1_ready(
                 last_err = Some(err.to_string());
                 (false, format!("unreachable: {err}"))
             }
-            Ok(state) if state.head_block_number < deploy_block => {
-                let remaining = deploy_block - state.head_block_number;
-                let closer = remaining < best_remaining;
-                best_remaining = best_remaining.min(remaining);
-                (closer, format!("{remaining} blocks below the deploy block"))
+            Ok(state) => {
+                // While L1 has no finalized block, a moving head counts as progress.
+                let head_advanced = state.head_block_number > best_head;
+                best_head = best_head.max(state.head_block_number);
+                let block = match probe {
+                    ReadinessProbe::DeployBlock(block) => Ok(Some(block)),
+                    ReadinessProbe::Finalized => l1_reader
+                        .finalized_block()
+                        .await
+                        .map(|finalized| finalized.map(|(number, _)| number)),
+                };
+                match block {
+                    Err(err) => {
+                        last_err = Some(err.to_string());
+                        (false, format!("finalized block probe failed: {err}"))
+                    }
+                    Ok(None) => (head_advanced, "L1 has no finalized block yet".to_string()),
+                    Ok(Some(block)) if state.head_block_number < block => {
+                        let remaining = block - state.head_block_number;
+                        let closer = remaining < best_remaining;
+                        best_remaining = best_remaining.min(remaining);
+                        (closer, format!("{remaining} blocks below {probe}"))
+                    }
+                    Ok(Some(block)) => match l1_reader.serves_history(block).await {
+                        Ok(true) if chain_verified => {
+                            event!(
+                                name: "eez.node.l1_ready",
+                                Level::INFO,
+                                head = state.head_block_number,
+                                block,
+                                %probe,
+                                "L1 source can serve our history",
+                            );
+                            return Ok(());
+                        }
+                        Ok(true) => (false, "chain id not read yet".to_string()),
+                        Ok(false) => (state.syncing, format!("does not serve {probe}")),
+                        Err(err) => {
+                            last_err = Some(err.to_string());
+                            (false, format!("history probe failed: {err}"))
+                        }
+                    },
+                }
             }
-            Ok(state) => match l1_reader.serves_history(deploy_block).await {
-                Ok(true) if chain_verified => {
-                    event!(
-                        name: "eez.node.l1_ready",
-                        Level::INFO,
-                        head = state.head_block_number,
-                        deploy_block,
-                        "L1 source can serve our history",
-                    );
-                    return Ok(());
-                }
-                Ok(true) => (false, "chain id not read yet".to_string()),
-                Ok(false) => (state.syncing, "does not serve the deploy block".to_string()),
-                Err(err) => {
-                    last_err = Some(err.to_string());
-                    (false, format!("history probe failed: {err}"))
-                }
-            },
         };
 
         stalled = if progressing { 0 } else { stalled + 1 };
@@ -200,7 +248,7 @@ pub async fn wait_for_l1_ready(
             event!(
                 name: "eez.node.l1_not_ready",
                 Level::WARN,
-                deploy_block,
+                %probe,
                 stalled_polls = stalled,
                 status,
                 "waiting for L1 to serve our history",
@@ -209,7 +257,7 @@ pub async fn wait_for_l1_ready(
         if stalled >= STALLED_POLLS || waited >= MAX_POLLS {
             let cause = last_err.unwrap_or(status);
             return Err(eyre::eyre!(
-                "L1 never became able to serve block {deploy_block}: {cause}"
+                "L1 never became able to serve {probe}: {cause}"
             ));
         }
         tokio::time::sleep(POLL).await;

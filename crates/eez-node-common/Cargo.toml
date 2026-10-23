@@ -8,12 +8,13 @@ description            = "Shared reth bootstrap substrate for eez node-role bina
 
 [features]
 default = []
-l1-startup = ["dep:eez-l1"]
+l1-startup = ["dep:eez-l1", "dep:eez-deriver"]
 
 [dependencies]
 eez-driver.workspace = true
 eez-p2p.workspace    = true
 eez-l1 = { workspace = true, optional = true }
+eez-deriver = { workspace = true, optional = true }
 
 alloy-primitives.workspace                = true
 alloy-eips.workspace                      = true
