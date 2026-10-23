@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use alloy_primitives::U256;
+use alloy_provider::{Provider, ProviderBuilder};
 use eez_testkit::{
     ANVIL_ADDR_3, ANVIL_KEY_1, Harness, NodeBinary, NodeConfig, NodeHandle, STAGING_USER_KEY,
     send_l2_value_transfer_confirmed, signals, wait_for, wait_for_latest_height,
@@ -87,6 +88,17 @@ async fn restart_with_datadir_ahead_of_l1_retreats_before_production() {
         "the dropped staged transaction is not reported: {:?}",
         dropped.fields
     );
+    // The signal saw the transfer on the restarted chain; reth losing its receipt shows the unwind.
+    let l2 = ProviderBuilder::new().connect_http(restarted.l2_rpc_url().parse().unwrap());
+    wait_for(Duration::from_mins(1), || async {
+        Ok(l2
+            .get_transaction_receipt(staged_tx)
+            .await?
+            .is_none()
+            .then_some(()))
+    })
+    .await
+    .expect("reth still serves the dropped staged transfer");
     // Catchup ignores the speculative cap, so the restarted chain's height says nothing;
     // the order does: the tail goes before the first Sync slot.
     let order: Vec<_> = restarted
