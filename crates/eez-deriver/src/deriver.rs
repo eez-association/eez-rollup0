@@ -1285,8 +1285,8 @@ where
         Ok(())
     }
 
-    /// Retreat reth's safe/finalized anchors and canonical head to the
-    /// L1-derived cursor. Caller holds the reconcile lock so the Sequencer
+    /// Retreat reth's safe/finalized anchors to the L1-derived cursor and drop
+    /// the blocks above it. Caller holds the reconcile lock so the Sequencer
     /// can't extend the branch between the two forkchoice updates.
     async fn retreat_l2_to_cursor(&self, cursor: u64) -> DeriverResult<B256> {
         let safe_header = self.l2_sealed_header_at(cursor)?;
@@ -1294,14 +1294,51 @@ where
         let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
 
         // Order matters: retreat safe/finalized first while the old head is
-        // still canonical, then roll head back and repair the parent mirror.
+        // still canonical, then drop the blocks above the cursor.
         self.inner
             .committer
             .advance_safe_finalized(safe_header.clone(), finalized_hash)
             .await?;
-        self.inner.committer.reorg_to(safe_header).await?;
+        if let Err(error) = self.replace_above(&safe_header).await {
+            event!(
+                name: "eez.deriver.l1.reorg.replace_failed",
+                Level::WARN,
+                cursor,
+                error = %error,
+                "could not replace the blocks above the cursor; rewinding, which loses their pure L2 txs",
+            );
+            self.inner.committer.reorg_to(safe_header).await?;
+        }
         self.inner.safe_l2_block.store(cursor, Ordering::Release);
         Ok(safe_hash)
+    }
+
+    /// Drop the blocks above `cursor` by committing an empty block in their
+    /// place while they are still canonical. That is a reth reorg, so the L2
+    /// pool takes back their pure L2 txs; a rewind would lose them.
+    async fn replace_above(
+        &self,
+        cursor: &SealedHeader<alloy_consensus::Header>,
+    ) -> DeriverResult<()> {
+        let head = self.inner.committer.last_header().number();
+        let inputs = BlockHeaderInputs {
+            beneficiary: cursor.beneficiary(),
+            extra_data: Bytes::new(),
+        };
+        // A block that already is the empty child of its parent stays:
+        // committing it again would unwind to it silently, not reorg.
+        for parent in cursor.number()..head {
+            let (payload, header) = self.execute_block(parent, &[], &inputs)?;
+            if self.l2_hash_at(parent + 1)? != header.hash() {
+                // feed_witness=true: a PRODUCED block, posted with the next batch.
+                self.inner
+                    .committer
+                    .commit_derived(payload, header, true)
+                    .await?;
+                break;
+            }
+        }
+        Ok(())
     }
 
     async fn on_l1_finalized(&self, l1_finalized_block: u64) -> DeriverResult<()> {
