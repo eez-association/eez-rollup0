@@ -108,6 +108,10 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     let timing = RollupTiming::from_env()?;
     let l1_head = Arc::new(L1CanonicalHead::default());
 
+    // Env reads come first so a bad L1 env fails at startup, not after a backfill.
+    let l1_reader_config = L1ReaderConfig::from_env()?;
+    let l1_watcher_config = L1WatcherConfig::from_env()?;
+
     // The committer reads reth's head, which a resumed backfill is still moving.
     wait_for_idle_engine(|| network.is_syncing()).await;
     let block_committer = BlockCommitterHandle::spawn_from_provider(
@@ -117,11 +121,10 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         None,
     )?;
 
-    let l1_reader_config = L1ReaderConfig::from_env()?;
     let deploy_block = l1_reader_config.deploy_block;
     let registry = l1_reader_config.eez;
     let l1_reader = L1Reader::new(l1_reader_config);
-    let l1_watcher = L1Watcher::new(L1WatcherConfig::from_env()?);
+    let l1_watcher = L1Watcher::new(l1_watcher_config);
     let l2_chain_id = chain_spec.chain().id();
     let head_domain = HeadDomain {
         l2_chain_id,

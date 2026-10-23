@@ -346,6 +346,10 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
 
     let timing = RollupTiming::from_env()?;
 
+    // Env reads come first so a bad L1 env fails at startup, not after a backfill.
+    let submitter_config = SubmitterConfig::from_env()?;
+    let l1_watcher_config = L1WatcherConfig::from_env()?;
+
     // The committer reads reth's head, which a resumed backfill is still moving.
     wait_for_idle_engine(|| network.is_syncing()).await;
     let block_committer = BlockCommitterHandle::spawn_from_provider(
@@ -359,11 +363,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MAX_SPECULATIVE_DEPTH);
 
-    let submitter_config = SubmitterConfig::from_env()?;
     let deploy_block = submitter_config.reader.deploy_block;
     let attributes = EthAttributesBuilder::new(chain_spec.clone())
         .with_fee_recipient(rollup_config.fee_recipient);
-    let l1_watcher_config = L1WatcherConfig::from_env()?;
 
     let submitter = Submitter::new(submitter_config);
     // Handle only — polling starts after boot catch-up fixes the
