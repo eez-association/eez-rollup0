@@ -21,6 +21,8 @@ pub const NODE_BOOT_CATCH_UP_FAILED: &str = "eez.node.deriver.boot_catch_up.fail
 /// A peers-mode node waits for its peers to serve the L1-finalized root.
 pub const NODE_SYNC_WAITING_FOR_PEERS: &str = "eez.node.sync.waiting_for_peers";
 pub const DERIVER_CATCH_UP_START: &str = "eez.deriver.catch_up.start";
+/// A restarted composer rewinds to L1's cursor, dropping the blocks L1 never settled.
+pub const COMPOSER_UNSETTLED_TAIL_DROPPED: &str = "eez.node.composer.unsettled_tail.dropped";
 pub const COMPOSER_BUNDLE_DISPATCHED: &str = "eez.composer.bundle.dispatched";
 pub const COMPOSER_SYNC_SLOT_INVOKED: &str = "eez.composer.sync_slot.invoked";
 pub const COMPOSER_SYNC_SLOT_DRAIN: &str = "eez.composer.sync_slot.drain";

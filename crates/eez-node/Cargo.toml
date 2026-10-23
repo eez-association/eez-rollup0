@@ -29,6 +29,7 @@ reth-ethereum-cli.workspace               = true
 reth-ethereum-primitives.workspace        = true
 reth-evm.workspace                        = true
 reth-evm-ethereum.workspace               = true
+reth-network.workspace                    = true
 reth-network-peers.workspace              = true
 reth-node-api.workspace                   = true
 reth-node-builder.workspace               = true

@@ -7,36 +7,50 @@
 use std::time::Duration;
 
 use alloy_primitives::U256;
-use alloy_rpc_types_eth::BlockNumberOrTag;
 use eez_testkit::{
     ANVIL_ADDR_3, ANVIL_KEY_1, Harness, NodeBinary, NodeConfig, NodeHandle, STAGING_USER_KEY,
-    block_number_and_hash_at, send_l2_value_transfer_confirmed, wait_for_latest_height,
+    send_l2_value_transfer_confirmed, signals, wait_for, wait_for_latest_height,
     wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
 };
 
 const TIMEOUT: Duration = Duration::from_mins(5);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "known restart defect: empty L1 derivation currently leaves an unconfirmed local suffix canonical"]
 async fn restart_with_datadir_ahead_of_l1_retreats_before_production() {
     // G-10 / P-03 / P-05: stage a crash boundary after L2 commit but before L1.
     let harness = Harness::fresh().await.unwrap();
     let chain = harness.chain();
     let datadir = tempfile::tempdir().unwrap();
+    // reth persists only past 50 in-memory blocks by default; at 0 the kill leaves the suffix on disk.
     let cfg = NodeConfig {
         genesis_path: Some(harness.l2_genesis_path()),
+        extra_args: vec!["--engine.persistence-threshold".into(), "0".into()],
         ..Default::default()
     };
-    let stage_env = harness.env_for(STAGING_USER_KEY, true).await.unwrap();
+    let env = harness.env_for(STAGING_USER_KEY, true).await.unwrap();
 
+    let staged_tx;
     {
-        let node =
-            NodeHandle::start_with_datadir("ahead-of-l1-stage", datadir.path(), &cfg, &stage_env)
-                .await
-                .unwrap();
+        let node = NodeHandle::start_with_datadir("ahead-of-l1-stage", datadir.path(), &cfg, &env)
+            .await
+            .unwrap();
+        staged_tx = send_l2_value_transfer_confirmed(
+            &node.l2_rpc_url(),
+            ANVIL_KEY_1,
+            ANVIL_ADDR_3,
+            U256::from(23u64),
+            TIMEOUT,
+        )
+        .await
+        .expect("staged transaction did not land");
         wait_for_latest_height(&node, 4, TIMEOUT)
             .await
             .expect("failed to stage a multi-block unconfirmed suffix");
+        // Persistence trails the head; one L1 block lets it flush.
+        chain
+            .wait_for_l1_blocks(1, Duration::from_secs(20))
+            .await
+            .expect("L1 did not advance while the staged suffix persisted");
         assert_eq!(
             chain.batches_posted().await.unwrap(),
             0,
@@ -44,27 +58,51 @@ async fn restart_with_datadir_ahead_of_l1_retreats_before_production() {
         );
     }
 
-    // Append because this key is absent from the standard environment.
-    let mut restart_env = stage_env;
-    restart_env.push(("EEZ_MAX_SPECULATIVE_DEPTH", "1".to_string()));
     let restarted =
-        NodeHandle::start_with_datadir("ahead-of-l1-restart", datadir.path(), &cfg, &restart_env)
+        NodeHandle::start_with_datadir("ahead-of-l1-restart", datadir.path(), &cfg, &env)
             .await
             .unwrap();
-
-    // Give startup reconciliation and one production opportunity time to run.
-    chain
-        .wait_for_l1_blocks(2, Duration::from_secs(20))
-        .await
-        .expect("L1 did not advance while observing restart reconciliation");
-    let latest = block_number_and_hash_at(&restarted.l2_rpc_url(), BlockNumberOrTag::Latest)
-        .await
-        .unwrap()
-        .expect("restarted node has a latest head");
+    let dropped = wait_for(Duration::from_mins(1), || async {
+        Ok(restarted
+            .signals_since(0)?
+            .into_iter()
+            .find(|s| s.name == signals::COMPOSER_UNSETTLED_TAIL_DROPPED))
+    })
+    .await
+    .expect("the restarted composer never dropped its unsettled tail");
+    assert_eq!(
+        dropped.u64("from").unwrap(),
+        1,
+        "the drop must start right above the L1-confirmed cursor, block 0"
+    );
     assert!(
-        latest.0 <= 1,
-        "unconfirmed pre-crash suffix survived boot: latest L2 is {}, L1-confirmed cursor is 0 and speculative limit is 1",
-        latest.0
+        dropped.u64("to").unwrap() >= 4,
+        "the drop missed part of the persisted staged suffix: {:?}",
+        dropped.fields
+    );
+    assert!(
+        dropped.fields["tx_hashes"]
+            .as_str()
+            .is_some_and(|hashes| hashes.contains(&format!("{staged_tx:#x}"))),
+        "the dropped staged transaction is not reported: {:?}",
+        dropped.fields
+    );
+    // Catchup ignores the speculative cap, so the restarted chain's height says nothing;
+    // the order does: the tail goes before the first Sync slot.
+    let order: Vec<_> = restarted
+        .signals_since(0)
+        .unwrap()
+        .into_iter()
+        .map(|s| s.name)
+        .filter(|name| {
+            name == signals::COMPOSER_UNSETTLED_TAIL_DROPPED
+                || name == signals::COMPOSER_SYNC_SLOT_INVOKED
+        })
+        .collect();
+    assert_eq!(
+        order.first().map(String::as_str),
+        Some(signals::COMPOSER_UNSETTLED_TAIL_DROPPED),
+        "the restarted composer produced before dropping its unsettled tail",
     );
     assert_eq!(
         chain.batches_posted().await.unwrap(),

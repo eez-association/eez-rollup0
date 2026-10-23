@@ -3489,6 +3489,7 @@ dependencies = [
  "reth-evm",
  "reth-evm-ethereum",
  "reth-libmdbx",
+ "reth-network",
  "reth-network-peers",
  "reth-node-api",
  "reth-node-builder",
