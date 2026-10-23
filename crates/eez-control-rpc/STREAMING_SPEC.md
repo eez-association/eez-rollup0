@@ -1,9 +1,8 @@
 # Composer-to-prover streaming RPC
 
-Status: proposed wire contract, following the design-only scope of
-[PR #168](https://github.com/eez-association/eez-rollup0/pull/168).
-This change does not implement a Composer or prover runtime. The existing
-[window RPC specification](SPEC.md) and endpoint remain unchanged.
+The Rollup0 runtime implements this contract for its current calldata-only,
+timeless settlement profile. The existing [window RPC specification](SPEC.md)
+and endpoint remain available for compatibility.
 [prove_stream.proto](proto/prove_stream.proto) is the canonical schema.
 
 The contract separates three things: required streaming behavior, optional
@@ -124,12 +123,14 @@ anchor, epoch and validated prefix unchanged. The client can open a new stream,
 Begin at the desired predecessor and backfill the same requested range; it must
 not silently widen the range or change the settlement input.
 
-The prover obtains the selected parent's header and L1 acceptance evidence from
-its own L1/L2 data sources and authenticates them under the configured settlement
-rules. For an intermediate parent, its execution evidence is already retained;
-its L1 authorization must still be checked. Validated ACKs alone never establish
-settlement eligibility. Missing evidence is UNAVAILABLE, not permission to sign.
-No parent-provenance payload is sent by the Composer.
+Parent authorization follows the configured settlement profile, as described in
+[section 3](#parent-authorization-by-profile). Current Rollup0 proofs are
+conditional on the selected parent; they do not attest its L1 acceptance.
+Profiles requiring prover-side L1 authentication obtain the selected parent's
+evidence from the prover's own L1/L2 sources, including for an intermediate parent.
+Missing required evidence is UNAVAILABLE, not permission to sign. Validated ACKs
+alone never establish L1 acceptance. No parent-provenance payload is sent by the
+Composer.
 
 Finalize binds the complete settlement input in section 3 to that exact range.
 Only successful execution, settlement, DA, proof-system and public-input checks
@@ -157,7 +158,8 @@ Blobs and posting context are optional at the common wire layer; the configured
 profile decides which are required. Today's calldata-only, timeless Rollup0
 profile omits both. The RollupX blob profile requires both. Blob-based Rollup0
 uses these same fields, with its own payload and settlement rules.
-Parent authorization is the prover's responsibility, not an RPC input.
+Where the profile requires prover-side parent authorization, evidence retrieval
+is the prover's responsibility, not an RPC input.
 Supporting the wire fields does not imply that a prover implements every profile.
 There is no authoritative Composer-claimed public-input hash, commitment or
 custom-data value in this envelope.
@@ -261,16 +263,33 @@ only after the new target's constraints are checked. Do not require the named
 parent to remain the tip: the on-chain latest-context binding determines whether
 the proof can be used in the actual posting environment.
 
-### Prover-owned parent authorization
+### Parent authorization by profile
 
+**Current calldata-only, timeless Rollup0 keeps conditional proofs.** A proof
+for blocks 101–110 establishes the valid transition starting from the selected
+block 100; it does not establish that block 100 was already accepted on L1.
+The signer binds execution and settlement claims to that exact parent, while the
+L1 contract checks each update's `currentRoot` against the live rollup root when
+consuming the entry. No independent L1-acceptance query is required of the
+stateless signer. This applies equally to baseline and subrange finalization,
+retries and cache hits. A valid proof does not guarantee future inclusion or
+that the batch will apply when submitted.
+
+The stateful backend still applies its existing admission/fork-choice policy:
+Begin checks the local L1-derived safe anchor, and Finalize selects a terminal
+consistent with Reth's safe/finalized ancestry. Those checks do not change the
+conditional meaning of the common attestation or require the stateless backend
+to fetch L1 history.
+
+**RollupX and draft blob-based Rollup0 require prover-side parent authentication.**
 At every Finalize, including retries and cache hits, the prover authenticates
 the selected settlement parent. For the baseline this is the session anchor,
-initially supplied in Begin;
-with optional subrange finalization it is the retained block immediately before
-from_block. Fetch any missing header from the prover's L2 data source and bind
-its number, hash and state root to that session parent. Obtain acceptance history
-from the configured L1 source; neither a Composer-supplied anchor nor successful
-block execution proves L1 acceptance.
+initially supplied in Begin; with optional subrange finalization it is the
+retained block immediately before from_block. Fetch any missing header from the
+prover's L2 data source and bind its number, hash and state root to that session
+parent. Obtain acceptance history from the configured L1 source; neither a
+Composer-supplied anchor nor successful block execution proves L1 acceptance.
+This is a check of historical acceptance, not a prediction of future inclusion.
 
 For the RollupX profile, authenticate the configured genesis or the selected
 parent's accepted endpoint on canonical L1. Obtain the complete ordered live-slot
@@ -283,9 +302,10 @@ does not establish parent authorization. These are the obligations enforced by
 RollupX's [authorization implementation](https://github.com/eduadiez/rollupX/blob/e15bb412420b36bfa40a0e2a73233ac4f213441d/crates/eez-l1/src/derivation/proof.rs);
 its caller-supplied evidence is replaced here by prover-owned retrieval.
 
-The prover must use a coherent canonical L1 snapshot. Unavailable evidence is
-UNAVAILABLE; a replaced target is ABORTED; invalid parent authorization is
-FAILED_PRECONDITION. These failures have no actionable candidate-eviction details
+For these L1-authenticated profiles, the prover must use a coherent canonical L1
+snapshot. Unavailable evidence is UNAVAILABLE; a replaced target is ABORTED;
+invalid parent authorization is FAILED_PRECONDITION. These failures have no
+actionable candidate-eviction details
 and must not consume validated progress. The prover needs access to the required
 history, but this contract does not mandate an index or storage layout.
 
@@ -321,8 +341,8 @@ inputs. Never strip required blobs or context to retry as a weaker request.
 Calldata-only Rollup0 can use the same settlement message with its optional inputs
 absent, then populate the existing blob/context fields when its profile migrates.
 
-This design-only change neither changes the existing runtime nor claims full
-Rollup0-draft or live RollupX conformance.
+The current Rollup0 implementation does not claim full Rollup0-draft or live
+RollupX conformance; those settlement profiles need separate implementations.
 
 ## 4. Optional advanced session controls
 
@@ -385,5 +405,36 @@ deadline is guaranteed by the wire contract.
 Conformance should cover baseline and optional exchanges separately. Codec
 vectors pin field numbers and request/response encoding; they are not substitutes
 for executed-block and on-chain proof oracles. Recorded live request/response
-transcripts belong with each runtime implementation. Keep vector fixtures and
-their test harness separate from this protocol proposal.
+transcripts belong with each runtime implementation.
+
+### Rollup0 runtime
+
+The stateless signer and the stateful follower signer implement Resume, Rewind,
+Cancel, subrange selection and bounded pipelining. Both reject nonempty blobs
+or any posting context with UNIMPLEMENTED; this is not a blob-profile implementation.
+Ordinary execution ACKs do not claim L1 acceptance. Final settlement retains
+the current Rollup0 [conditional-proof rules](#parent-authorization-by-profile);
+stateful fork selection additionally obeys Reth's safe/finalized ancestry.
+
+Rollup0's Composer requires a pipelining-capable server and retains a live stream,
+limiting outstanding requests to eight while draining responses concurrently.
+Unsupported session controls and subrange selection fall back to fresh Begin/backfill without
+changing the requested settlement. An exchange, including reconnect and EOF,
+has a five-second transport deadline; the Composer's proof cutoff can be shorter.
+
+The server admits at most 128 active streams and retains at most 64 sessions.
+Pending frames are bounded by the configured window block/witness quotas and
+twice its payload-byte quota (window plus Finalize). Session admission applies
+the configured window quotas independently, including on cache hits. Output
+backpressure uses the stream idle deadline. Stateless execution has four worker
+slots and a 512 MiB / 32,768-block cache; stateful execution serializes Reth fork
+selection with its follower's reconciliation. These are implementation limits,
+not protocol guarantees.
+
+### Executed Rollup0 transcripts
+
+See the [conformance guide](conformance/README.md) for the recorded normal and
+boundary cases, deployment profiles, replay instructions and coverage limits.
+The standalone client and the stateless signer integration suite share the same
+wire replayer and read-only expectations. The integration suite starts a fresh
+signer for each case, including cold-cache and configured-limit cases.
