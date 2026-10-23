@@ -460,7 +460,8 @@ until step 6 ends.
      (`l1_canonical_head.rs:82-88`); the boot-checkpoint seed is the template
      (`deriver.rs:388-401`);
    - safe and finalized start at `H_F`, so reth's finalized never resets to
-     genesis after a restart;
+     genesis after a restart (when `F` predates the rollup's registration the
+     seed is L2 genesis, so both start at block 0: nothing is settled yet);
    - the record is a floor. An L1 reorg or an index revalidation below it is
      fatal (finality broke, or the RPC lied); it never rewinds L2.
 5. **Reconcile `F` → L1 head** with the existing scan and its retry/terminal
