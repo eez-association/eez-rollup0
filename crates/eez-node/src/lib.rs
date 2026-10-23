@@ -28,7 +28,7 @@ use eez_driver::{
 use eez_l1::{
     L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
 };
-use eez_node_common::EezNode;
+use eez_node_common::{EezNode, HeldTxs};
 use eez_node_common::{
     L2NodeBuilder, NoRoleArgs, boot, node_cli, sync_mode_from_env, wait_for_idle_engine,
     wait_for_l1_ready, warn_on_deprecated_env,
@@ -473,8 +473,13 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     if p2p_config.is_some() && sequencer_key.is_none() {
         eyre::bail!("EEZ_P2P_LISTEN requires EEZ_SEQUENCER_KEY on a composer");
     }
+    // Before launch: the L2 pool refuses the cross-chain txs this pool holds.
+    let held_pool = Arc::new(HeldPool::new());
+    let held = Arc::clone(&held_pool);
     let handle = builder
-        .node(EezNode)
+        .node(EezNode {
+            held: Some(HeldTxs(Arc::new(move |hash| held.holds(hash)))),
+        })
         .extend_rpc_modules(move |ctx| {
             composer_rpc::install_composer_rpc(ctx, composer_info.clone())
         })
@@ -501,8 +506,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     let submitter_config = SubmitterConfig::from_env()?;
     let l1_watcher_config = L1WatcherConfig::from_env()?;
 
-    // Share the SAME HeldPool the ingress middleware pushes into.
-    let held_pool = Arc::new(HeldPool::new());
     // EVM config feeds the manual Sync-block construction path
     // (build_sync_block → reth-evm BlockBuilder). Same chain spec
     // the engine uses, so blocks produced here pass validation
