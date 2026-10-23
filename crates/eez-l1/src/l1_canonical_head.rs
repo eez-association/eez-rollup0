@@ -345,9 +345,19 @@ mod tests {
         let head = L1CanonicalHead::default();
         head.seed(record(100, u64::MAX, 40));
         head.append(record(105, 1, 50));
-        assert_eq!(head.retreat_on_l1_reorg(103), Ok((40, 40, 1)));
+        head.set_finalized_l2(45);
         assert_eq!(head.retreat_on_l1_reorg(99), Err(post(100, u64::MAX)));
-        assert_eq!(head.cursor(), 40);
+        assert_eq!(
+            (
+                head.cursor(),
+                head.finalized_l2(),
+                head.batches.lock().unwrap().len()
+            ),
+            (50, 45, 2),
+            "a refused retreat leaves the index untouched",
+        );
+        // An ancestor at the floor's own block keeps the seed.
+        assert_eq!(head.retreat_on_l1_reorg(100), Ok((40, 40, 1)));
         assert_eq!(
             head.last_indexed().map(|r| r.post),
             Some(post(100, u64::MAX))
