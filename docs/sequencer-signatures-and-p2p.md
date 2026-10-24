@@ -339,10 +339,10 @@ other.
   body against the header. The RPC block source exists only in RPC mode.
 - **Peers:** a fetch runs only when `num_connected_peers() > 0`, and it is
   time-boxed, because reth queues requests forever without peers.
-- **`advance_unsafe_head`** (used only by #206's stateful backend) still
-  accepts SYNCING. With devp2p peers, reth could then sync an unknown target
-  itself while the committer's head stays stale. #206's integration owns
-  that call.
+- **`advance_unsafe_head`** (used only by #206's stateful backend, to select
+  a validated terminal it already imported) moves nothing on SYNCING: it
+  returns Syncing and the backend retries. A kept target would make every
+  later safe/finalized FCU answer SYNCING.
 
 **Follower.** Heads arrive from gossip and from the RPC poller. Both feed the
 same tracker, and the highest version wins.
@@ -539,10 +539,9 @@ bundle is rolled back. That is fixed on its own branch off main, not here.
   earlier is stale, and an FCU carrying it would unwind what the backfill
   synced.
 - **SYNCING never counts as success** for a command that moves safe or
-  finalized. `advance_safe_finalized` stores its cursors only on VALID; today
-  it accepts SYNCING (`block_committer.rs:655-659`).
-- It builds on #206's "engine not ready" outcome. #206 merges before this
-  stack.
+  finalized. `advance_safe_finalized` stores its cursors only on VALID;
+  `advance_safe_finalized`, `refresh_forkchoice` and `reorg_to` return #206's
+  `DriverError::EngineNotReady` on SYNCING.
 
 **Peers and history.**
 - **Peers:** every node that may need history has devp2p peers, either
@@ -554,9 +553,10 @@ bundle is rolled back. That is fixed on its own branch off main, not here.
   - On a small network the composer is often the only one, and serving syncs
     competes with block production.
 - **Configs:**
-  - the genesis composer runs `EEZ_SYNC_L1_ONLY=1`;
-  - every other L2 node gets trusted peers: node B, followers, and #206's
-    stateful prover;
+  - the genesis composer runs `EEZ_SYNC_L1_ONLY=1`, and so does #206's
+    stateful prover: it verifies from L1, and it starts before the composer,
+    its only possible peer;
+  - every other L2 node gets trusted peers: node B and followers;
   - compose files and kurtosis change accordingly.
 
 **Tests.**
