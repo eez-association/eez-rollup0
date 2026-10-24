@@ -409,8 +409,7 @@ struct ProofSignerConfig<'a> {
     chain_config: &'a std::path::Path,
     rollup_id: u64,
     signer_key: &'a str,
-    /// Registry vkey for `proof_system`; it may differ from `signer_key` in
-    /// unauthorized-signer tests.
+    /// Vkey used to hash the proof's public inputs.
     vkey: B256,
     proof_system: Address,
 }
@@ -892,6 +891,37 @@ impl Harness {
         .await
     }
 
+    /// Connect another Composer to an existing prover, retaining its own witness DB.
+    /// The caller owns the prover and witness directory for the lifetime of the node.
+    pub async fn env_for_prover(
+        &self,
+        poster_key: &str,
+        endpoint: &str,
+        witness_dir: &std::path::Path,
+    ) -> Result<Vec<(&'static str, String)>> {
+        let mut env = self
+            .env_for_options(NodeEnvOptions {
+                poster_key: Some(poster_key),
+                proof_signer_key: None,
+                rollup_id: self.dep.rollup_id,
+                expect_external_batches: true,
+                sequencer_rpc: None,
+            })
+            .await?;
+        env.extend([
+            ("EEZ_PROVER_URL", endpoint.to_owned()),
+            (
+                "EEZ_ATTESTER_ADDRESS",
+                format!("{:#x}", signer_address(ANVIL_ATTESTER_KEY)?),
+            ),
+            (
+                "EEZ_WITNESS_DB_PATH",
+                witness_dir.to_string_lossy().into_owned(),
+            ),
+        ]);
+        Ok(env)
+    }
+
     pub async fn env_with_rollup_id(&self, rollup_id: u64) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
             poster_key: Some(ANVIL_KEY),
@@ -986,8 +1016,8 @@ impl Harness {
                 chain_config: genesis,
                 rollup_id: opts.rollup_id,
                 signer_key,
-                // Unauthorized-signer tests still hash the registry's vkey.
-                vkey: signer_address(ANVIL_ATTESTER_KEY)?.into_word(),
+                // Match the client's vkey; L1 still checks its registered signer.
+                vkey: attester.into_word(),
                 proof_system: self.dep.proof_system_address,
             })
             .await?;
@@ -1488,7 +1518,7 @@ impl NodeHandle {
             .unwrap_or_else(|| std::ffi::OsString::from("dev"));
         let mut cmd = Command::new(cfg.binary.path()?);
         let signal_filter = std::env::var("EEZ_TEST_LOG").unwrap_or_else(|_| {
-            "warn,eez_node=info,eez_l1=info,eez_composer=info,eez_deriver=info".to_string()
+            "warn,eez_node=info,eez_l1=info,eez_composer=info,eez_deriver=info,eez_prover_client=info".to_string()
         });
         // Each role binary loads dotenv files from its working directory. Running from
         // the datadir prevents repository settings from changing the explicit

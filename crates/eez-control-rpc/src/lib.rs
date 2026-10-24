@@ -7,7 +7,7 @@
 //! recomputed `publicInputsHash`, and returns a [`v1::ProveResponse`]. One
 //! request/response: no feed, no dispatch, no sink.
 //!
-//! The proposed `prove.v2.Prover/ProveStream` contract has a small sequential
+//! The `prove.v2.Prover/ProveStream` contract has a small sequential
 //! baseline, optional session controls, and shared blob and
 //! posting inputs. This crate defines wire types, not runtime support.
 //! Only generated types + tonic stubs live here — no `Prover`-trait coupling.
@@ -102,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_frames_round_trip_with_correlated_session_and_request() {
+    fn streaming_frames_round_trip_with_correlated_session_and_request() {
         let begin = ClientFrame {
             session_id: Vec::new(),
             request_id: 17,

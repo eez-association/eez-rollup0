@@ -95,7 +95,7 @@ impl Prover for ProveSvc {
         fields(
             request_id = next_request_id(),
             peer_addr = ?request.remote_addr(),
-            validator = self.state.validator.label(),
+            validator = self.state.backend.label(),
             expected_rollup_id = self.state.expected_rollup_id.get(),
             wire_rollup_id = tracing::field::Empty,
             declared_from_block = tracing::field::Empty,
