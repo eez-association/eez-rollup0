@@ -180,6 +180,8 @@ def run(plan, args):
                     "EEZ_PROOF_TIME_MS": str(eez.get("proof_time_ms", 5000)),
                     "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 2500)),
                     "EEZ_L2_DATADIR": "/data/l2",
+                    # Verifies from L1; it starts before the composer, its only possible peer.
+                    "EEZ_SYNC_L1_ONLY": "1",
                     "EEZ_L2_HTTP_PORT": str(STATEFUL_L2_RPC_PORT),
                     "EEZ_L2_RPC_URL": "http://127.0.0.1:{}".format(STATEFUL_L2_RPC_PORT),
                     "EEZ_L2_AUTH_PORT": str(STATEFUL_L2_ENGINE_PORT),
