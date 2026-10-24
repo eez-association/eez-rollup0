@@ -18,6 +18,7 @@ eez-node-common = { workspace = true, features = ["l1-startup"] }
 eez-protocol.workspace      = true
 eez-prover.workspace        = true
 eez-prover-client.workspace = true
+eez-seq-sig.workspace       = true
 
 # reth
 reth-chainspec.workspace                  = true
@@ -34,6 +35,7 @@ reth-node-core.workspace                  = true
 reth-node-ethereum.workspace              = true
 reth-rpc-eth-api.workspace                = true
 reth-rpc-server-types.workspace           = true
+reth-primitives-traits.workspace          = true
 reth-storage-api.workspace                = true
 reth-tasks.workspace                      = true
 # Persistent witness store: dedicated mdbx env, separate from reth's node DB.
@@ -47,6 +49,7 @@ reth_gnosis.workspace                     = true
 alloy-consensus.workspace    = true
 alloy-eips.workspace         = true
 alloy-primitives.workspace   = true
+alloy-rlp.workspace          = true
 alloy-rpc-types-debug.workspace = true
 alloy-provider.workspace     = true
 alloy-signer-local.workspace = true
@@ -76,6 +79,8 @@ alloy-genesis = { version = "2", default-features = false }
 alloy-network.workspace = true
 alloy-rpc-types-eth.workspace = true
 tempfile = "3"
+reth-provider = { workspace = true, features = ["test-utils"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

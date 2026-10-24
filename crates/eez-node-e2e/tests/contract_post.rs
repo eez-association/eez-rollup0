@@ -22,7 +22,7 @@ const TIMEOUT: Duration = Duration::from_mins(6);
 const RIVAL_TIP: u128 = 100_000_000_000;
 
 async fn follower(w: &CrossChainWorld, name: &str, trace_rpc: String) -> NodeHandle {
-    let mut env = w.follower_env();
+    let mut env = w.follower_env(None);
     env.push(("EEZ_L1_TRACE_RPC_URL", trace_rpc));
     let cfg = NodeConfig {
         binary: NodeBinary::Follower,

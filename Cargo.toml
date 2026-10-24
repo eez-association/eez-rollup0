@@ -19,6 +19,7 @@ members = [
     "crates/eez-evm",
     "crates/eez-prover",
     "crates/eez-prover-client",
+    "crates/eez-seq-sig",
     "crates/eez-testkit",
 ]
 
@@ -60,6 +61,7 @@ alloy-rpc-types-debug = { version = "=2.5.0", default-features = false }
 # prover-port crates (composer-controlled prover, Model B)
 eez-control-rpc    = { path = "crates/eez-control-rpc" }
 eez-prover-client  = { path = "crates/eez-prover-client" }
+eez-seq-sig        = { path = "crates/eez-seq-sig" }
 
 # allocator for the binary
 mimalloc           = "0.1"
