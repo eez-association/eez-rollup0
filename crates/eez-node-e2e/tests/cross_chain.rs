@@ -1129,6 +1129,7 @@ async fn follower_replays_settled_inbound_safe_block() {
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(w.cfg.l2_genesis.0.as_path()),
+        ..Default::default()
     };
     let follower = NodeHandle::start(
         "xchain-inbound-follower",
@@ -1172,6 +1173,7 @@ async fn follower_adopts_replaced_sync_block() {
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(w.cfg.l2_genesis.0.as_path()),
+        ..Default::default()
     };
     let follower_env = override_env(
         w.follower_env(Some(&l2_rpc)),

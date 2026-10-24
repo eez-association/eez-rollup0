@@ -15,15 +15,20 @@ use eez_node_common::{
 };
 use eez_seq_sig::HeadDomain;
 use reth_chainspec::EthChainSpec as _;
+use reth_network::BlockDownloaderProvider as _;
+use tokio::sync::mpsc;
 use tracing::{Level, event};
 
-use unsafe_head::UnsafeHeadFollower;
+use unsafe_head::{PeerBlocks, UnsafeHeadFollower};
 
 const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// ~15 min at the capped backoff: outlasts a restarting L1, but a permanently
 /// refused RPC call still surfaces as an exit.
 const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
+/// Overlay heads queued while the follower imports; past it the overlay drops
+/// and WARNs instead of waiting.
+const GOSSIP_BUFFER: usize = 64;
 
 struct FollowerSystemConfig {
     eezl2_address: Address,
@@ -43,12 +48,13 @@ impl FollowerSystemConfig {
 /// Follower-specific CLI arguments layered on top of reth's CLI.
 #[derive(clap::Args, Debug, Clone)]
 struct FollowerArgs {
-    /// Sequencer JSON-RPC URL. When set, the unsafe head follows its signed
-    /// heads; safe and finalized remain L1-derived.
+    /// Sequencer JSON-RPC URL, polled for signed heads; without the p2p
+    /// overlay it also serves the missing blocks.
     #[arg(long, env = "EEZ_SEQUENCER_RPC")]
     sequencer_rpc: Option<url::Url>,
 
-    /// The only address whose signed heads are followed.
+    /// The only address whose signed heads are followed. When set, the unsafe
+    /// head follows them; safe and finalized remain L1-derived.
     #[arg(long, env = "EEZ_SEQUENCER_ADDRESS")]
     sequencer_address: Option<Address>,
 }
@@ -73,16 +79,24 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     warn_on_deprecated_env();
 
     let stateful_proof_signer = eez_prover_stateful::Config::from_env()?;
-    if stateful_proof_signer.is_some() && ext.sequencer_rpc.is_some() {
+    if stateful_proof_signer.is_some() && ext.sequencer_address.is_some() {
         return Err(eyre::eyre!(
-            "stateful proof signing requires an L1-derived-only follower; remove EEZ_SEQUENCER_RPC",
+            "stateful proof signing requires an L1-derived-only follower; remove EEZ_SEQUENCER_ADDRESS",
         ));
     }
-    let head_source = signed_head_source(ext.sequencer_rpc, ext.sequencer_address)?;
     // A production follower must reconstruct the Composer's Sync-block system
     // transactions byte-for-byte. Read every required value before launching
     // reth so a misconfigured follower never appears healthy.
     let system_config = read_system_config()?;
+    let p2p_config = eez_p2p::P2pConfig::from_env(
+        builder.config().chain.chain().id(),
+        system_config.this_rollup_id,
+    )?;
+    let head_address = head_follower(
+        ext.sequencer_rpc.clone(),
+        p2p_config.is_some(),
+        ext.sequencer_address,
+    )?;
     let system_address = eez_primitives::SYSTEM_ADDRESS;
 
     let handle = builder
@@ -233,30 +247,61 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         );
     }
 
-    if let Some((sequencer_rpc, sequencer_address)) = head_source {
-        let follower = UnsafeHeadFollower::new(
-            block_committer,
-            RootProvider::new_http(sequencer_rpc),
-            provider,
-            l1_head,
-            head_domain,
-            sequencer_address,
-            timing.l2_block_time(),
-        );
+    if let Some(sequencer_address) = head_address {
+        let sequencer_rpc = ext.sequencer_rpc.map(RootProvider::new_http);
+        let poll_interval = timing.l2_block_time();
         event!(
-            name: "eez.node.follower.sequencer_rpc.spawned",
+            name: "eez.node.follower.unsafe_head.spawned",
             Level::INFO,
             %sequencer_address,
+            rpc = sequencer_rpc.is_some(),
+            p2p = p2p_config.is_some(),
             "spawning signed-head unsafe-head follower",
         );
-        task_executor.spawn_critical_task("eez-node-follower-unsafe-head", async move {
-            follower.run().await;
-        });
+        const TASK: &str = "eez-node-follower-unsafe-head";
+        // With the overlay on, blocks come only from peers; the RPC, if any, only polls heads.
+        if let Some(cfg) = p2p_config {
+            let network = handle.node.network.clone();
+            let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_BUFFER);
+            let overlay = eez_p2p::Overlay::new(
+                cfg,
+                eez_p2p::keypair(&network.secret_key().secret_bytes())?,
+                eez_p2p::Validator::new(head_domain, sequencer_address),
+                eez_node_common::discover(network.clone()),
+            )?;
+            task_executor.spawn_critical_task("eez-p2p", overlay.run(None, Some(gossip_tx)));
+            let follower = UnsafeHeadFollower::new(
+                block_committer,
+                sequencer_rpc,
+                Some(gossip_rx),
+                PeerBlocks::new(network.fetch_client().await?),
+                provider,
+                l1_head,
+                head_domain,
+                sequencer_address,
+                poll_interval,
+            );
+            task_executor.spawn_critical_task(TASK, follower.run());
+        } else {
+            let rpc = sequencer_rpc.expect("head_follower requires a head source");
+            let follower = UnsafeHeadFollower::new(
+                block_committer,
+                Some(rpc.clone()),
+                None,
+                rpc,
+                provider,
+                l1_head,
+                head_domain,
+                sequencer_address,
+                poll_interval,
+            );
+            task_executor.spawn_critical_task(TASK, follower.run());
+        }
     } else {
         event!(
             name: "eez.node.follower.l1_derived_only",
             Level::INFO,
-            "EEZ_SEQUENCER_RPC not set; running L1-derived-only follower",
+            "EEZ_SEQUENCER_ADDRESS not set; running L1-derived-only follower",
         );
     }
 
@@ -268,20 +313,23 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     handle.wait_for_node_exit().await
 }
 
-/// Pairs the sequencer RPC with the address that must sign its heads.
-fn signed_head_source(
+/// The follower-modes rule: the address switches the head follower on and
+/// needs at least one head source; a source without the address is an error.
+fn head_follower(
     rpc: Option<url::Url>,
+    p2p: bool,
     address: Option<Address>,
-) -> eyre::Result<Option<(url::Url, Address)>> {
-    match (rpc, address) {
-        (Some(rpc), Some(address)) => Ok(Some((rpc, address))),
-        (None, None) => Ok(None),
-        (Some(_), None) => Err(eyre::eyre!(
+) -> eyre::Result<Option<Address>> {
+    match (address, rpc.is_some(), p2p) {
+        (Some(_), false, false) => Err(eyre::eyre!(
+            "EEZ_SEQUENCER_ADDRESS requires EEZ_SEQUENCER_RPC or EEZ_P2P_LISTEN"
+        )),
+        (Some(address), _, _) => Ok(Some(address)),
+        (None, true, _) => Err(eyre::eyre!(
             "EEZ_SEQUENCER_RPC requires EEZ_SEQUENCER_ADDRESS"
         )),
-        (None, Some(_)) => Err(eyre::eyre!(
-            "EEZ_SEQUENCER_ADDRESS requires EEZ_SEQUENCER_RPC"
-        )),
+        (None, false, true) => Err(eyre::eyre!("EEZ_P2P_LISTEN requires EEZ_SEQUENCER_ADDRESS")),
+        (None, false, false) => Ok(None),
     }
 }
 
@@ -326,17 +374,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rpc_and_address_must_be_set_together() {
-        let rpc = url::Url::parse("http://127.0.0.1:8545").unwrap();
-        let err = signed_head_source(Some(rpc), None).unwrap_err();
+    fn head_follower_modes() {
+        let rpc = || Some(url::Url::parse("http://127.0.0.1:8545").unwrap());
+        let address = Some(Address::repeat_byte(1));
+        assert_eq!(head_follower(rpc(), false, address).unwrap(), address);
+        assert_eq!(head_follower(None, true, address).unwrap(), address);
+        let err = |rpc, p2p, address| head_follower(rpc, p2p, address).unwrap_err().to_string();
         assert_eq!(
-            err.to_string(),
+            err(None, false, address),
+            "EEZ_SEQUENCER_ADDRESS requires EEZ_SEQUENCER_RPC or EEZ_P2P_LISTEN"
+        );
+        assert_eq!(
+            err(rpc(), false, None),
             "EEZ_SEQUENCER_RPC requires EEZ_SEQUENCER_ADDRESS"
         );
-        let err = signed_head_source(None, Some(Address::repeat_byte(1))).unwrap_err();
         assert_eq!(
-            err.to_string(),
-            "EEZ_SEQUENCER_ADDRESS requires EEZ_SEQUENCER_RPC"
+            err(None, true, None),
+            "EEZ_P2P_LISTEN requires EEZ_SEQUENCER_ADDRESS"
         );
+        assert_eq!(head_follower(None, false, None).unwrap(), None);
     }
 }

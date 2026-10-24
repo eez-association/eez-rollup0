@@ -13,10 +13,10 @@ use eez_testkit::signals;
 use eez_testkit::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
     ANVIL_KEY_6, BuilderStubMode, Harness, INVALID_PROOF_SELECTOR,
-    INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary, NodeConfig, NodeHandle, STAGING_USER_KEY,
-    block_number_and_hash_at, override_env, safe_block_hash, send_l2_value_transfer,
-    send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
-    wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
+    INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary, NodeConfig, NodeHandle, SEQUENCER_ADDR,
+    STAGING_USER_KEY, block_number_and_hash_at, enode, override_env, safe_block_hash,
+    send_l2_value_transfer, send_l2_value_transfer_confirmed, unused_tcp_port, wait_for,
+    wait_for_latest_height, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
@@ -35,6 +35,7 @@ async fn multi_composer_intra_batch_suffix_replay_converges() {
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(genesis),
+        ..Default::default()
     };
 
     let primary_dir = tempfile::tempdir().unwrap();
@@ -1031,6 +1032,90 @@ async fn happy_case_follower_sequencer_rpc() {
     seq.assert_no_process_death();
 }
 
+/// Follower B, with no sequencer RPC, finds the network from the seed's bootnode,
+/// receives heads over gossip, and fetches their ancestors from devp2p peers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_follows_over_p2p() {
+    // Fixed so the seed's enode is known before it starts.
+    const SEED_KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    let harness = Harness::fresh().await.unwrap();
+    let p2p = |binary, args: &[&str]| NodeConfig {
+        binary,
+        discovery: true,
+        extra_args: args.iter().map(ToString::to_string).collect(),
+        ..Default::default()
+    };
+    let overlay = || {
+        let port = unused_tcp_port();
+        ("EEZ_P2P_LISTEN", format!("/ip4/127.0.0.1/tcp/{port}"))
+    };
+
+    // The bootnodes guard needs an entry. The seed's own is a no-op, so the
+    // ports, leased only at spawn, don't matter.
+    let seq_cfg = p2p(
+        NodeBinary::Composer,
+        &[
+            "--p2p-secret-key-hex",
+            SEED_KEY,
+            "--bootnodes",
+            &enode(SEED_KEY, 0, 0),
+        ],
+    );
+    let mut seq_env = harness.env().await.unwrap();
+    seq_env.push(overlay());
+    let seq = NodeHandle::start("seq", &seq_cfg, &seq_env).await.unwrap();
+
+    let follower_cfg = p2p(
+        NodeBinary::Follower,
+        &[
+            "--bootnodes",
+            &enode(SEED_KEY, seq.p2p_port, seq.discv5_port),
+        ],
+    );
+    let mut follower_env = harness.follower_env(None).await.unwrap();
+    follower_env.push(("EEZ_SEQUENCER_ADDRESS", format!("{SEQUENCER_ADDR:#x}")));
+    let mut a_env = follower_env.clone();
+    a_env.push(overlay());
+    let a = NodeHandle::start("follower-a", &follower_cfg, &a_env)
+        .await
+        .unwrap();
+
+    wait_for_latest_height(&seq, 10, DEFAULT_TIMEOUT)
+        .await
+        .expect("composer did not reach block 10");
+    let mut b_env = override_env(
+        follower_env,
+        "RUST_LOG",
+        "warn,eez_follower::unsafe_head=info",
+    );
+    b_env.push(overlay());
+    let b = NodeHandle::start("follower-b", &follower_cfg, &b_env)
+        .await
+        .unwrap();
+
+    // With no RPC, `imported >= 2` means the ancestors came from devp2p peers.
+    let seq_rpc = seq.l2_rpc_url();
+    wait_for(DEFAULT_TIMEOUT, || async {
+        for s in b.signals_since(0)? {
+            if s.name != signals::FOLLOWER_HEAD_ADVANCED || s.u64("imported")? < 2 {
+                continue;
+            }
+            let n = s.u64("block.number")?;
+            let at_seq = block_number_and_hash_at(&seq_rpc, BlockNumberOrTag::Number(n)).await?;
+            if at_seq == Some((n, s.b256("block.hash")?)) {
+                return Ok(Some(()));
+            }
+        }
+        Ok(None)
+    })
+    .await
+    .expect("follower B never adopted a gossiped head with peer-fetched ancestors");
+
+    for node in [&seq, &a, &b] {
+        node.assert_no_process_death();
+    }
+}
+
 /// An L1-only follower retreats, replays the replacement suffix, and converges
 /// with the composer after an L1 reorg.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1045,6 +1130,7 @@ async fn happy_case_follower_l1_reorg_recovers() {
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(genesis),
+        ..Default::default()
     };
     let seq_env = harness.env().await.unwrap();
     let follower_env = harness.follower_env(None).await.unwrap();
@@ -1154,6 +1240,7 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(genesis),
+        ..Default::default()
     };
     let follower = NodeHandle::start("follower", &follower_cfg, &follower_env)
         .await

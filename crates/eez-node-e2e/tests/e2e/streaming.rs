@@ -67,6 +67,7 @@ async fn shared_prover_reorg(stateful: bool) -> Result<()> {
                 &NodeConfig {
                     binary: NodeBinary::Follower,
                     genesis_path: Some(harness.l2_genesis_path()),
+                    ..Default::default()
                 },
                 &env,
             )
@@ -260,6 +261,7 @@ async fn stateful_sessions_can_extend_and_finalize_an_unselected_branch() -> Res
         &NodeConfig {
             binary: NodeBinary::Follower,
             genesis_path: Some(harness.l2_genesis_path()),
+            ..Default::default()
         },
         &env,
     )

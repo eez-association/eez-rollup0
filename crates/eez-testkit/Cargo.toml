@@ -27,6 +27,8 @@ anyhow = "1"
 eez-control-rpc.workspace = true
 eez-protocol.workspace = true
 reth-chainspec.workspace = true
+reth-network-peers = { workspace = true, features = ["secp256k1"] }
+secp256k1 = "0.30"
 serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true

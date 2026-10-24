@@ -10,6 +10,7 @@ members = [
     "crates/eez-node",
     "crates/eez-node-common",
     "crates/eez-node-e2e",
+    "crates/eez-p2p",
     "crates/eez-payload-codec",
     "crates/eez-proof-signer",
     "crates/eez-prover-stateful",
@@ -62,6 +63,10 @@ alloy-rpc-types-debug = { version = "=2.5.0", default-features = false }
 eez-control-rpc    = { path = "crates/eez-control-rpc" }
 eez-prover-client  = { path = "crates/eez-prover-client" }
 eez-seq-sig        = { path = "crates/eez-seq-sig" }
+eez-p2p            = { path = "crates/eez-p2p" }
+libp2p             = { version = "0.56", default-features = false, features = ["secp256k1", "gossipsub", "macros", "noise", "tcp", "tokio", "yamux"] }
+snap               = "1"
+sha2               = "0.10"
 
 # allocator for the binary
 mimalloc           = "0.1"
@@ -81,6 +86,7 @@ reth-chain-state                = { git = "https://github.com/paradigmxyz/reth",
 reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-cli                        = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-db                         = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-discv5                     = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-engine-primitives          = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-ethereum-cli               = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-ethereum-engine-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
@@ -90,6 +96,8 @@ reth-ethereum-primitives        = { git = "https://github.com/paradigmxyz/reth",
 reth-evm                        = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-evm-ethereum               = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-execution-types            = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-network                    = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
+reth-network-p2p                = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-network-peers              = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-node-api                   = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-node-builder               = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }

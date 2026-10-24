@@ -309,6 +309,14 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         },
     );
     let front_composer_info = Arc::new(serde_json::to_value(&composer_info)?);
+    let rollup_config = RollupConfig::from_env(
+        eez_evm::fee_collector(&builder.config().chain.genesis.config)?.unwrap_or_default(),
+    )?;
+    // Read before launch so a misconfiguration fails fast.
+    let p2p_config = eez_p2p::P2pConfig::from_env(l2_chain_id, rollup_config.rollup_id)?;
+    if p2p_config.is_some() && sequencer_key.is_none() {
+        eyre::bail!("EEZ_P2P_LISTEN requires EEZ_SEQUENCER_KEY on a composer");
+    }
     let head_store = head_rpc::SignedHeadStore::default();
     let rpc_head_store = sequencer_key.is_some().then(|| head_store.clone());
     let handle = builder
@@ -351,15 +359,23 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
 
     let submitter_config = SubmitterConfig::from_env()?;
     let deploy_block = submitter_config.reader.deploy_block;
-    let rollup_config = RollupConfig::from_env(
-        eez_evm::fee_collector(&chain_spec.genesis.config)?.unwrap_or_default(),
-    )?;
     if let Some(key) = sequencer_key {
         let domain = eez_seq_sig::HeadDomain {
             l2_chain_id,
             registry: eez_registry,
             rollup_id: rollup_config.rollup_id,
         };
+        if let Some(cfg) = p2p_config {
+            let network = handle.node.network.clone();
+            let overlay = eez_p2p::Overlay::new(
+                cfg,
+                eez_p2p::keypair(&network.secret_key().secret_bytes())?,
+                eez_p2p::Validator::new(domain, key.address()),
+                eez_node_common::discover(network),
+            )?;
+            task_executor
+                .spawn_critical_task("eez-p2p", overlay.run(Some(head_store.subscribe()), None));
+        }
         let now_ms = u64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?

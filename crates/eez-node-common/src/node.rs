@@ -5,7 +5,7 @@
 //! Engine validation delegates to:
 //! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/node/src/engine.rs>.
 
-use crate::{EezPayloadBuilder, EezPoolBuilder};
+use crate::{EezNetworkBuilder, EezPayloadBuilder, EezPoolBuilder};
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes};
 use eez_evm::EezEvmConfig;
 use eez_primitives::{Block, EezPrimitives, EezTxEnvelope, engine::EezEngineTypes};
@@ -23,7 +23,7 @@ use reth_node_builder::{
     },
     rpc::PayloadValidatorBuilder,
 };
-use reth_node_ethereum::{EthereumEngineValidator, node::EthereumNetworkBuilder};
+use reth_node_ethereum::EthereumEngineValidator;
 use reth_payload_primitives::{
     EngineApiMessageVersion, EngineObjectValidationError, NewPayloadError, PayloadOrAttributes,
 };
@@ -46,7 +46,7 @@ impl EezNode {
         N,
         EezPoolBuilder,
         BasicPayloadServiceBuilder<EezPayloadBuilder>,
-        EthereumNetworkBuilder,
+        EezNetworkBuilder,
         EezExecutorBuilder,
         EezConsensusBuilder,
     > {
@@ -55,7 +55,7 @@ impl EezNode {
             .pool(EezPoolBuilder::new(eez_primitives::SYSTEM_ADDRESS))
             .executor(EezExecutorBuilder)
             .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder::default()))
-            .network(EthereumNetworkBuilder::default())
+            .network(EezNetworkBuilder)
             .consensus(EezConsensusBuilder)
     }
 }
@@ -174,7 +174,7 @@ impl<N: FullNodeTypes<Types = Self>> reth_node_builder::Node<N> for EezNode {
         N,
         EezPoolBuilder,
         BasicPayloadServiceBuilder<EezPayloadBuilder>,
-        EthereumNetworkBuilder,
+        EezNetworkBuilder,
         EezExecutorBuilder,
         EezConsensusBuilder,
     >;

@@ -148,6 +148,7 @@ async fn settled_safe_prefix_survives_restart_and_fresh_follower_replay() {
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(harness.l2_genesis_path()),
+        ..Default::default()
     };
     let follower = NodeHandle::start("durability-fresh-follower", &follower_cfg, &follower_env)
         .await
