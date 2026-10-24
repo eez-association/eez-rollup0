@@ -10,7 +10,7 @@
 //! - `Sequence` — parent-bound Sequencer FCU+attrs → resolve payload → newPayload.
 //! - `RefreshForkchoice` — bare FCU to keep reth's view alive during quiet periods.
 //! - `AdvanceSafeFinalized` — Deriver pushes safe/finalized cursors forward.
-//! - `AdvanceHead` — follower points unsafe head at a sequencer-served block.
+//! - `AdvanceHead` — the stateful prover selects a validated block reth already holds.
 //! - `Derive` — Deriver submits a pre-built `ExecutionPayload` via newPayload + head-FCU.
 //!
 //! Until the Deriver speaks, `safe` and `finalized` stay at the boot anchors
@@ -417,10 +417,8 @@ where
     /// Advances the unsafe head mirror through a bare FCU. Safe and
     /// finalized stay exactly where the committer last accepted them.
     ///
-    /// This is used by follower nodes whose unsafe head comes from a
-    /// sequencer RPC. A `SYNCING` response is returned as a successful
-    /// [`ForkchoiceOutcome::Syncing`]; the engine has accepted the target
-    /// and will backfill it through normal sync.
+    /// A `SYNCING` response returns [`ForkchoiceOutcome::Syncing`] and moves
+    /// nothing, so later FCUs don't carry a head reth lacks; the caller retries.
     ///
     /// # Errors
     ///
@@ -760,8 +758,6 @@ where
         let outcome = classify_advance_head_response(&res)?;
         if outcome == ForkchoiceOutcome::Valid {
             self.set_head(header);
-        } else if outcome == ForkchoiceOutcome::Syncing {
-            self.unsafe_head_hash = header.hash();
         }
         Ok(outcome)
     }
@@ -1103,5 +1099,20 @@ mod tests {
         let next = seen.lock().unwrap()[1];
         assert_eq!(next.safe_block_hash, h0.hash());
         assert_eq!(next.finalized_block_hash, B256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn advance_unsafe_head_syncing_keeps_head() {
+        let (engine, seen) = mock_engine(true);
+        let h0 = sealed(0);
+        let handle = spawn_committer(engine, h0.clone());
+
+        assert_eq!(
+            handle.advance_unsafe_head(sealed(1)).await.unwrap(),
+            ForkchoiceOutcome::Syncing
+        );
+        let _ = handle.refresh_forkchoice().await;
+        assert_eq!(seen.lock().unwrap()[1].head_block_hash, h0.hash());
+        assert_eq!(handle.last_header().hash(), h0.hash());
     }
 }
