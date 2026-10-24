@@ -16,7 +16,7 @@ fn validated_single_block(
         window_pre,
         window_post,
         Vec::new(),
-        validate::ValidatedSettlingBlock::for_test(
+        validate::testing::settling_block_for_test(
             block,
             receipt_successes,
             transaction_state_checkpoints,
@@ -158,13 +158,6 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
                 actual: 0,
             },
         ),
-        SettlementPipelineError::BlockInspection(
-            crate::settlement::BlockInspectionError::SystemSenderCount {
-                block_number: 1,
-                required: 1,
-                actual: 0,
-            },
-        ),
         SettlementPipelineError::EffectPrefix(
             crate::settlement::EffectPrefixError::TransactionStateCheckpointCountMismatch {
                 expected: 1,
@@ -225,6 +218,11 @@ fn settlement_pipeline_errors_have_stable_rpc_mappings() {
 fn transient_validation_errors_have_stable_rpc_mappings() {
     let cases = [
         (
+            validate::ValidationError::DeadlineExceeded,
+            Code::DeadlineExceeded,
+            "block validation deadline exceeded",
+        ),
+        (
             validate::ValidationError::Unavailable("synthetic".to_owned()),
             Code::Unavailable,
             "validation backend is temporarily unavailable",
@@ -251,7 +249,7 @@ fn cancelled_settlement_stops_before_decoding_untrusted_input() {
         test_system_transaction_reconstructor(expected_rollup_id(1));
     let settling_block = validate::ValidatedBlock::for_test(
         1,
-        Vec::new(),
+        alloy_rlp::encode(eez_primitives::Block::default()),
         validate::SettlementBlockEvidence::for_test(Vec::new(), Vec::new()),
     );
     let validated = validated_single_block(settling_block, Vec::new(), Vec::new());
@@ -276,7 +274,7 @@ fn an_elapsed_deadline_stops_the_pipeline_between_validation_and_settlement() {
     let empty_body: eez_primitives::BlockBody = Default::default();
     input.rlp = alloy_rlp::encode(eez_primitives::Block::new(Default::default(), empty_body));
     let inputs = vec![input];
-    let state = inner(Validator::stub(vec![Ok(backend_output_for(&inputs))]));
+    let state = inner(StubBackend::new(vec![Ok(backend_output_for(&inputs))]));
     // A deadline captured now is already past when the boundary between
     // execution validation and settlement runs.
     let deadline = tokio::time::Instant::now();

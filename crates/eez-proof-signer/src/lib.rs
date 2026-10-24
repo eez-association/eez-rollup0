@@ -27,7 +27,7 @@ pub use eez_protocol::EEZL2_ADDRESS;
 
 pub use attest::{Attester, NonZeroProofSystemVkey};
 pub use service::{ProveSvc, ServiceLimits, ServiceLimitsParams, ServiceState};
-pub use validate::{ValidationBackend, Validator};
+pub use validate::ValidationBackend;
 
 /// Backend-neutral configuration for one proof-signer service.
 #[derive(Debug)]
@@ -50,16 +50,15 @@ pub async fn serve(
         expected_rollup_id,
         attester,
     } = config;
-    let validator = Validator::from_backend(backend);
     log_server_config(
         listen_addr,
         limits,
-        &validator,
+        &backend,
         expected_rollup_id.get(),
         &attester,
     );
     let svc = ProveSvc::new(
-        Arc::new(ServiceState::new(validator, expected_rollup_id, attester)?),
+        Arc::new(ServiceState::new(backend, expected_rollup_id, attester)?),
         limits,
     );
     if !listen_addr.ip().is_loopback() {
@@ -70,7 +69,8 @@ pub async fn serve(
     }
     let shutdown_service = svc.clone();
     let serve_result = tonic::transport::Server::builder()
-        .add_service(svc.into_server())
+        .add_service(svc.clone().into_server())
+        .add_service(svc.into_streaming_server())
         .serve_with_shutdown(listen_addr, shutdown)
         .await;
     shutdown_service.wait_until_idle().await;
@@ -81,7 +81,7 @@ pub async fn serve(
 fn log_server_config(
     listen_addr: SocketAddr,
     limits: ServiceLimits,
-    validator: &Validator,
+    backend: &dyn ValidationBackend,
     expected_rollup_id: u64,
     attester: &Attester,
 ) {
@@ -95,13 +95,13 @@ fn log_server_config(
         max_decoding_message_bytes = limits.max_decoding_message_bytes(),
         stream_idle_timeout_secs = limits.stream_idle_timeout().as_secs(),
         request_timeout_secs = limits.request_timeout().as_secs(),
-        validator = validator.label(),
+        validator = backend.label(),
         expected_rollup_id,
         attester = %attester.address(),
         expected_proof_system = %attester.expected_proof_system(),
         proof_system_vkey = %attester.proof_system_vkey(),
-        l2_chain_id = validator.chain_id(),
-        expected_l2_system_address = %validator.expected_l2_system_address(),
+        l2_chain_id = backend.chain_id(),
+        expected_l2_system_address = %backend.expected_l2_system_address(),
         profile = "anchor_single_call_outbound_then_inbound",
         "serving Prove — waiting for composer windows",
     );
