@@ -51,6 +51,14 @@ locally recomputed public-input hash only under all rules in this document.
 
 ### 1.1 What the signature does not establish
 
+Both the window RPC and streaming Finalize retain conditional-proof semantics:
+the signer proves the transition from the selected execution parent, not that
+the parent was already accepted on L1. The L1 contract checks each update's
+`currentRoot` against the live rollup root when consuming the entry. Streaming,
+subrange selection and cache reuse do not add an L1-history requirement to the
+stateless signer. The stateful backend's safe-anchor and fork-choice checks
+remain additional backend policy, not a different meaning for the signature.
+
 The signature does **not** establish:
 
 - canonical L2 ancestry, fork choice, finality, or sequencer authorization;
@@ -319,15 +327,17 @@ Signer recovery alone is not execution validation.
 
 ### 6.2 Local checkpoint plan
 
-Only the terminal block may request transaction-state checkpoints. For each
-recovered terminal transaction define:
+Ordinary blocks require regular execution, not transaction-state checkpoints.
+For each recovered transaction in a potential Sync block define:
 
 ```text
 system[i] = type(tx[i]) == 0x76
             && tx[i].to == EEZL2_ADDRESS
 ```
 
-The locally selected candidate positions are:
+If a nonempty block has no transaction satisfying `system[i]`, the checkpoint
+plan is empty, even when this is the terminal block. Otherwise the locally
+selected candidate positions are:
 
 ```text
 C = { i | !system[i] || system[i + 1] || i is the last transaction }
@@ -342,10 +352,11 @@ its pre-block system calls and before transaction 0, which is the anchor's
 candidate. The positions in `C` follow in order. For an empty terminal, that
 single checkpoint seals the complete terminal block.
 
-The Composer MUST NOT nominate checkpoint positions. The complete plan MUST be
-derived before earlier blocks are replayed. The backend MUST return exactly the
-requested positions in strict order. Preceding blocks MUST return no
-checkpoints.
+The Composer MUST NOT nominate checkpoint positions. The plan MUST be derived
+locally before replay. The backend MUST return exactly the requested positions
+in strict order. V1 requests checkpoints only for its selected terminal. V2
+retains them for streamed Sync candidates, since the eventual selected terminal
+is not yet known; Finalize consumes only that terminal's checkpoints.
 
 ### 6.3 Stateless replay guarantees
 
@@ -373,7 +384,7 @@ a header rather than from a backend root:
 
 ### 6.4 Stateful replay guarantees
 
-For a request covering `m..=n`, the stateful backend MUST:
+For a v1 request covering `m..=n`, the stateful backend MUST:
 
 1. require `m > 0` and identify block `m - 1` as the anchor;
 2. return `Unavailable` if the follower has not reached the anchor or cannot
@@ -395,6 +406,16 @@ follower database and chain specification are within this backend's operator
 trust boundary; the snapshot check prevents signing across an observed local
 reorganization but does not prove global canonicality or finality to a verifier
 of the signature.
+
+V2 imports/executes each streamed block through Reth before acknowledging it.
+Begin checks the exact L1-derived safe anchor. Each Block checks its immediate
+parent and execution-state continuity, and reuses retained execution/receipts
+where available. Sync-candidate checkpoint replay is cached inside the backend.
+Import, branch selection and evidence reads share the follower's reconciliation
+lock. At Finalize, `prepare_attestation` selects the checked terminal through
+forkchoice under that same lock; Reth enforces the current safe/finalized ancestry.
+An unavailable or rejected selection cannot produce a proof. This is distinct
+from v1's disposable window replay: v2 deliberately retains imported execution.
 
 ### 6.5 Settlement evidence
 
