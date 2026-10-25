@@ -24,6 +24,61 @@ async fn rpc(client: &reqwest::Client, url: &str, method: &str, params: Value) -
         .context("missing RPC result")
 }
 
+fn verify_actions(
+    batch: &eez_protocol::abi::EvmBatch,
+    actions: &[eez_payload_codec::Action],
+    rollup_id: u64,
+) -> Result<()> {
+    let mut actions = actions.iter();
+    let mut rebuilt_batch = batch.clone();
+    for (index, role) in eez_protocol::entries::entry_roles(&batch.entries, rollup_id)
+        .into_iter()
+        .enumerate()
+    {
+        if matches!(role, None | Some(EntryRole::Anchor)) {
+            continue;
+        }
+        let action = actions.next().context("entry has no DA action")?;
+        let rebuilt = manifest::entry_from_action(action, RollupId(rollup_id))?;
+        let entry = &batch.entries[index];
+        ensure!(
+            entry.success == action.success,
+            "action outcome differs from on-chain entry"
+        );
+        if matches!(role, Some(EntryRole::Inbound { .. })) {
+            ensure!(
+                entry.returnData.as_ref() == action.return_data.as_slice(),
+                "inbound return data differs from on-chain entry"
+            );
+            ensure!(
+                entry.proxyEntryHash == rebuilt.proxyEntryHash,
+                "inbound action hash mismatch"
+            );
+        } else {
+            ensure!(
+                entry.returnData.is_empty(),
+                "immediate outbound entry must have empty on-chain return data"
+            );
+            // Immediate return data is committed by the rolling hash.
+            rebuilt_batch.entries[index].returnData = action.return_data.clone().into();
+            ensure!(
+                manifest::action_from_entry(&rebuilt_batch.entries[index], RollupId(rollup_id),)?
+                    == *action,
+                "outbound action differs from on-chain call"
+            );
+        }
+    }
+    ensure!(actions.next().is_none(), "unbound DA actions");
+    eez_protocol::entries::finalize_l1_rolling_hashes(&mut rebuilt_batch)?;
+    for (rebuilt, entry) in rebuilt_batch.entries.iter().zip(&batch.entries) {
+        ensure!(
+            rebuilt.rollingHash == entry.rollingHash,
+            "rebuilt rolling hash differs from on-chain entry"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn blob_settlement_evidence() -> Result<()> {
     let deployment = Rollup0Deployment::from_process_env(6290)?
@@ -123,7 +178,7 @@ async fn blob_settlement_evidence() -> Result<()> {
                         .iter()
                         .map(alloy_primitives::keccak256),
                 );
-                let mut actions = container.actions.iter();
+                verify_actions(&post.batch, &container.actions, deployment.eez_rollup_id)?;
                 for (index, role) in eez_protocol::entries::entry_roles(
                     &post.batch.entries,
                     deployment.eez_rollup_id,
@@ -152,29 +207,7 @@ async fn blob_settlement_evidence() -> Result<()> {
                             _ => unreachable!(),
                         }
                     }
-                    let action = actions.next().context("entry has no DA action")?;
-                    let rebuilt =
-                        manifest::entry_from_action(action, RollupId(deployment.eez_rollup_id))?;
-                    let entry = &post.batch.entries[index];
-                    ensure!(
-                        entry.success == action.success
-                            && entry.returnData.as_ref() == action.return_data.as_slice(),
-                        "action outcome differs from on-chain entry"
-                    );
-                    if matches!(role, Some(EntryRole::Inbound { .. })) {
-                        ensure!(
-                            entry.proxyEntryHash == rebuilt.proxyEntryHash,
-                            "inbound action hash mismatch"
-                        );
-                    } else {
-                        ensure!(
-                            manifest::action_from_entry(entry, RollupId(deployment.eez_rollup_id))?
-                                == *action,
-                            "outbound action differs from on-chain call"
-                        );
-                    }
                 }
-                ensure!(actions.next().is_none(), "unbound DA actions");
                 ensure!(
                     reader.canonical_l1_hash(post.id.l1_block).await?
                         == Some(post.id.l1_block_hash),
@@ -249,4 +282,155 @@ async fn blob_settlement_evidence() -> Result<()> {
         serde_json::to_vec_pretty(&evidence)?,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eez_payload_codec::{Action, SpanBlock};
+    use eez_protocol::abi::{EvmBatch, RollupUpdateSol};
+    use eez_protocol::entries::finalize_l1_rolling_hashes;
+
+    const ROLLUP: u64 = 7;
+
+    fn action(outbound: bool) -> Action {
+        Action {
+            source_rollup_id: if outbound { ROLLUP } else { 0 },
+            target_rollup_id: if outbound { 0 } else { ROLLUP },
+            source_address: [0x11; 20],
+            target_address: [0x22; 20],
+            value: [0; 32],
+            gas: 0,
+            data: vec![1, 2, 3, 4],
+            success: true,
+            return_data: vec![0x42; 32],
+        }
+    }
+
+    fn settled_batch(actions: &[Action]) -> EvmBatch {
+        let entries = actions
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                let mut entry = manifest::entry_from_action(action, RollupId(ROLLUP)).unwrap();
+                entry.rollupUpdates = vec![RollupUpdateSol {
+                    rollupId: ROLLUP,
+                    currentRoot: B256::repeat_byte(index as u8),
+                    newRoot: B256::repeat_byte((index + 1) as u8),
+                    etherDelta: alloy_primitives::aliases::I192::ZERO,
+                }];
+                if action.target_rollup_id == ROLLUP {
+                    entry.l2ToL1Calls.clear();
+                }
+                entry
+            })
+            .collect();
+        let mut batch = EvmBatch {
+            entries,
+            immediateEntryCount: U256::from(
+                actions
+                    .iter()
+                    .take_while(|a| a.source_rollup_id == ROLLUP)
+                    .count(),
+            ),
+            ..Default::default()
+        };
+        finalize_l1_rolling_hashes(&mut batch).unwrap();
+        batch
+    }
+
+    #[test]
+    fn accepts_mixed_entries_with_folded_outbound_return_data() {
+        let actions = [action(true), action(false)];
+        let batch = settled_batch(&actions);
+        assert!(batch.entries[0].returnData.is_empty());
+        assert!(!batch.entries[1].returnData.is_empty());
+        verify_actions(&batch, &actions, ROLLUP).unwrap();
+    }
+
+    #[test]
+    fn rejects_tampered_outbound_return_data() {
+        let mut actions = [action(true)];
+        let batch = settled_batch(&actions);
+        actions[0].return_data[0] ^= 1;
+        let error = verify_actions(&batch, &actions, ROLLUP).unwrap_err();
+        assert!(error.to_string().contains("rolling hash"));
+    }
+
+    #[test]
+    fn rejects_uncleared_on_chain_outbound_return_data() {
+        let actions = [action(true)];
+        let mut batch = settled_batch(&actions);
+        batch.entries[0].returnData = actions[0].return_data.clone().into();
+        let error = verify_actions(&batch, &actions, ROLLUP).unwrap_err();
+        assert!(error.to_string().contains("empty on-chain return data"));
+    }
+
+    #[test]
+    fn rejects_tampered_inbound_call_and_return_data() {
+        let actions = [action(false)];
+        let batch = settled_batch(&actions);
+        let mut changed = actions.clone();
+        changed[0].data[0] ^= 1;
+        let error = verify_actions(&batch, &changed, ROLLUP).unwrap_err();
+        assert!(error.to_string().contains("inbound action hash mismatch"));
+        changed = actions.clone();
+        changed[0].return_data[0] ^= 1;
+        let error = verify_actions(&batch, &changed, ROLLUP).unwrap_err();
+        assert!(error.to_string().contains("inbound return data"));
+    }
+
+    #[test]
+    fn rejects_missing_extra_and_reordered_actions() {
+        let actions = [action(true), action(false)];
+        let batch = settled_batch(&actions);
+        assert!(verify_actions(&batch, &actions[..1], ROLLUP).is_err());
+        let extra = [actions[0].clone(), actions[1].clone(), action(false)];
+        assert!(verify_actions(&batch, &extra, ROLLUP).is_err());
+        let reordered = [actions[1].clone(), actions[0].clone()];
+        assert!(verify_actions(&batch, &reordered, ROLLUP).is_err());
+    }
+
+    #[test]
+    fn rejects_tampered_outbound_call_and_outcome() {
+        let actions = [action(true)];
+        let batch = settled_batch(&actions);
+        let mut changed = actions.clone();
+        changed[0].data[0] ^= 1;
+        assert!(verify_actions(&batch, &changed, ROLLUP).is_err());
+        changed = actions.clone();
+        changed[0].success = false;
+        assert!(verify_actions(&batch, &changed, ROLLUP).is_err());
+    }
+
+    #[test]
+    fn verifies_anchor_hashes_without_consuming_actions() {
+        let mut batch = settled_batch(&[action(true)]);
+        batch.entries[0].l2ToL1Calls.clear();
+        finalize_l1_rolling_hashes(&mut batch).unwrap();
+        verify_actions(&batch, &[], ROLLUP).unwrap();
+        batch.entries[0].rollingHash = B256::ZERO;
+        assert!(verify_actions(&batch, &[], ROLLUP).is_err());
+    }
+
+    #[test]
+    fn verifies_mixed_actions_after_two_blob_decode() {
+        let actions = [action(true), action(false)];
+        let batch = settled_batch(&actions);
+        let transaction = vec![0x42; eez_payload_codec::logical_blob_capacity(1)];
+        let blocks = [SpanBlock {
+            transactions: vec![transaction.clone()],
+            ..Default::default()
+        }];
+        let blobs = eez_payload_codec::encode_blob_container(ROLLUP, &blocks, &actions).unwrap();
+        assert_eq!(blobs.len(), 2);
+        let decoded = eez_payload_codec::decode_blob_container(&blobs).unwrap();
+        assert_eq!(decoded.rollup_id, ROLLUP);
+        assert_eq!(decoded.span.transactions, vec![transaction]);
+        verify_actions(&batch, &decoded.actions, ROLLUP).unwrap();
+        assert!(eez_payload_codec::decode_blob_container(&blobs[..1]).is_err());
+        let mut reversed = blobs.clone();
+        reversed.reverse();
+        assert!(eez_payload_codec::decode_blob_container(&reversed).is_err());
+    }
 }
