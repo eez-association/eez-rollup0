@@ -34,6 +34,18 @@ ignore = [
     # keys sign through alloy's k256 0.13, whose scalar add/sub use it. The fix
     # (>= 0.7.6) needs k256/p256 0.14, which alloy and revm don't use yet.
     "RUSTSEC-2026-0387",
+    # zstd 0.13 context-reuse leak; patched in 0.14.3. Pinned reth and
+    # compression-codecs require 0.13. Temporary exception until they migrate;
+    # reth-zstd-compressors uses bulk, not the affected with_context API.
+    "RUSTSEC-2026-0391",
+    # zstd-safe seekable decompression; the seekable feature is not enabled.
+    # Remove with the upstream zstd-safe 8 migration (patched in 8.2.0).
+    "RUSTSEC-2026-0398",
+    # zstd-safe legacy streaming error exposes uninitialized output. Pinned
+    # dependencies require 7; patched in 8.2.0. Temporary exception pending
+    # upstream migration: legacy is enabled, so streaming exposure is not
+    # ruled out. Bulk and read APIs are unaffected by this advisory.
+    "RUSTSEC-2026-0403",
 
     # ── seen only by cargo-audit's graph ───────────────────────────────────
     # tracing-subscriber 0.2.x ANSI escape injection through log fields.
