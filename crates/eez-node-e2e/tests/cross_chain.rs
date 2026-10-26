@@ -2134,7 +2134,11 @@ async fn failed_rich_bundle_keeps_live_l2_txs() {
                 .expect("mined receipt has a block number");
             let canonical =
                 block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(number)).await?;
-            if number > safe || canonical.map(|(_, hash)| hash) != receipt.block_hash {
+            anyhow::ensure!(
+                canonical.map(|(_, hash)| hash) == receipt.block_hash,
+                "stale receipt: transfer {hash} names block {number}, which is not canonical",
+            );
+            if number > safe {
                 return Ok(None);
             }
         }
