@@ -13,14 +13,11 @@ use alloy_rpc_types_debug::ExecutionWitness;
 use eez_control_rpc::v1::ExecutionWitness as WireExecutionWitness;
 use thiserror::Error;
 
-use crate::cancel::CancellationToken;
-use crate::window::AdmittedBlocks;
-
 pub mod support;
 
 type EthereumBlock = eez_primitives::Block;
 
-/// Untrusted block input shared by v1 window and v2 session validation.
+/// Untrusted block input admitted by a streaming session.
 ///
 /// Transport parsing checks hash widths and witness presence. Validation must
 /// bind the number and hash claims to the RLP, check the parent, and execute it.
@@ -149,16 +146,6 @@ pub struct BackendBlockOutput {
     pub post_state_root: B256,
     /// Locally derived facts retained specifically for settlement gates.
     pub settlement_evidence: SettlementBlockEvidence,
-}
-
-/// Successful backend output for a contiguous block window.
-///
-/// The backend binds each admitted input in order and verifies execution-state
-/// continuity; v1 admission owns the declared sequence and completeness.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BackendWindowOutput {
-    /// One associated output per replayed block, oldest first.
-    pub blocks: Vec<Arc<ValidatedBlock>>,
 }
 
 /// Canonically decoded fields used to bind an outbound effect.
@@ -433,8 +420,8 @@ impl ValidatedWindow {
             .chain(std::iter::once(self.settling_block.as_ref()))
     }
 
-    /// Package a range from a validated prefix. V1 admission/backend replay or
-    /// v2 session append established continuity; the caller owns range selection.
+    /// Package a range from a validated session prefix. Session append established
+    /// continuity; the caller owns range selection.
     pub(crate) fn from_validated_prefix(
         anchor: B256,
         preceding_blocks: Vec<Arc<ValidatedBlock>>,
@@ -484,9 +471,28 @@ pub enum ValidationError {
     /// Locally prepared validation state violated an implementation invariant.
     #[error("{0}")]
     InternalInvariant(String),
-    /// The request disappeared while a synchronous backend was still active.
-    #[error("validation cancelled")]
-    Cancelled,
+}
+
+impl ValidationError {
+    pub(crate) fn status(&self) -> tonic::Status {
+        use tonic::Status;
+        match self {
+            Self::DeadlineExceeded => {
+                Status::deadline_exceeded("block validation deadline exceeded")
+            }
+            Self::Unavailable(_) => {
+                Status::unavailable("validation backend is temporarily unavailable")
+            }
+            Self::Aborted(_) => {
+                Status::aborted("validation backend snapshot changed during validation")
+            }
+            Self::Rejected(_) => Status::failed_precondition("window validation rejected"),
+            Self::InvalidBackendOutput(_) => {
+                Status::internal("validation backend returned invalid output")
+            }
+            Self::InternalInvariant(_) => Status::internal("request pipeline invariant failed"),
+        }
+    }
 }
 
 /// Exact block identity and state root at an execution boundary.
@@ -511,42 +517,20 @@ pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
     /// Deployment address used to classify privileged L2 transactions.
     fn expected_l2_system_address(&self) -> alloy_primitives::Address;
 
-    /// Replay the admitted sequence in order, verify execution-state continuity,
-    /// and return checked evidence bound to each corresponding input.
-    /// `witnesses[i]` belongs to `blocks[i]` and may be consumed by the backend.
-    fn validate_blocks(
-        &self,
-        blocks: &[AdmittedBlock],
-        witnesses: &mut [ExecutionWitness],
-        cancellation: &CancellationToken,
-    ) -> Result<BackendWindowOutput, ValidationError>;
-
     /// Check a proving session's starting anchor without allocating a backend cursor.
-    /// Legacy-only backends reject v2 admission until they are migrated.
-    fn validate_anchor(&self, _anchor: BlockAnchor) -> Result<(), ValidationError> {
-        Err(ValidationError::Unavailable(format!(
-            "{} backend does not support per-block validation",
-            self.label()
-        )))
-    }
+    fn validate_anchor(&self, anchor: BlockAnchor) -> Result<(), ValidationError>;
 
-    /// Validate or reuse one block against its exact parent, returning whether execution was reused.
-    /// The parent is the session's admitted anchor or a previously validated block.
-    /// The session owns prefix continuity; safe compatibility is enforced at finalization.
-    /// Backends own their caches (including checkpoints), execution limits and deadlines.
-    /// Cache hits must bind the submitted bytes and parent; only successful results may be cached.
+    /// Validate or reuse one block against its exact parent.
+    /// Sessions own prefix continuity. Backends own execution limits and caches;
+    /// cache hits must bind the submitted bytes and parent, and only fully checked
+    /// results may be cached. The boolean reports execution reuse for diagnostics.
     async fn validate_next(
         &self,
-        _parent: BlockAnchor,
-        _block: &AdmittedBlock,
-        _witness: ExecutionWitness,
-        _request_timeout: Duration,
-    ) -> Result<(Arc<ValidatedBlock>, bool), ValidationError> {
-        Err(ValidationError::Unavailable(format!(
-            "{} backend does not support per-block validation",
-            self.label()
-        )))
-    }
+        parent: BlockAnchor,
+        block: &AdmittedBlock,
+        witness: ExecutionWitness,
+        request_timeout: Duration,
+    ) -> Result<(Arc<ValidatedBlock>, bool), ValidationError>;
 
     /// Prepare a selected, already-validated window for attestation. Stateful
     /// backends check retention and require Reth to accept the terminal forkchoice;
@@ -563,38 +547,6 @@ pub trait ValidationBackend: std::fmt::Debug + Send + Sync + 'static {
     }
 }
 
-/// Execute an admitted v1 window and package its checked blocks for settlement.
-/// Move witnesses into the backend without cloning their outer collections.
-pub(crate) fn validate_window(
-    backend: &dyn ValidationBackend,
-    blocks: AdmittedBlocks,
-    cancellation: &CancellationToken,
-) -> Result<ValidatedWindow, ValidationError> {
-    let mut blocks = blocks.into_vec();
-    let mut witnesses = blocks
-        .iter_mut()
-        .map(AdmittedBlock::take_witness)
-        .collect::<Vec<_>>();
-    let output = backend.validate_blocks(&blocks, &mut witnesses, cancellation)?;
-    if output.blocks.len() != blocks.len() {
-        return Err(ValidationError::InvalidBackendOutput(
-            "backend block count does not match admitted window".to_owned(),
-        ));
-    }
-    // V1 admission checked the claimed sequence; each backend binds those
-    // claims and verifies execution continuity while replaying in order.
-    let mut preceding = output.blocks;
-    let terminal = preceding.pop().ok_or_else(|| {
-        ValidationError::Rejected("refusing to validate an empty window".to_owned())
-    })?;
-    let anchor = preceding
-        .first()
-        .map_or(terminal.parent_hash, |block| block.parent_hash);
-    Ok(ValidatedWindow::from_validated_prefix(
-        anchor, preceding, terminal,
-    ))
-}
-
 /// Check backend evidence once, before a result becomes cacheable or visible to
 /// a session. The decoded input was already bound to the submitted RLP.
 fn check_backend_block_output(
@@ -602,7 +554,6 @@ fn check_backend_block_output(
     expected_hash: B256,
     decoded: &EthereumBlock,
     output: &BackendBlockOutput,
-    allow_checkpoints: bool,
 ) -> eyre::Result<()> {
     eyre::ensure!(
         output.computed_hash == expected_hash,
@@ -650,11 +601,6 @@ fn check_backend_block_output(
         );
     }
     let checkpoints = &output.transaction_state_checkpoints;
-    eyre::ensure!(
-        allow_checkpoints || checkpoints.is_empty(),
-        "backend output supplied transaction state checkpoints for preceding block {}",
-        number,
-    );
     // `CheckpointAt`'s variant order is execution order, so `Ord` is the
     // ordering check: pre-execution precedes every transaction boundary.
     for pair in checkpoints.windows(2) {
@@ -691,3 +637,66 @@ pub(crate) mod testing;
 
 #[cfg(test)]
 mod tests;
+
+/// Helpers used by validation-backend tests in downstream crates.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-utils"))]
+pub mod fixtures {
+    use alloy_rpc_types_debug::ExecutionWitness;
+
+    use super::{AdmittedBlock, B256};
+
+    /// Mutable admitted fields exposed only for downstream backend tests.
+    #[derive(Debug)]
+    pub struct AdmittedBlockPartsMut<'a> {
+        pub declared_number: &'a mut u64,
+        pub claimed_hash: &'a mut B256,
+        pub claimed_parent_hash: &'a mut B256,
+        pub rlp: &'a mut Vec<u8>,
+        pub witness: &'a mut ExecutionWitness,
+    }
+
+    /// Construct an admitted block without running the streaming transport.
+    pub fn admitted_block_from_consensus_rlp(
+        declared_number: u64,
+        claimed_hash: B256,
+        claimed_parent_hash: B256,
+        rlp: Vec<u8>,
+    ) -> AdmittedBlock {
+        admitted_block_with_witness(
+            declared_number,
+            claimed_hash,
+            claimed_parent_hash,
+            rlp,
+            ExecutionWitness::default(),
+        )
+    }
+
+    /// Construct an admitted block with an execution witness for backend tests.
+    pub fn admitted_block_with_witness(
+        declared_number: u64,
+        claimed_hash: B256,
+        claimed_parent_hash: B256,
+        rlp: Vec<u8>,
+        witness: ExecutionWitness,
+    ) -> AdmittedBlock {
+        AdmittedBlock {
+            declared_number,
+            claimed_hash,
+            claimed_parent_hash,
+            rlp,
+            witness,
+        }
+    }
+
+    /// Borrow all admitted fields mutably for downstream backend tests.
+    pub fn admitted_block_parts_mut(block: &mut AdmittedBlock) -> AdmittedBlockPartsMut<'_> {
+        AdmittedBlockPartsMut {
+            declared_number: &mut block.declared_number,
+            claimed_hash: &mut block.claimed_hash,
+            claimed_parent_hash: &mut block.claimed_parent_hash,
+            rlp: &mut block.rlp,
+            witness: &mut block.witness,
+        }
+    }
+}

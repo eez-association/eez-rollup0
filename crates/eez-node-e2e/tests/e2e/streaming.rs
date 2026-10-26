@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use alloy_primitives::{B256, U256};
 use anyhow::{Result, ensure};
-use eez_control_rpc::{v1, v2};
+use eez_control_rpc::v1;
 use eez_testkit::*;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -88,7 +88,7 @@ async fn shared_prover_reorg(stateful: bool) -> Result<()> {
     }
     let timeout = Duration::from_mins(3);
     wait_for(Duration::from_secs(30), || async {
-        Ok(v2::prover_client::ProverClient::connect(endpoint.clone())
+        Ok(v1::prover_client::ProverClient::connect(endpoint.clone())
             .await
             .ok())
     })
@@ -169,13 +169,13 @@ async fn rpc(url: &str, method: &str, params: Value) -> Result<Value> {
 }
 
 async fn exchange(
-    requests: &mpsc::Sender<v2::ClientFrame>,
-    responses: &mut tonic::Streaming<v2::ServerFrame>,
-    binding: &v2::ServerFrame,
-    kind: v2::client_frame::Kind,
-) -> Result<v2::ServerFrame> {
+    requests: &mpsc::Sender<v1::ClientFrame>,
+    responses: &mut tonic::Streaming<v1::ServerFrame>,
+    binding: &v1::ServerFrame,
+    kind: v1::client_frame::Kind,
+) -> Result<v1::ServerFrame> {
     requests
-        .send(v2::ClientFrame {
+        .send(v1::ClientFrame {
             session_id: binding.session_id.clone(),
             epoch: binding.epoch,
             request_id: 1,
@@ -266,7 +266,7 @@ async fn stateful_sessions_can_extend_and_finalize_an_unselected_branch() -> Res
     .await?;
     let endpoint = format!("http://{addr}");
     let mut client = wait_for(Duration::from_secs(30), || async {
-        Ok(v2::prover_client::ProverClient::connect(endpoint.clone())
+        Ok(v1::prover_client::ProverClient::connect(endpoint.clone())
             .await
             .ok())
     })
@@ -278,7 +278,7 @@ async fn stateful_sessions_can_extend_and_finalize_an_unselected_branch() -> Res
     )
     .await?;
     let decode = |value: &Value| alloy_primitives::hex::decode(value.as_str().unwrap());
-    let begin = v2::client_frame::Kind::Begin(v2::Begin {
+    let begin = v1::client_frame::Kind::Begin(v1::Begin {
         rollup_id: 1,
         anchor_number: 0,
         anchor_hash: decode(&genesis["hash"])?,
@@ -295,12 +295,12 @@ async fn stateful_sessions_can_extend_and_finalize_an_unselected_branch() -> Res
         let ready = exchange(
             &requests,
             &mut responses,
-            &v2::ServerFrame::default(),
+            &v1::ServerFrame::default(),
             begin.clone(),
         )
         .await?;
         ensure!(
-            matches!(ready.kind, Some(v2::server_frame::Kind::Ready(_))),
+            matches!(ready.kind, Some(v1::server_frame::Kind::Ready(_))),
             "{ready:?}"
         );
         let mut blocks = Vec::new();
@@ -314,7 +314,7 @@ async fn stateful_sessions_can_extend_and_finalize_an_unselected_branch() -> Res
             .await?;
             let block: alloy_rpc_types_eth::Block<eez_primitives::EezTxEnvelope> =
                 serde_json::from_value(header.clone())?;
-            blocks.push(v2::Block {
+            blocks.push(v1::Block {
                 data: Some(v1::BlockWitness {
                     number,
                     hash: decode(&header["hash"])?,
@@ -329,11 +329,11 @@ async fn stateful_sessions_can_extend_and_finalize_an_unselected_branch() -> Res
                 &requests,
                 &mut responses,
                 &ready,
-                v2::client_frame::Kind::Block(block.clone()),
+                v1::client_frame::Kind::Block(block.clone()),
             )
             .await?;
             ensure!(
-                matches!(response.kind, Some(v2::server_frame::Kind::Validated(_))),
+                matches!(response.kind, Some(v1::server_frame::Kind::Validated(_))),
                 "{response:?}"
             );
         }
@@ -365,11 +365,11 @@ async fn stateful_sessions_can_extend_and_finalize_an_unselected_branch() -> Res
         requests,
         responses,
         ready,
-        v2::client_frame::Kind::Block(branches[0][height as usize].clone()),
+        v1::client_frame::Kind::Block(branches[0][height as usize].clone()),
     )
     .await?;
     ensure!(
-        matches!(response.kind, Some(v2::server_frame::Kind::Validated(_))),
+        matches!(response.kind, Some(v1::server_frame::Kind::Validated(_))),
         "{response:?}"
     );
 
@@ -381,7 +381,7 @@ async fn stateful_sessions_can_extend_and_finalize_an_unselected_branch() -> Res
         requests,
         responses,
         ready,
-        v2::client_frame::Kind::Finalize(v2::Finalize {
+        v1::client_frame::Kind::Finalize(v1::Finalize {
             from_block: 1,
             to_block: height,
             terminal_hash: branches[1][height as usize - 1]
@@ -390,14 +390,14 @@ async fn stateful_sessions_can_extend_and_finalize_an_unselected_branch() -> Res
                 .unwrap()
                 .hash
                 .clone(),
-            settlement: Some(v2::SettlementInput {
+            settlement: Some(v1::SettlementInput {
                 abi_calldata: vec![0],
                 ..Default::default()
             }),
         }),
     )
     .await?;
-    let Some(v2::server_frame::Kind::Rejected(rejection)) = response.kind else {
+    let Some(v1::server_frame::Kind::Rejected(rejection)) = response.kind else {
         anyhow::bail!("expected calldata rejection")
     };
     ensure!(

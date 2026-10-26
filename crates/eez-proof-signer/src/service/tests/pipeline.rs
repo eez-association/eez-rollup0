@@ -235,7 +235,7 @@ fn transient_validation_errors_have_stable_rpc_mappings() {
     ];
 
     for (error, code, message) in cases {
-        let status = PipelineError::Validation(error).status();
+        let status = error.status();
         assert_eq!(status.code(), code);
         assert_eq!(status.message(), message);
     }
@@ -266,38 +266,6 @@ fn cancelled_settlement_stops_before_decoding_untrusted_input() {
     });
 
     assert!(matches!(run, Err(SettlementPipelineError::Cancelled)));
-}
-
-#[test]
-fn an_elapsed_deadline_stops_the_pipeline_between_validation_and_settlement() {
-    let mut input = AdmittedBlock::test(5, 0x04, 0x05);
-    let empty_body: eez_primitives::BlockBody = Default::default();
-    input.rlp = alloy_rlp::encode(eez_primitives::Block::new(Default::default(), empty_body));
-    let inputs = vec![input];
-    let state = inner(StubBackend::new(vec![Ok(backend_output_for(&inputs))]));
-    // A deadline captured now is already past when the boundary between
-    // execution validation and settlement runs.
-    let deadline = tokio::time::Instant::now();
-
-    let result = validate_and_settle(
-        &state,
-        crate::window::AdmittedBlocks::for_test(inputs),
-        b"not ABI calldata".to_vec(),
-        deadline,
-        &CancellationToken::default(),
-    );
-
-    // The exact variant proves settlement never decoded the untrusted bytes:
-    // decoding them would have produced a calldata error instead.
-    let error = result
-        .err()
-        .expect("an elapsed deadline must stop the pipeline");
-    assert!(matches!(error, PipelineError::DeadlineBeforeSettlement));
-    assert_eq!(error.phase(), "settlement");
-    assert_eq!(error.gate(), "deadline");
-    let status = error.status();
-    assert_eq!(status.code(), Code::DeadlineExceeded);
-    assert_eq!(status.message(), "Prove request deadline exceeded");
 }
 
 #[test]

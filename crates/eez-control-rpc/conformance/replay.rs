@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 
 use alloy_primitives::{Address, B256, Signature};
-use eez_control_rpc::v2::{ClientFrame, ServerFrame, prover_client::ProverClient, server_frame};
+use eez_control_rpc::v1::{ClientFrame, ServerFrame, prover_client::ProverClient, server_frame};
 use prost::Message;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;

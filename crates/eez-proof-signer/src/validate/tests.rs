@@ -77,33 +77,10 @@ fn accepts_backend_output_consistent_with_the_window() {
 }
 
 #[test]
-fn rejects_an_empty_window() {
-    let validator = StubBackend::new(vec![Ok(backend_output_for(&[]))]);
-
-    assert!(matches!(
-        validator.validate(&[]),
-        Err(ValidationError::Rejected(reason))
-            if reason == "refusing to validate an empty window"
-    ));
-    assert_eq!(validator.remaining_test_actions(), Some(1));
-}
-
-#[test]
-fn rejects_backend_output_with_the_wrong_block_count() {
-    let window = [admitted_block(5, 0x05)];
-    let two_blocks = backend_output_for(&[admitted_block(5, 0x05), admitted_block(6, 0x06)]);
-    let validator = StubBackend::new(vec![Ok(two_blocks)]);
-    assert!(matches!(
-        validator.validate(&window),
-        Err(ValidationError::InvalidBackendOutput(_))
-    ));
-}
-
-#[test]
 fn rejects_backend_output_with_a_mismatched_hash() {
     let window = [admitted_block(5, 0x05)];
     let mut output = backend_output_for(&window);
-    output.blocks[0].computed_hash = B256::repeat_byte(0xee);
+    output[0].computed_hash = B256::repeat_byte(0xee);
     let validator = StubBackend::new(vec![Ok(output)]);
     assert!(validator.validate(&window).is_err());
 }
@@ -112,7 +89,7 @@ fn rejects_backend_output_with_a_mismatched_hash() {
 fn rejects_system_sender_flags_that_do_not_cover_the_block() {
     let window = [admitted_block(5, 0x05)];
     let mut output = backend_output_for(&window);
-    output.blocks[0].settlement_evidence.system_sender_flags = vec![false];
+    output[0].settlement_evidence.system_sender_flags = vec![false];
     let validator = StubBackend::new(vec![Ok(output)]);
 
     assert!(matches!(
@@ -152,7 +129,6 @@ fn decoded_block_checks_execution_evidence_before_it_can_be_shared() {
         )
         .unwrap();
         let mut output = backend_output_for(std::slice::from_ref(&admitted))
-            .blocks
             .pop()
             .unwrap();
         match defect {
@@ -165,7 +141,7 @@ fn decoded_block_checks_execution_evidence_before_it_can_be_shared() {
             "checkpoint" => output.transaction_state_checkpoints.push(checkpoint(0, 0)),
             _ => {}
         }
-        let checked = decoded.finish(output, B256::repeat_byte(9), true);
+        let checked = decoded.finish(output, B256::repeat_byte(9));
         if defect == "none" {
             let checked = checked.unwrap();
             assert_eq!(checked.number(), admitted.declared_number());
@@ -185,9 +161,8 @@ fn decoded_block_checks_execution_evidence_before_it_can_be_shared() {
 fn rejects_an_outbound_observation_outside_the_block() {
     let window = [admitted_block_with_transactions(5, 0x05, 2)];
     let mut output = backend_output_for(&window);
-    output.blocks[0]
-        .settlement_evidence
-        .observed_outbound_events = vec![OutboundEventObservation::malformed_for_test(2, 0)];
+    output[0].settlement_evidence.observed_outbound_events =
+        vec![OutboundEventObservation::malformed_for_test(2, 0)];
     let validator = StubBackend::new(vec![Ok(output)]);
     assert!(matches!(
         validator.validate(&window),
@@ -199,9 +174,7 @@ fn rejects_an_outbound_observation_outside_the_block() {
 fn rejects_unordered_outbound_observations() {
     let window = [admitted_block_with_transactions(5, 0x05, 2)];
     let mut output = backend_output_for(&window);
-    output.blocks[0]
-        .settlement_evidence
-        .observed_outbound_events = vec![
+    output[0].settlement_evidence.observed_outbound_events = vec![
         OutboundEventObservation::malformed_for_test(1, 0),
         OutboundEventObservation::malformed_for_test(0, 0),
     ];
@@ -224,7 +197,7 @@ fn accepts_sparse_ordered_transaction_state_checkpoints() {
         vec![pre_execution, checkpoint(0, 0xaa), checkpoint(2, 0xcc)],
     ] {
         let mut output = backend_output_for(&window);
-        output.blocks[0].transaction_state_checkpoints = checkpoints;
+        output[0].transaction_state_checkpoints = checkpoints;
         let validator = StubBackend::new(vec![Ok(output)]);
         assert!(validator.validate(&window).is_ok());
     }
@@ -235,7 +208,7 @@ fn rejects_incomplete_or_surplus_transaction_statuses() {
     let window = [admitted_block_with_transactions(5, 0x05, 2)];
 
     let mut short = backend_output_for(&window);
-    short.blocks[0].receipt_successes = vec![true];
+    short[0].receipt_successes = vec![true];
     let short_validator = StubBackend::new(vec![Ok(short)]);
     assert!(matches!(
         short_validator.validate(&window),
@@ -243,7 +216,7 @@ fn rejects_incomplete_or_surplus_transaction_statuses() {
     ));
 
     let mut surplus = backend_output_for(&window);
-    surplus.blocks[0].receipt_successes = vec![true; 3];
+    surplus[0].receipt_successes = vec![true; 3];
     let surplus_validator = StubBackend::new(vec![Ok(surplus)]);
     assert!(matches!(
         surplus_validator.validate(&window),
@@ -265,7 +238,7 @@ fn rejects_duplicate_or_descending_state_checkpoints() {
         vec![checkpoint(0, 0xaa), pre_execution],
     ] {
         let mut output = backend_output_for(&window);
-        output.blocks[0].transaction_state_checkpoints = checkpoints;
+        output[0].transaction_state_checkpoints = checkpoints;
         let validator = StubBackend::new(vec![Ok(output)]);
         assert!(matches!(
             validator.validate(&window),
@@ -278,7 +251,7 @@ fn rejects_duplicate_or_descending_state_checkpoints() {
 fn rejects_out_of_bounds_transaction_state_checkpoint_indices() {
     let window = [admitted_block_with_transactions(5, 0x05, 2)];
     let mut output = backend_output_for(&window);
-    output.blocks[0].transaction_state_checkpoints = vec![checkpoint(2, 0xcc)];
+    output[0].transaction_state_checkpoints = vec![checkpoint(2, 0xcc)];
 
     let validator = StubBackend::new(vec![Ok(output)]);
     assert!(matches!(
@@ -291,7 +264,7 @@ fn rejects_out_of_bounds_transaction_state_checkpoint_indices() {
 fn accepts_a_last_transaction_checkpoint_before_post_block_changes() {
     let window = [admitted_block_with_transactions(5, 0x05, 2)];
     let mut output = backend_output_for(&window);
-    output.blocks[0].transaction_state_checkpoints = vec![checkpoint(1, 0xaa)];
+    output[0].transaction_state_checkpoints = vec![checkpoint(1, 0xaa)];
     let validator = StubBackend::new(vec![Ok(output)]);
 
     assert!(validator.validate(&window).is_ok());
@@ -304,7 +277,7 @@ fn rejects_transaction_state_checkpoints_when_the_block_rlp_is_malformed() {
     let window = [input];
 
     let mut output = backend_output_for(&window);
-    output.blocks[0].transaction_state_checkpoints = Vec::new();
+    output[0].transaction_state_checkpoints = Vec::new();
     let validator = StubBackend::new(vec![Ok(output)]);
     assert!(matches!(
         validator.validate(&window),
@@ -319,34 +292,10 @@ fn rejects_transaction_state_checkpoints_when_the_block_rlp_has_trailing_data() 
     let window = [input];
 
     let mut output = backend_output_for(&window);
-    output.blocks[0].transaction_state_checkpoints = Vec::new();
+    output[0].transaction_state_checkpoints = Vec::new();
     let validator = StubBackend::new(vec![Ok(output)]);
     assert!(matches!(
         validator.validate(&window),
-        Err(ValidationError::InvalidBackendOutput(_))
-    ));
-}
-
-#[test]
-fn a_backend_rejection_and_stub_exhaustion_both_fail() {
-    let window = [admitted_block(5, 0x05)];
-    let validator = StubBackend::new(vec![Err("re-execution mismatch".to_owned())]);
-    assert!(validator.validate(&window).is_err());
-    // The canned responses are spent; the next call fails loudly.
-    assert!(validator.validate(&window).is_err());
-}
-
-#[test]
-fn rejects_transaction_state_checkpoints_on_preceding_blocks() {
-    let two_block_window = [
-        admitted_block_with_transactions(5, 0x05, 1),
-        admitted_block(6, 0x06),
-    ];
-    let mut preceding_checkpoints = backend_output_for(&two_block_window);
-    preceding_checkpoints.blocks[0].transaction_state_checkpoints = vec![checkpoint(0, 0xaa)];
-    let validator = StubBackend::new(vec![Ok(preceding_checkpoints)]);
-    assert!(matches!(
-        validator.validate(&two_block_window),
         Err(ValidationError::InvalidBackendOutput(_))
     ));
 }
@@ -359,7 +308,7 @@ fn normalizes_validated_output_for_settlement() {
         chained_admitted_block(7),
     ];
     let mut output = backend_output_for(&window);
-    for (block, post_state_root) in output.blocks.iter_mut().zip([
+    for (block, post_state_root) in output.iter_mut().zip([
         B256::repeat_byte(0x11),
         B256::repeat_byte(0x12),
         B256::repeat_byte(0x13),
@@ -368,12 +317,7 @@ fn normalizes_validated_output_for_settlement() {
     }
     let validator = StubBackend::new(vec![Ok(output)]);
 
-    let validated = validate_window(
-        &validator,
-        AdmittedBlocks::for_test(window),
-        &CancellationToken::default(),
-    )
-    .unwrap();
+    let validated = validator.validate(&window).unwrap();
 
     // Endpoints come from the block headers; the re-executed state roots set
     // above must reach none of them.
@@ -394,15 +338,10 @@ fn normalizes_validated_output_for_settlement() {
 fn uses_the_terminal_parent_as_the_window_pre_hash_for_one_block() {
     let window = vec![chained_admitted_block(5)];
     let mut output = backend_output_for(&window);
-    output.blocks[0].post_state_root = B256::repeat_byte(0x11);
+    output[0].post_state_root = B256::repeat_byte(0x11);
     let validator = StubBackend::new(vec![Ok(output)]);
 
-    let validated = validate_window(
-        &validator,
-        AdmittedBlocks::for_test(window),
-        &CancellationToken::default(),
-    )
-    .unwrap();
+    let validated = validator.validate(&window).unwrap();
 
     assert_eq!(validated.window_pre_block_hash(), B256::repeat_byte(0x04));
     assert!(validated.preceding_blocks().is_empty());

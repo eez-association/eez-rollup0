@@ -9,11 +9,12 @@ itself never turns a Composer claim into validated evidence.
 
 ```mermaid
 flowchart TB
-    W[Composer ProveChunk stream] --> A[AdmittedWindow]
+    W[Composer Block frames] --> A[AdmittedBlock]
     A -->|RLP and witnesses| V[Validation backend]
-    V --> VW[ValidatedWindow]
+    V --> P[Checked session prefix]
+    P --> VW[Selected ValidatedWindow]
 
-    A -->|submitted PostBatch calldata| C[CanonicalPostBatch]
+    F[Composer Finalize calldata] --> C[CanonicalPostBatch]
     C --> B[Settlement binding and authorization]
     VW --> B
     B --> R[RecomputedPublicInputsHash]
@@ -48,16 +49,12 @@ Avoid the unqualified word `trusted` when a more precise source exists. Prefer
 
 ## Boundary guarantees
 
-### `AdmittedWindow`
+### `AdmittedBlock`
 
-The stream header appeared first, the declared inclusive range is valid, all
-declared blocks arrived in order, fixed-width hash claims were decoded, claimed
-adjacency holds, the header rollup claim matched `expected_rollup_id`, and the
-configured resource quotas were respected.
-
-Block hashes, RLP, witnesses, settlement calldata, and the discarded wire
-public-input hash remain Composer-controlled. Admission does not establish
-consensus or execution correctness.
+The stream is bound to an admitted session; hash widths, witness presence and
+resource quotas were checked. Metadata, RLP and witness remain untrusted.
+Backend execution checks the exact parent and block identity. Session append
+checks that the operation's captured epoch and parent are still current.
 
 ### Backend results
 
@@ -67,9 +64,9 @@ and compares the locally computed post-state root with the header commitment.
 The backend returns each block's computed identity, validated roots, receipt
 outcomes, selected transaction checkpoints, and settlement evidence together.
 
-Shared validation consumes that backend result and compares it with the
-admitted stream. A backend result is not handed to settlement until this
-contract check succeeds.
+Inside the backend, shared validation consumes the execution result and
+checks it against the decoded input before publishing a `ValidatedBlock`.
+Only that checked block can enter a cache, session, or settlement window.
 
 ### `ValidatedWindow`
 

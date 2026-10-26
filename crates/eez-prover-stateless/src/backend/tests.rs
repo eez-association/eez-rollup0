@@ -6,14 +6,16 @@ use alloy_primitives::{B256, Bytes, Log, Signature, U256, b256};
 use alloy_sol_types::SolEvent as _;
 use eez_primitives::{EezTxEnvelope as TransactionSigned, Receipt as EthereumReceipt};
 use eez_proof_signer::EEZL2_ADDRESS;
+use eez_proof_signer::validate::fixtures::admitted_block_with_witness;
 use eez_proof_signer::validate::{CheckpointAt, DecodedOutboundEvent, OutboundEventObservation};
-use eez_proof_signer::window::testing::admitted_block_with_witness;
 use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
 use reth_primitives_traits::SignerRecoverable as _;
 
 use super::*;
 use crate::testkit::{SYSTEM_TX, TEST_SYSTEM_ADDRESS};
 use eez_primitives::Block;
+use eez_proof_signer::validate::fixtures::admitted_block_parts_mut;
+use eez_proof_signer::validate::support::system_sender_flags;
 use reth_primitives_traits::RecoveredBlock;
 
 fn fixture_chain_config() -> ChainConfig {
@@ -64,7 +66,7 @@ fn block_input(mut block: AdmittedBlock) -> (AdmittedBlock, ExecutionWitness, Bl
 #[tokio::test]
 async fn block_validation_ordinal_execution_skips_checkpoints_and_checks_cache_hits() {
     // A real three-user-transaction block, not an empty block that would skip
-    // checkpoint work even before the v2 selection fix.
+    // checkpoint work under an unconditional checkpoint policy.
     let (input, config) = checkpoint_fixture();
     let (input, witness, parent) = block_input(input);
     let backend = Backend::new(config, TEST_SYSTEM_ADDRESS);
@@ -143,14 +145,12 @@ fn cache_evicts_by_bytes_without_invalidating_session_evidence() {
     let first = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
         .validate(vec![fixture_input()])
         .unwrap()
-        .blocks
         .pop()
         .unwrap();
     let (input, config) = checkpoint_fixture();
     let second = Backend::new(config, TEST_SYSTEM_ADDRESS)
         .validate(vec![input])
         .unwrap()
-        .blocks
         .pop()
         .unwrap();
     for (count, bytes) in [(8, first.size() + second.size() - 1), (1, usize::MAX)] {
@@ -269,7 +269,6 @@ async fn sync_execution_generates_and_reuses_checkpoints() {
     config.prague_time = None;
     config.osaka_time = None;
     let backend = Backend::new(config, TEST_SYSTEM_ADDRESS);
-    let v1 = backend.validate(vec![input.clone()]).unwrap();
     let (input, witness, parent) = block_input(input);
     let (fresh, reused) = backend
         .validate_next(parent, &input, witness, Duration::from_secs(10))
@@ -277,7 +276,6 @@ async fn sync_execution_generates_and_reuses_checkpoints() {
         .unwrap();
     assert!(!reused);
     let checkpoints = fresh.transaction_state_checkpoints();
-    assert_eq!(v1.blocks[0].transaction_state_checkpoints(), checkpoints);
     assert_eq!(checkpoints.len(), 2);
     assert_eq!(checkpoints[0].at, CheckpointAt::PreExecution);
     assert_eq!(checkpoints[0].state_root, parent.state_root);
@@ -876,8 +874,8 @@ fn validates_the_golden_block_through_stateless() {
     let output = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
         .validate(vec![fixture_input()])
         .unwrap();
-    assert_eq!(output.blocks.len(), 1);
-    let block = &output.blocks[0];
+    assert_eq!(output.len(), 1);
+    let block = &output[0];
     assert_eq!(
         block.hash(),
         b256!("16b64a78e9b3e0d533cafe81f9121735f6a2c8122c69b0bb5994ee75fe7bface")
@@ -908,18 +906,15 @@ fn validates_the_golden_block_through_stateless() {
 }
 
 #[test]
-fn ordinary_v1_terminal_executes_without_checkpoints() {
-    let (mut input, chain_config) = checkpoint_fixture();
+fn ordinary_block_executes_without_checkpoints() {
+    let (input, chain_config) = checkpoint_fixture();
     let expected_hash = input.claimed_hash();
 
     let output = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
-        .validate_admitted(
-            std::slice::from_mut(&mut input),
-            &CancellationToken::default(),
-        )
+        .validate(vec![input])
         .unwrap();
 
-    let block = &output.blocks[0];
+    let block = &output[0];
     assert_eq!(block.decoded().body.transactions.len(), 3);
     assert_eq!(
         block.settlement_evidence().system_sender_flags,
@@ -945,7 +940,7 @@ fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
         serde_json::from_str(&captured_fixture(FIXTURE, "chain-config.json")).unwrap();
     let from = oracle["from_block"].as_u64().unwrap();
     let to = oracle["to_block"].as_u64().unwrap();
-    let mut blocks = (from..=to)
+    let blocks = (from..=to)
         .map(|number| {
             let rlp = captured_hex(&captured_fixture(
                 FIXTURE,
@@ -966,13 +961,13 @@ fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
         .collect::<Vec<_>>();
 
     let output = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
-        .validate_admitted(&mut blocks, &CancellationToken::default())
+        .validate(blocks)
         .unwrap();
 
     // The window no longer carries a pre-state root; per-block post-state roots
     // are what the continuity check chains, and that check has its own test.
     assert_eq!(
-        output.blocks.last().unwrap().as_anchor().state_root,
+        output.last().unwrap().as_anchor().state_root,
         oracle["final_state_root"]
             .as_str()
             .unwrap()
@@ -981,7 +976,6 @@ fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
     );
     assert!(
         output
-            .blocks
             .last()
             .unwrap()
             .settlement_evidence()
@@ -989,30 +983,13 @@ fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
             .is_empty()
     );
     // Historical signed calls have no native system authority.
-    assert!(output.blocks.iter().all(|block| {
+    assert!(output.iter().all(|block| {
         block
             .settlement_evidence()
             .system_sender_flags
             .iter()
             .all(|is_system| !is_system)
     }));
-}
-
-#[test]
-fn pre_cancelled_validation_does_not_consume_the_witness() {
-    let cancellation = CancellationToken::default();
-    cancellation.cancel();
-    let mut input = fixture_input();
-    let state_items = admitted_block_parts_mut(&mut input).witness.state.len();
-
-    let result = Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS)
-        .validate_admitted(std::slice::from_mut(&mut input), &cancellation);
-
-    assert!(matches!(result, Err(ValidationError::Cancelled)));
-    assert_eq!(
-        admitted_block_parts_mut(&mut input).witness.state.len(),
-        state_items
-    );
 }
 
 #[test]
@@ -1108,4 +1085,36 @@ fn corrupt_witness_data_is_rejected_by_stateless() {
         Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(vec![input]),
         Err(ValidationError::Rejected(_))
     ));
+}
+
+impl Backend {
+    /// Replay captured fixtures through the production single-block executor.
+    fn validate(
+        &self,
+        inputs: Vec<AdmittedBlock>,
+    ) -> Result<Vec<Arc<ValidatedBlock>>, ValidationError> {
+        let mut blocks = Vec::new();
+        for mut input in inputs {
+            let witness = std::mem::take(admitted_block_parts_mut(&mut input).witness);
+            let parent = if let Some(previous) = blocks.last() {
+                let previous: &Arc<ValidatedBlock> = previous;
+                previous.as_anchor()
+            } else {
+                // The captured witness supplies the execution parent. Keep malformed
+                // claim fixtures intact so production validation rejects them.
+                let parent = witness
+                    .headers
+                    .iter()
+                    .filter_map(|bytes| alloy_rlp::decode_exact::<Header>(bytes).ok())
+                    .find(|header| header.number.checked_add(1) == Some(input.declared_number()));
+                BlockAnchor {
+                    number: input.declared_number().saturating_sub(1),
+                    hash: input.claimed_parent_hash(),
+                    state_root: parent.map_or(B256::ZERO, |header| header.state_root),
+                }
+            };
+            blocks.push(self.validate_block(parent, &input, witness)?);
+        }
+        Ok(blocks)
+    }
 }
