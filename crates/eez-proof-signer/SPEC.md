@@ -51,7 +51,7 @@ locally recomputed public-input hash only under all rules in this document.
 
 ### 1.1 What the signature does not establish
 
-Both the window RPC and streaming Finalize retain conditional-proof semantics:
+Streaming Finalize has conditional-proof semantics:
 the signer proves the transition from the selected execution parent, not that
 the parent was already accepted on L1. The L1 contract checks each update's
 `currentRoot` against the live rollup root when consuming the entry. Streaming,
@@ -71,7 +71,7 @@ The signature does **not** establish:
 - code identity at the fixed EEZL2 address;
 - immediate-versus-queued dispatch, eventual execution, or availability of
   every proved entry;
-- the contents of `proofs` or the Composer-supplied `public_inputs_hash`;
+- the contents of `proofs`;
 - a standalone on-chain commitment to the RPC window bounds, block hashes,
   block RLP, witnesses, or transaction checkpoints; or
 - caller authentication, transport confidentiality, or replay protection.
@@ -166,7 +166,7 @@ Genesis document supplies its timestamp and genesis fields; a bare
 
 The stateful backend runs inside `eez-follower` and is configured only through the
 environment. It is enabled when `EEZ_STATEFUL_PROOF_SIGNER_ADDR` is present;
-otherwise the node MUST NOT expose the stateful `Prove` service. It MUST run
+otherwise the node MUST NOT expose the stateful `ProveStream` service. It MUST run
 only in follower mode without `EEZ_SEQUENCER_RPC`, so its database view is
 derived from L1 rather than a sequencer's unsafe head.
 
@@ -198,105 +198,47 @@ deployment invariant.
 
 ## 4. Service and RPC behavior
 
-The service exposes one client-streaming RPC:
+The service exposes `prove.v1.Prover/ProveStream`, a bidirectional RPC.
+The [wire specification](../eez-control-rpc/SPEC.md) defines framing, recovery,
+status codes, and optional capabilities. Both execution backends inherit the
+same session runtime and settlement pipeline.
 
-```protobuf
-rpc Prove(stream ProveChunk) returns (ProveResponse);
-```
+`Begin` admits an exact execution anchor. Each `Block` is validated before its
+`Validated` acknowledgement. `Finalize` selects a nonempty contiguous range
+from that session's checked prefix and supplies the settlement calldata. Only
+a successful `Finalize` returns `Proof` and closes the response stream.
 
-One stream contains exactly one header followed by one block/witness chunk per
-declared block.
+Session IDs, request IDs and epochs bind responses and fence superseded work.
+The runtime supports Resume, Rewind, Cancel, subrange finalization and bounded
+pipelining. Backend caches contain checked evidence, never session authority.
 
-### 4.1 Single-flight execution
+### 4.1 Limits and deadlines
 
-Exactly one request may be admitted at a time. A second request MUST be
-rejected immediately with `Unavailable`; it MUST NOT wait while holding an
-open stream.
+Decoded request messages are limited to `min(max_request_bytes, 256 MiB)`;
+response messages are limited to 1024 bytes. Each session accounts for its
+submitted block bytes and witness items even on cache hits. Retained sessions,
+active streams and backend execution capacity are independently bounded.
 
-The active-request slot remains held through validation, settlement, signing,
-and response construction. If a blocking worker outlives its RPC future, the
-slot remains held until that worker exits. Graceful shutdown stops accepting
-new connections and waits for the slot to become idle.
-
-### 4.2 Message and request limits
-
-The maximum decoded request-message size is:
-
-```text
-min(max_request_bytes, 256 MiB)
-```
-
-The maximum response-message size is 1024 bytes.
-
-The aggregate byte quota is the sum of `prost::Message::encoded_len()` for
-decoded known fields of every header and block chunk, including fields later
-discarded. Integer overflow MUST reject the request. This quota does not undo
-allocations made while decoding the current message; the per-message limit
-bounds that stage.
-
-The witness-item quota counts all `state`, `codes`, `keys`, and `headers`
-elements across the request. The block quota covers the inclusive declared
-range.
-
-### 4.3 Deadlines and cancellation
-
-The stream idle timeout applies independently to every wait for a message or
-EOF. The request timeout is one absolute deadline covering ingestion,
-validation, settlement, signing, and response construction.
-
-CPU-bound validation and settlement run in one blocking worker. A worker that
-has not started MAY be aborted. Running EVM execution is non-interruptible; a
-running worker observes cooperative cancellation before block executions and
-at selected settlement phase boundaries. A timed-out or disconnected request
-MUST NOT release the active slot while its worker is still running.
-
-If the absolute deadline expires during signing, the signature MUST NOT be
-returned even if local signing completed.
+Idle timeouts bound stream waits. Per-operation deadlines bound execution and
+finalization; the latter includes attestation preparation and settlement.
+Cancellation fences publication/signing, while non-interruptible backend work
+may finish and publish fully checked cache entries. Stateless workers retain
+their execution permit until completion; stateful mutations retain their
+reconciliation guard. A failed or superseded operation MUST NOT sign.
 
 ## 5. Stream admission
 
-Admission proves stream shape and quota compliance only. It does not prove
-block, witness, or settlement correctness.
+Admission proves framing, binding and quota compliance, not execution validity.
+Begin checks the configured rollup ID, exact hash/root widths and backend
+anchor policy. Block requires a witness and exact-width hash claims. The
+backend binds the claimed identity to RLP and checks the exact parent; the
+session appends the checked result only if its epoch and parent are unchanged.
 
-### 5.1 Header
-
-The first chunk MUST be a `ProveHeader`. It MUST contain `post_batch`.
-
-The header is admitted only if:
-
-- `rollup_id` equals the operator-configured expected rollup ID;
-- `from_block != 0`;
-- `from_block <= to_block`;
-- the inclusive span `to_block - from_block + 1` is representable and no larger
-  than `max_request_blocks`; and
-- `post_batch.l1_block_hash` is empty.
-
-`post_batch.public_inputs_hash` is a non-authoritative Composer claim and MUST
-be ignored. It is not length-checked and is never signed. Only
-`post_batch.abi_calldata` is retained for settlement.
-
-### 5.2 Blocks
-
-After the header, every chunk MUST be a `BlockWitness`; duplicate headers and
-empty chunk kinds MUST be rejected.
-
-For block index `i`, admission MUST require:
-
-- `number == from_block + i`;
-- `hash` and `parent_hash` are exactly 32 bytes;
-- a witness is present;
-- the aggregate quotas remain within limits; and
-- for `i > 0`, the claimed parent hash equals the preceding claimed block hash.
-
-The wire profile requires a witness for every backend. The stateless backend
-MUST use it for replay. The stateful backend MAY ignore its contents, but the
-service MUST still enforce all witness presence and quota rules above.
-
-EOF is accepted only after exactly the declared number of blocks. Extra,
-missing, duplicated, or reordered blocks MUST be rejected.
-
-The first block's parent is not compared with a trusted external anchor during
-admission.
+The stateful backend may ignore witness contents, but presence and accounting
+rules still apply. Finalize must name a retained range and its exact checked
+terminal hash. Unsupported blobs or posting context return UNIMPLEMENTED;
+missing settlement input is INVALID_ARGUMENT. There is no Composer-supplied
+public-input hash in the wire input.
 
 ## 6. Execution validation
 
@@ -354,8 +296,7 @@ single checkpoint seals the complete terminal block.
 
 The Composer MUST NOT nominate checkpoint positions. The plan MUST be derived
 locally before replay. The backend MUST return exactly the requested positions
-in strict order. V1 requests checkpoints only for its selected terminal. V2
-retains them for streamed Sync candidates, since the eventual selected terminal
+in strict order. The backend retains them for streamed Sync candidates, since the eventual selected terminal
 is not yet known; Finalize consumes only that terminal's checkpoints.
 
 ### 6.3 Stateless replay guarantees
@@ -371,9 +312,9 @@ supplied witness and configured chain rules:
 - at any selected post-transaction position, the state root and the hash of the
   candidate block holding exactly that transaction prefix.
 
-The pre-state root of each block after the first MUST equal the preceding
-block's computed post-state root. This telescope is self-consistency, not proof
-that the first pre-state belongs to the canonical chain.
+The first block's validated pre-state root MUST equal the session anchor's
+state root. Every later block MUST telescope against its checked predecessor's
+post-state root. This establishes execution continuity, not canonical ancestry.
 
 The window exposes two settlement endpoints, each a block identity taken from
 a header rather than from a backend root:
@@ -384,38 +325,16 @@ a header rather than from a backend root:
 
 ### 6.4 Stateful replay guarantees
 
-For a v1 request covering `m..=n`, the stateful backend MUST:
-
-1. require `m > 0` and identify block `m - 1` as the anchor;
-2. return `Unavailable` if the follower has not reached the anchor or cannot
-   currently read required canonical state;
-3. reject the request if the claimed anchor, or any requested block already in
-   the follower's canonical view, conflicts with the local canonical hash;
-4. open historical state at the canonical anchor and replay every proposed
-   block through `n` in one disposable state overlay;
-5. apply sections 6.1 and 6.2 and validate each block's consensus/header rules,
-   transactions, receipts, block hash, post-state root, and the state root and
-   candidate block hash at every selected post-transaction position, against
-   the continuously updated overlay; and
-6. after replay, re-read the anchor and every requested height known canonical
-   at completion, returning `Aborted` if that snapshot changed.
-
-The stateful backend MUST NOT commit the replay overlay to the follower
-database. Success and failure therefore require no database rollback. The
-follower database and chain specification are within this backend's operator
-trust boundary; the snapshot check prevents signing across an observed local
-reorganization but does not prove global canonicality or finality to a verifier
-of the signature.
-
-V2 imports/executes each streamed block through Reth before acknowledging it.
+The stateful backend imports/executes each streamed block through Reth before
+acknowledging it.
 Begin checks the exact L1-derived safe anchor. Each Block checks its immediate
 parent and execution-state continuity, and reuses retained execution/receipts
 where available. Sync-candidate checkpoint replay is cached inside the backend.
 Import, branch selection and evidence reads share the follower's reconciliation
 lock. At Finalize, `prepare_attestation` selects the checked terminal through
 forkchoice under that same lock; Reth enforces the current safe/finalized ancestry.
-An unavailable or rejected selection cannot produce a proof. This is distinct
-from v1's disposable window replay: v2 deliberately retains imported execution.
+An unavailable or rejected selection cannot produce a proof. Imported execution
+remains owned by Reth and may be reused across sessions.
 
 ### 6.5 Settlement evidence
 
@@ -432,15 +351,15 @@ From the validated block and receipts, the backend MUST retain:
 A signature-matched but malformed or noncanonical event MUST remain an
 observation without decoded fields. It MUST NOT be silently discarded.
 
-Before settlement, a shared consuming check MUST bind one backend output to
-each admitted block and verify block count, identities, hashes, exact RLP
-transaction counts, receipt and sender-flag coverage, event coordinate bounds
-and strict ordering, and checkpoint bounds/order. A backend that claims success
-with malformed output is an internal failure, not an input rejection.
+Before publishing a checked block, the shared consuming check MUST bind its
+execution hash and verify receipt and sender-flag coverage against the decoded
+transaction count, event coordinate bounds/order, and checkpoint bounds/order.
+The session owns prefix continuity and range selection. A backend that claims
+success with malformed output is an internal failure, not an input rejection.
 
 ## 7. Canonical batch and public-input profile
 
-`PostBatch.abi_calldata` MUST exact-decode as the current
+`SettlementInput.abi_calldata` MUST exact-decode as the current
 `postAndVerifyBatch(ProofSystemBatchPerVerificationEntries)` ABI with selector
 `0xe4a480e4`. Re-encoding the decoded argument MUST reproduce every byte after
 the selector. Alternate, partial, or trailing encodings MUST be rejected.
@@ -814,7 +733,7 @@ r[32] || s[32] || v[1]
 ```
 
 The response contains the locally recomputed 32-byte hash and that signature.
-It MUST NOT return the Composer-supplied hash.
+The wire input contains no claimed hash to sign.
 
 ## 14. Public failure behavior
 
@@ -824,11 +743,12 @@ messages SHOULD remain stable and must not expose secrets.
 | gRPC code | Principal cases |
 | --- | --- |
 | `InvalidArgument` | Malformed stream structure; invalid widths or bounds; noncanonical/invalid PostBatch calldata; malformed or trailing DA payload. |
-| `FailedPrecondition` | Rollup identity mismatch; backend input rejection, including a stateful canonical conflict; unsupported batch profile; state/effect/inbound/outbound/DA semantic rejection. |
-| `Unavailable` | Another request is active; the stateful follower is behind the required anchor; or required local canonical data is temporarily unavailable. The same complete request may succeed after the transient condition clears. |
+| `Unimplemented` | The requested rollup is not served; an optional session capability is unsupported. |
+| `FailedPrecondition` | Backend input rejection, including a stateful canonical conflict; unsupported batch profile; state/effect/inbound/outbound/DA semantic rejection. |
+| `Unavailable` | The transport or required backend data is temporarily unavailable. The same complete request may succeed after the transient condition clears. |
 | `Aborted` | The stateful follower's relevant canonical snapshot changed during validation. |
 | `ResourceExhausted` | A decoding, block, byte, or witness-item limit was exceeded; or block-vector storage could not be reserved. |
-| `DeadlineExceeded` | Stream idle timeout or absolute request deadline. |
+| `DeadlineExceeded` | Stream idle timeout or operation deadline. |
 | `Cancelled` | Cooperative stop after request cancellation. |
 | `Internal` | Backend-success output violates its contract; local invariant failure; impossible public-input computation/cardinality; reconstruction failures attributable to already validated internal evidence; signing failure. |
 
@@ -838,7 +758,7 @@ be retained and rejected at its authorization gate.
 ### 14.1 Actionable failed preconditions
 
 A `FailedPrecondition` response MAY carry one protobuf-encoded `ProveFailure`
-in the gRPC status-details field when the validated execution identifies one
+in `Rejected.details` when the validated execution identifies one
 cross-chain candidate that the Composer can safely remove. The status code,
 not the details payload, remains authoritative for retry classification.
 
@@ -910,9 +830,9 @@ A compatible implementation MUST test at least:
 
 Each enabled execution backend MUST also test its trust boundary. The stateless
 backend MUST cover strict chain-document and witness-backed replay behavior. The
-stateful backend MUST cover follower lag, canonical conflicts, historical-state
-replay, disposable multi-block overlays, and canonical snapshot changes during
-validation.
+stateful backend MUST cover safe-anchor admission, exact-parent binding,
+engine import and receipt reuse, checkpoint replay, competing retained branches,
+reconciliation deadlines, and L1 reorganization during shared-session use.
 
 The root Kurtosis gate MUST also observe at least one successful signer
 attestation and one node-side acceptance of a remote attestation while running
@@ -1159,7 +1079,7 @@ The principal sources for this specification are:
 
 - `../eez-prover-stateless/src/config.rs`, `src/service.rs`, and `src/service/`
   for configuration, request lifetime, deadlines, and error mapping;
-- `src/window.rs` and `../eez-control-rpc/proto/prove.proto` for wire admission;
+- `src/service/sessions.rs` and `../eez-control-rpc/proto/prove.proto` for wire admission;
 - `src/validate.rs`, `src/validate/support.rs`,
   `../eez-prover-stateless/src/backend.rs`, and
   `../eez-prover-stateless/src/backend/chain_config.rs` for replay evidence;

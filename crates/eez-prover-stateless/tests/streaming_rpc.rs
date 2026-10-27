@@ -7,9 +7,7 @@ use std::time::Duration;
 use alloy_primitives::B256;
 use alloy_sol_types::SolCall as _;
 use eez_control_rpc::v1::prover_client::ProverClient;
-use eez_control_rpc::v1::{
-    BlockWitness, ExecutionWitness, PostBatch, ProveChunk, ProveHeader, prove_chunk,
-};
+use eez_control_rpc::v1::{BlockWitness, ExecutionWitness};
 use eez_prover::{Prover as _, ProvingAnchor, ProvingContext};
 use eez_prover_client::RemoteProver;
 use prost::Message as _;
@@ -151,50 +149,32 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
     let to = fixture_u64(&oracle, "to_block");
     let rollup_id = NonZeroU64::new(fixture_u64(&oracle, "rollup_id")).unwrap();
 
-    let mut window = vec![ProveChunk {
-        kind: Some(prove_chunk::Kind::Header(ProveHeader {
-            rollup_id: rollup_id.get(),
-            from_block: from,
-            to_block: to,
-            post_batch: Some(PostBatch {
-                abi_calldata: fixture_hex(&fixture("postbatch.hex")),
-                public_inputs_hash: expected_hash.to_vec(),
-                l1_block_hash: Vec::new(),
-            }),
-        })),
-    }];
+    let mut window = Vec::new();
     let recorded_blocks: serde_json::Value = serde_json::from_str(&fixture("blocks.json")).unwrap();
     for recorded in recorded_blocks.as_array().unwrap() {
         let number = fixture_u64(recorded, "number");
         let rlp = fixture_hex(&fixture(&format!("block-{number}.rlp.hex")));
         let block = alloy_rlp::decode_exact::<eez_primitives::Block>(&rlp).unwrap();
-        window.push(ProveChunk {
-            kind: Some(prove_chunk::Kind::Block(BlockWitness {
-                number,
-                hash: block.header.hash_slow().to_vec(),
-                parent_hash: block.header.parent_hash.to_vec(),
-                rlp,
-                witness: Some(recorded_wire_witness(&fixture(&format!(
-                    "witness-{number}.json"
-                )))),
-            })),
+        window.push(BlockWitness {
+            number,
+            hash: block.header.hash_slow().to_vec(),
+            parent_hash: block.header.parent_hash.to_vec(),
+            rlp,
+            witness: Some(recorded_wire_witness(&fixture(&format!(
+                "witness-{number}.json"
+            )))),
         });
     }
 
     let blocks = window
         .iter()
-        .filter_map(|chunk| {
-            let Some(prove_chunk::Kind::Block(block)) = &chunk.kind else {
-                return None;
-            };
-            Some(eez_prover::BlockWitness {
-                number: block.number,
-                hash: B256::from_slice(&block.hash),
-                parent_hash: B256::from_slice(&block.parent_hash),
-                rlp: block.rlp.clone().into(),
-                witness: serde_json::from_str(&fixture(&format!("witness-{}.json", block.number)))
-                    .unwrap(),
-            })
+        .map(|block| eez_prover::BlockWitness {
+            number: block.number,
+            hash: B256::from_slice(&block.hash),
+            parent_hash: B256::from_slice(&block.parent_hash),
+            rlp: block.rlp.clone().into(),
+            witness: serde_json::from_str(&fixture(&format!("witness-{}.json", block.number)))
+                .unwrap(),
         })
         .collect::<Vec<_>>();
     let parent = blocks[0]
@@ -213,29 +193,18 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
         rollup_id: rollup_id.get(),
         from_block: from,
         to_block: to,
-        anchor: Some(anchor),
+        anchor,
         batch: eez_protocol::abi::postAndVerifyBatchCall::abi_decode(&fixture_hex(&fixture(
             "postbatch.hex",
         )))
         .unwrap()
         .batch,
         blocks,
-        l1_block_hash: None,
     };
 
     let (_server, endpoint) = start_signer(&oracle, &[]).await;
-    let mut client = ProverClient::connect(endpoint.clone()).await.unwrap();
-    let response = client
-        .prove(tokio_stream::iter(window.clone()))
-        .await
-        .unwrap()
-        .into_inner();
-
-    assert_eq!(response.public_inputs_hash, expected_hash.as_slice());
-    assert_eq!(response.signature, expected_signature);
-
-    // The actual Composer client streams checked execution before it supplies
-    // settlement calldata. Both transports must attest the independent oracle.
+    // The actual Composer client streams checked execution before settlement;
+    // its signature must match the independently recorded oracle.
     let signer = alloy_primitives::Signature::try_from(expected_signature.as_slice())
         .unwrap()
         .recover_address_from_prehash(&expected_hash)
@@ -276,17 +245,17 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
                 &context.blocks[range.start - 1].rlp,
             )
             .unwrap();
-            selected.anchor = Some(ProvingAnchor {
+            selected.anchor = ProvingAnchor {
                 number: parent.header.number,
                 hash: parent.header.hash_slow(),
                 state_root: parent.header.state_root,
-            });
+            };
         }
         selected.blocks = context.blocks[range].to_vec();
         selected.from_block = selected.blocks.first().unwrap().number;
         selected.to_block = selected.blocks.last().unwrap().number;
         let update = &mut selected.batch.entries[0].rollupUpdates[0];
-        update.currentRoot = selected.anchor.unwrap().hash;
+        update.currentRoot = selected.anchor.hash;
         update.newRoot = selected.blocks.last().unwrap().hash;
         let span = selected
             .blocks
@@ -310,12 +279,9 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
     };
     let first = subrange(0..3);
     let second = subrange(3..6);
-    let charges = window[1..]
+    let charges = window
         .iter()
-        .map(|chunk| {
-            let Some(prove_chunk::Kind::Block(block)) = &chunk.kind else {
-                unreachable!()
-            };
+        .map(|block| {
             let witness = block.witness.as_ref().unwrap();
             (
                 block.encoded_len(),

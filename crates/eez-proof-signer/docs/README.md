@@ -14,7 +14,7 @@ of maintaining a second copy.
 | --- | --- |
 | The daemon as a whole and where code belongs | [Architecture](architecture.md) |
 | Which values are submitted, computed, validated, or authorized | [Data provenance](data-provenance.md) |
-| Single-request admission, deadlines, cancellation, and shutdown | [Request lifecycle](request-lifecycle.md) |
+| Session admission, deadlines, cancellation, and shutdown | [Request lifecycle](request-lifecycle.md) |
 | What backend evidence reaches settlement | [Validation evidence](validation-evidence.md) |
 | How a validated window becomes a signed digest | [Settlement pipeline](settlement-pipeline.md) |
 | Operator configuration and production behavior | [Operations](operations.md) |
@@ -25,11 +25,11 @@ changing `service/`; Operations is aimed at deployment and incident diagnosis.
 
 ## Shared vocabulary
 
-- **Window:** the inclusive L2 block span streamed in one `Prove` RPC.
-- **Batch:** the `PostBatch.abi_calldata` decoded as an `EvmBatch`.
+- **Window:** the inclusive validated L2 block span selected by `Finalize`.
+- **Batch:** the `SettlementInput.abi_calldata` decoded as an `EvmBatch`.
 - **Stateless:** the upstream witness-backed validator used by
   `eez-prover-stateless`.
-- **Settling block:** the final block in the streamed window; its transactions
+- **Settling block:** the terminal block selected by `Finalize`; its transactions
   carry the effects bound to the posted batch.
 - **Effect candidate:** a locally derived transaction-framing boundary that may
   correspond to an effect. It is not authorization by itself.
@@ -71,14 +71,14 @@ silently weaken a security check to make them agree.
 Unit tests live beside the module they exercise. Larger suites use a directory
 only when one flat test file would obscure the same ownership boundary:
 
-- [`src/window/tests.rs`](../src/window/tests.rs) covers structural admission
+- [`src/service/sessions.rs`](../src/service/sessions.rs) covers structural admission
   and quotas;
 - [`src/validate/tests.rs`](../src/validate/tests.rs) covers the backend-neutral
   backend-output contract;
 - [`eez-prover-stateless/src/backend/tests.rs`](../../eez-prover-stateless/src/backend/tests.rs)
   covers witness-backed replay and evidence;
 - [`eez-prover-stateful/src/backend/tests.rs`](../../eez-prover-stateful/src/backend/tests.rs)
-  covers follower-backed replay and canonical snapshot handling;
+  covers Reth evidence reuse, checkpoint replay, and forkchoice reconciliation;
 - [`src/settlement/tests/`](../src/settlement/tests) mirrors the focused
   settlement gate modules;
 - [`src/service/tests/`](../src/service/tests) covers in-process gRPC

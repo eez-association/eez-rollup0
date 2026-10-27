@@ -26,21 +26,18 @@ the spec are appropriate in repository documentation.
 
 - Production backends live in `eez-prover-stateless` and
   `eez-prover-stateful`; both inherit this crate's service pipeline.
-- For v1, exactly one request may be active across all connections. An overlap is
-  rejected, not queued. The request permit covers ingestion through response
-  construction and remains with a running detached worker until it exits.
-- V1 validation and settlement run in one blocking task. Cancellation is
-  cooperative between non-interruptible units; graceful shutdown waits for
-  detached work rather than terminating it halfway through execution.
+- Sessions own bounded prefixes and fence asynchronous work with epochs.
+- Backends validate one block at a time, own reusable evidence and execution
+  limits, and must bind every cache hit to submitted bytes and the exact parent.
 - The active settlement profile accepts an anchor followed by zero or more
   supported outbound effects and then zero or more supported successful inbound
   effects. Richer or ambiguous shapes fail closed.
 - Backends bind/decode inputs, execute them, and construct immutable checked
-  blocks before publishing reusable evidence. Both RPCs prepare checkpoints only
-  for sync blocks; ordinary blocks use ordinary execution. V2 caches and
+  blocks before publishing reusable evidence. Backends prepare checkpoints only
+  for sync blocks; ordinary blocks use ordinary execution. Caches and
   execution limits live in the backend.
-- V2 sessions own prefix append/rewind and select `ValidatedWindow` from that
-  prefix. V1 assembles its admitted replay sequence. Both share checked blocks
+- Sessions own prefix append/rewind and select `ValidatedWindow` from that
+  prefix. They share checked blocks
   with settlement, which verifies new batch claims without rechecking block
   identity or evidence coverage.
 
@@ -53,8 +50,7 @@ See [architecture](docs/architecture.md),
 ## Non-negotiable invariants
 
 - Treat every Composer field as untrusted, including range and hash claims,
-  block RLP, witnesses, `PostBatch` calldata, and the wire
-  `public_inputs_hash`.
+  block RLP, witnesses, `PostBatch` calldata, and session bindings.
 - Never choose a range, skip a streamed block, generate a zk proof, submit an
   L1 transaction, or sign after any failed gate.
 - Re-derive block identity, execution results, roots, transaction outcomes,

@@ -1,9 +1,9 @@
 //! `RemoteProver` — the composer-side streaming prover client.
 //!
-//! Committed blocks are prevalidated through resumable `prove.v2` sessions.
+//! Committed blocks are prevalidated through resumable `prove.v1` sessions.
 //! Finalization backfills any missing suffix, binds the exact settlement
 //! calldata, verifies the returned attestation, and returns its 65-byte
-//! signature. `prove.v1` remains the compatibility fallback.
+//! signature.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
@@ -14,13 +14,12 @@ use alloy_primitives::{Address, B256, Bytes, Signature};
 use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use eez_control_rpc::v1::{
-    BlockWitness as WireBlockWitness, ExecutionWitness as WireWitness, PostBatch, ProveChunk,
-    ProveHeader, prove_chunk, prove_failure, prover_client::ProverClient,
-};
-use eez_control_rpc::v2::{
     Begin as StreamBegin, Block as StreamBlock, ClientFrame, Finalize as StreamFinalize,
     Resume as StreamResume, Rewind as StreamRewind, ServerFrame, client_frame,
     prover_client::ProverClient as StreamingProverClient, server_frame,
+};
+use eez_control_rpc::v1::{
+    BlockWitness as WireBlockWitness, ExecutionWitness as WireWitness, prove_failure,
 };
 use eez_prover::{
     ActionableProverFailure, BlockWitness, Prover, ProverError, ProverResult, ProvingAnchor,
@@ -33,7 +32,7 @@ use tracing::{Level, event};
 // Rollup0 clients require bounded pipelining support from the streaming server.
 const MAX_IN_FLIGHT: usize = 8;
 
-/// A [`Prover`] backed by the v2 streaming service, with v1 fallback.
+/// A [`Prover`] backed by the streaming service.
 /// Cheap to clone (`Arc<Inner>`).
 #[derive(Debug, Clone)]
 pub struct RemoteProver {
@@ -64,7 +63,6 @@ impl Drop for ProofPriority<'_> {
 
 #[derive(Debug, Default)]
 struct StreamingState {
-    supported: Option<bool>,
     session: Option<StreamingSession>,
     // Retain the transport and its last acknowledged cursor until Finalize.
     // Taking it before an exchange makes cancellation drop the entire transport.
@@ -108,39 +106,6 @@ impl RemoteProver {
     }
 }
 
-/// Map a [`ProvingContext`] to the ordered `Prove` chunk stream: header first
-/// (with the authoritative postBatch calldata), then one chunk per block.
-fn chunks_for(ctx: &ProvingContext) -> Vec<ProveChunk> {
-    // The authoritative on-chain payload (proofs[] empty — the proof isn't part
-    // of the publicInputsHash). The prover decodes THIS to recompute the hash.
-    let abi_calldata = eez_protocol::abi::postAndVerifyBatchCall {
-        batch: ctx.batch.clone(),
-    }
-    .abi_encode();
-
-    let mut chunks = Vec::with_capacity(1 + ctx.blocks.len());
-    chunks.push(ProveChunk {
-        kind: Some(prove_chunk::Kind::Header(ProveHeader {
-            rollup_id: ctx.rollup_id,
-            from_block: ctx.from_block,
-            to_block: ctx.to_block,
-            post_batch: Some(PostBatch {
-                abi_calldata,
-                // Empty: the prover recomputes the hash and returns it; we don't
-                // pre-claim it (the batch determines it deterministically).
-                public_inputs_hash: Vec::new(),
-                l1_block_hash: ctx.l1_block_hash.map(|h| h.to_vec()).unwrap_or_default(),
-            }),
-        })),
-    });
-    for bw in &ctx.blocks {
-        chunks.push(ProveChunk {
-            kind: Some(prove_chunk::Kind::Block(wire_block(bw))),
-        });
-    }
-    chunks
-}
-
 fn wire_block(block: &BlockWitness) -> WireBlockWitness {
     WireBlockWitness {
         number: block.number,
@@ -173,29 +138,6 @@ fn wire_block(block: &BlockWitness) -> WireBlockWitness {
                 .map(|bytes| bytes.to_vec())
                 .collect(),
         }),
-    }
-}
-
-#[derive(Debug)]
-enum StreamingError {
-    Unsupported,
-    Prover(ProverError),
-}
-
-impl From<ProverError> for StreamingError {
-    fn from(error: ProverError) -> Self {
-        Self::Prover(error)
-    }
-}
-
-impl From<StreamingError> for ProverError {
-    fn from(error: StreamingError) -> Self {
-        match error {
-            StreamingError::Unsupported => {
-                Self::Backend("ProveStream unexpectedly unavailable".into())
-            }
-            StreamingError::Prover(error) => error,
-        }
     }
 }
 
@@ -232,7 +174,7 @@ impl StreamingState {
         responses: &mut tonic::Streaming<ServerFrame>,
         request_id: u64,
         range: (u64, u64),
-    ) -> Result<ServerFrame, StreamingError> {
+    ) -> Result<ServerFrame, ProverError> {
         let session = self.session.as_ref().expect("ready session exists");
         let response = next_stream_response(
             responses,
@@ -258,7 +200,7 @@ async fn next_stream_response(
     expected_epoch: Option<u64>,
     from_block: u64,
     to_block: u64,
-) -> Result<ServerFrame, StreamingError> {
+) -> Result<ServerFrame, ProverError> {
     let response = responses
         .message()
         .await
@@ -271,8 +213,7 @@ async fn next_stream_response(
         return Err(ProverError::Backend(format!(
             "ProveStream response {} crossed request {}",
             response.request_id, request_id,
-        ))
-        .into());
+        )));
     }
     // An unknown or stale session has no authorized binding to echo.
     let unbound_rejection = matches!(response.kind, Some(server_frame::Kind::Rejected(_)))
@@ -281,17 +222,16 @@ async fn next_stream_response(
     if !unbound_rejection
         && expected_session_id.is_some_and(|expected| response.session_id != expected)
     {
-        return Err(
-            ProverError::Backend("ProveStream response crossed Composer sessions".into()).into(),
-        );
+        return Err(ProverError::Backend(
+            "ProveStream response crossed Composer sessions".into(),
+        ));
     }
     if !unbound_rejection && expected_epoch.is_some_and(|expected| response.epoch != expected) {
         return Err(ProverError::Backend(format!(
             "ProveStream response epoch {} crossed epoch {}",
             response.epoch,
             expected_epoch.expect("checked above"),
-        ))
-        .into());
+        )));
     }
     Ok(response)
 }
@@ -318,24 +258,6 @@ fn rejection_error(response: &ServerFrame, from_block: u64, to_block: u64) -> Op
 }
 
 impl RemoteProver {
-    async fn prove_v1(&self, ctx: ProvingContext) -> ProverResult<Bytes> {
-        let chunks = chunks_for(&ctx);
-        let mut client = ProverClient::connect(self.inner.url.clone())
-            .await
-            .map_err(|error| ProverError::Retryable {
-                kind: RetryableProverError::Unavailable,
-                message: format!("connect {}: {error}", self.inner.url),
-            })?
-            .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
-            .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES);
-        let response = client
-            .prove(tokio_stream::iter(chunks))
-            .await
-            .map_err(|status| map_rpc_status(ctx.from_block, ctx.to_block, status))?
-            .into_inner();
-        self.verify_proof(&ctx, response.public_inputs_hash, response.signature)
-    }
-
     fn verify_proof(
         &self,
         ctx: &ProvingContext,
@@ -377,7 +299,7 @@ impl RemoteProver {
             tonic::Streaming<ServerFrame>,
             ServerFrame,
         ),
-        StreamingError,
+        ProverError,
     > {
         if begin.is_none()
             && let Some(connection) = state.connection.take()
@@ -411,13 +333,7 @@ impl RemoteProver {
         let mut responses = client
             .prove_stream(tokio_stream::wrappers::ReceiverStream::new(request_stream))
             .await
-            .map_err(|status| {
-                if status.code() == Code::Unimplemented {
-                    StreamingError::Unsupported
-                } else {
-                    map_rpc_status(from_block, to_block, status).into()
-                }
-            })?
+            .map_err(|status| map_rpc_status(from_block, to_block, status))?
             .into_inner();
         let ready = next_stream_response(
             &mut responses,
@@ -436,15 +352,12 @@ impl RemoteProver {
         rollup_id: u64,
         anchor: ProvingAnchor,
         blocks: &[BlockWitness],
-        finalize: Option<(u64, u64, PostBatch)>,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, StreamingError> {
+        finalize: Option<(u64, u64, Vec<u8>)>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, ProverError> {
         // One deadline covers lock acquisition, connect, both stream directions and EOF.
         // Dropping the exchange releases its lock; a later Resume recovers accepted work.
         tokio::time::timeout(self.inner.exchange_timeout, async {
         let mut state = self.inner.streaming.lock().await;
-        if state.supported == Some(false) {
-            return Err(StreamingError::Unsupported);
-        }
         if state
             .session
             .as_ref()
@@ -463,12 +376,7 @@ impl RemoteProver {
             |(from, to, _)| (*from, *to),
         );
         let finalize = finalize
-            .map(|(from_block, to_block, post_batch)| {
-                if !post_batch.l1_block_hash.is_empty() {
-                    return Err(ProverError::Backend(
-                        "Rollup0 streaming does not support L1-bound settlement".into(),
-                    ));
-                }
+            .map(|(from_block, to_block, abi_calldata)| {
                 let terminal = blocks
                     .iter()
                     .find(|block| block.number == to_block)
@@ -479,8 +387,8 @@ impl RemoteProver {
                     from_block,
                     to_block,
                     terminal_hash: terminal.hash.to_vec(),
-                    settlement: Some(eez_control_rpc::v2::SettlementInput {
-                        abi_calldata: post_batch.abi_calldata,
+                    settlement: Some(eez_control_rpc::v1::SettlementInput {
+                        abi_calldata,
                         blobs: Vec::new(),
                         posting_context: None,
                     }),
@@ -508,21 +416,7 @@ impl RemoteProver {
                 anchor_state_root: anchor.state_root.to_vec(),
             });
             let (requests, mut responses, response) =
-                match self.open_stream(&mut state, begin, range.0, range.1).await {
-                    Ok(opened) => opened,
-                    Err(StreamingError::Unsupported) => {
-                        event!(
-                            name: "eez.prover_client.streaming_unsupported",
-                            Level::WARN,
-                            "remote prover does not support streaming; using v1 until client restart",
-                        );
-                        state.supported = Some(false);
-                        state.session = None;
-                        return Err(StreamingError::Unsupported);
-                    }
-                    Err(error) => return Err(error),
-                };
-            state.supported = Some(true);
+                self.open_stream(&mut state, begin, range.0, range.1).await?;
             if !creating
                 && matches!(&response.kind,
                     Some(server_frame::Kind::Rejected(rejected)) if matches!(Code::from_i32(rejected.code), Code::NotFound | Code::Unimplemented)
@@ -532,11 +426,11 @@ impl RemoteProver {
                 continue; // The server evicted the session or restarted; begin at the supplied anchor.
             }
             if let Some(error) = rejection_error(&response, range.0, range.1) {
-                return Err(error.into());
+                return Err(error);
             }
             let mut cursor = response.clone();
             let Some(server_frame::Kind::Ready(ready)) = response.kind else {
-                return Err(ProverError::Backend("ProveStream expected Ready".into()).into());
+                return Err(ProverError::Backend("ProveStream expected Ready".into()));
             };
             if response.session_id.len() != 32
                 || response.epoch == 0
@@ -544,8 +438,7 @@ impl RemoteProver {
             {
                 return Err(ProverError::Backend(
                     "ProveStream returned an invalid Ready binding".into(),
-                )
-                .into());
+                ));
             }
             if creating
                 && (ready.validated_through != anchor.number
@@ -553,8 +446,7 @@ impl RemoteProver {
             {
                 return Err(ProverError::Backend(
                     "ProveStream Begin acknowledged another anchor".into(),
-                )
-                .into());
+                ));
             }
             state.session = Some(StreamingSession {
                 rollup_id,
@@ -624,14 +516,13 @@ impl RemoteProver {
                     continue; // The requested parent is no longer retained; backfill a new session.
                 }
                 if let Some(error) = rejection_error(&response, range.0, range.1) {
-                    return Err(error.into());
+                    return Err(error);
                 }
                 cursor = response.clone();
                 let Some(server_frame::Kind::Ready(ready)) = response.kind else {
                     return Err(ProverError::Backend(
                         "ProveStream expected Ready after Rewind".into(),
-                    )
-                    .into());
+                    ));
                 };
                 if response.epoch == 0
                     || ready.validated_through.checked_add(1) != Some(first.number)
@@ -640,8 +531,7 @@ impl RemoteProver {
                     state.session = None;
                     return Err(ProverError::Backend(
                         "ProveStream Rewind acknowledged another parent".into(),
-                    )
-                    .into());
+                    ));
                 }
                 state.session.as_mut().expect("ready session exists").epoch = response.epoch;
             }
@@ -690,20 +580,20 @@ impl RemoteProver {
                             || error.retryable_kind() == Some(RetryableProverError::Aborted) {
                             state.session = None;
                         }
-                        return Err(error.into());
+                        return Err(error);
                     }
                     if let Some(block) = blocks.get(index) {
                         if !matches!(&response.kind, Some(server_frame::Kind::Validated(validated))
                             if validated.number == block.number && validated.hash == block.hash.as_slice()
                                 && validated.post_state_root.len() == 32) {
-                            return Err(ProverError::Backend("ProveStream Validated response identity mismatch".into()).into());
+                            return Err(ProverError::Backend("ProveStream Validated response identity mismatch".into()));
                         }
-                        cursor = ServerFrame { kind: Some(server_frame::Kind::Ready(eez_control_rpc::v2::Ready {
+                        cursor = ServerFrame { kind: Some(server_frame::Kind::Ready(eez_control_rpc::v1::Ready {
                             validated_through: block.number, validated_hash: block.hash.to_vec(),
                         })), ..response };
                     } else {
                         let Some(server_frame::Kind::Proof(result)) = response.kind else {
-                            return Err(ProverError::Backend("ProveStream did not answer Finalize with Proof".into()).into());
+                            return Err(ProverError::Backend("ProveStream did not answer Finalize with Proof".into()));
                         };
                         proof = Some((result.public_inputs_hash, result.proof));
                     }
@@ -719,9 +609,8 @@ impl RemoteProver {
             Ok(None) => Ok(proof),
             Ok(Some(_)) => Err(ProverError::Backend(
                 "ProveStream returned an unsolicited response".into(),
-            )
-            .into()),
-            Err(status) => Err(map_rpc_status(range.0, range.1, status).into()),
+            )),
+            Err(status) => Err(map_rpc_status(range.0, range.1, status)),
         };
         }
         }).await.map_err(|_| ProverError::Retryable {
@@ -759,38 +648,27 @@ impl Prover for RemoteProver {
             result = self.stream_exchange(rollup_id, anchor, &blocks, None) => result,
         };
         match result {
-            Ok(None) | Err(StreamingError::Unsupported) => Ok(()),
+            Ok(None) => Ok(()),
             Ok(Some(_)) => Err(ProverError::Backend(
                 "ProveStream returned a proof without Finalize".into(),
             )),
-            Err(StreamingError::Prover(error)) => Err(error),
+            Err(error) => Err(error),
         }
     }
 
     async fn prove(&self, ctx: ProvingContext) -> ProverResult<Bytes> {
         self.inner.proving.send_modify(|count| *count += 1);
         let _priority = ProofPriority(&self.inner.proving);
-        let Some(anchor) = ctx.anchor else {
-            return self.prove_v1(ctx).await;
-        };
         let abi_calldata = eez_protocol::abi::postAndVerifyBatchCall {
             batch: ctx.batch.clone(),
         }
         .abi_encode();
-        let post_batch = PostBatch {
-            abi_calldata,
-            public_inputs_hash: Vec::new(),
-            l1_block_hash: ctx
-                .l1_block_hash
-                .map(|hash| hash.to_vec())
-                .unwrap_or_default(),
-        };
         match self
             .stream_exchange(
                 ctx.rollup_id,
-                anchor,
+                ctx.anchor,
                 &ctx.blocks,
-                Some((ctx.from_block, ctx.to_block, post_batch)),
+                Some((ctx.from_block, ctx.to_block, abi_calldata)),
             )
             .await
         {
@@ -798,8 +676,7 @@ impl Prover for RemoteProver {
             Ok(None) => Err(ProverError::Backend(
                 "ProveStream Finalize returned no proof".into(),
             )),
-            Err(StreamingError::Unsupported) => self.prove_v1(ctx).await,
-            Err(StreamingError::Prover(error)) => Err(error),
+            Err(error) => Err(error),
         }
     }
 
@@ -915,11 +792,8 @@ mod tests {
     use alloy_primitives::address;
     use alloy_signer::SignerSync;
     use alloy_signer_local::PrivateKeySigner;
+    use eez_control_rpc::v1::{InboundFailure, OutboundFailure, ProveFailure};
     use eez_control_rpc::v1::{
-        InboundFailure, OutboundFailure, ProveFailure, ProveResponse,
-        prover_server::{Prover as ProverService, ProverServer},
-    };
-    use eez_control_rpc::v2::{
         Proof as StreamProof, Ready, Validated as StreamValidated,
         prover_server::{Prover as StreamingProverService, ProverServer as StreamingProverServer},
     };
@@ -928,34 +802,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_stream::Stream;
     use tonic::{Request, Response, Streaming, transport::Server};
-
-    /// Stub `Prove` server: drains the window stream and returns a fixed
-    /// `publicInputsHash` signed by `signer` (the r||s||v packing L1 expects).
-    #[derive(Clone)]
-    struct StubProver {
-        signer: PrivateKeySigner,
-        hash: B256,
-    }
-
-    #[tonic::async_trait]
-    impl ProverService for StubProver {
-        async fn prove(
-            &self,
-            request: Request<Streaming<ProveChunk>>,
-        ) -> Result<Response<ProveResponse>, Status> {
-            let mut stream = request.into_inner();
-            while stream.message().await?.is_some() {}
-            let sig = self.signer.sign_hash_sync(&self.hash).unwrap();
-            let mut out = [0u8; 65];
-            out[..32].copy_from_slice(&sig.r().to_be_bytes::<32>());
-            out[32..64].copy_from_slice(&sig.s().to_be_bytes::<32>());
-            out[64] = u8::from(sig.v()) + 27;
-            Ok(Response::new(ProveResponse {
-                public_inputs_hash: self.hash.to_vec(),
-                signature: out.to_vec(),
-            }))
-        }
-    }
 
     #[derive(Debug, Clone, Copy)]
     struct UnavailableProver;
@@ -1053,10 +899,9 @@ mod tests {
                     1,
                     test_anchor(),
                     std::slice::from_ref(&input),
-                    Some((11, 11, PostBatch::default())),
+                    Some((11, 11, Vec::new())),
                 )
                 .await
-                .map_err(ProverError::from)
                 .unwrap_err();
             assert_eq!(
                 error.retryable_kind(),
@@ -1166,7 +1011,7 @@ mod tests {
                                 proof: sign_65(&this.signer, this.hash),
                             })
                         }
-                        _ => server_frame::Kind::Rejected(eez_control_rpc::v2::Rejected {
+                        _ => server_frame::Kind::Rejected(eez_control_rpc::v1::Rejected {
                             code: i32::from(Code::Unimplemented),
                             message: "baseline only".into(),
                             ..Default::default()
@@ -1313,11 +1158,12 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl ProverService for UnavailableProver {
-        async fn prove(
+    impl StreamingProverService for UnavailableProver {
+        type ProveStreamStream = Pin<Box<dyn Stream<Item = Result<ServerFrame, Status>> + Send>>;
+        async fn prove_stream(
             &self,
-            _request: Request<Streaming<ProveChunk>>,
-        ) -> Result<Response<ProveResponse>, Status> {
+            _request: Request<Streaming<ClientFrame>>,
+        ) -> Result<Response<Self::ProveStreamStream>, Status> {
             Err(Status::unavailable("test prover is busy"))
         }
     }
@@ -1329,7 +1175,16 @@ mod tests {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             Server::builder()
-                .add_service(ProverServer::new(StubProver { signer, hash }))
+                .add_service(StreamingProverServer::new(StreamingStub {
+                    signer,
+                    hash,
+                    blocks: Arc::new(AtomicUsize::new(0)),
+                    cursor: Arc::new(Mutex::new((0, B256::ZERO))),
+                    cross_wire_block_response: false,
+                    baseline_only: false,
+                    begins: Arc::new(AtomicUsize::new(0)),
+                    stall_first_block: None,
+                }))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -1340,7 +1195,6 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         serve_stub(listener, signer, hash);
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         format!("http://{addr}")
     }
 
@@ -1349,7 +1203,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             Server::builder()
-                .add_service(ProverServer::new(UnavailableProver))
+                .add_service(StreamingProverServer::new(UnavailableProver))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -1406,48 +1260,41 @@ mod tests {
         }
     }
 
-    /// Both direct v1 and fallback require the registered signer and requested batch.
     #[tokio::test]
-    async fn v1_and_fallback_bind_the_attestation_to_the_requested_batch() {
-        for fallback in [false, true] {
-            for wrong_batch in [false, true] {
-                let key = test_key();
-                let attester = key.address();
-                let ctx = ProvingContext {
-                    rollup_id: 1,
-                    from_block: 11,
-                    to_block: 11,
-                    anchor: fallback.then(test_anchor),
-                    blocks: vec![test_block(11, test_anchor().hash, 0x22)],
-                    batch: test_batch(),
-                    l1_block_hash: None,
-                };
-                let hash = if wrong_batch {
-                    B256::repeat_byte(0x7c)
-                } else {
-                    eez_protocol::public_inputs::public_inputs_hashes(
-                        &ctx.batch,
-                        attester.into_word(),
-                    )
+    async fn proof_binds_the_attestation_to_the_requested_batch() {
+        for wrong_batch in [false, true] {
+            let key = test_key();
+            let attester = key.address();
+            let ctx = test_context();
+            let hash = if wrong_batch {
+                B256::repeat_byte(0x7c)
+            } else {
+                eez_protocol::public_inputs::public_inputs_hashes(&ctx.batch, attester.into_word())
                     .unwrap()[0]
-                };
-                let prover = RemoteProver::new(spawn_stub(key, hash).await, attester);
-                let result = prover.prove(ctx).await;
-                assert_eq!(
-                    prover.inner.streaming.lock().await.supported,
-                    fallback.then_some(false)
+            };
+            let prover = RemoteProver::new(spawn_stub(key, hash).await, attester);
+            let result = prover.prove(ctx).await;
+            if wrong_batch {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("does not bind the requested batch")
                 );
-                if wrong_batch {
-                    assert!(
-                        result
-                            .unwrap_err()
-                            .to_string()
-                            .contains("does not bind the requested batch")
-                    );
-                } else {
-                    assert_eq!(result.unwrap().len(), 65);
-                }
+            } else {
+                assert_eq!(result.unwrap().len(), 65);
             }
+        }
+    }
+
+    fn test_context() -> ProvingContext {
+        ProvingContext {
+            rollup_id: 1,
+            from_block: 11,
+            to_block: 11,
+            anchor: test_anchor(),
+            blocks: vec![test_block(11, test_anchor().hash, 0x22)],
+            batch: test_batch(),
         }
     }
 
@@ -1462,7 +1309,7 @@ mod tests {
         let wrong_attester = address!("0x00000000000000000000000000000000000000ff");
         let prover = RemoteProver::new(url, wrong_attester);
         let err = prover
-            .prove(ProvingContext::default())
+            .prove(test_context())
             .await
             .expect_err("attestation not recovering to the registered attester must be refused");
         assert!(
@@ -1480,7 +1327,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            prover.prove(ProvingContext::default()),
+            prover.prove(test_context()),
         )
         .await
         .expect("connection failure should be prompt")
@@ -1496,7 +1343,7 @@ mod tests {
     async fn unavailable_rpc_status_surfaces_as_retryable() {
         let prover = RemoteProver::new(spawn_unavailable_stub().await, Address::ZERO);
 
-        let error = prover.prove(ProvingContext::default()).await.unwrap_err();
+        let error = prover.prove(test_context()).await.unwrap_err();
 
         assert_eq!(
             error.retryable_kind(),
@@ -1513,7 +1360,7 @@ mod tests {
         let attester = key.address();
         let ctx = ProvingContext {
             batch: test_batch(),
-            ..Default::default()
+            ..test_context()
         };
         let hash =
             eez_protocol::public_inputs::public_inputs_hashes(&ctx.batch, attester.into_word())
@@ -1573,10 +1420,9 @@ mod tests {
                 rollup_id: 1,
                 from_block: 11,
                 to_block: 11,
-                anchor: Some(anchor),
+                anchor,
                 batch: test_batch(),
                 blocks: vec![block_11.clone()],
-                l1_block_hash: None,
             })
             .await
             .unwrap();
@@ -1599,10 +1445,9 @@ mod tests {
                 rollup_id: 1,
                 from_block: 11,
                 to_block: 12,
-                anchor: Some(anchor),
+                anchor,
                 batch: test_batch(),
                 blocks: vec![block_11, block_12],
-                l1_block_hash: None,
             })
             .await
             .unwrap();
@@ -1652,10 +1497,9 @@ mod tests {
                     rollup_id: 1,
                     from_block: 11,
                     to_block: 11,
-                    anchor: Some(anchor),
+                    anchor,
                     blocks: vec![block],
                     batch: test_batch(),
-                    l1_block_hash: None,
                 }),
             )
             .await
@@ -1686,7 +1530,7 @@ mod tests {
             async move {
                 prover
                     .prove(ProvingContext {
-                        anchor: Some(test_anchor()),
+                        anchor: test_anchor(),
                         ..Default::default()
                     })
                     .await
@@ -1760,10 +1604,9 @@ mod tests {
                 rollup_id: 1,
                 from_block: 11,
                 to_block: 13,
-                anchor: Some(anchor),
+                anchor,
                 blocks: vec![first.clone(), second, third.clone()],
                 batch: test_batch(),
-                l1_block_hash: None,
             })
             .await
             .unwrap();
@@ -1818,10 +1661,9 @@ mod tests {
                     rollup_id: 1,
                     from_block: 11,
                     to_block: 12,
-                    anchor: Some(anchor),
+                    anchor,
                     blocks: vec![first, second],
                     batch: test_batch(),
-                    l1_block_hash: None,
                 })
                 .await;
             assert_eq!(begins.load(Ordering::SeqCst), 1);
@@ -1875,10 +1717,9 @@ mod tests {
                             rollup_id: 1,
                             from_block: 11,
                             to_block: 11,
-                            anchor: Some(anchor),
+                            anchor,
                             blocks: vec![test_block(11, anchor.hash, 0x99)],
                             batch: test_batch(),
-                            l1_block_hash: None,
                         })
                         .await
                         .unwrap();
@@ -1893,7 +1734,7 @@ mod tests {
                             rollup_id: 1,
                             from_block: if subrange { 12 } else { 11 },
                             to_block: 12,
-                            anchor: Some(if subrange {
+                            anchor: if subrange {
                                 ProvingAnchor {
                                     number: 11,
                                     hash: first.hash,
@@ -1901,14 +1742,13 @@ mod tests {
                                 }
                             } else {
                                 anchor
-                            }),
+                            },
                             blocks: if subrange {
                                 vec![second]
                             } else {
                                 vec![first, second]
                             },
                             batch: test_batch(),
-                            l1_block_hash: None,
                         })
                         .await
                         .unwrap();
@@ -1953,10 +1793,9 @@ mod tests {
                 rollup_id: 1,
                 from_block: 11,
                 to_block: 12,
-                anchor: Some(anchor),
+                anchor,
                 batch: test_batch(),
                 blocks: vec![block_11, block_12],
-                l1_block_hash: None,
             })
             .await
             .unwrap();

@@ -1,15 +1,13 @@
-//! Synchronous validation and settlement performed by one `Prove` request.
+//! Settlement authorization of a fully validated session range.
 
 use std::num::NonZeroU64;
 
 use alloy_primitives::{Address, B256};
 use eez_control_rpc::v1::{InboundFailure, OutboundFailure, ProveFailure, prove_failure};
-use tokio::time::Instant;
 use tonic::Status;
 
-use super::ServiceState;
 use crate::cancel::CancellationToken;
-use crate::{settlement, validate, window};
+use crate::{settlement, validate};
 
 /// A locally recomputed digest authorized by every settlement gate.
 ///
@@ -23,108 +21,6 @@ impl AttestablePublicInputsHash {
     pub(crate) const fn into_inner(self) -> B256 {
         self.0.into_inner()
     }
-}
-
-/// Fully checked material that may cross the attestation boundary.
-// Every field is a hash by nature; the shared postfix is the point, not noise.
-#[allow(clippy::struct_field_names, reason = "all three genuinely are hashes")]
-pub(super) struct AttestationMaterial {
-    pub(super) attestable_public_inputs_hash: AttestablePublicInputsHash,
-    pub(super) validated_window_pre_block_hash: B256,
-    pub(super) validated_window_post_block_hash: B256,
-}
-
-/// Failure from either synchronous phase of the request pipeline.
-#[derive(Debug, thiserror::Error)]
-pub(super) enum PipelineError {
-    #[error(transparent)]
-    Validation(#[from] validate::ValidationError),
-    #[error(transparent)]
-    Settlement(#[from] SettlementPipelineError),
-    #[error("request deadline elapsed before settlement")]
-    DeadlineBeforeSettlement,
-}
-
-impl PipelineError {
-    pub(super) const fn phase(&self) -> &'static str {
-        match self {
-            Self::Validation(_) => "validation",
-            Self::Settlement(_) | Self::DeadlineBeforeSettlement => "settlement",
-        }
-    }
-
-    pub(super) const fn gate(&self) -> &'static str {
-        match self {
-            Self::Validation(_) => "execution",
-            Self::Settlement(error) => error.gate(),
-            Self::DeadlineBeforeSettlement => "deadline",
-        }
-    }
-
-    pub(super) fn status(&self) -> Status {
-        match self {
-            Self::Validation(error) => match error {
-                validate::ValidationError::DeadlineExceeded => {
-                    Status::deadline_exceeded("block validation deadline exceeded")
-                }
-                validate::ValidationError::Unavailable(_) => {
-                    Status::unavailable("validation backend is temporarily unavailable")
-                }
-                validate::ValidationError::Aborted(_) => {
-                    Status::aborted("validation backend snapshot changed during validation")
-                }
-                validate::ValidationError::Rejected(_) => {
-                    Status::failed_precondition("window validation rejected")
-                }
-                validate::ValidationError::InvalidBackendOutput(_) => {
-                    Status::internal("validation backend returned invalid output")
-                }
-                validate::ValidationError::InternalInvariant(_) => {
-                    Status::internal("request pipeline invariant failed")
-                }
-                validate::ValidationError::Cancelled => {
-                    Status::cancelled("Prove request cancelled")
-                }
-            },
-            Self::Settlement(error) => error.status(),
-            Self::DeadlineBeforeSettlement => {
-                Status::deadline_exceeded("Prove request deadline exceeded")
-            }
-        }
-    }
-}
-
-/// Re-execute the window and immediately bind its evidence to settlement.
-///
-/// Keeping both CPU-bound phases in one worker avoids a second blocking-task
-/// handoff and prevents callers from handling parallel output/block vectors.
-pub(super) fn validate_and_settle(
-    state: &ServiceState,
-    blocks: window::AdmittedBlocks,
-    submitted_post_batch_calldata: Vec<u8>,
-    deadline: Instant,
-    cancellation: &CancellationToken,
-) -> Result<AttestationMaterial, PipelineError> {
-    let validated_window = validate::validate_window(state.backend.as_ref(), blocks, cancellation)?;
-    if Instant::now() >= deadline {
-        return Err(PipelineError::DeadlineBeforeSettlement);
-    }
-    let attestable_public_inputs_hash = run_settlement(SettlementInput {
-        submitted_post_batch_calldata,
-        validated_window: &validated_window,
-        expected_rollup_id: state.expected_rollup_id,
-        expected_l2_system_address: state.expected_l2_system_address,
-        proof_system_vkey: state.attester.proof_system_vkey(),
-        expected_proof_system: state.attester.expected_proof_system(),
-        system_transaction_reconstructor: &state.system_transaction_reconstructor,
-        cancellation,
-    })?;
-
-    Ok(AttestationMaterial {
-        attestable_public_inputs_hash,
-        validated_window_pre_block_hash: validated_window.window_pre_block_hash(),
-        validated_window_post_block_hash: validated_window.window_post_block_hash(),
-    })
 }
 
 /// Inputs for the synchronous settlement job.

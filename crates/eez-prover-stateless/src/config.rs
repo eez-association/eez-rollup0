@@ -52,7 +52,7 @@ impl SecretKeyArg {
     about = "EEZ window validation and attestation daemon"
 )]
 struct Args {
-    /// The `Prove` gRPC bind address the composer dials.
+    /// The `ProveStream` gRPC bind address the composer dials.
     #[arg(long, env = "EEZ_PROOF_SIGNER_ADDR", default_value = "127.0.0.1:50061")]
     listen_addr: SocketAddr,
 
@@ -94,7 +94,7 @@ struct Args {
     #[arg(long = "proof-system", env = "EEZ_PROOF_SYSTEM")]
     expected_proof_system: Address,
 
-    /// Maximum blocks declared by one `Prove` request.
+    /// Maximum blocks retained in one proving session.
     #[arg(
         long,
         env = "EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS",
@@ -102,7 +102,7 @@ struct Args {
     )]
     max_request_blocks: NonZeroUsize,
 
-    /// Aggregate canonical known-field protobuf bytes allowed per request.
+    /// Aggregate canonical known-field block protobuf bytes allowed per session.
     #[arg(
         long,
         env = "EEZ_PROOF_SIGNER_MAX_REQUEST_BYTES",
@@ -110,7 +110,7 @@ struct Args {
     )]
     max_request_bytes: NonZeroUsize,
 
-    /// Aggregate witness-array elements allowed per request.
+    /// Aggregate witness-array elements allowed per session.
     #[arg(
         long,
         env = "EEZ_PROOF_SIGNER_MAX_REQUEST_WITNESS_ITEMS",
@@ -126,7 +126,7 @@ struct Args {
     )]
     stream_idle_timeout_secs: NonZeroU64,
 
-    /// End-to-end deadline for ingestion, validation, settlement, and signing.
+    /// Deadline for each block validation or Finalize operation, including signing.
     #[arg(
         long,
         env = "EEZ_PROOF_SIGNER_REQUEST_TIMEOUT_SECS",

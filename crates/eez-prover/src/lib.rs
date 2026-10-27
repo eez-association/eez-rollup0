@@ -128,7 +128,7 @@ pub struct BlockWitness {
 }
 
 /// Exact L1-posted L2 block from which a proving session starts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProvingAnchor {
     pub number: u64,
     pub hash: B256,
@@ -137,8 +137,8 @@ pub struct ProvingAnchor {
 
 /// Inputs the prover needs to finalize one posted settlement window.
 ///
-/// The complete block list remains present for v1 compatibility and v2
-/// backfill. The remote prover uses the server's current cursor to skip a
+/// The complete block list allows session recovery and backfill. The remote
+/// prover uses the server's current cursor to skip a
 /// matching prefix; otherwise it rewinds and resubmits cached blocks before
 /// `Finalize`, without maintaining a second validated history.
 #[derive(Debug, Clone, Default)]
@@ -149,17 +149,13 @@ pub struct ProvingContext {
     pub from_block: u64,
     /// Last (settling) block of the window: the Sync height.
     pub to_block: u64,
-    /// Parent of `from_block`, including the state root registered on L1.
-    /// `None` keeps legacy v1-only prover implementations source-compatible.
-    pub anchor: Option<ProvingAnchor>,
+    /// Execution predecessor of `from_block`, including its execution state root.
+    pub anchor: ProvingAnchor,
     /// The authoritative postBatch payload (proof carriers filled, `proofs[]`
     /// empty). The prover recomputes the `publicInputsHash` from this.
     pub batch: EvmBatch,
     /// Every window block's RLP + augmented witness, in block order.
     pub blocks: Vec<BlockWitness>,
-    /// `blockhash(N)` for a block-bound batch's `blockNumber = N`; `None` for a
-    /// timeless (0) batch.
-    pub l1_block_hash: Option<B256>,
 }
 
 /// Produces the [`BlockWitness`] for a committed L2 block — the seam by which

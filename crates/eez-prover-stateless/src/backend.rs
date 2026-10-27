@@ -16,17 +16,13 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_debug::ExecutionWitness;
 use eez_evm::EezEvmConfig;
-use eez_proof_signer::cancel::CancellationToken;
 use eez_proof_signer::validate::support::{
-    CheckpointPlan, DecodedBlock, check_cancellation, decode_match_and_recover_signers,
-    observe_outbound_events, system_sender_flags,
+    CheckpointPlan, decode_match_and_recover_signers, observe_outbound_events,
 };
 use eez_proof_signer::validate::{
-    AdmittedBlock, BackendBlockOutput, BackendWindowOutput, BlockAnchor, SettlementBlockEvidence,
-    StateCheckpoint, ValidatedBlock, ValidationBackend, ValidationError,
+    AdmittedBlock, BackendBlockOutput, BlockAnchor, SettlementBlockEvidence, StateCheckpoint,
+    ValidatedBlock, ValidationBackend, ValidationError,
 };
-#[cfg(test)]
-use eez_proof_signer::window::testing::admitted_block_parts_mut;
 use lru::LruCache;
 use reth_chainspec::ChainSpec;
 use stateless_reth::validation::StatelessValidationError;
@@ -41,7 +37,6 @@ mod chain_config;
 
 use chain_config::{ChainDocumentKind, load_chain_document};
 
-const DEBUG_PROGRESS_INTERVAL: usize = 100;
 const MAX_CACHED_BLOCKS: usize = 32_768;
 const MAX_CACHED_BYTES: usize = 512 * 1024 * 1024;
 const MAX_CONCURRENT_VALIDATIONS: usize = 4;
@@ -72,17 +67,6 @@ impl BlockCache {
         }
         block
     }
-}
-
-/// Signer-recovered settling block prepared before replay.
-///
-/// This block is exact-decoded and its signers are recovered, but it remains
-/// untrusted until Stateless accepts the same `RecoveredBlock`. Preparing it
-/// early keeps checkpoint selection independent from execution side effects.
-struct PreparedSettlingBlock {
-    block: DecodedBlock,
-    checkpoint_plan: CheckpointPlan,
-    system_sender_flags: Vec<bool>,
 }
 
 /// In-process Stateless/Reth backend configured from operator-selected rules.
@@ -152,235 +136,80 @@ impl Backend {
         })
     }
 
-    #[cfg(test)]
-    pub(super) fn validate(
+    /// Execute one block against its exact parent and publish checked evidence.
+    fn validate_block(
         &self,
-        mut blocks: Vec<AdmittedBlock>,
-    ) -> Result<BackendWindowOutput, ValidationError> {
-        self.validate_admitted(&mut blocks, &CancellationToken::default())
-    }
-
-    #[cfg(test)]
-    fn validate_admitted(
-        &self,
-        blocks: &mut [AdmittedBlock],
-        cancellation: &CancellationToken,
-    ) -> Result<BackendWindowOutput, ValidationError> {
-        let mut witnesses = blocks
-            .iter_mut()
-            .map(|block| std::mem::take(admitted_block_parts_mut(block).witness))
-            .collect::<Vec<_>>();
-        let result = self.validate_blocks_inner(blocks, &mut witnesses, cancellation, None);
-        if result.is_err() {
-            for (block, witness) in blocks.iter_mut().zip(witnesses) {
-                *admitted_block_parts_mut(block).witness = witness;
-            }
-        }
-        result
-    }
-
-    /// Replay a v1 window or one v2 block (with its parent), returning checked evidence.
-    fn validate_blocks_inner(
-        &self,
-        blocks: &[AdmittedBlock],
-        witnesses: &mut [ExecutionWitness],
-        cancellation: &CancellationToken,
-        parent: Option<BlockAnchor>,
-    ) -> Result<BackendWindowOutput, ValidationError> {
-        let expected_l2_system_address = self.expected_l2_system_address;
-        let validation_started = Instant::now();
-        let total_blocks = blocks.len();
-        if witnesses.len() != total_blocks {
-            return Err(ValidationError::InternalInvariant(format!(
-                "stateless backend received {} blocks and {} witnesses",
-                total_blocks,
-                witnesses.len(),
+        parent: BlockAnchor,
+        admitted: &AdmittedBlock,
+        witness: ExecutionWitness,
+    ) -> Result<Arc<ValidatedBlock>, ValidationError> {
+        admitted.check_parent(parent)?;
+        let started = Instant::now();
+        let block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
+        let number = block.header().number;
+        let (plan, system_sender_flags) =
+            CheckpointPlan::for_block(&block, self.expected_l2_system_address);
+        // Checkpoints are determined by block contents, independently of which
+        // range a later Finalize selects. Ordinary blocks use normal execution.
+        let (output, checkpoints) = if plan.positions().is_empty() {
+            let output = stateless_validation_recovered(
+                block.execution_input(),
+                witness,
+                Arc::clone(&self.chain_spec),
+                self.evm_config.clone(),
+            )
+            .map_err(|error| map_stateless_error(number, error))?;
+            (output, Vec::new())
+        } else {
+            let output = stateless_validation_recovered_with_state_checkpoints(
+                block.execution_input(),
+                witness,
+                Arc::clone(&self.chain_spec),
+                self.evm_config.clone(),
+                plan.positions(),
+            )
+            .map_err(|error| map_stateless_error(number, error))?;
+            let checkpoints = output
+                .checkpoints
+                .checkpoints
+                .into_iter()
+                .map(|checkpoint| StateCheckpoint {
+                    at: checkpoint.at,
+                    state_root: checkpoint.state_root,
+                    block_hash: checkpoint.block_hash,
+                })
+                .collect::<Vec<_>>();
+            plan.verify_returned(&checkpoints)?;
+            (output.validation, checkpoints)
+        };
+        let StatelessValidationOutput {
+            block_hash: computed_hash,
+            pre_state_root,
+            post_state_root,
+            execution_output,
+            block_access_list: _validated_block_access_list,
+        } = output;
+        if pre_state_root != parent.state_root {
+            return Err(ValidationError::Rejected(format!(
+                "stateless state roots do not telescope at block {number}: expected pre-state root {}, got {pre_state_root}",
+                parent.state_root,
             )));
         }
-        let mut block_outputs = Vec::<Arc<ValidatedBlock>>::with_capacity(total_blocks);
-
-        // Derive Sync checkpoints from block contents, regardless of RPC version.
-        // Plan before consuming witnesses or replaying earlier v1 blocks.
-        check_cancellation(cancellation, 0, total_blocks)?;
-        let mut prepared_settling_block = blocks
-            .last()
-            .map(|admitted| {
-                let recovered_block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
-                let (checkpoint_plan, system_sender_flags) =
-                    CheckpointPlan::for_block(&recovered_block, expected_l2_system_address);
-                Ok(PreparedSettlingBlock {
-                    block: recovered_block,
-                    checkpoint_plan,
-                    system_sender_flags,
-                })
-            })
-            .transpose()?;
-
-        for (index, (admitted, witness)) in blocks.iter().zip(witnesses).enumerate() {
-            check_cancellation(cancellation, index, total_blocks)?;
-            let block_started = Instant::now();
-            let block_ordinal = index + 1;
-            let (recovered_block, checkpoint_plan, system_sender_flags) = if block_ordinal
-                == total_blocks
-            {
-                let prepared = prepared_settling_block.take().ok_or_else(|| {
-                    ValidationError::InternalInvariant(
-                        "prepared settling block unexpectedly missing".to_owned(),
-                    )
-                })?;
-                (
-                    prepared.block,
-                    Some(prepared.checkpoint_plan),
-                    prepared.system_sender_flags,
-                )
-            } else {
-                let recovered_block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
-                let system_sender_flags =
-                    system_sender_flags(&recovered_block, expected_l2_system_address);
-                (recovered_block, None, system_sender_flags)
-            };
-            let block_number = recovered_block.header().number;
-            let timestamp = recovered_block.header().timestamp;
-            let transaction_count = recovered_block.body().transactions.len();
-            trace!(
-                block_ordinal,
-                block_number,
-                claimed_block_hash = %admitted.claimed_hash(),
-                timestamp,
-                transactions = transaction_count,
-                "validating stateless block",
-            );
-
-            // Before this call the decoded block and witness remain untrusted.
-            // Successful Stateless output means consensus, witness pre-state,
-            // execution receipts, and the recomputed post-state commitment all
-            // passed. Only Sync candidates use the checkpoint path.
-            let witness = std::mem::take(witness);
-            let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
-                Some(plan) if !plan.positions().is_empty() => {
-                    let output = stateless_validation_recovered_with_state_checkpoints(
-                        recovered_block.execution_input(),
-                        witness,
-                        Arc::clone(&self.chain_spec),
-                        self.evm_config.clone(),
-                        plan.positions(),
-                    )
-                    .map_err(|error| map_stateless_error(block_number, error))?;
-                    let checkpoints = output
-                        .checkpoints
-                        .checkpoints
-                        .into_iter()
-                        .map(|checkpoint| StateCheckpoint {
-                            at: checkpoint.at,
-                            state_root: checkpoint.state_root,
-                            block_hash: checkpoint.block_hash,
-                        })
-                        .collect::<Vec<_>>();
-                    plan.verify_returned(&checkpoints)?;
-                    (output.validation, checkpoints)
-                }
-                _ => {
-                    let output = stateless_validation_recovered(
-                        recovered_block.execution_input(),
-                        witness,
-                        Arc::clone(&self.chain_spec),
-                        self.evm_config.clone(),
-                    )
-                    .map_err(|error| map_stateless_error(block_number, error))?;
-                    (output, Vec::new())
-                }
-            };
-
-            let StatelessValidationOutput {
-                block_hash: computed_hash,
-                pre_state_root,
-                post_state_root,
-                execution_output,
-                block_access_list: _validated_block_access_list,
-            } = stateless_output;
-            // Continue from the previous output, or the supplied parent for a v2 block.
-            if let Some(previous_post_state_root) = block_outputs
-                .last()
-                .map(|output| output.post_state_root())
-                .or_else(|| parent.map(|parent| parent.state_root))
-                && pre_state_root != previous_post_state_root
-            {
-                return Err(ValidationError::Rejected(format!(
-                    "stateless state roots do not telescope at block {block_number}: expected \
-                     pre-state root {previous_post_state_root}, got {pre_state_root}",
-                )));
-            }
-
-            // These receipts come from successful replay. Observed outbound
-            // events are retained here but authorized against batch entries only
-            // later by settlement.
-            let validated_receipts = execution_output.result.receipts;
-            let receipt_successes = validated_receipts
-                .iter()
-                .map(|receipt| receipt.success)
-                .collect::<Vec<_>>();
-            let observed_outbound_events = observe_outbound_events(&validated_receipts);
-
-            if tracing::enabled!(tracing::Level::TRACE) {
-                let failed_transactions = receipt_successes
-                    .iter()
-                    .filter(|&&success| !success)
-                    .count();
-                let malformed_outbound_events = observed_outbound_events
-                    .iter()
-                    .filter(|observation| observation.decoded_event.is_none())
-                    .count();
-                trace!(
-                    block_ordinal,
-                    total_blocks,
-                    block_number,
-                    computed_block_hash = %computed_hash,
-                    validated_pre_state_root = %pre_state_root,
-                    validated_post_state_root = %post_state_root,
-                    transactions = transaction_count,
-                    failed_transactions,
-                    outbound_events = observed_outbound_events.len(),
-                    malformed_outbound_events,
-                    block_elapsed_ms = elapsed_millis(block_started),
-                    "stateless block validated",
-                );
-            }
-            let output = BackendBlockOutput {
-                computed_hash,
-                receipt_successes,
-                transaction_state_checkpoints,
-                post_state_root,
-                settlement_evidence: SettlementBlockEvidence {
-                    system_sender_flags,
-                    observed_outbound_events,
-                },
-            };
-            block_outputs.push(recovered_block.finish(
-                output,
-                pre_state_root,
-                block_ordinal == total_blocks,
-            )?);
-
-            if block_ordinal.is_multiple_of(DEBUG_PROGRESS_INTERVAL) {
-                debug!(
-                    validated_blocks = block_ordinal,
-                    total_blocks,
-                    block_number,
-                    validated_post_state_root = %post_state_root,
-                    elapsed_ms = elapsed_millis(validation_started),
-                    "stateless validation progress",
-                );
-            }
-        }
-
-        if block_outputs.is_empty() {
-            return Err(ValidationError::Rejected(
-                "refusing to validate an empty window".to_owned(),
-            ));
-        }
-        Ok(BackendWindowOutput {
-            blocks: block_outputs,
-        })
+        let receipts = execution_output.result.receipts;
+        let output = BackendBlockOutput {
+            computed_hash,
+            receipt_successes: receipts.iter().map(|receipt| receipt.success).collect(),
+            transaction_state_checkpoints: checkpoints,
+            post_state_root,
+            settlement_evidence: SettlementBlockEvidence {
+                system_sender_flags,
+                observed_outbound_events: observe_outbound_events(&receipts),
+            },
+        };
+        let checked = block.finish(output, pre_state_root)?;
+        trace!(block_number = number, %computed_hash, %post_state_root,
+            elapsed_ms = elapsed_millis(started), "stateless block validated");
+        Ok(checked)
     }
 }
 
@@ -396,15 +225,6 @@ impl ValidationBackend for Backend {
 
     fn expected_l2_system_address(&self) -> Address {
         self.expected_l2_system_address
-    }
-
-    fn validate_blocks(
-        &self,
-        blocks: &[AdmittedBlock],
-        witnesses: &mut [ExecutionWitness],
-        cancellation: &CancellationToken,
-    ) -> Result<BackendWindowOutput, ValidationError> {
-        self.validate_blocks_inner(blocks, witnesses, cancellation, None)
     }
 
     fn validate_anchor(&self, _anchor: BlockAnchor) -> Result<(), ValidationError> {
@@ -441,17 +261,7 @@ impl ValidationBackend for Backend {
                 // The worker owns its slot until execution ends, even if its caller times out.
                 // A completed job may populate the cache for later callers; partial results never do.
                 let _permit = permit;
-                let output = backend.validate_blocks_inner(
-                    std::slice::from_ref(&admitted),
-                    &mut [witness],
-                    &CancellationToken::default(),
-                    Some(parent),
-                )?;
-                let output = output
-                    .blocks
-                    .into_iter()
-                    .next()
-                    .expect("one validated block");
+                let output = backend.validate_block(parent, &admitted, witness)?;
                 let mut blocks = backend.blocks.lock().unwrap();
                 // Concurrent misses may execute twice; only fully checked evidence is published.
                 Ok((blocks.insert(output), false))

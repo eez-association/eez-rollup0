@@ -60,21 +60,16 @@ async fn a_stubbed_value_bearing_outbound_window_returns_an_attestation() {
 async fn a_valid_anchor_only_window_returns_a_recoverable_attestation() {
     let server = TestServer::new(one_accepting_validator()).await;
     let window = happy_window();
-    let Some(prove_chunk::Kind::Header(header)) = &window[0].kind else {
-        unreachable!();
-    };
-    let batch = settlement::decode_canonical_post_batch(
-        header.post_batch.as_ref().unwrap().abi_calldata.clone(),
-    )
-    .expect("test batch must decode");
+    let batch = settlement::decode_canonical_post_batch(window.settlement.abi_calldata.clone())
+        .expect("test batch must decode");
     let expected_hash = recompute_test_public_inputs_hash(&batch);
 
     let response = server.attest(window).await;
 
     assert_eq!(response.public_inputs_hash, expected_hash.as_slice());
-    assert_eq!(response.signature.len(), 65);
-    assert!(matches!(response.signature[64], 27 | 28));
-    let signature = Signature::try_from(response.signature.as_slice()).unwrap();
+    assert_eq!(response.proof.len(), 65);
+    assert!(matches!(response.proof[64], 27 | 28));
+    let signature = Signature::try_from(response.proof.as_slice()).unwrap();
     assert!(
         signature.normalize_s().is_none(),
         "signature must use low-s"
@@ -97,11 +92,14 @@ async fn matching_intermediate_transaction_da_payload_is_attested() {
         Vec::new(),
     ))
     .await;
-    let mut window = vec![
-        header_chunk(5, 6),
-        transaction_block_chunk(5, 0x04, 0x05, non_system_transaction()),
-        block_chunk(6, 0x05, 0x06),
-    ];
+    let mut window = TestWindow::new(
+        5,
+        6,
+        vec![
+            transaction_block_chunk(5, 0x04, 0x05, non_system_transaction()),
+            block_chunk(6, 0x05, 0x06),
+        ],
+    );
     replace_batch_bound_to_window(&mut window, anchor_batch_spanning(5, 6));
 
     let _response = server.attest(window).await;
@@ -116,16 +114,22 @@ async fn mismatched_intermediate_transaction_da_payload_is_rejected() {
         Vec::new(),
     );
     let server = TestServer::new(Arc::clone(&inner)).await;
-    let mut window = vec![
-        header_chunk(5, 6),
-        transaction_block_chunk(5, 0x04, 0x05, non_system_transaction()),
-        block_chunk(6, 0x05, 0x06),
-    ];
-    let payload_source = vec![
-        header_chunk(5, 6),
-        transaction_block_chunk(5, 0x04, 0x05, system_transaction()),
-        block_chunk(6, 0x05, 0x06),
-    ];
+    let mut window = TestWindow::new(
+        5,
+        6,
+        vec![
+            transaction_block_chunk(5, 0x04, 0x05, non_system_transaction()),
+            block_chunk(6, 0x05, 0x06),
+        ],
+    );
+    let payload_source = TestWindow::new(
+        5,
+        6,
+        vec![
+            transaction_block_chunk(5, 0x04, 0x05, system_transaction()),
+            block_chunk(6, 0x05, 0x06),
+        ],
+    );
     let mut batch = anchor_batch_spanning(5, 6);
     batch.callData = da_payload_for_window(&payload_source).into();
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
@@ -220,7 +224,7 @@ async fn a_second_anchor_is_rejected_by_the_effect_prefix_gate() {
 async fn anchor_only_output_requires_empty_prefix_checkpoint() {
     let inputs = happy_block_inputs();
     let mut backend_output = backend_output_for(&inputs);
-    backend_output.blocks[2].transaction_state_checkpoints = Vec::new();
+    backend_output[2].transaction_state_checkpoints = Vec::new();
     let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output)]))).await;
 
     let status = server.prove(happy_window()).await;
@@ -236,7 +240,7 @@ async fn anchor_only_output_requires_empty_prefix_checkpoint() {
 async fn an_anchor_only_batch_rejects_a_different_empty_prefix() {
     let inputs = happy_block_inputs();
     let mut backend_output = backend_output_for(&inputs);
-    backend_output.blocks[2].transaction_state_checkpoints =
+    backend_output[2].transaction_state_checkpoints =
         vec![pre_execution_checkpoint(B256::repeat_byte(0xee))];
     let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output)]))).await;
 
@@ -286,17 +290,17 @@ async fn a_multi_block_outbound_effect_without_an_observed_call_is_rejected() {
         AdmittedBlock::test(6, 0x05, 0x06),
     ];
     let mut backend_output = backend_output_for(&inputs);
-    backend_output.blocks[0].post_state_root = pre_settling_root;
-    backend_output.blocks[1].post_state_root = final_root;
-    backend_output.blocks[0].set_transaction_results_for_test(vec![true]);
-    backend_output.blocks[1].set_transaction_results_for_test(vec![true]);
-    backend_output.blocks[0]
+    backend_output[0].post_state_root = pre_settling_root;
+    backend_output[1].post_state_root = final_root;
+    backend_output[0].set_transaction_results_for_test(vec![true]);
+    backend_output[1].set_transaction_results_for_test(vec![true]);
+    backend_output[0]
         .settlement_evidence
         .set_system_sender_flags_for_test(vec![false]);
-    backend_output.blocks[1]
+    backend_output[1]
         .settlement_evidence
         .set_system_sender_flags_for_test(vec![false]);
-    backend_output.blocks[1].transaction_state_checkpoints = vec![
+    backend_output[1].transaction_state_checkpoints = vec![
         pre_execution_checkpoint(empty_prefix_candidate()),
         checkpoint(0, final_root),
     ];
@@ -324,7 +328,7 @@ async fn a_state_update_final_block_mismatch_is_rejected() {
     let backend_output = backend_output_for(&blocks);
     let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output)]))).await;
     let mut window = happy_window();
-    block_mut(window.last_mut().unwrap()).hash = vec![0xee; 32];
+    window.blocks.last_mut().unwrap().hash = vec![0xee; 32];
 
     let status = server.prove(window).await;
 
@@ -352,7 +356,7 @@ async fn a_state_update_rollup_mismatch_is_rejected() {
 async fn malformed_settling_block_rlp_after_backend_success_is_internal() {
     let server = TestServer::new(one_accepting_validator()).await;
     let mut window = happy_window();
-    block_mut(window.last_mut().unwrap()).rlp = vec![0xff];
+    window.blocks.last_mut().unwrap().rlp = vec![0xff];
 
     let status = server.prove(window).await;
 
@@ -368,7 +372,7 @@ async fn distinct_reexecuted_roots_are_attested_when_the_anchor_matches() {
     // Re-executed state roots share nothing with the claimed chain: the anchor
     // matches because the window's endpoints are block hashes.
     let mut backend_output = backend_output_for(&happy_block_inputs());
-    backend_output.blocks.last_mut().unwrap().post_state_root = B256::repeat_byte(0x12);
+    backend_output.last_mut().unwrap().post_state_root = B256::repeat_byte(0x12);
     let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output)]))).await;
     let mut window = happy_window();
     replace_post_batch(
@@ -389,33 +393,13 @@ async fn a_matching_nondefault_rollup_identity_is_attested() {
     ))
     .await;
     let mut window = happy_window();
-    header_mut(&mut window[0]).rollup_id = ROLLUP_ID;
+    window.rollup_id = ROLLUP_ID;
     replace_post_batch(
         &mut window,
         public_input_post_batch_for_empty_blocks(anchor_batch_spanning_for(ROLLUP_ID, 5, 7), 3),
     );
 
     let _response = server.attest(window).await;
-}
-
-#[tokio::test]
-async fn the_composer_public_input_hash_cannot_control_the_attestation() {
-    let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output_for(
-        &happy_block_inputs(),
-    ))])))
-    .await;
-    let mut post_batch = public_input_post_batch();
-    let batch = settlement::decode_canonical_post_batch(post_batch.abi_calldata.clone()).unwrap();
-    let expected_hash = recompute_test_public_inputs_hash(&batch);
-    let composer_claim = vec![0x99; 32];
-    post_batch.public_inputs_hash.clone_from(&composer_claim);
-    let mut window = happy_window();
-    replace_post_batch(&mut window, post_batch);
-
-    let response = server.attest(window).await;
-
-    assert_attestation(&response, expected_hash, test_attester().address());
-    assert_ne!(response.public_inputs_hash, composer_claim);
 }
 
 #[tokio::test]
@@ -463,11 +447,14 @@ async fn an_intermediate_system_transaction_is_rejected() {
     let inner =
         two_block_validator_with_execution_evidence(vec![true], vec![true], Vec::new(), Vec::new());
     let server = TestServer::new(Arc::clone(&inner)).await;
-    let window = vec![
-        header_chunk(5, 6),
-        transaction_block_chunk(5, 0x04, 0x05, system_transaction()),
-        block_chunk(6, 0x05, 0x06),
-    ];
+    let window = TestWindow::new(
+        5,
+        6,
+        vec![
+            transaction_block_chunk(5, 0x04, 0x05, system_transaction()),
+            block_chunk(6, 0x05, 0x06),
+        ],
+    );
 
     let status = server.prove(window).await;
 
@@ -497,18 +484,19 @@ async fn an_inbound_candidate_hidden_in_an_outbound_pair_is_rejected() {
     let (window_pre, _settling_pre, window_post) = window_endpoints(5, 5);
     let inputs = [AdmittedBlock::test(5, 0x04, 0x05)];
     let mut backend_output = backend_output_for(&inputs);
-    backend_output.blocks[0].set_transaction_results_for_test(vec![true, true]);
-    backend_output.blocks[0]
+    backend_output[0].set_transaction_results_for_test(vec![true, true]);
+    backend_output[0]
         .settlement_evidence
         .set_system_sender_flags_for_test(vec![true, false]);
-    backend_output.blocks[0].transaction_state_checkpoints = vec![
+    backend_output[0].transaction_state_checkpoints = vec![
         pre_execution_checkpoint(empty_prefix_candidate()),
         checkpoint(1, block_hash_of(5)),
     ];
     let server = TestServer::new(inner(StubBackend::new(vec![Ok(backend_output)]))).await;
-    let mut window = vec![
-        header_chunk(5, 5),
-        transactions_block_chunk(
+    let mut window = TestWindow::new(
+        5,
+        5,
+        vec![transactions_block_chunk(
             5,
             0x04,
             0x05,
@@ -516,8 +504,8 @@ async fn an_inbound_candidate_hidden_in_an_outbound_pair_is_rejected() {
                 strict_inbound_transaction(U256::ZERO).0,
                 non_system_transaction(),
             ],
-        ),
-    ];
+        )],
+    );
     replace_post_batch(
         &mut window,
         public_input_post_batch_for(outbound_batch(window_pre, window_post)),
@@ -631,11 +619,7 @@ async fn malformed_settlement_calldata_is_rejected_after_validation() {
     let inner = one_accepting_validator();
     let server = TestServer::new(Arc::clone(&inner)).await;
     let mut window = happy_window();
-    header_mut(&mut window[0])
-        .post_batch
-        .as_mut()
-        .unwrap()
-        .abi_calldata = vec![0xde, 0xad, 0xbe, 0xef];
+    window.settlement.abi_calldata = vec![0xde, 0xad, 0xbe, 0xef];
 
     let status = server.prove(window).await;
 
@@ -676,12 +660,7 @@ async fn validator_rejection_precedes_settlement_decoding() {
     )])))
     .await;
     let mut window = happy_window();
-    header_mut(&mut window[0])
-        .post_batch
-        .as_mut()
-        .unwrap()
-        .abi_calldata
-        .clear();
+    window.settlement.abi_calldata.clear();
 
     let status = server.prove(window).await;
 

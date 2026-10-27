@@ -1,7 +1,7 @@
 # Executed Rollup0 streaming RPC vectors
 
 These are recorded protobuf request/response payloads for the
-[`prove.v2` wire contract](../proto/prove_stream.proto), with a
+[`prove.v1` wire contract](../proto/prove.proto), with a
 [standalone replay client](../examples/replay_streaming.rs). Use them to check a
 streaming prover's responses against expected protocol behavior. The client
 connects to a running prover configured for the fixture and selected test profile.
@@ -37,7 +37,7 @@ profile**: a proof binds the transition to its selected parent but does not
 attest the parent's L1 acceptance.
 The L1 contract checks applicability when consuming it. They do not test the
 prover-owned L1 parent authentication described for blob-based profiles in the
-[streaming specification](../STREAMING_SPEC.md).
+[streaming specification](../SPEC.md).
 
 ## Server setup and replay
 

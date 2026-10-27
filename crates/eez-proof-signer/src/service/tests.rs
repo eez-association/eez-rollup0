@@ -1,4 +1,4 @@
-//! Shared fixtures and the in-process tonic `Prove` harness for the service
+//! Shared fixtures and the in-process tonic `ProveStream` harness for the service
 //! test submodules.
 
 mod attestation;
@@ -11,8 +11,8 @@ use alloy_primitives::{B256, Bytes, Signature, U256, address, b256, keccak256};
 use alloy_sol_types::SolValue as _;
 use eez_control_rpc::v1::prover_client::ProverClient;
 use eez_control_rpc::v1::{
-    BlockWitness, ExecutionWitness, PostBatch, ProveChunk, ProveHeader, ProveResponse, prove_chunk,
-    prove_failure,
+    Begin, Block, BlockWitness, ClientFrame, ExecutionWitness, Finalize, Proof, ServerFrame,
+    SettlementInput as WireSettlementInput, client_frame, prove_failure, server_frame,
 };
 use eez_protocol::abi::{ExecutionEntrySol, L2ToL1CallSol, RollupUpdateSol};
 use reth_primitives_traits::BlockBody as _;
@@ -20,18 +20,15 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Status};
 
-use super::rpc::WorkerGuard;
-use super::settlement_job::{
-    PipelineError, SettlementInput, SettlementPipelineError, run_settlement, validate_and_settle,
-};
+use super::settlement_job::{SettlementInput, SettlementPipelineError, run_settlement};
 use super::*;
 use crate::cancel::CancellationToken;
 use crate::testkit::{
     TEST_SYSTEM_ADDRESS, checkpoint, empty_prefix_candidate, pre_execution_checkpoint,
     system_transaction_context, test_proof_system_vkey,
 };
+use crate::validate::AdmittedBlock;
 use crate::validate::testing::{StubBackend, backend_output_for};
-use crate::window::AdmittedBlock;
 
 fn nz(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).unwrap()
@@ -252,17 +249,17 @@ fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256
     (batch, alloy_rlp::encode(block), user, call_hash)
 }
 
-fn outbound_backend_output() -> validate::testing::TestBackendWindowOutput {
+fn outbound_backend_output() -> Vec<validate::BackendBlockOutput> {
     let inputs = [AdmittedBlock::test(5, 0x04, 0x05)];
     let mut backend_output = backend_output_for(&inputs);
-    backend_output.blocks[0].set_transaction_results_for_test(vec![true, true]);
+    backend_output[0].set_transaction_results_for_test(vec![true, true]);
     // The pair ends on the block's last transaction, so its candidate is the
     // settling block itself.
-    backend_output.blocks[0].transaction_state_checkpoints = vec![
+    backend_output[0].transaction_state_checkpoints = vec![
         pre_execution_checkpoint(empty_prefix_candidate()),
         checkpoint(1, block_hash_of(5)),
     ];
-    backend_output.blocks[0]
+    backend_output[0]
         .settlement_evidence
         .set_system_sender_flags_for_test(vec![true, false]);
     backend_output
@@ -330,11 +327,11 @@ fn mixed_outbound_inbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, B256) {
     (batch, alloy_rlp::encode(block), outbound_call_hash)
 }
 
-fn mixed_backend_output() -> validate::testing::TestBackendWindowOutput {
+fn mixed_backend_output() -> Vec<validate::BackendBlockOutput> {
     let inputs = [AdmittedBlock::test(5, 0x04, 0x05)];
     let mut backend_output = backend_output_for(&inputs);
-    backend_output.blocks[0].set_transaction_results_for_test(vec![true, true, true]);
-    backend_output.blocks[0].transaction_state_checkpoints = vec![
+    backend_output[0].set_transaction_results_for_test(vec![true, true, true]);
+    backend_output[0].transaction_state_checkpoints = vec![
         pre_execution_checkpoint(empty_prefix_candidate()),
         checkpoint(1, interior_candidate()),
         checkpoint(2, block_hash_of(5)),
@@ -354,52 +351,48 @@ fn mixed_evidence(outbound_call_hash: B256) -> validate::SettlementBlockEvidence
     )
 }
 
-fn single_block_settlement_window(
-    batch: eez_protocol::EvmBatch,
-    block_rlp: Vec<u8>,
-) -> Vec<ProveChunk> {
+fn single_block_settlement_window(batch: eez_protocol::EvmBatch, block_rlp: Vec<u8>) -> TestWindow {
     let mut block = block_chunk(5, 0x04, 0x05);
-    block_mut(&mut block).rlp = block_rlp;
-    let mut window = vec![header_chunk(5, 5), block];
+    block.rlp = block_rlp;
+    let mut window = TestWindow::new(5, 5, vec![block]);
     replace_post_batch(&mut window, public_input_post_batch_for(batch));
     window
 }
 
-fn header_chunk(from: u64, to: u64) -> ProveChunk {
-    let block_count = to
-        .checked_sub(from)
-        .and_then(|distance| distance.checked_add(1))
-        .and_then(|count| usize::try_from(count).ok())
-        .unwrap_or_default();
-    ProveChunk {
-        kind: Some(prove_chunk::Kind::Header(ProveHeader {
+struct TestWindow {
+    rollup_id: u64,
+    from_block: u64,
+    to_block: u64,
+    settlement: WireSettlementInput,
+    blocks: Vec<BlockWitness>,
+}
+
+impl TestWindow {
+    fn new(from_block: u64, to_block: u64, blocks: Vec<BlockWitness>) -> Self {
+        Self {
             rollup_id: 1,
-            from_block: from,
-            to_block: to,
-            post_batch: Some(public_input_post_batch_for_empty_blocks(
-                anchor_batch_spanning(from, to),
-                block_count,
-            )),
-        })),
+            from_block,
+            to_block,
+            settlement: public_input_post_batch_for_empty_blocks(
+                anchor_batch_spanning(from_block, to_block),
+                blocks.len(),
+            ),
+            blocks,
+        }
     }
 }
 
-/// The post-batch a [`happy_window`] carries: an anchor over blocks 5..=7.
-fn public_input_post_batch() -> PostBatch {
-    public_input_post_batch_for_empty_blocks(anchor_batch_spanning(5, 7), 3)
-}
-
-fn public_input_post_batch_for(batch: eez_protocol::EvmBatch) -> PostBatch {
-    PostBatch {
+fn public_input_post_batch_for(batch: eez_protocol::EvmBatch) -> WireSettlementInput {
+    WireSettlementInput {
         abi_calldata: eez_protocol::entries::encode_postbatch(&batch),
-        ..PostBatch::default()
+        ..WireSettlementInput::default()
     }
 }
 
 fn public_input_post_batch_for_empty_blocks(
     mut batch: eez_protocol::EvmBatch,
     block_count: usize,
-) -> PostBatch {
+) -> WireSettlementInput {
     // A span covers at least one block, so a zero-block window (an inverted
     // range fixture) has no encodable payload — an empty one stands in, and is
     // itself invalid, which is what such a fixture wants.
@@ -426,10 +419,10 @@ fn recompute_test_public_inputs_hash(batch: &eez_protocol::EvmBatch) -> B256 {
 }
 
 #[track_caller]
-fn assert_attestation(response: &ProveResponse, expected_hash: B256, expected_signer: Address) {
+fn assert_attestation(response: &Proof, expected_hash: B256, expected_signer: Address) {
     assert_eq!(response.public_inputs_hash, expected_hash.as_slice());
-    assert_eq!(response.signature.len(), 65);
-    let signature = Signature::try_from(response.signature.as_slice()).unwrap();
+    assert_eq!(response.proof.len(), 65);
+    let signature = Signature::try_from(response.proof.as_slice()).unwrap();
     assert_eq!(
         signature
             .recover_address_from_prehash(&expected_hash)
@@ -438,34 +431,15 @@ fn assert_attestation(response: &ProveResponse, expected_hash: B256, expected_si
     );
 }
 
-fn replace_post_batch(window: &mut [ProveChunk], post_batch: PostBatch) {
-    header_mut(&mut window[0]).post_batch = Some(post_batch);
+fn replace_post_batch(window: &mut TestWindow, settlement: WireSettlementInput) {
+    window.settlement = settlement;
 }
 
-#[track_caller]
-fn header_mut(chunk: &mut ProveChunk) -> &mut ProveHeader {
-    let Some(prove_chunk::Kind::Header(header)) = &mut chunk.kind else {
-        unreachable!("test chunk must be a header");
-    };
-    header
-}
-
-#[track_caller]
-fn block_mut(chunk: &mut ProveChunk) -> &mut BlockWitness {
-    let Some(prove_chunk::Kind::Block(block)) = &mut chunk.kind else {
-        unreachable!("test chunk must be a block");
-    };
-    block
-}
-
-fn da_payload_for_window(window: &[ProveChunk]) -> Vec<u8> {
+fn da_payload_for_window(window: &TestWindow) -> Vec<u8> {
     let blocks = window
+        .blocks
         .iter()
-        .skip(1)
-        .map(|chunk| {
-            let Some(prove_chunk::Kind::Block(block)) = &chunk.kind else {
-                panic!("test window contains a non-block chunk after its header");
-            };
+        .map(|block| {
             let block = alloy_rlp::decode_exact::<eez_primitives::Block>(&block.rlp).unwrap();
             block.body.encoded_2718_transactions_iter().collect()
         })
@@ -473,41 +447,40 @@ fn da_payload_for_window(window: &[ProveChunk]) -> Vec<u8> {
     settlement::encode_da_payload(&blocks, &[])
 }
 
-fn replace_batch_bound_to_window(window: &mut [ProveChunk], mut batch: eez_protocol::EvmBatch) {
+fn replace_batch_bound_to_window(window: &mut TestWindow, mut batch: eez_protocol::EvmBatch) {
     batch.callData = da_payload_for_window(window).into();
     replace_post_batch(window, public_input_post_batch_for(batch));
 }
 
-fn block_chunk(number: u64, parent: u8, hash: u8) -> ProveChunk {
-    let block =
-        eez_primitives::Block::new(Default::default(), eez_primitives::BlockBody::default());
-    ProveChunk {
-        kind: Some(prove_chunk::Kind::Block(BlockWitness {
-            number,
-            hash: vec![hash; 32],
-            parent_hash: vec![parent; 32],
-            rlp: alloy_rlp::encode(block),
-            witness: Some(ExecutionWitness {
-                state: vec![vec![number as u8]],
-                ..ExecutionWitness::default()
-            }),
-        })),
+fn block_chunk(number: u64, parent: u8, hash: u8) -> BlockWitness {
+    BlockWitness {
+        number,
+        hash: vec![hash; 32],
+        parent_hash: vec![parent; 32],
+        rlp: alloy_rlp::encode(eez_primitives::Block::default()),
+        witness: Some(ExecutionWitness {
+            state: vec![vec![number as u8]],
+            ..Default::default()
+        }),
     }
 }
 
-/// A chained happy-path window: header(5..=7) + blocks 5, 6, 7.
-fn happy_window() -> Vec<ProveChunk> {
-    vec![
-        header_chunk(5, 7),
-        block_chunk(5, 0x04, 0x05),
-        block_chunk(6, 0x05, 0x06),
-        block_chunk(7, 0x06, 0x07),
-    ]
+/// A chained happy-path fixture covering blocks 5, 6, and 7.
+fn happy_window() -> TestWindow {
+    TestWindow::new(
+        5,
+        7,
+        vec![
+            block_chunk(5, 0x04, 0x05),
+            block_chunk(6, 0x05, 0x06),
+            block_chunk(7, 0x06, 0x07),
+        ],
+    )
 }
 
 type TestTransaction = eez_primitives::EezTxEnvelope;
 
-fn single_non_system_transaction_window() -> Vec<ProveChunk> {
+fn single_non_system_transaction_window() -> TestWindow {
     single_transaction_window(non_system_transaction())
 }
 
@@ -517,7 +490,7 @@ fn non_system_transaction() -> TestTransaction {
         .into()
 }
 
-fn single_system_transaction_window() -> Vec<ProveChunk> {
+fn single_system_transaction_window() -> TestWindow {
     single_transaction_window(system_transaction())
 }
 
@@ -584,22 +557,23 @@ fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, Exe
     (transaction, call_hash, return_data, sidecar)
 }
 
-fn single_transaction_window(transaction: TestTransaction) -> Vec<ProveChunk> {
-    vec![
-        header_chunk(5, 5),
-        transaction_block_chunk(5, 0x04, 0x05, transaction),
-    ]
+fn single_transaction_window(transaction: TestTransaction) -> TestWindow {
+    TestWindow::new(
+        5,
+        5,
+        vec![transaction_block_chunk(5, 0x04, 0x05, transaction)],
+    )
 }
 
-fn two_block_transaction_window(
-    first: TestTransaction,
-    settling: TestTransaction,
-) -> Vec<ProveChunk> {
-    vec![
-        header_chunk(5, 6),
-        transaction_block_chunk(5, 0x04, 0x05, first),
-        transaction_block_chunk(6, 0x05, 0x06, settling),
-    ]
+fn two_block_transaction_window(first: TestTransaction, settling: TestTransaction) -> TestWindow {
+    TestWindow::new(
+        5,
+        6,
+        vec![
+            transaction_block_chunk(5, 0x04, 0x05, first),
+            transaction_block_chunk(6, 0x05, 0x06, settling),
+        ],
+    )
 }
 
 fn transaction_block_chunk(
@@ -607,7 +581,7 @@ fn transaction_block_chunk(
     parent: u8,
     hash: u8,
     transaction: TestTransaction,
-) -> ProveChunk {
+) -> BlockWitness {
     transactions_block_chunk(number, parent, hash, vec![transaction])
 }
 
@@ -616,14 +590,14 @@ fn transactions_block_chunk(
     parent: u8,
     hash: u8,
     transactions: Vec<TestTransaction>,
-) -> ProveChunk {
+) -> BlockWitness {
     let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
         transactions,
         ..Default::default()
     };
     let consensus_block = eez_primitives::Block::new(Default::default(), body);
     let mut chunk = block_chunk(number, parent, hash);
-    block_mut(&mut chunk).rlp = alloy_rlp::encode(consensus_block);
+    chunk.rlp = alloy_rlp::encode(consensus_block);
     chunk
 }
 
@@ -681,7 +655,6 @@ impl TestServer {
         let (shutdown, shutdown_rx) = oneshot::channel();
         tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(svc.clone().into_streaming_server())
                 .add_service(svc.into_server())
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
@@ -698,38 +671,91 @@ impl TestServer {
         }
     }
 
-    async fn client(&self) -> ProverClient<tonic::transport::Channel> {
-        ProverClient::connect(self.endpoint.clone()).await.unwrap()
-    }
-
-    pub(super) async fn streaming_client(
-        &self,
-    ) -> eez_control_rpc::v2::prover_client::ProverClient<tonic::transport::Channel> {
-        eez_control_rpc::v2::prover_client::ProverClient::connect(self.endpoint.clone())
+    pub(super) async fn client(&self) -> ProverClient<tonic::transport::Channel> {
+        ProverClient::connect(self.endpoint.clone())
             .await
             .unwrap()
+            .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
     }
 
-    async fn prove(&self, chunks: Vec<ProveChunk>) -> Status {
-        self.client()
+    async fn exchange(&self, window: TestWindow) -> Result<Proof, Status> {
+        let first = window.blocks.first().expect("fixture has a block");
+        let terminal_hash = window.blocks.last().unwrap().hash.clone();
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(ClientFrame {
+                request_id: 1,
+                kind: Some(client_frame::Kind::Begin(Begin {
+                    rollup_id: window.rollup_id,
+                    anchor_number: window.from_block - 1,
+                    anchor_hash: first.parent_hash.clone(),
+                    anchor_state_root: vec![0; 32],
+                })),
+                ..Default::default()
+            })
             .await
-            .prove(tokio_stream::iter(chunks))
+            .unwrap();
+        let mut responses = self
+            .client()
+            .await
+            .prove_stream(ReceiverStream::new(receiver))
+            .await?
+            .into_inner();
+        let ready = responses.message().await?.expect("Begin response");
+        let binding = (ready.session_id.clone(), ready.epoch);
+        require_success(ready)?;
+        let mut request_id = 1;
+        for block in window.blocks {
+            request_id += 1;
+            sender
+                .send(ClientFrame {
+                    session_id: binding.0.clone(),
+                    epoch: binding.1,
+                    request_id,
+                    kind: Some(client_frame::Kind::Block(Block { data: Some(block) })),
+                })
+                .await
+                .unwrap();
+            let response = responses.message().await?.expect("Block response");
+            assert_eq!(response.request_id, request_id);
+            assert!(matches!(
+                require_success(response)?,
+                server_frame::Kind::Validated(_)
+            ));
+        }
+        sender
+            .send(ClientFrame {
+                session_id: binding.0,
+                epoch: binding.1,
+                request_id: request_id + 1,
+                kind: Some(client_frame::Kind::Finalize(Finalize {
+                    from_block: window.from_block,
+                    to_block: window.to_block,
+                    terminal_hash,
+                    settlement: Some(window.settlement),
+                })),
+            })
+            .await
+            .unwrap();
+        let response = responses.message().await?.expect("Finalize response");
+        let server_frame::Kind::Proof(proof) = require_success(response)? else {
+            panic!("expected proof")
+        };
+        assert!(responses.message().await?.is_none());
+        Ok(proof)
+    }
+
+    async fn prove(&self, window: TestWindow) -> Status {
+        self.exchange(window)
             .await
             .expect_err("request must be rejected")
     }
 
-    async fn attest(&self, chunks: Vec<ProveChunk>) -> ProveResponse {
-        self.client()
-            .await
-            .prove(tokio_stream::iter(chunks))
+    async fn attest(&self, window: TestWindow) -> Proof {
+        self.exchange(window)
             .await
             .expect("valid window must be attested")
-            .into_inner()
     }
-}
-
-fn unused_validator() -> Arc<ServiceState> {
-    inner(StubBackend::new(Vec::new()))
 }
 
 fn one_accepting_validator() -> Arc<ServiceState> {
@@ -749,8 +775,8 @@ fn single_block_validator_with_execution_evidence(
     system_sender_flags: Vec<bool>,
 ) -> Arc<ServiceState> {
     let mut backend_output = backend_output_for(&[AdmittedBlock::test(5, 0x04, 0x05)]);
-    backend_output.blocks[0].set_transaction_results_for_test(receipt_successes);
-    backend_output.blocks[0]
+    backend_output[0].set_transaction_results_for_test(receipt_successes);
+    backend_output[0]
         .settlement_evidence
         .set_system_sender_flags_for_test(system_sender_flags);
     inner(StubBackend::new(vec![Ok(backend_output)]))
@@ -766,12 +792,12 @@ fn two_block_validator_with_execution_evidence(
         AdmittedBlock::test(5, 0x04, 0x05),
         AdmittedBlock::test(6, 0x05, 0x06),
     ]);
-    backend_output.blocks[0].set_transaction_results_for_test(first_receipt_successes);
-    backend_output.blocks[0]
+    backend_output[0].set_transaction_results_for_test(first_receipt_successes);
+    backend_output[0]
         .settlement_evidence
         .set_system_sender_flags_for_test(first_system_sender_flags);
-    backend_output.blocks[1].set_transaction_results_for_test(settling_receipt_successes);
-    backend_output.blocks[1]
+    backend_output[1].set_transaction_results_for_test(settling_receipt_successes);
+    backend_output[1]
         .settlement_evidence
         .set_system_sender_flags_for_test(settling_system_sender_flags);
     inner(StubBackend::new(vec![Ok(backend_output)]))
@@ -783,4 +809,15 @@ fn inner(validator: StubBackend) -> Arc<ServiceState> {
 
 fn inner_with_rollup(validator: StubBackend, expected_rollup_id: NonZeroU64) -> Arc<ServiceState> {
     Arc::new(ServiceState::new(validator, expected_rollup_id, test_attester()).unwrap())
+}
+
+fn require_success(response: ServerFrame) -> Result<server_frame::Kind, Status> {
+    match response.kind.expect("response kind") {
+        server_frame::Kind::Rejected(rejected) => Err(Status::with_details(
+            Code::from_i32(rejected.code),
+            rejected.message,
+            rejected.details.into(),
+        )),
+        kind => Ok(kind),
+    }
 }
