@@ -8,6 +8,18 @@
 [advisories]
 ignore = [
     # ── also ignored in deny.toml ──────────────────────────────────────────
+    # zstd 0.13 / zstd-safe 7 / zstd-sys 2.0. The fixes need zstd 0.14 and
+    # zstd-safe 8; reth and reth_gnosis still require zstd 0.13.
+    # Context reuse through `with_context`, which no dependency calls.
+    "RUSTSEC-2026-0391",
+    # `Seekable::decompress`, behind the `seekable` feature, which nothing enables.
+    "RUSTSEC-2026-0398",
+    # A failed legacy-frame stream decode into a `Vec`. Untrusted zstd input only
+    # reaches reth's RPC request decompression (off by default) and
+    # compression-codecs, which decodes into fixed buffers.
+    "RUSTSEC-2026-0403",
+    # The wasm32 allocator shim; we don't build for wasm32.
+    "RUSTSEC-2026-0410",
     # anyhow `Error::downcast_mut()` unsoundness. Transitive; we never
     # downcast_mut an anyhow error.
     "RUSTSEC-2026-0190",
