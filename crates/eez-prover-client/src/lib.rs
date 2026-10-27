@@ -396,8 +396,8 @@ impl RemoteProver {
             })
             .transpose()?;
 
-        // Retained history can fill the quota or prune a prefix needed after an
-        // L1 rollback; baseline servers can also reject subrange selection.
+        // An abandoned unproved prefix can fill the quota, or a rollback can need
+        // pruned history; baseline servers can also reject subrange selection.
         // Rebuild once at the exact predecessor, preserving inputs and deadline.
         let mut retry_at_anchor = state.session.is_some()
             && finalize.as_ref().is_some_and(|f| anchor.number.checked_add(1) == Some(f.from_block));
@@ -571,7 +571,7 @@ impl RemoteProver {
                         && matches!(&response.kind, Some(server_frame::Kind::Rejected(rejected))
                             if Code::from_i32(rejected.code) == Code::ResourceExhausted
                                 || (index == blocks.len() && matches!(Code::from_i32(rejected.code),
-                                    Code::InvalidArgument | Code::Unimplemented))) {
+                                    Code::OutOfRange | Code::Unimplemented))) {
                         state.session = None;
                         continue 'attempt;
                     }
