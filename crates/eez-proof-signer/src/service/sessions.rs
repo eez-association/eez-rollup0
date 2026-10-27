@@ -40,6 +40,9 @@ type FrameResult = Result<(ServerFrame, bool), FrameError>;
 struct Session {
     anchor: BlockAnchor,
     blocks: Vec<SessionBlock>,
+    // Proved history has its own window budget; it must not crowd out new blocks.
+    // This is a proof watermark, not an L1 settlement cursor.
+    proved_through: u64,
     epoch: u64,
     connected: bool,
     cancellation: CancellationToken,
@@ -65,13 +68,19 @@ impl Session {
         &self,
         finalize: &eez_control_rpc::v2::Finalize,
         terminal_hash: B256,
+        limits: ServiceLimits,
     ) -> Result<(BlockAnchor, ValidatedWindow, usize), Status> {
         let first_validated = self.anchor.number.checked_add(1).ok_or_else(|| {
             Status::invalid_argument("session anchor block number cannot be incremented")
         })?;
-        if finalize.from_block < first_validated || finalize.to_block < finalize.from_block {
+        if finalize.from_block == 0 || finalize.to_block < finalize.from_block {
             return Err(Status::invalid_argument(
-                "Finalize range is outside the session's validated active prefix",
+                "Finalize range must be nonempty and start after genesis",
+            ));
+        }
+        if finalize.from_block < first_validated {
+            return Err(Status::out_of_range(
+                "Finalize range starts before the retained session prefix",
             ));
         }
         let start_index = usize::try_from(finalize.from_block - first_validated)
@@ -83,6 +92,12 @@ impl Session {
                 "Finalize terminal block has not been fully validated",
             ));
         }
+        check_window_quota(
+            limits,
+            self.blocks[start_index..=end_index]
+                .iter()
+                .map(|block| (block.payload_bytes, block.witness_items)),
+        )?;
         let artifacts = self.blocks[start_index..=end_index]
             .iter()
             .map(|block| Arc::clone(&block.validated))
@@ -599,6 +614,7 @@ impl SessionRuntime {
             Arc::new(Mutex::new(Session {
                 anchor,
                 blocks: Vec::new(),
+                proved_through: anchor.number,
                 epoch: 1,
                 connected: true,
                 cancellation: CancellationToken::default(),
@@ -665,6 +681,7 @@ impl SessionRuntime {
                 })?
         };
         session.blocks.truncate(retained);
+        session.proved_through = session.proved_through.min(session.tip().number);
         session.cancellation.cancel();
         session.epoch = next_epoch(session.epoch);
         session.cancellation = CancellationToken::default();
@@ -737,28 +754,15 @@ impl SessionRuntime {
         let witness_items = wire_witness_item_count(&wire_witness);
 
         // Charge this session's submission before allocating the backend witness collections.
-        let attempted_blocks = session_guard.blocks.len().saturating_add(1);
-        if attempted_blocks > self.limits.max_blocks {
-            return Err(Status::resource_exhausted("session block quota exceeded"));
-        }
-        let (attempted_bytes, attempted_items) = session_guard.blocks.iter().try_fold(
-            (payload_bytes, witness_items),
-            |(bytes, items), block| {
-                let bytes = bytes
-                    .checked_add(block.payload_bytes)
-                    .ok_or_else(|| Status::resource_exhausted("session payload quota overflow"))?;
-                let items = items
-                    .checked_add(block.witness_items)
-                    .ok_or_else(|| Status::resource_exhausted("session witness quota overflow"))?;
-                Ok::<_, Status>((bytes, items))
-            },
+        check_window_quota(
+            self.limits,
+            session_guard
+                .blocks
+                .iter()
+                .skip_while(|block| block.validated.number() <= session_guard.proved_through)
+                .map(|block| (block.payload_bytes, block.witness_items))
+                .chain(std::iter::once((payload_bytes, witness_items))),
         )?;
-        if attempted_bytes > self.limits.max_payload_bytes {
-            return Err(Status::resource_exhausted("session payload quota exceeded"));
-        }
-        if attempted_items > self.limits.max_witness_items {
-            return Err(Status::resource_exhausted("session witness quota exceeded"));
-        }
 
         drop(session_guard);
         let mut admitted = AdmittedBlock {
@@ -831,7 +835,8 @@ impl SessionRuntime {
         let (anchor, validated_window, start_index, cancellation) = {
             let mut session = session.lock().await;
             require_epoch(&session, bound.epoch)?;
-            let (anchor, window, start_index) = session.select_window(&finalize, terminal_hash)?;
+            let (anchor, window, start_index) =
+                session.select_window(&finalize, terminal_hash, self.limits)?;
             // A deadline cancels this attempt, not every later Finalize in the epoch.
             // Controls still cancel the currently installed token under this same lock.
             session.cancellation.cancel();
@@ -950,6 +955,7 @@ impl SessionRuntime {
                 .map_err(|_| Status::internal("attestation signing failed"))?;
             session.anchor = anchor;
             session.blocks.drain(..start_index);
+            session.proved_through = session.proved_through.max(finalize.to_block);
             signature
         };
         event!(
@@ -992,6 +998,33 @@ impl Prover for ProveSvc {
         tokio::spawn(runtime.serve_stream(request.into_inner(), sender));
         Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
     }
+}
+
+/// Both the unproved suffix and each selected proof range fit one window.
+/// Successful proofs retain at most another window for retries and rewinds.
+fn check_window_quota(
+    limits: ServiceLimits,
+    charges: impl Iterator<Item = (usize, usize)>,
+) -> Result<(), Status> {
+    let (mut bytes, mut items) = (0_usize, 0_usize);
+    for (index, (payload_bytes, witness_items)) in charges.enumerate() {
+        if index >= limits.max_blocks {
+            return Err(Status::resource_exhausted("window block quota exceeded"));
+        }
+        bytes = bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| Status::resource_exhausted("window payload quota overflow"))?;
+        items = items
+            .checked_add(witness_items)
+            .ok_or_else(|| Status::resource_exhausted("window witness quota overflow"))?;
+        if bytes > limits.max_payload_bytes {
+            return Err(Status::resource_exhausted("window payload quota exceeded"));
+        }
+        if items > limits.max_witness_items {
+            return Err(Status::resource_exhausted("window witness quota exceeded"));
+        }
+    }
+    Ok(())
 }
 
 fn require_bound(
@@ -1510,6 +1543,214 @@ mod tests {
             3,
             "backfill must reuse the backend cache"
         );
+    }
+
+    #[tokio::test]
+    async fn consecutive_full_windows_keep_the_session_and_enforce_each_quota() {
+        let anchor = ProvingAnchor {
+            number: 10,
+            hash: B256::repeat_byte(0x11),
+            state_root: B256::repeat_byte(0x55),
+        };
+        let mut blocks = Vec::new();
+        let mut parent = anchor.hash;
+        for number in 11..=16 {
+            let mut block = remote_block(number, parent, number as u8);
+            // Keep the payload quota above the Finalize frame's decoding limit.
+            block.witness.state[0] = vec![0x44; 2048].into();
+            parent = block.hash;
+            blocks.push(block);
+        }
+        for quota in ["blocks", "payload", "witness"] {
+            let mut limits = limits();
+            match quota {
+                "blocks" => limits.max_blocks = 2,
+                "payload" => {
+                    limits.max_payload_bytes = blocks
+                        .chunks(2)
+                        .map(|pair| {
+                            pair.iter()
+                                .map(|block| {
+                                    let mut wire = block_after(
+                                        block.number,
+                                        block.parent_hash,
+                                        block.number as u8,
+                                    )
+                                    .data
+                                    .unwrap();
+                                    wire.witness.as_mut().unwrap().state[0] =
+                                        block.witness.state[0].to_vec();
+                                    wire.encoded_len()
+                                })
+                                .sum()
+                        })
+                        .max()
+                        .unwrap();
+                }
+                "witness" => limits.max_witness_items = 2,
+                _ => unreachable!(),
+            }
+            let state = state(Arc::new(AtomicUsize::new(0)));
+            let attester = state.attester.address();
+            let service = ProveSvc::new(state, limits);
+            let runtime = Arc::clone(&service.sessions);
+            let server = TestServer::with_service(service).await;
+            let prover = RemoteProver::new(&server.endpoint, attester);
+            let mut predecessor = anchor;
+            for (batch_index, pair) in blocks.chunks(2).enumerate() {
+                for block in pair {
+                    prover
+                        .prevalidate(1, predecessor, block.clone())
+                        .await
+                        .unwrap();
+                }
+                if batch_index == 1 {
+                    // Retention is not permission to prove two windows at once.
+                    let id = *runtime
+                        .registry
+                        .lock()
+                        .await
+                        .sessions
+                        .keys()
+                        .next()
+                        .unwrap();
+                    let epoch = runtime.session(id).await.unwrap().lock().await.epoch;
+                    let error = runtime
+                        .finalize(
+                            BoundSession { id, epoch },
+                            eez_control_rpc::v2::Finalize {
+                                from_block: 11,
+                                to_block: 14,
+                                terminal_hash: pair[1].hash.to_vec(),
+                                settlement: Some(post_batch(anchor.hash, pair[1].hash, 4)),
+                            },
+                        )
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.code(), tonic::Code::ResourceExhausted, "{quota}");
+                    // Malformed settlement is not a request to reset the session.
+                    let mut malformed = remote_context(predecessor, pair.to_vec());
+                    malformed.batch.callData = Bytes::new();
+                    let error = prover.prove(malformed).await.unwrap_err();
+                    assert!(
+                        error.to_string().contains("invalid batch callData"),
+                        "{error}"
+                    );
+                    assert_eq!(runtime.registry.lock().await.sessions.len(), 1, "{quota}");
+                }
+                assert_eq!(
+                    prover
+                        .prove(remote_context(predecessor, pair.to_vec()))
+                        .await
+                        .unwrap()
+                        .len(),
+                    65,
+                );
+                assert_eq!(runtime.registry.lock().await.sessions.len(), 1, "{quota}");
+                predecessor = ProvingAnchor {
+                    number: pair[1].number,
+                    hash: pair[1].hash,
+                    state_root: B256::repeat_byte(pair[1].number as u8),
+                };
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_quota_survives_retries_and_rewind_without_becoming_unbounded() {
+        let mut limits = limits();
+        limits.max_blocks = 2;
+        let runtime = SessionRuntime::new(state(Arc::new(AtomicUsize::new(0))), limits);
+        let (mut bound, _) = runtime.begin(begin()).await.unwrap();
+        let first = block_after(11, B256::repeat_byte(0x11), 0x11);
+        let first_hash = B256::from_slice(&first.data.as_ref().unwrap().hash);
+        let second = block_after(12, first_hash, 0x12);
+        let second_hash = B256::from_slice(&second.data.as_ref().unwrap().hash);
+        let third = block_after(13, second_hash, 0x13);
+        let third_hash = B256::from_slice(&third.data.as_ref().unwrap().hash);
+        let fourth = block_after(14, third_hash, 0x14);
+        let fourth_hash = B256::from_slice(&fourth.data.as_ref().unwrap().hash);
+        runtime.validate_block(bound, first.clone()).await.unwrap();
+        runtime.validate_block(bound, second.clone()).await.unwrap();
+        let finalize = eez_control_rpc::v2::Finalize {
+            from_block: 11,
+            to_block: 12,
+            terminal_hash: second_hash.to_vec(),
+            settlement: Some(post_batch(B256::repeat_byte(0x11), second_hash, 2)),
+        };
+        runtime.finalize(bound, finalize.clone()).await.unwrap();
+        runtime.validate_block(bound, third).await.unwrap();
+        runtime.validate_block(bound, fourth.clone()).await.unwrap();
+        // Re-proving an old window does not grant a third window of storage.
+        runtime.finalize(bound, finalize).await.unwrap();
+        assert_eq!(
+            runtime
+                .validate_block(bound, block_after(15, fourth_hash, 0x15))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+
+        // Rewinding into proved history charges the replacement suffix afresh.
+        bound = runtime.rewind(bound, first_hash).await.unwrap().0;
+        let replacement = block_after(12, first_hash, 0x99);
+        let replacement_hash = B256::from_slice(&replacement.data.as_ref().unwrap().hash);
+        runtime.validate_block(bound, replacement).await.unwrap();
+        let next = block_after(13, replacement_hash, 0x98);
+        let next_hash = B256::from_slice(&next.data.as_ref().unwrap().hash);
+        runtime.validate_block(bound, next).await.unwrap();
+        assert_eq!(
+            runtime
+                .validate_block(bound, block_after(14, next_hash, 0x97))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        // Rewind to the original anchor also removes the retained allowance.
+        bound = runtime
+            .rewind(bound, B256::repeat_byte(0x11))
+            .await
+            .unwrap()
+            .0;
+        runtime.validate_block(bound, first).await.unwrap();
+        runtime.validate_block(bound, second).await.unwrap();
+        assert_eq!(
+            runtime
+                .validate_block(bound, block_after(13, second_hash, 0x13))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+
+        let session = runtime.session(bound.id).await.unwrap();
+        let session = session.lock().await;
+        for (from, to, code) in [
+            (0, 12, tonic::Code::InvalidArgument),
+            (12, 11, tonic::Code::InvalidArgument),
+            (10, 9, tonic::Code::InvalidArgument),
+            (10, 12, tonic::Code::OutOfRange),
+            (11, 13, tonic::Code::FailedPrecondition),
+        ] {
+            assert_eq!(
+                session
+                    .select_window(
+                        &eez_control_rpc::v2::Finalize {
+                            from_block: from,
+                            to_block: to,
+                            ..Default::default()
+                        },
+                        second_hash,
+                        limits
+                    )
+                    .unwrap_err()
+                    .code(),
+                code,
+                "{from}..={to}"
+            );
+        }
     }
 
     #[tokio::test]

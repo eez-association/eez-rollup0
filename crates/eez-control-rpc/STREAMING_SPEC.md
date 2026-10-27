@@ -111,6 +111,9 @@ a conforming implementation may always return false.
 Finalize selects a nonempty contiguous inclusive [from_block, to_block] range
 and its 32-byte terminal_hash. Every selected block and its predecessor must
 belong to the validated prefix. The hash must match the selected terminal.
+Zero-start or reversed ranges are INVALID_ARGUMENT. A well-formed range starting
+at or below the retained anchor is OUT_OF_RANGE: begin at its exact predecessor
+and backfill the same range. Do not use malformed-input errors to trigger recovery.
 
 The baseline starts immediately after the session anchor, initially
 `from_block == Begin.anchor_number + 1`. That anchor is its settlement parent.
@@ -428,7 +431,12 @@ has a five-second transport deadline; the Composer's proof cutoff can be shorter
 The server admits at most 128 active streams and retains at most 64 sessions.
 Pending frames are bounded by the configured window block/witness quotas and
 twice its payload-byte quota (window plus Finalize). Session admission applies
-the configured window quotas independently, including on cache hits. Output
+the configured block/byte/witness quotas to the unproved suffix, including on
+cache hits. Proved history is retained under a separate, equal window budget;
+each Finalize range must still fit one window, even if it spans both regions.
+Thus a session retains at most two windows. Successful finalization promotes
+the selected predecessor and releases earlier history; retrying an old proof
+does not grant more storage, and Rewind charges replacements as new blocks. Output
 backpressure uses the stream idle deadline. Stateless execution has four worker
 slots and a 512 MiB / 32,768-block cache; stateful execution serializes Reth fork
 selection with its follower's reconciliation. These are implementation limits,
