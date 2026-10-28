@@ -1,5 +1,5 @@
 use alloy_primitives::Address;
-use eez_seq_sig::{Envelope, HeadDomain, HeadTracker, Observation};
+use eez_seq_sig::{HeadDomain, HeadTracker, Observation, VerifiedHead};
 
 use crate::wire;
 
@@ -7,7 +7,7 @@ use crate::wire;
 #[derive(Debug)]
 pub enum Verdict {
     /// Newer than its source's latest head; forward it.
-    Accept(Envelope),
+    Accept(Box<VerifiedHead>),
     /// Already seen, stale or future: harmless but not worth forwarding.
     Ignore,
     /// Invalid; not forwarded. v0 does not score peers.
@@ -36,12 +36,12 @@ impl Validator {
             Ok(e) => e,
             Err(e) => return Verdict::Reject(e.to_string()),
         };
-        let verified = match envelope.clone().verify(&self.domain, self.authorized) {
+        let verified = match envelope.verify(&self.domain, self.authorized) {
             Ok(v) => v,
             Err(e) => return Verdict::Reject(e.to_string()),
         };
-        match self.tracker.observe(verified, now_ms) {
-            Observation::New => Verdict::Accept(envelope),
+        match self.tracker.observe(verified.clone(), now_ms) {
+            Observation::New => Verdict::Accept(Box::new(verified)),
             // A seen head is ignored however it is encoded: Snappy has many encodings
             // of one payload, and relaying each would let a peer flood the mesh.
             Observation::Duplicate | Observation::Stale | Observation::Future => Verdict::Ignore,
@@ -58,7 +58,7 @@ mod tests {
     use alloy_primitives::{B256, Bytes};
     use alloy_signer::SignerSync;
     use alloy_signer_local::PrivateKeySigner;
-    use eez_seq_sig::HeadClaim;
+    use eez_seq_sig::{Envelope, HeadClaim};
 
     const DOMAIN: HeadDomain = HeadDomain {
         l2_chain_id: 1337,

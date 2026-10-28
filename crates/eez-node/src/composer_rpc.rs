@@ -82,7 +82,7 @@ pub struct ComposerContracts {
 /// Returns an error if the method name is already registered or the module
 /// cannot be merged into the configured transports.
 pub fn install_composer_rpc<Node, EthApi>(
-    ctx: &mut RpcContext<'_, Node, EthApi>,
+    ctx: RpcContext<'_, Node, EthApi>,
     info: ComposerInfo,
 ) -> eyre::Result<()>
 where
@@ -99,32 +99,23 @@ where
     Ok(())
 }
 
-/// Accept the standard zero-argument forms and reject actual arguments
-/// instead of silently ignoring a client mistake.
-pub(crate) fn reject_params(
-    params: &jsonrpsee::types::Params<'_>,
-    method: &str,
-) -> Result<(), jsonrpsee::types::ErrorObjectOwned> {
-    let Some(raw) = params.as_str() else {
-        return Ok(());
-    };
-    let value: serde_json::Value = params.parse()?;
-    let empty = matches!(&value, serde_json::Value::Array(values) if values.is_empty())
-        || matches!(&value, serde_json::Value::Object(values) if values.is_empty());
-    if empty {
-        return Ok(());
-    }
-    Err(jsonrpsee::types::ErrorObject::owned(
-        -32602,
-        format!("{method} takes no parameters"),
-        Some(raw),
-    ))
-}
-
 fn composer_rpc_module(info: ComposerInfo) -> eyre::Result<RpcModule<ComposerInfo>> {
     let mut module = RpcModule::new(info);
     module.register_method(METHOD, |params, info, _ext| {
-        reject_params(&params, METHOD)?;
+        // Accept the standard zero-argument forms while rejecting actual
+        // arguments instead of silently ignoring a client mistake.
+        if let Some(raw) = params.as_str() {
+            let value: serde_json::Value = params.parse()?;
+            let empty = matches!(&value, serde_json::Value::Array(values) if values.is_empty())
+                || matches!(&value, serde_json::Value::Object(values) if values.is_empty());
+            if !empty {
+                return Err(jsonrpsee::types::ErrorObject::owned(
+                    -32602,
+                    "eez_composerInfo takes no parameters",
+                    Some(raw),
+                ));
+            }
+        }
         Ok::<_, jsonrpsee::types::ErrorObjectOwned>(info.clone())
     })?;
     Ok(module)

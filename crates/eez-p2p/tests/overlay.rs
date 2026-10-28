@@ -9,7 +9,7 @@ use alloy_consensus::Header;
 use alloy_primitives::{Address, Bytes};
 use alloy_signer_local::PrivateKeySigner;
 use eez_p2p::{Overlay, P2pConfig, Validator, keypair, topic};
-use eez_seq_sig::{Envelope, HeadDomain, HeadSigner};
+use eez_seq_sig::{Envelope, HeadDomain, HeadSigner, VerifiedHead};
 use libp2p::Multiaddr;
 use reth_primitives_traits::SealedHeader;
 use tokio::{
@@ -58,15 +58,16 @@ fn heads(signer: u8, every: Duration, count: u64) -> watch::Receiver<Option<Enve
 }
 
 /// Waits for a head with `counter >= 5`; every head must be signed by key 0.
-async fn await_counter(rx: &mut mpsc::Receiver<Envelope>) {
+async fn await_counter(rx: &mut mpsc::Receiver<VerifiedHead>) {
     timeout(DEADLINE, async {
         loop {
-            let envelope = rx.recv().await.expect("inbound sender dropped");
-            envelope
-                .clone()
-                .verify(&DOMAIN, key(0).address())
-                .expect("received a head not signed by key 0");
-            if envelope.head.counter >= 5 {
+            let head = rx.recv().await.expect("inbound sender dropped");
+            assert_eq!(
+                head.signer,
+                key(0).address(),
+                "received a head not signed by key 0"
+            );
+            if head.claim.counter >= 5 {
                 return;
             }
         }
@@ -107,7 +108,7 @@ impl Node {
         &self,
         peers: &[&Node],
         publish: Option<watch::Receiver<Option<Envelope>>>,
-        inbound: Option<mpsc::Sender<Envelope>>,
+        inbound: Option<mpsc::Sender<VerifiedHead>>,
     ) {
         let config = P2pConfig {
             listen: format!("/ip4/127.0.0.1/tcp/{}", self.port).parse().unwrap(),

@@ -1,74 +1,21 @@
-//! Signed canonical-head publication: the signer task and the RPC that serves it.
+//! Signs every change of the canonical head for the p2p overlay to publish.
 
 use std::time::Duration;
 
-use crate::composer_rpc::reject_params;
 use alloy_consensus::Header;
 use alloy_primitives::{B256, Bytes};
 use eez_seq_sig::{Envelope, HeadSigner};
-use jsonrpsee::{
-    RpcModule,
-    types::{ErrorObject, ErrorObjectOwned},
-};
-use reth_node_api::FullNodeComponents;
-use reth_node_builder::rpc::RpcContext;
 use reth_primitives_traits::SealedHeader;
-use reth_rpc_eth_api::FullEthApiServer;
 use reth_storage_api::BlockReader;
 use tokio::sync::watch;
 use tracing::{Level, event};
-
-pub(crate) const GET_SIGNED_HEAD: &str = "eez_getSignedHead";
-pub(crate) const GET_RAW_BLOCK: &str = "eez_getRawBlock";
 
 /// A head can reach the watch before its block is readable.
 const BLOCK_READ_RETRY: Duration = Duration::from_millis(50);
 const BLOCK_READ_DEADLINE: Duration = Duration::from_secs(1);
 
-/// Latest signed head, shared between the signer task and the RPC.
+/// Latest signed head, which the overlay publishes.
 pub(crate) type SignedHeadStore = watch::Sender<Option<Envelope>>;
-
-/// Install the head methods on every configured L2 RPC transport.
-pub(crate) fn install_head_rpc<Node, EthApi>(
-    ctx: &mut RpcContext<'_, Node, EthApi>,
-    store: SignedHeadStore,
-) -> eyre::Result<()>
-where
-    Node: FullNodeComponents,
-    Node::Provider: BlockReader<Block = eez_primitives::Block>,
-    EthApi: FullEthApiServer + Clone + Send + Sync + 'static,
-{
-    let module = head_rpc_module(store, ctx.provider().clone())?;
-    ctx.modules.merge_configured(module)?;
-    event!(
-        name: "eez.node.head_rpc.installed",
-        Level::INFO,
-        "eez_getSignedHead and eez_getRawBlock RPC installed",
-    );
-    Ok(())
-}
-
-fn head_rpc_module<P>(
-    store: SignedHeadStore,
-    provider: P,
-) -> eyre::Result<RpcModule<(SignedHeadStore, P)>>
-where
-    P: BlockReader<Block = eez_primitives::Block> + Send + Sync + 'static,
-{
-    let mut module = RpcModule::new((store, provider));
-    module.register_method(GET_SIGNED_HEAD, |params, (store, _), _ext| {
-        reject_params(&params, GET_SIGNED_HEAD)?;
-        Ok::<_, ErrorObjectOwned>(store.borrow().clone())
-    })?;
-    module.register_method(GET_RAW_BLOCK, |params, (_, provider), _ext| {
-        let (hash,): (B256,) = params.parse()?;
-        let block = provider.block_by_hash(hash).map_err(|e| {
-            ErrorObject::owned(-32603, format!("block read failed: {e}"), None::<()>)
-        })?;
-        Ok::<_, ErrorObjectOwned>(block.map(|b| Bytes::from(alloy_rlp::encode(&b))))
-    })?;
-    Ok(module)
-}
 
 /// Sign every change of the canonical head, starting with the head current at
 /// launch. Returns when the committer is gone; never panics.
@@ -166,7 +113,7 @@ mod tests {
     use super::*;
     use alloy_signer_local::PrivateKeySigner;
     use eez_primitives::{BlockBody, EezPrimitives};
-    use eez_seq_sig::{HeadClaim, HeadDomain};
+    use eez_seq_sig::HeadDomain;
     use reth_provider::test_utils::MockEthProvider;
 
     type Mock = MockEthProvider<EezPrimitives>;
@@ -184,69 +131,6 @@ mod tests {
 
     fn sealed(block: &eez_primitives::Block) -> SealedHeader<Header> {
         SealedHeader::seal_slow(block.header.clone())
-    }
-
-    fn envelope(hash: B256) -> Envelope {
-        Envelope {
-            head: HeadClaim {
-                rollup_id: 1,
-                number: 1,
-                block_hash: hash,
-                parent_hash: B256::ZERO,
-                epoch_ms: 1,
-                counter: 1,
-            },
-            signature: Bytes::from_static(&[1; 65]),
-            block: None,
-        }
-    }
-
-    async fn call(module: &RpcModule<(SignedHeadStore, Mock)>, req: &str) -> serde_json::Value {
-        let (response, _) = module.raw_json_request(req, 1).await.unwrap();
-        serde_json::from_str(response.get()).unwrap()
-    }
-
-    #[tokio::test]
-    async fn get_signed_head_is_null_until_set_then_returns_envelope() {
-        let store = SignedHeadStore::default();
-        let module = head_rpc_module(store.clone(), Mock::new()).unwrap();
-        let req = r#"{"jsonrpc":"2.0","method":"eez_getSignedHead","params":[],"id":1}"#;
-        assert_eq!(call(&module, req).await["result"], serde_json::Value::Null);
-
-        let hash = B256::repeat_byte(7);
-        store.send_replace(Some(envelope(hash)));
-        let response = call(&module, req).await;
-        assert_eq!(
-            response["result"]["head"]["blockHash"],
-            serde_json::json!(format!("{hash:#x}"))
-        );
-    }
-
-    #[tokio::test]
-    async fn get_raw_block_returns_rlp_or_null() {
-        let provider = Mock::new();
-        let b = block(3);
-        let hash = b.header.hash_slow();
-        provider.add_block(hash, b.clone());
-        let module = head_rpc_module(SignedHeadStore::default(), provider).unwrap();
-
-        let req = format!(
-            r#"{{"jsonrpc":"2.0","method":"eez_getRawBlock","params":["{hash:#x}"],"id":1}}"#
-        );
-        let expected = Bytes::from(alloy_rlp::encode(&b));
-        assert_eq!(
-            call(&module, &req).await["result"],
-            serde_json::json!(expected.to_string())
-        );
-
-        let missing = format!(
-            r#"{{"jsonrpc":"2.0","method":"eez_getRawBlock","params":["{:#x}"],"id":1}}"#,
-            B256::repeat_byte(9)
-        );
-        assert_eq!(
-            call(&module, &missing).await["result"],
-            serde_json::Value::Null
-        );
     }
 
     #[tokio::test(start_paused = true)]

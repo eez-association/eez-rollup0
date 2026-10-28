@@ -3,7 +3,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use eez_seq_sig::Envelope;
+use eez_seq_sig::{Envelope, VerifiedHead};
 use eyre::{WrapErr, bail, eyre};
 use futures_util::StreamExt;
 use libp2p::{
@@ -174,7 +174,7 @@ impl Overlay {
     pub async fn run(
         mut self,
         mut publish: Option<watch::Receiver<Option<Envelope>>>,
-        mut inbound: Option<mpsc::Sender<Envelope>>,
+        mut inbound: Option<mpsc::Sender<VerifiedHead>>,
     ) {
         let mut dial = tokio::time::interval(DIAL_INTERVAL);
         loop {
@@ -245,7 +245,7 @@ impl Overlay {
     fn on_event(
         &mut self,
         event: SwarmEvent<BehaviourEvent>,
-        inbound: &mut Option<mpsc::Sender<Envelope>>,
+        inbound: &mut Option<mpsc::Sender<VerifiedHead>>,
     ) {
         match event {
             SwarmEvent::Behaviour(BehaviourEvent::Gossip(gossipsub::Event::Message {
@@ -266,7 +266,7 @@ impl Overlay {
                     .gossip
                     .report_message_validation_result(&message_id, &propagation_source, acceptance);
                 match verdict {
-                    Verdict::Accept(envelope) => forward(inbound, envelope),
+                    Verdict::Accept(head) => forward(inbound, *head),
                     Verdict::Ignore => {}
                     Verdict::Reject(reason) => {
                         event!(
@@ -324,6 +324,7 @@ impl Overlay {
         event!(
             name: "eez.p2p.message.rejects",
             Level::WARN,
+            event_name = "eez.p2p.message.rejects",
             count = self.rejected,
             %peer,
             %reason,
@@ -351,17 +352,17 @@ async fn next_head(publish: &mut Option<watch::Receiver<Option<Envelope>>>) -> O
     rx.borrow_and_update().clone()
 }
 
-fn forward(inbound: &mut Option<mpsc::Sender<Envelope>>, envelope: Envelope) {
+fn forward(inbound: &mut Option<mpsc::Sender<VerifiedHead>>, head: VerifiedHead) {
     let Some(tx) = inbound.as_ref() else {
         return;
     };
-    match tx.try_send(envelope) {
+    match tx.try_send(head) {
         Ok(()) => {}
-        Err(TrySendError::Full(envelope)) => event!(
+        Err(TrySendError::Full(head)) => event!(
             name: "eez.p2p.inbound.full",
             Level::WARN,
-            number = envelope.head.number,
-            counter = envelope.head.counter,
+            number = head.claim.number,
+            counter = head.claim.counter,
             "inbound head channel full; dropped head {{number}}",
         ),
         Err(TrySendError::Closed(_)) => {
