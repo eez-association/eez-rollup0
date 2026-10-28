@@ -5,7 +5,15 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+stateless = ["dep:alloy-rpc-types-debug", "dep:reth-trie-common", "dep:stateless-reth", "dep:stateless-tries"]
+
 [dependencies]
+eez-protocol.workspace = true
+alloy-rpc-types-debug = { workspace = true, optional = true }
+reth-trie-common = { workspace = true, optional = true }
+stateless-reth = { workspace = true, optional = true }
+stateless-tries = { workspace = true, optional = true }
 eez-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
@@ -20,6 +28,10 @@ reth-primitives-traits.workspace = true
 reth-storage-errors.workspace = true
 revm.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+alloy-rlp.workspace = true
+alloy-sol-types.workspace = true
 
 [lints]
 workspace = true

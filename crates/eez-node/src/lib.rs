@@ -638,11 +638,11 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     if let Some(cap) = l2_cap_source
         .current_declared_tx_gas_limit_cap()
         .map_err(|error| eyre::eyre!("resolve active L2 declared gas cap: {error}"))?
-        && eez_primitives::SYSTEM_TX_GAS_LIMIT > cap
+        && eez_primitives::SYSTEM_TX_GAS_CAP > cap
     {
         return Err(eyre::eyre!(
             "L2 system transaction gas limit {} exceeds the active transaction gas limit cap {cap}",
-            eez_primitives::SYSTEM_TX_GAS_LIMIT,
+            eez_primitives::SYSTEM_TX_GAS_CAP,
         ));
     }
 

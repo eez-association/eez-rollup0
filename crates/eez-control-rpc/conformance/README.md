@@ -17,7 +17,7 @@ more cases requiring explicit server limits. Together they contain 339 requests,
 | --- | --- |
 | Begin | Correct anchor; unsupported rollup; missing/31/33-byte hashes and roots; number overflow; invalid initial binding; repeated Begin. |
 | Block | Execution; duplicate at/before tip; missing data/witness; hash widths; zero/max/gapped numbers; contradictory parent/hash/RLP; invalid witness then valid retry; cache-parent binding. |
-| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; unsupported blob/context/profile inputs; valid retry. |
+| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; unsupported blobs/profile inputs, invalid ranges before context checks and malformed Rollup0 posting-context fields; valid retry. |
 | Resume | Progress after half-close and Proof; live takeover; missing/malformed/retired session; nonzero initial epoch; stale transport cannot use the new epoch. |
 | Rewind | Tip, intermediate block and anchor; malformed/unknown/pruned ancestors; stale epoch; removed suffix cannot finalize; promoted anchor survives Resume. |
 | Cancel | Acknowledgement and EOF; retired session cannot resume; cross-stream cancellation denied; another Composer can finish. |
@@ -29,7 +29,7 @@ backend-specific cases. A minimal implementation can run `baseline-and-rejection
 alone. The full suite covers Rollup0's baseline and optional capabilities;
 session controls, shared caching, and concurrent sessions are not baseline
 requirements.
-Unsupported blobs/context are negative tests of this calldata-only profile,
+Unsupported blobs and mismatched live context are negative tests of this profile,
 not requirements for a prover configured for another settlement profile.
 
 These vectors target Rollup0's calldata-only, timeless **conditional-proof
@@ -44,7 +44,7 @@ prover-owned L1 parent authentication described for blob-based profiles in the
 Use the six-empty-block
 [`captured-devnet-window-84`](../../eez-prover-stateless/tests/fixtures/captured-devnet-window-84)
 fixture. Configure a streaming server with its `chain-config.json`, rollup ID,
-proof system, vkey, attester and L2 system address from `oracle.json`. The signing
+proof system, vkey and attester from `oracle.json`, and the current reserved L2 sender `0xfffffffffffffffffffffffffffffffffffffffe`. The historical oracle retains the original deployment address; its six empty blocks and proof bytes are unchanged. The signing
 key is the **public Anvil test key**
 `59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d`.
 Never use it outside an isolated test deployment.
@@ -64,7 +64,7 @@ cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0
 ```
 
 Each limit case declares its required `server_args`: block quota 2, payload quota
-6528 bytes, witness quota 30 items, or message limit 4096 bytes. Run each against
+7154 bytes, witness quota 36 items, or message limit 4096 bytes. Run each against
 its own configured server; the runner does not configure or launch servers.
 The block/payload/witness cases charge the new suffix independently of retained
 proved history. Each Finalize range is still limited to one window. The
@@ -90,9 +90,7 @@ The runner substitutes server-issued IDs and epochs for recorded placeholders,
 checks session isolation and epoch changes, and preserves literal unknown or
 malformed bindings. It ignores only `Validated.reused` and `Rejected.message`.
 Status, authoritative cursor, binding, public-input hash, ordering and EOF remain
-assertions. With live parent/time support, the invalid-range Finalize rejects with
-FAILED_PRECONDITION before examining context, and nonzero Rollup0 chain-ID/parent-number
-fields reject with INVALID_ARGUMENT. The original witness and proof oracles are unchanged. Each proof's signature must recover the configured attester over the
+assertions. Each proof's signature must recover the configured attester over the
 expected digest; a different valid ECDSA nonce is allowed. The saved deterministic
 signature is a reference, not a requirement for byte-identical ECDSA output.
 
@@ -118,3 +116,14 @@ anchor/history seeded separately. This suite does not cover nonempty Sync
 effects, actionable candidate-eviction details, L1 recovery, blob/RollupX positive
 conformance, or stress/deadline guarantees. Timing-dependent in-flight cancellation and
 backpressure belong in runtime tests, not schedule-dependent wire vectors.
+
+The native finalization port supplements captured witnesses with authenticated
+SYSTEM/EEZL2 account proof nodes. Block bytes and proof-response digests are unchanged.
+The two-block payload and witness quotas include those extra nodes; the message
+size vectors reduce only their inert code padding to retain the 4096/4097-byte boundary.
+
+Context rejection vectors now pin the applicable validation failures instead
+of blanket UNIMPLEMENTED: an unvalidated Finalize range returns
+FAILED_PRECONDITION, and fields outside the Rollup0 parent/time profile return
+INVALID_ARGUMENT. Both preserve the validated cursor. Nonempty blobs still
+return UNIMPLEMENTED.

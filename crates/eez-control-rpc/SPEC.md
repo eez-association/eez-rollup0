@@ -91,6 +91,8 @@ The current profile requires:
 | `blockNumber` | Zero for timeless batches; `uint64.max` for live parent/time-bound settlement. |
 | `bindMsgSenderInPublicInput` | `false`. |
 
+Native `0x45` transactions require the live parent/time profile.
+
 Every entry MUST contain exactly one state update for the expected rollup. The
 updates MUST form one continuous chain:
 

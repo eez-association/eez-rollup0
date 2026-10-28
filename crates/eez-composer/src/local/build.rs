@@ -11,6 +11,7 @@
 //! session, so a claim read off it is the value the committed block produces.
 
 use alloy_consensus::Header;
+use alloy_consensus::Transaction as _;
 use alloy_eips::Decodable2718;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
@@ -18,6 +19,7 @@ use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT};
 use eez_evm::{EezEvmConfig, ensure_supported_transaction};
 use eez_primitives::engine::EezEngineTypes;
 use eez_primitives::{Block, EezTxEnvelope as TransactionSigned};
+use eez_protocol::system_tx::ExecutionGroupState;
 use reth_chainspec::EthereumHardforks;
 use reth_evm::{
     ConfigureEvm, Evm as _, EvmEnvFor, InspectorFor, NextBlockEnvAttributes, execute::BlockBuilder,
@@ -46,6 +48,9 @@ pub type DraftDb = State<StateProviderDatabase<EvmStateProviderAdapter<StateProv
 /// Errors raised by [`build_sync_block`].
 #[derive(Debug, Error)]
 pub enum BuildError {
+    /// The current prefix leaves too little gas; retry the group in a fresh block.
+    #[error("insufficient remaining block gas")]
+    Capacity,
     /// Provider lookup (state, header) failed.
     #[error("provider: {0}")]
     Provider(String),
@@ -267,24 +272,56 @@ fn execute_and_commit_inspected<I>(
     evm_env: &EvmEnvFor<EezEvmConfig>,
     raw: &Bytes,
     idx: usize,
+    gas_used: u64,
+    group: &mut ExecutionGroupState,
     inspector: I,
 ) -> Result<TxOutcome, BuildError>
 where
     I: for<'db> InspectorFor<EezEvmConfig, &'db mut DraftDb>,
 {
     let recovered = recover_tx(raw, idx)?;
+    let (next_group, complete) =
+        group
+            .after(recovered.inner())
+            .map_err(|msg| BuildError::ExecuteTx {
+                idx,
+                msg: msg.into(),
+            })?;
+    let remaining = evm_env.block_env.gas_limit.saturating_sub(gas_used);
+    if recovered.gas_limit() > remaining
+        || matches!(recovered.inner(), TransactionSigned::System(tx) if tx.gas_limit != eez_primitives::system_tx_gas_limit(evm_env.block_env.gas_limit, gas_used))
+    {
+        return Err(BuildError::Capacity);
+    }
     let mut evm = evm_config.evm_with_env_and_inspector(state, evm_env.clone(), inspector);
     // A database read failure is the store being unavailable, not the tx being
     // invalid: the two classes drive opposite recoveries in the drain.
-    let result = evm.transact(&recovered).map_err(|e| match e {
+    let mut result = evm.transact(&recovered).map_err(|e| match e {
         EVMError::Database(err) => BuildError::Provider(format!("execute tx #{idx}: {err}")),
+        EVMError::Transaction(
+            revm::context_interface::result::InvalidTransaction::CallGasCostMoreThanGasLimit {
+                ..
+            }
+            | revm::context_interface::result::InvalidTransaction::GasFloorMoreThanGasLimit {
+                ..
+            },
+        ) if matches!(recovered.inner(), TransactionSigned::System(_))
+            && recovered.gas_limit() < eez_primitives::SYSTEM_TX_GAS_CAP =>
+        {
+            BuildError::Capacity
+        }
         other => BuildError::ExecuteTx {
             idx,
             msg: other.to_string(),
         },
     })?;
     let outcome = exec_outcome(&result.result);
+    if complete {
+        eez_evm::balances::clear_protocol_balances(evm.db_mut(), &mut result.state)
+            .map_err(|e| BuildError::Provider(format!("protocol cleanup: {e}")))?;
+    }
     evm.db_mut().commit(result.state);
+    *group = next_group;
     Ok(outcome)
 }
 
@@ -308,6 +345,7 @@ pub struct SyncBlockState {
     /// Cumulative gas of the applied txs, matching the block executor's own
     /// total: the drain needs it to stop before the block overflows.
     gas_used: u64,
+    group: ExecutionGroupState,
 }
 
 impl std::fmt::Debug for SyncBlockState {
@@ -352,6 +390,7 @@ impl SyncBlockState {
         // `finish`: that applies the pre-execution changes exactly once and
         // leaves `state` at the mid-block point appended txs continue from.
         let mut gas_used: u64 = 0;
+        let mut group = ExecutionGroupState::default();
         {
             let mut builder = evm_config
                 .builder_for_next_block(&mut state, parent, attributes)
@@ -369,6 +408,13 @@ impl SyncBlockState {
                         msg: e.to_string(),
                     })?;
                 gas_used = gas_used.saturating_add(gas.tx_gas_used());
+                group = group
+                    .after(recover_tx(raw, idx)?.inner())
+                    .map_err(|msg| BuildError::ExecuteTx {
+                        idx,
+                        msg: msg.into(),
+                    })?
+                    .0;
             }
         }
 
@@ -380,6 +426,7 @@ impl SyncBlockState {
             state,
             applied: prefix_txs.len(),
             gas_used,
+            group,
         })
     }
 
@@ -403,6 +450,8 @@ impl SyncBlockState {
             &self.evm_env,
             raw,
             self.applied,
+            self.gas_used,
+            &mut self.group,
             NoOpInspector,
         )?;
         self.applied += 1;
@@ -429,6 +478,7 @@ impl SyncBlockState {
             state,
             applied: self.applied,
             gas_used: self.gas_used,
+            group: self.group,
         })
     }
 }
@@ -440,6 +490,7 @@ pub struct ForkSnapshot {
     cache: CacheState,
     applied: usize,
     gas_used: u64,
+    group: ExecutionGroupState,
 }
 
 /// A throwaway copy of a [`SyncBlockState`] for simulation: probes and source
@@ -451,6 +502,7 @@ pub struct SyncBlockFork {
     state: DraftDb,
     applied: usize,
     gas_used: u64,
+    group: ExecutionGroupState,
 }
 
 impl std::fmt::Debug for SyncBlockFork {
@@ -463,6 +515,11 @@ impl std::fmt::Debug for SyncBlockFork {
 }
 
 impl SyncBlockFork {
+    /// Metered gas of the full prefix, including accepted calls on this fork.
+    pub const fn gas_used(&self) -> u64 {
+        self.gas_used
+    }
+
     /// Execute one raw EIP-2718 tx on the fork and commit it there.
     ///
     /// # Errors
@@ -475,6 +532,8 @@ impl SyncBlockFork {
             &self.evm_env,
             raw,
             self.applied,
+            self.gas_used,
+            &mut self.group,
             NoOpInspector,
         )?;
         self.applied += 1;
@@ -502,6 +561,8 @@ impl SyncBlockFork {
             &self.evm_env,
             raw,
             self.applied,
+            self.gas_used,
+            &mut self.group,
             inspector,
         )?;
         self.applied += 1;
@@ -515,6 +576,7 @@ impl SyncBlockFork {
             cache: self.state.cache.clone(),
             applied: self.applied,
             gas_used: self.gas_used,
+            group: self.group,
         }
     }
 
@@ -523,6 +585,7 @@ impl SyncBlockFork {
         self.state.cache = snapshot.cache;
         self.applied = snapshot.applied;
         self.gas_used = snapshot.gas_used;
+        self.group = snapshot.group;
     }
 
     /// Raw state + env, for callers that drive their own EVM (a source

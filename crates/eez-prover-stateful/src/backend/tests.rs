@@ -82,10 +82,11 @@ fn cached_engine(
         "sync" => vec![
             SystemTransaction {
                 chain_id: 1,
-                nonce: 0,
+                source_hash: B256::repeat_byte(0x11),
+                gas_limit: eez_primitives::SYSTEM_TX_GAS_CAP,
                 to: EEZL2_ADDRESS,
                 value: U256::ZERO,
-                input: Bytes::new(),
+                input: Bytes::from_static(&[0xc3, 0xfb, 0x5f, 0x3d]),
             }
             .into(),
         ],
@@ -731,10 +732,11 @@ fn checkpoint_plan_is_not_limited_before_the_provider_is_read() {
     let chain_spec = Arc::new(ChainSpec::default());
     let transaction = eez_primitives::SystemTransaction {
         chain_id: 1,
-        nonce: 0,
+        source_hash: B256::repeat_byte(0x11),
+        gas_limit: eez_primitives::SYSTEM_TX_GAS_CAP,
         to: eez_primitives::EEZL2_ADDRESS,
         value: U256::ZERO,
-        input: Bytes::new(),
+        input: Bytes::from_static(&[0xc3, 0xfb, 0x5f, 0x3d]),
     }
     .into();
     let blocks = [admitted_block(Block {
@@ -1140,10 +1142,11 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
             transactions: vec![
                 SystemTransaction {
                     chain_id: 1,
-                    nonce: 0,
+                    source_hash: B256::repeat_byte(0x11),
+                    gas_limit: eez_primitives::SYSTEM_TX_GAS_CAP,
                     to: EEZL2_ADDRESS,
                     value: U256::from(13),
-                    input: Bytes::new(),
+                    input: Bytes::from_static(&[0xc3, 0xfb, 0x5f, 0x3d]),
                 }
                 .into(),
             ],
@@ -1182,23 +1185,19 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
             result.receipts[0].tx_type,
             eez_primitives::EezTxType::System
         );
-        let system = state
-            .bundle_state
-            .account(&SYSTEM_ADDRESS)
-            .unwrap()
-            .info
-            .as_ref()
-            .unwrap();
-        assert_eq!(system.nonce, 1);
-        assert_eq!(system.balance, U256::ZERO);
-        let recipient = state
-            .bundle_state
-            .account(&EEZL2_ADDRESS)
-            .unwrap()
-            .info
-            .as_ref()
-            .unwrap();
-        assert_eq!(recipient.balance, U256::from(13));
+        // The zero-nonce native sender and empty-code recipient are empty after
+        // group cleanup, so EIP-161 may remove them entirely.
+        for address in [SYSTEM_ADDRESS, EEZL2_ADDRESS] {
+            let account = state
+                .bundle_state
+                .account(&address)
+                .and_then(|account| account.info.as_ref());
+            assert_eq!(account.map_or(0, |account| account.nonce), 0);
+            assert_eq!(
+                account.map_or(U256::ZERO, |account| account.balance),
+                U256::ZERO
+            );
+        }
     }
 }
 

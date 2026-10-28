@@ -194,24 +194,10 @@ async fn sync_execution_generates_and_reuses_checkpoints() {
     use alloy_consensus::proofs::{
         calculate_receipt_root, calculate_transaction_root, calculate_withdrawals_root,
     };
-    use alloy_primitives::{KECCAK256_EMPTY, keccak256};
     use eez_primitives::{EezTxType, SystemTransaction};
-
-    // Execute a native call from an empty state. Its only persistent change is
-    // SYSTEM_ADDRESS's nonce becoming one; independently seal that account's
-    // single-leaf MPT to supply the expected post-state, not a mocked backend root.
-    let account = alloy_rlp::encode(vec![
-        Bytes::from_static(&[1]),
-        Bytes::new(),
-        Bytes::copy_from_slice(alloy_consensus::constants::EMPTY_ROOT_HASH.as_slice()),
-        Bytes::copy_from_slice(KECCAK256_EMPTY.as_slice()),
-    ]);
-    let mut path = vec![0x20]; // Hex-prefix encoding of a leaf with an even, full-length key.
-    path.extend_from_slice(keccak256(TEST_SYSTEM_ADDRESS).as_slice());
-    let post_root = keccak256(alloy_rlp::encode(vec![
-        Bytes::from(path),
-        Bytes::from(account),
-    ]));
+    // A zero-value native call to empty code leaves the empty trie unchanged:
+    // the native sender has no nonce transition, even while executing.
+    let post_root = alloy_consensus::constants::EMPTY_ROOT_HASH;
     let parent = Header {
         gas_limit: 30_000_000,
         base_fee_per_gas: Some(1),
@@ -224,17 +210,18 @@ async fn sync_execution_generates_and_reuses_checkpoints() {
     let transactions = vec![
         SystemTransaction {
             chain_id: 1,
-            nonce: 0,
+            source_hash: B256::repeat_byte(0x11),
+            gas_limit: eez_primitives::SYSTEM_TX_GAS_CAP,
             to: EEZL2_ADDRESS,
             value: U256::ZERO,
-            input: Bytes::new(),
+            input: Bytes::from_static(&eez_protocol::entries::EXECUTE_INCOMING_SELECTOR),
         }
         .into(),
     ];
     let receipt = EthereumReceipt {
         tx_type: EezTxType::System,
         success: true,
-        cumulative_gas_used: 21_000,
+        cumulative_gas_used: 21_064,
         logs: Vec::new(),
     };
     let block = Block::new(
@@ -245,7 +232,7 @@ async fn sync_execution_generates_and_reuses_checkpoints() {
             state_root: post_root,
             transactions_root: calculate_transaction_root(&transactions),
             receipts_root: calculate_receipt_root(&[receipt.with_bloom_ref()]),
-            gas_used: 21_000,
+            gas_used: 21_064,
             ..parent.clone()
         },
         eez_primitives::BlockBody {
@@ -422,38 +409,10 @@ fn timed_out_block_validation_worker_keeps_its_slot_and_publishes_only_after_suc
     });
 }
 
-/// A recorded three-user-transaction block and its execution configuration.
+/// Three ordinary transfers with an independently calculated state/receipt root.
+/// Historical checkpoint captures omit the native burn-account proofs now required.
 fn checkpoint_fixture() -> (AdmittedBlock, ChainConfig) {
-    let rlp = hex::decode(
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/stateless-checkpoint-2175/checkpoint-block-2175.rlp.hex"
-        ))
-        .trim()
-        .trim_start_matches("0x"),
-    )
-    .unwrap();
-    let block = alloy_rlp::decode_exact::<Block>(&rlp).unwrap();
-    let witness = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/stateless-checkpoint-2175/checkpoint-witness-2175.json"
-    )))
-    .unwrap();
-    let chain_config = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/stateless-checkpoint-2175/checkpoint-chain-config.json"
-    )))
-    .unwrap();
-    (
-        admitted_block_with_witness(
-            block.header.number,
-            block.header.hash_slow(),
-            block.header.parent_hash,
-            rlp,
-            witness,
-        ),
-        chain_config,
-    )
+    fees::ordinary_three_transaction_fixture()
 }
 
 fn captured_fixture(dir: &str, name: &str) -> String {
@@ -941,7 +900,7 @@ fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
     const FIXTURE: &str = "nonzero-outbound-630";
     let oracle: serde_json::Value =
         serde_json::from_str(&captured_fixture(FIXTURE, "oracle.json")).unwrap();
-    let chain_config =
+    let chain_config: ChainConfig =
         serde_json::from_str(&captured_fixture(FIXTURE, "chain-config.json")).unwrap();
     let from = oracle["from_block"].as_u64().unwrap();
     let to = oracle["to_block"].as_u64().unwrap();
@@ -965,37 +924,55 @@ fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
         })
         .collect::<Vec<_>>();
 
-    let output = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
-        .validate_admitted(&mut blocks, &CancellationToken::default())
-        .unwrap();
-
-    // The window no longer carries a pre-state root; per-block post-state roots
-    // are what the continuity check chains, and that check has its own test.
-    assert_eq!(
-        output.blocks.last().unwrap().as_anchor().state_root,
-        oracle["final_state_root"]
-            .as_str()
-            .unwrap()
-            .parse::<B256>()
-            .unwrap()
-    );
-    assert!(
-        output
-            .blocks
-            .last()
-            .unwrap()
-            .settlement_evidence()
-            .observed_outbound_events
-            .is_empty()
-    );
-    // Historical signed calls have no native system authority.
-    assert!(output.blocks.iter().all(|block| {
-        block
-            .settlement_evidence()
-            .system_sender_flags
-            .iter()
-            .all(|is_system| !is_system)
+    // Replay the captured historical chain with its Ethereum rules to recover
+    // the actual old event. Native consensus additionally requires burn-account
+    // proofs that this capture predates, so it is not a native-success vector.
+    let chain_spec = Arc::new(ChainSpec::from_genesis(Genesis {
+        config: chain_config.clone(),
+        ..Default::default()
     }));
+    for input in &blocks {
+        let historical =
+            alloy_rlp::decode_exact::<reth_ethereum_primitives::Block>(input.rlp()).unwrap();
+        let output = stateless_validation_recovered(
+            RecoveredBlock::try_recover(historical).unwrap(),
+            captured_witness(&captured_fixture(
+                FIXTURE,
+                &format!("witness-{}.json", input.declared_number()),
+            )),
+            chain_spec.clone(),
+            reth_evm_ethereum::EthEvmConfig::new(chain_spec.clone()),
+        )
+        .unwrap();
+        let receipts = output
+            .execution_output
+            .result
+            .receipts
+            .into_iter()
+            .map(|receipt| EthereumReceipt {
+                tx_type: eez_primitives::EezTxType::Ethereum(receipt.tx_type),
+                success: receipt.success,
+                cumulative_gas_used: receipt.cumulative_gas_used,
+                logs: receipt.logs,
+            })
+            .collect::<Vec<_>>();
+        assert!(observe_outbound_events(&receipts).is_empty());
+        let native =
+            RecoveredBlock::try_recover(alloy_rlp::decode_exact::<Block>(input.rlp()).unwrap())
+                .unwrap();
+        assert!(
+            native
+                .body()
+                .transactions
+                .iter()
+                .all(|tx| matches!(tx, TransactionSigned::Ethereum(_)))
+        );
+    }
+    assert!(
+        Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
+            .validate_admitted(&mut blocks, &CancellationToken::default())
+            .is_err()
+    );
 }
 
 #[test]

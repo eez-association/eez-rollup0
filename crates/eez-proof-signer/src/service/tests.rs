@@ -233,10 +233,13 @@ fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256
         &[(sidecar.clone(), Bytes::from(user.clone()))],
         &[],
         &system_transaction_context(),
-        0,
+        crate::testkit::native_source(0),
     )
     .unwrap();
     let transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
+        .into_iter()
+        .map(|plan| plan.at_position(30_000_000, 0).unwrap())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|raw| {
             <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
@@ -307,10 +310,13 @@ fn mixed_outbound_inbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, B256) {
         &[(outbound_sidecar.clone(), Bytes::from(user.clone()))],
         std::slice::from_ref(&inbound_sidecar),
         &system_transaction_context(),
-        0,
+        crate::testkit::native_source(0),
     )
     .unwrap();
     let transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
+        .into_iter()
+        .map(|plan| plan.at_position(30_000_000, 0).unwrap())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|raw| {
             <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
@@ -584,10 +590,12 @@ fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, Exe
     let raw = eez_protocol::system_tx::build_inbound_system_txs(
         std::slice::from_ref(&inbound),
         &context,
-        0,
+        crate::testkit::native_source(0),
     )
     .unwrap()
-    .remove(0);
+    .remove(0)
+    .at_position(30_000_000, 0)
+    .unwrap();
     let transaction: TestTransaction =
         <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
             raw.as_ref(),
