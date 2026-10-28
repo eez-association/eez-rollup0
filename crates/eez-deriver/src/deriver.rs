@@ -31,7 +31,7 @@ use revm::database::State;
 use tokio::sync::broadcast;
 use tracing::{Level, event};
 
-use crate::error::{DeriverError, DeriverResult};
+use crate::error::{DeriverError, DeriverResult, is_fatal};
 
 /// Per-block header inputs the composer chose, carried in the DA span. Read
 /// from the payload, not assumed — a constant diverges the moment the composer
@@ -57,6 +57,21 @@ impl BlockHeaderInputs {
             beneficiary: Address::from(*beneficiary),
             extra_data: Bytes::copy_from_slice(extra_data),
         })
+    }
+}
+
+/// Stop the node on a fatal error. PANIC, don't return: reth reports only a
+/// critical task's panic, and a resync would retry the error forever.
+fn stop_if_fatal(err: &DeriverError) {
+    if is_fatal(err) {
+        event!(
+            name: "eez.deriver.fatal",
+            Level::ERROR,
+            event_name = "eez.deriver.fatal",
+            error = %err,
+            "deriver hit an error no resync can fix; stopping the node",
+        );
+        panic!("deriver stopped: {err}");
     }
 }
 
@@ -898,6 +913,7 @@ where
         // Defensive re-anchor: a cheap no-op in the normal boot order;
         // load-bearing for any caller that subscribed rx late.
         if let Err(err) = self.catch_up().await {
+            stop_if_fatal(&err);
             event!(
                 name: "eez.deriver.resync.failed",
                 Level::ERROR,
@@ -917,6 +933,7 @@ where
             match rx.recv().await {
                 Ok(event) => {
                     if let Err(err) = self.handle_event(event).await {
+                        stop_if_fatal(&err);
                         if matches!(&err, DeriverError::CommitterClosed) {
                             event!(
                                 name: "eez.deriver.committer.closed",
@@ -966,7 +983,7 @@ where
 
     /// Post-failure recovery via [`Self::catch_up`]. Returns `false` only
     /// when the committer is gone and the loop must exit; a failed resync is
-    /// logged and retried at the next L1 event.
+    /// logged and retried at the next L1 event. Panics on an [`is_fatal`] one.
     async fn try_recover(&self) -> bool {
         match self.catch_up().await {
             Ok(()) => {
@@ -990,6 +1007,7 @@ where
                 false
             }
             Err(err) => {
+                stop_if_fatal(&err);
                 event!(
                     name: "eez.deriver.resync.failed",
                     Level::ERROR,

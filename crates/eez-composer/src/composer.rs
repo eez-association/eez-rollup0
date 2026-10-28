@@ -3969,9 +3969,9 @@ where
         }
         // Candidates highest-first; each is priced exactly by
         // `prepare_post_batch_raw`, which returns `Ok(None)` when the range does
-        // not fit the gas budget — then step back a whole K and re-prepare. The
-        // gate precedes witness assembly and proving, so a rejected candidate
-        // costs one block walk plus one encode.
+        // not fit the gas or blob budget — then step back a whole K and re-prepare.
+        // The gate precedes witness assembly and proving, so a rejected
+        // candidate costs one block walk plus one encode.
         let candidates = self.empty_chunk_boundaries(rollup, cursor, snapped)?;
         let provider = rollup.l2_provider.as_ref();
         let mut over_budget = 0usize;

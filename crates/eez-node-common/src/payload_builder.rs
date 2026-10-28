@@ -42,6 +42,15 @@ use reth_ethereum_payload_builder::EthereumBuilderConfig;
 
 type BestTransactionsIter<Tx> = Box<dyn BestTransactions<Item = Arc<ValidPoolTransaction<Tx>>>>;
 
+/// A failed admission check must not prevent cadence and settlement recovery.
+/// Zero admits no pool transactions and also discards any nonempty best payload.
+fn sequencing_budget_or_empty(budget: Result<usize, String>) -> usize {
+    budget.unwrap_or_else(|error| {
+        warn!(target: "payload_builder", %error, "sequencing DA budget unavailable; building an empty payload");
+        0
+    })
+}
+
 /// Live L2 payload builder.
 #[derive(Debug, Clone)]
 pub struct NativePayloadBuilder<Pool, Client, EvmConfig = EezEvmConfig> {
@@ -171,8 +180,7 @@ where
 
     let da_budget = data_guard
         .map(|guard| guard.budget(&parent_header, attributes.timestamp()))
-        .transpose()
-        .map_err(|error| PayloadBuilderError::other(std::io::Error::other(error)))?;
+        .map(sequencing_budget_or_empty);
     let mut da_bytes = 0usize;
     if let (Some(limit), Some(payload)) = (da_budget, best_payload.as_ref()) {
         let bytes = payload

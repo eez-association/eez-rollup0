@@ -668,7 +668,7 @@ mod tests {
                 vec![L(0, 0), Px(0, 1)], decode),
             ("a commitment mismatch, co-listed", vec![duo, duo_other],
                 vec![L(0, 0), Px(0, 1)], unsupported),
-            ("blobs", vec![x.clone(), blobs], vec![L(0, 0), Px(0, 1)], unsupported),
+            ("invalid blob carrier", vec![x.clone(), blobs], vec![L(0, 0), Px(0, 1)], decode),
             ("a nonzero blockNumber", vec![x.clone(), numbered], vec![L(0, 0), Px(0, 1)],
                 unsupported),
             // Settlement.

@@ -82,7 +82,12 @@ impl BeaconBlobSource {
             .get_optional(&format!("eth/v2/beacon/blocks/{slot}"))
             .await?
         else {
-            return Err(self.missing_blobs(block, slot).await?);
+            return Err(L1Error::SourceIncomplete {
+                block,
+                detail: format!(
+                    "beacon block at slot {slot} is not served; cannot verify execution block {block_hash}; retry after synchronization"
+                ),
+            });
         };
         let execution_hash = json_b256(
             &beacon_block,
@@ -121,9 +126,9 @@ impl BeaconBlobSource {
     }
 
     async fn missing_blobs(&self, block: u64, slot: u64) -> L1Result<L1Error> {
-        let head = self.get("eth/v1/beacon/headers/head").await?;
-        let head_slot = json_u64(&head, "/data/header/message/slot")?;
-        Ok(missing_blob_error(block, slot, head_slot))
+        let finalized = self.get("eth/v1/beacon/headers/finalized").await?;
+        let finalized_slot = json_u64(&finalized, "/data/header/message/slot")?;
+        Ok(missing_blob_error(block, slot, finalized_slot))
     }
 
     async fn timing(&self) -> L1Result<BeaconTiming> {
@@ -180,19 +185,19 @@ impl BeaconBlobSource {
     }
 }
 
-fn missing_blob_error(block: u64, slot: u64, head_slot: u64) -> L1Error {
-    if head_slot <= slot {
+fn missing_blob_error(block: u64, slot: u64, finalized_slot: u64) -> L1Error {
+    if finalized_slot < slot {
         L1Error::SourceIncomplete {
             block,
             detail: format!(
-                "beacon head {head_slot} has not advanced past blob slot {slot}; retry after synchronization"
+                "beacon has not finalized blob slot {slot}; retry after synchronization"
             ),
         }
     } else {
         L1Error::BlobUnavailable {
             block,
             detail: format!(
-                "beacon does not retain all selected blobs at slot {slot}; use a beacon node retaining this history"
+                "beacon does not serve all selected blobs at finalized slot {slot}; use a supernode retaining this history"
             ),
         }
     }
@@ -253,14 +258,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_blobs_wait_for_a_lagging_beacon_but_halt_for_lost_history() {
+    fn missing_blobs_wait_for_finality_but_halt_for_lost_history() {
         assert!(missing_blob_error(100, 20, 19).is_retryable());
-        assert!(missing_blob_error(100, 20, 20).is_retryable());
-        assert!(matches!(
-            missing_blob_error(100, 20, 21),
-            L1Error::BlobUnavailable { block: 100, .. }
-        ));
-        assert!(missing_blob_error(100, 20, 21).is_terminal());
+        for finalized in [20, 21] {
+            assert!(matches!(
+                missing_blob_error(100, 20, finalized),
+                L1Error::BlobUnavailable { block: 100, .. }
+            ));
+            assert!(missing_blob_error(100, 20, finalized).is_terminal());
+        }
     }
 
     #[test]

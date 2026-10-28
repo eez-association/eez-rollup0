@@ -56,16 +56,15 @@ Each call whose post lists this rollup is checked against its own `BatchPosted`:
 
 1. the bytes decode as `postAndVerifyBatch`, else `Decode`;
 2. `rollupIdsWithProofSystems[].rollupId` equals `rollupIds`, else `Decode`;
-3. `blockNumber == 0`; blob DA requires empty `callData` and valid indices
-   into the outer transaction's versioned hashes;
-4. the shared public input equals `sharedPublicInput`, else `Decode`, or
-   `Unsupported` when another listed rollup may bind custom data the scan
-   cannot reproduce. Both DA profiles use empty custom data from stock
-   `Rollup.sol` at block zero.
+3. calldata requires `blockNumber == 0`, else `Unsupported`; blobs require
+   `blockNumber == 0`, empty `callData` and valid `blobIndices`, else `Decode`;
+4. the shared public input equals `sharedPublicInput` (`:753-762`), else
+   `Decode`, or `Unsupported` when another listed rollup may bind `customData`
+   the scan cannot reproduce. The proof signer uses the same composition.
 
-The scan selects versioned hashes in `blobIndices` order and ignores unselected
-transaction blobs. Derivation retrieves exactly those blobs from
-`EEZ_L1_BEACON_URL`, checks their hashes, and decodes the close-stream marker.
+For direct and contract posts, `blobIndices` selects the outer transaction's
+versioned hashes in batch order; unlisted blobs are ignored. Derivation fetches
+those blobs, checks their hashes and decodes the stream.
 
 The hash does not bind `immediateEntryCount`, `expectedRootPerRollup` or the
 proofs; the scan reads them from the exact bytes EEZ received.
@@ -101,8 +100,8 @@ must match its entry, else `Decode`: `callHash` and `queue` (`:1304-1320`),
 | Variant | Class | Raised for |
 |---|---|---|
 | `Provider` | retryable | transport; a malformed `get_logs` answer; a trace failure other than `-32601`, including a post's transaction failing or missing |
-| `SourceIncomplete` | retryable | two hashes for one block; a transaction or block the endpoint does not serve yet; a lagging beacon |
-| `BlobUnavailable` | terminal | selected blob data missing from a slot behind the beacon head |
+| `SourceIncomplete` | retryable | two hashes for one block; a transaction or block the endpoint does not serve yet; a missing or mismatched beacon block; blobs missing at an unfinalized slot |
+| `BlobUnavailable` | terminal | selected blobs missing at a finalized slot whose execution hash matches the post |
 | `Decode` | terminal | undecodable bytes; a `rollupIds` or commitment mismatch; a grammar, pairing, ownership or entry-match violation |
 | `Unsupported` | terminal | the shapes below; a multi-rollup commitment mismatch; a post not made by a selector `CALL` |
 | `TraceUnavailable` | terminal | `-32601` (no `debug` namespace) on a block that needs a trace |
@@ -111,6 +110,8 @@ The watcher and the settlement observer retry a retryable error on their next
 poll. Boot reconcile retries with backoff, but gives up after
 `BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES` `Provider` errors. A terminal one panics
 the watcher (invariant 7), fails boot reconcile and fails the observed bundle.
+Only derivation fetches blobs: `BlobUnavailable` fails boot reconcile or stops
+the live deriver's critical task, shutting down the node.
 
 ## Operation
 
@@ -126,6 +127,23 @@ The signer binds no sender, so anyone can re-post a batch through a contract
 and force every node to trace that block, stalling it on a trace over the
 endpoint's limits.
 
+### Beacon node requirement
+
+Every node deriving blob posts needs `EEZ_L1_BEACON_URL`, including followers
+using the calldata profile. It must serve the same chain as `EEZ_L1_RPC_URL`
+and retain complete blobs for the replay range. Old L1 replay needs a blob
+archive; ordinary beacon retention is finite. After Fulu, use a supernode with
+full column custody or a service that reconstructs blobs
+([Beacon API](https://github.com/ethereum/beacon-APIs/blob/master/apis/beacon/blobs/blobs.yaml)).
+The Chiado Compose stack's Lighthouse serves `http://127.0.0.1:6152`; start it
+with `--supernode` for blob mode or use another complete-blob source.
+
+A missing beacon block, an execution-hash mismatch, unfinalized missing blobs
+and transport/server failures retry. Selected blobs missing after the block's
+execution hash matches the post and the slot is finalized fail loudly as
+`BlobUnavailable`. Finality does not establish pruning: repair or replace the
+source so it serves those blobs. The post is never skipped.
+
 ### Trace latency (measured)
 
 `debug_traceBlockByHash` (callTracer, withLog) against the node's embedded L1
@@ -140,34 +158,7 @@ A trace costs milliseconds against a 12 s slot.
 
 ## Unsupported shapes
 
-- **Other blob profiles.** The scan accepts only the current Rollup0 blob
-  carrier. It cannot reproduce another rollup's manager data.
 - **`blockNumber != 0`.** `customData` comes from the rollup's `getCustomData`,
   which may read any state, so the call alone cannot recompute the hash.
 - **`upgradeToAndCall` posts.** They run by `DELEGATECALL` into a proxied EEZ;
   ours is not proxied.
-
-## Blob deployment and recovery
-
-Both DA profiles use the stock protocol `Rollup.sol`. The poster sends
-`postAndVerifyBatch` directly to EEZ. No new manager or settlement wrapper is
-required.
-
-Blob payloads are checked against the active fork's per-transaction blob limit
-before proving. Ranges that do not fit use the existing bounded-prefix emission
-path. In blob mode, ordinary sequencing reserves a complete Sync interval's
-metadata, transaction-length fields, and close marker within the blob allowance.
-The allowance accounts for retained blocks and scheduled capacity reductions.
-Cross-chain selections that cannot fit are reduced by deferring their FIFO tail;
-a single transaction that cannot fit is evicted with its dependent nonce suffix.
-These capacity checks apply only to blob DA.
-
-Blob derivation requires `EEZ_L1_BEACON_URL` pointing to a beacon REST node that
-retains the blobs needed from the node's settled cursor onward. Restoring old
-history requires a beacon archive retaining those blobs. Missing/pruned blob
-data from a slot behind the beacon head raises terminal `BlobUnavailable`;
-a lagging beacon and transport failures remain retryable. The scan reads outer
-transaction hashes for both direct and contract posts, selects exactly
-`blobIndices`, and ignores unlisted blobs.
-
-Both DA profiles use `blockNumber == 0` and empty `customData`.

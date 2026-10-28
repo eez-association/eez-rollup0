@@ -69,6 +69,7 @@ services:
     env_file:
       - ./deployments.env
     environment:
+      EEZ_SETTLEMENT_PROFILE: "${EEZ_SETTLEMENT_PROFILE:-calldata}"
       EEZ_L1_MAX_FEE_PER_BLOB_GAS: "${EEZ_L1_MAX_FEE_PER_BLOB_GAS:-}"
       EEZ_L1_BEACON_URL: "${EEZ_L1_BEACON_URL:-}"
       EEZ_L1_POSTER_KEY: "${EEZ_L1_POSTER_KEY:?set EEZ_L1_POSTER_KEY}"
