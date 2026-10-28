@@ -3832,6 +3832,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "eez-primitives",
+ "reth-consensus-common",
  "reth-primitives-traits",
  "serde",
  "serde_json",

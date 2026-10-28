@@ -105,7 +105,8 @@ stream carries.
 
 A receiver checks two things before anything else:
 1. `signature` recovers to the configured sequencer address.
-2. If `block` is present, its `hash_slow()` equals `blockHash` and its parent
+2. If `block` is present, its transactions, ommers and withdrawals hash to
+   its header's roots, its `hash_slow()` equals `blockHash` and its parent
    equals `parentHash`.
 
 ### Version
@@ -255,9 +256,9 @@ in `docker-compose.chiado-node.yml:156`).
 
 **Tests:**
 - **Unit:** sign/verify round trip, wrong signer, tampered field, block-hash
-  mismatch, version ordering across restarts and sources, replay,
-  equivocation, future epoch, failover when the preferred source's chain
-  stops descending from safe, and the decision table.
+  mismatch, a body that doesn't match its header, version ordering across
+  restarts and sources, replay, equivocation, future epoch, failover when the
+  preferred source's chain stops descending from safe, and the decision table.
 - **e2e, `happy_case_follower_sequencer_rpc`** (`e2e.rs:969`): assert the
   follower's head reaches the sequencer's signed head while above L1 safe.
   This replaces the log-line check.
