@@ -1,4 +1,4 @@
-//! EIP-4844 carrier for Rollup0 candidate-V1 settlement.
+//! EIP-4844 carrier for Rollup0 blob settlement.
 //!
 //! `eez-payload-codec` owns the logical stream and its 31-byte field-element
 //! packing; this crate owns everything Ethereum adds around those bytes: KZG

@@ -164,12 +164,14 @@ pub trait SyncSlotComposer: Send + Sync + 'static {
     }
 
     /// Compose a Sync slot. `target_l1_block`: `Some(n)` supplies the exact L1
-    /// target for cap-triggered historical chunks; steady mode also uses it
+    /// target for steady mode; the composer resolves historical targets
+    /// against the current L1 head. Steady mode also uses it
     /// for the regular postBatch and pins its timestamp. `None` leaves that
     /// historical emission aimed at the next available block. `mode` gates the
     /// drain: `Catchup` blocks are empty (cross-chain waits for the next
     /// `Steady` slot), and their regular minimal postBatch remains
-    /// next-available.
+    /// aimed at the next available slot. Both DA profiles pin the resolved
+    /// target's timestamp and parent before proving.
     async fn compose_sync_slot(
         &self,
         rollup_id: u64,

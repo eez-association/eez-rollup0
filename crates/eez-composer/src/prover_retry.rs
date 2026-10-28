@@ -141,55 +141,6 @@ fn proof_start_cutoff_ms(timing: RollupTiming, target: BundleTarget) -> Option<u
     )
 }
 
-/// One blob target window shared by preparation, proving and transaction signing.
-#[derive(Clone, Copy)]
-pub(crate) struct BlobPipelineDeadline {
-    unix_ms: u64,
-    instant: Instant,
-    post_proof_reserve: Duration,
-}
-
-impl BlobPipelineDeadline {
-    pub fn new(
-        timing: RollupTiming,
-        target: BundleTarget,
-        post_proof_reserve: Duration,
-    ) -> Result<Self, String> {
-        let BundleTarget::Exact { timestamp, .. } = target else {
-            return Err("blob settlement requires an exact L1 target".into());
-        };
-        let slack = u64::try_from(timing.submission_slack().as_millis()).unwrap_or(u64::MAX);
-        let unix_ms = timestamp.saturating_mul(1_000).saturating_sub(slack);
-        let instant = Instant::now()
-            .checked_add(Duration::from_millis(
-                unix_ms.saturating_sub(unix_time_millis()),
-            ))
-            .ok_or("blob target deadline overflow")?;
-        let deadline = Self {
-            unix_ms,
-            instant,
-            post_proof_reserve,
-        };
-        if deadline.proof_budget().is_zero() {
-            return Err("blob settlement window exhausted before preparation".into());
-        }
-        Ok(deadline)
-    }
-
-    pub fn remaining(self) -> Duration {
-        self.instant
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_millis(
-                self.unix_ms.saturating_sub(unix_time_millis()),
-            ))
-    }
-
-    fn proof_budget(self) -> Duration {
-        // Leave time for signing, fee/nonce reads and handing the bundle to the submitter.
-        self.remaining().saturating_sub(self.post_proof_reserve)
-    }
-}
-
 /// Exponential backoff with ±20% wall-clock jitter and a fixed cap.
 fn prover_retry_backoff(failed_attempt: u32) -> Duration {
     let jitter_seed = u64::from(
@@ -226,27 +177,14 @@ fn retry_budget(
 
 /// Run one complete proving operation with the Composer profile's closed
 /// retryable-error allowlist. Every attempt is independently bounded by the
-/// configured proof-time budget, or the remaining shared blob window.
+/// configured proof-time budget.
 pub(crate) async fn prove_with_retry(
     prover: &dyn Prover,
     ctx: ProvingContext,
     timing: RollupTiming,
     target: BundleTarget,
-    deadline: Option<BlobPipelineDeadline>,
 ) -> Result<Bytes, ProverError> {
-    if let Some(deadline) = deadline {
-        prove_with_retry_window(
-            prover,
-            ctx,
-            timing,
-            target,
-            deadline.proof_budget(),
-            Some(deadline),
-        )
-        .await
-    } else {
-        prove_with_retry_at(prover, ctx, timing, target, unix_time_millis()).await
-    }
+    prove_with_retry_at(prover, ctx, timing, target, unix_time_millis()).await
 }
 
 async fn prove_with_retry_at(
@@ -257,39 +195,16 @@ async fn prove_with_retry_at(
     now_ms: u64,
 ) -> Result<Bytes, ProverError> {
     let budget = retry_budget(timing, target, now_ms)?;
-    prove_with_retry_window(prover, ctx, timing, target, budget, None).await
-}
-
-async fn prove_with_retry_window(
-    prover: &dyn Prover,
-    ctx: ProvingContext,
-    timing: RollupTiming,
-    target: BundleTarget,
-    budget: Duration,
-    deadline: Option<BlobPipelineDeadline>,
-) -> Result<Bytes, ProverError> {
     let retry_deadline = Instant::now() + budget;
     let mut attempt = 1_u32;
 
     loop {
-        let attempt_timeout = if let Some(deadline) = deadline {
-            deadline
-                .proof_budget()
-                .min(retry_deadline.saturating_duration_since(Instant::now()))
-        } else {
-            match target {
-                BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => {
-                    retry_deadline.saturating_duration_since(Instant::now())
-                }
-                BundleTarget::Exact { .. } => timing.proof_time(),
+        let attempt_timeout = match target {
+            BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => {
+                retry_deadline.saturating_duration_since(Instant::now())
             }
+            BundleTarget::Exact { .. } => timing.proof_time(),
         };
-        if deadline.is_some() && attempt_timeout.is_zero() {
-            return Err(ProverError::Retryable {
-                kind: RetryableProverError::DeadlineExceeded,
-                message: "shared blob settlement window exhausted before proving".into(),
-            });
-        }
         let result = match timeout(attempt_timeout, prover.prove(ctx.clone())).await {
             Ok(result) => result,
             Err(_) => Err(ProverError::Retryable {
@@ -629,88 +544,6 @@ mod tests {
     }
 
     const TEST_NOW_MS: u64 = 1_700_000_000_000;
-
-    fn blob_deadline(remaining_ms: u64) -> BlobPipelineDeadline {
-        BlobPipelineDeadline {
-            unix_ms: u64::MAX,
-            instant: Instant::now() + Duration::from_millis(remaining_ms),
-            post_proof_reserve: Duration::from_millis(200),
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn blob_preparation_can_pass_the_legacy_proof_start_cutoff() {
-        let timing = RollupTiming::new(12_000, 2_000, 5_000, 500);
-        let target = BundleTarget::Exact {
-            block: 1,
-            timestamp: TEST_NOW_MS / 1_000 + 6,
-        };
-        let deadline = blob_deadline(5_500);
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        assert!(retry_budget(timing, target, TEST_NOW_MS + 800).is_err());
-        let prover = ScriptedProver::new(vec![Ok(Bytes::from_static(b"proof"))]);
-        let proof = prove_with_retry(
-            &prover,
-            ProvingContext::default(),
-            timing,
-            target,
-            Some(deadline),
-        )
-        .await
-        .unwrap();
-        assert_eq!(proof, Bytes::from_static(b"proof"));
-        assert_eq!(prover.calls(), 1);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn blob_retries_share_remaining_time_and_preserve_signing_reserve() {
-        let prover = DelayedFailureThenStallProver::default();
-        let started = Instant::now();
-        let deadline = blob_deadline(1_000);
-        let error = prove_with_retry(
-            &prover,
-            ProvingContext::default(),
-            test_timing(),
-            BundleTarget::Exact {
-                block: 1,
-                timestamp: TEST_NOW_MS / 1_000 + 1,
-            },
-            Some(deadline),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            error.retryable_kind(),
-            Some(RetryableProverError::DeadlineExceeded)
-        );
-        assert_eq!(prover.calls.load(Ordering::Relaxed), 2);
-        assert_eq!(started.elapsed(), Duration::from_millis(800));
-        assert_eq!(deadline.remaining(), Duration::from_millis(200));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn exhausted_blob_preparation_starts_no_proof() {
-        let prover = ScriptedProver::new(vec![Ok(Bytes::from_static(b"unexpected"))]);
-        let deadline = blob_deadline(1_000);
-        tokio::time::sleep(Duration::from_millis(1_000)).await;
-        let error = prove_with_retry(
-            &prover,
-            ProvingContext::default(),
-            test_timing(),
-            BundleTarget::Exact {
-                block: 1,
-                timestamp: 1,
-            },
-            Some(deadline),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            error.retryable_kind(),
-            Some(RetryableProverError::DeadlineExceeded)
-        );
-        assert_eq!(prover.calls(), 0);
-    }
 
     #[tokio::test(start_paused = true)]
     async fn retryable_prover_error_retries_the_complete_operation() {

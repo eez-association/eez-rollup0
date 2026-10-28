@@ -251,7 +251,7 @@ pub(crate) fn verify_da_payload(
 }
 
 /// Verify blob DA against the validated blocks and effects, then derive its
-/// versioned hashes. Candidate V1 carries the complete stream in blobs.
+/// versioned hashes. The blob profile carries the complete stream in blobs.
 pub(crate) fn verify_blob_da_payload(
     blobs: &[Vec<u8>],
     validated_window: &ValidatedWindow,

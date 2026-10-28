@@ -256,7 +256,6 @@ impl Backend {
             // execution receipts, and the recomputed post-state commitment all
             // passed. Only Sync candidates use the checkpoint path.
             let witness = std::mem::take(witness);
-            let checkpoint_plan = checkpoint_plan.filter(|plan| !plan.positions().is_empty());
             let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
                 Some(plan) if !plan.positions().is_empty() => {
                     let output = stateless_validation_recovered_with_state_checkpoints(
