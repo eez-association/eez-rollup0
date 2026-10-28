@@ -13,7 +13,7 @@ L1 alone decides safe and finalized.
 | Version | PR | Scope |
 |---|---|---|
 | seq-sig-v0 | 1 | Signed heads, follower fork choice, delivery over the sequencer RPC |
-| p2p-v0 | 2, stacked on 1 | The same signed heads over libp2p gossip; missing blocks by hash over devp2p |
+| p2p-v0 | 2, stacked on 1 | The same signed heads over libp2p gossip; missing blocks by hash over devp2p; the sequencer RPC removed |
 | sync-v0 | 3, stacked on 2 | History from peers, verified against L1. To be designed |
 
 Later versions:
@@ -311,13 +311,11 @@ discv5 uses.
     - A head the node has already seen is ignored however it is encoded.
     - Snappy has many encodings of one payload, so accepting copies would let
       a peer flood the mesh with re-encodings of one valid head.
-    - The overlay keeps its own tracker, so this never hides a head the
-      follower learned over RPC.
   - **Reject:** undecodable, the wrong signer, or an equivocation. v0 does not
     score peers, so Reject only stops the message; penalties come with peer
     scoring.
-- **Never blocking:** accepted heads reach the follower through a bounded
-  channel with `try_send`; overflow is dropped and WARNed. The swarm loop
+- **Never blocking:** accepted heads reach the follower, already verified,
+  through a bounded channel with `try_send`; overflow is dropped and WARNed. The swarm loop
   never awaits a channel.
 
 **Block fetch (execution layer).** L2 reth nodes find each other over discv5
@@ -334,7 +332,7 @@ other.
   the sequencer is a separate feature.
 - **Fetching:** with the overlay on, a follower fetches missing blocks only
   from peers, through reth's `FetchClient`. It checks the header hash and the
-  body against the header. The RPC block source exists only in RPC mode.
+  body against the header.
 - **Peers:** a fetch runs only when `num_connected_peers() > 0`, and it is
   time-boxed, because reth queues requests forever without peers.
 - **`advance_unsafe_head`** (used only by #206's stateful backend) still
@@ -342,8 +340,10 @@ other.
   itself while the committer's head stays stale. #206's integration owns
   that call.
 
-**Follower.** Heads arrive from gossip and from the RPC poller. Both feed the
-same tracker, and the highest version wins.
+**Sequencer RPC removed.** Heads arrive only from gossip, and missing blocks
+only from devp2p peers. `EEZ_SEQUENCER_RPC`, the follower's RPC poller and RPC
+block source, and the composer's `eez_getSignedHead` and `eez_getRawBlock` are
+removed. The follower still retries its target every L2 block time.
 
 **Configs.** The testkit gains per-node extra CLI args and leased devp2p and
 discv5 ports. Deployment configs have no L2 follower service yet, so they
@@ -363,8 +363,9 @@ transaction, but no part of this overlay.
   - a rogue flood doesn't stall the publisher;
   - a peer started late is dialed.
 - **e2e:** three nodes find each other from the seed's bootnode alone.
-  Follower B has no RPC, starts late, and fetches its missing ancestors from
-  peers.
+  Follower B starts late and fetches its missing ancestors from peers. The
+  seq-sig-v0 e2e tests (rogue sequencer, replacement, safe parity) follow
+  heads over the overlay; `happy_case_follower_sequencer_rpc` is removed.
 
 **Budget:** about 1.4k lines.
 
@@ -378,13 +379,13 @@ and moves the unsafe head itself (#206), so it must be the only unsafe writer.
 |---|---|---|---|
 | main today | `EEZ_SEQUENCER_RPC` | the RPC | startup error (`eez-follower/src/lib.rs:70-75`) |
 | seq-sig-v0 | `EEZ_SEQUENCER_RPC`; it now also requires `EEZ_SEQUENCER_ADDRESS` | the RPC | startup error, as before |
-| p2p-v0 | `EEZ_SEQUENCER_ADDRESS` | `EEZ_SEQUENCER_RPC` and/or `EEZ_P2P_LISTEN` | startup error |
+| p2p-v0 | `EEZ_SEQUENCER_ADDRESS` | `EEZ_P2P_LISTEN` | startup error |
 
 Startup rules:
 - **Neither switch:** an L1-derived-only follower.
 - **In p2p-v0:**
-  - an address without a source is a startup error;
-  - a source without an address is a startup error;
+  - an address without `EEZ_P2P_LISTEN` is a startup error;
+  - `EEZ_P2P_LISTEN` without an address is a startup error;
   - a stateful-prover follower doesn't join the overlay.
 
 ## sync-v0 (PR 3, to be designed)
@@ -431,7 +432,8 @@ derivation time (measure first).
 
 **Owner, for p2p-v0:**
 - Overlay discovery runs through reth's discv5.
-- There is no RPC fallback for blocks in p2p mode.
+- The sequencer RPC is removed: heads come only from gossip, and blocks only
+  from peers.
 - Discovery is on.
 - Sequencer promote/demote is manual, in its own later PR.
 
