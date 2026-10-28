@@ -23,3 +23,5 @@ run_check "cross-chain-wave-mixed-pure" \
     bash "$HERE/cross-chain-wave.sh"
 
 run_check "state-chaining" bash "$HERE/verify-state-chaining.sh"
+
+run_check "bridge-round-trip" bash "$HERE/verify-bridge-round-trip.sh"

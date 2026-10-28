@@ -462,6 +462,23 @@ an `invalid nonce` rejection with no destination mutation and no source-nonce
 consumption, then settles the contiguous pair and checks L1/L2 block-hash
 commitment convergence.
 
+### Reference bridge round-trip
+
+The shared wave suite also runs `scripts/verify-bridge-round-trip.sh` after the
+existing direct-proxy and state-chaining checks. It deposits ETH through the
+reference L1 bridge and waits for safe derivation before withdrawing the same
+amount through the L2 bridge. Receipt fees are accounted for separately from
+principal. The check requires the rollup's L1 escrow to increase by the deposit
+and return to its baseline after withdrawal.
+
+An independent `eez-follower` in the candidate node image derives only from L1,
+with its own datadir and no sequencer RPC. At each leg it must reach the same
+safe block and reproduce the sender's L2 balance. The check writes
+`checks/bridge-round-trip.json` and captures `checks/bridge-follower.log` before
+removing the follower container. It uses Linux Docker host networking and does
+not require an additional Kurtosis service or image build.
+
+
 ### Run all included workloads
 
 The suite requires an output directory:
@@ -595,3 +612,4 @@ Kurtosis assigns different host ports automatically. Remember that
 - `scripts/verify-state-chaining.sh`: ordered same-Sync-block state-chaining regression.
 - `scripts/verify-fault-recovery.sh`: proof-signer outage, node restart, and exact safe-prefix replay.
 - `scripts/verify-ingress-admission.sh`: live L1 front nonce-gap rejection and contiguous recovery.
+- `scripts/verify-bridge-round-trip.sh`: reference ETH bridge round-trip and independent follower checks.
