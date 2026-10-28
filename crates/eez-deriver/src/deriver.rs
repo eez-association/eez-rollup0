@@ -33,19 +33,6 @@ use tracing::{Level, event};
 
 use crate::error::{DeriverError, DeriverResult};
 
-async fn receive_l1_event(
-    rx: &mut broadcast::Receiver<L1Event>,
-    recovery_pending: bool,
-) -> Option<Result<L1Event, broadcast::error::RecvError>> {
-    if recovery_pending {
-        tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .ok()
-    } else {
-        Some(rx.recv().await)
-    }
-}
-
 /// Per-block header inputs the composer chose, carried in the DA span. Read
 /// from the payload, not assumed — a constant diverges the moment the composer
 /// picks something else.
@@ -910,9 +897,7 @@ where
     pub async fn run(self, mut rx: broadcast::Receiver<L1Event>) {
         // Defensive re-anchor: a cheap no-op in the normal boot order;
         // load-bearing for any caller that subscribed rx late.
-        let mut recovery_pending = false;
         if let Err(err) = self.catch_up().await {
-            recovery_pending = true;
             event!(
                 name: "eez.deriver.resync.failed",
                 Level::ERROR,
@@ -929,14 +914,8 @@ where
             "deriver loop started",
         );
         loop {
-            // Beacon DA may recover without another L1 batch event.
-            match receive_l1_event(&mut rx, recovery_pending).await {
-                None => {
-                    if !self.try_recover(&mut recovery_pending).await {
-                        return;
-                    }
-                }
-                Some(Ok(event)) => {
+            match rx.recv().await {
+                Ok(event) => {
                     if let Err(err) = self.handle_event(event).await {
                         if matches!(&err, DeriverError::CommitterClosed) {
                             event!(
@@ -957,23 +936,23 @@ where
                             error = %err,
                             "deriver failed to handle event; resyncing from L1",
                         );
-                        if !self.try_recover(&mut recovery_pending).await {
+                        if !self.try_recover().await {
                             return;
                         }
                     }
                 }
-                Some(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     event!(
                         name: "eez.deriver.l1_events.lagged",
                         Level::WARN,
                         skipped,
                         "L1 event stream lagged; resyncing from L1",
                     );
-                    if !self.try_recover(&mut recovery_pending).await {
+                    if !self.try_recover().await {
                         return;
                     }
                 }
-                Some(Err(broadcast::error::RecvError::Closed)) => {
+                Err(broadcast::error::RecvError::Closed) => {
                     event!(
                         name: "eez.deriver.l1_events.closed",
                         Level::ERROR,
@@ -988,11 +967,9 @@ where
     /// Post-failure recovery via [`Self::catch_up`]. Returns `false` only
     /// when the committer is gone and the loop must exit; a failed resync is
     /// logged and retried at the next L1 event.
-    async fn try_recover(&self, recovery_pending: &mut bool) -> bool {
-        *recovery_pending = true;
+    async fn try_recover(&self) -> bool {
         match self.catch_up().await {
             Ok(()) => {
-                *recovery_pending = false;
                 event!(
                     name: "eez.deriver.resync.recovered",
                     Level::INFO,
@@ -3026,41 +3003,5 @@ mod seed_tests {
         // Floor above the endpoint (L1 rewound under an indexed batch).
         assert_eq!(choose_seed(999, 40, Some(20)), 40);
         assert_eq!(choose_seed(0, 0, None), 0);
-    }
-}
-
-#[cfg(test)]
-mod recovery_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn failed_scan_retries_without_another_l1_event() {
-        let (_sender, mut receiver) = broadcast::channel(1);
-        assert!(receive_l1_event(&mut receiver, true).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn healthy_idle_stream_does_not_trigger_rescans() {
-        let (_sender, mut receiver) = broadcast::channel(1);
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(20),
-                receive_l1_event(&mut receiver, false),
-            )
-            .await
-            .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn closed_stream_stops_even_while_recovering() {
-        for pending in [false, true] {
-            let (sender, mut receiver) = broadcast::channel(1);
-            drop(sender);
-            assert!(matches!(
-                receive_l1_event(&mut receiver, pending).await,
-                Some(Err(broadcast::error::RecvError::Closed))
-            ));
-        }
     }
 }

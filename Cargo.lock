@@ -3488,11 +3488,8 @@ name = "eez-proof-signer"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
- "alloy-contract",
  "alloy-eips",
- "alloy-genesis",
  "alloy-primitives",
- "alloy-provider",
  "alloy-rlp",
  "alloy-rpc-types-debug",
  "alloy-sol-types",
@@ -3510,7 +3507,6 @@ dependencies = [
  "prost",
  "reth-chainspec",
  "reth-primitives-traits",
- "reth_gnosis",
  "serde_json",
  "stateless",
  "thiserror 2.0.18",
@@ -3518,7 +3514,6 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
- "url",
 ]
 
 [[package]]

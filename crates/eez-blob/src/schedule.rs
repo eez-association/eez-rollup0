@@ -29,16 +29,6 @@ pub fn blob_limit_at(spec: &ChainSpec, timestamp: u64) -> Option<ActiveBlobLimit
     })
 }
 
-/// `target` is one or more L1 slots after `parent`. The slot length is the
-/// configured L1 block time.
-#[must_use]
-pub fn on_later_slot(parent_timestamp: u64, target_timestamp: u64, slot_seconds: u64) -> bool {
-    slot_seconds != 0
-        && target_timestamp
-            .checked_sub(parent_timestamp)
-            .is_some_and(|elapsed| elapsed != 0 && elapsed.is_multiple_of(slot_seconds))
-}
-
 #[cfg(test)]
 mod tests {
     use reth_chainspec::ChainSpecBuilder;
@@ -68,15 +58,5 @@ mod tests {
         assert_eq!(blob_limit_at(&spec, 1).unwrap().max_blobs, 2);
         spec.blob_params.cancun.max_blob_count = 0;
         assert!(blob_limit_at(&spec, 1).is_none());
-    }
-
-    #[test]
-    fn a_target_must_be_later_on_the_slot_grid() {
-        assert!(on_later_slot(112, 124, 12));
-        assert!(on_later_slot(112, 136, 12));
-        assert!(!on_later_slot(112, 112, 12));
-        assert!(!on_later_slot(112, 125, 12));
-        assert!(!on_later_slot(112, 100, 12));
-        assert!(!on_later_slot(112, 124, 0));
     }
 }

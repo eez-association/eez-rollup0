@@ -69,8 +69,6 @@ See [architecture](docs/architecture.md),
 - An attestation does not claim canonical ancestry, sequencer authority, live
   L1 applicability, successful future L1 execution, dispatch mode, or the code
   identity and funding mechanism at the pinned EEZL2 address.
-  Candidate V1 additionally checks the settled L1 cursor and active deployment
-  at the posting parent before signing.
 
 ## Reuse canonical implementations
 

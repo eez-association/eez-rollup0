@@ -109,7 +109,6 @@ pub struct ServiceState {
     expected_l2_system_address: Address,
     attester: Attester,
     system_transaction_reconstructor: settlement::SystemTransactionReconstructor,
-    blob_context_authority: Option<Arc<crate::BlobContextAuthority>>,
 }
 
 impl ServiceState {
@@ -137,18 +136,7 @@ impl ServiceState {
             expected_l2_system_address,
             attester,
             system_transaction_reconstructor,
-            blob_context_authority: None,
         })
-    }
-
-    /// Enable blob settlement with an authenticated L1 source.
-    #[must_use]
-    pub fn with_blob_context_authority(
-        mut self,
-        authority: Arc<crate::BlobContextAuthority>,
-    ) -> Self {
-        self.blob_context_authority = Some(authority);
-        self
     }
 }
 

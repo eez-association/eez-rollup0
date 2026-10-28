@@ -81,7 +81,7 @@ message SettlementInput {
   // including when the posting client submits it through a settlement wrapper.
   bytes abi_calldata = 1;
   // Complete physical EIP-4844 blobs in transaction order.
-  // The prover derives commitments/versioned hashes itself. RollupX and draft
+  // The prover derives commitments/versioned hashes itself. RollupX and
   // blob-based Rollup0 require all blobs, empty batch.callData and indices [0, 1, ...].
   repeated bytes blobs = 2;
   // Named L1 target, independently authenticated.

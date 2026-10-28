@@ -203,7 +203,7 @@ impl Submitter {
                     + NEXT_BLOCK_SLACK
             }
         };
-        // A Candidate-V1 post is a pooled type-3 wrapper carrying its sidecar.
+        // A blob post is a pooled type-3 wrapper carrying its sidecar.
         let post_batch_hash = if raw_txs[0].first() == Some(&3) {
             eez_blob::pooled_blob_transaction_hash(&raw_txs[0]).map_err(|error| {
                 L1Error::Submission(format!("send_bundle: decode blob postBatch: {error}"))
@@ -544,7 +544,6 @@ impl Inner {
             &self.reader.build_trace_provider(),
             self.reader.eez(),
             self.reader.rollup_id(),
-            self.reader.candidate(),
             l1_block,
             l1_block,
         )
@@ -812,7 +811,6 @@ mod tests {
             },
             tx_hash,
             sender: Address::ZERO,
-            tx_sender: Address::ZERO,
             batch: eez_protocol::abi::EvmBatch::default(),
             blob_hashes: Vec::new(),
             settlement: Settlement::new(Vec::new(), root(log_index), None, false),

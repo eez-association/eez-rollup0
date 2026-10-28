@@ -161,27 +161,18 @@ fn per_ps_hashes(plan: &ProofPlan, shared: B256) -> Vec<B256> {
     out
 }
 
-/// Errors produced while reconstructing public inputs from the
-/// supported batch profiles.
+/// Errors produced while reconstructing public inputs from the initial
+/// supported batch profile.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PublicInputsError {
     /// The proof plan reconstructed from the batch is malformed.
     #[error(transparent)]
     InvalidPlan(#[from] ProofPlanInvariantError),
-    /// The block number does not match the selected settlement profile.
-    #[error("unsupported public-input blockNumber {block_number}")]
+    /// Manager-defined custom data for nonzero block numbers is not wired yet.
+    #[error("public-input hashing currently requires blockNumber == 0, got {block_number}")]
     UnsupportedBlockNumber {
         /// Unsupported `batch.blockNumber` value.
         block_number: u64,
-    },
-    /// Sender-bound public inputs require the actual transaction sender.
-    #[error("public-input hashing currently requires bindMsgSenderInPublicInput == false")]
-    UnsupportedSenderBinding,
-    /// Blob hashes cannot be reconstructed from blob indices alone.
-    #[error("public-input hashing currently requires empty blobIndices, got {count}")]
-    UnsupportedBlobIndices {
-        /// Number of unsupported blob indices.
-        count: usize,
     },
     /// Independently derived hashes must cover the selected indices exactly.
     #[error("blob hash count {actual} does not match blobIndices count {expected}")]
@@ -191,13 +182,14 @@ pub enum PublicInputsError {
         /// Number derived from the submitted physical blobs.
         actual: usize,
     },
-    /// Manager custom data is supplied once for every rollup assignment.
-    #[error("custom-data count {actual} does not match rollup assignment count {expected}")]
-    CustomDataCount {
-        /// Number of rollup assignments in the canonical batch.
-        expected: usize,
-        /// Number of authenticated manager values supplied.
-        actual: usize,
+    /// Sender-bound public inputs require the actual transaction sender.
+    #[error("public-input hashing currently requires bindMsgSenderInPublicInput == false")]
+    UnsupportedSenderBinding,
+    /// Blob hashes cannot be reconstructed from blob indices alone.
+    #[error("public-input hashing currently requires empty blobIndices, got {count}")]
+    UnsupportedBlobIndices {
+        /// Number of unsupported blob indices.
+        count: usize,
     },
 }
 
@@ -219,31 +211,28 @@ pub fn batch_shared_public_input(
             count: batch.blobIndices.len(),
         });
     }
-    let custom_data = vec![Bytes::new(); batch.rollupIdsWithProofSystems.len()];
-    batch_shared_public_input_with(batch, sender, &[], &custom_data)
+    batch_shared_public_input_with_blobs(batch, sender, &[])
 }
 
-/// Computes `sharedPublicInput` with independently derived settlement data.
+/// Compute the shared input with independently derived blob hashes.
 ///
 /// # Errors
 ///
-/// [`PublicInputsError`] when the supplied values do not cover the batch.
-pub fn batch_shared_public_input_with(
+/// [`PublicInputsError`] for a nonzero block number or a blob hash count mismatch.
+pub fn batch_shared_public_input_with_blobs(
     batch: &EvmBatch,
     sender: Address,
     blob_hashes: &[B256],
-    custom_data: &[Bytes],
 ) -> Result<B256, PublicInputsError> {
+    if batch.blockNumber != 0 {
+        return Err(PublicInputsError::UnsupportedBlockNumber {
+            block_number: batch.blockNumber,
+        });
+    }
     if blob_hashes.len() != batch.blobIndices.len() {
         return Err(PublicInputsError::BlobHashCount {
             expected: batch.blobIndices.len(),
             actual: blob_hashes.len(),
-        });
-    }
-    if custom_data.len() != batch.rollupIdsWithProofSystems.len() {
-        return Err(PublicInputsError::CustomDataCount {
-            expected: batch.rollupIdsWithProofSystems.len(),
-            actual: custom_data.len(),
         });
     }
     let entry_hashes: Vec<B256> = batch.entries.iter().map(entry_hash).collect();
@@ -252,8 +241,7 @@ pub fn batch_shared_public_input_with(
     let custom_data_hashes: Vec<B256> = batch
         .rollupIdsWithProofSystems
         .iter()
-        .zip(custom_data)
-        .map(|(rollup, data)| custom_data_hash(RollupId(rollup.rollupId), data))
+        .map(|rollup| custom_data_hash(RollupId(rollup.rollupId), &Bytes::new()))
         .collect();
     let bound_sender = if batch.bindMsgSenderInPublicInput {
         sender
@@ -270,7 +258,7 @@ pub fn batch_shared_public_input_with(
     ))
 }
 
-/// Compute every per-proof-system hash for the calldata batch
+/// Compute every per-proof-system hash for the currently supported batch
 /// profile: block number zero, no sender binding, and no blobs.
 ///
 /// The reference manager returns empty `customData` for block zero, so this
@@ -285,45 +273,33 @@ pub fn public_inputs_hashes(batch: &EvmBatch, vkey: B256) -> Result<Vec<B256>, P
     if batch.bindMsgSenderInPublicInput {
         return Err(PublicInputsError::UnsupportedSenderBinding);
     }
-    // Refuses a nonzero block number and blobs.
-    let shared = batch_shared_public_input(batch, Address::ZERO)?;
-    let custom_data = vec![Bytes::new(); batch.rollupIdsWithProofSystems.len()];
-    per_ps_hashes_for(batch, vkey, custom_data, shared)
-}
-
-/// Compute blob-settlement hashes from independently derived blob hashes and
-/// manager data. This profile lists only Rollup0 and never binds the sender.
-///
-/// # Errors
-///
-/// Returns [`PublicInputsError`] for sender binding, another listed rollup, or
-/// blob hashes that do not cover `blobIndices`.
-pub fn public_inputs_hashes_with_context(
-    batch: &EvmBatch,
-    vkey: B256,
-    blob_hashes: &[B256],
-    custom_data: Bytes,
-) -> Result<Vec<B256>, PublicInputsError> {
-    if batch.blockNumber != u64::MAX {
+    if batch.blockNumber != 0 {
         return Err(PublicInputsError::UnsupportedBlockNumber {
             block_number: batch.blockNumber,
         });
     }
+    if !batch.blobIndices.is_empty() {
+        return Err(PublicInputsError::UnsupportedBlobIndices {
+            count: batch.blobIndices.len(),
+        });
+    }
+    public_inputs_hashes_with_blobs(batch, vkey, &[])
+}
+
+/// Compute settlement hashes with locally derived blob hashes and empty custom data.
+///
+/// # Errors
+///
+/// [`PublicInputsError`] for unsupported binding, invalid proof plans, or hash count mismatch.
+pub fn public_inputs_hashes_with_blobs(
+    batch: &EvmBatch,
+    vkey: B256,
+    blob_hashes: &[B256],
+) -> Result<Vec<B256>, PublicInputsError> {
     if batch.bindMsgSenderInPublicInput {
         return Err(PublicInputsError::UnsupportedSenderBinding);
     }
-    let custom_data = vec![custom_data];
-    let shared = batch_shared_public_input_with(batch, Address::ZERO, blob_hashes, &custom_data)?;
-    per_ps_hashes_for(batch, vkey, custom_data, shared)
-}
-
-/// Fold `shared` for every proof system, one uniform `vkey` per assignment.
-fn per_ps_hashes_for(
-    batch: &EvmBatch,
-    vkey: B256,
-    custom_data: Vec<Bytes>,
-    shared: B256,
-) -> Result<Vec<B256>, PublicInputsError> {
+    let shared = batch_shared_public_input_with_blobs(batch, Address::ZERO, blob_hashes)?;
     let rollup_assignments: Vec<RollupProofAssignment> = batch
         .rollupIdsWithProofSystems
         .iter()
@@ -338,7 +314,7 @@ fn per_ps_hashes_for(
         .collect();
     let plan = ProofPlan {
         proof_systems: batch.proofSystems.clone(),
-        custom_data,
+        custom_data: vec![Bytes::new(); rollup_assignments.len()],
         rollup_assignments,
         vk_matrix,
     };
@@ -591,61 +567,5 @@ mod tests {
         ] {
             assert_eq!(batch_shared_public_input(batch, sender), want);
         }
-    }
-
-    #[test]
-    fn candidate_v1_binds_blob_hashes_and_custom_data() {
-        let vkey = B256::repeat_byte(0x42);
-        let mut batch = carrier_batch();
-        batch.blockNumber = u64::MAX;
-        batch.blobIndices = vec![alloy_primitives::U256::ZERO];
-        let blob_hashes = [B256::repeat_byte(0x01)];
-        let custom_data = Bytes::from_static(&[0xd2; 288]);
-
-        let got =
-            public_inputs_hashes_with_context(&batch, vkey, &blob_hashes, custom_data.clone());
-        let custom_hash = custom_data_hash(RollupId(1), &custom_data);
-        let shared = shared_public_input(
-            &[],
-            &[],
-            &blob_hashes,
-            &Bytes::new(),
-            &[custom_hash],
-            Address::ZERO,
-        );
-        let plan = singleton_plan();
-        assert_eq!(got.unwrap(), [per_ps_public_inputs_hash(shared, &plan, 0)]);
-
-        assert_eq!(
-            public_inputs_hashes_with_context(&batch, vkey, &[], custom_data.clone()),
-            Err(PublicInputsError::BlobHashCount {
-                expected: 1,
-                actual: 0
-            }),
-        );
-        let mut wrong_block = batch.clone();
-        wrong_block.blockNumber = 0;
-        assert_eq!(
-            public_inputs_hashes_with_context(
-                &wrong_block,
-                vkey,
-                &blob_hashes,
-                custom_data.clone()
-            ),
-            Err(PublicInputsError::UnsupportedBlockNumber { block_number: 0 }),
-        );
-        let mut bound = batch.clone();
-        bound.bindMsgSenderInPublicInput = true;
-        assert_eq!(
-            public_inputs_hashes_with_context(&bound, vkey, &blob_hashes, custom_data.clone()),
-            Err(PublicInputsError::UnsupportedSenderBinding),
-        );
-        assert_eq!(
-            batch_shared_public_input_with(&batch, Address::ZERO, &blob_hashes, &[]),
-            Err(PublicInputsError::CustomDataCount {
-                expected: 1,
-                actual: 0
-            }),
-        );
     }
 }

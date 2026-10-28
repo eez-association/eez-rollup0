@@ -39,8 +39,8 @@
 mod container;
 
 pub use container::{
-    Action, AnchorOnlyBlobSizer, DecodedContainer, STREAM_VERSION, decode_blob_container,
-    decode_container, encode_blob_container, encode_container, logical_blob_capacity,
+    Action, DecodedContainer, STREAM_VERSION, decode_blob_container, decode_container,
+    encode_blob_container, encode_container, logical_blob_capacity,
 };
 
 /// A raw EIP-2718 signed transaction, exactly as it enters the block's
@@ -158,8 +158,8 @@ pub enum CodecError {
     /// A bracket followed a failed return, which terminates the manifest.
     #[error("an action bracket follows a failed return")]
     ActionAfterFailure,
-    /// Candidate V1 requires at least one physical blob.
-    #[error("candidate V1 requires at least one physical blob")]
+    /// The blob profile requires at least one physical blob.
+    #[error("blob profile requires at least one physical blob")]
     NoBlobs,
     /// A physical EIP-4844 blob did not have the required byte length.
     #[error("blob {index} has length {actual}; expected {expected}")]
@@ -185,9 +185,6 @@ pub enum CodecError {
     /// Bytes after the close marker must be zero padding.
     #[error("blob stream has nonzero padding after CloseBlobStream")]
     NonZeroBlobPadding,
-    /// A decoded message is valid EEZ but outside Rollup0 candidate V1.
-    #[error("invalid Rollup0 blob profile: {0}")]
-    InvalidBlobProfile(&'static str),
     /// A value did not fit the `uvarint32` domain on encode.
     #[error("{what} = {value} exceeds u32")]
     ValueTooLarge {

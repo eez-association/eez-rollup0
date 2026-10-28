@@ -70,7 +70,6 @@ async fn start_signer(
                 "30",
             ])
             .args(extra_args)
-            .env_remove("EEZ_SETTLEMENT_WRAPPER_ADDRESS")
             .env_remove("EEZ_SETTLEMENT_PROFILE")
             .env("RUST_LOG", "info")
             .spawn()
@@ -212,7 +211,7 @@ fn recorded_window(oracle: &serde_json::Value) -> (Vec<ProveChunk>, ProvingConte
         .batch,
         blocks,
         l1_block_hash: None,
-        blob: None,
+        blobs: Vec::new(),
     };
 
     (window, context)

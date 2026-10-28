@@ -39,7 +39,6 @@ pub mod abi;
 pub mod action;
 pub mod addresses;
 pub mod authorized_proxies;
-pub mod candidate_domain;
 pub mod composition;
 pub mod dialect;
 pub mod entries;
@@ -68,8 +67,6 @@ pub use authorized_proxies::{
     EEZ_AUTHORIZED_PROXIES_SLOT, EEZL2_AUTHORIZED_PROXIES_SLOT, ProxyInfo, ProxyLookupConfig,
     decode_proxy_value, proxy_mapping_key,
 };
-#[doc(inline)]
-pub use candidate_domain::Rollup0Deployment;
 #[doc(inline)]
 pub use composition::{CompositionBuilder, Rollup, TargetConfig};
 #[doc(inline)]

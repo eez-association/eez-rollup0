@@ -37,10 +37,6 @@ services:
     env_file:
       - ./deployments.env
     environment:
-      EEZ_L1_RPC_URL: "${EEZ_PROOF_SIGNER_L1_RPC_URL:-http://127.0.0.1:18645}"
-      EEZ_L1_CHAIN_ID: "10200"
-      EEZ_L1_BLOCK_TIME_MS: "5000"
-      EEZ_L2_BLOCK_TIME_MS: "1000"
       EEZ_PROOF_SIGNER_ADDR: 127.0.0.1:${EEZ_SIGNER_PORT:-50061}
       EEZ_CHAIN_CONFIG: /app/genesis.json
       EEZ_PROOF_SIGNER_KEY: "${EEZ_PROOF_SIGNER_KEY:?set EEZ_PROOF_SIGNER_KEY}"

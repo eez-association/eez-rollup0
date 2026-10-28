@@ -10,7 +10,7 @@
 mod schedule;
 mod transport;
 
-pub use schedule::{ActiveBlobLimit, blob_limit_at, on_later_slot};
+pub use schedule::{ActiveBlobLimit, blob_limit_at};
 pub use transport::{
     BYTES_PER_BLOB, BlobSidecarEncoding, BlobTransactionParams, PreparedBlobSidecar,
     TransportError, pooled_blob_transaction_hash, prepare_blob_sidecar, sign_blob_transaction,
