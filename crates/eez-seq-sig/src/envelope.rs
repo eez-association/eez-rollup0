@@ -1,6 +1,7 @@
 use alloy_primitives::{Address, Bytes};
 use alloy_rlp::Decodable;
 use alloy_signer::Signature;
+use reth_consensus_common::validation::validate_body_against_header;
 use reth_primitives_traits::SealedBlock;
 
 use crate::{HeadClaim, HeadDomain};
@@ -33,8 +34,12 @@ pub enum VerifyError {
     BlockDecode(String),
     #[error("block {0} does not match claim")]
     BlockMismatch(&'static str),
+    #[error("block body does not match its header: {0}")]
+    BodyMismatch(String),
 }
 
+/// Decodes a consensus-RLP block whose body matches its header's roots, so
+/// checking the hash binds the whole block.
 pub fn decode_block(rlp: &[u8]) -> Result<SealedBlock<eez_primitives::Block>, VerifyError> {
     let mut buf = rlp;
     let block = eez_primitives::Block::decode(&mut buf)
@@ -42,6 +47,8 @@ pub fn decode_block(rlp: &[u8]) -> Result<SealedBlock<eez_primitives::Block>, Ve
     if !buf.is_empty() {
         return Err(VerifyError::BlockDecode("trailing bytes".into()));
     }
+    validate_body_against_header(&block.body, &block.header)
+        .map_err(|e| VerifyError::BodyMismatch(e.to_string()))?;
     Ok(SealedBlock::seal_slow(block))
 }
 
@@ -197,6 +204,27 @@ mod tests {
             env.verify(&domain(), s.address()).unwrap_err(),
             VerifyError::BlockMismatch("hash")
         );
+    }
+
+    #[test]
+    fn body_not_matching_header_is_rejected() {
+        let mut s = signer();
+        let (header, _) = block(7);
+        // Same header, so the hash still matches the claim.
+        let tampered = eez_primitives::Block {
+            header: header.header().clone(),
+            body: eez_primitives::BlockBody {
+                ommers: vec![Header::default()],
+                ..Default::default()
+            },
+        };
+        let env = s
+            .sign(&header, Bytes::from(alloy_rlp::encode(tampered)))
+            .unwrap();
+        assert!(matches!(
+            env.verify(&domain(), s.address()),
+            Err(VerifyError::BodyMismatch(_))
+        ));
     }
 
     #[test]
