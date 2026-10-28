@@ -7,7 +7,7 @@ use alloy_sol_types::SolValue as _;
 use eez_protocol::EvmBatch;
 use eez_protocol::abi::ProofSystemBatchPerVerificationEntriesSol;
 use eez_protocol::entries::decode_postbatch;
-use eez_protocol::public_inputs::public_inputs_hashes;
+use eez_protocol::public_inputs::public_inputs_hashes_with_context;
 use thiserror::Error;
 
 use crate::attest::NonZeroProofSystemVkey;
@@ -102,6 +102,7 @@ pub(crate) enum PublicInputError {
 /// service can reject cheaper settlement failures first.
 pub(crate) struct CheckedPublicInputProfile<'a> {
     canonical_batch: &'a CanonicalPostBatch,
+    context: Option<eez_protocol::l1_context::LiveSettlementContext>,
 }
 
 impl<'a> CheckedPublicInputProfile<'a> {
@@ -110,13 +111,25 @@ impl<'a> CheckedPublicInputProfile<'a> {
         canonical_batch: &'a CanonicalPostBatch,
         expected_rollup_id: NonZeroU64,
         expected_proof_system: Address,
+        context: Option<eez_protocol::l1_context::LiveSettlementContext>,
     ) -> Result<Self, PublicInputError> {
         validate_public_input_structure(
             canonical_batch.as_batch(),
             expected_rollup_id,
             expected_proof_system,
         )?;
-        Ok(Self { canonical_batch })
+        if (canonical_batch.as_batch().blockNumber == u64::MAX) != context.is_some() {
+            return Err(invalid_structure(
+                "live settlement context does not match batch blockNumber",
+            ));
+        }
+        if let Some(context) = context {
+            context.validate().map_err(invalid_structure)?;
+        }
+        Ok(Self {
+            canonical_batch,
+            context,
+        })
     }
 
     /// Compute the sole canonical hash from this profile-checked batch.
@@ -127,8 +140,12 @@ impl<'a> CheckedPublicInputProfile<'a> {
         &self,
         proof_system_vkey: NonZeroProofSystemVkey,
     ) -> Result<RecomputedPublicInputsHash, PublicInputError> {
-        let hashes = public_inputs_hashes(self.canonical_batch.as_batch(), proof_system_vkey.get())
-            .map_err(|error| PublicInputError::Computation(error.to_string()))?;
+        let hashes = public_inputs_hashes_with_context(
+            self.canonical_batch.as_batch(),
+            proof_system_vkey.get(),
+            self.context,
+        )
+        .map_err(|error| PublicInputError::Computation(error.to_string()))?;
         let [hash] = hashes.as_slice() else {
             return Err(PublicInputError::HashCount {
                 actual: hashes.len(),
@@ -158,7 +175,7 @@ pub(crate) fn recompute_public_input_hash(
     expected_proof_system: Address,
 ) -> Result<B256, PublicInputError> {
     let canonical = CanonicalPostBatch(batch.clone());
-    CheckedPublicInputProfile::new(&canonical, expected_rollup_id, expected_proof_system)?
+    CheckedPublicInputProfile::new(&canonical, expected_rollup_id, expected_proof_system, None)?
         .recompute_public_inputs_hash(proof_system_vkey)
         .map(RecomputedPublicInputsHash::into_inner)
 }
@@ -247,9 +264,9 @@ fn validate_public_input_structure(
         )));
     }
 
-    if batch.blockNumber != 0 {
+    if batch.blockNumber != 0 && batch.blockNumber != u64::MAX {
         return Err(invalid_structure(format!(
-            "blockNumber must be zero, got {}",
+            "blockNumber must be zero or the live sentinel, got {}",
             batch.blockNumber
         )));
     }

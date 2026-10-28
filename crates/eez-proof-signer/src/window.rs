@@ -100,8 +100,8 @@ pub mod testing {
 /// Structurally admitted Composer header and its submitted settlement calldata.
 ///
 /// Every decoded header field is charged against the payload quota. Admission
-/// then discards the non-authoritative Composer `public_inputs_hash` and the
-/// checked-empty L1 block hash. The retained calldata remains untrusted until
+/// then discards the non-authoritative Composer `public_inputs_hash` and retains
+/// the optional intended L1 parent. The retained calldata remains untrusted until
 /// settlement validation succeeds. The rollup claim is held separately only
 /// long enough for the service to compare it with operator configuration.
 pub(crate) struct AdmittedHeader {
@@ -109,6 +109,8 @@ pub(crate) struct AdmittedHeader {
     pub(crate) declared_to_block: u64,
     /// Composer-submitted calldata retained for canonical decoding and settlement checks.
     pub(crate) submitted_post_batch_calldata: Vec<u8>,
+    /// Untrusted intended L1 parent; settlement binds it through manager custom data.
+    pub(crate) l1_parent_hash: Option<B256>,
 }
 
 /// A complete, structurally checked window ready for backend validation.
@@ -183,7 +185,9 @@ pub(crate) enum WindowError {
     DuplicateHeader,
     #[error("header carries no post_batch")]
     MissingPostBatch,
-    #[error("header post_batch carries a {actual}-byte l1_block_hash; it must be empty")]
+    #[error(
+        "header post_batch carries an invalid {actual}-byte l1_block_hash; expected absent or a nonzero 32-byte hash"
+    )]
     NonemptyL1BlockHash { actual: usize },
     #[error("invalid window bounds {from}..={to}")]
     InvalidBounds { from: u64, to: u64 },
@@ -354,12 +358,17 @@ impl WindowAssembler<false> {
             l1_block_hash: submitted_l1_block_hash,
             abi_calldata: submitted_post_batch_calldata,
         } = submitted_post_batch;
-        let l1_block_hash_len = submitted_l1_block_hash.len();
-        if l1_block_hash_len != 0 {
-            return Err(WindowError::NonemptyL1BlockHash {
-                actual: l1_block_hash_len,
-            });
-        }
+        let l1_parent_hash = match submitted_l1_block_hash.as_slice() {
+            [] => None,
+            bytes if bytes.len() == 32 && bytes.iter().any(|b| *b != 0) => {
+                Some(B256::from_slice(bytes))
+            }
+            _ => {
+                return Err(WindowError::NonemptyL1BlockHash {
+                    actual: submitted_l1_block_hash.len(),
+                });
+            }
+        };
         if declared_from_block == 0 || declared_from_block > declared_to_block {
             return Err(WindowError::InvalidBounds {
                 from: declared_from_block,
@@ -386,6 +395,7 @@ impl WindowAssembler<false> {
                 declared_from_block,
                 declared_to_block,
                 submitted_post_batch_calldata,
+                l1_parent_hash,
             },
             declared_block_count,
         })

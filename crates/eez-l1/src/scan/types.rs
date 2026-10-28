@@ -33,6 +33,8 @@ pub struct Post {
     /// EEZ's `msg.sender` for this call.
     pub sender: Address,
     pub batch: EvmBatch,
+    /// Actual inclusion parent/time, read from the exact block containing this post.
+    pub l1_context: Option<eez_protocol::l1_context::LiveSettlementContext>,
     /// What L1 applied of it for our rollup.
     pub settlement: Settlement,
 }

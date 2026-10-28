@@ -107,6 +107,9 @@ pub fn eez_node_bin() -> Result<PathBuf> {
 }
 
 pub fn anvil_bin() -> String {
+    if let Ok(path) = std::env::var("EEZ_TEST_ANVIL_BIN") {
+        return path;
+    }
     for path in [
         "/root/.foundry/bin/anvil",
         &format!(
@@ -2430,9 +2433,26 @@ pub async fn assert_latest_batch_signature(
         .proofs
         .first()
         .ok_or_else(|| anyhow!("posted batch has no proof"))?;
-    let public_inputs_hash = eez_protocol::public_inputs::public_inputs_hashes(
+    let context = if call.batch.blockNumber == u64::MAX {
+        let header = provider
+            .get_block_by_hash(
+                log.block_hash
+                    .ok_or_else(|| anyhow!("BatchPosted log has no block hash"))?,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("batch inclusion block is missing"))?
+            .header;
+        Some(eez_protocol::l1_context::LiveSettlementContext {
+            parent_hash: header.parent_hash,
+            timestamp: header.timestamp,
+        })
+    } else {
+        None
+    };
+    let public_inputs_hash = eez_protocol::public_inputs::public_inputs_hashes_with_context(
         &call.batch,
         expected_attester.into_word(),
+        context,
     )?
     .into_iter()
     .next()

@@ -181,7 +181,21 @@ async fn read_logs(
     let lists =
         |log: &ScannedLog| matches!(&log.event, Event::Posted(_, ids) if ids.contains(&rollup_id));
     let mut posts = Vec::new();
-    for block in group_blocks(raw)? {
+    for mut block in group_blocks(raw)? {
+        let header = logs
+            .get_block_by_hash(block.hash)
+            .await
+            .map_err(|error| L1Error::Provider(format!("fetch batch inclusion header: {error}")))?
+            .ok_or_else(|| L1Error::Provider("batch inclusion header unavailable".into()))?;
+        if header.header.number != block.number || header.header.hash != block.hash {
+            return Err(L1Error::Provider(
+                "batch inclusion header changed during scan".into(),
+            ));
+        }
+        block.context = Some(eez_protocol::l1_context::LiveSettlementContext {
+            parent_hash: header.header.parent_hash,
+            timestamp: header.header.timestamp,
+        });
         let number = block.number;
         let block_hash = block.hash;
         let mut calls_by_tx = BTreeMap::new();
@@ -799,6 +813,15 @@ mod tests {
         (served_as(logs, 0, &tx), tx)
     }
 
+    fn serve_inclusion_header(asserter: &Asserter, number: u64, hash: B256) {
+        let mut block = Block::<Transaction>::default();
+        block.header.inner.number = number;
+        block.header.hash = hash;
+        block.header.inner.parent_hash = B256::repeat_byte(0x99);
+        block.header.inner.timestamp = 42;
+        asserter.push_success(&block);
+    }
+
     /// The trace endpoint knows the block, then traces `frames`.
     fn serve_trace(asserter: &Asserter, frames: &[(B256, CallFrame)]) {
         asserter.push_success(&Block::<Transaction>::default());
@@ -822,7 +845,9 @@ mod tests {
         }
         let ((asserter, rpc), (_, no_trace)) = (mock(), mock());
         asserter.push_success(&[next, served_as(first, 0, &tx_x)].concat());
+        serve_inclusion_header(&asserter, BLOCK, HASH);
         asserter.push_success(&tx_x);
+        serve_inclusion_header(&asserter, BLOCK + 1, B256::repeat_byte(0xB2));
         asserter.push_success(&tx_y);
         // Any other call meets an empty FIFO and fails the scan.
         let posts = scan_range(&rpc, &no_trace, EEZ, US, BLOCK, BLOCK + 1).await;
@@ -850,6 +875,7 @@ mod tests {
         // One FIFO pins the order: logs, the txs, then one trace.
         let (asserter, rpc) = mock();
         asserter.push_success(&served_as(served_as(logs, 0, &direct), 1, &router));
+        serve_inclusion_header(&asserter, BLOCK, HASH);
         asserter.push_success(&direct);
         asserter.push_success(&router);
         serve_trace(&asserter, &[(*router.inner.tx_hash(), traced)]);
@@ -889,6 +915,7 @@ mod tests {
         for (name, answers, class) in cases {
             let (asserter, rpc) = mock();
             asserter.push_success(&logs);
+            serve_inclusion_header(&asserter, BLOCK, HASH);
             for answer in &answers {
                 asserter.push_success(answer);
             }
@@ -928,6 +955,7 @@ mod tests {
         let (logs, tx) = routed();
         let mut chunks = BatchLogChunks::new(BLOCK, BLOCK + 1);
         asserter.push_success(&logs);
+        serve_inclusion_header(&asserter, BLOCK, HASH);
         asserter.push_success(&tx);
         asserter.push_success(&Block::<Transaction>::default());
         asserter.push_failure_msg("query timeout exceeded");

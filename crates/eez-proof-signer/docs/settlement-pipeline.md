@@ -45,10 +45,12 @@ flowchart LR
 
 1. `post_batch` exact-decodes and canonical round-trips the full calldata into
    `CanonicalPostBatch`. Its fields remain Composer claims.
-2. `CheckedPublicInputProfile` pins the supported one-rollup,
-   one-proof-system, timeless shape to the expected/configured deployment
-   values. It retains the typed capability needed for later hash computation;
-   it never accepts the wire hash as authoritative.
+2. The pipeline requires live L1 context whenever the terminal block contains
+   a system transaction. `CheckedPublicInputProfile` pins the supported
+   one-rollup, one-proof-system shape to the configured deployment and requires
+   `blockNumber = uint64.max` exactly when live context is supplied. Ordinary-only
+   batches may remain timeless. The profile retains the typed capability needed
+   for later hash computation; it never accepts the wire hash as authoritative.
 3. `state_chain` requires exactly one expected-rollup state update per entry and a
    continuous commitment chain from `ValidatedWindow.window_pre_block_hash` to
    `window_post_block_hash`.

@@ -1,7 +1,10 @@
 # Composer-to-prover streaming RPC
 
-The Rollup0 runtime implements this contract for its current calldata-only,
-timeless settlement profile. The existing [window RPC specification](SPEC.md)
+The Rollup0 runtime implements this contract for calldata settlement, with
+timeless ordinary-only batches and parent/time-bound live cross-chain batches.
+System transactions require the live profile; the prover enforces this before
+signing. See the [settlement policy and rationale](../eez-proof-signer/SPEC.md#7-canonical-batch-and-public-input-profile).
+The existing [window RPC specification](SPEC.md)
 and endpoint remain available for compatibility.
 [prove_stream.proto](proto/prove_stream.proto) is the canonical schema.
 
@@ -158,8 +161,7 @@ after the Composer abandons its corresponding batch or settlement cutoff.
 Every request uses `Finalize.settlement`, containing exact proofless
 EEZ.postAndVerifyBatch calldata, physical blobs and an L1PostingContext.
 Blobs and posting context are optional at the common wire layer; the configured
-profile decides which are required. Today's calldata-only, timeless Rollup0
-profile omits both. The RollupX blob profile requires both. Blob-based Rollup0
+profile decides which are required. Rollup0 ordinary-only timeless batches omit both. Live cross-chain batches require posting context: intended parent hash and terminal timestamp, with chain ID and parent number zero for its conditional-proof profile. The RollupX blob profile requires both. Blob-based Rollup0
 uses these same fields, with its own payload and settlement rules.
 Where the profile requires prover-side parent authorization, evidence retrieval
 is the prover's responsibility, not an RPC input.
@@ -230,7 +232,10 @@ data, but wire compatibility does not resolve those deployment/spec blockers.
 
 ### L1 posting context
 
-L1PostingContext contains exactly the RollupX target fields:
+L1PostingContext uses the same field tags for each profile. Calldata-only cross-chain
+Rollup0 requires a nonzero parent hash and terminal timestamp, with `chain_id`
+and `parent_number` zero; L1 authenticates the context at proof consumption.
+The RollupX and draft blob profiles require:
 
 - chain_id: nonzero and equal to the operator-trusted L1 network;
 - target_timestamp: nonzero, the intended child's exact timestamp;
@@ -258,7 +263,7 @@ manager/wrapper overrides. The configured profile determines the applicable
 rules. Sharing fields does not mean sharing public-input hashes or accepting a
 signature under another deployment's domain.
 
-Authenticate the named parent through the prover's configured L1 source and
+For the blob profiles, authenticate the named parent through the prover's configured L1 source and
 check the target timestamp against its chain/slot rules. The target is a
 proposed environment, not proof of future inclusion. A changed parent hash or
 timestamp needs a new Finalize and proof; retained execution may still be reused
@@ -268,7 +273,7 @@ the proof can be used in the actual posting environment.
 
 ### Parent authorization by profile
 
-**Current calldata-only, timeless Rollup0 keeps conditional proofs.** A proof
+**Calldata-only Rollup0 keeps conditional proofs.** Live cross-chain batches additionally bind the intended L1 parent/time through the reference manager's `getCustomData(uint64.max)`. The signer checks execution and settlement; L1 authenticates the context when consuming the proof. A proof
 for blocks 101–110 establishes the valid transition starting from the selected
 block 100; it does not establish that block 100 was already accepted on L1.
 The signer binds execution and settlement claims to that exact parent, while the
@@ -341,8 +346,8 @@ Every Finalize MUST supply settlement; absence is INVALID_ARGUMENT. The prover
 checks the complete input against the configured profile and rejects unsupported
 inputs. Never strip required blobs or context to retry as a weaker request.
 
-Calldata-only Rollup0 can use the same settlement message with its optional inputs
-absent, then populate the existing blob/context fields when its profile migrates.
+Calldata-only Rollup0 omits blobs. It omits posting context for timeless batches
+and supplies the parent/time-only context for live cross-chain batches.
 
 The current Rollup0 implementation does not claim full Rollup0-draft or live
 RollupX conformance; those settlement profiles need separate implementations.
@@ -414,7 +419,8 @@ transcripts belong with each runtime implementation.
 
 The stateless signer and the stateful follower signer implement Resume, Rewind,
 Cancel, subrange selection and bounded pipelining. Both reject nonempty blobs
-or any posting context with UNIMPLEMENTED; this is not a blob-profile implementation.
+with UNIMPLEMENTED and validate live cross-chain posting context as described above.
+This is not a blob-profile implementation.
 Ordinary execution ACKs do not claim L1 acceptance. Final settlement retains
 the current Rollup0 [conditional-proof rules](#parent-authorization-by-profile);
 stateful fork selection additionally obeys Reth's safe/finalized ancestry.

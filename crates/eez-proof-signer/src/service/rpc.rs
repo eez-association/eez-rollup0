@@ -120,6 +120,7 @@ impl Prover for ProveSvc {
             declared_from_block,
             declared_to_block,
             submitted_post_batch_calldata,
+            l1_parent_hash,
         } = header;
         timing.ensure_before_deadline(
             "pipeline",
@@ -135,6 +136,7 @@ impl Prover for ProveSvc {
             .run_pipeline(
                 blocks,
                 submitted_post_batch_calldata,
+                l1_parent_hash,
                 request_permit,
                 pipeline_started,
                 timing,
@@ -269,6 +271,7 @@ impl ProveSvc {
         &self,
         blocks: window::AdmittedBlocks,
         submitted_post_batch_calldata: Vec<u8>,
+        l1_parent_hash: Option<alloy_primitives::B256>,
         request_permit: OwnedSemaphorePermit,
         pipeline_started: Instant,
         timing: RequestTiming,
@@ -294,6 +297,7 @@ impl ProveSvc {
                     &state,
                     blocks,
                     submitted_post_batch_calldata,
+                    l1_parent_hash,
                     deadline,
                     &worker_cancellation,
                 )

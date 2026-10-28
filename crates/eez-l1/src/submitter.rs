@@ -795,6 +795,7 @@ mod tests {
             },
             tx_hash,
             sender: Address::ZERO,
+            l1_context: None,
             batch: eez_protocol::abi::EvmBatch::default(),
             settlement: Settlement::new(Vec::new(), root(log_index), None, false),
         };
