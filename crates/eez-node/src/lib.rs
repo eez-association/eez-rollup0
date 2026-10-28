@@ -7,7 +7,7 @@
 //!
 mod bundle_rpc;
 mod composer_rpc;
-mod head_rpc;
+mod head_signer;
 mod ingress;
 mod l1_embedded;
 mod witness_source;
@@ -317,16 +317,10 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     if p2p_config.is_some() && sequencer_key.is_none() {
         eyre::bail!("EEZ_P2P_LISTEN requires EEZ_SEQUENCER_KEY on a composer");
     }
-    let head_store = head_rpc::SignedHeadStore::default();
-    let rpc_head_store = sequencer_key.is_some().then(|| head_store.clone());
     let handle = builder
         .node(EezNode)
-        .extend_rpc_modules(move |mut ctx| {
-            composer_rpc::install_composer_rpc(&mut ctx, composer_info.clone())?;
-            if let Some(store) = rpc_head_store {
-                head_rpc::install_head_rpc(&mut ctx, store)?;
-            }
-            Ok(())
+        .extend_rpc_modules(move |ctx| {
+            composer_rpc::install_composer_rpc(ctx, composer_info.clone())
         })
         .launch_with_debug_capabilities()
         .await?;
@@ -783,6 +777,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             registry: eez_registry,
             rollup_id: rollup_config.rollup_id,
         };
+        let head_store = head_signer::SignedHeadStore::default();
         if let Some(cfg) = p2p_config {
             let overlay = eez_p2p::Overlay::new(
                 cfg,
@@ -800,7 +795,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         )?;
         task_executor.spawn_critical_task(
             "eez-head-signer",
-            head_rpc::run_head_signer(
+            head_signer::run_head_signer(
                 block_committer.subscribe_head(),
                 provider.clone(),
                 eez_seq_sig::HeadSigner::new(key, domain, now_ms),

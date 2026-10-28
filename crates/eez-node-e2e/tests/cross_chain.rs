@@ -16,8 +16,8 @@ use eez_testkit::{
     block_number_and_hash_at, call_read, call_revert_data, completed_proxy_calls, count_events,
     create_l2_cross_chain_proxy, cross_chain_source_proxy, deploy_nested_setter_inner,
     deploy_nested_setter_outer, events_since, l2_balance, l2_value, last_proxy_result,
-    onchain_nonce, override_env, read_state_word, receipt_ok, rollup_commitment, run_scenarios,
-    safe_block_hash, setter_call, setup_cross_chain, setup_cross_chain_codeless,
+    onchain_nonce, overlay_follower, override_env, read_state_word, receipt_ok, rollup_commitment,
+    run_scenarios, safe_block_hash, setter_call, setup_cross_chain, setup_cross_chain_codeless,
     setup_cross_chain_empty_call, setup_cross_chain_nested_setter,
     setup_cross_chain_outbound_return_data, setup_cross_chain_proxied,
     setup_cross_chain_return_data, setup_cross_chain_reverting,
@@ -1131,13 +1131,9 @@ async fn follower_replays_settled_inbound_safe_block() {
         genesis_path: Some(w.cfg.l2_genesis.0.as_path()),
         ..Default::default()
     };
-    let follower = NodeHandle::start(
-        "xchain-inbound-follower",
-        &follower_cfg,
-        &w.follower_env(None),
-    )
-    .await
-    .unwrap();
+    let follower = NodeHandle::start("xchain-inbound-follower", &follower_cfg, &w.follower_env())
+        .await
+        .unwrap();
     wait_for_safe_chain_contains(&follower, settled.0, settled.1, SETTLE_TIMEOUT)
         .await
         .unwrap_or_else(|err| {
@@ -1170,13 +1166,15 @@ async fn follower_replays_settled_inbound_safe_block() {
 async fn follower_adopts_replaced_sync_block() {
     let w = setup_cross_chain_with_builder_stub().await.unwrap();
     let l2_rpc = w.l2_rpc();
-    let follower_cfg = NodeConfig {
+    let mut follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(w.cfg.l2_genesis.0.as_path()),
         ..Default::default()
     };
+    let mut follower_env = w.follower_env();
+    overlay_follower(&w.node, &mut follower_cfg, &mut follower_env);
     let follower_env = override_env(
-        w.follower_env(Some(&l2_rpc)),
+        follower_env,
         "RUST_LOG",
         "warn,eez_follower::unsafe_head=info",
     );

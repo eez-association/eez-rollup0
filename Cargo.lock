@@ -3398,7 +3398,6 @@ dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
- "alloy-provider",
  "clap",
  "eez-deriver",
  "eez-driver",
@@ -3420,7 +3419,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -3834,6 +3832,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "eez-primitives",
+ "reth-consensus-common",
  "reth-primitives-traits",
  "serde",
  "serde_json",

@@ -37,7 +37,7 @@ async fn shared_prover_reorg(stateful: bool) -> Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         drop(listener);
-        let mut env = harness.follower_env(None).await?;
+        let mut env = harness.follower_env().await?;
         env.extend([
             ("EEZ_STATEFUL_PROOF_SIGNER_ADDR", address.to_string()),
             (
@@ -229,7 +229,7 @@ async fn stateful_sessions_can_extend_and_finalize_an_unselected_branch() -> Res
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     drop(listener);
-    let mut env = harness.follower_env(None).await?;
+    let mut env = harness.follower_env().await?;
     for (key, value) in [
         ("EEZ_STATEFUL_PROOF_SIGNER_ADDR", addr.to_string()),
         (

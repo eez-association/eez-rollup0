@@ -898,21 +898,16 @@ impl Harness {
             proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id: self.dep.rollup_id,
             expect_external_batches,
-            sequencer_rpc: None,
         })
         .await
     }
 
-    pub async fn follower_env(
-        &self,
-        sequencer_rpc: Option<&str>,
-    ) -> Result<Vec<(&'static str, String)>> {
+    pub async fn follower_env(&self) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
             poster_key: None,
             proof_signer_key: None,
             rollup_id: self.dep.rollup_id,
             expect_external_batches: true,
-            sequencer_rpc,
         })
         .await
     }
@@ -931,7 +926,6 @@ impl Harness {
                 proof_signer_key: None,
                 rollup_id: self.dep.rollup_id,
                 expect_external_batches: true,
-                sequencer_rpc: None,
             })
             .await?;
         env.extend([
@@ -954,7 +948,6 @@ impl Harness {
             proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id,
             expect_external_batches: false,
-            sequencer_rpc: None,
         })
         .await
     }
@@ -968,7 +961,6 @@ impl Harness {
             proof_signer_key: Some(proof_signer_key),
             rollup_id: self.dep.rollup_id,
             expect_external_batches: false,
-            sequencer_rpc: None,
         })
         .await
     }
@@ -1062,10 +1054,6 @@ impl Harness {
                 .map_err(|_| anyhow!("prover registry poisoned"))?
                 .push((signer, witness_dir));
         }
-        if let Some(sequencer_rpc) = opts.sequencer_rpc {
-            env.push(("EEZ_SEQUENCER_RPC", sequencer_rpc.to_string()));
-            env.push(("EEZ_SEQUENCER_ADDRESS", format!("{SEQUENCER_ADDR:#x}")));
-        }
         Ok(env)
     }
 }
@@ -1075,7 +1063,6 @@ struct NodeEnvOptions<'a> {
     proof_signer_key: Option<&'a str>,
     rollup_id: u64,
     expect_external_batches: bool,
-    sequencer_rpc: Option<&'a str>,
 }
 
 pub struct Deployment {
@@ -1472,6 +1459,43 @@ pub fn enode(secret_hex: &str, tcp: u16, udp: u16) -> String {
 /// No other testkit lease reuses it.
 pub fn unused_tcp_port() -> u16 {
     PortLease::tcp().port()
+}
+
+/// devp2p key of the overlay seed, so its enode is known before it starts.
+pub const SEED_KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Makes a composer the overlay seed under [`SEED_KEY`]: it publishes its
+/// signed heads and serves blocks to the followers that find it.
+pub fn overlay_seed(cfg: &mut NodeConfig<'_>, env: &mut Vec<(&'static str, String)>) {
+    cfg.discovery = true;
+    // The bootnodes guard needs an entry; the seed's own is a no-op.
+    cfg.extra_args.extend([
+        "--p2p-secret-key-hex".into(),
+        SEED_KEY.into(),
+        "--bootnodes".into(),
+        enode(SEED_KEY, 0, 0),
+    ]);
+    env.push(overlay_listen());
+}
+
+/// Makes a follower find `seed` through its bootnode and follow its signed heads.
+pub fn overlay_follower(
+    seed: &NodeHandle,
+    cfg: &mut NodeConfig<'_>,
+    env: &mut Vec<(&'static str, String)>,
+) {
+    cfg.discovery = true;
+    cfg.extra_args.extend([
+        "--bootnodes".into(),
+        enode(SEED_KEY, seed.p2p_port, seed.discv5_port),
+    ]);
+    env.push(overlay_listen());
+    env.push(("EEZ_SEQUENCER_ADDRESS", format!("{SEQUENCER_ADDR:#x}")));
+}
+
+fn overlay_listen() -> (&'static str, String) {
+    let port = unused_tcp_port();
+    ("EEZ_P2P_LISTEN", format!("/ip4/127.0.0.1/tcp/{port}"))
 }
 
 impl NodeHandle {
@@ -3828,14 +3852,12 @@ impl CrossChainWorld {
         self.node.l2_rpc_url()
     }
 
-    /// Environment for a follower of this world's composer: L1-derived, plus
-    /// the composer's signed heads when `sequencer_rpc` is set.
+    /// Environment for an L1-derived follower of this world's composer.
     ///
     /// The follower talks to the composer's embedded L1 over RPC and must not
     /// reuse that process's bound HTTP, P2P, or cross-chain ports.
-    pub fn follower_env(&self, sequencer_rpc: Option<&str>) -> Vec<(&'static str, String)> {
-        let mut env: Vec<_> = self
-            .cfg
+    pub fn follower_env(&self) -> Vec<(&'static str, String)> {
+        self.cfg
             .env()
             .into_iter()
             .filter(|(key, _)| {
@@ -3855,12 +3877,7 @@ impl CrossChainWorld {
                 }
                 (key, value)
             })
-            .collect();
-        if let Some(sequencer_rpc) = sequencer_rpc {
-            env.push(("EEZ_SEQUENCER_RPC", sequencer_rpc.to_string()));
-            env.push(("EEZ_SEQUENCER_ADDRESS", format!("{SEQUENCER_ADDR:#x}")));
-        }
-        env
+            .collect()
     }
 
     /// Select how the relay stub treats the composer's next bundles.
@@ -4545,7 +4562,8 @@ pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
     setup_cross_chain_inner(None, None, &[], false).await
 }
 
-/// Start the fixture with the composer's bundles routed through the relay stub.
+/// Start the fixture with the composer's bundles routed through the relay stub,
+/// and the composer as the overlay seed (see [`overlay_seed`]).
 /// The stub forwards only single-transaction bundles, so inbound calls cannot settle here.
 pub async fn setup_cross_chain_with_builder_stub() -> Result<CrossChainWorld> {
     setup_cross_chain_inner(None, None, &[], true).await
@@ -4757,10 +4775,14 @@ async fn setup_cross_chain_inner(
         !env.iter().any(|(name, _)| *name == "EEZ_PROOF_SIGNER_KEY"),
         "remote composer environment must not contain the proof-signer key",
     );
+    let mut node_cfg = NodeConfig::default();
+    if builder_stub {
+        overlay_seed(&mut node_cfg, &mut env);
+    }
     let node = NodeHandle::spawn_with_reservations(
         "node",
         datadir.path(),
-        &NodeConfig::default(),
+        &node_cfg,
         &env,
         cfg.take_port_leases(),
     )?;

@@ -36,6 +36,7 @@ pub const COMPOSER_POISON_EVICTION_COMPLETED: &str =
     "eez.composer.cc_compose.poison_eviction_completed";
 pub const FOLLOWER_HEAD_ADVANCED: &str = "eez.node.follower.head.advanced";
 pub const FOLLOWER_HEAD_REJECTED: &str = "eez.node.follower.head.rejected";
+pub const P2P_MESSAGE_REJECTS: &str = "eez.p2p.message.rejects";
 pub const L1_REORG_DETECTED: &str = "eez.l1_watcher.reorg.detected";
 pub const TX_NONCE_CHAIN_EVICTED: &str = "eez.composer.recovery.nonce_chain_evicted";
 /// L1 kept only some of a batch's entries — the composer's partial verdict.
