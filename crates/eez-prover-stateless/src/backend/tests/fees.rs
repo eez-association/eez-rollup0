@@ -3,6 +3,154 @@ use alloy_consensus::{BlockBody, TxReceipt as _, constants::EMPTY_OMMER_ROOT_HAS
 use alloy_primitives::{TxKind, keccak256};
 use reth_trie_common::{HashBuilder, Nibbles, TrieAccount, proof::ProofRetainer};
 
+pub(super) fn ordinary_three_transaction_fixture() -> (AdmittedBlock, ChainConfig) {
+    let beneficiary = Address::repeat_byte(0xb0);
+    let recipient = Address::repeat_byte(0xa0);
+    let mut config = fixture_chain_config();
+    config.shanghai_time = None;
+    config.cancun_time = None;
+    config.prague_time = None;
+    config.osaka_time = None;
+    let transactions = (1..=3)
+        .map(|value| {
+            TransactionSigned::from(
+                TxLegacy {
+                    chain_id: Some(1),
+                    gas_limit: 21_000,
+                    gas_price: 10,
+                    to: TxKind::Call(recipient),
+                    value: U256::from(value),
+                    ..Default::default()
+                }
+                .into_signed(Signature::test_signature()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let senders = transactions
+        .iter()
+        .map(|tx| tx.recover_signer().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        senders
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3
+    );
+    let targets = senders
+        .iter()
+        .copied()
+        .chain([
+            beneficiary,
+            recipient,
+            eez_primitives::SYSTEM_ADDRESS,
+            EEZL2_ADDRESS,
+        ])
+        .map(|address| Nibbles::unpack(keccak256(address)))
+        .collect();
+    let mut accounts = senders
+        .iter()
+        .map(|sender| {
+            (
+                keccak256(sender),
+                TrieAccount {
+                    balance: U256::from(1_000_000),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    accounts.sort_unstable_by_key(|(key, _)| *key);
+    let mut trie = HashBuilder::default().with_proof_retainer(ProofRetainer::new(targets));
+    for (key, account) in accounts {
+        trie.add_leaf(Nibbles::unpack(key), &alloy_rlp::encode(account));
+    }
+    let parent = Header {
+        number: 99,
+        state_root: trie.root(),
+        beneficiary,
+        ommers_hash: EMPTY_OMMER_ROOT_HASH,
+        gas_limit: 30_000_000,
+        gas_used: 15_000_000,
+        base_fee_per_gas: Some(7),
+        ..Default::default()
+    };
+    let witness = ExecutionWitness {
+        state: trie.take_proof_nodes().into_inner().into_values().collect(),
+        headers: vec![alloy_rlp::encode(&parent).into()],
+        ..Default::default()
+    };
+    // Each independent sender pays 210,000 plus value; recipient gets 1+2+3;
+    // beneficiary gets three 63,000 tips and 441,000 base fees are burned.
+    let post = senders
+        .into_iter()
+        .enumerate()
+        .map(|(i, sender)| {
+            (
+                sender,
+                TrieAccount {
+                    nonce: 1,
+                    balance: U256::from(1_000_000 - 210_000 - (i + 1)),
+                    ..Default::default()
+                },
+            )
+        })
+        .chain([
+            (
+                recipient,
+                TrieAccount {
+                    balance: U256::from(6),
+                    ..Default::default()
+                },
+            ),
+            (
+                beneficiary,
+                TrieAccount {
+                    balance: U256::from(189_000),
+                    ..Default::default()
+                },
+            ),
+        ]);
+    let receipts = (1..=3)
+        .map(|i| EthereumReceipt {
+            success: true,
+            cumulative_gas_used: i * 21_000,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let block = Block {
+        header: Header {
+            parent_hash: parent.hash_slow(),
+            number: 100,
+            timestamp: 1,
+            state_root: reth_trie_common::root::state_root_unhashed(post),
+            gas_used: 63_000,
+            transactions_root: proofs::calculate_transaction_root(&transactions),
+            receipts_root: proofs::calculate_receipt_root(
+                &receipts
+                    .iter()
+                    .map(EthereumReceipt::with_bloom_ref)
+                    .collect::<Vec<_>>(),
+            ),
+            ..parent
+        },
+        body: BlockBody {
+            transactions,
+            ..Default::default()
+        },
+    };
+    (
+        admitted_block_with_witness(
+            100,
+            block.header.hash_slow(),
+            block.header.parent_hash,
+            alloy_rlp::encode(block),
+            witness,
+        ),
+        config,
+    )
+}
+
 #[test]
 fn collector_credits_are_committed_by_stateless_replay_and_transaction_checkpoints() {
     let collector = Address::repeat_byte(0xc0);
@@ -151,7 +299,7 @@ fn collector_credits_are_committed_by_stateless_replay_and_transaction_checkpoin
             backend.evm_config.clone(),
         )
         .unwrap();
-        let detailed = stateless_validation_recovered_with_state_checkpoints(
+        let detailed = eez_evm::stateless::validate_with_closed_prefixes(
             recovered,
             witness.clone(),
             backend.chain_spec.clone(),

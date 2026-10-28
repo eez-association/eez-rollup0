@@ -30,10 +30,7 @@ use eez_proof_signer::window::testing::admitted_block_parts_mut;
 use lru::LruCache;
 use reth_chainspec::ChainSpec;
 use stateless_reth::validation::StatelessValidationError;
-use stateless_reth::{
-    StatelessValidationOutput, stateless_validation_recovered,
-    stateless_validation_recovered_with_state_checkpoints,
-};
+use stateless_reth::{StatelessValidationOutput, stateless_validation_recovered};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, trace};
 
@@ -258,7 +255,7 @@ impl Backend {
             let witness = std::mem::take(witness);
             let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
                 Some(plan) if !plan.positions().is_empty() => {
-                    let output = stateless_validation_recovered_with_state_checkpoints(
+                    let output = eez_evm::stateless::validate_with_closed_prefixes(
                         recovered_block.execution_input(),
                         witness,
                         Arc::clone(&self.chain_spec),
@@ -351,6 +348,10 @@ impl Backend {
                 transaction_state_checkpoints,
                 post_state_root,
                 settlement_evidence: SettlementBlockEvidence {
+                    cumulative_gas_used: validated_receipts
+                        .iter()
+                        .map(|r| r.cumulative_gas_used)
+                        .collect(),
                     system_sender_flags,
                     observed_outbound_events,
                 },

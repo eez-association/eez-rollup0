@@ -15,6 +15,17 @@ pub(crate) struct SystemTransactionReconstructor {
 }
 
 impl SystemTransactionReconstructor {
+    pub(super) fn source(
+        &self,
+        parent_hash: alloy_primitives::B256,
+    ) -> Result<eez_protocol::native_source::SourceEntry, String> {
+        Ok(eez_protocol::native_source::LiveSourceContext::new(
+            self.context.l2_chain_id,
+            parent_hash,
+        )?
+        .entry(0))
+    }
+
     pub(crate) fn new(l2_chain_id: u64, expected_rollup_id: NonZeroU64) -> Self {
         Self {
             context: eez_protocol::system_tx::SystemTxContext {
@@ -30,13 +41,13 @@ impl SystemTransactionReconstructor {
         &self,
         outbound: &[(ExecutionEntrySol, Bytes)],
         inbound: &[ExecutionEntrySol],
-        starting_nonce: u64,
+        source: eez_protocol::native_source::SourceEntry,
     ) -> Result<Vec<eez_protocol::system_tx::SyncPair>, String> {
         eez_protocol::system_tx::build_cross_chain_sync_pairs(
             outbound,
             inbound,
             &self.context,
-            starting_nonce,
+            source,
         )
     }
 }

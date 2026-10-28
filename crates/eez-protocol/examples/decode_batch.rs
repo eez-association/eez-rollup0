@@ -184,32 +184,40 @@ fn main() {
                     .map(|t| alloy_primitives::Bytes::from(t.clone())),
             )
             .collect();
-        // Reconstruction requires only public configuration and the parent nonce.
+        // Reconstruction requires only public configuration and authenticated L1 parent hash.
         let cfg = SystemTxContext {
             eezl2_address: alloy_primitives::address!("4200000000000000000000000000000000000007"),
             l2_chain_id: 1,
             this_rollup_id: 1,
         };
-        for start_nonce in [0u64, 1u64] {
-            let pairs =
-                build_cross_chain_sync_pairs(&outbound_paired, &da_inbound, &cfg, start_nonce)
-                    .unwrap();
+        for parent_hash in [B256::repeat_byte(1), B256::repeat_byte(2)] {
+            let pairs = build_cross_chain_sync_pairs(
+                &outbound_paired,
+                &da_inbound,
+                &cfg,
+                eez_protocol::native_source::LiveSourceContext::new(cfg.l2_chain_id, parent_hash)
+                    .unwrap()
+                    .entry(0),
+            )
+            .unwrap();
             let txs = interleave_sync_block_txs(&pairs);
             println!(
-                "-- starting_nonce={start_nonce}: {} sync-block txs --",
+                "-- illustrative L1 parent={parent_hash}: {} sync-block txs --",
                 txs.len()
             );
             for (i, t) in txs.iter().enumerate() {
                 use alloy_consensus::Transaction as _;
                 use alloy_eips::eip2718::Decodable2718 as _;
-                let mut s: &[u8] = t.as_ref();
+                // Illustrative only: exact gas requires replaying the preceding txs.
+                let raw = t.at_position(30_000_000, 0).unwrap();
+                let mut s: &[u8] = raw.as_ref();
                 let stx = TransactionSigned::decode_2718(&mut s).unwrap();
                 println!(
                     "   synctx[{i}] nonce={} to={:?} sel=0x{} len={}",
                     stx.nonce(),
                     stx.to(),
                     hex::encode(stx.input().get(..4).unwrap_or(&[])),
-                    t.len(),
+                    raw.len(),
                 );
             }
         }
