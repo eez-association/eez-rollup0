@@ -16,7 +16,6 @@ use eez_protocol::abi::{
 use eez_protocol::entries::{EntryRole, entry_roles};
 use eez_protocol::public_inputs::batch_shared_public_input;
 
-use super::blob::CandidateBlock;
 use super::types::{AppliedEntry, Post, PostId, Settlement};
 use crate::error::{L1Error, L1Result};
 
@@ -73,7 +72,6 @@ pub(super) struct Consumed {
 pub(super) struct Call {
     pub input: Bytes,
     pub from: Address,
-    pub tx_sender: Address,
     pub logs: usize,
     pub blob_hashes: Vec<B256>,
 }
@@ -291,22 +289,13 @@ fn parse_tx(block: u64, logs: &[ScannedLog]) -> L1Result<Tx<'_>> {
     Ok(Tx { logs, items })
 }
 
-/// The call of a tx sent straight to EEZ or its wrapper with the selector:
-/// the whole tx, sent by its signer. For wrapper posts, EEZ's caller is the wrapper.
-pub(super) fn direct_call(
-    tx: &Transaction,
-    eez: Address,
-    settlement_wrapper: Option<Address>,
-    logs: usize,
-) -> Option<Call> {
+/// The call of a tx sent straight to EEZ with the selector: the whole tx, sent by its signer.
+pub(super) fn direct_call(tx: &Transaction, eez: Address, logs: usize) -> Option<Call> {
     let input = tx.input();
-    let to = tx.to()?;
-    let direct = (to == eez || settlement_wrapper == Some(to))
-        && input.starts_with(&postAndVerifyBatchCall::SELECTOR);
+    let direct = tx.to() == Some(eez) && input.starts_with(&postAndVerifyBatchCall::SELECTOR);
     direct.then(|| Call {
         input: input.clone(),
-        from: if to == eez { tx.inner.signer() } else { to },
-        tx_sender: tx.inner.signer(),
+        from: tx.inner.signer(),
         logs,
         blob_hashes: tx.blob_versioned_hashes().unwrap_or_default().to_vec(),
     })
@@ -337,7 +326,6 @@ pub(super) fn calls_in_tx(
             out.0.push(Call {
                 input: frame.input.clone(),
                 from: frame.from,
-                tx_sender: Address::ZERO,
                 logs: 0,
                 blob_hashes: Vec::new(),
             });
@@ -357,9 +345,6 @@ pub(super) fn calls_in_tx(
     let mut out = (Vec::new(), 0);
     let flat = walk(root, eez, None, &mut out);
     ensure!(flat, "{here}: trace nests a committed post");
-    for call in &mut out.0 {
-        call.tx_sender = root.from;
-    }
     Ok(out)
 }
 
@@ -383,7 +368,6 @@ pub(super) fn read_block(
     block: &Block,
     calls_by_tx: &BTreeMap<u64, (Vec<Call>, usize)>,
     us: u64,
-    candidate: Option<&CandidateBlock<'_>>,
 ) -> L1Result<Vec<Post>> {
     let mut parsed = Vec::new();
     for logs in block.logs.chunk_by(|a, b| a.tx_index == b.tx_index) {
@@ -394,7 +378,7 @@ pub(super) fn read_block(
     let mut places_by_tx = Vec::with_capacity(parsed.len());
     for tx in &parsed {
         let tx_calls = calls_by_tx.get(&tx.logs[0].tx_index);
-        places_by_tx.push(label(block, tx, tx_calls, us, candidate, &mut posts)?);
+        places_by_tx.push(label(block, tx, tx_calls, us, &mut posts)?);
     }
     // Walk the block in log order. A queue belongs to the latest post that
     // listed it (EEZ.sol:804-811, :1578-1582).
@@ -461,7 +445,6 @@ fn label(
     tx: &Tx<'_>,
     tx_calls: Option<&(Vec<Call>, usize)>,
     us: u64,
-    candidate: Option<&CandidateBlock<'_>>,
     posts: &mut Vec<Reading>,
 ) -> L1Result<Vec<Place>> {
     // No post in this tx lists us, so its calls are not read.
@@ -522,12 +505,11 @@ fn label(
             l1_block_hash: block.hash,
             log_index: tx.logs[end.last].log_index,
         };
-        let (batch, blob_hashes) = verify(call, spi, ids, &id, &here, candidate)?;
+        let (batch, blob_hashes) = verify(call, spi, ids, &id, &here)?;
         let post = Post {
             id,
             tx_hash: head.tx_hash,
             sender: call.from,
-            tx_sender: call.tx_sender,
             batch,
             blob_hashes,
             settlement: Settlement::NONE,
@@ -547,7 +529,6 @@ fn verify(
     ids: &[u64],
     id: &PostId,
     here: &str,
-    candidate: Option<&CandidateBlock<'_>>,
 ) -> L1Result<(EvmBatch, Vec<B256>)> {
     let decoded = postAndVerifyBatchCall::abi_decode_validate(&call.input);
     let decoded = decoded.map_err(|e| L1Error::Decode(format!("{here}: bad call: {e}")))?;
@@ -561,22 +542,18 @@ fn verify(
         log_index: id.log_index,
         detail,
     };
-    // Refuses blobs and a non-zero blockNumber, whose customData may read any
-    // state (IRollup.sol:41-54), unless the configured candidate domain applies.
-    let (commitment, blob_hashes) = if batch.blockNumber == 0 && batch.blobIndices.is_empty() {
+    // Refuses a non-zero blockNumber, whose customData may read any state
+    // (IRollup.sol:41-54).
+    let (commitment, blob_hashes) = if batch.blobIndices.is_empty() {
         let commitment = batch_shared_public_input(&batch, call.from);
         (
-            commitment.map_err(|e| unsupported(format!("{here}: {e}")))?,
+            commitment.map_err(|error| unsupported(format!("{here}: {error}")))?,
             Vec::new(),
         )
     } else {
-        let Some(candidate) = candidate.filter(|c| ids == [c.deployment.eez_rollup_id]) else {
-            let detail = format!("{here}: an L1-bound post outside the configured candidate V1");
-            return Err(unsupported(detail));
-        };
         (
-            candidate.commitment(&batch, &call.blob_hashes, call.from, here)?,
-            call.blob_hashes.clone(),
+            super::blob::commitment(&batch, &call.blob_hashes, call.from, here)?,
+            super::blob::selected_hashes(&batch, &call.blob_hashes, here)?,
         )
     };
     let mismatch = format!("{here}: call hashes to {commitment}, not {spi}");

@@ -117,42 +117,27 @@ fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
 
 /// Blob posting uses the embedded L1 fork schedule and configured slot duration.
 fn blob_posting_from_env(
-    candidate: Option<eez_protocol::Rollup0Deployment>,
+    enabled: bool,
     chain_spec: Arc<reth_chainspec::ChainSpec>,
     slot_duration: Duration,
-    submission_slack: Duration,
 ) -> eyre::Result<Option<eez_composer::BlobPostingConfig>> {
-    let Some(deployment) = candidate else {
+    if !enabled {
         return Ok(None);
-    };
+    }
     eyre::ensure!(
         !slot_duration.is_zero() && slot_duration.subsec_nanos() == 0,
-        "EEZ_L1_BLOCK_TIME_MS must be a positive whole number of seconds for candidate V1",
+        "EEZ_L1_BLOCK_TIME_MS must be a positive whole number of seconds for blob profile",
     );
     let max_fee_per_blob_gas = env::var("EEZ_L1_MAX_FEE_PER_BLOB_GAS")
-        .map_err(|_| eyre::eyre!("EEZ_L1_MAX_FEE_PER_BLOB_GAS is required for candidate V1"))?
+        .map_err(|_| eyre::eyre!("EEZ_L1_MAX_FEE_PER_BLOB_GAS is required for blob profile"))?
         .parse::<u128>()
         .ok()
         .filter(|cap| *cap > 0)
         .ok_or_else(|| eyre::eyre!("EEZ_L1_MAX_FEE_PER_BLOB_GAS must be a nonzero wei amount"))?;
-    let post_proof_reserve = match env::var("EEZ_BLOB_POST_PROOF_RESERVE_MS") {
-        Ok(value) => Duration::from_millis(value.parse::<u64>().map_err(|_| {
-            eyre::eyre!("EEZ_BLOB_POST_PROOF_RESERVE_MS must be a nonnegative integer")
-        })?),
-        Err(env::VarError::NotPresent) => submission_slack,
-        Err(error) => return Err(eyre::eyre!("EEZ_BLOB_POST_PROOF_RESERVE_MS: {error}")),
-    };
-    eyre::ensure!(
-        !post_proof_reserve.is_zero()
-            && post_proof_reserve < slot_duration.saturating_sub(submission_slack),
-        "EEZ_BLOB_POST_PROOF_RESERVE_MS must be positive and leave time before the submission deadline",
-    );
     Ok(Some(eez_composer::BlobPostingConfig {
-        deployment,
         chain_spec,
         slot_seconds: slot_duration.as_secs(),
         max_fee_per_blob_gas,
-        post_proof_reserve,
     }))
 }
 
@@ -315,12 +300,15 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         EmbeddedL1::Chiado(chiado_handle) => chiado_handle.node.chain_spec().inner.chain().id(),
     };
     let l2_chain_id = builder.config().chain.chain().id();
-    let candidate = eez_protocol::Rollup0Deployment::from_env(l1_source_chain_id, l2_chain_id)?;
-    let data_guard = candidate.map(|deployment| {
-        Arc::new(eez_node_common::SequencingDataGuard::new(
-            deployment.eez_rollup_id,
-        ))
-    });
+    let blob_da = eez_l1::config::blob_da_enabled()?;
+    let data_guard = if blob_da {
+        let rollup_id = env::var("EEZ_ROLLUP_ID")?.parse::<u64>()?;
+        Some(Arc::new(eez_node_common::SequencingDataGuard::new(
+            rollup_id,
+        )))
+    } else {
+        None
+    };
     let composer_info = composer_rpc::ComposerInfo::new(
         composer_rpc::ComposerContracts {
             registry: eez_registry,
@@ -375,15 +363,14 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MAX_SPECULATIVE_DEPTH);
 
-    let mut submitter_config = SubmitterConfig::from_env()?;
-    submitter_config.reader = submitter_config.reader.with_candidate(candidate)?;
+    let submitter_config = SubmitterConfig::from_env()?;
     let deploy_block = submitter_config.reader.deploy_block;
     let rollup_config = RollupConfig::from_env(
         eez_evm::fee_collector(&chain_spec.genesis.config)?.unwrap_or_default(),
     )?;
     let attributes = EthAttributesBuilder::new(chain_spec.clone())
         .with_fee_recipient(rollup_config.fee_recipient);
-    let l1_watcher_config = L1WatcherConfig::from_env()?.with_candidate(candidate);
+    let l1_watcher_config = L1WatcherConfig::from_env()?;
 
     let submitter = Submitter::new(submitter_config);
     // Handle only — polling starts after boot catch-up fixes the
@@ -547,12 +534,12 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 .await
                 .map_err(|_| eyre::eyre!("timed out reading chain id from EEZ_L1_RPC_URL"))?
                 .map_err(|e| eyre::eyre!("read chain id from EEZ_L1_RPC_URL: {e}"))?;
-        // The signed domain binds the chain where the wrapper executes.
-        if let Some(deployment) = candidate {
+        // Use the fork schedule of the chain receiving the blob transaction.
+        if blob_da {
             eyre::ensure!(
-                deployment.l1_chain_id == l1_submission_chain_id,
-                "candidate V1 binds L1 chain {} but EEZ_L1_RPC_URL serves chain {l1_submission_chain_id}",
-                deployment.l1_chain_id,
+                l1_source_chain_id == l1_submission_chain_id,
+                "blob profile binds L1 chain {} but EEZ_L1_RPC_URL serves chain {l1_submission_chain_id}",
+                l1_source_chain_id,
             );
         }
         let l1_poster_key = env::var("EEZ_L1_POSTER_KEY")
@@ -590,10 +577,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             l1_post_batch_priority_fee,
             ecdsa_proof_system_address,
             blob_posting: blob_posting_from_env(
-                candidate,
+                blob_da,
                 posting_chain_spec,
                 timing.l1_block_time(),
-                timing.submission_slack(),
             )?,
         });
         event!(
@@ -680,6 +666,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             timing,
         )?;
         let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
+
         if let Some(guard) = &data_guard {
             guard.bind(&sync_slot_handle)?;
         }
@@ -1122,23 +1109,9 @@ mod tests {
 
     #[test]
     fn blob_posting_rejects_fractional_l1_slots() {
-        let deployment = eez_protocol::Rollup0Deployment {
-            l1_chain_id: 1,
-            l2_chain_id: 10,
-            eez: Address::repeat_byte(1),
-            manager: Address::repeat_byte(2),
-            settlement_wrapper: Address::repeat_byte(3),
-            eez_rollup_id: 1,
-        };
         let spec = Arc::new(reth_chainspec::ChainSpecBuilder::mainnet().build());
         for duration in [Duration::ZERO, Duration::from_millis(1500)] {
-            let error = blob_posting_from_env(
-                Some(deployment),
-                spec.clone(),
-                duration,
-                Duration::from_millis(100),
-            )
-            .unwrap_err();
+            let error = blob_posting_from_env(true, spec.clone(), duration).unwrap_err();
             assert!(
                 error
                     .to_string()

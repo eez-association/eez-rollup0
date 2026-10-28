@@ -52,7 +52,6 @@ tokio.workspace       = true
 tracing.workspace     = true
 
 [dev-dependencies]
-alloy-rpc-types-eth.workspace = true
 alloy-transport = { version = "2", default-features = false }
 # MockEthProvider: an in-memory StateProviderFactory for the prefix-state
 # equivalence test (no datadir, no engine API).

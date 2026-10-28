@@ -86,7 +86,6 @@ impl L1Reader {
             &trace,
             self.config.eez,
             self.config.rollup_id,
-            self.config.candidate.as_ref(),
             chunks,
         )
         .await
@@ -97,18 +96,14 @@ impl L1Reader {
     /// # Errors
     ///
     /// [`L1Error::Config`] without a beacon, [`L1Error::Provider`] on RPC or
-    /// malformed data, and [`L1Error::SourceIncomplete`] for missing or stale DA.
+    /// malformed data, [`L1Error::SourceIncomplete`] while a source catches up,
+    /// and [`L1Error::BlobUnavailable`] for missing/pruned DA.
     pub async fn post_blobs(&self, post: &Post) -> L1Result<Vec<Vec<u8>>> {
         let beacon = self
             .beacon
             .as_ref()
             .ok_or_else(|| L1Error::Config("blob derivation requires EEZ_L1_BEACON_URL".into()))?;
         beacon.fetch(&self.build_provider(), post).await
-    }
-
-    /// The configured candidate-V1 deployment, if any.
-    pub(crate) fn candidate(&self) -> Option<&eez_protocol::Rollup0Deployment> {
-        self.config.candidate.as_ref()
     }
 
     /// Hash of the canonical L1 block at `number`, or `None` if none. Used by

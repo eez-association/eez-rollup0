@@ -9,7 +9,6 @@ use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{Address, B256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{Filter, Log, Transaction};
-use eez_protocol::Rollup0Deployment;
 use eez_protocol::abi::SCANNED_TOPICS;
 use tracing::{Level, event};
 
@@ -22,7 +21,6 @@ pub mod types;
 
 pub use types::{AppliedEntry, EntryRole, Post, PostId, Settlement};
 
-use self::blob::CandidateBlock;
 use self::model::{Event, ScannedLog, calls_in_tx, direct_call, group_blocks, read_block};
 
 /// Initial block span for historical log scans, so wide catch-up gaps are
@@ -92,7 +90,6 @@ pub(crate) async fn scan_batch_logs_range_adaptive(
     trace: &impl Provider,
     eez: Address,
     rollup_id: u64,
-    candidate: Option<&Rollup0Deployment>,
     from: u64,
     to: u64,
 ) -> L1Result<(Vec<Post>, u64)> {
@@ -117,10 +114,7 @@ pub(crate) async fn scan_batch_logs_range_adaptive(
             Err(err) => return Err(err),
         }
     };
-    Ok((
-        read_logs(logs, trace, eez, rollup_id, candidate, &raw).await?,
-        hi,
-    ))
+    Ok((read_logs(logs, trace, eez, rollup_id, &raw).await?, hi))
 }
 
 /// Scans the oldest pending chunk; `None` once every chunk is scanned.
@@ -129,14 +123,13 @@ pub(crate) async fn scan_next_batch_log_chunk(
     trace: &impl Provider,
     eez: Address,
     rollup_id: u64,
-    candidate: Option<&Rollup0Deployment>,
     chunks: &mut BatchLogChunks,
 ) -> L1Result<Option<Vec<Post>>> {
     let Some(&(from, to)) = chunks.ranges.last() else {
         return Ok(None);
     };
     let (posts, reached) =
-        scan_batch_logs_range_adaptive(logs, trace, eez, rollup_id, candidate, from, to).await?;
+        scan_batch_logs_range_adaptive(logs, trace, eez, rollup_id, from, to).await?;
     chunks.ranges.pop();
     if reached < to {
         // Narrowed: re-queue the tail so no range is skipped.
@@ -152,12 +145,11 @@ pub(crate) async fn scan_range(
     trace: &impl Provider,
     eez: Address,
     rollup_id: u64,
-    candidate: Option<&Rollup0Deployment>,
     from: u64,
     to: u64,
 ) -> L1Result<Vec<Post>> {
     let raw = fetch_scanned_logs(logs, eez, from, to).await?;
-    read_logs(logs, trace, eez, rollup_id, candidate, &raw).await
+    read_logs(logs, trace, eez, rollup_id, &raw).await
 }
 
 /// One `get_logs` for every scanned event: separate calls could answer from
@@ -186,7 +178,6 @@ async fn read_logs(
     trace: &impl Provider,
     eez: Address,
     rollup_id: u64,
-    candidate: Option<&Rollup0Deployment>,
     raw: &[Log],
 ) -> L1Result<Vec<Post>> {
     let lists =
@@ -197,7 +188,6 @@ async fn read_logs(
         let block_hash = block.hash;
         let mut calls_by_tx = BTreeMap::new();
         let mut traced = Vec::new();
-        let mut carries_blobs = false;
         // Only txs with a post listing us are fetched; a direct post's call is the tx itself.
         for tx_logs in block.logs.chunk_by(|a, b| a.tx_index == b.tx_index) {
             let index = tx_logs[0].tx_index;
@@ -206,13 +196,7 @@ async fn read_logs(
             if tx_logs.iter().any(lists) {
                 let tx = fetch_log_transaction(logs, number, block_hash, index, hash).await?;
                 let blob_hashes = tx.blob_versioned_hashes().unwrap_or_default();
-                carries_blobs |= !blob_hashes.is_empty();
-                if let Some(call) = direct_call(
-                    &tx,
-                    eez,
-                    candidate.map(|deployment| deployment.settlement_wrapper),
-                    count,
-                ) {
+                if let Some(call) = direct_call(&tx, eez, count) {
                     calls_by_tx.insert(index, (vec![call], count));
                 } else {
                     traced.push((index, hash, blob_hashes.to_vec()));
@@ -241,18 +225,7 @@ async fn read_logs(
                 calls_by_tx.insert(index, (tx_calls, committed));
             }
         }
-        let candidate_block = match candidate {
-            Some(deployment) if carries_blobs => {
-                Some(CandidateBlock::fetch(logs, number, block_hash, deployment).await?)
-            }
-            _ => None,
-        };
-        posts.extend(read_block(
-            &block,
-            &calls_by_tx,
-            rollup_id,
-            candidate_block.as_ref(),
-        )?);
+        posts.extend(read_block(&block, &calls_by_tx, rollup_id)?);
     }
     Ok(posts)
 }
@@ -290,17 +263,17 @@ mod tests {
     use alloy_rpc_types_trace::geth::{CallFrame, CallLogFrame};
     use alloy_sol_types::{SolCall, SolEvent, SolValue};
     use alloy_transport::mock::Asserter;
-    use eez_protocol::Rollup0Deployment;
     use eez_protocol::abi::{
         BatchPosted, EntryExecuted, EvmBatch, ExecutionConsumed, ExecutionEntrySol,
         L2ExecutionPerformed, L2TxSkipped, RollupIdWithProofSystemsSol, RollupUpdateSol,
         executeL2TxsCall, postAndVerifyBatchCall,
     };
     use eez_protocol::entries::EntryRole::{self, Anchor as A, Inbound};
-    use eez_protocol::public_inputs::{batch_shared_public_input, batch_shared_public_input_with};
+    use eez_protocol::public_inputs::{
+        batch_shared_public_input, batch_shared_public_input_with_blobs,
+    };
     use serde_json::{Value, json};
 
-    use super::blob::CandidateBlock;
     use super::model::{Call, calls_in_tx, direct_call, group_blocks, read_block};
     use super::{AppliedEntry, BatchLogChunks, Post, PostId, Settlement};
     use super::{scan_next_batch_log_chunk, scan_range};
@@ -379,7 +352,6 @@ mod tests {
         Call {
             input,
             from,
-            tx_sender: from,
             logs,
             blob_hashes: Vec::new(),
         }
@@ -528,7 +500,7 @@ mod tests {
 
     fn read(batches: &[EvmBatch], steps: &[S]) -> L1Result<Vec<Post>> {
         let (logs, calls) = build(batches, steps);
-        read_block(&group_blocks(&logs)?.remove(0), &calls, US, None)
+        read_block(&group_blocks(&logs)?.remove(0), &calls, US)
     }
 
     /// What a post settled: `applied` in L1's order, moving us `from -> to`.
@@ -760,19 +732,6 @@ mod tests {
     }
 
     #[test]
-    fn routed_post_preserves_the_outer_transaction_sender() {
-        let input = call(&ours(0, H), ROUTER, 0).input;
-        let mut inner = frame("CALL", EEZ, &input, 1, Vec::new());
-        inner.from = ROUTER;
-        let mut root = frame("CALL", ROUTER, &Bytes::new(), 0, vec![inner]);
-        root.from = EOA;
-        let (calls, _) = calls_in_tx(&root, EEZ, "routed post").unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].from, ROUTER);
-        assert_eq!(calls[0].tx_sender, EOA);
-    }
-
-    #[test]
     fn the_walk_reads_committed_post_calls_only() {
         let (input, other) = (
             call(&ours(0, H), EOA, 0).input,
@@ -813,13 +772,8 @@ mod tests {
         for (to, input, direct) in cases {
             let tx = signed_tx(to, input.clone(), 0);
             let expected = direct.then(|| call(&ours(0, H), EOA, 4));
-            assert_eq!(direct_call(&tx, EEZ, None, 4), expected, "{to} {input}");
+            assert_eq!(direct_call(&tx, EEZ, 4), expected, "{to} {input}");
         }
-        let wrapper = Address::repeat_byte(0x3b);
-        let tx = signed_tx(wrapper, input.clone(), 0);
-        let mut expected = call(&ours(0, H), wrapper, 4);
-        expected.tx_sender = EOA;
-        assert_eq!(direct_call(&tx, EEZ, Some(wrapper), 4), Some(expected));
     }
 
     fn mock() -> (Asserter, impl Provider) {
@@ -886,7 +840,7 @@ mod tests {
         asserter.push_success(&tx_x);
         asserter.push_success(&tx_y);
         // Any other call meets an empty FIFO and fails the scan.
-        let posts = scan_range(&rpc, &no_trace, EEZ, US, None, BLOCK, BLOCK + 1).await;
+        let posts = scan_range(&rpc, &no_trace, EEZ, US, BLOCK, BLOCK + 1).await;
         let posts = posts.expect("read");
         let id = PostId {
             l1_block: BLOCK,
@@ -914,7 +868,7 @@ mod tests {
         asserter.push_success(&direct);
         asserter.push_success(&router);
         serve_trace(&asserter, &[(*router.inner.tx_hash(), traced)]);
-        let posts = scan_range(&rpc, &rpc, EEZ, US, None, BLOCK, BLOCK)
+        let posts = scan_range(&rpc, &rpc, EEZ, US, BLOCK, BLOCK)
             .await
             .expect("read");
         assert!(asserter.read_q().is_empty());
@@ -926,6 +880,62 @@ mod tests {
         );
         let settled = [&posts[0].settlement, &posts[1].settlement];
         assert_eq!(settled, [&s(&[(0, A)], 0, 1), &s(&[(0, A)], 1, 2)]);
+    }
+
+    #[tokio::test]
+    async fn blob_posts_scan_indices_for_direct_and_contract_posts() {
+        for routed in [false, true] {
+            let mut batch = blob_post();
+            let tx_hashes = vec![root(2), root(0x77), root(1)];
+            let selected = vec![root(1), root(2)];
+            batch.blobIndices = vec![U256::from(2), U256::ZERO];
+            let caller = if routed { ROUTER } else { EOA };
+            let input = call(&batch, caller, 0).input;
+            let spi = batch_shared_public_input_with_blobs(&batch, caller, &selected).unwrap();
+            let posted = BatchPosted {
+                sharedPublicInput: spi,
+                rollupIds: vec![US],
+            };
+            let data = [
+                root_log(US, root(1)),
+                exec(0, batch.entries[0].rollingHash),
+                posted.encode_log_data(),
+            ];
+            let logs = data
+                .into_iter()
+                .enumerate()
+                .map(|(i, data)| rpc_log(0, i as u64, data))
+                .collect();
+            let to = if routed { ROUTER } else { EEZ };
+            let tx_input = if routed { Bytes::new() } else { input.clone() };
+            let tx = alloy_consensus::TxEip4844 {
+                chain_id: 1,
+                to,
+                input: tx_input,
+                blob_versioned_hashes: tx_hashes,
+                ..Default::default()
+            };
+            let tx = Transaction::from_transaction(
+                Recovered::new_unchecked(
+                    TxEnvelope::Eip4844(tx.into_signed(Signature::test_signature()).into()),
+                    EOA,
+                ),
+                Default::default(),
+            );
+            let (asserter, rpc) = mock();
+            asserter.push_success(&served_as(logs, 0, &tx));
+            asserter.push_success(&tx);
+            if routed {
+                let inner = frame("CALL", EEZ, &input, 3, Vec::new());
+                let trace = frame("CALL", ROUTER, &Bytes::new(), 0, vec![inner]);
+                serve_trace(&asserter, &[(*tx.inner.tx_hash(), trace)]);
+            }
+            let posts = scan_range(&rpc, &rpc, EEZ, US, BLOCK, BLOCK).await.unwrap();
+            assert_eq!(posts[0].sender, caller);
+            assert_eq!(posts[0].blob_hashes, selected);
+            assert_eq!(posts[0].settlement, s(&[(0, A)], 0, 1));
+            assert!(asserter.read_q().is_empty());
+        }
     }
 
     #[tokio::test]
@@ -953,7 +963,7 @@ mod tests {
             for answer in &answers {
                 asserter.push_success(answer);
             }
-            let err = scan_range(&rpc, &rpc, EEZ, US, None, BLOCK, BLOCK)
+            let err = scan_range(&rpc, &rpc, EEZ, US, BLOCK, BLOCK)
                 .await
                 .expect_err(name);
             assert!(class(&err), "{name}: {err}");
@@ -971,7 +981,7 @@ mod tests {
         assert_eq!(chunks.ranges, [(100_000, 150_000), (0, 99_999)]);
         asserter.push_failure_msg("query exceeds max results 20000");
         asserter.push_success(&Vec::<Log>::new());
-        let posts = scan_next_batch_log_chunk(&rpc, &rpc, EEZ, US, None, &mut chunks).await;
+        let posts = scan_next_batch_log_chunk(&rpc, &rpc, EEZ, US, &mut chunks).await;
         assert!(posts.expect("narrowed").expect("a chunk").is_empty());
         assert_eq!(chunks.ranges, [(100_000, 150_000), (50_000, 99_999)]);
 
@@ -980,7 +990,7 @@ mod tests {
         asserter.push_failure_msg("query exceeds max results 20000");
         // Read only by a retry of the same one-block range.
         asserter.push_success(&Vec::<Log>::new());
-        let err = scan_next_batch_log_chunk(&rpc, &rpc, EEZ, US, None, &mut chunks).await;
+        let err = scan_next_batch_log_chunk(&rpc, &rpc, EEZ, US, &mut chunks).await;
         assert!(matches!(err, Err(L1Error::Provider(_))), "{err:?}");
         let left = (chunks.ranges, asserter.read_q().len());
         assert_eq!(left, (vec![(BLOCK, BLOCK)], 1));
@@ -994,55 +1004,28 @@ mod tests {
         asserter.push_failure_msg("query timeout exceeded");
         // Read only by a wrongly narrowed retry.
         asserter.push_success(&Vec::<Log>::new());
-        let err = scan_next_batch_log_chunk(&rpc, &rpc, EEZ, US, None, &mut chunks).await;
+        let err = scan_next_batch_log_chunk(&rpc, &rpc, EEZ, US, &mut chunks).await;
         assert!(matches!(err, Err(L1Error::Provider(_))), "{err:?}");
         let left = (chunks.ranges, asserter.read_q().len());
         assert_eq!(left, (vec![(BLOCK, BLOCK + 1)], 1));
     }
 
-    const DEPLOYMENT: Rollup0Deployment = Rollup0Deployment {
-        l1_chain_id: 1,
-        eez: EEZ,
-        manager: Address::repeat_byte(0x3A),
-        settlement_wrapper: Address::repeat_byte(0x3B),
-        eez_rollup_id: US,
-        l2_chain_id: 10,
-    };
-
-    fn candidate_block(parent: u8) -> CandidateBlock<'static> {
-        CandidateBlock {
-            deployment: &DEPLOYMENT,
-            timestamp: 1_200,
-            parent_hash: root(parent),
-        }
-    }
-
-    /// An anchor-only candidate-V1 batch selecting both of its tx's blobs.
-    fn candidate_v1() -> EvmBatch {
+    /// An anchor-only blob batch selecting both of its tx's blobs.
+    fn blob_post() -> EvmBatch {
         let mut v1 = batch(&[US], vec![anchor(0, 1)], 1);
-        v1.blockNumber = u64::MAX;
+        v1.blockNumber = 0;
         v1.callData = Bytes::new();
         v1.blobIndices = vec![U256::ZERO, U256::from(1)];
         v1
     }
 
     /// Reads one direct post of `carried` in a tx with `blob_hashes`, whose
-    /// `BatchPosted` commits to `v1` as EEZ computes it in block `parent`'s child.
-    fn read_v1(
-        carried: &EvmBatch,
-        blob_hashes: &[B256],
-        candidate: Option<&CandidateBlock<'_>>,
-    ) -> L1Result<Vec<Post>> {
-        let v1 = candidate_v1();
-        let custom_data = DEPLOYMENT.custom_data(1_200, root(0x99));
+    /// `BatchPosted` commits to `v1` as EEZ computes it.
+    fn read_v1(carried: &EvmBatch, blob_hashes: &[B256]) -> L1Result<Vec<Post>> {
+        let v1 = blob_post();
         let committed_hashes = [root(0x01), root(0x02)];
-        let spi = batch_shared_public_input_with(
-            &v1,
-            EOA,
-            &committed_hashes,
-            std::slice::from_ref(&custom_data),
-        )
-        .expect("covered");
+        let spi =
+            batch_shared_public_input_with_blobs(&v1, EOA, &committed_hashes).expect("covered");
         let applied = &v1.entries[0];
         let posted = BatchPosted {
             sharedPublicInput: spi,
@@ -1057,56 +1040,45 @@ mod tests {
             .zip(logs)
             .map(|(i, data)| rpc_log(0, i, data))
             .collect();
-        let mut tx_call = call(carried, DEPLOYMENT.settlement_wrapper, logs.len());
-        tx_call.tx_sender = EOA;
+        let mut tx_call = call(carried, EOA, logs.len());
         tx_call.blob_hashes = blob_hashes.to_vec();
         let calls = Calls::from([(0, (vec![tx_call], logs.len()))]);
-        read_block(&group_blocks(&logs)?.remove(0), &calls, US, candidate)
+        read_block(&group_blocks(&logs)?.remove(0), &calls, US)
     }
 
-    /// A blob post commits to its transaction's blobs and containing block
-    /// domain; the scan reproduces both and reads only the wrapper's carrier.
+    /// A blob post commits to the selected transaction blobs.
     #[test]
-    fn candidate_v1_posts_bind_their_blobs_and_block() {
+    fn blob_posts_select_indices() {
         let hashes = [root(0x01), root(0x02)];
-        let ours = candidate_block(0x99);
 
-        let posts = read_v1(&candidate_v1(), &hashes, Some(&ours)).expect("canonical");
+        let posts = read_v1(&blob_post(), &hashes).expect("canonical");
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].blob_hashes, hashes);
         assert_eq!(posts[0].settlement, s(&[(0, A)], 0, 1));
 
-        let rotated = Rollup0Deployment {
-            settlement_wrapper: Address::repeat_byte(0x3C),
-            ..DEPLOYMENT
-        };
-        let historical = CandidateBlock {
-            deployment: &rotated,
-            ..ours
-        };
-        assert!(read_v1(&candidate_v1(), &hashes, Some(&historical)).is_ok());
+        // Select the named blobs in batch order and ignore unrelated tx blobs.
+        let mut indexed = blob_post();
+        indexed.blobIndices = vec![U256::from(2), U256::ZERO];
+        let tx_hashes = [root(0x02), root(0x77), root(0x01)];
+        let indexed_posts = read_v1(&indexed, &tx_hashes).unwrap();
+        assert_eq!(indexed_posts[0].blob_hashes, hashes);
+        assert_eq!(indexed_posts[0].settlement, posts[0].settlement);
+        indexed.blobIndices[0] = U256::MAX;
+        assert!(matches!(
+            read_v1(&indexed, &tx_hashes),
+            Err(L1Error::Decode(_))
+        ));
 
-        // Without the configured deployment the customData is not reproducible.
-        let err = read_v1(&candidate_v1(), &hashes, None).unwrap_err();
-        assert!(matches!(err, L1Error::Unsupported { .. }), "{err}");
-
-        // Another parent is another domain: the commitment no longer matches.
-        let err = read_v1(&candidate_v1(), &hashes, Some(&candidate_block(0x98))).unwrap_err();
-        assert!(matches!(err, L1Error::Decode(_)), "{err}");
-
-        let mut tail = candidate_v1();
+        let mut tail = blob_post();
         tail.callData = vec![0xDA].into();
-        let mut partial = candidate_v1();
-        partial.blobIndices.pop();
-        let mut timeless = candidate_v1();
+        let mut timeless = blob_post();
         timeless.blockNumber = 7;
         for (name, carried, tx_hashes) in [
             ("calldata tail", tail, &hashes[..]),
-            ("unselected blob", partial, &hashes[..]),
-            ("missing blob", candidate_v1(), &hashes[..1]),
+            ("missing blob", blob_post(), &hashes[..1]),
             ("other blockNumber", timeless, &hashes[..]),
         ] {
-            let err = read_v1(&carried, tx_hashes, Some(&ours)).unwrap_err();
+            let err = read_v1(&carried, tx_hashes).unwrap_err();
             assert!(matches!(err, L1Error::Decode(_)), "{name}: {err}");
         }
     }

@@ -3720,9 +3720,9 @@ where
 
         // ── Dispatch the rich L1 bundle and register the optimistic block. ──
         let sync_height = built.header.number();
-        // keccak of the raw EIP-2718 envelope (excluding any blob sidecar) is the tx's hash —
-        // recorded in the ledger so the finality audit can look up the
-        // postBatch receipt.
+        // keccak of the raw EIP-2718 envelope (excluding any blob sidecar) is
+        // the tx's hash — recorded in the ledger so the finality audit can
+        // look up the postBatch receipt.
         let post_batch_hash = post_batch_tx_hash(&postbatch_raw)?;
         let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivors.len());
         bundle.push(postbatch_raw);
@@ -3876,9 +3876,9 @@ where
             }
         };
         let sync_height = empty_built.header.number();
-        // keccak of the raw EIP-2718 envelope (excluding any blob sidecar) is the tx's hash —
-        // recorded in the ledger so the finality audit can look up the
-        // postBatch receipt.
+        // keccak of the raw EIP-2718 envelope (excluding any blob sidecar) is
+        // the tx's hash — recorded in the ledger so the finality audit can
+        // look up the postBatch receipt.
         let post_batch_hash = post_batch_tx_hash(&minimal_postbatch_raw)?;
         event!(
             name: "eez.composer.phase1.bundle.dispatched",

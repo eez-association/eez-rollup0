@@ -1,4 +1,4 @@
-//! Producer-only DA budget; imported blocks retain the consensus rules.
+//! Blob sequencing budget for locally produced blocks; imports use consensus rules.
 
 use std::sync::{Arc, OnceLock, Weak};
 

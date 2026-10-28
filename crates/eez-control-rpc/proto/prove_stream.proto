@@ -81,13 +81,13 @@ message SettlementInput {
   // including when the posting client submits it through a settlement wrapper.
   bytes abi_calldata = 1;
   // Complete physical EIP-4844 blobs in transaction order.
-  // The prover derives commitments/versioned hashes itself. RollupX and
+  // The prover derives commitments/versioned hashes itself. RollupX and draft
   // blob-based Rollup0 require all blobs, empty batch.callData and indices [0, 1, ...].
   repeated bytes blobs = 2;
   // Named L1 target, independently authenticated.
   // Manager-specific custom data is derived from trusted profile/deployment rules,
   // not supplied here. Both blob profiles use these same target fields.
-  // Required for the Rollup0 and RollupX blob profiles.
+  // Required for the RollupX profile.
   L1PostingContext posting_context = 3;
 }
 

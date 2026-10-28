@@ -22,6 +22,9 @@ pub enum L1Error {
     /// source, a reorg between two calls, or logs from two forks of one block.
     #[error("L1 source incomplete at block {block}: {detail}")]
     SourceIncomplete { block: u64, detail: String },
+    /// A mined batch's blob data is absent from the configured beacon node.
+    #[error("blob data unavailable at block {block}: {detail}")]
+    BlobUnavailable { block: u64, detail: String },
     /// A batch post for our rollup in a shape this node does not read.
     #[error("unsupported L1 batch post at block {block}, log {log_index}: {detail}")]
     Unsupported {
@@ -67,6 +70,7 @@ impl L1Error {
         matches!(
             self,
             Self::Decode(_)
+                | Self::BlobUnavailable { .. }
                 | Self::Unsupported { .. }
                 | Self::TraceUnavailable { .. }
                 | Self::ReorgTooDeep { .. }
@@ -88,6 +92,7 @@ mod tests {
             (L1Error::Config(d()), NEITHER),
             (L1Error::Provider(d()), RETRYABLE),
             (L1Error::Decode(d()), TERMINAL),
+            (L1Error::BlobUnavailable { block, detail: d() }, TERMINAL),
             (L1Error::SourceIncomplete { block, detail: d() }, RETRYABLE),
             (
                 L1Error::Unsupported {

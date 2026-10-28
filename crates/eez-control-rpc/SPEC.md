@@ -9,7 +9,9 @@ send it to an EEZ prover, validate the response, and use the returned proof in
 It does not specify how a prover validates or proves a request. See the
 [`eez-proof-signer` documentation](../eez-proof-signer/docs/README.md) for the
 reference implementation's architecture and validation pipeline.
-[`prove.proto`](proto/prove.proto) is the canonical wire schema.
+[`prove.proto`](proto/prove.proto) is the canonical wire schema. This window RPC
+supports calldata settlement; blob settlement uses the
+[streaming RPC](STREAMING_SPEC.md).
 
 ## 1. Composer flow
 

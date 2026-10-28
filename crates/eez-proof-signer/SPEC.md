@@ -40,64 +40,38 @@ where:
 - each outbound effect represents one successful mutable L2-to-L1 call; and
 - each inbound effect represents one successful mutable L1-to-L2 delivery.
 
-Both profiles support exactly one nonzero rollup ID, one nonzero proof-system
-address, and one nonzero proof-system verification key. They do not support
+The profile supports exactly one nonzero rollup ID, one nonzero proof-system
+address, and one nonzero proof-system verification key. It does not support
 static entries, nested calls, multiple calls per effect, explicit call gas,
-force-revert spans, sender binding, or multiple proof systems.
+force-revert spans, L1 block binding, sender binding, or multiple proof
+systems.
 
-`EEZ_SETTLEMENT_PROFILE=blob` selects the blob-settlement profile for both
-daemons; unset or `calldata` keeps the calldata profile. The profile must match
-the deployment: `blob` requires `EEZ_SETTLEMENT_WRAPPER_ADDRESS`, and `calldata`
-refuses it, since the candidate-V1 manager rejects calldata posts. Each blob
-`Finalize` must then carry the complete physical blobs and an
-`L1PostingContext`, and the signer additionally requires:
-
-- the posting parent canonical on its own `EEZ_L1_RPC_URL`, read again after the
-  other L1 reads, and a target timestamp one or more `EEZ_L1_BLOCK_TIME_MS`
-  slots after that parent;
-- at that parent, EEZ's Rollup0 manager and that manager's active wrapper equal
-  the configured ones, and the EEZ root equals the selected L2 parent's hash;
-- at most the active L1 chain-spec blob limit, with `blobIndices == [0, n)` and
-  empty `callData` (the signer reads that spec from `EEZ_L1_CHAIN_CONFIG`, or
-  uses the built-in Chiado spec when `EEZ_L1_CHAIN_ID` is 10200);
-- `blockNumber == uint64.max`, the same `anchor, outbound*, inbound*` sequence
-  as the calldata profile, and a span of whole
-  `K = EEZ_L1_BLOCK_TIME_MS / EEZ_L2_BLOCK_TIME_MS` intervals ending at a Sync
-  height. A batch with actions ends at the target timestamp; an anchor-only
-  catch-up batch may end earlier, and no batch may end later; and
-- the decoded blob stream bound to the validated window, with versioned hashes
-  and manager data derived locally from trusted configuration.
-
-Unsupported blobs or context in the calldata profile, and the v1 `Prove` RPC in
-candidate V1, fail `UNIMPLEMENTED`;
-malformed or missing candidate inputs fail `INVALID_ARGUMENT`; a replaced parent
-fails `ABORTED`; an unavailable L1 source fails `UNAVAILABLE`; and a parent other
-than the settled cursor, or another manager or wrapper, fails `FAILED_PRECONDITION`.
+The profile supports calldata and blob DA using the stock protocol `Rollup.sol`.
+Both retain `blockNumber == 0` and empty `customData`. Blob settlement uses
+streaming `Finalize` with physical blobs and no `posting_context`; the signer
+derives the blob hashes locally after verifying the same execution and effects
+as calldata. The stream is unchanged apart from `CloseBlobStream` and 31-byte
+field-element packing.
 
 No failed stage may produce a signature. A successful signature authorizes the
 locally recomputed public-input hash only under all rules in this document.
 
 ### 1.1 What the signature does not establish
 
-In the calldata profile, both the window RPC and streaming Finalize retain
-conditional-proof semantics: the signer proves the transition from the selected
-execution parent, not that the parent was already accepted on L1. The L1
-contract checks each update's `currentRoot` against the live rollup root when
-consuming the entry. Streaming, subrange selection and cache reuse do not add
-an L1-history requirement to the stateless signer. The stateful backend's safe-anchor and fork-choice checks
+Both the window RPC and streaming Finalize retain conditional-proof semantics:
+the signer proves the transition from the selected execution parent, not that
+the parent was already accepted on L1. The L1 contract checks each update's
+`currentRoot` against the live rollup root when consuming the entry. Streaming,
+subrange selection and cache reuse do not add an L1-history requirement to the
+stateless signer. The stateful backend's safe-anchor and fork-choice checks
 remain additional backend policy, not a different meaning for the signature.
-
-The blob profile additionally authenticates the selected parent against the
-settled L1 cursor and checks the manager and active wrapper at the posting
-parent. Those snapshot checks do not guarantee future on-chain applicability.
 
 The signature does **not** establish:
 
 - canonical L2 ancestry, fork choice, finality, or sequencer authorization;
 - that the witness-backed pre-state is an operator-trusted chain checkpoint, or
   which execution backend produced the validation evidence;
-- L1 registry state after the authenticated snapshot, or future on-chain
-  applicability of a state update;
+- current L1 registry state or future on-chain applicability of a state update;
 - successful future execution of an L1 target call;
 - proof-system registration, threshold configuration, or verification-key
   equality in the deployed rollup manager;
@@ -492,17 +466,17 @@ The decoded batch MUST satisfy all of these profile rules:
 6. `immediateStaticEntryCount == 0`.
 7. `immediateEntryCount` equals the complete leading run of mutable entries
    whose `proxyEntryHash == 0`.
-8. Calldata profile: `blockNumber == 0` and `blobIndices` is empty.
-   Blob profile: `blockNumber == uint64.max`, `callData` is empty, and
-   `blobIndices == [0, n)`.
-9. `bindMsgSenderInPublicInput == false`.
+8. `blockNumber == 0`.
+9. Calldata: `blobIndices` is empty. Blob DA: `callData` is empty and
+   `blobIndices == [0, n)`, with at least one blob.
+10. `bindMsgSenderInPublicInput == false`.
 
 `proofs` is not inspected and is absent from the public-input hash. The caller
 is responsible for inserting the returned signature into the correct proof
 carrier and satisfying the on-chain `proofSystems.length == proofs.length`
 requirement.
 
-The calldata profile assumes the deployed rollup manager returns empty `customData` for
+This profile assumes the deployed rollup manager returns empty `customData` for
 `getCustomData(0)`, as the pinned reference `Rollup` does. The configured vkey
 and proof-system address MUST match the deployed manager configuration; the
 signer does not query L1 to confirm them.
@@ -684,20 +658,28 @@ nonnegative `int192`.
 
 ## 11. Data-availability and Sync-block verification
 
-The batch `callData` MUST have this exact shape:
+The DA stream MUST have this exact shape:
 
 ```text
-0x00 || RLP([blockTxCounts, transactions, l2Entries])
+0x00 || ChainOperation(rollup_id, operations)
+     || (Initiate || Call || Return || Finish)*
 ```
 
-There MUST be no trailing bytes or fields. `blockTxCounts` contains one RLP
-`u16` per validated block. `transactions` and `l2Entries` are RLP lists whose
-items are themselves RLP lists of byte values; decoding each item MUST recover
-the exact EIP-2718 transaction bytes or ABI sidecar bytes being compared.
+`operations` contains the version-0 columnar block span defined by
+[`eez-payload-codec`](../eez-payload-codec/src/lib.rs). Its transaction counts
+and bytes MUST recover the exact EIP-2718 transactions being compared. The
+stream's rollup ID MUST equal the expected rollup ID.
 
-For every block before the terminal block, `blockTxCounts` MUST equal the exact
-validated transaction count and every transaction byte string MUST match in
-order.
+Calldata settlement carries the stream in `batch.callData`, with no trailing
+bytes or fields. Blob settlement appends `CloseBlobStream`, packs 31 bytes per
+field element, and zero-pads the final blob. Each physical blob MUST contain
+131072 bytes, every field element's high byte MUST be zero, and every byte
+after the close marker MUST be zero. Both profiles use the same decoded span
+and action checks below.
+
+For every block before the terminal block, the decoded transaction count MUST
+equal the exact validated transaction count and every transaction byte string
+MUST match in order.
 
 For the terminal block, the DA projection omits:
 
@@ -707,7 +689,7 @@ For the terminal block, the DA projection omits:
 Outbound user transactions remain. Counts and retained transaction bytes MUST
 match this projection exactly.
 
-There MUST be one `l2Entries` sidecar per effect, in effect order:
+There MUST be one decoded action sidecar per effect, in effect order:
 
 - an outbound sidecar is the authorized batch entry with `rollupUpdates`
   cleared, `rollingHash` set to zero, and `returnData` supplied by the DA
@@ -775,10 +757,8 @@ customDataHashes  = dynamic bytes32[] containing only customDataHash
 boundSender       = address(0)
 ```
 
-For the blob profile, `blobHashes` are the versioned hashes of the submitted
-blobs and `customData` is the manager value for the authenticated L1 parent.
-`staticEntryHashes` and `boundSender` stay as above. `callData` is empty, so
-`H(batch.callData)` is the hash of empty bytes.
+For blob DA, `blobHashes` are independently derived from the validated physical
+blobs. `callData` is empty; custom data and the remaining fields are unchanged.
 
 The shared input is:
 
@@ -816,7 +796,7 @@ not participate.
 
 ### 12.1 Fields not bound by the digest
 
-The full mutable entries and `callData` are bound as above. The following batch
+The full mutable entries and DA payload are bound as above. The following batch
 carriers are not directly included in the digest:
 
 - `expectedRootPerRollup`;

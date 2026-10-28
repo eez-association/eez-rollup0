@@ -806,30 +806,15 @@ impl SessionRuntime {
     ) -> Result<Proof, Status> {
         let started = Instant::now();
         let terminal_hash = parse_b256("terminal hash", &finalize.terminal_hash)?;
-        let mut settlement = finalize
+        let settlement = finalize
             .settlement
             .take()
             .ok_or_else(|| Status::invalid_argument("Finalize carries no settlement input"))?;
-        let requested_blob_context = match (
-            self.state.blob_context_authority.as_deref(),
-            settlement.blobs.is_empty(),
-            settlement.posting_context.take(),
-        ) {
-            (None, true, None) => None,
-            (None, _, _) => {
-                return Err(Status::unimplemented("blob settlement is not configured"));
-            }
-            (Some(authority), false, Some(context)) => {
-                let requested = crate::blob_profile::parse_posting_context(context)
-                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
-                Some((authority, requested))
-            }
-            (Some(_), _, _) => {
-                return Err(Status::invalid_argument(
-                    "blob settlement requires both blobs and posting_context",
-                ));
-            }
-        };
+        if settlement.posting_context.is_some() {
+            return Err(Status::unimplemented(
+                "this Rollup0 deployment does not support posting context",
+            ));
+        }
         let session = self.session(bound.id).await?;
         // Check the requested range and terminal identity, then snapshot its artifacts and anchor.
         let (anchor, validated_window, start_index, cancellation) = {
@@ -844,44 +829,9 @@ impl SessionRuntime {
             (anchor, window, start_index, session.cancellation.clone())
         };
 
-        let authenticated_blob_context =
-            if let Some((authority, requested)) = requested_blob_context {
-                let remaining = self
-                    .limits
-                    .request_timeout()
-                    .saturating_sub(started.elapsed());
-                if remaining.is_zero() {
-                    return Err(Status::deadline_exceeded(
-                        "Finalize posting-context authentication deadline exceeded",
-                    ));
-                }
-                Some(
-                    timeout(remaining, authority.authenticate(requested, anchor.hash))
-                        .await
-                        .map_err(|_| {
-                            Status::deadline_exceeded(
-                                "Finalize posting-context authentication deadline exceeded",
-                            )
-                        })?
-                        .map_err(blob_context_status)?,
-                )
-            } else {
-                None
-            };
-
         let state = Arc::clone(&self.state);
-        let remaining = self
-            .limits
-            .request_timeout()
-            .saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            cancellation.cancel();
-            return Err(Status::deadline_exceeded(
-                "ProveStream Finalize deadline exceeded",
-            ));
-        }
         match timeout(
-            remaining,
+            self.limits.request_timeout(),
             state.backend.prepare_attestation(&validated_window),
         )
         .await
@@ -907,12 +857,6 @@ impl SessionRuntime {
         }
         let worker_cancellation = cancellation.clone();
         let worker = tokio::task::spawn_blocking(move || {
-            let blob = authenticated_blob_context.as_ref().map(|context| {
-                super::settlement_job::BlobSettlementInput {
-                    blobs: &settlement.blobs,
-                    context,
-                }
-            });
             let hash = run_settlement(SettlementInput {
                 submitted_post_batch_calldata: settlement.abi_calldata,
                 validated_window: &validated_window,
@@ -922,7 +866,7 @@ impl SessionRuntime {
                 expected_proof_system: state.attester.expected_proof_system(),
                 system_transaction_reconstructor: &state.system_transaction_reconstructor,
                 cancellation: &worker_cancellation,
-                blob,
+                blobs: &settlement.blobs,
             })
             .map_err(PipelineError::Settlement)?;
             Ok::<_, PipelineError>(hash)
@@ -963,8 +907,6 @@ impl SessionRuntime {
             Level::INFO,
             event_name = "eez.proof_signer.window_signed",
             session_id = %bound.id,
-            from = finalize.from_block,
-            to = finalize.to_block,
             validated_from_block = finalize.from_block,
             validated_to_block = finalize.to_block,
             recomputed_public_inputs_hash = %hash.into_inner(),
@@ -990,7 +932,7 @@ impl Prover for ProveSvc {
         let (sender, receiver) = mpsc::channel(8);
         self.sessions
             .active_streams
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_ACTIVE_STREAMS).then_some(active + 1)
             })
             .map_err(|_| Status::resource_exhausted("too many active prover streams"))?;
@@ -1091,19 +1033,6 @@ fn validated_response(artifact: &ValidatedBlock, reused: bool) -> Validated {
 fn validation_status(error: ValidationError) -> Status {
     warn!(%error, "stream validation failed");
     PipelineError::Validation(error).status()
-}
-
-fn blob_context_status(error: crate::blob_profile::BlobContextError) -> Status {
-    use crate::blob_profile::BlobContextError;
-    let message = error.to_string();
-    match error {
-        BlobContextError::Invalid(_) => Status::invalid_argument(message),
-        BlobContextError::StaleTarget => Status::aborted(message),
-        BlobContextError::Unavailable(_) => Status::unavailable(message),
-        BlobContextError::WrongSettledCursor | BlobContextError::WrongDeployment => {
-            Status::failed_precondition(message)
-        }
-    }
 }
 
 fn server_frame(bound: BoundSession, request_id: u64, kind: server_frame::Kind) -> ServerFrame {
@@ -1457,7 +1386,7 @@ mod tests {
                 .batch,
             blocks,
             l1_block_hash: None,
-            blob: None,
+            blobs: Vec::new(),
         }
     }
 

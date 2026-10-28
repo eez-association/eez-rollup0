@@ -59,7 +59,7 @@ impl BeaconBlobSource {
         }
     }
 
-    /// Fetch a post's committed blobs in transaction order, pinned to its L1 block.
+    /// Fetch a post's committed blobs in blobIndices order, pinned to its L1 block.
     pub(crate) async fn fetch(
         &self,
         provider: &impl Provider,
@@ -78,7 +78,12 @@ impl BeaconBlobSource {
             .header
             .timestamp;
         let slot = self.timing().await?.slot_at(timestamp)?;
-        let beacon_block = self.get(&format!("eth/v2/beacon/blocks/{slot}")).await?;
+        let Some(beacon_block) = self
+            .get_optional(&format!("eth/v2/beacon/blocks/{slot}"))
+            .await?
+        else {
+            return Err(self.missing_blobs(block, slot).await?);
+        };
         let execution_hash = json_b256(
             &beacon_block,
             "/data/message/body/execution_payload/block_hash",
@@ -102,18 +107,23 @@ impl BeaconBlobSource {
                     .await?
             }
         };
-        let body = body.ok_or_else(|| L1Error::SourceIncomplete {
-            block,
-            detail: format!("beacon serves no blobs for slot {slot}: behind or pruned"),
-        })?;
+        let Some(body) = body else {
+            return Err(self.missing_blobs(block, slot).await?);
+        };
         let served = parse_blobs(&body)?;
         let hashes = eez_blob::versioned_hashes(&served).map_err(|error| {
             L1Error::Provider(format!("beacon served an invalid blob: {error}"))
         })?;
-        select_blobs(hashes, served, &post.blob_hashes).ok_or_else(|| L1Error::SourceIncomplete {
-            block,
-            detail: format!("beacon slot {slot} does not serve every transaction blob"),
-        })
+        match select_blobs(hashes, served, &post.blob_hashes) {
+            Some(blobs) => Ok(blobs),
+            None => Err(self.missing_blobs(block, slot).await?),
+        }
+    }
+
+    async fn missing_blobs(&self, block: u64, slot: u64) -> L1Result<L1Error> {
+        let head = self.get("eth/v1/beacon/headers/head").await?;
+        let head_slot = json_u64(&head, "/data/header/message/slot")?;
+        Ok(missing_blob_error(block, slot, head_slot))
     }
 
     async fn timing(&self) -> L1Result<BeaconTiming> {
@@ -170,6 +180,24 @@ impl BeaconBlobSource {
     }
 }
 
+fn missing_blob_error(block: u64, slot: u64, head_slot: u64) -> L1Error {
+    if head_slot <= slot {
+        L1Error::SourceIncomplete {
+            block,
+            detail: format!(
+                "beacon head {head_slot} has not advanced past blob slot {slot}; retry after synchronization"
+            ),
+        }
+    } else {
+        L1Error::BlobUnavailable {
+            block,
+            detail: format!(
+                "beacon does not retain all selected blobs at slot {slot}; use a beacon node retaining this history"
+            ),
+        }
+    }
+}
+
 fn select_blobs(
     hashes: Vec<B256>,
     blobs: Vec<Vec<u8>>,
@@ -223,6 +251,17 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn missing_blobs_wait_for_a_lagging_beacon_but_halt_for_lost_history() {
+        assert!(missing_blob_error(100, 20, 19).is_retryable());
+        assert!(missing_blob_error(100, 20, 20).is_retryable());
+        assert!(matches!(
+            missing_blob_error(100, 20, 21),
+            L1Error::BlobUnavailable { block: 100, .. }
+        ));
+        assert!(missing_blob_error(100, 20, 21).is_terminal());
+    }
 
     #[test]
     fn both_beacon_response_shapes_parse() {

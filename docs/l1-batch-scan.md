@@ -36,15 +36,11 @@ ids strictly increase (`:578-584`).
 
 ## Calls
 
-- **Direct post.** `tx.to` is EEZ, or the configured settlement wrapper, and the
-  input starts with the selector. The wrapper forwards that calldata in one
-  EEZ call, so the bytes are `tx.input`. `sender` is `tx.from` for a direct EEZ
-  post and the wrapper for a wrapper post. `tx_sender` is the outer signer
-  either way. Every scanned log is the post's.
+- **Direct post.** `tx.to` is EEZ and the input starts with the selector: the
+  bytes are `tx.input`, the sender `tx.from`, and every scanned log is the post's.
 - **Contract post.** Anything else (router, Safe, ERC-4337, EIP-7702,
   `EEZPostBatcher`) may build the bytes in memory, so the scan traces the block
   with `debug_traceBlockByHash` (`callTracer`, `withLog`), pinned by hash.
-  `tx_sender` is the traced transaction's signer.
 
 The walk drops every frame with an `error` or `revertReason`, and its subtree.
 A call is a committed `CALL` to EEZ with the selector, sent by the frame's
@@ -60,21 +56,16 @@ Each call whose post lists this rollup is checked against its own `BatchPosted`:
 
 1. the bytes decode as `postAndVerifyBatch`, else `Decode`;
 2. `rollupIdsWithProofSystems[].rollupId` equals `rollupIds`, else `Decode`;
-3. no `blobIndices` and `blockNumber == 0`; or, in a blob-carrying tx under
-   the configured `Rollup0Deployment`, a post listing only this rollup must be
-   a candidate-V1 carrier: `blockNumber == uint64.max`, empty `callData` and
-   `blobIndices == [0, n)` over the tx's `n` blobs (`Decode` otherwise). Any
-   other shape is `Unsupported`;
+3. `blockNumber == 0`; blob DA requires empty `callData` and valid indices
+   into the outer transaction's versioned hashes;
 4. the shared public input equals `sharedPublicInput`, else `Decode`, or
-   `Unsupported` when another listed rollup may bind `customData` the scan
-   cannot reproduce. A Rollup0 blob post binds the tx's versioned hashes and
-   manager data derived from its own block's timestamp and parent. Historical
-   posts use their committed EEZ caller as the wrapper, so rotating the wrapper
-   does not invalidate earlier history. The proof signer authenticates the
-   active wrapper from its own L1 read before signing a new candidate.
+   `Unsupported` when another listed rollup may bind custom data the scan
+   cannot reproduce. Both DA profiles use empty custom data from stock
+   `Rollup.sol` at block zero.
 
-Derivation fetches a settled, unprocessed candidate-V1 post's blobs from
-`EEZ_L1_BEACON_URL` and keeps only those matching its versioned hashes.
+The scan selects versioned hashes in `blobIndices` order and ignores unselected
+transaction blobs. Derivation retrieves exactly those blobs from
+`EEZ_L1_BEACON_URL`, checks their hashes, and decodes the close-stream marker.
 
 The hash does not bind `immediateEntryCount`, `expectedRootPerRollup` or the
 proofs; the scan reads them from the exact bytes EEZ received.
@@ -110,7 +101,8 @@ must match its entry, else `Decode`: `callHash` and `queue` (`:1304-1320`),
 | Variant | Class | Raised for |
 |---|---|---|
 | `Provider` | retryable | transport; a malformed `get_logs` answer; a trace failure other than `-32601`, including a post's transaction failing or missing |
-| `SourceIncomplete` | retryable | two hashes for one block; a transaction or block the endpoint does not serve yet; unavailable blob data |
+| `SourceIncomplete` | retryable | two hashes for one block; a transaction or block the endpoint does not serve yet; a lagging beacon |
+| `BlobUnavailable` | terminal | selected blob data missing from a slot behind the beacon head |
 | `Decode` | terminal | undecodable bytes; a `rollupIds` or commitment mismatch; a grammar, pairing, ownership or entry-match violation |
 | `Unsupported` | terminal | the shapes below; a multi-rollup commitment mismatch; a post not made by a selector `CALL` |
 | `TraceUnavailable` | terminal | `-32601` (no `debug` namespace) on a block that needs a trace |
@@ -148,37 +140,34 @@ A trace costs milliseconds against a 12 s slot.
 
 ## Unsupported shapes
 
-- **Other blob profiles.** The scan accepts only the configured Rollup0 blob
+- **Other blob profiles.** The scan accepts only the current Rollup0 blob
   carrier. It cannot reproduce another rollup's manager data.
-- **Other nonzero block numbers.** `customData` may read arbitrary manager
-  state, so the call alone cannot reproduce it.
+- **`blockNumber != 0`.** `customData` comes from the rollup's `getCustomData`,
+  which may read any state, so the call alone cannot recompute the hash.
 - **`upgradeToAndCall` posts.** They run by `DELEGATECALL` into a proxied EEZ;
   ours is not proxied.
 
 ## Blob deployment and recovery
 
-The inbound and outbound blob profile uses the
-`EEZ_ROLLUP0_CANDIDATE_V1` domain. Deploy matching manager, wrapper and signer
-versions.
+Both DA profiles use the stock protocol `Rollup.sol`. The poster sends
+`postAndVerifyBatch` directly to EEZ. No new manager or settlement wrapper is
+required.
 
-Payload construction reserves enough blob capacity for a complete Sync interval,
-including metadata and empty blocks. It also accounts for scheduled capacity
-reductions. This prevents new oversized intervals; it does not repair history
-already produced without that size guard. If retained history exceeds the
-allowance, sequencing fails closed. Recover the unsafe branch from the settled
-cursor before resuming; preserve settled history.
+Blob payloads are checked against the active fork's per-transaction blob limit
+before proving. Ranges that do not fit use the existing bounded-prefix emission
+path. In blob mode, ordinary sequencing reserves a complete Sync interval's
+metadata, transaction-length fields, and close marker within the blob allowance.
+The allowance accounts for retained blocks and scheduled capacity reductions.
+Cross-chain selections that cannot fit are reduced by deferring their FIFO tail;
+a single transaction that cannot fit is evicted with its dependent nonce suffix.
+These capacity checks apply only to blob DA.
 
-Blob preparation, proving and signing share one deadline: the target timestamp
-minus `EEZ_SUBMISSION_SLACK_MS`. Proving reserves
-`EEZ_BLOB_POST_PROOF_RESERVE_MS` for fee and nonce reads, signing and passing
-the bundle to the submitter. The reserve defaults to the submission slack and
-is deducted separately. Expired attempts retain pending work for a later slot.
+Blob derivation requires `EEZ_L1_BEACON_URL` pointing to a beacon REST node that
+retains the blobs needed from the node's settled cursor onward. Restoring old
+history requires a beacon archive retaining those blobs. Missing/pruned blob
+data from a slot behind the beacon head raises terminal `BlobUnavailable`;
+a lagging beacon and transport failures remain retryable. The scan reads outer
+transaction hashes for both direct and contract posts, selects exactly
+`blobIndices`, and ignores unlisted blobs.
 
-`eez.composer.blob.proof_window` reports preparation time and the remaining
-window; `eez.composer.blob.ready_to_submit` reports proof and signing time.
-
-After a blob proof or signing deadline miss, the next attempt is capped at half
-the failed range, rounded down to whole Sync intervals. Only empty historical
-Sync blocks can end these anchor-only prefixes. The cap resets when the L1
-cursor changes; pending work is retained. A single interval cannot be split
-further and must fit the configured timing window.
+Both DA profiles use `blockNumber == 0` and empty `customData`.
