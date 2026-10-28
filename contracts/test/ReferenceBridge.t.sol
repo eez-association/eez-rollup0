@@ -43,7 +43,7 @@ contract ReferenceBridgeTest is Test {
         assertEq(address(manager.proxy()), address(0));
     }
 
-    function testFailedProxyCallDoesNotKeepTheSendersEther() external {
+    function testProxyCallFailureDoesNotKeepTheSendersEther() external {
         BridgeManager manager = new BridgeManager();
         Bridge bridge = new InitializedBridge(address(manager), 0, address(this));
         address proxy = manager.computeCrossChainProxyAddress(address(0xBEEF), 1);
