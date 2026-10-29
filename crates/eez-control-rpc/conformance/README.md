@@ -17,7 +17,7 @@ more cases requiring explicit server limits. Together they contain 339 requests,
 | --- | --- |
 | Begin | Correct anchor; unsupported rollup; missing/31/33-byte hashes and roots; number overflow; invalid initial binding; repeated Begin. |
 | Block | Execution; duplicate at/before tip; missing data/witness; hash widths; zero/max/gapped numbers; contradictory parent/hash/RLP; invalid witness then valid retry; cache-parent binding. |
-| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; unsupported blob/context/profile inputs; valid retry. |
+| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; invalid blob carrier/unsupported context/profile inputs; valid retry. |
 | Resume | Progress after half-close and Proof; live takeover; missing/malformed/retired session; nonzero initial epoch; stale transport cannot use the new epoch. |
 | Rewind | Tip, intermediate block and anchor; malformed/unknown/pruned ancestors; stale epoch; removed suffix cannot finalize; promoted anchor survives Resume. |
 | Cancel | Acknowledgement and EOF; retired session cannot resume; cross-stream cancellation denied; another Composer can finish. |
@@ -29,10 +29,11 @@ backend-specific cases. A minimal implementation can run `baseline-and-rejection
 alone. The full suite covers Rollup0's baseline and optional capabilities;
 session controls, shared caching, and concurrent sessions are not baseline
 requirements.
-Unsupported blobs/context are negative tests of this calldata-only profile,
-not requirements for a prover configured for another settlement profile.
+Blob submissions with calldata still populated are negative tests of blob carrier
+validation; posting context remains unsupported. Blob proof success is covered
+by the stateless streaming integration tests, separately from these vectors.
 
-These vectors target Rollup0's calldata-only, timeless **conditional-proof
+These vectors target Rollup0's timeless **conditional-proof
 profile**: a proof binds the transition to its selected parent but does not
 attest the parent's L1 acceptance.
 The L1 contract checks applicability when consuming it. They do not test the

@@ -4619,6 +4619,12 @@ where
             return Ok(None);
         }
 
+        let (blobs, carrier) = if let Some((config, blobs, encoding)) = physical_blobs {
+            let carrier = prepare_blob_post(&ctx.l1_provider, config, &blobs, encoding).await?;
+            (blobs.into_iter().map(Bytes::from).collect(), Some(carrier))
+        } else {
+            (Vec::new(), None)
+        };
         // Prove the assembled window (proofs[] empty — not part of the
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
         // `blocks`. Settlement path, off block production.
@@ -4678,12 +4684,6 @@ where
             }
             // Tests may use a lightweight prover without a witness source.
             None => Vec::new(),
-        };
-        let (blobs, carrier) = if let Some((config, blobs, encoding)) = physical_blobs {
-            let carrier = prepare_blob_post(&ctx.l1_provider, config, &blobs, encoding).await?;
-            (blobs.into_iter().map(Bytes::from).collect(), Some(carrier))
-        } else {
-            (Vec::new(), None)
         };
         let proving_ctx = ProvingContext {
             rollup_id,

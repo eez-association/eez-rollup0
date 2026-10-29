@@ -551,10 +551,7 @@ fn verify(
             Vec::new(),
         )
     } else {
-        (
-            super::blob::commitment(&batch, &call.blob_hashes, call.from, here)?,
-            super::blob::selected_hashes(&batch, &call.blob_hashes, here)?,
-        )
+        super::blob::commitment(&batch, &call.blob_hashes, call.from, here)?
     };
     let mismatch = format!("{here}: call hashes to {commitment}, not {spi}");
     // Only a co-listed rollup's block-zero customData can explain a mismatch (EEZ.sol:753-762).

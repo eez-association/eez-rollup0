@@ -82,12 +82,7 @@ impl BeaconBlobSource {
             .get_optional(&format!("eth/v2/beacon/blocks/{slot}"))
             .await?
         else {
-            return Err(L1Error::SourceIncomplete {
-                block,
-                detail: format!(
-                    "beacon block at slot {slot} is not served; cannot verify execution block {block_hash}; retry after synchronization"
-                ),
-            });
+            return Err(self.missing_blobs(block, slot).await?);
         };
         let execution_hash = json_b256(
             &beacon_block,
@@ -174,6 +169,24 @@ impl BeaconBlobSource {
         ) {
             return Ok(None);
         }
+        if response.status() == reqwest::StatusCode::BAD_REQUEST
+            && (path.starts_with("eth/v1/beacon/blobs/")
+                || path.starts_with("eth/v1/beacon/blob_sidecars/"))
+        {
+            let body = response
+                .json::<Value>()
+                .await
+                .map_err(|error| L1Error::Provider(format!("beacon {path}: {error}")))?;
+            if let Some(message) = body["message"].as_str().filter(|message| {
+                message.starts_with("Insufficient data columns to reconstruct blobs:")
+            }) {
+                tracing::warn!(path, message, "beacon blob data unavailable");
+                return Ok(None);
+            }
+            return Err(L1Error::Provider(format!(
+                "beacon {path}: 400 Bad Request: {body}"
+            )));
+        }
         let response = response
             .error_for_status()
             .map_err(|error| L1Error::Provider(format!("beacon {path}: {error}")))?;
@@ -197,7 +210,7 @@ fn missing_blob_error(block: u64, slot: u64, finalized_slot: u64) -> L1Error {
         L1Error::BlobUnavailable {
             block,
             detail: format!(
-                "beacon does not serve all selected blobs at finalized slot {slot}; use a supernode retaining this history"
+                "beacon does not serve the block or all selected blobs at finalized slot {slot}; use a supernode retaining this history"
             ),
         }
     }
@@ -267,6 +280,50 @@ mod tests {
             ));
             assert!(missing_blob_error(100, 20, finalized).is_terminal());
         }
+    }
+
+    #[tokio::test]
+    async fn only_insufficient_columns_are_treated_as_missing_data() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let blobs = "eth/v1/beacon/blobs/20";
+        let columns = "Insufficient data columns to reconstruct blobs: required 64, found 0";
+        let cases = [
+            (blobs, 400, columns, true),
+            ("eth/v1/beacon/blob_sidecars/20", 400, columns, true),
+            (blobs, 400, "Invalid block ID", false),
+            (blobs, 500, columns, false),
+            ("eth/v2/beacon/blocks/20", 400, columns, false),
+        ];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source = BeaconBlobSource::new(
+            Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap(),
+        );
+        let server = tokio::spawn(async move {
+            for (_, status, message, _) in cases {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = BufReader::new(&mut socket);
+                loop {
+                    let mut line = String::new();
+                    assert!(request.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let body = json!({"message":message}).to_string();
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        for (path, _, _, missing) in cases {
+            let result = tokio::time::timeout(Duration::from_secs(5), source.get_optional(path))
+                .await
+                .unwrap();
+            if missing {
+                assert!(result.unwrap().is_none(), "{path}");
+            } else {
+                assert!(matches!(result, Err(L1Error::Provider(_))), "{path}");
+            }
+        }
+        server.await.unwrap();
     }
 
     #[test]

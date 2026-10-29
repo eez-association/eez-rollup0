@@ -11,13 +11,14 @@ pub(super) fn commitment(
     hashes: &[B256],
     sender: Address,
     here: &str,
-) -> L1Result<B256> {
+) -> L1Result<(B256, Vec<B256>)> {
     if batch.blockNumber != 0 || batch.blobIndices.is_empty() || !batch.callData.is_empty() {
         return Err(L1Error::Decode(format!("{here}: invalid blob DA carrier")));
     }
     let selected = selected_hashes(batch, hashes, here)?;
-    batch_shared_public_input_with_blobs(batch, sender, &selected)
-        .map_err(|error| L1Error::Decode(format!("{here}: {error}")))
+    let commitment = batch_shared_public_input_with_blobs(batch, sender, &selected)
+        .map_err(|error| L1Error::Decode(format!("{here}: {error}")))?;
+    Ok((commitment, selected))
 }
 
 /// Read the named outer-transaction blobs in batch order, ignoring the rest.
