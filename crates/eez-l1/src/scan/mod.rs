@@ -883,7 +883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_posts_scan_indices_for_direct_and_contract_posts() {
+    async fn blob_posts_select_indexed_blobs_and_reject_invalid_batches() {
         for routed in [false, true] {
             let mut batch = blob_post();
             let tx_hashes = vec![root(2), root(0x77), root(1)];
@@ -935,6 +935,29 @@ mod tests {
             assert_eq!(posts[0].blob_hashes, selected);
             assert_eq!(posts[0].settlement, s(&[(0, A)], 0, 1));
             assert!(asserter.read_q().is_empty());
+        }
+
+        let hashes = [root(0x01), root(0x02)];
+
+        let mut indexed = blob_post();
+        indexed.blobIndices = vec![U256::MAX, U256::ZERO];
+        let tx_hashes = [root(0x02), root(0x77), root(0x01)];
+        assert!(matches!(
+            read_v1(&indexed, &tx_hashes),
+            Err(L1Error::Decode(_))
+        ));
+
+        let mut tail = blob_post();
+        tail.callData = vec![0xDA].into();
+        let mut timeless = blob_post();
+        timeless.blockNumber = 7;
+        for (name, carried, tx_hashes) in [
+            ("calldata tail", tail, &hashes[..]),
+            ("missing blob", blob_post(), &hashes[..1]),
+            ("other blockNumber", timeless, &hashes[..]),
+        ] {
+            let err = read_v1(&carried, tx_hashes).unwrap_err();
+            assert!(matches!(err, L1Error::Decode(_)), "{name}: {err}");
         }
     }
 
@@ -1044,42 +1067,5 @@ mod tests {
         tx_call.blob_hashes = blob_hashes.to_vec();
         let calls = Calls::from([(0, (vec![tx_call], logs.len()))]);
         read_block(&group_blocks(&logs)?.remove(0), &calls, US)
-    }
-
-    /// A blob post commits to the selected transaction blobs.
-    #[test]
-    fn blob_posts_select_indices() {
-        let hashes = [root(0x01), root(0x02)];
-
-        let posts = read_v1(&blob_post(), &hashes).expect("canonical");
-        assert_eq!(posts.len(), 1);
-        assert_eq!(posts[0].blob_hashes, hashes);
-        assert_eq!(posts[0].settlement, s(&[(0, A)], 0, 1));
-
-        // Select the named blobs in batch order and ignore unrelated tx blobs.
-        let mut indexed = blob_post();
-        indexed.blobIndices = vec![U256::from(2), U256::ZERO];
-        let tx_hashes = [root(0x02), root(0x77), root(0x01)];
-        let indexed_posts = read_v1(&indexed, &tx_hashes).unwrap();
-        assert_eq!(indexed_posts[0].blob_hashes, hashes);
-        assert_eq!(indexed_posts[0].settlement, posts[0].settlement);
-        indexed.blobIndices[0] = U256::MAX;
-        assert!(matches!(
-            read_v1(&indexed, &tx_hashes),
-            Err(L1Error::Decode(_))
-        ));
-
-        let mut tail = blob_post();
-        tail.callData = vec![0xDA].into();
-        let mut timeless = blob_post();
-        timeless.blockNumber = 7;
-        for (name, carried, tx_hashes) in [
-            ("calldata tail", tail, &hashes[..]),
-            ("missing blob", blob_post(), &hashes[..1]),
-            ("other blockNumber", timeless, &hashes[..]),
-        ] {
-            let err = read_v1(&carried, tx_hashes).unwrap_err();
-            assert!(matches!(err, L1Error::Decode(_)), "{name}: {err}");
-        }
     }
 }

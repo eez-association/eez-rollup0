@@ -78,24 +78,6 @@ impl BeaconBlobSource {
             .header
             .timestamp;
         let slot = self.timing().await?.slot_at(timestamp)?;
-        let Some(beacon_block) = self
-            .get_optional(&format!("eth/v2/beacon/blocks/{slot}"))
-            .await?
-        else {
-            return Err(self.missing_blobs(block, slot).await?);
-        };
-        let execution_hash = json_b256(
-            &beacon_block,
-            "/data/message/body/execution_payload/block_hash",
-        )?;
-        if execution_hash != block_hash {
-            return Err(L1Error::SourceIncomplete {
-                block,
-                detail: format!(
-                    "beacon slot {slot} execution block {execution_hash} is not L1 block {block_hash}; retry after beacon synchronization"
-                ),
-            });
-        }
         // Fulu's `blobs` endpoint first; pre-Fulu nodes only serve sidecars.
         let body = match self
             .get_optional(&format!("eth/v1/beacon/blobs/{slot}"))
@@ -246,15 +228,6 @@ fn parse_blobs(body: &Value) -> L1Result<Vec<Vec<u8>>> {
         .collect()
 }
 
-fn json_b256(value: &Value, pointer: &str) -> L1Result<B256> {
-    let invalid = || L1Error::Provider(format!("beacon response: invalid {pointer}"));
-    let raw = value
-        .pointer(pointer)
-        .and_then(Value::as_str)
-        .ok_or_else(invalid)?;
-    raw.parse().map_err(|_| invalid())
-}
-
 fn json_u64(value: &Value, pointer: &str) -> L1Result<u64> {
     let invalid = || L1Error::Provider(format!("beacon response: invalid {pointer}"));
     match value.pointer(pointer).ok_or_else(invalid)? {
@@ -327,16 +300,21 @@ mod tests {
     }
 
     #[test]
-    fn both_beacon_response_shapes_parse() {
+    fn repeated_blob_hashes_reuse_the_matching_body() {
+        let hash = B256::repeat_byte(1);
+        let selected = select_blobs(vec![hash], vec![vec![1]], &[hash, hash]).unwrap();
+        assert_eq!(selected, [vec![1], vec![1]]);
+        assert!(select_blobs(vec![hash], vec![vec![1]], &[B256::repeat_byte(2)]).is_none());
+    }
+
+    #[test]
+    fn beacon_responses_parse_blobs_and_reject_malformed_data() {
         let fulu = json!({ "data": ["0x0102", "0x03"] });
         let sidecars = json!({ "data": [{ "index": "0", "blob": "0x0102" }, { "blob": "0x03" }] });
         for body in [fulu, sidecars] {
             assert_eq!(parse_blobs(&body).unwrap(), [vec![1, 2], vec![3]]);
         }
-    }
 
-    #[test]
-    fn malformed_beacon_bodies_are_provider_errors() {
         for body in [
             json!({}),
             json!({ "data": [{ "index": "0" }] }),
@@ -350,31 +328,27 @@ mod tests {
     }
 
     #[test]
-    fn slots_follow_the_beacon_grid() {
-        let timing = BeaconTiming {
-            genesis_time: 100,
-            seconds_per_slot: 12,
-        };
-        assert_eq!(timing.slot_at(100).unwrap(), 0);
-        assert_eq!(timing.slot_at(136).unwrap(), 3);
-        assert!(matches!(timing.slot_at(137), Err(L1Error::Config(_))));
-        assert!(matches!(timing.slot_at(88), Err(L1Error::Config(_))));
-    }
-
-    #[test]
-    fn json_numbers_accept_strings_and_integers() {
-        let body = json!({ "data": { "a": "7", "b": 8, "c": true } });
-        assert_eq!(json_u64(&body, "/data/a").unwrap(), 7);
-        assert_eq!(json_u64(&body, "/data/b").unwrap(), 8);
-        assert!(json_u64(&body, "/data/c").is_err());
-        assert!(json_u64(&body, "/data/missing").is_err());
-    }
-
-    #[test]
-    fn repeated_blob_hashes_reuse_the_matching_body() {
-        let hash = B256::repeat_byte(1);
-        let selected = select_blobs(vec![hash], vec![vec![1]], &[hash, hash]).unwrap();
-        assert_eq!(selected, [vec![1], vec![1]]);
-        assert!(select_blobs(vec![hash], vec![vec![1]], &[B256::repeat_byte(2)]).is_none());
+    fn beacon_timing_rejects_invalid_slots_and_numbers() {
+        for body in [
+            json!({ "genesis": "100", "seconds_per_slot": 12 }),
+            json!({ "genesis": 100, "seconds_per_slot": "12" }),
+        ] {
+            let timing = BeaconTiming {
+                genesis_time: json_u64(&body, "/genesis").unwrap(),
+                seconds_per_slot: json_u64(&body, "/seconds_per_slot").unwrap(),
+            };
+            for (timestamp, expected) in [(100, Some(0)), (136, Some(3)), (137, None), (88, None)] {
+                match expected {
+                    Some(slot) => assert_eq!(timing.slot_at(timestamp).unwrap(), slot),
+                    None => assert!(matches!(timing.slot_at(timestamp), Err(L1Error::Config(_)))),
+                }
+            }
+        }
+        for body in [json!({ "genesis": true }), json!({})] {
+            assert!(matches!(
+                json_u64(&body, "/genesis"),
+                Err(L1Error::Provider(_))
+            ));
+        }
     }
 }

@@ -426,19 +426,86 @@ mod tests {
     }
 
     #[test]
-    fn physical_blobs_round_trip_across_blob_boundaries() {
+    fn blob_codec_preserves_actions_across_blob_boundaries() {
+        let mut outbound = action(true);
+        outbound.source_rollup_id = ROLLUP;
+        outbound.target_rollup_id = 0;
+        let mut foreign = action(true);
+        foreign.source_rollup_id = 7;
+        let mut cases = vec![
+            vec![outbound, action(true)],
+            vec![foreign],
+            vec![action(false), action(true)],
+        ];
+        for length in [
+            30,
+            31,
+            32,
+            LOGICAL_BYTES_PER_BLOB - 1,
+            LOGICAL_BYTES_PER_BLOB + 1,
+        ] {
+            let mut item = action(true);
+            item.data = (0..length).map(|i| i as u8).collect();
+            item.return_data = vec![0xab; length];
+            cases.push(vec![item]);
+        }
+        for actions in cases {
+            let calldata = encode_container(ROLLUP, &span(), &actions).unwrap();
+            let blobs = encode_blob_container(ROLLUP, &span(), &actions).unwrap();
+            assert!(blobs.iter().all(|blob| blob.len() == BYTES_PER_BLOB));
+            let decoded = decode_blob_container(&blobs).unwrap();
+            assert_eq!(decoded, decode_container(&calldata).unwrap());
+            assert_eq!(decoded.actions, actions);
+        }
         let blocks = vec![SpanBlock {
-            beneficiary: [0x11; 20],
-            extra_data: vec![],
             transactions: vec![vec![0x42; LOGICAL_BYTES_PER_BLOB]],
+            ..Default::default()
         }];
         let blobs = encode_blob_container(ROLLUP, &blocks, &[]).unwrap();
         assert_eq!(blobs.len(), 2);
-        assert!(blobs.iter().all(|blob| blob.len() == BYTES_PER_BLOB));
         assert_eq!(
             decode_blob_container(&blobs).unwrap().span.transactions[0].len(),
             LOGICAL_BYTES_PER_BLOB
         );
+    }
+
+    #[test]
+    fn blob_codec_rejects_bad_framing_padding_and_routes() {
+        let valid = encode_blob_container(ROLLUP, &span(), &[]).unwrap();
+        let mut field = valid.clone();
+        field[0][0] = 1;
+        assert!(matches!(
+            decode_blob_container(&field),
+            Err(CodecError::NonCanonicalFieldElement { .. })
+        ));
+        let mut padding = valid.clone();
+        *padding[0].last_mut().unwrap() = 1;
+        assert_eq!(
+            decode_blob_container(&padding),
+            Err(CodecError::NonZeroBlobPadding)
+        );
+        let mut truncated = valid;
+        truncated[0].pop();
+        assert!(matches!(
+            decode_blob_container(&truncated),
+            Err(CodecError::InvalidBlobLength { index: 0, .. })
+        ));
+        assert_eq!(decode_blob_container(&[]), Err(CodecError::NoBlobs));
+
+        let mut route = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();
+        let target_at = first_bracket_offset() + 11;
+        route[target_at..target_at + 8].copy_from_slice(&(ROLLUP + 1).to_le_bytes());
+        let expected = decode_container(&route).unwrap_err();
+        route.push(MSG_CLOSE_BLOB_STREAM);
+        assert_eq!(decode_blob_container(&pack_blobs(route)), Err(expected));
+
+        let stream = encode_container(ROLLUP, &span(), &[]).unwrap();
+        let mut doubled = stream.clone();
+        doubled.extend_from_slice(&stream[1..]);
+        doubled.push(MSG_CLOSE_BLOB_STREAM);
+        for invalid in [stream, doubled] {
+            assert!(decode_blob_container(&pack_blobs(invalid)).is_err());
+        }
     }
 
     #[test]
@@ -453,98 +520,6 @@ mod tests {
             &pack_blobs(stream.to_vec())[0][..FIELD_ELEMENT_BYTES],
             expected
         );
-    }
-
-    #[test]
-    fn physical_blobs_reject_bad_field_elements_and_padding() {
-        let mut blobs = encode_blob_container(ROLLUP, &span(), &[]).unwrap();
-        blobs[0][0] = 1;
-        assert!(matches!(
-            decode_blob_container(&blobs),
-            Err(CodecError::NonCanonicalFieldElement { .. })
-        ));
-
-        let mut blobs = encode_blob_container(ROLLUP, &span(), &[]).unwrap();
-        *blobs[0].last_mut().unwrap() = 1;
-        assert_eq!(
-            decode_blob_container(&blobs),
-            Err(CodecError::NonZeroBlobPadding)
-        );
-    }
-
-    #[test]
-    fn blob_profile_matches_calldata_action_semantics() {
-        let mut foreign_source = action(true);
-        foreign_source.source_rollup_id = 7;
-        for actions in [vec![foreign_source], vec![action(false), action(true)]] {
-            let calldata = encode_container(ROLLUP, &span(), &actions).unwrap();
-            let blobs = encode_blob_container(ROLLUP, &span(), &actions).unwrap();
-            assert_eq!(decode_blob_container(&blobs), decode_container(&calldata));
-        }
-    }
-
-    #[test]
-    fn blob_profile_round_trips_outbound_and_inbound_actions() {
-        let mut outbound = action(true);
-        outbound.source_rollup_id = ROLLUP;
-        outbound.target_rollup_id = 0;
-        let actions = vec![outbound, action(true)];
-        let blobs = encode_blob_container(ROLLUP, &span(), &actions).unwrap();
-        assert_eq!(decode_blob_container(&blobs).unwrap().actions, actions);
-    }
-
-    #[test]
-    fn blob_decoder_matches_calldata_for_invalid_routes() {
-        let mut stream = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();
-        let target_at = first_bracket_offset() + 11;
-        stream[target_at..target_at + 8].copy_from_slice(&(ROLLUP + 1).to_le_bytes());
-        let calldata_error = decode_container(&stream).unwrap_err();
-        stream.push(MSG_CLOSE_BLOB_STREAM);
-        assert_eq!(
-            decode_blob_container(&pack_blobs(stream)),
-            Err(calldata_error)
-        );
-    }
-
-    #[test]
-    fn blob_decoder_requires_close_and_rejects_a_second_chain_operation() {
-        let stream = encode_container(ROLLUP, &span(), &[]).unwrap();
-        assert!(decode_blob_container(&pack_blobs(stream.clone())).is_err());
-        let mut doubled = stream.clone();
-        doubled.extend_from_slice(&stream[1..]);
-        doubled.push(MSG_CLOSE_BLOB_STREAM);
-        assert!(decode_blob_container(&pack_blobs(doubled)).is_err());
-    }
-
-    #[test]
-    fn blob_actions_continue_across_field_and_blob_boundaries() {
-        for length in [
-            30,
-            31,
-            32,
-            LOGICAL_BYTES_PER_BLOB - 1,
-            LOGICAL_BYTES_PER_BLOB + 1,
-        ] {
-            let mut expected = action(true);
-            expected.data = (0..length).map(|i| i as u8).collect();
-            expected.return_data = vec![0xab; length];
-            let blobs = encode_blob_container(ROLLUP, &span(), &[expected.clone()]).unwrap();
-            assert_eq!(
-                decode_blob_container(&blobs).unwrap().actions,
-                vec![expected]
-            );
-        }
-    }
-
-    #[test]
-    fn blob_decoder_rejects_empty_and_truncated_physical_blobs() {
-        assert_eq!(decode_blob_container(&[]), Err(CodecError::NoBlobs));
-        let mut blobs = encode_blob_container(ROLLUP, &span(), &[]).unwrap();
-        blobs[0].pop();
-        assert!(matches!(
-            decode_blob_container(&blobs),
-            Err(CodecError::InvalidBlobLength { index: 0, .. })
-        ));
     }
 
     /// The stream opens exactly as the spec defines: protocol version byte,

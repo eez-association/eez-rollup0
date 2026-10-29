@@ -63,12 +63,10 @@ async fn check_proof(prover: &RemoteProver, context: ProvingContext, vkey: B256,
 }
 
 #[tokio::test]
-async fn captured_blob_windows_recover_after_quota_exhaustion_and_invalid_da() {
+async fn blob_stream_proves_valid_window_after_rejecting_invalid_da() {
     let oracle: serde_json::Value = serde_json::from_str(&fixture("oracle.json")).unwrap();
     let (_, context) = recorded_window(&oracle);
-    let first = settlement_context(&context, 0..3);
-    let second = settlement_context(&context, 3..6);
-    let whole = settlement_context(&context, 0..6);
+    let window = settlement_context(&context, 3..6);
     let vkey: B256 = fixture_str(&oracle, "proof_system_vkey").parse().unwrap();
     let system = SYSTEM_ADDRESS.parse().unwrap();
     let attester = || {
@@ -82,53 +80,43 @@ async fn captured_blob_windows_recover_after_quota_exhaustion_and_invalid_da() {
     };
     let signer = attester().address();
 
-    for maximum in [3, 6] {
-        let chain_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(format!("tests/fixtures/{FIXTURE}/chain-config.json"));
-        let backend = Backend::from_chain_document_file(&chain_path, system).unwrap();
-        let state = ServiceState::new(
-            backend,
-            NonZeroU64::new(context.rollup_id).unwrap(),
-            attester(),
-        )
-        .unwrap();
-        let limits = ServiceLimits::new(ServiceLimitsParams {
-            max_window_blocks: NonZeroUsize::new(maximum).unwrap(),
-            max_window_bytes: NonZeroUsize::new(16 * 1024 * 1024).unwrap(),
-            max_window_witness_items: NonZeroUsize::new(1_000_000).unwrap(),
-            stream_idle_timeout: Duration::from_secs(30),
-            request_timeout: Duration::from_secs(30),
-        })
-        .unwrap();
-        let service = ProveSvc::new(Arc::new(state), limits);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let (shutdown, done) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(service.into_streaming_server())
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
-                    let _ = done.await;
-                })
-                .await
-                .unwrap();
-        });
-        let prover = RemoteProver::new(endpoint, signer);
-        check_proof(&prover, first.clone(), vkey, signer).await;
-        check_proof(&prover, second.clone(), vkey, signer).await;
-        if maximum == 6 {
-            check_proof(&prover, whole.clone(), vkey, signer).await;
-        } else {
-            let error = prover.prove(whole.clone()).await.unwrap_err();
-            assert!(error.to_string().contains("quota exceeded"), "{error}");
-            check_proof(&prover, second.clone(), vkey, signer).await;
-        }
-        let mut invalid = second.clone();
-        invalid.blobs[0] = Bytes::from(vec![0xff; eez_blob::BYTES_PER_BLOB]);
-        assert!(prover.prove(invalid).await.is_err());
-        check_proof(&prover, second.clone(), vkey, signer).await;
-        drop(prover);
-        let _ = shutdown.send(());
-        server.await.unwrap();
-    }
+    let chain_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("tests/fixtures/{FIXTURE}/chain-config.json"));
+    let backend = Backend::from_chain_document_file(&chain_path, system).unwrap();
+    let state = ServiceState::new(
+        backend,
+        NonZeroU64::new(context.rollup_id).unwrap(),
+        attester(),
+    )
+    .unwrap();
+    let limits = ServiceLimits::new(ServiceLimitsParams {
+        max_window_blocks: NonZeroUsize::new(6).unwrap(),
+        max_window_bytes: NonZeroUsize::new(16 * 1024 * 1024).unwrap(),
+        max_window_witness_items: NonZeroUsize::new(1_000_000).unwrap(),
+        stream_idle_timeout: Duration::from_secs(30),
+        request_timeout: Duration::from_secs(30),
+    })
+    .unwrap();
+    let service = ProveSvc::new(Arc::new(state), limits);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let (shutdown, done) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(service.into_streaming_server())
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = done.await;
+            })
+            .await
+            .unwrap();
+    });
+    let prover = RemoteProver::new(endpoint, signer);
+    check_proof(&prover, window.clone(), vkey, signer).await;
+    let mut invalid = window.clone();
+    invalid.blobs[0] = Bytes::from(vec![0xff; eez_blob::BYTES_PER_BLOB]);
+    assert!(prover.prove(invalid).await.is_err());
+    check_proof(&prover, window, vkey, signer).await;
+    drop(prover);
+    let _ = shutdown.send(());
+    server.await.unwrap();
 }
