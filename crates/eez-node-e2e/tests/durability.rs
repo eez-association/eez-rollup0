@@ -144,10 +144,11 @@ async fn settled_safe_prefix_survives_restart_and_fresh_follower_replay() {
             .await
             .expect("post-restart transaction never became safe");
 
-    let follower_env = harness.follower_env(None).await.unwrap();
+    let follower_env = harness.follower_env().await.unwrap();
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(harness.l2_genesis_path()),
+        ..Default::default()
     };
     let follower = NodeHandle::start("durability-fresh-follower", &follower_cfg, &follower_env)
         .await

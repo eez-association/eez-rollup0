@@ -94,6 +94,7 @@ pub async fn spawn_composer(world: &CrossChainWorld, builder_url: &str) -> Resul
         &NodeConfig {
             binary: NodeBinary::Composer,
             genesis_path: Some(&world.cfg.l2_genesis.0),
+            ..Default::default()
         },
         &env,
         port_leases.into(),
@@ -243,6 +244,7 @@ pub async fn spawn_follower(world: &CrossChainWorld, name: &str) -> Result<NodeH
         &NodeConfig {
             binary: NodeBinary::Follower,
             genesis_path: Some(&world.cfg.l2_genesis.0),
+            ..Default::default()
         },
         &env,
     )

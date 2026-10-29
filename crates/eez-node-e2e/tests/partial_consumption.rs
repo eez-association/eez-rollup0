@@ -213,11 +213,12 @@ async fn assert_follower_reaches(w: &eez_testkit::CrossChainWorld, expected: (u6
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(w.cfg.l2_genesis.0.as_path()),
+        ..Default::default()
     };
     let follower = NodeHandle::start(
         "partial-settlement-follower",
         &follower_cfg,
-        &w.follower_env(None),
+        &w.follower_env(),
     )
     .await
     .unwrap();

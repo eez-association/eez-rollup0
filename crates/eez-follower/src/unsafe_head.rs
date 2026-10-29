@@ -1,12 +1,13 @@
 //! Signed-head unsafe-head follower.
 //!
 //! Safe and finalized are owned by the L1 deriver through
-//! `BlockCommitterHandle::advance_safe_finalized`. This task polls the
-//! sequencer's `eez_getSignedHead`, keeps the latest verified head of each
-//! signing source, and moves the unsafe head to the highest-version candidate
-//! that descends from the L1-derived safe block. Missing ancestors are fetched
-//! by hash, checked against the requested hash, and imported through the
-//! committer under the reconcile lock.
+//! `BlockCommitterHandle::advance_safe_finalized`. The p2p overlay hands over
+//! signed heads it has verified and de-duplicated. This task keeps the latest
+//! head of each signing source and moves the unsafe head to the
+//! highest-version candidate that descends from the L1-derived safe block. Missing ancestors come from
+//! devp2p peers; they are fetched in batches sized to the gap, checked against
+//! the requested hashes, and imported through the committer under the
+//! reconcile lock.
 //!
 //! Descent from safe is enforced here, not by reth: the engine only requires
 //! safe/finalized to be *known*, so it would canonicalize a head whose
@@ -20,16 +21,21 @@ use std::{
 
 use alloy_consensus::Header;
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{Address, B256, Bytes};
-use alloy_provider::{Provider, RootProvider};
+use alloy_primitives::B256;
 use eez_driver::BlockCommitterHandle;
 use eez_l1::L1CanonicalHead;
-use eez_primitives::{Block, engine::EezEngineTypes};
-use eez_seq_sig::{Envelope, HeadDomain, HeadTracker, Observation, VerifiedHead, decode_block};
+use eez_primitives::{Block, BlockBody, engine::EezEngineTypes};
+use eez_seq_sig::{HeadTracker, VerifiedHead};
+use reth_consensus_common::validation::validate_body_against_header;
+use reth_network_p2p::{
+    BodiesClient, HeadersClient, error::RequestResult, headers::client::HeadersRequest,
+    priority::Priority,
+};
 use reth_payload_primitives::PayloadTypes as _;
 use reth_primitives_traits::{SealedBlock, SealedHeader};
 use reth_storage_api::{BlockIdReader, BlockNumReader, HeaderProvider};
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tracing::{Level, event};
 
 /// Keepalive cadence: re-publish the current forkchoice state so reth's
@@ -43,11 +49,21 @@ const MAX_ANCESTRY_WALK: u64 = 1024;
 /// Bound on remembered rejections: a rogue signer can mint new hashes forever.
 const MAX_LOGGED_REJECTIONS: usize = 256;
 
+/// Most blocks asked of a source at once; also the bodies per peer request.
+const FETCH_BATCH: u64 = 64;
+
+/// reth queues a peer request until some peer answers, so each one is time-boxed.
+const PEER_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Error)]
 pub(crate) enum FollowerError {
-    /// Sequencer JSON-RPC transport, decode or missing-block failure.
-    #[error("sequencer RPC error: {0}")]
-    Rpc(String),
+    /// devp2p peer request failure, timeout or invalid body.
+    #[error("peer error: {0}")]
+    Peer(String),
+
+    /// No source served this block.
+    #[error("block {0} not served")]
+    NotServed(B256),
 
     /// Local chain provider failure while validating a candidate head.
     #[error("local provider error: {0}")]
@@ -83,16 +99,96 @@ enum SafeCompat {
     Unverifiable,
 }
 
-/// Serves consensus-RLP blocks by hash.
+/// Serves blocks by hash, walking back through parent hashes.
 pub(crate) trait BlockSource {
-    async fn raw_block(&self, hash: B256) -> Result<Option<Bytes>, FollowerError>;
+    /// Up to `count` blocks, newest first, starting at `from`; each
+    /// hash-checked and parent-linked. May return fewer; empty = not served.
+    async fn blocks_back(
+        &self,
+        from: B256,
+        count: u64,
+    ) -> Result<Vec<SealedBlock<Block>>, FollowerError>;
 }
 
-impl BlockSource for RootProvider {
-    async fn raw_block(&self, hash: B256) -> Result<Option<Bytes>, FollowerError> {
-        self.raw_request("eez_getRawBlock".into(), (hash,))
-            .await
-            .map_err(|e| FollowerError::Rpc(format!("eez_getRawBlock({hash}): {e}")))
+/// Blocks from devp2p peers through reth's `FetchClient`.
+#[derive(Debug)]
+pub(crate) struct PeerBlocks<C> {
+    client: C,
+}
+
+impl<C> PeerBlocks<C> {
+    pub(crate) fn new(client: C) -> Self {
+        Self { client }
+    }
+}
+
+impl<C> BlockSource for PeerBlocks<C>
+where
+    C: HeadersClient<Header = Header> + BodiesClient<Body = BlockBody>,
+{
+    async fn blocks_back(
+        &self,
+        from: B256,
+        count: u64,
+    ) -> Result<Vec<SealedBlock<Block>>, FollowerError> {
+        if self.client.num_connected_peers() == 0 {
+            return Err(FollowerError::Peer("no connected devp2p peers".into()));
+        }
+        let request = HeadersRequest::falling(from.into(), count);
+        let (peer, headers) = peer_request(
+            self.client
+                .get_headers_with_priority(request, Priority::High),
+        )
+        .await?
+        .split();
+        // Keep the run that links back from `from`, so bodies are asked only for it.
+        let mut chain: Vec<SealedHeader> = Vec::new();
+        let mut expected = from;
+        for header in headers.into_iter().take(count as usize) {
+            let header = SealedHeader::seal_slow(header);
+            if header.hash() != expected {
+                self.client.report_bad_message(peer);
+                break;
+            }
+            expected = header.parent_hash;
+            chain.push(header);
+        }
+        let mut blocks = Vec::with_capacity(chain.len());
+        while blocks.len() < chain.len() {
+            let pending = &chain[blocks.len()..];
+            let hashes = pending
+                .iter()
+                .take(FETCH_BATCH as usize)
+                .map(SealedHeader::hash)
+                .collect();
+            let (peer, bodies) = peer_request(self.client.get_block_bodies(hashes))
+                .await?
+                .split();
+            if bodies.is_empty() {
+                break;
+            }
+            for (header, body) in pending.iter().zip(bodies) {
+                if let Err(e) = validate_body_against_header(&body, header.header()) {
+                    self.client.report_bad_message(peer);
+                    return Err(FollowerError::Peer(format!("body {}: {e}", header.hash())));
+                }
+                blocks.push(SealedBlock::from_sealed_parts(header.clone(), body));
+            }
+        }
+        Ok(blocks)
+    }
+}
+
+/// One peer request, time-boxed by [`PEER_TIMEOUT`].
+async fn peer_request<T>(
+    request: impl Future<Output = RequestResult<T>>,
+) -> Result<T, FollowerError> {
+    match tokio::time::timeout(PEER_TIMEOUT, request).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(e)) => Err(FollowerError::Peer(e.to_string())),
+        Err(_) => Err(FollowerError::Peer(format!(
+            "no answer within {PEER_TIMEOUT:?}"
+        ))),
     }
 }
 
@@ -105,66 +201,67 @@ pub(crate) struct Missing {
     pub blocks: Vec<SealedBlock<Block>>,
 }
 
-/// Polls the sequencer RPC for signed heads and routes every engine call
-/// through the shared [`BlockCommitterHandle`].
+/// Follows signed heads from gossip and routes every engine call through the
+/// shared [`BlockCommitterHandle`].
 #[derive(Debug)]
-pub(crate) struct UnsafeHeadFollower<P> {
+pub(crate) struct UnsafeHeadFollower<P, S> {
     committer: BlockCommitterHandle<EezEngineTypes>,
-    sequencer_rpc: RootProvider,
+    /// Heads the p2p overlay verified and accepted.
+    gossip: mpsc::Receiver<VerifiedHead>,
+    /// Serves missing ancestors.
+    blocks: S,
     /// Local chain reader: resolves the current safe anchor and the
     /// candidate head's ancestry for the compatibility check.
     local: P,
     /// The Deriver's L1 batch index, which can run ahead of reth's safe block.
     l1_head: Arc<L1CanonicalHead>,
-    domain: HeadDomain,
-    /// The only signer whose heads are followed.
-    sequencer_address: Address,
-    /// Cadence for polling the sequencer RPC for new signed heads.
-    poll_interval: Duration,
+    /// Cadence for retrying the target.
+    retry_interval: Duration,
     tracker: HeadTracker,
     rejections: Rejections,
 }
 
-impl<P> UnsafeHeadFollower<P>
+impl<P, S> UnsafeHeadFollower<P, S>
 where
     P: HeaderProvider<Header = Header> + BlockIdReader,
+    S: BlockSource,
 {
     pub(crate) fn new(
         committer: BlockCommitterHandle<EezEngineTypes>,
-        sequencer_rpc: RootProvider,
+        gossip: mpsc::Receiver<VerifiedHead>,
+        blocks: S,
         local: P,
         l1_head: Arc<L1CanonicalHead>,
-        domain: HeadDomain,
-        sequencer_address: Address,
-        poll_interval: Duration,
+        retry_interval: Duration,
     ) -> Self {
         Self {
             committer,
-            sequencer_rpc,
+            gossip,
+            blocks,
             local,
             l1_head,
-            domain,
-            sequencer_address,
-            poll_interval,
+            retry_interval,
             tracker: HeadTracker::default(),
             rejections: Rejections::default(),
         }
     }
 
     pub(crate) async fn run(mut self) {
-        let mut poll = tokio::time::interval(self.poll_interval);
+        let mut retry = tokio::time::interval(self.retry_interval);
+        // A slow fetch must not queue a burst of catch-up retries.
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut fcu_interval = tokio::time::interval(FCU_REFRESH);
         loop {
-            tokio::select! {
-                _ = poll.tick() => {
-                    if let Err(err) = self.advance().await {
-                        event!(
-                            name: "eez.node.follower.advance.failed",
-                            Level::WARN,
-                            error = %err,
-                            "sequencer unsafe-head advance failed; will retry",
-                        );
+            let advanced = tokio::select! {
+                _ = retry.tick() => self.follow_best().await,
+                Some(head) = self.gossip.recv() => {
+                    // The overlay passes only heads newer than their source's latest.
+                    self.tracker.observe(head, now_ms());
+                    // Take the whole burst first, so one fetch serves the newest head.
+                    while let Ok(head) = self.gossip.try_recv() {
+                        self.tracker.observe(head, now_ms());
                     }
+                    self.follow_best().await
                 }
                 _ = fcu_interval.tick() => {
                     if let Err(err) = self.committer.refresh_forkchoice().await {
@@ -175,61 +272,16 @@ where
                             "forkchoice refresh failed",
                         );
                     }
+                    continue;
                 }
-            }
-        }
-    }
-
-    async fn advance(&mut self) -> Result<(), FollowerError> {
-        let envelope: Option<Envelope> = self
-            .sequencer_rpc
-            .raw_request("eez_getSignedHead".into(), ())
-            .await
-            .map_err(|e| FollowerError::Rpc(format!("eez_getSignedHead: {e}")))?;
-        match envelope {
-            Some(envelope) => self.observe(envelope),
-            None => event!(
-                name: "eez.node.follower.head.unsigned",
-                Level::DEBUG,
-                "sequencer has not signed a head yet",
-            ),
-        }
-        self.follow_best().await
-    }
-
-    fn observe(&mut self, envelope: Envelope) {
-        let (number, hash) = (envelope.head.number, envelope.head.block_hash);
-        let head = match envelope.verify(&self.domain, self.sequencer_address) {
-            Ok(head) => head,
-            Err(err) => {
-                self.rejections.warn(number, hash, &err.to_string());
-                return;
-            }
-        };
-        match self.tracker.observe(head, now_ms()) {
-            Observation::New => {}
-            Observation::Duplicate | Observation::Stale => event!(
-                name: "eez.node.follower.head.ignored",
-                Level::DEBUG,
-                block.number = number,
-                block.hash = %hash,
-                "signed head is not newer than its source's latest",
-            ),
-            Observation::Future => {
-                self.rejections
-                    .warn(number, hash, "epoch is ahead of the local clock");
-            }
-            Observation::Equivocation { kept } => {
-                if self.rejections.first(hash, "equivocation") {
-                    event!(
-                        name: "eez.node.follower.head.equivocation",
-                        Level::ERROR,
-                        block.number = number,
-                        block.hash = %hash,
-                        kept = %kept,
-                        "sequencer signed two heads with one version; keeping the first",
-                    );
-                }
+            };
+            if let Err(err) = advanced {
+                event!(
+                    name: "eez.node.follower.advance.failed",
+                    Level::WARN,
+                    error = %err,
+                    "sequencer unsafe-head advance failed; will retry",
+                );
             }
         }
     }
@@ -246,7 +298,8 @@ where
                 self.rejections.warn(number, hash, "conflicts with safe");
                 continue;
             }
-            let missing = match self.fetch(head).await {
+            let fetched = fetch_missing(&self.local, &self.blocks, at, head.block.as_ref()).await;
+            let missing = match fetched {
                 Ok(missing) => missing,
                 Err(err @ FollowerError::Ahead { .. }) => {
                     if self.rejections.first(hash, "ahead") {
@@ -319,18 +372,6 @@ where
         Ok(())
     }
 
-    async fn fetch(&self, head: &VerifiedHead) -> Result<Missing, FollowerError> {
-        let fetched;
-        let target = match &head.block {
-            Some(block) => block,
-            None => {
-                fetched = fetch_block(&self.sequencer_rpc, head.claim.block_hash).await?;
-                &fetched
-            }
-        };
-        fetch_missing(&self.local, &self.sequencer_rpc, target).await
-    }
-
     /// Returns whether the head moved.
     async fn import(&self, missing: Missing) -> Result<bool, FollowerError> {
         let driver = |e: eez_driver::DriverError| FollowerError::Driver(e.to_string());
@@ -355,7 +396,7 @@ where
     }
 }
 
-/// Rejections already logged, so a head the RPC keeps returning warns once.
+/// Rejections already logged, so a head retried every tick warns once.
 #[derive(Debug, Default)]
 struct Rejections(HashSet<(B256, String)>);
 
@@ -388,31 +429,13 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Fetches one block by hash, refusing any block but the one requested.
-async fn fetch_block<S: BlockSource>(
-    source: &S,
-    hash: B256,
-) -> Result<SealedBlock<Block>, FollowerError> {
-    let rlp = source
-        .raw_block(hash)
-        .await?
-        .ok_or_else(|| FollowerError::Rpc(format!("block {hash} not served")))?;
-    let block = decode_block(&rlp).map_err(|e| FollowerError::Rpc(format!("block {hash}: {e}")))?;
-    if block.hash() != hash {
-        return Err(FollowerError::BadAncestor {
-            requested: hash,
-            got: block.hash(),
-        });
-    }
-    Ok(block)
-}
-
-/// Walks `target`'s parent hashes back to the first locally known block,
-/// fetching each unknown one from `source`.
+/// Walks back from `target` (its block, if in hand) to the first locally known
+/// block, fetching the unknown ones from `source` in batches.
 async fn fetch_missing<P, S>(
     local: &P,
     source: &S,
-    target: &SealedBlock<Block>,
+    target: BlockNumHash,
+    target_block: Option<&SealedBlock<Block>>,
 ) -> Result<Missing, FollowerError>
 where
     P: HeaderProvider<Header = Header> + BlockNumReader,
@@ -429,7 +452,11 @@ where
         });
     }
     let mut blocks = Vec::new();
-    let mut hash = target.hash();
+    let mut batch = Vec::from_iter(target_block.cloned()).into_iter();
+    let BlockNumHash {
+        mut number,
+        mut hash,
+    } = target;
     loop {
         if let Some(header) = local
             .header(hash)
@@ -445,12 +472,23 @@ where
         if depth >= MAX_ANCESTRY_WALK {
             return Err(FollowerError::Unverifiable { depth });
         }
-        let block = if depth == 0 {
-            target.clone()
-        } else {
-            fetch_block(source, hash).await?
+        let block = match batch.next() {
+            Some(block) => block,
+            None => {
+                // Sized to the gap down to the local head, so one missed head costs one block.
+                let count = number.saturating_sub(best).clamp(1, FETCH_BATCH);
+                batch = source.blocks_back(hash, count).await?.into_iter();
+                batch.next().ok_or(FollowerError::NotServed(hash))?
+            }
         };
-        hash = block.parent_hash;
+        // Sources promise linked blocks; checked again since this is what gets imported.
+        if block.hash() != hash {
+            return Err(FollowerError::BadAncestor {
+                requested: hash,
+                got: block.hash(),
+            });
+        }
+        (number, hash) = (block.number.saturating_sub(1), block.parent_hash);
         blocks.push(block);
     }
 }
@@ -529,10 +567,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::{
+        cell::RefCell,
+        collections::{BTreeMap, HashMap},
+    };
 
-    use alloy_primitives::{BlockHash, BlockNumber};
+    use alloy_primitives::{BlockHash, BlockNumber, Bytes};
+    use eez_primitives::{EezPrimitives, EezTxEnvelope};
     use reth_chainspec::ChainInfo;
+    use reth_network::primitives::BasicNetworkPrimitives;
+    use reth_network_p2p::NoopFullBlockClient;
     use reth_storage_api::{BlockHashReader, errors::provider::ProviderResult};
 
     use super::*;
@@ -777,12 +821,37 @@ mod tests {
         );
     }
 
-    impl BlockSource for HashMap<B256, Bytes> {
-        fn raw_block(
+    /// Serves blocks by hash, walking parent hashes, and records each request's `count`.
+    #[derive(Default)]
+    struct MapSource {
+        blocks: HashMap<B256, SealedBlock<Block>>,
+        counts: RefCell<Vec<u64>>,
+    }
+
+    impl BlockSource for MapSource {
+        fn blocks_back(
             &self,
-            hash: B256,
-        ) -> impl Future<Output = Result<Option<Bytes>, FollowerError>> {
-            std::future::ready(Ok(self.get(&hash).cloned()))
+            from: B256,
+            count: u64,
+        ) -> impl Future<Output = Result<Vec<SealedBlock<Block>>, FollowerError>> {
+            self.counts.borrow_mut().push(count);
+            let mut blocks = Vec::new();
+            let mut hash = from;
+            for _ in 0..count {
+                let Some(block) = self.blocks.get(&hash) else {
+                    break;
+                };
+                hash = block.parent_hash;
+                blocks.push(block.clone());
+            }
+            std::future::ready(Ok(blocks))
+        }
+    }
+
+    fn serving(blocks: &[SealedBlock<Block>]) -> MapSource {
+        MapSource {
+            blocks: blocks.iter().map(|b| (b.hash(), b.clone())).collect(),
+            ..Default::default()
         }
     }
 
@@ -798,8 +867,13 @@ mod tests {
         })
     }
 
-    fn rlp(block: &SealedBlock<Block>) -> Bytes {
-        Bytes::from(alloy_rlp::encode(block.clone_block()))
+    /// Blocks `0..len`, each the parent of the next.
+    fn chain(len: u64) -> Vec<SealedBlock<Block>> {
+        let mut chain = vec![block(0, B256::ZERO, 0)];
+        for number in 1..len {
+            chain.push(block(number, chain[chain.len() - 1].hash(), 0));
+        }
+        chain
     }
 
     #[tokio::test]
@@ -809,9 +883,11 @@ mod tests {
         let b2 = block(2, b1.hash(), 0);
         let mut local = MockLocal::default();
         local.insert_canonical(b0.hash(), b0.header().clone());
-        let remote = HashMap::from([(b1.hash(), rlp(&b1))]);
+        let remote = serving(std::slice::from_ref(&b1));
 
-        let missing = fetch_missing(&local, &remote, &b2).await.unwrap();
+        let missing = fetch_missing(&local, &remote, b2.num_hash(), Some(&b2))
+            .await
+            .unwrap();
 
         assert_eq!(missing.fork_point.hash(), b0.hash());
         let hashes: Vec<_> = missing.blocks.iter().map(SealedBlock::hash).collect();
@@ -824,7 +900,9 @@ mod tests {
         let mut local = MockLocal::default();
         local.insert_canonical(b0.hash(), b0.header().clone());
 
-        let missing = fetch_missing(&local, &HashMap::new(), &b0).await.unwrap();
+        let missing = fetch_missing(&local, &MapSource::default(), b0.num_hash(), Some(&b0))
+            .await
+            .unwrap();
 
         assert_eq!(missing.fork_point.hash(), b0.hash());
         assert!(missing.blocks.is_empty());
@@ -838,9 +916,14 @@ mod tests {
         let b2 = block(2, b1.hash(), 0);
         let mut local = MockLocal::default();
         local.insert_canonical(b0.hash(), b0.header().clone());
-        let remote = HashMap::from([(b1.hash(), rlp(&bx))]);
+        let remote = MapSource {
+            blocks: HashMap::from([(b1.hash(), bx.clone())]),
+            ..Default::default()
+        };
 
-        let err = fetch_missing(&local, &remote, &b2).await.unwrap_err();
+        let err = fetch_missing(&local, &remote, b2.num_hash(), Some(&b2))
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(err, FollowerError::BadAncestor { requested, got }
@@ -851,17 +934,16 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_is_unverifiable_past_walk_cap() {
-        let mut chain = vec![block(0, B256::ZERO, 0)];
-        for number in 1..MAX_ANCESTRY_WALK + 2 {
-            chain.push(block(number, chain[chain.len() - 1].hash(), 0));
-        }
-        let remote: HashMap<_, _> = chain.iter().map(|b| (b.hash(), rlp(b))).collect();
+        let chain = chain(MAX_ANCESTRY_WALK + 2);
+        let remote = serving(&chain);
         let target = chain.last().unwrap();
         // An unrelated local head at the target's height lets the walk start.
         let mut local = MockLocal::default();
         local.insert_canonical(hash(0xee), header(target.number, hash(0xed)));
 
-        let err = fetch_missing(&local, &remote, target).await.unwrap_err();
+        let err = fetch_missing(&local, &remote, target.num_hash(), Some(target))
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, FollowerError::Unverifiable { .. }), "{err}");
     }
@@ -874,10 +956,45 @@ mod tests {
         let target = block(MAX_ANCESTRY_WALK + 1, hash(0xaa), 0);
 
         // Any fetch from the empty remote would fail as "not served" instead.
-        let err = fetch_missing(&local, &HashMap::new(), &target)
-            .await
-            .unwrap_err();
+        let err = fetch_missing(
+            &local,
+            &MapSource::default(),
+            target.num_hash(),
+            Some(&target),
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(err, FollowerError::Ahead { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_walks_in_batches() {
+        let chain = chain(151);
+        let mut local = MockLocal::default();
+        local.insert_canonical(chain[0].hash(), chain[0].header().clone());
+        let remote = serving(&chain);
+        let target = &chain[150];
+
+        let missing = fetch_missing(&local, &remote, target.num_hash(), Some(target))
+            .await
+            .unwrap();
+
+        // Each batch is the gap left to the local head, capped at FETCH_BATCH.
+        assert_eq!(*remote.counts.borrow(), [64, 64, 21]);
+        assert_eq!(missing.fork_point.hash(), chain[0].hash());
+        let hashes: Vec<_> = missing.blocks.iter().map(SealedBlock::hash).collect();
+        let walked: Vec<_> = chain[1..].iter().map(SealedBlock::hash).collect();
+        assert_eq!(hashes, walked);
+    }
+
+    #[tokio::test]
+    async fn peer_source_without_peers_errors() {
+        type Net = BasicNetworkPrimitives<EezPrimitives, EezTxEnvelope>;
+        let source = PeerBlocks::new(NoopFullBlockClient::<Net>::default());
+
+        let err = source.blocks_back(B256::ZERO, 1).await.unwrap_err();
+
+        assert_eq!(err.to_string(), "peer error: no connected devp2p peers");
     }
 }
