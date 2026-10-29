@@ -765,20 +765,6 @@ fn sim_error_is_insufficient_funds(err: &eez_protocol::ComposerError) -> bool {
     )
 }
 
-alloy_sol_types::sol! {
-    /// Storage getter for `EEZ.rollups[rollupId]` (auto-generated
-    /// from `mapping(uint64 => RollupConfig) public rollups`).
-    /// Returns the three public-getter fields in declaration order;
-    /// this reader consumes `etherBalance`.
-    #[sol(rpc)]
-    interface IEEZReader {
-        function rollups(uint64 rollupId)
-            external
-            view
-            returns (address rollupContract, bytes32 root, uint256 etherBalance);
-    }
-}
-
 /// L1-confirmed escrow (`rollups(rid).etherBalance`) an outbound withdrawal draws
 /// down. `None` on any read failure, so the caller skips this early rejection;
 /// the on-chain escrow check remains authoritative.
@@ -787,10 +773,16 @@ async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -
         .ok()?
         .parse::<Address>()
         .ok()?;
-    IEEZReader::new(eez, provider)
-        .rollups(rid)
-        .call()
-        .await
+    use alloy_sol_types::SolCall;
+    let req = alloy_rpc_types_eth::TransactionRequest::default()
+        .to(eez)
+        .input(
+            eez_protocol::abi::rollupsCall { rollupId: rid }
+                .abi_encode()
+                .into(),
+        );
+    let out = provider.call(req).await.ok()?;
+    eez_protocol::abi::rollupsCall::abi_decode_returns(&out)
         .ok()
         .map(|r| r.etherBalance)
 }

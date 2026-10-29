@@ -17,7 +17,14 @@ pub const DERIVER_SYNC_BLOCK_BUILT: &str = "eez.deriver.reconcile.sync_block_bui
 pub const DERIVER_RESYNC_FAILED: &str = "eez.deriver.resync.failed";
 pub const DERIVER_RESYNC_RECOVERED: &str = "eez.deriver.resync.recovered";
 pub const DERIVER_COMMITTER_CLOSED: &str = "eez.deriver.committer.closed";
+/// The deriver stops the node on an error no resync can fix.
+pub const DERIVER_FATAL: &str = "eez.deriver.fatal";
 pub const NODE_BOOT_CATCH_UP_FAILED: &str = "eez.node.deriver.boot_catch_up.failed";
+/// A peers-mode node waits for its peers to serve the L1-finalized root.
+pub const NODE_SYNC_WAITING_FOR_PEERS: &str = "eez.node.sync.waiting_for_peers";
+pub const DERIVER_CATCH_UP_START: &str = "eez.deriver.catch_up.start";
+/// A restarted composer rewinds to L1's cursor, dropping the blocks L1 never settled.
+pub const COMPOSER_UNSETTLED_TAIL_DROPPED: &str = "eez.node.composer.unsettled_tail.dropped";
 pub const COMPOSER_BUNDLE_DISPATCHED: &str = "eez.composer.bundle.dispatched";
 pub const COMPOSER_SYNC_SLOT_INVOKED: &str = "eez.composer.sync_slot.invoked";
 pub const COMPOSER_SYNC_SLOT_DRAIN: &str = "eez.composer.sync_slot.drain";
@@ -46,6 +53,7 @@ pub const FATAL: &[&str] = &[
     NODE_BOOT_CATCH_UP_FAILED,
     DERIVER_RESYNC_FAILED,
     DERIVER_COMMITTER_CLOSED,
+    DERIVER_FATAL,
     DERIVER_STATE_DIVERGED_PRE,
     DERIVER_STATE_DIVERGED_POST,
 ];

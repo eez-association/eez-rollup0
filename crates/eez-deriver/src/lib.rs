@@ -20,6 +20,6 @@ pub mod error;
 #[doc(inline)]
 pub use checkpoint::ReconcileCheckpoint;
 #[doc(inline)]
-pub use deriver::Deriver;
+pub use deriver::{Deriver, DeriverBoot};
 #[doc(inline)]
 pub use error::{DeriverError, DeriverResult};

@@ -2,29 +2,25 @@
 
 mod unsafe_head;
 
-use std::{env, str::FromStr, sync::Arc, time::Duration};
+use std::{env, str::FromStr, sync::Arc};
 
 use alloy_primitives::Address;
-use eez_deriver::{Deriver, DeriverError};
+use eez_deriver::Deriver;
 use eez_driver::{BlockCommitterHandle, RollupTiming};
-use eez_l1::{L1CanonicalHead, L1Error, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
+use eez_l1::{L1CanonicalHead, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
 use eez_node_common::EezNode;
 use eez_node_common::{
-    L2NodeBuilder, node_cli, read_checkpoint_dir, wait_for_l1_ready, warn_on_deprecated_env,
+    L2NodeBuilder, boot, node_cli, sync_mode_from_env, wait_for_idle_engine, wait_for_l1_ready,
+    warn_on_deprecated_env,
 };
 use eez_seq_sig::HeadDomain;
 use reth_chainspec::EthChainSpec as _;
-use reth_network::BlockDownloaderProvider as _;
+use reth_network::{BlockDownloaderProvider as _, NetworkInfo as _, PeersInfo as _};
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
 use unsafe_head::{PeerBlocks, UnsafeHeadFollower};
 
-const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
-const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-/// ~15 min at the capped backoff: outlasts a restarting L1, but a permanently
-/// refused RPC call still surfaces as an exit.
-const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
 /// Overlay heads queued while the follower imports; past it the overlay drops
 /// and WARNs instead of waiting.
 const GOSSIP_BUFFER: usize = 64;
@@ -72,6 +68,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         "launching eez follower",
     );
     warn_on_deprecated_env();
+    let sync_mode = sync_mode_from_env()?;
 
     let stateful_proof_signer = eez_prover_stateful::Config::from_env()?;
     if stateful_proof_signer.is_some() && ext.sequencer_address.is_some() {
@@ -98,9 +95,16 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     let chain_spec: Arc<_> = handle.node.chain_spec();
     let provider = handle.node.provider.clone();
     let task_executor = handle.node.task_executor.clone();
+    let network = handle.node.network.clone();
     let timing = RollupTiming::from_env()?;
     let l1_head = Arc::new(L1CanonicalHead::default());
 
+    // Env reads come first so a bad L1 env fails at startup, not after a backfill.
+    let l1_reader_config = L1ReaderConfig::from_env()?;
+    let l1_watcher_config = L1WatcherConfig::from_env()?;
+
+    // The committer reads reth's head, which a resumed backfill is still moving.
+    wait_for_idle_engine(|| network.is_syncing()).await;
     let block_committer = BlockCommitterHandle::spawn_from_provider(
         &provider,
         handle.node.add_ons_handle.beacon_engine_handle.clone(),
@@ -108,11 +112,10 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         None,
     )?;
 
-    let l1_reader_config = L1ReaderConfig::from_env()?;
     let deploy_block = l1_reader_config.deploy_block;
     let registry = l1_reader_config.eez;
     let l1_reader = L1Reader::new(l1_reader_config);
-    let l1_watcher = L1Watcher::new(L1WatcherConfig::from_env()?);
+    let l1_watcher = L1Watcher::new(l1_watcher_config);
     let l2_chain_id = chain_spec.chain().id();
     let head_domain = HeadDomain {
         l2_chain_id,
@@ -136,67 +139,21 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
-        read_checkpoint_dir(),
+        sync_mode.deriver_boot(),
     );
 
-    wait_for_l1_ready(&l1_reader, deploy_block, read_l1_chain_id()?).await?;
-
-    let mut retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
-    let mut attempts = 0_u64;
-    let mut transport_failures = 0_u32;
-    let (l1_seed_number, l1_seed_hash) = loop {
-        match deriver.catch_up_with_seed().await {
-            Ok(seed) => break seed,
-            Err(err)
-                if matches!(&err, DeriverError::L1Scan(L1Error::Provider(_))) && {
-                    transport_failures += 1;
-                    transport_failures >= BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES
-                } =>
-            {
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.transport_exhausted",
-                    Level::ERROR,
-                    mode = "follower",
-                    transport_failures,
-                    error = %err,
-                    "L1 transport kept failing during boot catch-up; the endpoint is likely refusing a call we need, not merely unreachable",
-                );
-                return Err(eyre::eyre!(
-                    "boot-time deriver catch_up gave up after {transport_failures} L1 transport failures: {err}"
-                ));
-            }
-            Err(err) if matches!(&err, DeriverError::L1Scan(l1) if l1.is_retryable()) => {
-                attempts += 1;
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.source_incomplete",
-                    Level::WARN,
-                    mode = "follower",
-                    attempts,
-                    retry_delay_secs = retry_delay.as_secs(),
-                    error = %err,
-                    "boot-time catch_up could not read all L1 source data yet; retrying before starting L1-active tasks",
-                );
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = Duration::from_secs(
-                    retry_delay
-                        .as_secs()
-                        .saturating_mul(2)
-                        .min(BOOT_CATCH_UP_MAX_RETRY_DELAY.as_secs()),
-                );
-            }
-            Err(err) => {
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.failed",
-                    Level::ERROR,
-                    event_name = "eez.node.deriver.boot_catch_up.failed",
-                    mode = "follower",
-                    error = %err,
-                    "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",
-                );
-                return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
-            }
-        }
-    };
+    let probe = sync_mode.readiness_probe(deploy_block);
+    wait_for_l1_ready(&l1_reader, probe, read_l1_chain_id()?).await?;
+    let (l1_seed_number, l1_seed_hash) = boot(
+        sync_mode,
+        &provider,
+        &block_committer,
+        &deriver,
+        &l1_reader,
+        || network.num_connected_peers(),
+        "follower",
+    )
+    .await?;
 
     event!(
         name: "eez.node.deriver.spawned",
@@ -245,7 +202,6 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
             %sequencer_address,
             "spawning signed-head unsafe-head follower",
         );
-        let network = handle.node.network.clone();
         let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_BUFFER);
         let overlay = eez_p2p::Overlay::new(
             cfg,

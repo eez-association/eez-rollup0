@@ -5,7 +5,7 @@ mod streaming;
 
 use std::time::Duration;
 
-use alloy_primitives::U256;
+use alloy_primitives::{B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 
@@ -13,9 +13,10 @@ use eez_testkit::signals;
 use eez_testkit::{
     ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
     ANVIL_KEY_6, BuilderStubMode, Harness, INVALID_PROOF_SELECTOR,
-    INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary, NodeConfig, NodeHandle, STAGING_USER_KEY,
-    block_number_and_hash_at, overlay_follower, overlay_seed, override_env, safe_block_hash,
-    send_l2_value_transfer, send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
+    INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary, NodeConfig, NodeHandle, SEED_KEY,
+    STAGING_USER_KEY, block_number_and_hash_at, enode, overlay_follower, overlay_seed,
+    override_env, peers_mode, rollup_root_at, safe_block_hash, send_l2_value_transfer,
+    send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
     wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
@@ -1254,4 +1255,221 @@ async fn happy_case_follower_deep_backfill_late_join() {
 
     follower.assert_no_process_death();
     seq.assert_no_process_death();
+}
+
+/// A fresh peers-mode follower syncs the history below L1-finalized from its
+/// trusted peer through reth's pipeline, and scans L1 only from there; one
+/// without peers waits at genesis and never derives from L1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_follower_syncs_history_from_peers() {
+    let harness = Harness::fresh_with_fast_finality().await.unwrap();
+    let composer = peers_composer(&harness).await;
+
+    // reth backfills with its pipeline only past DEFAULT_BACKFILL_RUN_THRESHOLD = EPOCH_SLOTS = 32
+    // (engine/primitives/src/config.rs:28); a shorter gap is downloaded block by block.
+    let (finalized_l1, height, root) = wait_for(DEFAULT_TIMEOUT, || async {
+        Ok(finalized_root(&harness, &composer)
+            .await?
+            .filter(|(_, height, _)| *height > 32))
+    })
+    .await
+    .expect("L1 never finalized a root above L2 block 32");
+
+    let mut follower_env = harness.follower_env().await.unwrap();
+    peers_mode(&mut follower_env);
+    let follower_cfg = |extra_args| NodeConfig {
+        binary: NodeBinary::Follower,
+        extra_args,
+        ..Default::default()
+    };
+    let lonely = NodeHandle::start("follower-no-peers", &follower_cfg(vec![]), &follower_env)
+        .await
+        .unwrap();
+    let waiting = wait_for(Duration::from_secs(40), || async {
+        Ok(lonely
+            .signals_since(0)?
+            .into_iter()
+            .find(|s| s.name == signals::NODE_SYNC_WAITING_FOR_PEERS))
+    })
+    .await
+    .expect("a follower without peers never reported waiting for them");
+    assert_eq!(
+        waiting.u64("peers").unwrap(),
+        0,
+        "the lonely follower has a peer"
+    );
+    // Checked again at the end, after it has waited through the other follower's sync.
+    let still_waiting = || async {
+        let latest = block_number_and_hash_at(&lonely.l2_rpc_url(), BlockNumberOrTag::Latest)
+            .await
+            .unwrap();
+        assert_eq!(
+            latest.map(|(n, _)| n),
+            Some(0),
+            "follower without peers left genesis"
+        );
+        assert_eq!(
+            lonely
+                .count_signal(signals::DERIVER_CATCH_UP_START)
+                .unwrap(),
+            0,
+            "follower without peers derived from L1",
+        );
+    };
+    still_waiting().await;
+
+    let trusted = vec![
+        "--trusted-peers".into(),
+        enode(SEED_KEY, composer.p2p_port, composer.discv5_port),
+    ];
+    let synced = NodeHandle::start("follower-synced", &follower_cfg(trusted), &follower_env)
+        .await
+        .unwrap();
+    wait_for_safe_chain_contains(&synced, height, root, DEFAULT_TIMEOUT)
+        .await
+        .expect("follower never synced to the L1-finalized root");
+    // reth reports the synced root as safe before boot reaches the L1 scan.
+    let first_scan = wait_for(DEFAULT_TIMEOUT, || async {
+        Ok(synced
+            .signals_since(0)?
+            .into_iter()
+            .find(|s| s.name == signals::DERIVER_CATCH_UP_START))
+    })
+    .await
+    .expect("synced follower never scanned L1");
+    // The seeded scan starts at the follower's own F, never below the one read here.
+    assert!(
+        first_scan.u64("from_l1_block").unwrap() >= finalized_l1,
+        "synced follower scanned L1 from below L1-finalized",
+    );
+    // No head source moves safe now, so passing it takes a batch the Deriver reconciled from L1.
+    let (seeded_safe, _) = block_number_and_hash_at(&synced.l2_rpc_url(), BlockNumberOrTag::Safe)
+        .await
+        .unwrap()
+        .expect("synced follower has a safe block");
+    wait_for_safe_prefix_convergence(&[&composer, &synced], seeded_safe + 1, DEFAULT_TIMEOUT)
+        .await
+        .expect("synced follower never reconciled an L1 batch past its seed");
+
+    still_waiting().await;
+    for node in [&composer, &lonely, &synced] {
+        node.assert_no_process_death();
+    }
+}
+
+/// A peers-mode follower restarted more than 32 blocks below L1-finalized
+/// rewinds to its own finalized block, syncs the rest from its peer through
+/// reth's pipeline, and scans L1 only from F.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_restart_below_finalized_resyncs_from_peers() {
+    let harness = Harness::fresh_with_fast_finality().await.unwrap();
+    let composer = peers_composer(&harness).await;
+    let mut env = harness.follower_env().await.unwrap();
+    peers_mode(&mut env);
+    // At threshold 0 reth persists every block, so the kill keeps a finalized block above genesis.
+    let cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        extra_args: vec![
+            "--trusted-peers".into(),
+            enode(SEED_KEY, composer.p2p_port, composer.discv5_port),
+            "--engine.persistence-threshold".into(),
+            "0".into(),
+        ],
+        ..Default::default()
+    };
+    let datadir = tempfile::tempdir().unwrap();
+    let last_head = {
+        let first = NodeHandle::start_with_datadir("follower-first", datadir.path(), &cfg, &env)
+            .await
+            .unwrap();
+        let rpc = first.l2_rpc_url();
+        wait_for(DEFAULT_TIMEOUT, || async {
+            let finalized = block_number_and_hash_at(&rpc, BlockNumberOrTag::Finalized).await?;
+            Ok(finalized.filter(|(number, _)| *number > 0))
+        })
+        .await
+        .expect("follower never finalized an L1-settled batch");
+        // reth writes a finalized FCU to disk only with the next block it saves.
+        let head = wait_for_latest_height(&first, 0, DEFAULT_TIMEOUT).await;
+        let later = wait_for_latest_height(&first, head.unwrap().number + 1, DEFAULT_TIMEOUT)
+            .await
+            .expect("follower never saved a block after finalizing");
+        // Persistence trails the head; one L1 block lets it flush.
+        harness
+            .chain()
+            .wait_for_l1_blocks(1, Duration::from_secs(20))
+            .await
+            .unwrap();
+        first.assert_no_process_death();
+        later.number
+    };
+
+    let (finalized_l1, height, root) = wait_for(DEFAULT_TIMEOUT, || async {
+        Ok(finalized_root(&harness, &composer)
+            .await?
+            .filter(|(_, height, _)| *height > last_head + 32))
+    })
+    .await
+    .expect("L1 never finalized a root 32 blocks past the stopped follower");
+    let restarted =
+        NodeHandle::start_with_datadir("follower-restarted", datadir.path(), &cfg, &env)
+            .await
+            .unwrap();
+    let first_signal = |name: &'static str| {
+        let node = &restarted;
+        wait_for(DEFAULT_TIMEOUT, move || async move {
+            Ok(node.signals_since(0)?.into_iter().find(|s| s.name == name))
+        })
+    };
+    // Waiting for peers means the Sync path, not Seed; a best block above 0 means it rewound to f > 0.
+    let syncing = first_signal(signals::NODE_SYNC_WAITING_FOR_PEERS)
+        .await
+        .expect("restarted follower never synced from peers");
+    assert!(syncing.u64("local_best").unwrap() > 0, "rewound to genesis");
+    wait_for_safe_chain_contains(&restarted, height, root, DEFAULT_TIMEOUT)
+        .await
+        .expect("restarted follower never reached the L1-finalized root");
+    let first_scan = first_signal(signals::DERIVER_CATCH_UP_START)
+        .await
+        .expect("restarted follower never scanned L1");
+    assert!(
+        first_scan.u64("from_l1_block").unwrap() >= finalized_l1,
+        "restarted follower scanned L1 from below L1-finalized",
+    );
+    wait_for_safe_prefix_convergence(&[&composer, &restarted], height + 1, DEFAULT_TIMEOUT)
+        .await
+        .expect("restarted follower never reconciled an L1 batch past the root");
+    restarted.assert_no_process_death();
+    composer.assert_no_process_death();
+}
+
+/// A peers-mode composer under [`SEED_KEY`], with traffic.
+async fn peers_composer(harness: &Harness) -> NodeHandle {
+    let mut env = harness.env().await.unwrap();
+    peers_mode(&mut env);
+    let cfg = NodeConfig {
+        extra_args: vec!["--p2p-secret-key-hex".into(), SEED_KEY.into()],
+        ..Default::default()
+    };
+    let composer = NodeHandle::start("composer", &cfg, &env).await.unwrap();
+    composer.run_tx_spammer(ANVIL_KEY_1);
+    composer
+}
+
+/// L1's finalized block F, and the height and hash of the root L1 stores at F
+/// once `node` holds it.
+async fn finalized_root(
+    harness: &Harness,
+    node: &NodeHandle,
+) -> anyhow::Result<Option<(u64, u64, B256)>> {
+    let l1 = ProviderBuilder::new().connect_http(harness.anvil.rpc_url.parse()?);
+    let Some(finalized) = l1.get_block_by_number(BlockNumberOrTag::Finalized).await? else {
+        return Ok(None);
+    };
+    let f = finalized.header.number;
+    let (eez, rollup_id) = (harness.dep.eez_address, harness.dep.rollup_id);
+    let root = rollup_root_at(&harness.anvil.rpc_url, eez, rollup_id, Some(f)).await?;
+    let l2 = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse()?);
+    let block = l2.get_block_by_hash(root).await?;
+    Ok(block.map(|block| (f, block.header.number, root)))
 }
