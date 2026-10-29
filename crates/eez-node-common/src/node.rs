@@ -5,7 +5,7 @@
 //! Engine validation delegates to:
 //! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/node/src/engine.rs>.
 
-use crate::{EezNetworkBuilder, EezPayloadBuilder, EezPoolBuilder};
+use crate::{EezNetworkBuilder, EezPayloadBuilder, EezPoolBuilder, HeldTxs};
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes};
 use eez_evm::EezEvmConfig;
 use eez_primitives::{Block, EezPrimitives, EezTxEnvelope, engine::EezEngineTypes};
@@ -31,8 +31,11 @@ use reth_primitives_traits::SealedBlock;
 use reth_provider::EthStorage;
 use std::{future::ready, sync::Arc};
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct EezNode;
+/// The L2 node. A composer's pool also refuses the cross-chain txs it holds.
+#[derive(Debug, Default, Clone)]
+pub struct EezNode {
+    pub held: Option<HeldTxs>,
+}
 
 impl NodeTypes for EezNode {
     type Primitives = EezPrimitives;
@@ -42,7 +45,9 @@ impl NodeTypes for EezNode {
 }
 
 impl EezNode {
-    pub fn components<N: FullNodeTypes<Types = Self>>() -> ComponentsBuilder<
+    pub fn components<N: FullNodeTypes<Types = Self>>(
+        &self,
+    ) -> ComponentsBuilder<
         N,
         EezPoolBuilder,
         BasicPayloadServiceBuilder<EezPayloadBuilder>,
@@ -52,7 +57,10 @@ impl EezNode {
     > {
         ComponentsBuilder::default()
             .node_types::<N>()
-            .pool(EezPoolBuilder::new(eez_primitives::SYSTEM_ADDRESS))
+            .pool(EezPoolBuilder::new(
+                eez_primitives::SYSTEM_ADDRESS,
+                self.held.clone(),
+            ))
             .executor(EezExecutorBuilder)
             .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder::default()))
             .network(EezNetworkBuilder)
@@ -185,7 +193,7 @@ impl<N: FullNodeTypes<Types = Self>> reth_node_builder::Node<N> for EezNode {
     >;
 
     fn components_builder(&self) -> Self::ComponentsBuilder {
-        Self::components()
+        self.components()
     }
 
     fn add_ons(&self) -> Self::AddOns {

@@ -34,6 +34,7 @@ pub const COMPOSER_OUTBOUND_MULTICALL_UNSUPPORTED: &str =
     "eez.composer.cc_compose.outbound_multicall_unsupported";
 pub const COMPOSER_POISON_EVICTION_COMPLETED: &str =
     "eez.composer.cc_compose.poison_eviction_completed";
+pub const POOL_TX_REJECTED: &str = "eez.node.pool.tx_rejected";
 pub const FOLLOWER_HEAD_ADVANCED: &str = "eez.node.follower.head.advanced";
 pub const FOLLOWER_HEAD_REJECTED: &str = "eez.node.follower.head.rejected";
 pub const P2P_MESSAGE_REJECTS: &str = "eez.p2p.message.rejects";
@@ -46,7 +47,6 @@ pub const COMPOSER_NONCE_BURNED: &str = "eez.composer.recovery.nonce_burned";
 /// The deriver rebuilt only the entries L1 ran.
 pub const DERIVER_PARTIAL_CONSUMPTION: &str = "eez.deriver.reconcile.partial_consumption";
 pub const TX_POISON_EVICTED: &str = "eez.composer.recovery.poison_evicted";
-pub const COMPOSER_RECOVERY_ROLLED_BACK: &str = "eez.composer.recovery.rolled_back";
 pub const COMPOSER_RECOVERY_SUBSTITUTED: &str = "eez.composer.recovery.substituted";
 
 pub const FATAL: &[&str] = &[

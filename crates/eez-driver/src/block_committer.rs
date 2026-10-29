@@ -378,17 +378,12 @@ where
     }
 
     /// Roll the canonical L2 head back to `target_header` (FCU with
-    /// this hash, dropping any blocks past it). Two callers:
+    /// this hash, dropping any blocks past it). reth unwinds silently, so
+    /// its pool never gets the dropped blocks' txs back.
     ///
-    /// - **L1 reorg retreat (`Deriver::on_l1_reorg`).** L1 rolled out a
-    ///   confirmed postBatch, so the L2 head must follow. The caller
-    ///   advances safe/finalized FIRST, then calls `reorg_to` — the
-    ///   reverse order yields an FCU where safe ≠ ancestor(head), which
-    ///   reth rejects.
-    /// - **Bundle-failure retreat (Composer).** A just-committed Sync
-    ///   block's L1 bundle didn't settle, so the block is rebuilt.
-    ///   `safe`/`finalized` stay put — a dropped-bundle reorg never
-    ///   invalidates an L1-confirmed block.
+    /// On an L1 reorg retreat (`Deriver::on_l1_reorg`) the caller advances
+    /// safe/finalized FIRST — the reverse order yields an FCU where
+    /// safe ≠ ancestor(head), which reth rejects.
     ///
     /// # Errors
     ///

@@ -1830,8 +1830,7 @@ where
     ) -> RecoveryOutcome {
         let sync_height = failed.sync_height;
         let pool = rollup.held_pool.as_ref();
-        // Set by the two operations that move the head: the rollback and the
-        // sibling commit.
+        // Set when the sibling commit moves the head.
         let mut outcome = RecoveryOutcome::HeadUnchanged;
         let committer = &self.inner.committer;
         let mut landed = Vec::new();
@@ -1886,30 +1885,7 @@ where
                 return RecoveryOutcome::HeadUnchanged;
             }
             let head = committer.last_header();
-            if head.number() >= sync_height {
-                if let Err(err) = committer.reorg_to(failed.parent.clone()).await {
-                    event!(
-                        name: "eez.composer.recovery.reorg_failed",
-                        Level::ERROR,
-                        rollup_id,
-                        sync_height,
-                        error = %err,
-                        "reorg_to failed; keeping entry Failed — next slot retries",
-                    );
-                    rollup.optimistic.reinsert_failed(failed);
-                    return RecoveryOutcome::HeadUnchanged;
-                }
-                outcome = RecoveryOutcome::HeadMoved;
-                event!(
-                    name: "eez.composer.recovery.rolled_back",
-                    Level::WARN,
-                    event_name = "eez.composer.recovery.rolled_back",
-                    rollup_id,
-                    sync_height,
-                    head = head.number(),
-                    "bundle failed on L1; optimistic Sync block rolled back to parent",
-                );
-            } else {
+            if head.number() < sync_height {
                 event!(
                     name: "eez.composer.recovery.not_committed",
                     Level::INFO,
@@ -1919,9 +1895,12 @@ where
                     "failed Sync block never became canonical; nothing to roll back",
                 );
             }
-            // Still under the reconcile guard, so nothing slips between the
-            // reorg and the replacement. Head elsewhere → nothing to substitute.
-            if committer.last_header().hash() == failed.parent.hash() {
+            // Still under the reconcile guard. Committed while the failed branch is
+            // canonical, the sibling is a reorg, so reth's pool takes back its pure
+            // L2 txs. Head elsewhere → nothing to substitute.
+            if head.number() >= sync_height || head.hash() == failed.parent.hash() {
+                // Disposal below can release a tx before reth re-adds it.
+                pool.refuse(failed.txs.iter().map(|tx| tx.hash), sync_height);
                 let timestamp = failed
                     .parent
                     .timestamp()
@@ -1958,7 +1937,7 @@ where
                             rollup_id,
                             sync_height,
                             error = %err,
-                            "empty-sibling commit failed; head stays at the parent and Catchup rebuilds",
+                            "empty-sibling commit failed",
                         ),
                     },
                     Err(err) => event!(
@@ -1967,9 +1946,15 @@ where
                         rollup_id,
                         sync_height,
                         error = %err,
-                        "empty-sibling build failed; head stays at the parent and Catchup rebuilds",
+                        "empty-sibling build failed",
                     ),
                 }
+            }
+            // The failed block stays canonical until a sibling replaces it, so keep
+            // the entry Failed for the next slot. A rewind would lose the pure L2 txs.
+            if head.number() >= sync_height && matches!(outcome, RecoveryOutcome::HeadUnchanged) {
+                rollup.optimistic.reinsert_failed(failed);
+                return RecoveryOutcome::HeadUnchanged;
             }
         }
         dispose_recovered_txs(

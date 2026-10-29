@@ -24,7 +24,7 @@ pub use payload::EezPayloadBuilder;
 mod payload_builder;
 mod pool;
 mod pool_transaction;
-pub use pool::EezPoolBuilder;
+pub use pool::{EezPoolBuilder, HeldTxs};
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]
@@ -66,16 +66,20 @@ fn l2_cli<Ext>(mut argv: Vec<String>) -> eyre::Result<Cli<EthereumChainSpecParse
 where
     Ext: clap::Args + std::fmt::Debug,
 {
-    // Engine API FCUs may intentionally unwind the L2 head during recovery.
+    // Engine API FCUs may intentionally unwind the L2 head during recovery. An
+    // unwind sends reth no reorg notification, so its RPC tx-hash cache would
+    // keep serving the dropped blocks' txs: run without that cache.
     // Transactions enter only through the sequencer's ingress, never devp2p gossip.
     // Sync state reads Syncing only while reth backfills, so boot can wait it out.
     for flag in [
         "--engine.always-process-payload-attributes-on-canonical-head",
         "--engine.allow-unwind-canonical-header",
+        "--rpc-cache.max-cached-tx-hashes=0",
         "--disable-tx-gossip",
         "--debug.startup-sync-state-idle",
     ] {
-        if !argv.iter().any(|a| a == flag) {
+        let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+        if !argv.iter().any(|a| a.starts_with(name)) {
             argv.push(flag.to_owned());
         }
     }
