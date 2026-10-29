@@ -5,7 +5,7 @@ use alloy_primitives::{B256, U256};
 use alloy_sol_types::SolEvent as _;
 use anyhow::{Context, Result, ensure};
 use eez_l1::{EntryRole, L1Reader, L1ReaderConfig};
-use eez_protocol::{Rollup0Deployment, RollupId, abi::ExecutionConsumed, entries::manifest};
+use eez_protocol::{RollupId, abi::ExecutionConsumed, entries::manifest};
 use serde_json::{Value, json};
 
 async fn rpc(client: &reqwest::Client, url: &str, method: &str, params: Value) -> Result<Value> {
@@ -81,9 +81,13 @@ fn verify_actions(
 
 #[tokio::test]
 async fn blob_settlement_evidence() -> Result<()> {
-    let deployment = Rollup0Deployment::from_process_env(6290)?
-        .context("blob_settlement requires EEZ_SETTLEMENT_PROFILE=blob")?;
-    let config = L1ReaderConfig::from_env()?.with_candidate(Some(deployment))?;
+    ensure!(
+        env::var("EEZ_SETTLEMENT_PROFILE").as_deref() == Ok("blob"),
+        "blob_settlement requires EEZ_SETTLEMENT_PROFILE=blob"
+    );
+    let config = L1ReaderConfig::from_env()?;
+    let rollup_id = config.rollup_id;
+    let eez = config.eez;
     let rpc_url = config.rpc_url.to_string();
     let reader = L1Reader::new(config);
     let client = reqwest::Client::builder()
@@ -110,8 +114,8 @@ async fn blob_settlement_evidence() -> Result<()> {
         while let Some(posts) = reader.next_batch_log_chunk(&mut chunks).await? {
             for post in posts.into_iter().filter(|post| post.id.l1_block <= last) {
                 ensure!(
-                    post.sender == deployment.settlement_wrapper,
-                    "unexpected settlement wrapper"
+                    post.batch.blockNumber == 0,
+                    "nonzero blob batch block number"
                 );
                 ensure!(
                     !post.blob_hashes.is_empty(),
@@ -142,8 +146,8 @@ async fn blob_settlement_evidence() -> Result<()> {
                         .as_str()
                         .context("missing tx destination")?
                         .parse::<alloy_primitives::Address>()?
-                        == deployment.settlement_wrapper,
-                    "settlement must call the wrapper directly"
+                        == eez,
+                    "settlement must call EEZ directly"
                 );
                 let hashes: Vec<B256> = serde_json::from_value(tx["blobVersionedHashes"].clone())?;
                 ensure!(
@@ -167,10 +171,7 @@ async fn blob_settlement_evidence() -> Result<()> {
                 // and recomputes KZG commitments before selecting transaction blobs.
                 let blobs = reader.post_blobs(&post).await?;
                 let container = eez_payload_codec::decode_blob_container(&blobs)?;
-                ensure!(
-                    container.rollup_id == deployment.eez_rollup_id,
-                    "foreign blob container"
-                );
+                ensure!(container.rollup_id == rollup_id, "foreign blob container");
                 published_transactions.extend(
                     container
                         .span
@@ -178,13 +179,11 @@ async fn blob_settlement_evidence() -> Result<()> {
                         .iter()
                         .map(alloy_primitives::keccak256),
                 );
-                verify_actions(&post.batch, &container.actions, deployment.eez_rollup_id)?;
-                for (index, role) in eez_protocol::entries::entry_roles(
-                    &post.batch.entries,
-                    deployment.eez_rollup_id,
-                )
-                .into_iter()
-                .enumerate()
+                verify_actions(&post.batch, &container.actions, rollup_id)?;
+                for (index, role) in
+                    eez_protocol::entries::entry_roles(&post.batch.entries, rollup_id)
+                        .into_iter()
+                        .enumerate()
                 {
                     if matches!(role, None | Some(EntryRole::Anchor)) {
                         continue;
@@ -253,9 +252,9 @@ async fn blob_settlement_evidence() -> Result<()> {
                     serde_json::from_value(receipt["logs"].clone())?;
                 let calls: Vec<_> = logs
                     .iter()
-                    .filter(|log| log.address() == deployment.eez)
+                    .filter(|log| log.address() == eez)
                     .filter_map(|log| ExecutionConsumed::decode_log(&log.inner).ok())
-                    .filter(|log| log.rollupId == deployment.eez_rollup_id)
+                    .filter(|log| log.rollupId == rollup_id)
                     .collect();
                 ensure!(
                     !calls.is_empty(),
@@ -411,6 +410,39 @@ mod tests {
         verify_actions(&batch, &[], ROLLUP).unwrap();
         batch.entries[0].rollingHash = B256::ZERO;
         assert!(verify_actions(&batch, &[], ROLLUP).is_err());
+    }
+
+    #[test]
+    fn decodes_actions_after_a_failed_return_but_rejects_settlement() {
+        let mut failed = action(true);
+        failed.success = false;
+        let actions = [failed, action(false)];
+        let blocks = [SpanBlock::default()];
+        let blobs = eez_payload_codec::encode_blob_container(ROLLUP, &blocks, &actions).unwrap();
+        let decoded = eez_payload_codec::decode_blob_container(&blobs).unwrap();
+        assert_eq!(decoded.actions, actions);
+        // Wire decoding is permissive; a failed action cannot describe the
+        // successful entries admitted by the current settlement profile.
+        let batch = settled_batch(&[action(true), action(false)]);
+        let error = verify_actions(&batch, &decoded.actions, ROLLUP).unwrap_err();
+        assert!(error.to_string().contains("action outcome"));
+    }
+
+    #[test]
+    fn verifies_blob_inbound_action_from_another_rollup() {
+        let mut inbound = action(false);
+        inbound.source_rollup_id = ROLLUP + 1;
+        let actions = [inbound];
+        let batch = settled_batch(&actions);
+        let blobs =
+            eez_payload_codec::encode_blob_container(ROLLUP, &[SpanBlock::default()], &actions)
+                .unwrap();
+        let decoded = eez_payload_codec::decode_blob_container(&blobs).unwrap();
+        assert_eq!(decoded.actions, actions);
+        verify_actions(&batch, &decoded.actions, ROLLUP).unwrap();
+        let mut changed = decoded.actions;
+        changed[0].source_rollup_id = 0;
+        assert!(verify_actions(&batch, &changed, ROLLUP).is_err());
     }
 
     #[test]
