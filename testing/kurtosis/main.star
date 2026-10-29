@@ -122,16 +122,6 @@ def run(plan, args):
         "RUST_LOG": eez.get("proof_signer_rust_log", "info"),
     }
     signer_files = {"/out": deploy.files_artifacts[0]}
-    if settlement_profile == "blob":
-        signer_files["/genesis"] = "el_cl_genesis_data"
-        signer_env.update({
-            "EEZ_L1_RPC_URL": l1_el.rpc_http_url,
-            "EEZ_L1_CHAIN_ID": chain_id,
-            "EEZ_L1_CHAIN_CONFIG": "/genesis/genesis.json",
-            "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
-            "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 2000)),
-        })
-
     prover_service = "eez-proof-signer"
     if prover_backend == "stateless":
         plan.add_service(

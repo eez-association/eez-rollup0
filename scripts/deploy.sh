@@ -165,20 +165,10 @@ echo "      ECDSA_PS   = $EEZ_ECDSA_PROOF_SYSTEM_ADDRESS"
 
 # ── 3/5 DeployRollup ────────────────────────────────────────────────
 echo "[3/5] DeployRollup"
-if [[ "$settlement_profile" == blob ]]; then
-    l2_chain_id="$(jq -er '.config.chainId' "$GENESIS_BASE")"
-    run_forge "DeployRollup0CandidateV1" forge script script/DeployRollup0CandidateV1.s.sol:DeployRollup0CandidateV1 \
-        --sig "run(address,address,address,address,uint256)" \
-        "$EEZ_REGISTRY_ADDRESS" "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" "$AUTHORIZED_SIGNER" "$OWNER" "$l2_chain_id" \
-        $RPC $KEY --broadcast
-    EEZ_SETTLEMENT_WRAPPER_ADDRESS="$(extract SETTLEMENT_WRAPPER "$OUT")"
-    [[ -n "$EEZ_SETTLEMENT_WRAPPER_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: missing settlement wrapper" >&2; exit 1; }
-else
-    run_forge "DeployRollup" forge script script/DeployRollup.s.sol:DeployRollup \
-        --sig "run(address,address,address,address)" \
-        "$EEZ_REGISTRY_ADDRESS" "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" "$AUTHORIZED_SIGNER" "$OWNER" \
-        $RPC $KEY --broadcast
-fi
+run_forge "DeployRollup" forge script script/DeployRollup.s.sol:DeployRollup \
+    --sig "run(address,address,address,address)" \
+    "$EEZ_REGISTRY_ADDRESS" "$EEZ_ECDSA_PROOF_SYSTEM_ADDRESS" "$AUTHORIZED_SIGNER" "$OWNER" \
+    $RPC $KEY --broadcast
 EEZ_ROLLUP_MANAGER_ADDRESS="$(extract ROLLUP_CONTRACT "$OUT")"
 [[ -n "$EEZ_ROLLUP_MANAGER_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture ROLLUP_CONTRACT address" >&2; exit 1; }
 echo "      rollupMgr  = $EEZ_ROLLUP_MANAGER_ADDRESS"
@@ -349,7 +339,6 @@ EOF
 if [[ "$settlement_profile" == blob ]]; then
     cat >> "$OUT_FILE" <<EOF
 EEZ_SETTLEMENT_PROFILE=blob
-EEZ_SETTLEMENT_WRAPPER_ADDRESS=$EEZ_SETTLEMENT_WRAPPER_ADDRESS
 EOF
 fi
 

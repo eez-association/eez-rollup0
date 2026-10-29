@@ -624,7 +624,7 @@ Run the separate blob lane with:
 bash testing/kurtosis/run-blob-ci.sh
 ```
 
-`blob-args.yaml` selects the candidate-V1 manager and settlement wrapper,
+`blob-args.yaml` selects blob DA with the standard Rollup manager,
 chain 7332, and a Lighthouse supernode for full blob retrieval. The runner uses
 `eez-blob-ci`, `:blob-ci` images, enclave-local deployment artifacts and datadirs,
 and `artifacts/kurtosis-blob-e2e` for results and wave logs. It refuses to reuse
@@ -633,15 +633,18 @@ same host with their defaults.
 
 The blob lane runs the shared settlement scenarios, then the explicitly
 selected `blob_settlement` integration target. For each wave's L1 block range,
-that target checks successful type-3 wrapper transactions, empty batch
+that target checks successful type-3 transactions sent directly to EEZ, empty batch
 calldata, exact ordered blob hashes, beacon data pinned to the execution block,
 KZG-derived commitments, decoded actions bound to the on-chain entries,
 outbound transaction bytes in DA, and inbound receipt consumption events
 matching the applied blob entries.
 The shared waves check transaction effects and convergence of the L1 commitment
 with the L2 safe block hash. `blob-evidence.json` records the verified carriers.
-These waves do not guarantee multi-blob coverage or exercise malformed wrapper
-submissions; those require dedicated workloads beyond this lane.
+The target also includes offline regressions for two-blob decoding, action
+binding, foreign-source inbound actions, and the distinction between permissive
+wire decoding and settlement rejection of failed actions. The live waves do not
+guarantee multi-blob coverage or exercise malformed settlement submissions;
+those require dedicated workloads beyond this lane.
 
 The target is excluded from ordinary integration runs by `required-features`.
 To check an already running blob enclave, source its deployment artifact and set

@@ -65,7 +65,7 @@ kurtosis files download "$KURTOSIS_ENCLAVE" eez-deployments "$EEZ_CI_RESULT_DIR/
 set -a
 source "$EEZ_CI_RESULT_DIR/deployments/deployments.env"
 set +a
-[[ "${EEZ_SETTLEMENT_PROFILE:-}" == blob && -n "${EEZ_SETTLEMENT_WRAPPER_ADDRESS:-}" ]] || {
+[[ "${EEZ_SETTLEMENT_PROFILE:-}" == blob ]] || {
     echo "enclave did not deploy the blob settlement profile" >&2; exit 1;
 }
 export EEZ_L1_CHAIN_ID
