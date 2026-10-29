@@ -11,13 +11,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use alloy_eips::{Decodable2718, Encodable2718};
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_eips::{Decodable2718, Encodable2718, Typed2718};
+use alloy_primitives::{Address, B256, Bytes, TxHash};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
 use eez_evm::EezEvmConfig;
 use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Reader, Post, PostId};
 use eez_primitives::EezTxEnvelope as TransactionSigned;
+use eez_primitives::SYSTEM_TX_TYPE;
 use eez_primitives::engine::EezEngineTypes;
 use eez_protocol::outbound_gate::OutboundCallObservation;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
@@ -59,6 +60,9 @@ impl BlockHeaderInputs {
         })
     }
 }
+
+/// Holds tx hashes out of the L2 pool for a while past an L2 height.
+pub type RefuseTxs = Arc<dyn Fn(Vec<TxHash>, u64) + Send + Sync>;
 
 /// Where the deriver's history starts.
 #[derive(Debug, Clone)]
@@ -139,6 +143,8 @@ where
     system_tx_cfg: Option<eez_protocol::system_tx::SystemTxContext>,
     /// Peers mode never touches the boot checkpoint or scans from deploy.
     boot: DeriverBoot,
+    /// See [`Deriver::new`].
+    refuse_txs: Option<RefuseTxs>,
 }
 
 impl<L2> std::fmt::Debug for Deriver<L2>
@@ -182,6 +188,9 @@ where
     ///
     /// `boot` picks where history starts; [`DeriverBoot::Peers`] needs
     /// [`Self::seed`] before the first catch-up.
+    ///
+    /// `refuse_txs` keeps the cross-chain txs of blocks an L1-reorg retreat
+    /// drops out of the L2 pool; a composer's held pool backs it.
     pub fn new(
         committer: BlockCommitterHandle<EezEngineTypes>,
         l2_provider: Arc<L2>,
@@ -192,6 +201,7 @@ where
         l1_head: Arc<L1CanonicalHead>,
         system_tx_cfg: Option<eez_protocol::system_tx::SystemTxContext>,
         boot: DeriverBoot,
+        refuse_txs: Option<RefuseTxs>,
     ) -> Self {
         let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec))
             .expect("execution chain configuration was validated at startup");
@@ -208,6 +218,7 @@ where
                 safe_l2_block: AtomicU64::new(0),
                 system_tx_cfg,
                 boot,
+                refuse_txs,
             }),
         }
     }
@@ -1353,7 +1364,7 @@ where
             new_cursor,
             dropped_batches = dropped,
             new_safe_hash = %new_safe_hash,
-            "L1 reorg rolled out confirmed batches; L2 head retreated to the surviving safe cursor",
+            "L1 reorg rolled out confirmed batches; L2 safe retreated to the surviving cursor",
         );
         Ok(())
     }
@@ -1370,8 +1381,8 @@ where
             })
     }
 
-    /// Retreat reth's safe/finalized anchors and canonical head to the
-    /// L1-derived cursor. Caller holds the reconcile lock so the Sequencer
+    /// Retreat reth's safe/finalized anchors to the L1-derived cursor and drop
+    /// the blocks above it. Caller holds the reconcile lock so the Sequencer
     /// can't extend the branch between the two forkchoice updates.
     async fn retreat_l2_to_cursor(&self, cursor: u64) -> DeriverResult<B256> {
         let safe_header = self.l2_sealed_header_at(cursor)?;
@@ -1379,14 +1390,78 @@ where
         let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
 
         // Order matters: retreat safe/finalized first while the old head is
-        // still canonical, then roll head back and repair the parent mirror.
+        // still canonical, then drop the blocks above the cursor.
         self.inner
             .committer
             .advance_safe_finalized(safe_header.clone(), finalized_hash)
             .await?;
-        self.inner.committer.reorg_to(safe_header).await?;
+        if let Err(error) = self.replace_above(&safe_header).await {
+            event!(
+                name: "eez.deriver.l1.reorg.replace_failed",
+                Level::WARN,
+                cursor,
+                error = %error,
+                "could not replace the blocks above the cursor; rewinding, which loses their pure L2 txs",
+            );
+            self.inner.committer.reorg_to(safe_header).await?;
+        }
         self.inner.safe_l2_block.store(cursor, Ordering::Release);
         Ok(safe_hash)
+    }
+
+    /// Drop the blocks above `cursor` by committing an empty block in their
+    /// place while they are still canonical. That is a reth reorg, so the L2
+    /// pool takes back their pure L2 txs; a rewind would lose them.
+    async fn replace_above(
+        &self,
+        cursor: &SealedHeader<alloy_consensus::Header>,
+    ) -> DeriverResult<()> {
+        let head = self.inner.committer.last_header().number();
+        let inputs = BlockHeaderInputs {
+            beneficiary: cursor.beneficiary(),
+            extra_data: Bytes::new(),
+        };
+        // A block that already is the empty child of its parent stays:
+        // committing it again would unwind to it silently, not reorg.
+        for parent in cursor.number()..head {
+            let (payload, header) = self.execute_block(parent, &[], &inputs)?;
+            if self.l2_hash_at(parent + 1)? != header.hash() {
+                self.refuse_cross_chain_txs(parent + 1..=head)?;
+                // feed_witness=true: a PRODUCED block, posted with the next batch.
+                self.inner
+                    .committer
+                    .commit_derived(payload, header, true)
+                    .await?;
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// reth's reorg re-adds every dropped tx, and a Sync block's user txs are
+    /// cross-chain: mined again as plain L2 calls, they revert. Refuse them,
+    /// whoever composed the block.
+    fn refuse_cross_chain_txs(&self, blocks: std::ops::RangeInclusive<u64>) -> DeriverResult<()> {
+        let Some(refuse) = &self.inner.refuse_txs else {
+            return Ok(());
+        };
+        let height = *blocks.end();
+        let mut hashes = Vec::new();
+        for number in blocks {
+            let block = self
+                .inner
+                .l2_provider
+                .block_by_number(number)
+                .map_err(|e| DeriverError::L2Provider(e.to_string()))?
+                .ok_or_else(|| DeriverError::L2Provider(format!("no local L2 block {number}")))?;
+            let txs = block.body().transactions();
+            if txs.iter().any(|tx| tx.ty() == SYSTEM_TX_TYPE) {
+                let user_txs = txs.iter().filter(|tx| tx.ty() != SYSTEM_TX_TYPE);
+                hashes.extend(user_txs.map(Encodable2718::trie_hash));
+            }
+        }
+        refuse(hashes, height);
+        Ok(())
     }
 
     async fn on_l1_finalized(&self, l1_finalized_block: u64) -> DeriverResult<()> {
