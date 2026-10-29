@@ -60,6 +60,20 @@ impl BlockHeaderInputs {
     }
 }
 
+/// Where the deriver's history starts.
+#[derive(Debug, Clone)]
+pub enum DeriverBoot {
+    /// Peers sync the history; boot seeds the index at L1-finalized through
+    /// [`Deriver::seed`]. No boot checkpoint, no deploy-block scan.
+    Peers,
+    /// Derive everything from L1: the boot checkpoint in `checkpoint_dir`,
+    /// else the deploy block.
+    L1Only {
+        /// L2 datadir holding the boot checkpoint; `None` disables it.
+        checkpoint_dir: Option<PathBuf>,
+    },
+}
+
 /// Stop the node on a fatal error. PANIC, don't return: reth reports only a
 /// critical task's panic, and a resync would retry the error forever.
 fn stop_if_fatal(err: &DeriverError) {
@@ -123,9 +137,8 @@ where
     /// L1-entries → L2 system-tx prepending in `reconcile_batch_blocks`;
     /// `None` falls back to pure-user-tx STF. See [`Deriver::new`] docs.
     system_tx_cfg: Option<eez_protocol::system_tx::SystemTxContext>,
-    /// L2 datadir holding the boot checkpoint. `None` disables it, which is
-    /// the old behaviour: boot rescans from the deploy block.
-    checkpoint_dir: Option<PathBuf>,
+    /// Peers mode never touches the boot checkpoint or scans from deploy.
+    boot: DeriverBoot,
 }
 
 impl<L2> std::fmt::Debug for Deriver<L2>
@@ -166,6 +179,9 @@ where
     /// the composer produced (from the postBatch's `entries[]` /
     /// `l2_entries[]`) and prepends them to the batch's Sync block, so
     /// local replay is byte-identical. `None` is the pure-user-tx STF.
+    ///
+    /// `boot` picks where history starts; [`DeriverBoot::Peers`] needs
+    /// [`Self::seed`] before the first catch-up.
     pub fn new(
         committer: BlockCommitterHandle<EezEngineTypes>,
         l2_provider: Arc<L2>,
@@ -175,7 +191,7 @@ where
         deploy_block: u64,
         l1_head: Arc<L1CanonicalHead>,
         system_tx_cfg: Option<eez_protocol::system_tx::SystemTxContext>,
-        checkpoint_dir: Option<PathBuf>,
+        boot: DeriverBoot,
     ) -> Self {
         let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec))
             .expect("execution chain configuration was validated at startup");
@@ -191,8 +207,31 @@ where
                 l1_head,
                 safe_l2_block: AtomicU64::new(0),
                 system_tx_cfg,
-                checkpoint_dir,
+                boot,
             }),
+        }
+    }
+
+    /// Start the empty index at `record`, a floor no L1 reorg may cross, and
+    /// mirror its L2 block as safe. Boot has already moved reth's safe and
+    /// finalized there.
+    ///
+    /// # Panics
+    ///
+    /// If the index is not empty.
+    pub fn seed(&self, record: BatchRecord) {
+        self.inner.l1_head.seed(record);
+        self.inner
+            .safe_l2_block
+            .store(record.last_l2_block, Ordering::Release);
+    }
+
+    /// The boot checkpoint's directory. Peers mode has none: a checkpoint over
+    /// peer-synced history would let a later L1-only boot skip verifying it.
+    fn checkpoint_dir(&self) -> Option<&std::path::Path> {
+        match &self.inner.boot {
+            DeriverBoot::L1Only { checkpoint_dir } => checkpoint_dir.as_deref(),
+            DeriverBoot::Peers => None,
         }
     }
 
@@ -201,7 +240,7 @@ where
     /// is safe, even one sharing its block or tx with earlier posts, because
     /// `is_processed` compares positions (block, hash, log index).
     fn save_checkpoint(&self) {
-        let Some(dir) = self.inner.checkpoint_dir.as_deref() else {
+        let Some(dir) = self.checkpoint_dir() else {
             return;
         };
         let Some(tail) = self.inner.l1_head.last_indexed() else {
@@ -261,8 +300,7 @@ where
     /// Checkpoint to seed the boot scan from, or `None` to rescan from the
     /// deploy block. [`ReconcileCheckpoint::usable_with`] decides.
     async fn checkpoint_seed(&self) -> Option<crate::checkpoint::ReconcileCheckpoint> {
-        let checkpoint =
-            crate::checkpoint::ReconcileCheckpoint::load(self.inner.checkpoint_dir.as_deref()?)?;
+        let checkpoint = crate::checkpoint::ReconcileCheckpoint::load(self.checkpoint_dir()?)?;
         // The checkpoint names the tip we last indexed. A restart brings the L1
         // back with us, so for a few seconds its head sits below that block and
         // every hash read is `None` — discarding the checkpoint then is a
@@ -309,14 +347,17 @@ where
     }
 
     /// Reorg-aware catch-up from the latest canonical L1 batch already
-    /// indexed locally, or from the registry deploy block if the index is
-    /// empty. Scans historical `BatchPosted` events in chunks, replaying
-    /// non-matching L2 blocks and populating `L1CanonicalHead`.
+    /// indexed locally, or, in L1-only mode with an empty index, from the
+    /// boot checkpoint or the registry deploy block. Scans historical
+    /// `BatchPosted` events in chunks, replaying non-matching L2 blocks and
+    /// populating `L1CanonicalHead`.
     ///
     /// # Errors
     ///
     /// `l1_scan` (scan failure), `l2_provider` (lookup failure),
-    /// `local_diverged` (replay failure), `committer_closed`.
+    /// `local_diverged` (replay failure), `committer_closed`; the fatal
+    /// `below_seed_floor`, `unseeded` (peers mode before [`Self::seed`]) and
+    /// `finalized_resume`.
     ///
     /// # Panics
     ///
@@ -398,8 +439,11 @@ where
         }
         match anchor {
             Some(anchor_l1_block) => self.sync_batches_inner(anchor_l1_block, cursor).await,
-            // Every boot has an empty index. The checkpoint keeps the scan
-            // short (`docs/issues/deep-reverify-cost.md`).
+            // Peers mode seeds before catch-up and no reorg drops the floor, so
+            // an empty index is a boot bug, never a cue to scan from deploy.
+            None if matches!(self.inner.boot, DeriverBoot::Peers) => Err(DeriverError::Unseeded),
+            // Every L1-only boot has an empty index. The checkpoint keeps the
+            // scan short (`docs/issues/deep-reverify-cost.md`).
             None => match self.checkpoint_seed().await {
                 Some(seed) => {
                     // The seed is the tail: its block's posts at or before it read as processed.
@@ -412,6 +456,17 @@ where
                         tx_hash: seed.tx_hash,
                         last_l2_block: seed.l2_cursor,
                     });
+                    // L1 finality below the seed maps to no indexed batch, so keep
+                    // reth's stored finalized; otherwise the tag drops to genesis.
+                    let finalized = self
+                        .inner
+                        .l2_provider
+                        .finalized_block_number()
+                        .map_err(|e| DeriverError::L2Provider(e.to_string()))?
+                        .unwrap_or(0);
+                    self.inner
+                        .l1_head
+                        .set_finalized_l2(finalized.min(seed.l2_cursor));
                     self.sync_batches_inner(seed.l1_block, seed.l2_cursor).await
                 }
                 None => self.sync_batches_inner(self.inner.deploy_block, 0).await,
@@ -457,10 +512,8 @@ where
                 return Ok(Some(tail.post.l1_block));
             }
             let old_cursor = self.inner.l1_head.cursor();
-            let (new_cursor, _new_finalized, dropped) = self
-                .inner
-                .l1_head
-                .retreat_on_l1_reorg(tail.post.l1_block.saturating_sub(1));
+            let (new_cursor, _new_finalized, dropped) =
+                self.retreat_index(tail.post.l1_block.saturating_sub(1))?;
             event!(
                 name: "eez.deriver.l1.reorg.retreated",
                 Level::WARN,
@@ -502,6 +555,7 @@ where
         event!(
             name: "eez.deriver.catch_up.start",
             Level::INFO,
+            event_name = "eez.deriver.catch_up.start",
             local_head,
             from_l1_block,
             to_l1_block,
@@ -909,6 +963,10 @@ where
     /// Runs the deriver loop, processing each event on `rx` until the
     /// stream closes. `rx` must be subscribed before the `L1Watcher`
     /// starts so no event predates it.
+    ///
+    /// # Panics
+    ///
+    /// On a fatal error (`is_fatal`), to stop the node.
     pub async fn run(self, mut rx: broadcast::Receiver<L1Event>) {
         // Defensive re-anchor: a cheap no-op in the normal boot order;
         // load-bearing for any caller that subscribed rx late.
@@ -1275,10 +1333,7 @@ where
         let _guard = self.inner.committer.begin_reconcile().await;
 
         let old_cursor = self.inner.l1_head.cursor();
-        let (new_cursor, _new_finalized, dropped) = self
-            .inner
-            .l1_head
-            .retreat_on_l1_reorg(common_ancestor_number);
+        let (new_cursor, _new_finalized, dropped) = self.retreat_index(common_ancestor_number)?;
         if new_cursor >= old_cursor {
             event!(
                 name: "eez.deriver.l1.reorg.noop",
@@ -1311,6 +1366,18 @@ where
             "L1 reorg rolled out confirmed batches; L2 head retreated to the surviving safe cursor",
         );
         Ok(())
+    }
+
+    /// Drop indexed batches above `common_ancestor`. Crossing the seed floor is
+    /// fatal: the floor is L1-finalized, so it never rewinds L2.
+    fn retreat_index(&self, common_ancestor: u64) -> DeriverResult<(u64, u64, usize)> {
+        self.inner
+            .l1_head
+            .retreat_on_l1_reorg(common_ancestor)
+            .map_err(|floor| DeriverError::BelowSeedFloor {
+                l1_block: common_ancestor,
+                floor_l1_block: floor.l1_block,
+            })
     }
 
     /// Retreat reth's safe/finalized anchors and canonical head to the
@@ -1749,12 +1816,9 @@ where
                     // an invalid forkchoice), so refuse loudly here (invariant 7).
                     let finalized_l2 = self.inner.l1_head.finalized_l2();
                     if from_block <= finalized_l2 {
-                        return Err(DeriverError::LocalDiverged {
+                        return Err(DeriverError::FinalizedResume {
                             l2_block: from_block,
-                            detail: Some(format!(
-                                "resumed batch would rewrite Sync block {from_block} at or below \
-                                 the L1-finalized L2 head {finalized_l2}"
-                            )),
+                            finalized_l2,
                         });
                     }
                     let parent = self.l2_sealed_header_at(from_block - 1)?;

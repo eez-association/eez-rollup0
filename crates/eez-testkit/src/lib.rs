@@ -15,6 +15,7 @@ pub mod native;
 use std::{
     collections::HashSet,
     fmt::Write as _,
+    net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -43,6 +44,7 @@ use eez_control_rpc::{
 };
 use eez_protocol::EEZL2_ADDRESS;
 use eez_protocol::abi::postAndVerifyBatchCall;
+use reth_network_peers::NodeRecord;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -64,6 +66,10 @@ pub const ANVIL_KEY_6: &str = "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d
 pub const ANVIL_ATTESTER_KEY: &str =
     "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
+/// Anvil account #7 signs composer heads. No other role uses it; signing needs no funds.
+pub const SEQUENCER_KEY: &str =
+    "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356";
+pub const SEQUENCER_ADDR: Address = address!("0x14dC79964da2C08b23698B3D3cc7Ca32193d9955");
 /// Unfunded ordinary sender used to stage divergent speculative history.
 pub const STAGING_USER_KEY: &str =
     "0x6f7d72ecb79c8bf1bd8e7c49a1c4a22741ab708f06bb19e5b5d44a6f0934a7c1";
@@ -73,6 +79,10 @@ const L1_BLOCK_TIME_SECS: u64 = 4;
 
 // Consumed by the launcher as `--chain`; never forwarded to `eez-node`.
 const TEST_L2_GENESIS_ENV: &str = "EEZ_TEST_L2_GENESIS_PATH";
+
+// Every node env names its mode. In the default peers mode, a node booting
+// after L1 finalized a settlement waits for peers to serve the history.
+const SYNC_L1_ONLY_ENV: &str = "EEZ_SYNC_L1_ONLY";
 
 const TX_SPAM_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -131,6 +141,8 @@ pub struct Anvil {
 struct AnvilConfig {
     gas_limit: u64,
     genesis_timestamp: u64,
+    /// Anvil finalizes two epochs behind its head; `None` keeps its 32 slots.
+    slots_in_an_epoch: Option<u64>,
 }
 
 impl AnvilConfig {
@@ -138,6 +150,7 @@ impl AnvilConfig {
         Self {
             gas_limit: 30_000_000,
             genesis_timestamp,
+            slots_in_an_epoch: None,
         }
     }
 }
@@ -163,6 +176,9 @@ impl Anvil {
         ]);
         cmd.args(["--gas-limit", &cfg.gas_limit.to_string()]);
         cmd.args(["--timestamp", &cfg.genesis_timestamp.to_string()]);
+        if let Some(slots) = cfg.slots_in_an_epoch {
+            cmd.args(["--slots-in-an-epoch", &slots.to_string()]);
+        }
         cmd.stdout(Stdio::from(log)).stderr(Stdio::from(err_log));
         drop(port_lease);
         let mut child = cmd.spawn().context("spawn anvil")?;
@@ -263,7 +279,7 @@ impl BuilderStubMode {
 }
 
 impl BundleStub {
-    async fn spawn(port_lease: PortLease, upstream: &str) -> Result<Self> {
+    async fn spawn(port_lease: PortLease, upstream: &str, passthrough: bool) -> Result<Self> {
         let port = port_lease.port();
         let script = repo_root().join("scripts/builder-stub.py");
         let listen = format!("127.0.0.1:{port}");
@@ -275,7 +291,12 @@ impl BundleStub {
             .arg(script)
             .args(["--listen", &listen, "--upstream", upstream])
             .arg("--block-time")
-            .arg(L1_BLOCK_TIME_SECS.to_string())
+            .arg(L1_BLOCK_TIME_SECS.to_string());
+        if passthrough {
+            // The L1 is a reth node, not Anvil: relay bundles instead of mining them.
+            command.arg("--passthrough");
+        }
+        command
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err_log));
         drop(port_lease);
@@ -803,13 +824,29 @@ impl Harness {
         Self::with_anvil_config(cfg, l2_genesis_block_hash_at(ts)?, l2_genesis).await
     }
 
+    /// [`Self::fresh`] with L1 finalized two blocks behind its head, not 64.
+    pub async fn fresh_with_fast_finality() -> Result<Self> {
+        Self::fresh_with_slots_in_an_epoch(1).await
+    }
+
+    /// [`Self::fresh`] with L1 finalized `2 * slots` blocks behind its head, not 64.
+    pub async fn fresh_with_slots_in_an_epoch(slots: u64) -> Result<Self> {
+        let ts = now_unix_secs();
+        let l2_genesis = write_l2_genesis_at(ts)?;
+        let cfg = AnvilConfig {
+            slots_in_an_epoch: Some(slots),
+            ..AnvilConfig::standard(ts)
+        };
+        Self::with_anvil_config(cfg, l2_genesis_block_hash_at(ts)?, l2_genesis).await
+    }
+
     async fn with_anvil_config(
         cfg: AnvilConfig,
         initial_state: B256,
         l2_genesis: (PathBuf, tempfile::TempDir),
     ) -> Result<Self> {
         let mut anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
-        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url).await?;
+        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url, false).await?;
         // Route every harness client through the builder so its snapshot-based
         // block assembly cannot race direct mutations of the backing Anvil.
         anvil.rpc_url.clone_from(&stub.url);
@@ -861,21 +898,16 @@ impl Harness {
             proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id: self.dep.rollup_id,
             expect_external_batches,
-            sequencer_rpc: None,
         })
         .await
     }
 
-    pub async fn follower_env(
-        &self,
-        sequencer_rpc: Option<&str>,
-    ) -> Result<Vec<(&'static str, String)>> {
+    pub async fn follower_env(&self) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
             poster_key: None,
             proof_signer_key: None,
             rollup_id: self.dep.rollup_id,
             expect_external_batches: true,
-            sequencer_rpc,
         })
         .await
     }
@@ -894,7 +926,6 @@ impl Harness {
                 proof_signer_key: None,
                 rollup_id: self.dep.rollup_id,
                 expect_external_batches: true,
-                sequencer_rpc: None,
             })
             .await?;
         env.extend([
@@ -917,7 +948,6 @@ impl Harness {
             proof_signer_key: Some(ANVIL_ATTESTER_KEY),
             rollup_id,
             expect_external_batches: false,
-            sequencer_rpc: None,
         })
         .await
     }
@@ -931,7 +961,6 @@ impl Harness {
             proof_signer_key: Some(proof_signer_key),
             rollup_id: self.dep.rollup_id,
             expect_external_batches: false,
-            sequencer_rpc: None,
         })
         .await
     }
@@ -986,6 +1015,7 @@ impl Harness {
                 TEST_L2_GENESIS_ENV,
                 self.l2_genesis.0.to_string_lossy().into_owned(),
             ),
+            (SYNC_L1_ONLY_ENV, "1".to_string()),
         ];
 
         if let Some(poster_key) = opts.poster_key {
@@ -993,6 +1023,7 @@ impl Harness {
                 ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
                 ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
                 ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
+                ("EEZ_SEQUENCER_KEY", SEQUENCER_KEY.to_string()),
             ]);
         }
 
@@ -1023,9 +1054,6 @@ impl Harness {
                 .map_err(|_| anyhow!("prover registry poisoned"))?
                 .push((signer, witness_dir));
         }
-        if let Some(sequencer_rpc) = opts.sequencer_rpc {
-            env.push(("EEZ_SEQUENCER_RPC", sequencer_rpc.to_string()));
-        }
         Ok(env)
     }
 }
@@ -1035,7 +1063,6 @@ struct NodeEnvOptions<'a> {
     proof_signer_key: Option<&'a str>,
     rollup_id: u64,
     expect_external_batches: bool,
-    sequencer_rpc: Option<&'a str>,
 }
 
 pub struct Deployment {
@@ -1357,6 +1384,10 @@ pub struct NodeHandle {
     /// Owned node database. CI retains it only if this test unwinds in failure.
     owned_datadir: Option<FailureDatadir>,
     pub http_port: u16,
+    /// devp2p RLPx TCP port.
+    pub p2p_port: u16,
+    /// discv5 UDP port; bound only with [`NodeConfig::discovery`].
+    pub discv5_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1405,6 +1436,66 @@ pub struct NodeConfig<'a> {
     /// Explicit node-role executable to launch.
     pub binary: NodeBinary,
     pub genesis_path: Option<&'a std::path::Path>,
+    /// Runs discv5 on loopback instead of `--disable-discovery`; `extra_args`
+    /// must then name `--bootnodes`.
+    pub discovery: bool,
+    /// Appended to the node command line.
+    pub extra_args: Vec<String>,
+}
+
+/// Enode of a loopback node started with `--p2p-secret-key-hex <secret_hex>`.
+pub fn enode(secret_hex: &str, tcp: u16, udp: u16) -> String {
+    let key: secp256k1::SecretKey = secret_hex
+        .trim_start_matches("0x")
+        .parse()
+        .expect("secret_hex is a 32-byte hex secp256k1 key");
+    // Display adds `?discport=<udp>`; without it discv5 bootstraps against the TCP port.
+    NodeRecord::from_secret_key(SocketAddr::from((Ipv4Addr::LOCALHOST, tcp)), &key)
+        .with_udp_port(udp)
+        .to_string()
+}
+
+/// A free loopback TCP port for a listener set through env, such as `EEZ_P2P_LISTEN`.
+/// No other testkit lease reuses it.
+pub fn unused_tcp_port() -> u16 {
+    PortLease::tcp().port()
+}
+
+/// devp2p key of the overlay seed, so its enode is known before it starts.
+pub const SEED_KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Makes a composer the overlay seed under [`SEED_KEY`]: it publishes its
+/// signed heads and serves blocks to the followers that find it.
+pub fn overlay_seed(cfg: &mut NodeConfig<'_>, env: &mut Vec<(&'static str, String)>) {
+    cfg.discovery = true;
+    // The bootnodes guard needs an entry; the seed's own is a no-op.
+    cfg.extra_args.extend([
+        "--p2p-secret-key-hex".into(),
+        SEED_KEY.into(),
+        "--bootnodes".into(),
+        enode(SEED_KEY, 0, 0),
+    ]);
+    env.push(overlay_listen());
+}
+
+/// Makes a follower find `seed` through its bootnode and follow its signed heads.
+pub fn overlay_follower(
+    seed: &NodeHandle,
+    cfg: &mut NodeConfig<'_>,
+    env: &mut Vec<(&'static str, String)>,
+) {
+    cfg.discovery = true;
+    cfg.extra_args.extend([
+        "--bootnodes".into(),
+        enode(SEED_KEY, seed.p2p_port, seed.discv5_port),
+    ]);
+    env.push(overlay_listen());
+    env.push(("EEZ_SEQUENCER_ADDRESS", format!("{SEQUENCER_ADDR:#x}")));
+}
+
+fn overlay_listen() -> (&'static str, String) {
+    let port = unused_tcp_port();
+    ("EEZ_P2P_LISTEN", format!("/ip4/127.0.0.1/tcp/{port}"))
 }
 
 impl NodeHandle {
@@ -1432,6 +1523,7 @@ impl NodeHandle {
         let http_lease = PortLease::tcp();
         let ws_lease = PortLease::tcp();
         let p2p_lease = PortLease::tcp();
+        let discv5_lease = PortLease::udp();
         let l1_http_lease = PortLease::http_pair();
         let l1_auth_lease = PortLease::tcp();
         // Embedded L1 uses this numeric port for RLPx TCP and discovery UDP.
@@ -1443,6 +1535,7 @@ impl NodeHandle {
         let http_port = http_lease.port();
         let ws_port = ws_lease.port();
         let p2p_port = p2p_lease.port();
+        let discv5_port = discv5_lease.port();
         let l1_http_port = l1_http_lease.port();
         let l1_auth_port = l1_auth_lease.port();
         let l1_p2p_port = l1_p2p_lease.port();
@@ -1454,6 +1547,7 @@ impl NodeHandle {
             http_lease,
             ws_lease,
             p2p_lease,
+            discv5_lease,
             l1_http_lease,
             l1_auth_lease,
             l1_p2p_lease,
@@ -1504,7 +1598,6 @@ impl NodeHandle {
                 &authrpc_port.to_string(),
                 "--port",
                 &p2p_port.to_string(),
-                "--disable-discovery",
                 "--ipcdisable",
             ])
             .stderr(stderr)
@@ -1520,6 +1613,25 @@ impl NodeHandle {
                 "CARGO_HOME",
                 std::env::var("CARGO_HOME").unwrap_or_default(),
             );
+        if cfg.discovery {
+            // discv4 would bind its default UDP port on every node, so only discv5 runs, on
+            // a leased port. `--addr` and `--disable-nat` keep 127.0.0.1 in the ENR for
+            // peers to dial, and 1 s bootstrap lookups find them within seconds.
+            cmd.args([
+                "--addr",
+                "127.0.0.1",
+                "--disable-discv4-discovery",
+                "--disable-dns-discovery",
+                "--disable-nat",
+                "--discovery.v5.port",
+                &discv5_port.to_string(),
+                "--discovery.v5.bootstrap.lookup-interval",
+                "1",
+            ]);
+        } else {
+            cmd.arg("--disable-discovery");
+        }
+        cmd.args(&cfg.extra_args);
         cmd.env("EEZ_L1_HTTP_PORT", l1_http_port.to_string())
             .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
             .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
@@ -1548,6 +1660,8 @@ impl NodeHandle {
             _keep_alive: log_tempdir.into_iter().collect(),
             owned_datadir: None,
             http_port,
+            p2p_port,
+            discv5_port,
         })
     }
 
@@ -2631,6 +2745,12 @@ pub async fn wait_for_safe_chain_contains(
     .await
 }
 
+/// Switches a node env from the testkit's L1-only default to peers mode.
+pub fn peers_mode(env: &mut Vec<(&'static str, String)>) {
+    env.retain(|(key, _)| *key != SYNC_L1_ONLY_ENV);
+    env.push((SYNC_L1_ONLY_ENV, "0".to_string()));
+}
+
 /// Return `env` with `key`'s value replaced by `value`. No-op if `key`
 /// isn't present.
 pub fn override_env(
@@ -3514,6 +3634,7 @@ impl CrossChainConfig {
                 self.l1_genesis.0.to_string_lossy().into_owned(),
             ),
             ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
+            ("EEZ_SEQUENCER_KEY", SEQUENCER_KEY.to_string()),
             ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
             (
                 "EEZ_L1_BLOCK_TIME_MS",
@@ -3552,6 +3673,7 @@ impl CrossChainConfig {
                 TEST_L2_GENESIS_ENV,
                 self.l2_genesis.0.to_string_lossy().into_owned(),
             ),
+            (SYNC_L1_ONLY_ENV, "1".to_string()),
         ]
     }
 }
@@ -3593,6 +3715,8 @@ pub struct CrossChainWorld {
     /// Present only in signer-mutation tests.
     pub prover_proxy: Option<ProverProxyHandle>,
     pub proof_signer: ProofSignerHandle,
+    /// Present only in worlds from [`setup_cross_chain_with_builder_stub`].
+    builder: Option<BundleStub>,
     _witness_dir: tempfile::TempDir,
     _datadir: FailureDatadir,
 }
@@ -3744,6 +3868,7 @@ impl CrossChainWorld {
                         | "EEZ_L1_P2P_PORT"
                         | "EEZ_L1_XCHAIN_PORT"
                         | "EEZ_L2_XCHAIN_PORT"
+                        | "EEZ_SEQUENCER_KEY"
                 )
             })
             .map(|(key, mut value)| {
@@ -3753,6 +3878,17 @@ impl CrossChainWorld {
                 (key, value)
             })
             .collect()
+    }
+
+    /// Select how the relay stub treats the composer's next bundles.
+    pub async fn set_builder_mode(&self, mode: BuilderStubMode) -> Result<()> {
+        self.builder
+            .as_ref()
+            .context(
+                "world has no builder stub; start it with setup_cross_chain_with_builder_stub",
+            )?
+            .set_mode(mode)
+            .await
     }
 }
 
@@ -4423,14 +4559,21 @@ pub async fn run_scenarios(
 
 /// Start the shared cross-chain fixture.
 pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(None, None, &[]).await
+    setup_cross_chain_inner(None, None, &[], false).await
+}
+
+/// Start the fixture with the composer's bundles routed through the relay stub,
+/// and the composer as the overlay seed (see [`overlay_seed`]).
+/// The stub forwards only single-transaction bundles, so inbound calls cannot settle here.
+pub async fn setup_cross_chain_with_builder_stub() -> Result<CrossChainWorld> {
+    setup_cross_chain_inner(None, None, &[], true).await
 }
 
 /// Start the fixture with additional node environment variables.
 pub async fn setup_cross_chain_with_env(
     extra_env: &[(&'static str, String)],
 ) -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(None, None, extra_env).await
+    setup_cross_chain_inner(None, None, extra_env, false).await
 }
 
 /// Starts the fixture with a mutation proxy and expected attester override.
@@ -4438,7 +4581,7 @@ pub async fn setup_cross_chain_proxied(
     mutation: ProverMutation,
     attester: Address,
 ) -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(Some(mutation), Some(attester), &[]).await
+    setup_cross_chain_inner(Some(mutation), Some(attester), &[], false).await
 }
 
 pub async fn setup_cross_chain_empty_call() -> Result<CrossChainEmptyCallWorld> {
@@ -4585,6 +4728,7 @@ async fn setup_cross_chain_inner(
     mutation: Option<ProverMutation>,
     attester_override: Option<Address>,
     extra_env: &[(&'static str, String)],
+    builder_stub: bool,
 ) -> Result<CrossChainWorld> {
     let mut cfg = CrossChainConfig::new()?;
     let signer_attester = signer_address(cfg.attester_key)?;
@@ -4608,6 +4752,11 @@ async fn setup_cross_chain_inner(
     let attester = attester_override.unwrap_or(signer_attester);
     let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
     let mut datadir = FailureDatadir::new("eez-cross-chain")?;
+    let builder = if builder_stub {
+        Some(BundleStub::spawn(PortLease::tcp(), &cfg.l1_rpc_url(), true).await?)
+    } else {
+        None
+    };
     let mut env = cfg.env();
     env.extend([
         ("EEZ_PROVER_URL", prover_url.to_string()),
@@ -4617,16 +4766,23 @@ async fn setup_cross_chain_inner(
             witness_dir.path().to_string_lossy().into_owned(),
         ),
     ]);
+    if let Some(builder) = &builder {
+        env.push(("EEZ_L1_BUILDER_RPC_URL", builder.url.clone()));
+    }
     // Before the assertion below, so caller-supplied vars are checked too.
     env.extend_from_slice(extra_env);
     assert!(
         !env.iter().any(|(name, _)| *name == "EEZ_PROOF_SIGNER_KEY"),
         "remote composer environment must not contain the proof-signer key",
     );
+    let mut node_cfg = NodeConfig::default();
+    if builder_stub {
+        overlay_seed(&mut node_cfg, &mut env);
+    }
     let node = NodeHandle::spawn_with_reservations(
         "node",
         datadir.path(),
-        &NodeConfig::default(),
+        &node_cfg,
         &env,
         cfg.take_port_leases(),
     )?;
@@ -4734,6 +4890,7 @@ async fn setup_cross_chain_inner(
         outbound_wrapper,
         prover_proxy,
         proof_signer,
+        builder,
         _witness_dir: witness_dir,
         _datadir: datadir,
     })

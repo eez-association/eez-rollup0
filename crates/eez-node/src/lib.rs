@@ -7,40 +7,40 @@
 //!
 mod bundle_rpc;
 mod composer_rpc;
+mod head_signer;
 mod ingress;
 mod l1_embedded;
 mod witness_source;
 
 use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
 
+use alloy_consensus::{BlockHeader as _, Header, transaction::TxHashRef as _};
 use alloy_primitives::{Address, B256};
 use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
 use eez_composer::composer::CrossChainWiring;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
-use eez_deriver::{Deriver, DeriverError};
+use eez_deriver::Deriver;
 use eez_driver::{
     BlockCommitterHandle, DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, RollupTiming,
     Sequencer, SyncSlotComposerHandle, spawn_l1_anchored,
 };
 use eez_l1::{
-    L1CanonicalHead, L1Error, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
+    L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
 };
 use eez_node_common::EezNode;
 use eez_node_common::{
-    L2NodeBuilder, NoRoleArgs, node_cli, read_checkpoint_dir, wait_for_l1_ready,
-    warn_on_deprecated_env,
+    L2NodeBuilder, NoRoleArgs, boot, node_cli, sync_mode_from_env, wait_for_idle_engine,
+    wait_for_l1_ready, warn_on_deprecated_env,
 };
+use eez_primitives::engine::EezEngineTypes;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
+use reth_network::{NetworkInfo as _, PeersInfo as _};
 use reth_node_ethereum::EthereumNode;
+use reth_storage_api::{BlockReader, HeaderProvider};
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
-const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
-const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-/// ~15 min at the capped backoff: outlasts a restarting L1, but a permanently
-/// refused RPC call still surfaces as an exit.
-const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
 const L1_CHAIN_ID_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Witness-capture resources selected by the mandatory composer prover.
@@ -141,6 +141,18 @@ fn blob_posting_from_env(
     }))
 }
 
+/// `EEZ_SEQUENCER_KEY`: the key that signs this composer's heads; unset disables signing.
+fn sequencer_key_from_env() -> eyre::Result<Option<PrivateKeySigner>> {
+    match env::var("EEZ_SEQUENCER_KEY") {
+        // The parse error is dropped on purpose: it must never echo the key.
+        Ok(value) => PrivateKeySigner::from_str(value.trim())
+            .map(Some)
+            .map_err(|_| eyre::eyre!("EEZ_SEQUENCER_KEY is not a valid private key")),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(eyre::eyre!("EEZ_SEQUENCER_KEY is not valid unicode")),
+    }
+}
+
 fn optional_address_from_env(name: &str) -> eyre::Result<Option<Address>> {
     match env::var(name) {
         Ok(value) => Address::from_str(value.trim())
@@ -161,6 +173,15 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     );
 
     warn_on_deprecated_env();
+    let sync_mode = sync_mode_from_env()?;
+    let sequencer_key = sequencer_key_from_env()?;
+    if sequencer_key.is_none() {
+        event!(
+            name: "eez.node.head_signer.disabled",
+            Level::WARN,
+            "EEZ_SEQUENCER_KEY not set; this composer does not sign heads",
+        );
+    }
     // Fail before launching either reth if no usable prover is configured.
     let ComposerProving {
         prover,
@@ -323,6 +344,14 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         },
     );
     let front_composer_info = Arc::new(serde_json::to_value(&composer_info)?);
+    let rollup_config = RollupConfig::from_env(
+        eez_evm::fee_collector(&builder.config().chain.genesis.config)?.unwrap_or_default(),
+    )?;
+    // Read before launch so a misconfiguration fails fast.
+    let p2p_config = eez_p2p::P2pConfig::from_env(l2_chain_id, rollup_config.rollup_id)?;
+    if p2p_config.is_some() && sequencer_key.is_none() {
+        eyre::bail!("EEZ_P2P_LISTEN requires EEZ_SEQUENCER_KEY on a composer");
+    }
     let handle = builder
         .with_types::<EezNode>()
         .with_components(EezNode::components().payload(
@@ -343,6 +372,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     let payload_builder_handle = handle.node.payload_builder_handle.clone();
     let beacon_engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
     let task_executor = handle.node.task_executor.clone();
+    let network = handle.node.network.clone();
 
     // Shared L1-confirmed L2 head. Created unconditionally so the
     // Sequencer's speculative-depth limit can be wired even when
@@ -352,6 +382,12 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
 
     let timing = RollupTiming::from_env()?;
 
+    // Env reads come first so a bad L1 env fails at startup, not after a backfill.
+    let submitter_config = SubmitterConfig::from_env()?;
+    let l1_watcher_config = L1WatcherConfig::from_env()?;
+
+    // The committer reads reth's head, which a resumed backfill is still moving.
+    wait_for_idle_engine(|| network.is_syncing()).await;
     let block_committer = BlockCommitterHandle::spawn_from_provider(
         &provider,
         beacon_engine_handle,
@@ -363,14 +399,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MAX_SPECULATIVE_DEPTH);
 
-    let submitter_config = SubmitterConfig::from_env()?;
     let deploy_block = submitter_config.reader.deploy_block;
-    let rollup_config = RollupConfig::from_env(
-        eez_evm::fee_collector(&chain_spec.genesis.config)?.unwrap_or_default(),
-    )?;
     let attributes = EthAttributesBuilder::new(chain_spec.clone())
         .with_fee_recipient(rollup_config.fee_recipient);
-    let l1_watcher_config = L1WatcherConfig::from_env()?;
 
     let submitter = Submitter::new(submitter_config);
     // Handle only — polling starts after boot catch-up fixes the
@@ -731,7 +762,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
-        read_checkpoint_dir(),
+        sync_mode.deriver_boot(),
     );
 
     // Bind before the L1 wait so port checks see a live front. Submissions are
@@ -769,67 +800,24 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     }
 
     let l1_reader = submitter.reader();
-    wait_for_l1_ready(&l1_reader, deploy_block, l1_source_chain_id).await?;
+    let probe = sync_mode.readiness_probe(deploy_block);
+    wait_for_l1_ready(&l1_reader, probe, l1_source_chain_id).await?;
     for (expected_chain_id, provider) in &xchain_checks {
         ingress::validate_cross_chain_front(provider, *expected_chain_id).await?;
     }
 
-    let mut catch_up_retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
-    let mut catch_up_attempts = 0_u64;
-    let mut transport_failures = 0_u32;
-    let (l1_seed_number, l1_seed_hash) = loop {
-        match deriver.catch_up_with_seed().await {
-            Ok(seed) => break seed,
-            Err(err)
-                if matches!(&err, DeriverError::L1Scan(L1Error::Provider(_))) && {
-                    transport_failures += 1;
-                    transport_failures >= BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES
-                } =>
-            {
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.transport_exhausted",
-                    Level::ERROR,
-                    mode = "composer",
-                    transport_failures,
-                    error = %err,
-                    "L1 transport kept failing during boot catch-up; the endpoint is likely refusing a call we need, not merely unreachable",
-                );
-                return Err(eyre::eyre!(
-                    "boot-time deriver catch_up gave up after {transport_failures} L1 transport failures: {err}"
-                ));
-            }
-            Err(err) if matches!(&err, DeriverError::L1Scan(l1) if l1.is_retryable()) => {
-                catch_up_attempts += 1;
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.source_incomplete",
-                    Level::WARN,
-                    mode = "composer",
-                    attempts = catch_up_attempts,
-                    retry_delay_secs = catch_up_retry_delay.as_secs(),
-                    error = %err,
-                    "boot-time catch_up could not read all L1 source data yet; retrying before starting L1-active tasks",
-                );
-                tokio::time::sleep(catch_up_retry_delay).await;
-                catch_up_retry_delay = Duration::from_secs(
-                    catch_up_retry_delay
-                        .as_secs()
-                        .saturating_mul(2)
-                        .min(BOOT_CATCH_UP_MAX_RETRY_DELAY.as_secs()),
-                );
-            }
-            Err(err) => {
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.failed",
-                    Level::ERROR,
-                    event_name = "eez.node.deriver.boot_catch_up.failed",
-                    mode = "composer",
-                    error = %err,
-                    "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",
-                );
-                return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
-            }
-        }
-    };
+    let (l1_seed_number, l1_seed_hash) = boot(
+        sync_mode,
+        &provider,
+        &block_committer,
+        &deriver,
+        &l1_reader,
+        || network.num_connected_peers(),
+        "composer",
+    )
+    .await?;
+    drop_unsettled_tail(&provider, &block_committer, l1_head.cursor()).await?;
+
     event!(
         name: "eez.node.deriver.spawned",
         Level::INFO,
@@ -843,6 +831,41 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         deriver_run.run(deriver_events).await;
     });
 
+    // Signing only after boot: a syncing composer would sign stale heads under
+    // the newest version, which followers prefer.
+    if let Some(key) = sequencer_key {
+        let domain = eez_seq_sig::HeadDomain {
+            l2_chain_id,
+            registry: eez_registry,
+            rollup_id: rollup_config.rollup_id,
+        };
+        let head_store = head_signer::SignedHeadStore::default();
+        if let Some(cfg) = p2p_config {
+            let overlay = eez_p2p::Overlay::new(
+                cfg,
+                eez_p2p::keypair(&network.secret_key().secret_bytes())?,
+                eez_p2p::Validator::new(domain, key.address()),
+                eez_node_common::discover(network),
+            )?;
+            task_executor
+                .spawn_critical_task("eez-p2p", overlay.run(Some(head_store.subscribe()), None));
+        }
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?;
+        task_executor.spawn_critical_task(
+            "eez-head-signer",
+            head_signer::run_head_signer(
+                block_committer.subscribe_head(),
+                provider.clone(),
+                eez_seq_sig::HeadSigner::new(key, domain, now_ms),
+                head_store,
+            ),
+        );
+    }
+
     event!(name: "eez.node.sequencer.spawned", Level::INFO, mode = "composer", "spawning eez sequencer (L1-anchored)");
     task_executor.spawn_critical_task("eez-sequencer", async move {
         sequencer.run().await;
@@ -855,7 +878,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     });
 
     // Start polling last: every consumer is subscribed and catch-up
-    // covered [deploy_block, seed], so the watcher owns all blocks
+    // covered every block up to its seed, so the watcher owns all blocks
     // strictly after its seed — no startup scan gap.
     task_executor.spawn_critical_task(
         "eez-l1-watcher",
@@ -864,6 +887,45 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     xchain_ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     handle.wait_for_node_exit().await
+}
+
+/// Rewinds the head to `settled`, L1's cursor, and returns how many transactions
+/// the dropped blocks held. A restarted composer lost the optimistic ledger
+/// that could post them, and reth's rewind doesn't return them to its pool.
+async fn drop_unsettled_tail<P>(
+    provider: &P,
+    committer: &BlockCommitterHandle<EezEngineTypes>,
+    settled: u64,
+) -> eyre::Result<usize>
+where
+    P: BlockReader<Block = eez_primitives::Block> + HeaderProvider<Header = Header>,
+{
+    let head = committer.last_header().number();
+    if head <= settled {
+        return Ok(0);
+    }
+    let mut tx_hashes = Vec::new();
+    for number in settled + 1..=head {
+        let block = provider
+            .block_by_number(number)?
+            .ok_or_else(|| eyre::eyre!("no local block at L2 height {number}"))?;
+        tx_hashes.extend(block.body.transactions.iter().map(|tx| *tx.tx_hash()));
+    }
+    let target = provider
+        .sealed_header(settled)?
+        .ok_or_else(|| eyre::eyre!("no local header at settled L2 height {settled}"))?;
+    committer.reorg_to(target).await?;
+    event!(
+        name: "eez.node.composer.unsettled_tail.dropped",
+        Level::WARN,
+        event_name = "eez.node.composer.unsettled_tail.dropped",
+        from = settled + 1,
+        to = head,
+        tx_count = tx_hashes.len(),
+        ?tx_hashes,
+        "dropped the L2 blocks L1 has not settled; their transactions are lost and users resubmit",
+    );
+    Ok(tx_hashes.len())
 }
 
 /// Read the L1 rollup id from env. Defaults to `0` to match the bridge

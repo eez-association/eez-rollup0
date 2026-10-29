@@ -114,6 +114,11 @@ sol! {
 
     function executeL2Txs(uint64 rollupId) external returns (bytes);
 
+    function rollups(uint64 rollupId)
+        external
+        view
+        returns (address rollupContract, bytes32 root, uint256 etherBalance);
+
     function staticCrossChainCall(address sourceAddress, bytes callData) external view returns (bytes);
 
     event BatchPosted(bytes32 sharedPublicInput, uint64[] rollupIds);

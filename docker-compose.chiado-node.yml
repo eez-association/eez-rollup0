@@ -75,6 +75,8 @@ services:
       EEZ_L1_POSTER_KEY: "${EEZ_L1_POSTER_KEY:?set EEZ_L1_POSTER_KEY}"
       EEZ_L1_BUILDER_RPC_URL: "${EEZ_L1_BUILDER_RPC_URL:?set EEZ_L1_BUILDER_RPC_URL}"
       EEZ_PROVER_URL: http://127.0.0.1:${EEZ_SIGNER_PORT:-50061}
+      # The genesis composer has no peers to sync from.
+      EEZ_SYNC_L1_ONLY: "1"
       EEZ_WITNESS_DB_PATH: /l2/witnesses
       # Embedded chiado L1 (reth_gnosis) — single L1 for the whole node.
       EEZ_L1_CHAIN: chiado

@@ -17,7 +17,14 @@ pub const DERIVER_SYNC_BLOCK_BUILT: &str = "eez.deriver.reconcile.sync_block_bui
 pub const DERIVER_RESYNC_FAILED: &str = "eez.deriver.resync.failed";
 pub const DERIVER_RESYNC_RECOVERED: &str = "eez.deriver.resync.recovered";
 pub const DERIVER_COMMITTER_CLOSED: &str = "eez.deriver.committer.closed";
+/// The deriver stops the node on an error no resync can fix.
+pub const DERIVER_FATAL: &str = "eez.deriver.fatal";
 pub const NODE_BOOT_CATCH_UP_FAILED: &str = "eez.node.deriver.boot_catch_up.failed";
+/// A peers-mode node waits for its peers to serve the L1-finalized root.
+pub const NODE_SYNC_WAITING_FOR_PEERS: &str = "eez.node.sync.waiting_for_peers";
+pub const DERIVER_CATCH_UP_START: &str = "eez.deriver.catch_up.start";
+/// A restarted composer rewinds to L1's cursor, dropping the blocks L1 never settled.
+pub const COMPOSER_UNSETTLED_TAIL_DROPPED: &str = "eez.node.composer.unsettled_tail.dropped";
 pub const COMPOSER_BUNDLE_DISPATCHED: &str = "eez.composer.bundle.dispatched";
 pub const COMPOSER_SYNC_SLOT_INVOKED: &str = "eez.composer.sync_slot.invoked";
 pub const COMPOSER_SYNC_SLOT_DRAIN: &str = "eez.composer.sync_slot.drain";
@@ -28,7 +35,8 @@ pub const COMPOSER_OUTBOUND_MULTICALL_UNSUPPORTED: &str =
 pub const COMPOSER_POISON_EVICTION_COMPLETED: &str =
     "eez.composer.cc_compose.poison_eviction_completed";
 pub const FOLLOWER_HEAD_ADVANCED: &str = "eez.node.follower.head.advanced";
-pub const FOLLOWER_HEAD_SYNCING: &str = "eez.node.follower.head.syncing";
+pub const FOLLOWER_HEAD_REJECTED: &str = "eez.node.follower.head.rejected";
+pub const P2P_MESSAGE_REJECTS: &str = "eez.p2p.message.rejects";
 pub const L1_REORG_DETECTED: &str = "eez.l1_watcher.reorg.detected";
 pub const TX_NONCE_CHAIN_EVICTED: &str = "eez.composer.recovery.nonce_chain_evicted";
 /// L1 kept only some of a batch's entries — the composer's partial verdict.
@@ -38,11 +46,14 @@ pub const COMPOSER_NONCE_BURNED: &str = "eez.composer.recovery.nonce_burned";
 /// The deriver rebuilt only the entries L1 ran.
 pub const DERIVER_PARTIAL_CONSUMPTION: &str = "eez.deriver.reconcile.partial_consumption";
 pub const TX_POISON_EVICTED: &str = "eez.composer.recovery.poison_evicted";
+pub const COMPOSER_RECOVERY_ROLLED_BACK: &str = "eez.composer.recovery.rolled_back";
+pub const COMPOSER_RECOVERY_SUBSTITUTED: &str = "eez.composer.recovery.substituted";
 
 pub const FATAL: &[&str] = &[
     NODE_BOOT_CATCH_UP_FAILED,
     DERIVER_RESYNC_FAILED,
     DERIVER_COMMITTER_CLOSED,
+    DERIVER_FATAL,
     DERIVER_STATE_DIVERGED_PRE,
     DERIVER_STATE_DIVERGED_POST,
 ];
