@@ -448,8 +448,10 @@ until step 6 ends.
       (genesis on a fresh node). Any local tail above it goes, so reth syncs
       forward from a block L1 finalized.
    2. Call `sync_to(H_F)`: an FCU with head = safe = finalized = `H_F`,
-      repeated every 2 s until VALID. reth backfills with its pipeline when the
-      gap is over 32 blocks, and downloads the range otherwise
+      repeated every 2 s until VALID, re-reading `F` before each. A resume can
+      replace the old `H_F`, and peers may stop serving it. reth backfills
+      with its pipeline when the gap is over 32 blocks, and downloads the range
+      otherwise
       (`crates/engine/tree/src/tree/mod.rs:2768-2840`,
       `crates/engine/primitives/src/config.rs:28`). While it answers SYNCING,
       log a WARN every 30 s with the connected peers, the local best block,
@@ -588,9 +590,10 @@ bundle is rolled back. That is fixed on its own branch off main, not here.
   - the L1-only "history incomplete" error.
 
 **Known limits.**
-- **A resume at `H_F`'s height after the seed is refused.** It appends to that
-  Sync block, and it is already refused once that height is finalized
-  (`deriver.rs:1719-1731`). It gets its own error instead of a resync loop.
+- **A resume of `H_F`'s block that lands after `F` stops a booting node**
+  (`FinalizedResume` in peers mode, "L1 history incomplete" in L1-only).
+  Finalizing `H_F`'s parent instead would close it; that waits on what
+  `finalized` must mean for bridges.
 - **Blob DA**, when it comes, needs a beacon endpoint for the window.
 - **Old history's DA isn't re-checked:** new nodes don't re-check it, because
   v0 trusts L1 settlements.
