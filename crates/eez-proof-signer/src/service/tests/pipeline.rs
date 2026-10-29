@@ -700,7 +700,7 @@ fn outbound_blob_settlement_fixture() -> BlobSettlementFixture {
     use reth_primitives_traits::BlockBody as _;
 
     let (window_pre, _, window_post) = window_endpoints(5, 6);
-    let mut batch = outbound_batch(window_pre, window_post);
+    let batch = outbound_batch(window_pre, window_post);
     let call = &batch.entries[1].l2ToL1Calls[0];
     let call_hash = eez_protocol::l2_outbound_call_hash(
         eez_protocol::CallHashInput {
