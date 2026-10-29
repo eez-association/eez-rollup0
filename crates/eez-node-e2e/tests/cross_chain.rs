@@ -8,20 +8,21 @@ use eez_protocol::EEZL2_ADDRESS;
 use eez_protocol::abi::computeCrossChainProxyAddressCall;
 use eez_testkit::signals;
 use eez_testkit::{
-    ANVIL_ATTESTER_KEY, DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER, INestedSetterInner,
-    INestedSetterOuter, IReturnData, IReturnDataWrapper, IRevertBubbleWrapper, IRevertingTarget,
-    ISetterWrapper, IValue, IValueNoRet, L1_ROLLUP_ID, NodeBinary, NodeConfig, NodeHandle,
-    OUTBOUND_USER, ProverMutation, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead,
+    ANVIL_ATTESTER_KEY, BuilderStubMode, DEV_CHAIN_ID, IEEZL2Direct, IEmptyCall, INBOUND_USER,
+    INestedSetterInner, INestedSetterOuter, IReturnData, IReturnDataWrapper, IRevertBubbleWrapper,
+    IRevertingTarget, ISetterWrapper, IValue, IValueNoRet, L1_ROLLUP_ID, NodeBinary, NodeConfig,
+    NodeHandle, OUTBOUND_USER, ProverMutation, SETTLE_TIMEOUT, Scenario, ScenarioCall, StateRead,
     TARGET_DEPLOYER, account_code, assert_latest_batch_signature, batches_posted,
     block_number_and_hash_at, call_read, call_revert_data, completed_proxy_calls, count_events,
     create_l2_cross_chain_proxy, cross_chain_source_proxy, deploy_nested_setter_inner,
     deploy_nested_setter_outer, events_since, l2_balance, l2_value, last_proxy_result,
-    onchain_nonce, read_state_word, receipt_ok, rollup_commitment, run_scenarios, safe_block_hash,
-    setter_call, setup_cross_chain, setup_cross_chain_codeless, setup_cross_chain_empty_call,
-    setup_cross_chain_nested_setter, setup_cross_chain_outbound_return_data,
-    setup_cross_chain_proxied, setup_cross_chain_return_data, setup_cross_chain_reverting,
-    sign_and_send, signer_address, value_no_ret, value_read, wait_for,
-    wait_for_safe_chain_contains,
+    onchain_nonce, override_env, read_state_word, receipt_ok, rollup_commitment, run_scenarios,
+    safe_block_hash, setter_call, setup_cross_chain, setup_cross_chain_codeless,
+    setup_cross_chain_empty_call, setup_cross_chain_nested_setter,
+    setup_cross_chain_outbound_return_data, setup_cross_chain_proxied,
+    setup_cross_chain_return_data, setup_cross_chain_reverting,
+    setup_cross_chain_with_builder_stub, sign_and_send, signer_address, value_no_ret, value_read,
+    wait_for, wait_for_safe_chain_contains,
 };
 
 const WAVE_SETTERS: &[u64] = &[7, 11, 17];
@@ -1129,9 +1130,13 @@ async fn follower_replays_settled_inbound_safe_block() {
         binary: NodeBinary::Follower,
         genesis_path: Some(w.cfg.l2_genesis.0.as_path()),
     };
-    let follower = NodeHandle::start("xchain-inbound-follower", &follower_cfg, &w.follower_env())
-        .await
-        .unwrap();
+    let follower = NodeHandle::start(
+        "xchain-inbound-follower",
+        &follower_cfg,
+        &w.follower_env(None),
+    )
+    .await
+    .unwrap();
     wait_for_safe_chain_contains(&follower, settled.0, settled.1, SETTLE_TIMEOUT)
         .await
         .unwrap_or_else(|err| {
@@ -1153,6 +1158,128 @@ async fn follower_replays_settled_inbound_safe_block() {
         Some(committed),
         "follower safe block hash must match the L1 commitment",
     );
+    follower.assert_no_process_death();
+    w.node.assert_no_divergence_failure_logs();
+}
+
+/// When a dropped bundle makes the composer replace its rich Sync block, a
+/// follower on the composer's signed heads adopts the replacement before L1
+/// settles that height.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_adopts_replaced_sync_block() {
+    let w = setup_cross_chain_with_builder_stub().await.unwrap();
+    let l2_rpc = w.l2_rpc();
+    let follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        genesis_path: Some(w.cfg.l2_genesis.0.as_path()),
+    };
+    let follower_env = override_env(
+        w.follower_env(Some(&l2_rpc)),
+        "RUST_LOG",
+        "warn,eez_follower::unsafe_head=info",
+    );
+    let follower = NodeHandle::start("replaced-sync-follower", &follower_cfg, &follower_env)
+        .await
+        .unwrap();
+    let follower_rpc = follower.l2_rpc_url();
+
+    w.set_builder_mode(BuilderStubMode::Drop).await.unwrap();
+    let drained_from = w.node.signal_cursor().unwrap();
+    wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(drained_from)?;
+        let drained = emitted
+            .iter()
+            .any(|s| s.name == signals::COMPOSER_SYNC_SLOT_DRAIN);
+        Ok(drained.then_some(()))
+    })
+    .await
+    .expect("composer did not report a fresh sync-slot drain boundary");
+    // Outbound: its rich bundle is the lone postBatch the stub can forward later.
+    let sent_from = w.node.signal_cursor().unwrap();
+    let follower_from = follower.signal_cursor().unwrap();
+    let nonce = onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap();
+    sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        nonce,
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        ISetterWrapper::setViaProxyCall {
+            v: U256::from(83u64),
+        }
+        .abi_encode(),
+        1_200_000,
+    )
+    .await
+    .expect("outbound call must be admitted");
+
+    let n = wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(sent_from)?;
+        let dispatched = emitted
+            .iter()
+            .find(|s| s.name == signals::COMPOSER_BUNDLE_DISPATCHED);
+        dispatched.map(|s| s.u64("sync_height")).transpose()
+    })
+    .await
+    .expect("composer did not dispatch the rich bundle");
+    let rich = wait_for(SETTLE_TIMEOUT, || async {
+        block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(n)).await
+    })
+    .await
+    .expect("composer did not commit the rich Sync block")
+    .1;
+
+    wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(sent_from)?;
+        let substituted = emitted.iter().any(|s| {
+            s.name == signals::COMPOSER_RECOVERY_SUBSTITUTED && s.u64("sync_height").ok() == Some(n)
+        });
+        Ok(substituted.then_some(()))
+    })
+    .await
+    .expect("composer did not substitute the dropped rich Sync block");
+    // Restore before MAX_BUNDLE_ATTEMPTS evicts the outbound call.
+    w.set_builder_mode(BuilderStubMode::Forward).await.unwrap();
+
+    let replacement = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(n))
+        .await
+        .unwrap()
+        .expect("composer has a block at the replaced height")
+        .1;
+    assert_ne!(
+        replacement, rich,
+        "the composer must replace the dropped rich block at {n}"
+    );
+
+    // A signed-head import covering `n`, ending at a head the composer holds,
+    // carried the replacement. Records are read before safe, so safe < n held at the import.
+    let outcome = wait_for(SETTLE_TIMEOUT, || async {
+        let mut adopted = false;
+        for s in follower.signals_since(follower_from)? {
+            if s.name != signals::FOLLOWER_HEAD_ADVANCED {
+                continue;
+            }
+            let (m, imported) = (s.u64("block.number")?, s.u64("imported")?);
+            if m < n || m.saturating_sub(imported) >= n {
+                continue;
+            }
+            let at_composer =
+                block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(m)).await?;
+            adopted |= at_composer == Some((m, s.b256("block.hash")?));
+        }
+        let safe = block_number_and_hash_at(&follower_rpc, BlockNumberOrTag::Safe).await?;
+        Ok(match safe {
+            Some((safe, _)) if safe >= n => Some(Err(safe)),
+            _ => adopted.then_some(Ok(())),
+        })
+    })
+    .await
+    .expect("follower never adopted the replacement through a signed head");
+    if let Err(safe) = outcome {
+        panic!("follower safe reached {safe} before it adopted the replacement at {n}");
+    }
+
     follower.assert_no_process_death();
     w.node.assert_no_divergence_failure_logs();
 }

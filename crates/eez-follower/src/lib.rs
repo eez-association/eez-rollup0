@@ -13,6 +13,7 @@ use eez_node_common::EezNode;
 use eez_node_common::{
     L2NodeBuilder, node_cli, read_checkpoint_dir, wait_for_l1_ready, warn_on_deprecated_env,
 };
+use eez_seq_sig::HeadDomain;
 use reth_chainspec::EthChainSpec as _;
 use tracing::{Level, event};
 
@@ -42,10 +43,14 @@ impl FollowerSystemConfig {
 /// Follower-specific CLI arguments layered on top of reth's CLI.
 #[derive(clap::Args, Debug, Clone)]
 struct FollowerArgs {
-    /// Sequencer JSON-RPC URL. When set, this enables the optional unsafe-head
-    /// overlay; safe and finalized remain L1-derived.
+    /// Sequencer JSON-RPC URL. When set, the unsafe head follows its signed
+    /// heads; safe and finalized remain L1-derived.
     #[arg(long, env = "EEZ_SEQUENCER_RPC")]
     sequencer_rpc: Option<url::Url>,
+
+    /// The only address whose signed heads are followed.
+    #[arg(long, env = "EEZ_SEQUENCER_ADDRESS")]
+    sequencer_address: Option<Address>,
 }
 
 /// Launch an L1-derived follower node.
@@ -73,6 +78,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
             "stateful proof signing requires an L1-derived-only follower; remove EEZ_SEQUENCER_RPC",
         ));
     }
+    let head_source = signed_head_source(ext.sequencer_rpc, ext.sequencer_address)?;
     // A production follower must reconstruct the Composer's Sync-block system
     // transactions byte-for-byte. Read every required value before launching
     // reth so a misconfigured follower never appears healthy.
@@ -99,9 +105,16 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
 
     let l1_reader_config = L1ReaderConfig::from_env()?;
     let deploy_block = l1_reader_config.deploy_block;
+    let registry = l1_reader_config.eez;
     let l1_reader = L1Reader::new(l1_reader_config);
     let l1_watcher = L1Watcher::new(L1WatcherConfig::from_env()?);
-    let system_tx_cfg = system_config.into_context(chain_spec.chain().id());
+    let l2_chain_id = chain_spec.chain().id();
+    let head_domain = HeadDomain {
+        l2_chain_id,
+        registry,
+        rollup_id: system_config.this_rollup_id,
+    };
+    let system_tx_cfg = system_config.into_context(l2_chain_id);
     event!(
         name: "eez.node.follower.system_tx_cfg",
         Level::INFO,
@@ -220,17 +233,21 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         );
     }
 
-    if let Some(sequencer_rpc) = ext.sequencer_rpc {
+    if let Some((sequencer_rpc, sequencer_address)) = head_source {
         let follower = UnsafeHeadFollower::new(
             block_committer,
             RootProvider::new_http(sequencer_rpc),
             provider,
+            l1_head,
+            head_domain,
+            sequencer_address,
             timing.l2_block_time(),
         );
         event!(
             name: "eez.node.follower.sequencer_rpc.spawned",
             Level::INFO,
-            "spawning sequencer-RPC unsafe-head follower",
+            %sequencer_address,
+            "spawning signed-head unsafe-head follower",
         );
         task_executor.spawn_critical_task("eez-node-follower-unsafe-head", async move {
             follower.run().await;
@@ -249,6 +266,23 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     );
 
     handle.wait_for_node_exit().await
+}
+
+/// Pairs the sequencer RPC with the address that must sign its heads.
+fn signed_head_source(
+    rpc: Option<url::Url>,
+    address: Option<Address>,
+) -> eyre::Result<Option<(url::Url, Address)>> {
+    match (rpc, address) {
+        (Some(rpc), Some(address)) => Ok(Some((rpc, address))),
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(eyre::eyre!(
+            "EEZ_SEQUENCER_RPC requires EEZ_SEQUENCER_ADDRESS"
+        )),
+        (None, Some(_)) => Err(eyre::eyre!(
+            "EEZ_SEQUENCER_ADDRESS requires EEZ_SEQUENCER_RPC"
+        )),
+    }
 }
 
 /// Read the mandatory system-transaction identity before follower startup.
@@ -285,4 +319,24 @@ fn read_l1_chain_id() -> eyre::Result<u64> {
     value
         .parse::<u64>()
         .map_err(|err| eyre::eyre!("EEZ_L1_CHAIN_ID={value:?} malformed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_and_address_must_be_set_together() {
+        let rpc = url::Url::parse("http://127.0.0.1:8545").unwrap();
+        let err = signed_head_source(Some(rpc), None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "EEZ_SEQUENCER_RPC requires EEZ_SEQUENCER_ADDRESS"
+        );
+        let err = signed_head_source(None, Some(Address::repeat_byte(1))).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "EEZ_SEQUENCER_ADDRESS requires EEZ_SEQUENCER_RPC"
+        );
+    }
 }
