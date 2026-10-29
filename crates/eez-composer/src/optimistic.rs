@@ -57,6 +57,8 @@ pub struct FailedBatch {
     pub post_batch_hash: TxHash,
     /// The Sync block's parent — the reorg target if the block landed.
     pub parent: SealedHeader<alloy_consensus::Header>,
+    /// The Sync block itself: recovery replaces only this block.
+    pub block: alloy_primitives::B256,
     /// The user txs whose effects the block carried.
     pub txs: Vec<HeldTx>,
     /// Drop not attributable to the txs (skipped L1 slot, relay transport
@@ -91,6 +93,7 @@ struct InFlight {
     /// checks its receipt before the entry is dropped.
     post_batch_hash: TxHash,
     parent: SealedHeader<alloy_consensus::Header>,
+    block: alloy_primitives::B256,
     resolution: Resolution,
     /// Whether the Deriver cursor has confirmed this entry. This is
     /// independent from `resolution`: the observer can mark an entry
@@ -125,6 +128,7 @@ impl OptimisticallyIncluded {
         sync_height: u64,
         post_batch_hash: TxHash,
         parent: SealedHeader<alloy_consensus::Header>,
+        block: alloy_primitives::B256,
         txs: Vec<HeldTx>,
     ) {
         let mut map = self.by_sync_height.lock().unwrap();
@@ -134,6 +138,7 @@ impl OptimisticallyIncluded {
                 txs,
                 post_batch_hash,
                 parent,
+                block,
                 resolution: Resolution::Pending,
                 cursor_confirmed: false,
                 slot_skipped: false,
@@ -203,6 +208,7 @@ impl OptimisticallyIncluded {
             sync_height: h,
             post_batch_hash: entry.post_batch_hash,
             parent: entry.parent.clone(),
+            block: entry.block,
             // Copied, not drained: disposition awaits nonce reads, and a reorg
             // in that window must still find every tx here to recover. The full
             // set is right then, since the reorg also undoes their spent nonces.
@@ -288,6 +294,7 @@ impl OptimisticallyIncluded {
             sync_height: h,
             post_batch_hash: entry.post_batch_hash,
             parent: entry.parent,
+            block: entry.block,
             txs: entry.txs,
             slot_skipped: entry.slot_skipped,
         })
@@ -302,6 +309,7 @@ impl OptimisticallyIncluded {
                 txs: batch.txs,
                 post_batch_hash: batch.post_batch_hash,
                 parent: batch.parent,
+                block: batch.block,
                 resolution: Resolution::Failed,
                 cursor_confirmed: false,
                 slot_skipped: batch.slot_skipped,
@@ -395,7 +403,7 @@ mod tests {
     #[test]
     fn a_cursor_that_confirms_first_hands_the_batch_to_disposition() {
         let ledger = OptimisticallyIncluded::new();
-        ledger.begin(10, pb_hash(0xA1), hdr(), vec![tx(1), tx(2)]);
+        ledger.begin(10, pb_hash(0xA1), hdr(), B256::ZERO, vec![tx(1), tx(2)]);
 
         // Deriver wins the race; the observer's verdict comes too late to matter.
         assert!(
@@ -421,7 +429,13 @@ mod tests {
     fn a_reorg_recovers_the_burned_txs_and_leaves_the_requeued_ones_alone() {
         let ledger = OptimisticallyIncluded::new();
         let (burned, requeued) = (tx(3), tx(4));
-        ledger.begin(20, pb_hash(0xB2), hdr(), vec![burned.clone(), requeued]);
+        ledger.begin(
+            20,
+            pb_hash(0xB2),
+            hdr(),
+            B256::ZERO,
+            vec![burned.clone(), requeued],
+        );
         ledger.mark_settled_partial(20, pb_hash(0xB2));
         let disposed = ledger.partial_to_dispose(20).expect("partial settlement");
         assert_eq!(disposed.txs.len(), 2, "disposition sees the whole bundle");
@@ -443,7 +457,7 @@ mod tests {
     #[test]
     fn a_batch_rolled_out_during_disposition_cannot_be_claimed() {
         let ledger = OptimisticallyIncluded::new();
-        ledger.begin(20, pb_hash(0xB3), hdr(), vec![tx(7), tx(8)]);
+        ledger.begin(20, pb_hash(0xB3), hdr(), B256::ZERO, vec![tx(7), tx(8)]);
         ledger.mark_settled_partial(20, pb_hash(0xB3));
         let disposed = ledger.partial_to_dispose(20).expect("partial settlement");
 
@@ -460,12 +474,12 @@ mod tests {
     #[test]
     fn claim_partial_ignores_a_rebuilt_height() {
         let ledger = OptimisticallyIncluded::new();
-        ledger.begin(30, pb_hash(0xC1), hdr(), vec![tx(5)]);
+        ledger.begin(30, pb_hash(0xC1), hdr(), B256::ZERO, vec![tx(5)]);
         ledger.mark_settled_partial(30, pb_hash(0xC1));
         let old = ledger.partial_to_dispose(30).expect("partial settlement");
 
         // The slot rebuilds at the same height with a different bundle.
-        ledger.begin(30, pb_hash(0xC2), hdr(), vec![tx(6)]);
+        ledger.begin(30, pb_hash(0xC2), hdr(), B256::ZERO, vec![tx(6)]);
         assert!(
             !ledger.claim_partial(30, old.post_batch_hash, vec![tx(5)]),
             "the new bundle is not the one disposed"
@@ -503,7 +517,7 @@ mod tests {
                 match command {
                     0 if blocking.is_none() => {
                         let height = cursor.saturating_add(1 + u64::from(next_tag % 3));
-                        ledger.begin(height, pb_hash(next_tag), hdr(), vec![tx(next_tag)]);
+                        ledger.begin(height, pb_hash(next_tag), hdr(), B256::ZERO, vec![tx(next_tag)]);
                         next_tag = next_tag.wrapping_add(1);
                     }
                     1 => {
@@ -571,7 +585,7 @@ mod tests {
     #[test]
     fn gate_blocks_until_cursor_passes_even_when_settled() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
         assert_eq!(pool.blocking_height(5), Some(10));
         // Observer settle-verdict does NOT re-open the gate…
         pool.mark_settled(10, pb_hash(0xa));
@@ -585,7 +599,7 @@ mod tests {
     #[test]
     fn a_partial_settlement_is_not_released_by_the_cursor() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1), tx(2)]);
         pool.mark_settled_partial(10, pb_hash(0xa));
 
         assert!(
@@ -614,7 +628,7 @@ mod tests {
     #[test]
     fn a_partial_settlement_is_never_recovered_as_a_failure() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
         pool.mark_settled_partial(10, pb_hash(0xa));
         assert!(
             pool.take_failed_for_recovery(0).is_none(),
@@ -627,7 +641,7 @@ mod tests {
     #[test]
     fn a_partial_verdict_cannot_override_a_settled_entry() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
         pool.mark_settled(10, pb_hash(0xa));
         pool.mark_settled_partial(10, pb_hash(0xa));
         assert!(pool.partial_to_dispose(10).is_none());
@@ -638,7 +652,7 @@ mod tests {
     #[test]
     fn an_unswept_partial_settlement_rolls_out_with_its_l1_block() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1), tx(2)]);
         pool.mark_settled_partial(10, pb_hash(0xa));
 
         let rolled = pool.take_rolled_out(9);
@@ -660,8 +674,8 @@ mod tests {
     #[test]
     fn a_verdict_for_a_replaced_batch_is_ignored() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
-        pool.begin(10, pb_hash(0xb), hdr(), vec![tx(2)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
+        pool.begin(10, pb_hash(0xb), hdr(), B256::ZERO, vec![tx(2)]);
 
         pool.mark_failed(10, pb_hash(0xa), false);
         pool.mark_settled(10, pb_hash(0xa));
@@ -682,7 +696,7 @@ mod tests {
     #[test]
     fn a_partial_settlement_waits_for_the_deriver() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
         pool.mark_settled_partial(10, pb_hash(0xa));
 
         assert!(pool.partial_to_dispose(9).is_none(), "not derived yet");
@@ -697,7 +711,7 @@ mod tests {
     #[test]
     fn failed_recovery_extracts_once_and_unblocks() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1), tx(2)]);
         pool.mark_failed(10, pb_hash(0xa), false);
         // Failed entry still blocks until recovered.
         assert_eq!(pool.blocking_height(0), Some(10));
@@ -720,7 +734,7 @@ mod tests {
         let reserved = held_pool.pop_n(1);
 
         let optimistic = OptimisticallyIncluded::new();
-        optimistic.begin(10, pb_hash(0xa), hdr(), reserved);
+        optimistic.begin(10, pb_hash(0xa), hdr(), B256::ZERO, reserved);
         optimistic.mark_failed(10, pb_hash(0xa), false);
         let failed = optimistic.take_failed_for_recovery(0).unwrap();
         optimistic.reinsert_failed(failed);
@@ -735,7 +749,7 @@ mod tests {
     #[test]
     fn failed_recovery_propagates_slot_skipped() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1), tx(2)]);
         // A skipped-slot drop isn't the tx's fault; the flag must reach
         // recovery so the caller requeues without poison-eviction.
         pool.mark_failed(10, pb_hash(0xa), true);
@@ -747,7 +761,7 @@ mod tests {
     #[test]
     fn cursor_resolution_overrides_false_failure() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
         pool.mark_failed(10, pb_hash(0xa), false);
         // Deriver confirmed the batch — the false-negative verdict is overridden,
         // and nonces, not the verdict, decide what happens to its txs.
@@ -760,7 +774,7 @@ mod tests {
     #[test]
     fn cursor_resolution_releases_observer_settled_once() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1), tx(2)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1), tx(2)]);
         pool.mark_settled(10, pb_hash(0xa));
 
         let released = pool.resolve_below_cursor(10);
@@ -771,9 +785,9 @@ mod tests {
     #[test]
     fn rolled_out_recovers_only_settled() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
         pool.mark_settled(10, pb_hash(0xa));
-        pool.begin(15, pb_hash(0xb), hdr(), vec![tx(2)]); // Pending — in-flight bundle
+        pool.begin(15, pb_hash(0xb), hdr(), B256::ZERO, vec![tx(2)]); // Pending — in-flight bundle
         let recovered = pool.take_rolled_out(8);
         // Only the settled batch's txs come back; the pending bundle's
         // observer will resolve it.
@@ -784,9 +798,9 @@ mod tests {
     #[test]
     fn finalize_extracts_settled_for_audit() {
         let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), vec![tx(1)]);
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
         pool.mark_settled(10, pb_hash(0xa));
-        pool.begin(15, pb_hash(0xb), hdr(), vec![tx(2)]); // Pending — stays
+        pool.begin(15, pb_hash(0xb), hdr(), B256::ZERO, vec![tx(2)]); // Pending — stays
         let finalized = pool.take_finalized(12);
         // The settled entry is returned with its postBatch hash so the
         // caller can audit the receipt; the pending entry stays.

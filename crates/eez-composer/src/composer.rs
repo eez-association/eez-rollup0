@@ -1873,32 +1873,45 @@ where
             // roll it back again, and every postBatch in between
             // anchors against the wrong root.
             if rollup.l1_head.cursor() >= sync_height {
-                pool.release_in_flight_batch(&failed.txs);
+                // The cursor proves the height settled, not that these txs ran: a
+                // rival or partial batch may have settled it. Back in the ledger
+                // below the cursor, the entry goes to nonce disposition.
+                rollup.optimistic.reinsert_failed(failed);
                 event!(
                     name: "eez.composer.recovery.stale_verdict",
                     Level::WARN,
                     rollup_id,
                     sync_height,
                     cursor = rollup.l1_head.cursor(),
-                    "failure verdict is stale — Deriver confirmed the batch from L1; dropping recovery",
+                    "failure verdict is stale — Deriver confirmed the height from L1; its txs go to nonce disposition",
                 );
                 return RecoveryOutcome::HeadUnchanged;
             }
             let head = committer.last_header();
-            if head.number() < sync_height {
+            // Replace only the block that failed: another can hold its height after
+            // an L1-reorg retreat, or when its commit bailed after the batch began.
+            let replaces = head.number() >= sync_height
+                && match rollup.l2_provider.block_hash(sync_height) {
+                    Ok(hash) => hash == Some(failed.block),
+                    Err(_) => {
+                        rollup.optimistic.reinsert_failed(failed);
+                        return RecoveryOutcome::HeadUnchanged;
+                    }
+                };
+            if !replaces {
                 event!(
                     name: "eez.composer.recovery.not_committed",
                     Level::INFO,
                     rollup_id,
                     sync_height,
                     head = head.number(),
-                    "failed Sync block never became canonical; nothing to roll back",
+                    "failed Sync block is not canonical; nothing to roll back",
                 );
             }
             // Still under the reconcile guard. Committed while the failed branch is
             // canonical, the sibling is a reorg, so reth's pool takes back its pure
             // L2 txs. Head elsewhere → nothing to substitute.
-            if head.number() >= sync_height || head.hash() == failed.parent.hash() {
+            if replaces || head.hash() == failed.parent.hash() {
                 // Disposal below can release a tx before reth re-adds it.
                 pool.refuse(failed.txs.iter().map(|tx| tx.hash), sync_height);
                 let timestamp = failed
@@ -1952,7 +1965,7 @@ where
             }
             // The failed block stays canonical until a sibling replaces it, so keep
             // the entry Failed for the next slot. A rewind would lose the pure L2 txs.
-            if head.number() >= sync_height && matches!(outcome, RecoveryOutcome::HeadUnchanged) {
+            if replaces && matches!(outcome, RecoveryOutcome::HeadUnchanged) {
                 rollup.optimistic.reinsert_failed(failed);
                 return RecoveryOutcome::HeadUnchanged;
             }
@@ -3536,6 +3549,7 @@ where
             sync_height,
             post_batch_hash,
             parent_header.clone(),
+            built.header.hash(),
             survivors,
         );
         self.spawn_bundle_observer(
@@ -3677,6 +3691,7 @@ where
             sync_height,
             post_batch_hash,
             parent_header.clone(),
+            empty_built.header.hash(),
             Vec::new(),
         );
         self.spawn_bundle_observer(
@@ -3809,9 +3824,13 @@ where
                 "settlement backlog exceeds the batch cap; settling a bounded historical chunk",
             );
 
-            rollup
-                .optimistic
-                .begin(boundary, post_batch_hash, boundary_parent, Vec::new());
+            rollup.optimistic.begin(
+                boundary,
+                post_batch_hash,
+                boundary_parent,
+                boundary_header.hash(),
+                Vec::new(),
+            );
             // A past terminal cannot carry a timestamp pin, but the bundle can
             // still target the exact L1 slot that triggered this composition.
             self.spawn_bundle_observer(
