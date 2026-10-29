@@ -40,7 +40,7 @@ mod container;
 
 pub use container::{
     Action, DecodedContainer, STREAM_VERSION, decode_blob_container, decode_container,
-    encode_blob_container, encode_container, logical_blob_capacity,
+    encode_blob_container, encode_container,
 };
 
 /// A raw EIP-2718 signed transaction, exactly as it enters the block's

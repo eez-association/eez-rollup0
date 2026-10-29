@@ -51,12 +51,6 @@ const LOGICAL_FIELD_BYTES: usize = 31;
 const FIELD_ELEMENTS_PER_BLOB: usize = BYTES_PER_BLOB / FIELD_ELEMENT_BYTES;
 const LOGICAL_BYTES_PER_BLOB: usize = FIELD_ELEMENTS_PER_BLOB * LOGICAL_FIELD_BYTES;
 
-/// Logical stream bytes carried by this many physical blobs.
-#[must_use]
-pub const fn logical_blob_capacity(blobs: usize) -> usize {
-    blobs.saturating_mul(LOGICAL_BYTES_PER_BLOB)
-}
-
 /// One cross-chain action, in its semantic form.
 ///
 /// On the wire this is `InitiateCrossChainTransaction` ‖ `Call` ‖

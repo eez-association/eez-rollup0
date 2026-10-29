@@ -24,15 +24,7 @@ use reth_transaction_pool::{PoolTransaction, TransactionPool};
 /// Marker type — mirrors `EthereumPayloadBuilder` but uses our constants.
 #[derive(Clone, Default, Debug)]
 #[non_exhaustive]
-pub struct EezPayloadBuilder {
-    data_guard: Option<std::sync::Arc<crate::SequencingDataGuard>>,
-}
-
-impl EezPayloadBuilder {
-    pub fn with_data_guard(data_guard: Option<std::sync::Arc<crate::SequencingDataGuard>>) -> Self {
-        Self { data_guard }
-    }
-}
+pub struct EezPayloadBuilder;
 
 impl<Types, Node, Pool, Evm> PayloadBuilderBuilder<Node, Pool, Evm> for EezPayloadBuilder
 where
@@ -61,7 +53,6 @@ where
             EthereumBuilderConfig::new()
                 .with_gas_limit(BUILDER_GAS_LIMIT)
                 .with_extra_data(Bytes::from_static(BUILDER_EXTRA_DATA)),
-        )
-        .with_data_guard(self.data_guard)))
+        )))
     }
 }

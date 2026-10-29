@@ -2,39 +2,6 @@
 
 use alloy_primitives::B256;
 
-/// Reserve the stream envelope, close marker, and worst-case block metadata
-/// for a complete Sync interval. Transaction bytes are charged separately,
-/// including the maximum five-byte length prefix for each transaction.
-pub(super) fn ordinary_interval_budget(k: u64, blobs: usize) -> Result<usize, String> {
-    let capacity = eez_payload_codec::logical_blob_capacity(blobs);
-    let k = usize::try_from(k)
-        .ok()
-        .filter(|k| *k != 0 && *k <= capacity)
-        .ok_or("blob allowance cannot carry an empty Sync interval")?;
-    // Alternate metadata so every block starts a new run in the columnar codec.
-    let blocks: Vec<_> = (0..k)
-        .map(|index| eez_payload_codec::SpanBlock {
-            beneficiary: [(index % 2) as u8; 20],
-            extra_data: vec![(index % 2) as u8; eez_payload_codec::MAX_EXTRA_DATA],
-            transactions: Vec::new(),
-        })
-        .collect();
-    let overhead = eez_payload_codec::encode_container(1, &blocks, &[])
-        .map_err(|error| error.to_string())?
-        .len();
-    // Reserve four extra bytes for each block's transaction count and the
-    // operations-length prefix, which can grow from one to five bytes.
-    let growth = k
-        .checked_add(1)
-        .and_then(|fields| fields.checked_mul(4))
-        .ok_or("sequencing size overflow")?;
-    capacity
-        .checked_sub(overhead)
-        .and_then(|bytes| bytes.checked_sub(1)) // CloseBlobStream
-        .and_then(|bytes| bytes.checked_sub(growth))
-        .ok_or_else(|| "blob allowance cannot carry an empty Sync interval".into())
-}
-
 /// Fork schedule, slot duration, and fee cap for blob posting.
 #[derive(Clone, Debug)]
 pub struct BlobPostingConfig {
@@ -99,42 +66,6 @@ mod tests {
     use alloy_transport::mock::Asserter;
 
     use super::*;
-
-    #[test]
-    fn interval_budget_reserves_all_blocks_and_envelope() {
-        for k in [2, 5, 6, 128] {
-            for blobs in [1, 2, 6] {
-                let budget = ordinary_interval_budget(k, blobs).unwrap();
-                let mut blocks = (0..k)
-                    .map(|index| eez_payload_codec::SpanBlock {
-                        beneficiary: [index as u8; 20],
-                        extra_data: vec![index as u8; 32],
-                        transactions: Vec::new(),
-                    })
-                    .collect::<Vec<_>>();
-                blocks[0].transactions.push(vec![0xaa; budget - 5]);
-                assert!(
-                    eez_payload_codec::encode_blob_container(1, &blocks, &[])
-                        .unwrap()
-                        .len()
-                        <= blobs
-                );
-                blocks[0].transactions.clear();
-                for index in 0..budget / 6 {
-                    blocks[index % k as usize].transactions.push(vec![0xaa]);
-                }
-                assert!(
-                    eez_payload_codec::encode_blob_container(1, &blocks, &[])
-                        .unwrap()
-                        .len()
-                        <= blobs
-                );
-            }
-        }
-        assert!(ordinary_interval_budget(6, 0).is_err());
-        assert!(ordinary_interval_budget(0, 2).is_err());
-        assert!(ordinary_interval_budget(u64::MAX, 2).is_err());
-    }
 
     fn config() -> BlobPostingConfig {
         BlobPostingConfig {

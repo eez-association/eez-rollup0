@@ -322,14 +322,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     };
     let l2_chain_id = builder.config().chain.chain().id();
     let blob_da = eez_l1::config::blob_da_enabled()?;
-    let data_guard = if blob_da {
-        let rollup_id = env::var("EEZ_ROLLUP_ID")?.parse::<u64>()?;
-        Some(Arc::new(eez_node_common::SequencingDataGuard::new(
-            rollup_id,
-        )))
-    } else {
-        None
-    };
     let composer_info = composer_rpc::ComposerInfo::new(
         composer_rpc::ComposerContracts {
             registry: eez_registry,
@@ -353,13 +345,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         eyre::bail!("EEZ_P2P_LISTEN requires EEZ_SEQUENCER_KEY on a composer");
     }
     let handle = builder
-        .with_types::<EezNode>()
-        .with_components(EezNode::components().payload(
-            reth_node_builder::components::BasicPayloadServiceBuilder::new(
-                eez_node_common::EezPayloadBuilder::with_data_guard(data_guard.clone()),
-            ),
-        ))
-        .with_add_ons(eez_node_common::eez_add_ons())
+        .node(EezNode)
         .extend_rpc_modules(move |ctx| {
             composer_rpc::install_composer_rpc(ctx, composer_info.clone())
         })
@@ -697,10 +683,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             timing,
         )?;
         let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
-
-        if let Some(guard) = &data_guard {
-            guard.bind(&sync_slot_handle)?;
-        }
 
         let schedule_rx = spawn_l1_anchored(
             L1HeadStream::from_watcher(&l1_watcher),
