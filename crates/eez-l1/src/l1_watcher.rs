@@ -1432,6 +1432,7 @@ mod tests {
             tx_hash: B256::with_last_byte(tx),
             sender: Address::ZERO,
             batch: eez_protocol::abi::EvmBatch::default(),
+            blob_hashes: Vec::new(),
             settlement: crate::scan::Settlement::NONE,
         }
     }

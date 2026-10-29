@@ -1,7 +1,7 @@
 # Composer-to-prover streaming RPC
 
-The Rollup0 runtime implements this contract for its current calldata-only,
-timeless settlement profile. The existing [window RPC specification](SPEC.md)
+The Rollup0 runtime implements this contract for its timeless calldata and
+blob settlement profiles. The existing [window RPC specification](SPEC.md)
 and endpoint remain available for compatibility.
 [prove_stream.proto](proto/prove_stream.proto) is the canonical schema.
 
@@ -158,9 +158,9 @@ after the Composer abandons its corresponding batch or settlement cutoff.
 Every request uses `Finalize.settlement`, containing exact proofless
 EEZ.postAndVerifyBatch calldata, physical blobs and an L1PostingContext.
 Blobs and posting context are optional at the common wire layer; the configured
-profile decides which are required. Today's calldata-only, timeless Rollup0
-profile omits both. The RollupX blob profile requires both. Blob-based Rollup0
-uses these same fields, with its own payload and settlement rules.
+profile decides which are required. Current calldata Rollup0 omits both; blob
+Rollup0 carries physical blobs and omits posting context. Both use block zero
+and empty custom data. The RollupX blob profile requires both.
 Where the profile requires prover-side parent authorization, evidence retrieval
 is the prover's responsibility, not an RPC input.
 Supporting the wire fields does not imply that a prover implements every profile.
@@ -191,16 +191,16 @@ version; unknown protobuf fields are not a support check.
 order. Each element is exactly 131072 bytes of canonical
 [EIP-4844](https://eips.ethereum.org/EIPS/eip-4844) field elements. The prover
 derives KZG commitments and versioned hashes from these bytes using its trusted
-chain configuration, then selects hashes in batch.blobIndices order. No separate
+KZG settings, then selects hashes in batch.blobIndices order. No separate
 index, claimed commitment or blob proof is sent; network sidecar construction
 remains the posting client's responsibility. The actual transaction must carry
 the same physical blobs in the same order.
 
-Both RollupX and draft blob-based Rollup0 require at least one blob, empty
+Both RollupX and blob-based Rollup0 require at least one blob, empty
 batch.callData and batch.blobIndices exactly `[0, 1, ..., blobs.len() - 1]`. They reject gaps,
 duplicates, reordered indices, extra/unselected blobs and calldata-only DA.
-Resolve the active per-transaction/per-block allowance from the independently
-configured L1 chain profile and target timestamp, not a client-supplied limit.
+The posting client resolves the active per-transaction/per-block allowance from
+its configured L1 chain profile and target timestamp, not a client-supplied limit.
 
 The draft delegates physical packing and framing to
 [EEZ Core's blob format](https://github.com/eez-association/eez-core-protocol/blob/9a1f815336c20d28e5ec5cecbf195c41fbd5ab0f/docs/blobs/BLOB_FORMAT_SPEC.md),
@@ -230,6 +230,9 @@ data, but wire compatibility does not resolve those deployment/spec blockers.
 
 ### L1 posting context
 
+Current Rollup0 does not implement this context or the draft binding described
+below. Parent/time binding is deferred to a separate protocol change.
+
 L1PostingContext contains exactly the RollupX target fields:
 
 - chain_id: nonzero and equal to the operator-trusted L1 network;
@@ -238,8 +241,9 @@ L1PostingContext contains exactly the RollupX target fields:
 - parent_hash: a nonzero 32-byte hash, independently authenticated at that height.
 
 The intended posting block is the child of this parent; neither parent_number
-nor that child height is batch.blockNumber. Both blob profiles require
-`batch.blockNumber == uint64.max`; they do not use the older timeless mode.
+nor that child height is batch.blockNumber. RollupX and the draft Rollup0
+profile require `batch.blockNumber == uint64.max`. Current Rollup0 retains
+block zero for both DA profiles.
 The manager's custom-data derivation is profile-specific:
 
 - RollupX uses `abi.encode(uint256(target_timestamp), parent_hash)` and rejects
@@ -268,7 +272,7 @@ the proof can be used in the actual posting environment.
 
 ### Parent authorization by profile
 
-**Current calldata-only, timeless Rollup0 keeps conditional proofs.** A proof
+**Current timeless Rollup0 keeps conditional proofs for both DA profiles.** A proof
 for blocks 101–110 establishes the valid transition starting from the selected
 block 100; it does not establish that block 100 was already accepted on L1.
 The signer binds execution and settlement claims to that exact parent, while the
@@ -341,8 +345,8 @@ Every Finalize MUST supply settlement; absence is INVALID_ARGUMENT. The prover
 checks the complete input against the configured profile and rejects unsupported
 inputs. Never strip required blobs or context to retry as a weaker request.
 
-Calldata-only Rollup0 can use the same settlement message with its optional inputs
-absent, then populate the existing blob/context fields when its profile migrates.
+Calldata Rollup0 uses the same settlement message with blobs and posting context
+absent. Blob Rollup0 supplies physical blobs and omits posting context.
 
 The current Rollup0 implementation does not claim full Rollup0-draft or live
 RollupX conformance; those settlement profiles need separate implementations.
@@ -413,8 +417,9 @@ transcripts belong with each runtime implementation.
 ### Rollup0 runtime
 
 The stateless signer and the stateful follower signer implement Resume, Rewind,
-Cancel, subrange selection and bounded pipelining. Both reject nonempty blobs
-or any posting context with UNIMPLEMENTED; this is not a blob-profile implementation.
+Cancel, subrange selection and bounded pipelining. Both support blob DA with
+the same execution and settlement rules as calldata, plus packing and the close
+marker. Both reject any posting context with UNIMPLEMENTED.
 Ordinary execution ACKs do not claim L1 acceptance. Final settlement retains
 the current Rollup0 [conditional-proof rules](#parent-authorization-by-profile);
 stateful fork selection additionally obeys Reth's safe/finalized ancestry.

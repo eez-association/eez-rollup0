@@ -9,6 +9,7 @@ use alloy_rpc_types_eth::{Filter, TransactionRequest};
 use alloy_sol_types::SolCall;
 use eez_protocol::abi::rollupsCall;
 
+use crate::blob_source::BeaconBlobSource;
 use crate::config::L1ReaderConfig;
 use crate::error::{L1Error, L1Result};
 use crate::scan::{BatchLogChunks, Post, scan_next_batch_log_chunk};
@@ -18,6 +19,7 @@ use crate::scan::{BatchLogChunks, Post, scan_next_batch_log_chunk};
 #[derive(Clone)]
 pub struct L1Reader {
     config: Arc<L1ReaderConfig>,
+    beacon: Option<Arc<BeaconBlobSource>>,
 }
 
 /// The rollup's L2 block hash as stored on L1 at its finalized block.
@@ -70,8 +72,14 @@ impl L1Reader {
     /// Build a read-only L1 client from its config.
     #[must_use]
     pub fn new(config: L1ReaderConfig) -> Self {
+        let beacon = config
+            .beacon_url
+            .clone()
+            .map(BeaconBlobSource::new)
+            .map(Arc::new);
         Self {
             config: Arc::new(config),
+            beacon,
         }
     }
 
@@ -113,6 +121,21 @@ impl L1Reader {
             chunks,
         )
         .await
+    }
+
+    /// Fetch a post's blobs in commitment order, only when derivation needs them.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Config`] without a beacon, [`L1Error::Provider`] on RPC or
+    /// malformed data, [`L1Error::SourceIncomplete`] while a source catches up,
+    /// and [`L1Error::BlobUnavailable`] for missing/pruned DA.
+    pub async fn post_blobs(&self, post: &Post) -> L1Result<Vec<Vec<u8>>> {
+        let beacon = self
+            .beacon
+            .as_ref()
+            .ok_or_else(|| L1Error::Config("blob derivation requires EEZ_L1_BEACON_URL".into()))?;
+        beacon.fetch(&self.build_provider(), post).await
     }
 
     /// Hash of the canonical L1 block at `number`, or `None` if none. Used by

@@ -62,6 +62,7 @@ pub enum DeriverError {
 }
 
 /// `true` for errors no resync can fix; the deriver stops the node on them.
+/// Blobs missing at a finalized slot stay missing until the source changes.
 #[must_use]
 pub(crate) fn is_fatal(err: &DeriverError) -> bool {
     matches!(
@@ -69,6 +70,7 @@ pub(crate) fn is_fatal(err: &DeriverError) -> bool {
         DeriverError::BelowSeedFloor { .. }
             | DeriverError::Unseeded
             | DeriverError::FinalizedResume { .. }
+            | DeriverError::L1Scan(eez_l1::L1Error::BlobUnavailable { .. })
     )
 }
 
@@ -87,6 +89,22 @@ impl From<eez_driver::DriverError> for DeriverError {
 #[cfg(test)]
 mod tests {
     use super::{DeriverError, is_fatal};
+
+    #[test]
+    fn unavailable_blobs_are_fatal() {
+        assert!(is_fatal(&DeriverError::L1Scan(
+            eez_l1::L1Error::BlobUnavailable {
+                block: 7,
+                detail: "pruned".into(),
+            }
+        )));
+        assert!(!is_fatal(&DeriverError::L1Scan(
+            eez_l1::L1Error::SourceIncomplete {
+                block: 7,
+                detail: "lagging beacon".into(),
+            }
+        )));
+    }
 
     #[test]
     fn floor_errors_are_fatal() {

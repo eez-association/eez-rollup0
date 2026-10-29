@@ -3257,6 +3257,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "eez-blob"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer-local",
+ "reth-chainspec",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "eez-composer"
 version = "0.1.0"
 dependencies = [
@@ -3269,7 +3282,9 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-signer-local",
  "alloy-sol-types",
+ "alloy-transport",
  "async-trait",
+ "eez-blob",
  "eez-driver",
  "eez-evm",
  "eez-l1",
@@ -3435,6 +3450,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "alloy-transport",
+ "eez-blob",
  "eez-protocol",
  "fail",
  "reqwest 0.12.28",
@@ -3671,6 +3687,7 @@ dependencies = [
  "alloy-rpc-types-debug",
  "alloy-sol-types",
  "async-trait",
+ "eez-blob",
  "eez-control-rpc",
  "eez-payload-codec",
  "eez-primitives",
@@ -3735,6 +3752,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "async-trait",
+ "eez-blob",
  "eez-control-rpc",
  "eez-protocol",
  "eez-prover",
@@ -3795,6 +3813,7 @@ dependencies = [
  "alloy-sol-types",
  "async-trait",
  "clap",
+ "eez-blob",
  "eez-control-rpc",
  "eez-evm",
  "eez-payload-codec",
@@ -6417,9 +6436,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.28"
+version = "1.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc3a226e576f50782b3305c5ccf458698f92798987f551c6a02efe8276721e22"
+checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
 dependencies = [
  "cc",
  "libc",

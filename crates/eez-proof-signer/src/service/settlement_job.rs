@@ -118,6 +118,7 @@ pub(super) fn validate_and_settle(
         expected_proof_system: state.attester.expected_proof_system(),
         system_transaction_reconstructor: &state.system_transaction_reconstructor,
         cancellation,
+        blobs: &[],
     })?;
 
     Ok(AttestationMaterial {
@@ -140,6 +141,7 @@ pub(super) struct SettlementInput<'a> {
     pub(super) expected_proof_system: Address,
     pub(super) system_transaction_reconstructor: &'a settlement::SystemTransactionReconstructor,
     pub(super) cancellation: &'a CancellationToken,
+    pub(super) blobs: &'a [Vec<u8>],
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -254,6 +256,10 @@ impl SettlementPipelineError {
                 tonic::Code::FailedPrecondition,
                 "settlement validation rejected",
             ),
+            Self::PublicInputs(settlement::PublicInputError::InvalidBlobInput(_)) => (
+                tonic::Code::InvalidArgument,
+                "invalid blob settlement input",
+            ),
             Self::DaPayload(error) => match error {
                 settlement::DaPayloadError::Decode { .. }
                 | settlement::DaPayloadError::TrailingBytes { .. } => {
@@ -267,6 +273,10 @@ impl SettlementPipelineError {
                 | settlement::DaPayloadError::InvalidEffectTransactionLayout => (
                     tonic::Code::Internal,
                     "validation backend returned invalid output",
+                ),
+                settlement::DaPayloadError::Kzg { .. } => (
+                    tonic::Code::Internal,
+                    "blob commitment derivation failed",
                 ),
                 settlement::DaPayloadError::BlockCount { .. }
                 | settlement::DaPayloadError::UnexpectedItems { .. }
@@ -321,15 +331,25 @@ pub(super) fn run_settlement(
         expected_proof_system,
         system_transaction_reconstructor,
         cancellation,
+        blobs,
     } = input;
     ensure_settlement_active(cancellation)?;
     let settling_block = validated_window.settling_block();
     let canonical_batch = settlement::decode_canonical_post_batch(submitted_post_batch_calldata)?;
-    let checked_public_input_profile = settlement::CheckedPublicInputProfile::new(
-        &canonical_batch,
-        expected_rollup_id,
-        expected_proof_system,
-    )?;
+    let checked_public_input_profile = if blobs.is_empty() {
+        settlement::CheckedPublicInputProfile::new(
+            &canonical_batch,
+            expected_rollup_id,
+            expected_proof_system,
+        )?
+    } else {
+        settlement::CheckedPublicInputProfile::new_blob(
+            &canonical_batch,
+            expected_rollup_id,
+            expected_proof_system,
+            blobs.len(),
+        )?
+    };
 
     let verified_state_chain = settlement::verify_state_update_chain(
         &canonical_batch,
@@ -383,17 +403,28 @@ pub(super) fn run_settlement(
 
     // Bind posted transactions and effect sidecars to the validated block bytes,
     // including the reconstructed Sync-block transaction sequence.
-    settlement::verify_da_payload(
-        &canonical_batch,
-        validated_window,
-        &authorized_outbound_effects,
-        &authorized_inbound_effects,
-        system_transaction_reconstructor,
-        expected_rollup_id.get(),
-    )?;
-
-    let recomputed_public_inputs_hash =
-        checked_public_input_profile.recompute_public_inputs_hash(proof_system_vkey)?;
+    let recomputed_public_inputs_hash = if blobs.is_empty() {
+        settlement::verify_da_payload(
+            &canonical_batch,
+            validated_window,
+            &authorized_outbound_effects,
+            &authorized_inbound_effects,
+            system_transaction_reconstructor,
+            expected_rollup_id.get(),
+        )?;
+        checked_public_input_profile.recompute_public_inputs_hash(proof_system_vkey, None)?
+    } else {
+        let verified_da = settlement::verify_blob_da_payload(
+            blobs,
+            validated_window,
+            &authorized_outbound_effects,
+            &authorized_inbound_effects,
+            system_transaction_reconstructor,
+            expected_rollup_id.get(),
+        )?;
+        checked_public_input_profile
+            .recompute_public_inputs_hash(proof_system_vkey, Some(&verified_da))?
+    };
     Ok(AttestablePublicInputsHash(recomputed_public_inputs_hash))
 }
 

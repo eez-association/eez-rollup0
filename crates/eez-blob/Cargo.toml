@@ -1,0 +1,21 @@
+[package]
+name                   = "eez-blob"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "EIP-4844 carrier shared by the Composer, proof signer and L1 reader: KZG sidecars, type-3 signing and the active blob limit."
+
+[dependencies]
+alloy-consensus = { workspace = true, features = ["kzg"] }
+alloy-eips = { workspace = true, features = ["kzg"] }
+alloy-network.workspace = true
+alloy-primitives.workspace = true
+reth-chainspec.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+alloy-signer-local.workspace = true
+
+[lints]
+workspace = true

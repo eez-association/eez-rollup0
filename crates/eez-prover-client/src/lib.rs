@@ -3,7 +3,7 @@
 //! Committed blocks are prevalidated through resumable `prove.v2` sessions.
 //! Finalization backfills any missing suffix, binds the exact settlement
 //! calldata, verifies the returned attestation, and returns its 65-byte
-//! signature. `prove.v1` remains the compatibility fallback.
+//! signature. `prove.v1` remains the compatibility fallback for calldata settlement.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
@@ -19,7 +19,8 @@ use eez_control_rpc::v1::{
 };
 use eez_control_rpc::v2::{
     Begin as StreamBegin, Block as StreamBlock, ClientFrame, Finalize as StreamFinalize,
-    Resume as StreamResume, Rewind as StreamRewind, ServerFrame, client_frame,
+    Resume as StreamResume, Rewind as StreamRewind, ServerFrame,
+    SettlementInput as StreamSettlement, client_frame,
     prover_client::ProverClient as StreamingProverClient, server_frame,
 };
 use eez_prover::{
@@ -33,7 +34,7 @@ use tracing::{Level, event};
 // Rollup0 clients require bounded pipelining support from the streaming server.
 const MAX_IN_FLIGHT: usize = 8;
 
-/// A [`Prover`] backed by the v2 streaming service, with v1 fallback.
+/// A [`Prover`] backed by the v2 streaming service, with v1 fallback for calldata.
 /// Cheap to clone (`Arc<Inner>`).
 #[derive(Debug, Clone)]
 pub struct RemoteProver {
@@ -343,8 +344,14 @@ impl RemoteProver {
         signature: Vec<u8>,
     ) -> ProverResult<Bytes> {
         let hash = verify_attestation(&signature, &public_inputs_hash, self.inner.attester)?;
-        let expected = eez_protocol::public_inputs::public_inputs_hashes(&ctx.batch, self.vkey())
-            .map_err(|error| {
+        let hashes = eez_blob::versioned_hashes(&ctx.blobs)
+            .map_err(|error| ProverError::Backend(format!("request blobs: {error}")))?;
+        let expected = eez_protocol::public_inputs::public_inputs_hashes_with_blobs(
+            &ctx.batch,
+            self.vkey(),
+            &hashes,
+        )
+        .map_err(|error| {
             ProverError::Backend(format!("cannot verify requested public inputs: {error}"))
         })?;
         if expected.len() != 1 || hash != expected[0] {
@@ -436,7 +443,7 @@ impl RemoteProver {
         rollup_id: u64,
         anchor: ProvingAnchor,
         blocks: &[BlockWitness],
-        finalize: Option<(u64, u64, PostBatch)>,
+        finalize: Option<(u64, u64, StreamSettlement)>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>, StreamingError> {
         // One deadline covers lock acquisition, connect, both stream directions and EOF.
         // Dropping the exchange releases its lock; a later Resume recovers accepted work.
@@ -463,12 +470,7 @@ impl RemoteProver {
             |(from, to, _)| (*from, *to),
         );
         let finalize = finalize
-            .map(|(from_block, to_block, post_batch)| {
-                if !post_batch.l1_block_hash.is_empty() {
-                    return Err(ProverError::Backend(
-                        "Rollup0 streaming does not support L1-bound settlement".into(),
-                    ));
-                }
+            .map(|(from_block, to_block, settlement)| {
                 let terminal = blocks
                     .iter()
                     .find(|block| block.number == to_block)
@@ -479,11 +481,7 @@ impl RemoteProver {
                     from_block,
                     to_block,
                     terminal_hash: terminal.hash.to_vec(),
-                    settlement: Some(eez_control_rpc::v2::SettlementInput {
-                        abi_calldata: post_batch.abi_calldata,
-                        blobs: Vec::new(),
-                        posting_context: None,
-                    }),
+                    settlement: Some(settlement),
                 })
             })
             .transpose()?;
@@ -771,26 +769,33 @@ impl Prover for RemoteProver {
         self.inner.proving.send_modify(|count| *count += 1);
         let _priority = ProofPriority(&self.inner.proving);
         let Some(anchor) = ctx.anchor else {
+            if !ctx.blobs.is_empty() {
+                return Err(ProverError::Backend(
+                    "blob settlement requires a streaming anchor".into(),
+                ));
+            }
             return self.prove_v1(ctx).await;
         };
         let abi_calldata = eez_protocol::abi::postAndVerifyBatchCall {
             batch: ctx.batch.clone(),
         }
         .abi_encode();
-        let post_batch = PostBatch {
+        if ctx.l1_block_hash.is_some() {
+            return Err(ProverError::Backend(
+                "Rollup0 streaming does not support L1-bound settlement".into(),
+            ));
+        }
+        let settlement = StreamSettlement {
             abi_calldata,
-            public_inputs_hash: Vec::new(),
-            l1_block_hash: ctx
-                .l1_block_hash
-                .map(|hash| hash.to_vec())
-                .unwrap_or_default(),
+            blobs: ctx.blobs.iter().map(|bytes| bytes.to_vec()).collect(),
+            posting_context: None,
         };
         match self
             .stream_exchange(
                 ctx.rollup_id,
                 anchor,
                 &ctx.blocks,
-                Some((ctx.from_block, ctx.to_block, post_batch)),
+                Some((ctx.from_block, ctx.to_block, settlement)),
             )
             .await
         {
@@ -798,7 +803,10 @@ impl Prover for RemoteProver {
             Ok(None) => Err(ProverError::Backend(
                 "ProveStream Finalize returned no proof".into(),
             )),
-            Err(StreamingError::Unsupported) => self.prove_v1(ctx).await,
+            Err(StreamingError::Unsupported) if ctx.blobs.is_empty() => self.prove_v1(ctx).await,
+            Err(StreamingError::Unsupported) => Err(ProverError::Backend(
+                "ProveStream does not support blob settlement".into(),
+            )),
             Err(StreamingError::Prover(error)) => Err(error),
         }
     }
@@ -1053,7 +1061,7 @@ mod tests {
                     1,
                     test_anchor(),
                     std::slice::from_ref(&input),
-                    Some((11, 11, PostBatch::default())),
+                    Some((11, 11, StreamSettlement::default())),
                 )
                 .await
                 .map_err(ProverError::from)
@@ -1406,6 +1414,20 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn blob_settlement_requires_a_streaming_anchor() {
+        let prover = RemoteProver::new("http://127.0.0.1:1", Address::ZERO);
+        let error = prover
+            .prove(ProvingContext {
+                blobs: vec![Bytes::new()],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("requires a streaming anchor"));
+    }
+
     /// Both direct v1 and fallback require the registered signer and requested batch.
     #[tokio::test]
     async fn v1_and_fallback_bind_the_attestation_to_the_requested_batch() {
@@ -1421,6 +1443,7 @@ mod tests {
                     blocks: vec![test_block(11, test_anchor().hash, 0x22)],
                     batch: test_batch(),
                     l1_block_hash: None,
+                    blobs: Vec::new(),
                 };
                 let hash = if wrong_batch {
                     B256::repeat_byte(0x7c)
@@ -1577,6 +1600,7 @@ mod tests {
                 batch: test_batch(),
                 blocks: vec![block_11.clone()],
                 l1_block_hash: None,
+                blobs: Vec::new(),
             })
             .await
             .unwrap();
@@ -1603,6 +1627,7 @@ mod tests {
                 batch: test_batch(),
                 blocks: vec![block_11, block_12],
                 l1_block_hash: None,
+                blobs: Vec::new(),
             })
             .await
             .unwrap();
@@ -1656,6 +1681,7 @@ mod tests {
                     blocks: vec![block],
                     batch: test_batch(),
                     l1_block_hash: None,
+                    blobs: Vec::new(),
                 }),
             )
             .await
@@ -1764,6 +1790,7 @@ mod tests {
                 blocks: vec![first.clone(), second, third.clone()],
                 batch: test_batch(),
                 l1_block_hash: None,
+                blobs: Vec::new(),
             })
             .await
             .unwrap();
@@ -1822,6 +1849,7 @@ mod tests {
                     blocks: vec![first, second],
                     batch: test_batch(),
                     l1_block_hash: None,
+                    blobs: Vec::new(),
                 })
                 .await;
             assert_eq!(begins.load(Ordering::SeqCst), 1);
@@ -1879,6 +1907,7 @@ mod tests {
                             blocks: vec![test_block(11, anchor.hash, 0x99)],
                             batch: test_batch(),
                             l1_block_hash: None,
+                            blobs: Vec::new(),
                         })
                         .await
                         .unwrap();
@@ -1909,6 +1938,7 @@ mod tests {
                             },
                             batch: test_batch(),
                             l1_block_hash: None,
+                            blobs: Vec::new(),
                         })
                         .await
                         .unwrap();
@@ -1957,6 +1987,7 @@ mod tests {
                 batch: test_batch(),
                 blocks: vec![block_11, block_12],
                 l1_block_hash: None,
+                blobs: Vec::new(),
             })
             .await
             .unwrap();

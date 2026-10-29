@@ -810,9 +810,9 @@ impl SessionRuntime {
             .settlement
             .take()
             .ok_or_else(|| Status::invalid_argument("Finalize carries no settlement input"))?;
-        if !settlement.blobs.is_empty() || settlement.posting_context.is_some() {
+        if settlement.posting_context.is_some() {
             return Err(Status::unimplemented(
-                "this Rollup0 deployment uses calldata settlement without posting context",
+                "this Rollup0 deployment does not support posting context",
             ));
         }
         let session = self.session(bound.id).await?;
@@ -866,6 +866,7 @@ impl SessionRuntime {
                 expected_proof_system: state.attester.expected_proof_system(),
                 system_transaction_reconstructor: &state.system_transaction_reconstructor,
                 cancellation: &worker_cancellation,
+                blobs: &settlement.blobs,
             })
             .map_err(PipelineError::Settlement)?;
             Ok::<_, PipelineError>(hash)
@@ -1385,6 +1386,7 @@ mod tests {
                 .batch,
             blocks,
             l1_block_hash: None,
+            blobs: Vec::new(),
         }
     }
 

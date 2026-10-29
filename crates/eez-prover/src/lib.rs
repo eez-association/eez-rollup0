@@ -160,6 +160,8 @@ pub struct ProvingContext {
     /// `blockhash(N)` for a block-bound batch's `blockNumber = N`; `None` for a
     /// timeless (0) batch.
     pub l1_block_hash: Option<B256>,
+    /// Physical DA blobs in transaction order; empty for calldata settlement.
+    pub blobs: Vec<Bytes>,
 }
 
 /// Produces the [`BlockWitness`] for a committed L2 block — the seam by which

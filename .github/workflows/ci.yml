@@ -82,9 +82,9 @@ jobs:
           --test rolling_hash_vectors
           --no-fail-fast
       - name: Executed streaming RPC vectors
-        run: cargo nextest run --locked -p eez-prover-stateless --test streaming_rpc --no-fail-fast
+        run: cargo nextest run --locked --cargo-profile ci-e2e -p eez-prover-stateless --test streaming_rpc --no-fail-fast
       - name: Payload conformance vectors
-        run: cargo nextest run --locked -p eez-payload-codec --test conformance --no-fail-fast
+        run: cargo nextest run --locked --cargo-profile ci-e2e -p eez-payload-codec --test conformance --no-fail-fast
 
   contract-tests:
     name: Contract Tests

@@ -17,9 +17,10 @@
 //!   which the proof signer verifies rather than re-executing the call on L1.
 //! - **Canonical public inputs.** [`public_inputs::public_inputs_hashes`] is the
 //!   reconstruction used by the proof signer; another encoding changes the
-//!   signed inputs. The supported profile requires one uniform verification
-//!   key, block number zero, no blobs, and no sender binding; other profiles are
-//!   rejected.
+//!   signed inputs. The calldata profile requires one uniform verification
+//!   key, block number zero, no blobs, and no sender binding; the blob profile
+//!   requires one uniform verification key, block number zero, a blob hash
+//!   for every blob index, and no sender binding.
 //! - **Settlement root.** Before signing, the proof signer checks
 //!   `RollupUpdate.newRoot` against the root reth produced for the block.
 //!

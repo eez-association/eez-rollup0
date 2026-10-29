@@ -43,8 +43,15 @@ where:
 The profile supports exactly one nonzero rollup ID, one nonzero proof-system
 address, and one nonzero proof-system verification key. It does not support
 static entries, nested calls, multiple calls per effect, explicit call gas,
-force-revert spans, blobs, L1 block binding, sender binding, or multiple proof
+force-revert spans, L1 block binding, sender binding, or multiple proof
 systems.
+
+The profile supports calldata and blob DA using the stock protocol `Rollup.sol`.
+Both retain `blockNumber == 0` and empty `customData`. Blob settlement uses
+streaming `Finalize` with physical blobs and no `posting_context`; the signer
+derives the blob hashes locally after verifying the same execution and effects
+as calldata. The stream is unchanged apart from `CloseBlobStream` and 31-byte
+field-element packing.
 
 No failed stage may produce a signature. A successful signature authorizes the
 locally recomputed public-input hash only under all rules in this document.
@@ -460,7 +467,8 @@ The decoded batch MUST satisfy all of these profile rules:
 7. `immediateEntryCount` equals the complete leading run of mutable entries
    whose `proxyEntryHash == 0`.
 8. `blockNumber == 0`.
-9. `blobIndices` is empty.
+9. Calldata: `blobIndices` is empty. Blob DA: `callData` is empty and
+   `blobIndices == [0, n)`, with at least one blob.
 10. `bindMsgSenderInPublicInput == false`.
 
 `proofs` is not inspected and is absent from the public-input hash. The caller
@@ -650,20 +658,28 @@ nonnegative `int192`.
 
 ## 11. Data-availability and Sync-block verification
 
-The batch `callData` MUST have this exact shape:
+The DA stream MUST have this exact shape:
 
 ```text
-0x00 || RLP([blockTxCounts, transactions, l2Entries])
+0x00 || ChainOperation(rollup_id, operations)
+     || (Initiate || Call || Return || Finish)*
 ```
 
-There MUST be no trailing bytes or fields. `blockTxCounts` contains one RLP
-`u16` per validated block. `transactions` and `l2Entries` are RLP lists whose
-items are themselves RLP lists of byte values; decoding each item MUST recover
-the exact EIP-2718 transaction bytes or ABI sidecar bytes being compared.
+`operations` contains the version-0 columnar block span defined by
+[`eez-payload-codec`](../eez-payload-codec/src/lib.rs). Its transaction counts
+and bytes MUST recover the exact EIP-2718 transactions being compared. The
+stream's rollup ID MUST equal the expected rollup ID.
 
-For every block before the terminal block, `blockTxCounts` MUST equal the exact
-validated transaction count and every transaction byte string MUST match in
-order.
+Calldata settlement carries the stream in `batch.callData`, with no trailing
+bytes or fields. Blob settlement appends `CloseBlobStream`, packs 31 bytes per
+field element, and zero-pads the final blob. Each physical blob MUST contain
+131072 bytes, every field element's high byte MUST be zero, and every byte
+after the close marker MUST be zero. Both profiles use the same decoded span
+and action checks below.
+
+For every block before the terminal block, the decoded transaction count MUST
+equal the exact validated transaction count and every transaction byte string
+MUST match in order.
 
 For the terminal block, the DA projection omits:
 
@@ -673,7 +689,7 @@ For the terminal block, the DA projection omits:
 Outbound user transactions remain. Counts and retained transaction bytes MUST
 match this projection exactly.
 
-There MUST be one `l2Entries` sidecar per effect, in effect order:
+There MUST be one decoded action sidecar per effect, in effect order:
 
 - an outbound sidecar is the authorized batch entry with `rollupUpdates`
   cleared, `rollingHash` set to zero, and `returnData` supplied by the DA
@@ -730,7 +746,7 @@ For every mutable entry:
 entryHash[i] = H(abi.encode(batch.entries[i]))
 ```
 
-For the supported profile:
+For the calldata profile:
 
 ```text
 staticEntryHashes = []
@@ -740,6 +756,9 @@ customDataHash    = H(abi.encode(uint64(expected_rollup_id), customData))
 customDataHashes  = dynamic bytes32[] containing only customDataHash
 boundSender       = address(0)
 ```
+
+For blob DA, `blobHashes` are independently derived from the validated physical
+blobs. `callData` is empty; custom data and the remaining fields are unchanged.
 
 The shared input is:
 
@@ -777,7 +796,7 @@ not participate.
 
 ### 12.1 Fields not bound by the digest
 
-The full mutable entries and `callData` are bound as above. The following batch
+The full mutable entries and DA payload are bound as above. The following batch
 carriers are not directly included in the digest:
 
 - `expectedRootPerRollup`;

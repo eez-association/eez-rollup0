@@ -174,6 +174,14 @@ pub enum PublicInputsError {
         /// Unsupported `batch.blockNumber` value.
         block_number: u64,
     },
+    /// Independently derived hashes must cover the selected indices exactly.
+    #[error("blob hash count {actual} does not match blobIndices count {expected}")]
+    BlobHashCount {
+        /// Number selected by the canonical batch.
+        expected: usize,
+        /// Number derived from the submitted physical blobs.
+        actual: usize,
+    },
     /// Sender-bound public inputs require the actual transaction sender.
     #[error("public-input hashing currently requires bindMsgSenderInPublicInput == false")]
     UnsupportedSenderBinding,
@@ -203,6 +211,30 @@ pub fn batch_shared_public_input(
             count: batch.blobIndices.len(),
         });
     }
+    batch_shared_public_input_with_blobs(batch, sender, &[])
+}
+
+/// Compute the shared input with independently derived blob hashes.
+///
+/// # Errors
+///
+/// [`PublicInputsError`] for a nonzero block number or a blob hash count mismatch.
+pub fn batch_shared_public_input_with_blobs(
+    batch: &EvmBatch,
+    sender: Address,
+    blob_hashes: &[B256],
+) -> Result<B256, PublicInputsError> {
+    if batch.blockNumber != 0 {
+        return Err(PublicInputsError::UnsupportedBlockNumber {
+            block_number: batch.blockNumber,
+        });
+    }
+    if blob_hashes.len() != batch.blobIndices.len() {
+        return Err(PublicInputsError::BlobHashCount {
+            expected: batch.blobIndices.len(),
+            actual: blob_hashes.len(),
+        });
+    }
     let entry_hashes: Vec<B256> = batch.entries.iter().map(entry_hash).collect();
     let static_entry_hashes: Vec<B256> =
         batch.staticEntries.iter().map(static_entry_hash).collect();
@@ -219,7 +251,7 @@ pub fn batch_shared_public_input(
     Ok(shared_public_input(
         &entry_hashes,
         &static_entry_hashes,
-        &[],
+        blob_hashes,
         &batch.callData,
         &custom_data_hashes,
         bound_sender,
@@ -241,8 +273,33 @@ pub fn public_inputs_hashes(batch: &EvmBatch, vkey: B256) -> Result<Vec<B256>, P
     if batch.bindMsgSenderInPublicInput {
         return Err(PublicInputsError::UnsupportedSenderBinding);
     }
-    // Refuses a nonzero block number and blobs.
-    let shared = batch_shared_public_input(batch, Address::ZERO)?;
+    if batch.blockNumber != 0 {
+        return Err(PublicInputsError::UnsupportedBlockNumber {
+            block_number: batch.blockNumber,
+        });
+    }
+    if !batch.blobIndices.is_empty() {
+        return Err(PublicInputsError::UnsupportedBlobIndices {
+            count: batch.blobIndices.len(),
+        });
+    }
+    public_inputs_hashes_with_blobs(batch, vkey, &[])
+}
+
+/// Compute settlement hashes with locally derived blob hashes and empty custom data.
+///
+/// # Errors
+///
+/// [`PublicInputsError`] for unsupported binding, invalid proof plans, or hash count mismatch.
+pub fn public_inputs_hashes_with_blobs(
+    batch: &EvmBatch,
+    vkey: B256,
+    blob_hashes: &[B256],
+) -> Result<Vec<B256>, PublicInputsError> {
+    if batch.bindMsgSenderInPublicInput {
+        return Err(PublicInputsError::UnsupportedSenderBinding);
+    }
+    let shared = batch_shared_public_input_with_blobs(batch, Address::ZERO, blob_hashes)?;
     let rollup_assignments: Vec<RollupProofAssignment> = batch
         .rollupIdsWithProofSystems
         .iter()

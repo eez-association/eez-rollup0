@@ -73,6 +73,7 @@ pub(super) struct Call {
     pub input: Bytes,
     pub from: Address,
     pub logs: usize,
+    pub blob_hashes: Vec<B256>,
 }
 
 /// Names a log's position for error messages.
@@ -296,6 +297,7 @@ pub(super) fn direct_call(tx: &Transaction, eez: Address, logs: usize) -> Option
         input: input.clone(),
         from: tx.inner.signer(),
         logs,
+        blob_hashes: tx.blob_versioned_hashes().unwrap_or_default().to_vec(),
     })
 }
 
@@ -325,6 +327,7 @@ pub(super) fn calls_in_tx(
                 input: frame.input.clone(),
                 from: frame.from,
                 logs: 0,
+                blob_hashes: Vec::new(),
             });
         }
         // Count this frame's own scanned EEZ logs, for the tx and the post it runs in.
@@ -502,11 +505,13 @@ fn label(
             l1_block_hash: block.hash,
             log_index: tx.logs[end.last].log_index,
         };
+        let (batch, blob_hashes) = verify(call, spi, ids, &id, &here)?;
         let post = Post {
             id,
             tx_hash: head.tx_hash,
             sender: call.from,
-            batch: verify(call, spi, ids, &id, &here)?,
+            batch,
+            blob_hashes,
             settlement: Settlement::NONE,
         };
         by_call.push(Place::Ours(posts.len()));
@@ -518,7 +523,13 @@ fn label(
 }
 
 /// The batch `call` carried, checked against its own `BatchPosted`.
-fn verify(call: &Call, spi: B256, ids: &[u64], id: &PostId, here: &str) -> L1Result<EvmBatch> {
+fn verify(
+    call: &Call,
+    spi: B256,
+    ids: &[u64],
+    id: &PostId,
+    here: &str,
+) -> L1Result<(EvmBatch, Vec<B256>)> {
     let decoded = postAndVerifyBatchCall::abi_decode_validate(&call.input);
     let decoded = decoded.map_err(|e| L1Error::Decode(format!("{here}: bad call: {e}")))?;
     let batch = decoded.batch;
@@ -531,17 +542,24 @@ fn verify(call: &Call, spi: B256, ids: &[u64], id: &PostId, here: &str) -> L1Res
         log_index: id.log_index,
         detail,
     };
-    // Refuses blobs and a non-zero blockNumber, whose customData may read any
-    // state (IRollup.sol:41-54).
-    let commitment = batch_shared_public_input(&batch, call.from);
-    let commitment = commitment.map_err(|e| unsupported(format!("{here}: {e}")))?;
+    // Refuses a non-zero blockNumber, whose customData may read any state
+    // (IRollup.sol:41-54).
+    let (commitment, blob_hashes) = if batch.blobIndices.is_empty() {
+        let commitment = batch_shared_public_input(&batch, call.from);
+        (
+            commitment.map_err(|error| unsupported(format!("{here}: {error}")))?,
+            Vec::new(),
+        )
+    } else {
+        super::blob::commitment(&batch, &call.blob_hashes, call.from, here)?
+    };
     let mismatch = format!("{here}: call hashes to {commitment}, not {spi}");
     // Only a co-listed rollup's block-zero customData can explain a mismatch (EEZ.sol:753-762).
     ensure!(commitment == spi || ids.len() > 1, "{mismatch}");
     if commitment != spi {
         return Err(unsupported(mismatch));
     }
-    Ok(batch)
+    Ok((batch, blob_hashes))
 }
 
 /// A post listing us, while its block is read.

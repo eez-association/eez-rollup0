@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/eez-blob",
     "crates/eez-composer",
     "crates/eez-control-rpc",
     "crates/eez-deriver",
@@ -184,6 +185,7 @@ jsonrpsee              = { version = "0.26", features = ["server", "macros"] }
 # internal crates
 eez-evm = { path = "crates/eez-evm" }
 eez-primitives = { path = "crates/eez-primitives" }
+eez-blob           = { path = "crates/eez-blob" }
 eez-composer       = { path = "crates/eez-composer" }
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }
