@@ -277,23 +277,15 @@ EEZ_ROLLUP_ID="$(extract_uint L2_ROLLUP_ID "$OUT")"
 }
 echo "      rollupId   = $EEZ_ROLLUP_ID"
 
-# ── 5/5 DeployBridgeL1 ──────────────────────────────────────────────
-# Creates the L1 CrossChainProxy (representing the L2 BridgeReceiver
-# predeploy at `0x4200…0008`) and a user-facing BridgeSender. The
-# composer's first cross-chain smoke routes a deposit through these.
-EEZ_L2_BRIDGE_RECEIVER_DEFAULT="0x4200000000000000000000000000000000000008"
-EEZ_L2_BRIDGE_RECEIVER="${EEZ_L2_BRIDGE_RECEIVER:-$EEZ_L2_BRIDGE_RECEIVER_DEFAULT}"
-echo "[5/5] DeployBridgeL1(l2Dest=$EEZ_L2_BRIDGE_RECEIVER, rollupId=$EEZ_ROLLUP_ID)"
-EEZ_REGISTRY_ADDRESS="$EEZ_REGISTRY_ADDRESS" \
-EEZ_L2_BRIDGE_RECEIVER="$EEZ_L2_BRIDGE_RECEIVER" \
-EEZ_ROLLUP_ID="$EEZ_ROLLUP_ID" \
-run_forge "DeployBridgeL1" forge script script/DeployBridgeL1.s.sol:DeployBridgeL1 $RPC $KEY --broadcast
-EEZ_L1_L2_PROXY="$(extract L2_PROXY "$OUT")"
-EEZ_L1_BRIDGE_SENDER="$(extract BRIDGE_SENDER "$OUT")"
-[[ -n "$EEZ_L1_L2_PROXY"     ]] || { echo "$OUT" >&2; echo "deploy: failed to capture L2_PROXY" >&2; exit 1; }
-[[ -n "$EEZ_L1_BRIDGE_SENDER" ]] || { echo "$OUT" >&2; echo "deploy: failed to capture BRIDGE_SENDER" >&2; exit 1; }
-echo "      L2 proxy   = $EEZ_L1_L2_PROXY"
-echo "      L1 bridge  = $EEZ_L1_BRIDGE_SENDER"
+# ── 5/5 DeployBridge ────────────────────────────────────────────────
+# The reference bridge is initialized in its creation transaction.
+echo "[5/5] DeployBridge(L1)"
+run_forge "DeployBridge" forge script script/DeployBridge.s.sol:DeployBridge \
+    --sig "run(address,uint64,address)" "$EEZ_REGISTRY_ADDRESS" 0 "$OWNER" \
+    $RPC $KEY --broadcast
+EEZ_L1_BRIDGE_ADDRESS="$(extract BRIDGE "$OUT")"
+[[ -n "$EEZ_L1_BRIDGE_ADDRESS" ]] || { echo "$OUT" >&2; echo "deploy: missing L1 bridge address" >&2; exit 1; }
+echo "      L1 bridge  = $EEZ_L1_BRIDGE_ADDRESS"
 
 # ── Write deployments.env ───────────────────────────────────────────
 cat > "$OUT_FILE" <<EOF
@@ -317,10 +309,8 @@ EEZ_L2_GENESIS_PROFILE_PATH=$GENESIS_PROFILE_OUT
 # Also used by the composer for priority fees; base fees are fixed in genesis.
 EEZ_L2_FEE_RECIPIENT=$EEZ_L2_FEE_RECIPIENT
 
-# L1 cross-chain bridge contracts (DeployBridgeL1).
-EEZ_L1_L2_PROXY=$EEZ_L1_L2_PROXY
-EEZ_L1_BRIDGE_SENDER=$EEZ_L1_BRIDGE_SENDER
-EEZ_L2_BRIDGE_RECEIVER=$EEZ_L2_BRIDGE_RECEIVER
+# Reference ETH bridge. Deploy its L2 counterpart after the node starts.
+EEZ_L1_BRIDGE_ADDRESS=$EEZ_L1_BRIDGE_ADDRESS
 
 # EEZL2 predeploy baked into genesis.json.
 EEZL2_ADDRESS=0x4200000000000000000000000000000000000007
