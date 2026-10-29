@@ -323,3 +323,58 @@ fn batch_shared_public_input_matches_pinned_solidity_vectors() {
     }
     assert_eq!(checked, 3, "three vectors lie inside the supported profile");
 }
+
+#[test]
+fn live_context_matches_solidity_and_rejects_missing_context() {
+    use eez_protocol::l1_context::LiveSettlementContext;
+    use eez_protocol::public_inputs::{
+        batch_shared_public_input_with_context, public_inputs_hashes_with_context,
+    };
+    let context = LiveSettlementContext {
+        parent_hash: B256::repeat_byte(0x99),
+        timestamp: 42,
+    };
+    let mut batch = EvmBatch {
+        blockNumber: u64::MAX,
+        proofSystems: vec![Address::repeat_byte(1)],
+        rollupIdsWithProofSystems: vec![RollupIdWithProofSystemsSol {
+            rollupId: 1,
+            proofSystemIndexes: vec![0],
+        }],
+        ..Default::default()
+    };
+    let vkey = B256::with_last_byte(0x42);
+    let shared =
+        batch_shared_public_input_with_context(&batch, Address::ZERO, Some(context)).unwrap();
+    let hashes = public_inputs_hashes_with_context(&batch, vkey, Some(context)).unwrap();
+    // Both constants are independently asserted against the real reference EEZ contract.
+    assert_eq!(
+        shared,
+        alloy_primitives::b256!("65c65b6059b34c249f220e4a2f144b0c9bd0447e9248cbd839f6fa2c26e7eec9")
+    );
+    assert_eq!(
+        hashes,
+        vec![alloy_primitives::b256!(
+            "83c332392dceacc310d1892f43a321b25c7ed31dc84da77d3099e910e3f0bc3e"
+        )]
+    );
+    for changed in [
+        LiveSettlementContext {
+            timestamp: 43,
+            ..context
+        },
+        LiveSettlementContext {
+            parent_hash: B256::repeat_byte(0x98),
+            ..context
+        },
+    ] {
+        assert_ne!(
+            hashes,
+            public_inputs_hashes_with_context(&batch, vkey, Some(changed)).unwrap()
+        );
+    }
+    assert!(public_inputs_hashes_with_context(&batch, vkey, None).is_err());
+    batch.blockNumber = 0;
+    assert!(public_inputs_hashes_with_context(&batch, vkey, Some(context)).is_err());
+    assert!(public_inputs_hashes_with_context(&batch, vkey, None).is_ok());
+}

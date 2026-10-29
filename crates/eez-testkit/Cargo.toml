@@ -9,7 +9,7 @@ description            = "Reusable process, chain, and cross-chain integration t
 [dependencies]
 alloy-consensus-any.workspace = true
 alloy-eips.workspace = true
-alloy-rpc-types-engine.workspace = true
+alloy-rpc-types-engine = { workspace = true, features = ["jwt"] }
 eez-primitives.workspace = true
 jsonrpsee.workspace = true
 reqwest.workspace = true

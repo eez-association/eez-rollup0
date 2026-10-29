@@ -88,7 +88,7 @@ The current profile requires:
 | `blobIndices` | Empty. |
 | `callData` | Exact tagged DA payload described below. |
 | `proofs` | Empty while constructing and sending the request. |
-| `blockNumber` | Zero. |
+| `blockNumber` | Zero for timeless batches; `uint64.max` for live parent/time-bound settlement. |
 | `bindMsgSenderInPublicInput` | `false`. |
 
 Every entry MUST contain exactly one state update for the expected rollup. The
@@ -188,7 +188,11 @@ The first streamed chunk MUST contain exactly one `ProveHeader`:
   3.1.
 - `post_batch.public_inputs_hash` is non-authoritative. The Composer SHOULD
   send it empty; the prover response supplies the recomputed hash.
-- The current timeless profile requires `post_batch.l1_block_hash` to be empty.
+- Timeless batches require `post_batch.l1_block_hash` to be empty. Live cross-chain
+  batches require the nonzero 32-byte intended L1 parent hash. Their inclusion
+  timestamp is the validated terminal Sync header timestamp. The proof binds
+  both through the reference manager's `getCustomData(uint64.max)`; the L1
+  contract checks the actual context when consuming the proof.
 
 ### 3.3 Block chunks
 

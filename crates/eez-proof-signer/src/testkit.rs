@@ -60,3 +60,18 @@ pub(crate) fn pre_execution_checkpoint(block_hash: B256) -> crate::validate::Sta
         block_hash,
     }
 }
+
+pub(crate) fn live_context() -> eez_protocol::l1_context::LiveSettlementContext {
+    eez_protocol::l1_context::LiveSettlementContext {
+        parent_hash: B256::repeat_byte(0x99),
+        timestamp: 1,
+    }
+}
+
+pub(crate) fn block_header() -> alloy_consensus::Header {
+    alloy_consensus::Header {
+        gas_limit: 30_000_000,
+        timestamp: 1,
+        ..Default::default()
+    }
+}

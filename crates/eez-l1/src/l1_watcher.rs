@@ -1431,6 +1431,7 @@ mod tests {
             },
             tx_hash: B256::with_last_byte(tx),
             sender: Address::ZERO,
+            l1_context: None,
             batch: eez_protocol::abi::EvmBatch::default(),
             settlement: crate::scan::Settlement::NONE,
         }

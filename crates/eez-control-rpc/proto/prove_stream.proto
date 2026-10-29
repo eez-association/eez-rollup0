@@ -84,10 +84,11 @@ message SettlementInput {
   // The prover derives commitments/versioned hashes itself. RollupX and draft
   // blob-based Rollup0 require all blobs, empty batch.callData and indices [0, 1, ...].
   repeated bytes blobs = 2;
-  // Named L1 target, independently authenticated.
+  // Named L1 target, authenticated according to the deployment profile.
   // Manager-specific custom data is derived from trusted profile/deployment rules,
   // not supplied here. Both blob profiles use these same target fields.
-  // Required for the RollupX profile.
+  // Required for RollupX and live cross-chain Rollup0. Rollup0 binds the terminal
+  // timestamp and parent hash conditionally; its L1 manager checks actual inclusion.
   L1PostingContext posting_context = 3;
 }
 
@@ -96,7 +97,7 @@ message L1PostingContext {
   uint64 chain_id = 1;
   uint64 target_timestamp = 2;
   uint64 parent_number = 3;
-  bytes parent_hash = 4; // nonzero 32-byte hash; authenticated on configured L1.
+  bytes parent_hash = 4; // nonzero 32-byte hash; profile-specific authentication.
 }
 
 // Optional; unsupported Cancel returns UNIMPLEMENTED. Ordinary gRPC cancellation

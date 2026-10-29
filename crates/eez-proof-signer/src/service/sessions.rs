@@ -810,9 +810,9 @@ impl SessionRuntime {
             .settlement
             .take()
             .ok_or_else(|| Status::invalid_argument("Finalize carries no settlement input"))?;
-        if !settlement.blobs.is_empty() || settlement.posting_context.is_some() {
+        if !settlement.blobs.is_empty() {
             return Err(Status::unimplemented(
-                "this Rollup0 deployment uses calldata settlement without posting context",
+                "this Rollup0 deployment uses calldata settlement without blobs",
             ));
         }
         let session = self.session(bound.id).await?;
@@ -829,6 +829,13 @@ impl SessionRuntime {
             (anchor, window, start_index, session.cancellation.clone())
         };
 
+        let l1_parent_hash = settlement.posting_context.as_ref().map(|context| {
+            if context.target_timestamp != validated_window.settling_block().decoded().header.timestamp
+                || context.chain_id != 0 || context.parent_number != 0 {
+                return Err(Status::invalid_argument("Rollup0 posting context must match terminal time and use parent/time-only fields"));
+            }
+            parse_b256("L1 parent hash", &context.parent_hash)
+        }).transpose()?;
         let state = Arc::clone(&self.state);
         match timeout(
             self.limits.request_timeout(),
@@ -859,6 +866,7 @@ impl SessionRuntime {
         let worker = tokio::task::spawn_blocking(move || {
             let hash = run_settlement(SettlementInput {
                 submitted_post_batch_calldata: settlement.abi_calldata,
+                l1_parent_hash,
                 validated_window: &validated_window,
                 expected_rollup_id: state.expected_rollup_id,
                 expected_l2_system_address: state.expected_l2_system_address,
@@ -1384,7 +1392,7 @@ mod tests {
                 .unwrap()
                 .batch,
             blocks,
-            l1_block_hash: None,
+            l1_context: None,
         }
     }
 

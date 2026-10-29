@@ -43,6 +43,36 @@ contract PublicInputsHashVectorsTest is Test {
     bytes32 private constant ALL_DIMENSIONS_PUBLIC_INPUT =
         0x18742f97fac6fcd3ca33e57739399b92eb55a4cf3465327a9dd274199ef677ef;
 
+    function testLiveContextBindsActualParentAndTimestamp() external {
+        EEZ eez = new EEZ(address(0xDEAD));
+        MockProofSystem proofSystem = new MockProofSystem();
+        uint64 rollupId = _registerRollup(eez, _singleton(proofSystem), _singleton(bytes32(uint256(0x42))));
+        ProofSystemBatchPerVerificationEntries memory batch = _emptyBatch();
+        batch.blockNumber = type(uint64).max;
+        batch.proofSystems = _addresses(_singleton(proofSystem));
+        batch.proofs = _proofs(1);
+        batch.rollupIdsWithProofSystems = _assignments1(rollupId, 0);
+        bytes32 parent = 0x9999999999999999999999999999999999999999999999999999999999999999;
+        bytes[] memory context = new bytes[](1);
+        context[0] = abi.encode(uint256(42), parent);
+        bytes32 shared = _shared(batch, context, address(0));
+        bytes32 publicInput = _publicInput(shared, _singleton(rollupId), _singleton(bytes32(uint256(0x42))));
+        assertEq(shared, 0x65c65b6059b34c249f220e4a2f144b0c9bd0447e9248cbd839f6fa2c26e7eec9);
+        assertEq(publicInput, 0x83c332392dceacc310d1892f43a321b25c7ed31dc84da77d3099e910e3f0bc3e);
+        proofSystem.setExpectedPublicInputsHash(publicInput);
+        vm.roll(100);
+        vm.warp(42);
+        vm.setBlockhash(99, parent);
+        eez.postAndVerifyBatch(batch);
+        vm.warp(43);
+        vm.expectRevert(EEZ.InvalidProof.selector);
+        eez.postAndVerifyBatch(batch);
+        vm.warp(42);
+        vm.setBlockhash(99, bytes32(uint256(1)));
+        vm.expectRevert(EEZ.InvalidProof.selector);
+        eez.postAndVerifyBatch(batch);
+    }
+
     function testEmptyEntryVector() external {
         EEZ eez = new EEZ(address(0xDEAD));
         MockProofSystem proofSystem = new MockProofSystem();

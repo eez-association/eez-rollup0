@@ -14,7 +14,7 @@ use eez_protocol::abi::{
     L2ExecutionPerformed, L2TxSkipped, SCANNED_TOPICS, postAndVerifyBatchCall,
 };
 use eez_protocol::entries::{EntryRole, entry_roles};
-use eez_protocol::public_inputs::batch_shared_public_input;
+use eez_protocol::public_inputs::batch_shared_public_input_with_context;
 
 use super::types::{AppliedEntry, Post, PostId, Settlement};
 use crate::error::{L1Error, L1Result};
@@ -33,6 +33,7 @@ macro_rules! ensure {
 pub(super) struct Block {
     pub number: u64,
     pub hash: B256,
+    pub context: Option<eez_protocol::l1_context::LiveSettlementContext>,
     pub logs: Vec<ScannedLog>,
 }
 
@@ -140,7 +141,12 @@ pub(super) fn group_blocks(raw: &[Log]) -> L1Result<Vec<Block>> {
                 event,
             });
         }
-        decoded.push(Block { number, hash, logs });
+        decoded.push(Block {
+            number,
+            hash,
+            context: None,
+            logs,
+        });
     }
     Ok(decoded)
 }
@@ -506,7 +512,8 @@ fn label(
             id,
             tx_hash: head.tx_hash,
             sender: call.from,
-            batch: verify(call, spi, ids, &id, &here)?,
+            batch: verify(call, spi, ids, &id, &here, block.context)?,
+            l1_context: block.context,
             settlement: Settlement::NONE,
         };
         by_call.push(Place::Ours(posts.len()));
@@ -518,7 +525,14 @@ fn label(
 }
 
 /// The batch `call` carried, checked against its own `BatchPosted`.
-fn verify(call: &Call, spi: B256, ids: &[u64], id: &PostId, here: &str) -> L1Result<EvmBatch> {
+fn verify(
+    call: &Call,
+    spi: B256,
+    ids: &[u64],
+    id: &PostId,
+    here: &str,
+    context: Option<eez_protocol::l1_context::LiveSettlementContext>,
+) -> L1Result<EvmBatch> {
     let decoded = postAndVerifyBatchCall::abi_decode_validate(&call.input);
     let decoded = decoded.map_err(|e| L1Error::Decode(format!("{here}: bad call: {e}")))?;
     let batch = decoded.batch;
@@ -531,9 +545,17 @@ fn verify(call: &Call, spi: B256, ids: &[u64], id: &PostId, here: &str) -> L1Res
         log_index: id.log_index,
         detail,
     };
-    // Refuses blobs and a non-zero blockNumber, whose customData may read any
-    // state (IRollup.sol:41-54).
-    let commitment = batch_shared_public_input(&batch, call.from);
+    // Accept only timeless or the reference manager's live parent/time profile.
+    // Other block selectors and blob profiles require separate verification.
+    let commitment = batch_shared_public_input_with_context(
+        &batch,
+        call.from,
+        if batch.blockNumber == u64::MAX {
+            context
+        } else {
+            None
+        },
+    );
     let commitment = commitment.map_err(|e| unsupported(format!("{here}: {e}")))?;
     let mismatch = format!("{here}: call hashes to {commitment}, not {spi}");
     // Only a co-listed rollup's block-zero customData can explain a mismatch (EEZ.sol:753-762).

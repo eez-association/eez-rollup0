@@ -165,11 +165,16 @@ fn per_ps_hashes(plan: &ProofPlan, shared: B256) -> Vec<B256> {
 /// supported batch profile.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PublicInputsError {
+    /// Live source context was absent, zero or incompatible with the batch profile.
+    #[error("invalid live settlement context: {0}")]
+    InvalidContext(String),
     /// The proof plan reconstructed from the batch is malformed.
     #[error(transparent)]
     InvalidPlan(#[from] ProofPlanInvariantError),
-    /// Manager-defined custom data for nonzero block numbers is not wired yet.
-    #[error("public-input hashing currently requires blockNumber == 0, got {block_number}")]
+    /// Unsupported block selector or missing/mismatched live context.
+    #[error(
+        "public-input hashing requires blockNumber zero without context or uint64.max with live context, got {block_number}"
+    )]
     UnsupportedBlockNumber {
         /// Unsupported `batch.blockNumber` value.
         block_number: u64,
@@ -193,11 +198,27 @@ pub fn batch_shared_public_input(
     batch: &EvmBatch,
     sender: Address,
 ) -> Result<B256, PublicInputsError> {
-    if batch.blockNumber != 0 {
-        return Err(PublicInputsError::UnsupportedBlockNumber {
-            block_number: batch.blockNumber,
-        });
-    }
+    batch_shared_public_input_with_context(batch, sender, None)
+}
+
+/// Hash with the intended L1 context. Live cross-chain batches bind the reference
+/// manager's actual inclusion parent/time; timeless batches require no context.
+pub fn batch_shared_public_input_with_context(
+    batch: &EvmBatch,
+    sender: Address,
+    context: Option<crate::l1_context::LiveSettlementContext>,
+) -> Result<B256, PublicInputsError> {
+    let custom_data = match (batch.blockNumber, context) {
+        (0, None) => Bytes::new(),
+        (u64::MAX, Some(context)) => context
+            .custom_data()
+            .map_err(PublicInputsError::InvalidContext)?,
+        _ => {
+            return Err(PublicInputsError::UnsupportedBlockNumber {
+                block_number: batch.blockNumber,
+            });
+        }
+    };
     if !batch.blobIndices.is_empty() {
         return Err(PublicInputsError::UnsupportedBlobIndices {
             count: batch.blobIndices.len(),
@@ -209,7 +230,7 @@ pub fn batch_shared_public_input(
     let custom_data_hashes: Vec<B256> = batch
         .rollupIdsWithProofSystems
         .iter()
-        .map(|rollup| custom_data_hash(RollupId(rollup.rollupId), &Bytes::new()))
+        .map(|rollup| custom_data_hash(RollupId(rollup.rollupId), &custom_data))
         .collect();
     let bound_sender = if batch.bindMsgSenderInPublicInput {
         sender
@@ -238,11 +259,20 @@ pub fn batch_shared_public_input(
 /// proof-system carriers.
 #[tracing::instrument(level = "debug", name = "public_inputs_hashes", skip_all, err)]
 pub fn public_inputs_hashes(batch: &EvmBatch, vkey: B256) -> Result<Vec<B256>, PublicInputsError> {
+    public_inputs_hashes_with_context(batch, vkey, None)
+}
+
+/// Recompute proof inputs with exact live cross-chain settlement context.
+pub fn public_inputs_hashes_with_context(
+    batch: &EvmBatch,
+    vkey: B256,
+    context: Option<crate::l1_context::LiveSettlementContext>,
+) -> Result<Vec<B256>, PublicInputsError> {
     if batch.bindMsgSenderInPublicInput {
         return Err(PublicInputsError::UnsupportedSenderBinding);
     }
-    // Refuses a nonzero block number and blobs.
-    let shared = batch_shared_public_input(batch, Address::ZERO)?;
+    // Validates the selected context profile and rejects blobs.
+    let shared = batch_shared_public_input_with_context(batch, Address::ZERO, context)?;
     let rollup_assignments: Vec<RollupProofAssignment> = batch
         .rollupIdsWithProofSystems
         .iter()

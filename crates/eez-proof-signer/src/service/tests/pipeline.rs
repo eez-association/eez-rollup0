@@ -255,6 +255,7 @@ fn cancelled_settlement_stops_before_decoding_untrusted_input() {
     let validated = validated_single_block(settling_block, Vec::new(), Vec::new());
 
     let run = run_settlement(SettlementInput {
+        l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: b"not ABI calldata".to_vec(),
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
@@ -283,6 +284,7 @@ fn an_elapsed_deadline_stops_the_pipeline_between_validation_and_settlement() {
         &state,
         crate::window::AdmittedBlocks::for_test(inputs),
         b"not ABI calldata".to_vec(),
+        None,
         deadline,
         &CancellationToken::default(),
     );
@@ -308,7 +310,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         transactions: vec![transaction],
         ..Default::default()
     };
-    let block = eez_primitives::Block::new(Default::default(), body);
+    let block = eez_primitives::Block::new(crate::testkit::block_header(), body);
     let block_rlp = alloy_rlp::encode(block);
     let settling_block = validate::ValidatedBlock::for_test(
         5,
@@ -351,6 +353,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         test_system_transaction_reconstructor(expected_rollup_id(1));
 
     let run = run_settlement(SettlementInput {
+        l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: calldata.clone(),
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
@@ -362,6 +365,28 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     });
 
     assert_eq!(run.unwrap().into_inner(), expected_hash);
+
+    // Removing both the selector and its context must not turn an inbound
+    // system transaction into an attestable timeless batch.
+    let mut timeless = batch.clone();
+    timeless.blockNumber = 0;
+    let error = run_settlement(SettlementInput {
+        l1_parent_hash: None,
+        submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&timeless),
+        validated_window: &validated,
+        expected_rollup_id: expected_rollup_id(1),
+        expected_l2_system_address: TEST_SYSTEM_ADDRESS,
+        proof_system_vkey: test_proof_system_vkey(),
+        expected_proof_system: test_proof_system(),
+        system_transaction_reconstructor: &system_transaction_reconstructor,
+        cancellation: &cancellation,
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SettlementPipelineError::PublicInputs(settlement::PublicInputError::InvalidStructure(reason))
+            if reason == "native execution requires live L1 context"
+    ));
 
     // Reuse the same successful execution evidence. Only the submitted DA
     // changes, so rejection must come from DA binding before signing.
@@ -408,6 +433,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         let mut substituted = batch.clone();
         substituted.callData = replacement.into();
         let error = run_settlement(SettlementInput {
+            l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
             submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&substituted),
             validated_window: &validated,
             expected_rollup_id: expected_rollup_id(1),
@@ -429,6 +455,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     );
     let reverted = validated_single_block(reverted_block, vec![false], checkpoints.to_vec());
     let error = run_settlement(SettlementInput {
+        l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: calldata,
         validated_window: &reverted,
         expected_rollup_id: expected_rollup_id(1),
@@ -475,6 +502,7 @@ fn a_reverted_outbound_load_reports_the_paired_user_transaction() {
         test_system_transaction_reconstructor(expected_rollup_id(1));
 
     let error = run_settlement(SettlementInput {
+        l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
@@ -519,6 +547,7 @@ fn an_outbound_observation_failure_reports_the_user_transaction() {
         test_system_transaction_reconstructor(expected_rollup_id(1));
 
     let error = run_settlement(SettlementInput {
+        l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
@@ -569,6 +598,7 @@ fn an_outbound_claim_hash_mismatch_remains_non_actionable() {
         test_system_transaction_reconstructor(expected_rollup_id(1));
 
     let error = run_settlement(SettlementInput {
+        l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
@@ -612,6 +642,7 @@ fn a_fully_bound_outbound_effect_is_authorized() {
         test_system_transaction_reconstructor(expected_rollup_id(1));
 
     let run = run_settlement(SettlementInput {
+        l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: calldata,
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
@@ -634,6 +665,7 @@ fn a_fully_bound_outbound_effect_is_authorized() {
     mismatched_da.callData = settlement::encode_da_payload(&[vec![user]], &[wrong_call]).into();
     let mismatched_calldata = eez_protocol::entries::encode_postbatch(&mismatched_da);
     let run = run_settlement(SettlementInput {
+        l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: mismatched_calldata,
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
