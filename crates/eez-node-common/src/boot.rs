@@ -105,8 +105,8 @@ enum BootStep {
         l1_hash: B256,
         l2_block: u64,
     },
-    /// The local chain lacks the root.
-    Sync { root: B256 },
+    /// The local chain lacks the root L1 stores at `l1_block`.
+    Sync { l1_block: u64, root: B256 },
 }
 
 /// Decides the boot step. `local_root_number` gives a hash's height on the
@@ -138,7 +138,7 @@ fn decide(
             l1_hash,
             l2_block,
         },
-        None => BootStep::Sync { root },
+        None => BootStep::Sync { l1_block, root },
     })
 }
 
@@ -305,12 +305,6 @@ where
     let mut rewound: Option<SealedHeader<Header>> = None;
     loop {
         let commitment = l1_reader.finalized_commitment().await;
-        let l1_finalized = commitment
-            .as_ref()
-            .ok()
-            .copied()
-            .flatten()
-            .map(|c| c.l1_block);
         // The lookup can't return an error through `decide`; a failed local read stops boot.
         let mut lookup_err = None;
         let step = decide(commitment, |root| {
@@ -323,7 +317,7 @@ where
             return Err(err);
         }
 
-        let root = match step {
+        let (mut l1_finalized, mut root) = match step {
             BootStep::Wait(cause) => {
                 if waiting.due() {
                     event!(
@@ -347,7 +341,7 @@ where
                 committer.advance_safe_finalized(header, hash).await?;
                 return Ok(seed_record(l1_block, l1_hash, l2_block));
             }
-            BootStep::Sync { root } => root,
+            BootStep::Sync { l1_block, root } => (l1_block, root),
         };
 
         let f = match &rewound {
@@ -383,6 +377,12 @@ where
                         );
                     }
                     tokio::time::sleep(SYNC_POLL).await;
+                    // A resume can replace `root`, and peers may then stop serving it.
+                    // `|_| None` retargets even to a local root: reth answers VALID at once.
+                    let latest = l1_reader.finalized_commitment().await;
+                    if let BootStep::Sync { l1_block, root: r } = decide(latest, |_| None)? {
+                        (l1_finalized, root) = (l1_block, r);
+                    }
                 }
                 ForkchoiceOutcome::InvalidState => {
                     return Err(eyre::eyre!(
@@ -588,7 +588,10 @@ mod tests {
     fn local_without_root_syncs() {
         assert_eq!(
             decide(Ok(Some(commitment(Some(ROOT)))), |_| None).unwrap(),
-            BootStep::Sync { root: ROOT }
+            BootStep::Sync {
+                l1_block: 40,
+                root: ROOT
+            }
         );
     }
 
