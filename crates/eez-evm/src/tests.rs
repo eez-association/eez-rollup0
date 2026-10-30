@@ -9,7 +9,7 @@ use eez_primitives::{
 use reth_chainspec::ChainSpecBuilder;
 use reth_evm::{ConvertTx, ExecutableTxTuple, execute::Executor};
 use revm::{
-    DatabaseCommit,
+    Database as _, DatabaseCommit,
     context::TxEnv,
     context_interface::result::EVMError,
     database::InMemoryDB,
@@ -123,13 +123,10 @@ fn native_mints_without_prefunding_and_rolls_back_failed_calls_without_spending_
                 assert_eq!(receipt.cumulative_gas_used, SYSTEM_TX_GAS_CAP);
             }
             let mut state = executor.into_state();
+            let system = state.basic(SYSTEM_ADDRESS).unwrap();
             let bundle = state.take_bundle();
-            let system = bundle
-                .state
-                .get(&SYSTEM_ADDRESS)
-                .and_then(|account| account.info.as_ref());
-            assert_eq!(system.map_or(0, |info| info.nonce), 0);
-            assert_eq!(system.map_or(U256::ZERO, |info| info.balance), U256::ZERO);
+            assert_eq!(system.as_ref().map_or(0, |info| info.nonce), 0);
+            assert_eq!(system.map_or(U256::ZERO, |info| info.balance), balance);
             let beneficiary_balance = bundle
                 .state
                 .get(&alloy_primitives::Address::ZERO)
@@ -143,7 +140,10 @@ fn native_mints_without_prefunding_and_rolls_back_failed_calls_without_spending_
                 .and_then(|account| account.info.as_ref())
                 .map(|info| info.balance)
                 .unwrap_or_default();
-            assert_eq!(target_balance, U256::ZERO);
+            assert_eq!(
+                target_balance,
+                if success { U256::from(13) } else { U256::ZERO }
+            );
             if success {
                 let target = bundle.state.get(&EEZL2_ADDRESS).unwrap();
                 assert_eq!(
@@ -706,7 +706,7 @@ fn native_raw_environment_rejects_non_wire_fields_and_forged_recovery() {
 }
 
 #[test]
-fn outbound_group_retains_inventory_until_user_and_burns_at_close() {
+fn outbound_group_preserves_inventory_and_requires_paired_user() {
     use alloy_sol_types::SolCall as _;
     for (code, user_succeeds) in [
         (bytes!("4760005500"), true),
@@ -724,7 +724,7 @@ fn outbound_group_retains_inventory_until_user_and_burns_at_close() {
         .into_signed(Signature::new(U256::ONE, U256::ONE, false))
         .into();
         let sender = user.recover_signer().unwrap();
-        // Store SELFBALANCE at slot 0. Both calls see the inventory; only group close burns it.
+        // Store SELFBALANCE at slot 0. Both calls see and retain the inventory.
         let mut db = database(U256::from(5), code);
         db.cache
             .accounts
@@ -765,6 +765,7 @@ fn outbound_group_retains_inventory_until_user_and_burns_at_close() {
         assert!(result.receipts[0].success);
         assert_eq!(result.receipts[1].success, user_succeeds);
         let mut state = executor.into_state();
+        let system = state.basic(SYSTEM_ADDRESS).unwrap().unwrap();
         let bundle = state.take_bundle();
         let target = &bundle.state[&EEZL2_ADDRESS];
         assert_eq!(
@@ -775,9 +776,8 @@ fn outbound_group_retains_inventory_until_user_and_burns_at_close() {
             Some(U256::from(19)),
             "user_succeeds={user_succeeds}: {target:?}"
         );
-        assert_eq!(target.info.as_ref().unwrap().balance, U256::ZERO);
-        let system = bundle.state[&SYSTEM_ADDRESS].info.as_ref().unwrap();
-        assert_eq!(system.balance, U256::ZERO);
+        assert_eq!(target.info.as_ref().unwrap().balance, U256::from(19));
+        assert_eq!(system.balance, U256::from(5));
         assert_eq!(system.nonce, 7);
         // A load is not an independently publishable group.
         body.body.transactions.pop();

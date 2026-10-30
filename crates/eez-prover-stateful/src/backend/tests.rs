@@ -1185,9 +1185,11 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
             result.receipts[0].tx_type,
             eez_primitives::EezTxType::System
         );
-        // The zero-nonce native sender and empty-code recipient are empty after
-        // group cleanup, so EIP-161 may remove them entirely.
-        for address in [SYSTEM_ADDRESS, EEZL2_ADDRESS] {
+        // The native sender stays empty; the successful deposit remains at its recipient.
+        for (address, balance) in [
+            (SYSTEM_ADDRESS, U256::ZERO),
+            (EEZL2_ADDRESS, U256::from(13)),
+        ] {
             let account = state
                 .bundle_state
                 .account(&address)
@@ -1195,7 +1197,7 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
             assert_eq!(account.map_or(0, |account| account.nonce), 0);
             assert_eq!(
                 account.map_or(U256::ZERO, |account| account.balance),
-                U256::ZERO
+                balance
             );
         }
     }

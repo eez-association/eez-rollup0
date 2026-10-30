@@ -36,9 +36,7 @@ Native `GASPRICE` is zero, including nested calls. Native calls retain chain-ID 
 
 An inbound call credits exactly its authorized value before execution. An outer revert/halt removes that mint while retaining gas usage; invalid execution commits nothing. Rollup0 still rejects unsupported nested/multicall settlement shapes, so outbound table loads carry zero value. There is no independent unrestricted mint field.
 
-Residual ETH at SYSTEM and EEZL2 is cleared after a complete native group and at block finish. A load and its user execute together before cleanup. Code, storage and nonce are preserved. This burns outgoing value and unsolicited protocol inventory instead of accumulating it for later native calls. The ordinary fee-collector configuration is unchanged.
-
-A settlement prefix root includes block-finalization cleanup on a disposable projection. The continuing composer/prover draft remains unfinalized. Stateful replay projects hashed state; stateless replay uses a private trie adapter. Stateless validation separately checks the unmodified terminal execution output, so checkpoint projection cannot repair a malformed terminal root.
+Residual ETH at SYSTEM and EEZL2 is preserved across groups and block finalization. Outgoing value accumulates at SYSTEM; the native envelope does not introduce automatic balance clearing. The ordinary fee-collector configuration is unchanged.
 
 ## Deployment and validation
 

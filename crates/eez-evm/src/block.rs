@@ -1,6 +1,5 @@
 //! L2 block processing around Ethereum transaction execution.
 
-use crate::balances::clear_protocol_balances;
 use alloy_evm::{
     Evm, EvmFactory, RecoveredTx,
     block::{
@@ -13,8 +12,8 @@ use alloy_evm::{
     },
 };
 use eez_protocol::system_tx::ExecutionGroupState;
+use revm::context::result::ResultAndState;
 use revm::context_interface::Block as _;
-use revm::{DatabaseCommit, context::result::ResultAndState};
 use revm::{Inspector, primitives::hardfork::SpecId};
 use std::sync::Arc;
 
@@ -109,7 +108,7 @@ where
         tx: impl ExecutableTx<Self>,
     ) -> Result<Self::Result, BlockExecutionError> {
         let (tx_env, recovered_tx) = tx.into_parts();
-        let (group_state, complete) = self
+        let (group_state, _) = self
             .group_state
             .after(recovered_tx.tx())
             .map_err(BlockExecutionError::msg)?;
@@ -125,13 +124,9 @@ where
                 .into());
             }
         }
-        let mut inner = self
+        let inner = self
             .ethereum
             .execute_transaction_without_commit((tx_env, recovered_tx))?;
-        if complete {
-            clear_protocol_balances(self.ethereum.evm.db_mut(), &mut inner.result.state)
-                .map_err(|_| BlockExecutionError::msg("cannot load protocol cleanup accounts"))?;
-        }
         Ok(EezTxResult { inner, group_state })
     }
 
@@ -140,14 +135,10 @@ where
         self.ethereum.commit_transaction(output.inner)
     }
 
-    fn finish(mut self) -> Result<(Self::Evm, BlockExecutionResult<Receipt>), BlockExecutionError> {
+    fn finish(self) -> Result<(Self::Evm, BlockExecutionResult<Receipt>), BlockExecutionError> {
         self.group_state
             .ensure_complete()
             .map_err(BlockExecutionError::msg)?;
-        let mut cleanup = Default::default();
-        clear_protocol_balances(self.ethereum.evm.db_mut(), &mut cleanup)
-            .map_err(|_| BlockExecutionError::msg("cannot load protocol cleanup accounts"))?;
-        self.ethereum.evm.db_mut().commit(cleanup);
         // L2 has no consensus-layer requests (EIP-6110/7002/7251), beacon
         // withdrawals, or mining rewards. Do not execute those transitions and
         // discard their output: even an empty request list can change state.
