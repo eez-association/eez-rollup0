@@ -35,3 +35,20 @@ artifact that *was* captured is anchor-only and lives in
 `crates/eez-protocol/tests/fixtures/captured-chiado-anchor-23104703`; it pins
 the public-input digest, attester recovery and the block-hash chain against a
 genuinely mined chiado transaction, but carries no window.
+
+## Native finalization witness extension
+
+The native `0x45` executor reads SYSTEM (`0xffff…fffe`) and EEZL2 at block
+finalization. These historical captures predate those reads. The witness `state`
+arrays now include additional Merkle proof nodes recovered from committed genesis
+state. Each added node is authenticated by its Keccak hash on the path from the
+original captured parent state root; no account value, block, root, transaction,
+or proof-response oracle was changed. The source checksums above describe the
+original capture, before this proof-only extension.
+
+- `witness-79.json`: added `0x0f36abc33943d73d6715e837855aae655e45d96dbea5d57eba109e803be8357e`, `0x74c29e23aea2b198502333e222da631a276ad587027bd00628203e75f7e98325`, `0xdb6de720b307a58caf10e0dae6806fb2bb1131aa39e81ba1d2309ce18e7bc932`.
+- `witness-80.json`: added `0x0f36abc33943d73d6715e837855aae655e45d96dbea5d57eba109e803be8357e`, `0x74c29e23aea2b198502333e222da631a276ad587027bd00628203e75f7e98325`, `0xdb6de720b307a58caf10e0dae6806fb2bb1131aa39e81ba1d2309ce18e7bc932`.
+- `witness-81.json`: added `0x0f36abc33943d73d6715e837855aae655e45d96dbea5d57eba109e803be8357e`, `0x74c29e23aea2b198502333e222da631a276ad587027bd00628203e75f7e98325`, `0xdb6de720b307a58caf10e0dae6806fb2bb1131aa39e81ba1d2309ce18e7bc932`.
+- `witness-82.json`: added `0x0f36abc33943d73d6715e837855aae655e45d96dbea5d57eba109e803be8357e`, `0x74c29e23aea2b198502333e222da631a276ad587027bd00628203e75f7e98325`, `0xdb6de720b307a58caf10e0dae6806fb2bb1131aa39e81ba1d2309ce18e7bc932`.
+- `witness-83.json`: added `0x0f36abc33943d73d6715e837855aae655e45d96dbea5d57eba109e803be8357e`, `0x74c29e23aea2b198502333e222da631a276ad587027bd00628203e75f7e98325`, `0xdb6de720b307a58caf10e0dae6806fb2bb1131aa39e81ba1d2309ce18e7bc932`.
+- `witness-84.json`: added `0x0f36abc33943d73d6715e837855aae655e45d96dbea5d57eba109e803be8357e`, `0x74c29e23aea2b198502333e222da631a276ad587027bd00628203e75f7e98325`, `0xdb6de720b307a58caf10e0dae6806fb2bb1131aa39e81ba1d2309ce18e7bc932`.

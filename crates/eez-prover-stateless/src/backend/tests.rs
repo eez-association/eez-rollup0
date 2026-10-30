@@ -409,38 +409,10 @@ fn timed_out_block_validation_worker_keeps_its_slot_and_publishes_only_after_suc
     });
 }
 
-/// A recorded three-user-transaction block and its execution configuration.
+/// Three ordinary transfers with an independently calculated state/receipt root.
+/// Historical checkpoint captures omit the native burn-account proofs now required.
 fn checkpoint_fixture() -> (AdmittedBlock, ChainConfig) {
-    let rlp = hex::decode(
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/stateless-checkpoint-2175/checkpoint-block-2175.rlp.hex"
-        ))
-        .trim()
-        .trim_start_matches("0x"),
-    )
-    .unwrap();
-    let block = alloy_rlp::decode_exact::<Block>(&rlp).unwrap();
-    let witness = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/stateless-checkpoint-2175/checkpoint-witness-2175.json"
-    )))
-    .unwrap();
-    let chain_config = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/stateless-checkpoint-2175/checkpoint-chain-config.json"
-    )))
-    .unwrap();
-    (
-        admitted_block_with_witness(
-            block.header.number,
-            block.header.hash_slow(),
-            block.header.parent_hash,
-            rlp,
-            witness,
-        ),
-        chain_config,
-    )
+    fees::ordinary_three_transaction_fixture()
 }
 
 fn captured_fixture(dir: &str, name: &str) -> String {
@@ -928,7 +900,7 @@ fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
     const FIXTURE: &str = "nonzero-outbound-630";
     let oracle: serde_json::Value =
         serde_json::from_str(&captured_fixture(FIXTURE, "oracle.json")).unwrap();
-    let chain_config =
+    let chain_config: ChainConfig =
         serde_json::from_str(&captured_fixture(FIXTURE, "chain-config.json")).unwrap();
     let from = oracle["from_block"].as_u64().unwrap();
     let to = oracle["to_block"].as_u64().unwrap();
@@ -952,37 +924,55 @@ fn captured_legacy_outbound_events_are_not_accepted_as_current_events() {
         })
         .collect::<Vec<_>>();
 
-    let output = Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
-        .validate_admitted(&mut blocks, &CancellationToken::default())
-        .unwrap();
-
-    // The window no longer carries a pre-state root; per-block post-state roots
-    // are what the continuity check chains, and that check has its own test.
-    assert_eq!(
-        output.blocks.last().unwrap().as_anchor().state_root,
-        oracle["final_state_root"]
-            .as_str()
-            .unwrap()
-            .parse::<B256>()
-            .unwrap()
-    );
-    assert!(
-        output
-            .blocks
-            .last()
-            .unwrap()
-            .settlement_evidence()
-            .observed_outbound_events
-            .is_empty()
-    );
-    // Historical signed calls have no native system authority.
-    assert!(output.blocks.iter().all(|block| {
-        block
-            .settlement_evidence()
-            .system_sender_flags
-            .iter()
-            .all(|is_system| !is_system)
+    // Replay the captured historical chain with its Ethereum rules to recover
+    // the actual old event. Native consensus additionally requires burn-account
+    // proofs that this capture predates, so it is not a native-success vector.
+    let chain_spec = Arc::new(ChainSpec::from_genesis(Genesis {
+        config: chain_config.clone(),
+        ..Default::default()
     }));
+    for input in &blocks {
+        let historical =
+            alloy_rlp::decode_exact::<reth_ethereum_primitives::Block>(input.rlp()).unwrap();
+        let output = stateless_validation_recovered(
+            RecoveredBlock::try_recover(historical).unwrap(),
+            captured_witness(&captured_fixture(
+                FIXTURE,
+                &format!("witness-{}.json", input.declared_number()),
+            )),
+            chain_spec.clone(),
+            reth_evm_ethereum::EthEvmConfig::new(chain_spec.clone()),
+        )
+        .unwrap();
+        let receipts = output
+            .execution_output
+            .result
+            .receipts
+            .into_iter()
+            .map(|receipt| EthereumReceipt {
+                tx_type: eez_primitives::EezTxType::Ethereum(receipt.tx_type),
+                success: receipt.success,
+                cumulative_gas_used: receipt.cumulative_gas_used,
+                logs: receipt.logs,
+            })
+            .collect::<Vec<_>>();
+        assert!(observe_outbound_events(&receipts).is_empty());
+        let native =
+            RecoveredBlock::try_recover(alloy_rlp::decode_exact::<Block>(input.rlp()).unwrap())
+                .unwrap();
+        assert!(
+            native
+                .body()
+                .transactions
+                .iter()
+                .all(|tx| matches!(tx, TransactionSigned::Ethereum(_)))
+        );
+    }
+    assert!(
+        Backend::new(chain_config, TEST_SYSTEM_ADDRESS)
+            .validate_admitted(&mut blocks, &CancellationToken::default())
+            .is_err()
+    );
 }
 
 #[test]

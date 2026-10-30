@@ -280,12 +280,13 @@ where
     I: for<'db> InspectorFor<EezEvmConfig, &'db mut DraftDb>,
 {
     let recovered = recover_tx(raw, idx)?;
-    let (next_group, _) = group
-        .after(recovered.inner())
-        .map_err(|msg| BuildError::ExecuteTx {
-            idx,
-            msg: msg.into(),
-        })?;
+    let (next_group, complete) =
+        group
+            .after(recovered.inner())
+            .map_err(|msg| BuildError::ExecuteTx {
+                idx,
+                msg: msg.into(),
+            })?;
     let remaining = evm_env.block_env.gas_limit.saturating_sub(gas_used);
     if recovered.gas_limit() > remaining
         || matches!(recovered.inner(), TransactionSigned::System(tx) if tx.gas_limit != eez_primitives::system_tx_gas_limit(evm_env.block_env.gas_limit, gas_used))
@@ -295,7 +296,7 @@ where
     let mut evm = evm_config.evm_with_env_and_inspector(state, evm_env.clone(), inspector);
     // A database read failure is the store being unavailable, not the tx being
     // invalid: the two classes drive opposite recoveries in the drain.
-    let result = evm.transact(&recovered).map_err(|e| match e {
+    let mut result = evm.transact(&recovered).map_err(|e| match e {
         EVMError::Database(err) => BuildError::Provider(format!("execute tx #{idx}: {err}")),
         EVMError::Transaction(
             revm::context_interface::result::InvalidTransaction::CallGasCostMoreThanGasLimit {
@@ -315,6 +316,10 @@ where
         },
     })?;
     let outcome = exec_outcome(&result.result);
+    if complete {
+        eez_evm::balances::clear_protocol_balances(evm.db_mut(), &mut result.state)
+            .map_err(|e| BuildError::Provider(format!("protocol cleanup: {e}")))?;
+    }
     evm.db_mut().commit(result.state);
     *group = next_group;
     Ok(outcome)

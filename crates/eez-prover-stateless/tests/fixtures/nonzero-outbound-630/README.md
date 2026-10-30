@@ -17,7 +17,7 @@ Block 630 contains five successful transactions in canonical Sync order:
 The recording's L2 manager emitted the five-field base
 `CrossChainCallExecuted` event. The current `EEZL2` contract emits a distinct
 six-field event containing `uint64 callGas`, with a different topic. The
-fixture is retained to verify that stateless replay does not reinterpret the
+fixture is retained to verify that historical Ethereum replay does not reinterpret the
 incompatible event or permit an attestation by inventing a gas value.
 
 The block, witness, and `PostBatch` artifacts were exported from
@@ -45,3 +45,8 @@ This is a rejection vector, not a successful outbound conformance vector.
 
 The fixture contains no credentials. These artifacts are contributed under the
 repository's dual `MIT OR Apache-2.0` license.
+
+The current test recovers the actual old receipts using the historical Ethereum
+executor, then applies the current event classifier. These witnesses lack the
+reserved SYSTEM proof required by native finalization; current Rollup0 validation
+rejects them. They are not successful native execution vectors.

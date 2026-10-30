@@ -64,7 +64,7 @@ cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0
 ```
 
 Each limit case declares its required `server_args`: block quota 2, payload quota
-6528 bytes, witness quota 30 items, or message limit 4096 bytes. Run each against
+7154 bytes, witness quota 36 items, or message limit 4096 bytes. Run each against
 its own configured server; the runner does not configure or launch servers.
 The block/payload/witness cases charge the new suffix independently of retained
 proved history. Each Finalize range is still limited to one window. The
@@ -116,6 +116,11 @@ anchor/history seeded separately. This suite does not cover nonempty Sync
 effects, actionable candidate-eviction details, L1 recovery, blob/RollupX positive
 conformance, or stress/deadline guarantees. Timing-dependent in-flight cancellation and
 backpressure belong in runtime tests, not schedule-dependent wire vectors.
+
+The native finalization port supplements captured witnesses with authenticated
+SYSTEM/EEZL2 account proof nodes. Block bytes and proof-response digests are unchanged.
+The two-block payload and witness quotas include those extra nodes; the message
+size vectors reduce only their inert code padding to retain the 4096/4097-byte boundary.
 
 Context rejection vectors now pin the applicable validation failures instead
 of blanket UNIMPLEMENTED: an unvalidated Finalize range returns
