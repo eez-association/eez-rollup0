@@ -34,6 +34,12 @@ source "$ENV_FILE"
 : "${EEZ_L1_POSTER_KEY:?EEZ_L1_POSTER_KEY not set in .env}"
 : "${EEZ_PROOF_SIGNER_KEY:?EEZ_PROOF_SIGNER_KEY not set in .env}"
 
+settlement_profile="${EEZ_SETTLEMENT_PROFILE:-calldata}"
+case "$settlement_profile" in
+    calldata|blob) ;;
+    *) echo "deploy: EEZ_SETTLEMENT_PROFILE must be calldata or blob" >&2; exit 1 ;;
+esac
+
 configured_initial_state_root="${EEZ_INITIAL_STATE_ROOT:-}"
 
 # One deployment setting selects both the genesis base-fee collector and the
@@ -330,6 +336,11 @@ EEZ_L2_SYSTEM_ADDRESS=$EEZ_L2_SYSTEM_ADDRESS
 EEZ_L2_RECOVERY_ADDRESS=$EEZ_L2_RECOVERY_ADDRESS
 EEZ_L2_EEZL2_CODE_HASH=$EEZ_L2_EEZL2_CODE_HASH
 EOF
+if [[ "$settlement_profile" == blob ]]; then
+    cat >> "$OUT_FILE" <<EOF
+EEZ_SETTLEMENT_PROFILE=blob
+EOF
+fi
 
 echo
 echo "deploy: wrote $OUT_FILE"

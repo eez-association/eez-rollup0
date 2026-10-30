@@ -8,7 +8,7 @@ export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 K="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="$(cd "$K/../.." && pwd)"
 ENCLAVE="${KURTOSIS_ENCLAVE:-eez-ci}"
-LOG_DIR="$REPO/datadir/smoke-logs"
+LOG_DIR="${EEZ_WAVE_LOG_DIR:-$REPO/datadir/smoke-logs}"
 mkdir -p "$LOG_DIR"
 
 for tool in cast forge jq curl kurtosis openssl; do
