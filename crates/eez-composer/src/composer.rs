@@ -2196,6 +2196,9 @@ where
         // list the prefix is rebuilt from and the keystone assert compares the
         // canonical rebuild against.
         let mut sync_txs: Vec<Bytes> = Vec::new();
+        // Fixed source-hash inputs for this Sync candidate: the L2 chain and
+        // intended L1 parent. `live_source.entry(group_index)` combines these
+        // with each group's original ordinal to derive its system tx sourceHash.
         let live_source = eez_protocol::native_source::LiveSourceContext::new(
             ctx.l2_chain_id,
             l1_state.anchor.hash(),
