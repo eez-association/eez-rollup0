@@ -794,7 +794,7 @@ fn execute_block_with_state_checkpoints(
             let state_root = {
                 let db = executor.evm_mut().db_mut();
                 db.merge_transitions(BundleRetention::Reverts);
-                closed_prefix_state_root(db)?
+                state_root(db)?
             };
             let block_hash =
                 candidate_block_hash::<EezPrimitives>(block.sealed_header(), &[], &[], state_root)
@@ -821,7 +821,7 @@ fn execute_block_with_state_checkpoints(
                 let state_root = {
                     let db = executor.evm_mut().db_mut();
                     db.merge_transitions(BundleRetention::Reverts);
-                    closed_prefix_state_root(db)?
+                    state_root(db)?
                 };
                 let block_hash = candidate_block_hash::<EezPrimitives>(
                     block.sealed_header(),
@@ -863,36 +863,6 @@ fn state_root(
         .hashed_post_state(&state.bundle_state)
         .map_err(provider_error)?;
     provider.state_root(hashed_state).map_err(provider_error)
-}
-
-fn closed_prefix_state_root(
-    state: &State<StateProviderDatabase<EvmStateProviderAdapter<Box<dyn StateProvider + Send>>>>,
-) -> Result<B256, ValidationError> {
-    use alloy_primitives::{U256, keccak256};
-    use reth_storage_api::AccountReader;
-    let provider = &state.database.0;
-    let mut hashed = provider
-        .hashed_post_state(&state.bundle_state)
-        .map_err(provider_error)?;
-    for address in eez_evm::balances::PROTOCOL_BALANCE_ACCOUNTS {
-        let hash = keccak256(address);
-        let account = match hashed.accounts.get(&hash) {
-            Some(account) => *account,
-            None => provider.basic_account(&address).map_err(provider_error)?,
-        };
-        if let Some(mut account) = account
-            && !account.balance.is_zero()
-        {
-            account.balance = U256::ZERO;
-            if account.is_empty() {
-                hashed.accounts.insert(hash, None);
-                hashed.storages.remove(&hash);
-            } else {
-                hashed.accounts.insert(hash, Some(account));
-            }
-        }
-    }
-    provider.state_root(hashed).map_err(provider_error)
 }
 
 fn canonical_hash<P: BlockHashReader>(provider: &P, number: u64) -> Result<B256, ValidationError> {

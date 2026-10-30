@@ -123,7 +123,6 @@ reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.
 # Stateless execution on the same reth v2.7.0 as the node. Branch
 # feat/reth-v2.7-candidate-block-hashes: the reth-v2.7 trie port plus our
 # candidate block hashes and empty-prefix checkpoint, pending upstream merge.
-stateless-tries = { package = "tries", git = "https://github.com/eez-association/stateless", rev = "935f25aa0c28c36c3c169e36e36b823206c5a856" }
 stateless-reth = { package = "stateless", git = "https://github.com/eez-association/stateless", rev = "935f25aa0c28c36c3c169e36e36b823206c5a856" }
 
 # reth_gnosis — Gnosis chain (chiado / gnosis mainnet) NodeBuilder.
