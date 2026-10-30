@@ -472,9 +472,7 @@ mod tests {
     }
 
     fn source(index: u64) -> SourceEntry {
-        crate::native_source::LiveSourceContext::new(1, B256::repeat_byte(0x99))
-            .unwrap()
-            .entry(index)
+        SourceEntry::new(1, B256::repeat_byte(0x99), index).unwrap()
     }
     fn source_of(plan: &NativeTransactionPlan) -> B256 {
         use alloy_eips::eip2718::Decodable2718 as _;

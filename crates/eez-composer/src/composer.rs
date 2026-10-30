@@ -2197,11 +2197,12 @@ where
         // canonical rebuild against.
         let mut sync_txs: Vec<Bytes> = Vec::new();
         // Fixed source-hash inputs for this Sync candidate: the L2 chain and
-        // intended L1 parent. `live_source.entry(group_index)` combines these
+        // intended L1 parent. `live_source.with_index(group_index)` combines these
         // with each group's original ordinal to derive its system tx sourceHash.
-        let live_source = eez_protocol::native_source::LiveSourceContext::new(
+        let live_source = eez_protocol::native_source::SourceEntry::new(
             ctx.l2_chain_id,
             l1_state.anchor.hash(),
+            0,
         )?;
         // One ordinal per complete native group in the original candidate.
         let mut system_txs_appended: u64 = 0;
@@ -2506,7 +2507,7 @@ where
                         &l1_entries[0],
                         &held.raw_tx,
                         &stf_cfg,
-                        live_source.entry(system_txs_appended),
+                        live_source.with_index(system_txs_appended),
                     ) {
                         Ok(pairs) => pairs,
                         Err(e) => {
@@ -2757,7 +2758,7 @@ where
                     InboundL2TargetSession::new(
                         fork,
                         stf_cfg.clone(),
-                        live_source.entry(system_txs_appended),
+                        live_source.with_index(system_txs_appended),
                     )
                 })
                 .and_then(|probe| {
@@ -2857,7 +2858,7 @@ where
                             eez_protocol::system_tx::build_inbound_system_txs(
                                 &inbound,
                                 &stf_cfg,
-                                live_source.entry(system_txs_appended),
+                                live_source.with_index(system_txs_appended),
                             )
                         }) {
                         Ok(deliveries) if deliveries.is_empty() && !target_entries.is_empty() => {
@@ -3152,7 +3153,7 @@ where
             &pending_out,
             &pending_in,
             &stf_cfg,
-            live_source.entry(0),
+            live_source,
         )
         .and_then(|pairs| {
             let mut check = reopen(&[]).map_err(|e| e.to_string())?;

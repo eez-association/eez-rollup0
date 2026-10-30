@@ -63,9 +63,7 @@ pub(crate) fn pre_execution_checkpoint(block_hash: B256) -> crate::validate::Sta
 
 /// Fixed live parent for fixture reconstruction. These unit fixtures mock execution.
 pub(crate) fn native_source(index: u64) -> eez_protocol::native_source::SourceEntry {
-    eez_protocol::native_source::LiveSourceContext::new(1, B256::repeat_byte(0x99))
-        .unwrap()
-        .entry(index)
+    eez_protocol::native_source::SourceEntry::new(1, B256::repeat_byte(0x99), index).unwrap()
 }
 
 pub(crate) fn live_context() -> eez_protocol::l1_context::LiveSettlementContext {

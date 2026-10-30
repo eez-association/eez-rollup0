@@ -195,9 +195,8 @@ fn main() {
                 &outbound_paired,
                 &da_inbound,
                 &cfg,
-                eez_protocol::native_source::LiveSourceContext::new(cfg.l2_chain_id, parent_hash)
-                    .unwrap()
-                    .entry(0),
+                eez_protocol::native_source::SourceEntry::new(cfg.l2_chain_id, parent_hash, 0)
+                    .unwrap(),
             )
             .unwrap();
             let txs = interleave_sync_block_txs(&pairs);

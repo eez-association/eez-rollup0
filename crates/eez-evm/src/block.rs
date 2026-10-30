@@ -108,24 +108,26 @@ where
         &mut self,
         tx: impl ExecutableTx<Self>,
     ) -> Result<Self::Result, BlockExecutionError> {
-        let tx = tx.into_parts();
+        let (tx_env, recovered_tx) = tx.into_parts();
         let (group_state, complete) = self
             .group_state
-            .after(tx.1.tx())
+            .after(recovered_tx.tx())
             .map_err(BlockExecutionError::msg)?;
-        if let EezTxEnvelope::System(native) = tx.1.tx() {
+        if let EezTxEnvelope::System(native) = recovered_tx.tx() {
             let expected = eez_primitives::system_tx_gas_limit(
                 self.ethereum.evm.block().gas_limit(),
                 self.ethereum.cumulative_tx_gas_used,
             );
-            if native.gas_limit != expected || tx.0.gas_limit != expected {
+            if native.gas_limit != expected || tx_env.gas_limit != expected {
                 return Err(BlockValidationError::msg(
                     "native gas does not match execution position",
                 )
                 .into());
             }
         }
-        let mut inner = self.ethereum.execute_transaction_without_commit(tx)?;
+        let mut inner = self
+            .ethereum
+            .execute_transaction_without_commit((tx_env, recovered_tx))?;
         if complete {
             clear_protocol_balances(self.ethereum.evm.db_mut(), &mut inner.result.state)
                 .map_err(|_| BlockExecutionError::msg("cannot load protocol cleanup accounts"))?;

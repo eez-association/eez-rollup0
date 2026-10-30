@@ -1596,9 +1596,10 @@ where
                         l2_block: from_block,
                         detail: Some("native derivation requires authenticated L1 context".into()),
                     })?;
-                    let source = eez_protocol::native_source::LiveSourceContext::new(
+                    let source = eez_protocol::native_source::SourceEntry::new(
                         cfg.l2_chain_id,
                         context.parent_hash,
+                        0,
                     )
                     .map_err(DeriverError::L2Provider)?;
                     let all_outbound = outbound
@@ -1610,7 +1611,7 @@ where
                         &all_outbound,
                         &inbound,
                         cfg,
-                        source.entry(0),
+                        source,
                     )
                     .map_err(DeriverError::L2Provider)?
                 };
