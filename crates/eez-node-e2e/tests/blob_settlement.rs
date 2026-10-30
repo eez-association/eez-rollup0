@@ -286,6 +286,7 @@ async fn blob_settlement_evidence() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_eips::eip4844::BYTES_PER_BLOB;
     use eez_payload_codec::{Action, SpanBlock};
     use eez_protocol::abi::{EvmBatch, RollupUpdateSol};
     use eez_protocol::entries::finalize_l1_rolling_hashes;
@@ -446,23 +447,31 @@ mod tests {
     }
 
     #[test]
-    fn verifies_mixed_actions_after_two_blob_decode() {
+    fn verifies_mixed_actions_across_blob_capacity() {
         let actions = [action(true), action(false)];
         let batch = settled_batch(&actions);
-        let transaction = vec![0x42; eez_payload_codec::logical_blob_capacity(1)];
-        let blocks = [SpanBlock {
-            transactions: vec![transaction.clone()],
-            ..Default::default()
-        }];
-        let blobs = eez_payload_codec::encode_blob_container(ROLLUP, &blocks, &actions).unwrap();
-        assert_eq!(blobs.len(), 2);
-        let decoded = eez_payload_codec::decode_blob_container(&blobs).unwrap();
-        assert_eq!(decoded.rollup_id, ROLLUP);
-        assert_eq!(decoded.span.transactions, vec![transaction]);
-        verify_actions(&batch, &decoded.actions, ROLLUP).unwrap();
-        assert!(eez_payload_codec::decode_blob_container(&blobs[..1]).is_err());
-        let mut reversed = blobs.clone();
-        reversed.reverse();
-        assert!(eez_payload_codec::decode_blob_container(&reversed).is_err());
+        // Each 32-byte field element carries 31 payload bytes.
+        let capacity = BYTES_PER_BLOB / 32 * 31;
+        for (transaction_len, expected_blobs) in [(capacity / 2, 1), (capacity, 2)] {
+            let transaction = vec![0x42; transaction_len];
+            let blocks = [SpanBlock {
+                transactions: vec![transaction.clone()],
+                ..Default::default()
+            }];
+            let blobs =
+                eez_payload_codec::encode_blob_container(ROLLUP, &blocks, &actions).unwrap();
+            assert_eq!(blobs.len(), expected_blobs);
+            assert!(blobs.iter().all(|blob| blob.len() == BYTES_PER_BLOB));
+            let decoded = eez_payload_codec::decode_blob_container(&blobs).unwrap();
+            assert_eq!(decoded.rollup_id, ROLLUP);
+            assert_eq!(decoded.span.transactions, vec![transaction]);
+            verify_actions(&batch, &decoded.actions, ROLLUP).unwrap();
+            assert!(eez_payload_codec::decode_blob_container(&blobs[..blobs.len() - 1]).is_err());
+            if blobs.len() > 1 {
+                let mut reversed = blobs;
+                reversed.reverse();
+                assert!(eez_payload_codec::decode_blob_container(&reversed).is_err());
+            }
+        }
     }
 }
