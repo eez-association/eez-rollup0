@@ -194,24 +194,10 @@ async fn sync_execution_generates_and_reuses_checkpoints() {
     use alloy_consensus::proofs::{
         calculate_receipt_root, calculate_transaction_root, calculate_withdrawals_root,
     };
-    use alloy_primitives::{KECCAK256_EMPTY, keccak256};
     use eez_primitives::{EezTxType, SystemTransaction};
-
-    // Execute a native call from an empty state. Its only persistent change is
-    // SYSTEM_ADDRESS's nonce becoming one; independently seal that account's
-    // single-leaf MPT to supply the expected post-state, not a mocked backend root.
-    let account = alloy_rlp::encode(vec![
-        Bytes::from_static(&[1]),
-        Bytes::new(),
-        Bytes::copy_from_slice(alloy_consensus::constants::EMPTY_ROOT_HASH.as_slice()),
-        Bytes::copy_from_slice(KECCAK256_EMPTY.as_slice()),
-    ]);
-    let mut path = vec![0x20]; // Hex-prefix encoding of a leaf with an even, full-length key.
-    path.extend_from_slice(keccak256(TEST_SYSTEM_ADDRESS).as_slice());
-    let post_root = keccak256(alloy_rlp::encode(vec![
-        Bytes::from(path),
-        Bytes::from(account),
-    ]));
+    // A zero-value native call to empty code leaves the empty trie unchanged:
+    // the native sender has no nonce transition, even while executing.
+    let post_root = alloy_consensus::constants::EMPTY_ROOT_HASH;
     let parent = Header {
         gas_limit: 30_000_000,
         base_fee_per_gas: Some(1),
@@ -224,17 +210,18 @@ async fn sync_execution_generates_and_reuses_checkpoints() {
     let transactions = vec![
         SystemTransaction {
             chain_id: 1,
-            nonce: 0,
+            source_hash: B256::repeat_byte(0x11),
+            gas_limit: eez_primitives::SYSTEM_TX_GAS_CAP,
             to: EEZL2_ADDRESS,
             value: U256::ZERO,
-            input: Bytes::new(),
+            input: Bytes::from_static(&eez_protocol::entries::EXECUTE_INCOMING_SELECTOR),
         }
         .into(),
     ];
     let receipt = EthereumReceipt {
         tx_type: EezTxType::System,
         success: true,
-        cumulative_gas_used: 21_000,
+        cumulative_gas_used: 21_064,
         logs: Vec::new(),
     };
     let block = Block::new(
@@ -245,7 +232,7 @@ async fn sync_execution_generates_and_reuses_checkpoints() {
             state_root: post_root,
             transactions_root: calculate_transaction_root(&transactions),
             receipts_root: calculate_receipt_root(&[receipt.with_bloom_ref()]),
-            gas_used: 21_000,
+            gas_used: 21_064,
             ..parent.clone()
         },
         eez_primitives::BlockBody {

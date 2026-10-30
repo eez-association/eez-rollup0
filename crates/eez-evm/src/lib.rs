@@ -1,7 +1,7 @@
 //! Adapts Ethereum execution to EEZ transaction and receipt types.
 //!
 //! The pinned `EthEvmConfig` fixes its primitives to Ethereum types, which cannot
-//! represent native type `0x76`. This wrapper selects `EezPrimitives`, preserves
+//! represent native type `0x45`. This wrapper selects `EezPrimitives`, preserves
 //! the native receipt type, and decodes native transactions in Engine payloads.
 //! Ethereum transaction execution, gas accounting, block assembly, and header
 //! environment are reused. L2 block processing keeps EIP-2935 but disables
@@ -114,7 +114,7 @@ impl ReceiptBuilder for EezReceiptBuilder {
     type Transaction = EezTxEnvelope;
     type Receipt = Receipt;
 
-    /// Preserve native type `0x76` in the receipt root; Ethereum's receipt builder
+    /// Preserve native type `0x45` in the receipt root; Ethereum's receipt builder
     /// only accepts its own type enum. Status, gas, and logs are unchanged.
     fn build_receipt<E: Evm>(&self, ctx: ReceiptBuilderCtx<'_, EezTxType, E>) -> Receipt {
         Receipt {

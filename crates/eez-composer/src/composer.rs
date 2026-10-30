@@ -746,6 +746,7 @@ fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
         ComposerError::Executor(ee) => !matches!(
             ee,
             ExecutorError::Unavailable(_)
+                | ExecutorError::Capacity
                 | ExecutorError::Provider(_)
                 | ExecutorError::Missing(_)
                 | ExecutorError::InsufficientFunds { .. }
@@ -1021,13 +1022,25 @@ fn requeue_unprocessed(
 /// caller can check what a tx actually did against what it composed.
 fn append_and_execute(
     prefix: &mut SyncBlockState,
-    txs: &[Bytes],
+    txs: &[eez_protocol::system_tx::PlannedTransaction],
+    encoded: &mut Vec<Bytes>,
 ) -> Result<Vec<alloy_primitives::Log>, (usize, BuildError)> {
     let mut logs = Vec::new();
-    for (at, tx) in txs.iter().enumerate() {
-        match prefix.execute_tx(tx) {
+    for (at, plan) in txs.iter().enumerate() {
+        let tx = plan
+            .at_position(BUILDER_GAS_LIMIT, prefix.gas_used())
+            .map_err(|msg| (at, BuildError::ExecuteTx { idx: at, msg }))?;
+        match prefix.execute_tx(&tx) {
             Ok(outcome) if outcome.success => logs.extend(outcome.logs),
             Ok(outcome) => {
+                if matches!(plan, eez_protocol::system_tx::PlannedTransaction::Native(_))
+                    && eez_primitives::system_tx_gas_limit(
+                        BUILDER_GAS_LIMIT,
+                        prefix.gas_used().saturating_sub(outcome.gas_used),
+                    ) < eez_primitives::SYSTEM_TX_GAS_CAP
+                {
+                    return Err((at, BuildError::Capacity));
+                }
                 return Err((
                     at,
                     BuildError::ExecuteTx {
@@ -1038,6 +1051,7 @@ fn append_and_execute(
             }
             Err(e) => return Err((at, e)),
         }
+        encoded.push(tx);
     }
     Ok(logs)
 }
@@ -2014,8 +2028,8 @@ where
         bundle_target: BundleTarget,
     ) -> Result<Option<SyncSlotBlock>, String> {
         let ctx = cc.exec_ctx.as_ref();
-        // Read the base SYSTEM_ADDRESS nonce from parent state. The canonical
-        // builder allocates outbound-load nonces before inbound-delivery nonces.
+        // Ordinary source nonces remain parent-state inputs; native identity
+        // is derived from the pinned intended L1 parent below.
         let parent_hash = parent_header.hash();
         let rollup =
             self.inner.rollups.get(&rollup_id).ok_or_else(|| {
@@ -2026,14 +2040,6 @@ where
             .l2_provider
             .state_by_block_hash(parent_hash)
             .map_err(|e| format!("state_by_block_hash({parent_hash}): {e}"))?;
-        let system_address = eez_primitives::SYSTEM_ADDRESS;
-        // Base SYSTEM_ADDRESS nonce; the canonical builder advances it
-        // internally (outbound loads, then inbound deliveries) post-drain.
-        let nonce = state
-            .account_nonce(&system_address)
-            .map_err(|e| format!("account_nonce({system_address}): {e}"))?
-            .unwrap_or(0);
-
         let stf_cfg = eez_protocol::system_tx::SystemTxContext {
             eezl2_address: ctx.eezl2_address,
             l2_chain_id: ctx.l2_chain_id,
@@ -2190,10 +2196,15 @@ where
         // list the prefix is rebuilt from and the keystone assert compares the
         // canonical rebuild against.
         let mut sync_txs: Vec<Bytes> = Vec::new();
-        // SYSTEM_ADDRESS cursor: one nonce per appended system tx. Phase 1 runs
-        // to completion first, so this counts outbound loads N..N+K-1 and then
-        // inbound deliveries from N+K — `build_cross_chain_sync_pairs`' split,
-        // by construction.
+        // Fixed source-hash inputs for this Sync candidate: the L2 chain and
+        // intended L1 parent. `live_source.with_index(group_index)` combines these
+        // with each group's original ordinal to derive its system tx sourceHash.
+        let live_source = eez_protocol::native_source::SourceEntry::new(
+            ctx.l2_chain_id,
+            l1_state.anchor.hash(),
+            0,
+        )?;
+        // One ordinal per complete native group in the original candidate.
         let mut system_txs_appended: u64 = 0;
 
         // Drain indices ride along so a re-queue can restore pool order across
@@ -2438,8 +2449,9 @@ where
                     }
                     // `[load, user]` must fit the Sync block or `build_sync_block`
                     // hard-errors. Before the L1 budget, so a refusal costs nothing.
-                    let declared =
-                        eez_primitives::SYSTEM_TX_GAS_LIMIT.saturating_add(user_declared);
+                    // Native loads use the remaining budget. The append below
+                    // checks the user's declared limit after actual load gas.
+                    let declared = user_declared;
                     match block_gas_fit(draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
                         BlockGasFit::Accept => {}
                         BlockGasFit::Defer => {
@@ -2495,7 +2507,7 @@ where
                         &l1_entries[0],
                         &held.raw_tx,
                         &stf_cfg,
-                        nonce + system_txs_appended,
+                        live_source.with_index(system_txs_appended),
                     ) {
                         Ok(pairs) => pairs,
                         Err(e) => {
@@ -2512,10 +2524,23 @@ where
                             continue;
                         }
                     };
-                    let pair_txs = eez_protocol::system_tx::interleave_sync_block_txs(&pairs_k);
-                    let pair_logs = match append_and_execute(&mut draft, &pair_txs) {
+                    let plans = eez_protocol::system_tx::interleave_sync_block_txs(&pairs_k);
+                    let mut pair_txs = Vec::new();
+                    let pair_logs = match append_and_execute(&mut draft, &plans, &mut pair_txs) {
                         Ok(logs) => logs,
                         Err((at, why)) => {
+                            if matches!(why, BuildError::Capacity) && !sync_txs.is_empty() {
+                                block_gas_cut = Some(BlockGasCut {
+                                    gas_used: draft.gas_used(),
+                                    declared: user_declared,
+                                });
+                                deferred = abort_rest(
+                                    Some((idx, held)),
+                                    &mut out_iter,
+                                    std::mem::take(&mut inbounds),
+                                );
+                                break;
+                            }
                             // A backing-store failure says nothing about the tx —
                             // abort the slot instead of evicting a valid pair.
                             if matches!(&why, BuildError::Provider(_)) {
@@ -2730,7 +2755,11 @@ where
                 .fork()
                 .map_err(|e| format!("SyncBlockState::fork: {e}"))
                 .map(|fork| {
-                    InboundL2TargetSession::new(fork, stf_cfg.clone(), nonce + system_txs_appended)
+                    InboundL2TargetSession::new(
+                        fork,
+                        stf_cfg.clone(),
+                        live_source.with_index(system_txs_appended),
+                    )
                 })
                 .and_then(|probe| {
                     l1_state
@@ -2802,36 +2831,6 @@ where
                         continue;
                     }
 
-                    // Same gate: one delivery tx per entry, each at the protocol gas budget.
-                    // Foreign entries never ship, so this over-counts at worst.
-                    let declared = eez_primitives::SYSTEM_TX_GAS_LIMIT
-                        .saturating_mul(target_entries.len() as u64);
-                    match block_gas_fit(draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
-                        BlockGasFit::Accept => {}
-                        BlockGasFit::Defer => {
-                            block_gas_cut = Some(BlockGasCut {
-                                gas_used: draft.gas_used(),
-                                declared,
-                            });
-                            deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
-                            break;
-                        }
-                        BlockGasFit::Unfittable => {
-                            event!(
-                                name: "eez.composer.cc_compose.block_gas_unfittable",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                declared,
-                                deliveries = target_entries.len(),
-                                block_gas_limit = BUILDER_GAS_LIMIT,
-                                "inbound deliveries declare more gas than a whole L2 block; no slot can ever take them — evicting (resubmit as separate calls)",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        }
-                    }
                     // Same gate, no target gas: a deferred entry only queues
                     // here, and its L1 half is a separate bundled tx.
                     let cost = projected_tx_l1_gas(
@@ -2859,7 +2858,7 @@ where
                             eez_protocol::system_tx::build_inbound_system_txs(
                                 &inbound,
                                 &stf_cfg,
-                                nonce + system_txs_appended,
+                                live_source.with_index(system_txs_appended),
                             )
                         }) {
                         Ok(deliveries) if deliveries.is_empty() && !target_entries.is_empty() => {
@@ -2893,7 +2892,21 @@ where
                     // The delivery re-runs the on-chain claim compare, so this
                     // append IS the verifier: a revert means the claims and the
                     // block disagree and the tx must go.
-                    if let Err((at, why)) = append_and_execute(&mut draft, &deliveries) {
+                    let plans = deliveries
+                        .into_iter()
+                        .map(eez_protocol::system_tx::PlannedTransaction::Native)
+                        .collect::<Vec<_>>();
+                    let mut deliveries = Vec::new();
+                    if let Err((at, why)) = append_and_execute(&mut draft, &plans, &mut deliveries)
+                    {
+                        if matches!(why, BuildError::Capacity) && !sync_txs.is_empty() {
+                            block_gas_cut = Some(BlockGasCut {
+                                gas_used: draft.gas_used(),
+                                declared: eez_primitives::SYSTEM_TX_GAS_CAP,
+                            });
+                            deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
+                            break;
+                        }
                         // A backing-store failure says nothing about the tx —
                         // abort the slot instead of evicting a valid delivery.
                         if matches!(&why, BuildError::Provider(_)) {
@@ -2944,6 +2957,16 @@ where
                     );
                     survivor_comps.push((composition, held.hash));
                     survivors.push((idx, held));
+                }
+                Err(eez_protocol::ComposerError::Executor(
+                    eez_protocol::ExecutorError::Capacity,
+                )) if !sync_txs.is_empty() => {
+                    block_gas_cut = Some(BlockGasCut {
+                        gas_used: draft.gas_used(),
+                        declared: eez_primitives::SYSTEM_TX_GAS_CAP,
+                    });
+                    deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
+                    break;
                 }
                 Err(e) if sim_error_is_poison(&e) => {
                     event!(
@@ -3124,18 +3147,25 @@ where
         // Past the drain the pool's order is all that matters again.
         let survivors: Vec<HeldTx> = restore_pool_order(survivors);
 
-        // ── Rebuild the Sync block's system txs via THE canonical builder —
-        // deriver-byte-identical two-phase SYSTEM_ADDRESS nonces (outbound loads
-        // N.., then inbound deliveries N+K..) + interleaved order
-        // [load,user,…,deliveries]. Handles inbound / outbound / mixed
-        // uniformly. A failure is systemic (signing / nonce overflow) →
-        // re-queue survivors, degrade to minimal.
-        let pairs = match eez_protocol::system_tx::build_cross_chain_sync_pairs(
+        // Reconstruct and execute the canonical plans independently of the
+        // accepted byte list. A mismatch aborts posting and requeues survivors.
+        let (pairs, canonical) = match eez_protocol::system_tx::build_cross_chain_sync_pairs(
             &pending_out,
             &pending_in,
             &stf_cfg,
-            nonce,
-        ) {
+            live_source,
+        )
+        .and_then(|pairs| {
+            let mut check = reopen(&[]).map_err(|e| e.to_string())?;
+            let mut bytes = Vec::new();
+            append_and_execute(
+                &mut check,
+                &eez_protocol::system_tx::interleave_sync_block_txs(&pairs),
+                &mut bytes,
+            )
+            .map_err(|(at, e)| format!("canonical reconstruction at {at}: {e}"))?;
+            Ok((pairs, bytes))
+        }) {
             Ok(p) => p,
             Err(e) => {
                 event!(
@@ -3166,7 +3196,6 @@ where
         // reconstructs from the same entries. Inequality is a composer bug, not
         // an input condition, so it degrades the slot loudly instead of posting
         // a block nobody else can rebuild.
-        let canonical = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
         if canonical != sync_txs {
             let first_divergent = canonical
                 .iter()
@@ -5621,9 +5650,9 @@ mod tests {
     fn eip_7825_user_cap_is_independent_of_sync_block_fit() {
         // An invalid user limit can still fit in the aggregate Sync-block budget.
         const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
-        const SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
+        const SYSTEM_TX_GAS_CAP: u64 = 2_000_000;
         let invalid_user_limit = EIP_7825_TX_GAS_LIMIT + 1;
-        let pair_limit = SYSTEM_TX_GAS_LIMIT + invalid_user_limit;
+        let pair_limit = SYSTEM_TX_GAS_CAP + invalid_user_limit;
 
         assert_eq!(
             block_gas_fit(0, pair_limit, BUILDER_GAS_LIMIT),

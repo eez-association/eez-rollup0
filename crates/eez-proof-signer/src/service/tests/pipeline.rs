@@ -388,6 +388,29 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
             if reason == "native execution requires live L1 context"
     ));
 
+    // Native source authority is independent of the submitted bytes. A wrong
+    // L1 parent must fail even with otherwise valid execution evidence.
+    let error = run_settlement(SettlementInput {
+        l1_parent_hash: Some(B256::repeat_byte(0x98)),
+        submitted_post_batch_calldata: calldata.clone(),
+        validated_window: &validated,
+        expected_rollup_id: expected_rollup_id(1),
+        expected_l2_system_address: TEST_SYSTEM_ADDRESS,
+        proof_system_vkey: test_proof_system_vkey(),
+        expected_proof_system: test_proof_system(),
+        system_transaction_reconstructor: &system_transaction_reconstructor,
+        cancellation: &cancellation,
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        SettlementPipelineError::DaPayload(
+            settlement::DaPayloadError::SyncBlockTransactionMismatch {
+                transaction_index: 0
+            }
+        )
+    ));
+
     // Reuse the same successful execution evidence. Only the submitted DA
     // changes, so rejection must come from DA binding before signing.
     // Backend execution is stubbed here; this exercises the real settlement pipeline.

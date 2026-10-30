@@ -44,7 +44,7 @@ The profile supports exactly one nonzero rollup ID, one nonzero proof-system
 address, and one nonzero proof-system verification key. It does not support
 static entries, nested calls, multiple calls per effect, explicit call gas,
 force-revert spans, blobs, historical L1 block selectors, sender binding, or multiple
-proof systems. Live batches can bind the intended L1 parent and inclusion time.
+proof systems. Native live batches bind the intended L1 parent and inclusion time.
 
 No failed stage may produce a signature. A successful signature authorizes the
 locally recomputed public-input hash only under all rules in this document.
@@ -142,7 +142,7 @@ The CLI value takes precedence.
 | `--vkey` | `EEZ_VKEY` | none | Nonzero 32-byte proof-system vkey. |
 | `--signer-key` | `EEZ_PROOF_SIGNER_KEY` | none | Valid secp256k1 attestation private key. |
 | `--attester-address` | `EEZ_ATTESTER_ADDRESS` | none | MUST equal the address derived from `--signer-key`. |
-| `--l2-system-address` | `EEZ_L2_SYSTEM_ADDRESS` | none | Address embedded in EEZL2; MUST equal reserved native sender `0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076`. |
+| `--l2-system-address` | `EEZ_L2_SYSTEM_ADDRESS` | none | Address embedded in EEZL2; MUST equal reserved native sender `0xfffffffffffffffffffffffffffffffffffffffe`. |
 | `--proof-system` | `EEZ_PROOF_SYSTEM` | none | Nonzero expected proof-system contract address. |
 | `--max-request-blocks` | `EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS` | `512` | Nonzero. |
 | `--max-request-bytes` | `EEZ_PROOF_SIGNER_MAX_REQUEST_BYTES` | `536870912` | Nonzero. |
@@ -187,7 +187,7 @@ reserved system-address, and fixed EEZL2-address checks as the stateless service
 The active deployment bindings are:
 
 ```text
-SYSTEM_ADDRESS = 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076
+SYSTEM_ADDRESS = 0xfffffffffffffffffffffffffffffffffffffffe
 EEZL2_ADDRESS  = 0x4200000000000000000000000000000000000007
 ```
 
@@ -269,7 +269,7 @@ The header is admitted only if:
 - `from_block <= to_block`;
 - the inclusive span `to_block - from_block + 1` is representable and no larger
   than `max_request_blocks`; and
-- `post_batch.l1_block_hash` is empty for timeless batches, or the nonzero 32-byte intended L1 parent for live batches.
+- `post_batch.l1_block_hash` is empty for timeless batches, or the nonzero 32-byte intended L1 parent for native live batches.
 
 `post_batch.public_inputs_hash` is a non-authoritative Composer claim and MUST
 be ignored. It is not length-checked and is never signed. Only
@@ -331,7 +331,7 @@ Ordinary blocks require regular execution, not transaction-state checkpoints.
 For each recovered transaction in a potential Sync block define:
 
 ```text
-system[i] = type(tx[i]) == 0x76
+system[i] = type(tx[i]) == 0x45
             && tx[i].to == EEZL2_ADDRESS
 ```
 
@@ -712,16 +712,15 @@ transaction sequence and compare it byte for byte with the validated block.
 The reconstruction context is:
 
 ```text
-type         = 0x76 (unsigned native)
+type         = 0x45 (unsigned native)
 sender       = reserved EEZ_L2_SYSTEM_ADDRESS
 target       = EEZL2_ADDRESS
 chain id     = operator-configured L2 chain ID
 rollup id    = expected_rollup_id
-first nonce  = nonce of the first validated omitted system transaction
+source hash  = SOURCE_ENTRY_V1 over configured chain, intended L1 parent, full group ordinal
 ```
 
-Gas fields are not encoded: execution uses a fixed gas limit of `2_000_000`
-and a gas price of `0`.
+Each envelope encodes exactly `min(16_777_216, blockGasLimit - precedingCumulativeGasUsed)`. The cumulative gas comes from validated receipts. Gas price is zero; the RPC nonce placeholder is zero, the envelope has no nonce, and no account nonce transition occurs.
 
 The canonical order is:
 
@@ -734,7 +733,7 @@ The canonical order is:
  inbound delivery M-1]
 ```
 
-System nonces increase through that order. Outbound loads carry zero native
+Group ordinals increase through that order, once per outbound pair or inbound delivery. Outbound loads carry zero native
 value. Inbound deliveries carry their authorized inbound value. The reconstructed
 sequence length and every raw transaction byte MUST equal the validated
 terminal block.

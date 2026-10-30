@@ -623,6 +623,7 @@ where
                     batch.id.l1_block,
                     batch.tx_hash,
                     &batch.settlement,
+                    batch.l1_context,
                 )
                 .await?;
             total_replayed += replayed_here;
@@ -695,6 +696,25 @@ where
         raw_txs: &[Vec<u8>],
         header: &BlockHeaderInputs,
     ) -> DeriverResult<(ExecutionData, SealedHeader<alloy_consensus::Header>)> {
+        let plans = raw_txs
+            .iter()
+            .map(|raw| eez_protocol::system_tx::PlannedTransaction::User(raw.clone().into()))
+            .collect::<Vec<_>>();
+        let (payload, header, _) =
+            self.execute_planned_block(parent_block_number, &plans, header)?;
+        Ok((payload, header))
+    }
+
+    fn execute_planned_block(
+        &self,
+        parent_block_number: u64,
+        plans: &[eez_protocol::system_tx::PlannedTransaction],
+        header: &BlockHeaderInputs,
+    ) -> DeriverResult<(
+        ExecutionData,
+        SealedHeader<alloy_consensus::Header>,
+        Vec<Vec<u8>>,
+    )> {
         // Diagnostic: log parent context before touching reth so we can
         // pinpoint failing `state_by_block_hash` lookups.
         let local_best = self
@@ -707,7 +727,7 @@ where
             Level::DEBUG,
             parent_block_number,
             local_best,
-            tx_count = raw_txs.len(),
+            tx_count = plans.len(),
             "execute_block: looking up parent header",
         );
 
@@ -799,7 +819,13 @@ where
             .apply_pre_execution_changes()
             .map_err(|e| DeriverError::L2Provider(format!("pre-execution changes failed: {e}")))?;
 
-        for (tx_idx, tx_bytes) in raw_txs.iter().enumerate() {
+        let mut raw_txs = Vec::with_capacity(plans.len());
+        let mut gas_used = 0u64;
+        for (tx_idx, plan) in plans.iter().enumerate() {
+            let raw = plan
+                .at_position(BUILDER_GAS_LIMIT, gas_used)
+                .map_err(DeriverError::L2Provider)?;
+            let tx_bytes = raw.to_vec();
             let tx = TransactionSigned::decode_2718(&mut tx_bytes.as_slice()).map_err(|e| {
                 DeriverError::LocalDiverged {
                     l2_block: parent_block_number + 1,
@@ -812,12 +838,14 @@ where
                     detail: Some(format!("could not recover signer for tx #{tx_idx}")),
                 }
             })?;
-            builder
-                .execute_transaction(recovered)
-                .map_err(|e| DeriverError::LocalDiverged {
+            let gas = builder.execute_transaction(recovered).map_err(|e| {
+                DeriverError::LocalDiverged {
                     l2_block: parent_block_number + 1,
                     detail: Some(format!("execute tx #{tx_idx}: {e}")),
-                })?;
+                }
+            })?;
+            gas_used = gas_used.saturating_add(gas.tx_gas_used());
+            raw_txs.push(tx_bytes);
         }
 
         let outcome = builder
@@ -827,7 +855,7 @@ where
         let sealed_block = outcome.block.sealed_block().clone();
         let sealed_header = sealed_block.sealed_header().clone();
         let execution_data = <EezEngineTypes as PayloadTypes>::block_to_payload(sealed_block, None);
-        Ok((execution_data, sealed_header))
+        Ok((execution_data, sealed_header, raw_txs))
     }
 
     /// Build + commit one L1-derived L2 block via STF replay.
@@ -1130,6 +1158,7 @@ where
                 l1_block_number,
                 tx_hash,
                 settlement,
+                post.l1_context,
             )
             .await?;
         event!(
@@ -1429,6 +1458,7 @@ where
         l1_block_number: u64,
         tx_hash: B256,
         settlement: &eez_l1::Settlement,
+        l1_context: Option<eez_protocol::l1_context::LiveSettlementContext>,
     ) -> DeriverResult<(u64, Option<B256>)> {
         // Cross-chain path (skipped when `system_tx_cfg` is `None`):
         // reconstruct the system txs the composer produced from the DA action
@@ -1459,7 +1489,11 @@ where
         // `gate_outbound`: outbound entries L1 paid, stashed for the post-replay
         // gate (empty in the pure-user-tx path → no-op).
         let mut gate_outbound: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
-        let sync_block_txs: Option<Vec<Vec<u8>>> = match self.inner.system_tx_cfg.as_ref() {
+        let sync_block_txs: Option<Vec<eez_protocol::system_tx::PlannedTransaction>> = match self
+            .inner
+            .system_tx_cfg
+            .as_ref()
+        {
             Some(cfg) => {
                 // The DA publishes actions, not entries: an inbound entry's
                 // on-chain form binds its call only via `proxyEntryHash`, so
@@ -1549,74 +1583,65 @@ where
                     );
                 }
                 let outbound_paired = slots.outbound_paired;
-                // `inbound` stays the FULL claimed list: the skipped-prefix nonce
-                // count below indexes it. Applied deliveries are separate.
-                let applied_inbound = slots.inbound;
+                // Keep the full claimed list so source ordinals survive prefix selection.
 
                 // Stash for the post-replay gate — it needs the
                 // `CrossChainCallExecuted` events, observable only after replay.
                 gate_outbound = outbound_paired.iter().map(|(e, _)| e.clone()).collect();
 
-                // A resume appends after the rival's system txs, so count the
-                // skipped prefix. Not the block's own nonce: an earlier append
-                // would count, shift the rebuilt txs and defeat the resume dedup.
-                let mut starting_nonce = self.system_address_nonce_at(from_block - 1)?;
-                let (outbound_skip, inbound_skip) =
-                    match settlement.applied().first().map(|a| a.role) {
-                        Some(eez_l1::EntryRole::Outbound { ordinal }) => (ordinal, 0),
-                        // Every outbound entry precedes every inbound one.
-                        Some(eez_l1::EntryRole::Inbound { ordinal }) => {
-                            (original_outbound_len, ordinal)
-                        }
-                        _ => (0, 0),
-                    };
-                if outbound_skip > 0 || inbound_skip > 0 {
-                    let skipped_paired: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> =
-                        outbound[..outbound_skip]
-                            .iter()
-                            .cloned()
-                            .zip(sync_user_txs[..outbound_skip].iter().cloned())
-                            .collect();
-                    let prefix_pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
-                        &skipped_paired,
-                        &inbound[..inbound_skip],
-                        cfg,
-                        starting_nonce,
-                    )
-                    .map_err(|e| {
-                        DeriverError::L2Provider(format!(
-                            "build_cross_chain_sync_pairs(skipped prefix, tx={tx_hash}): {e}"
-                        ))
+                let all_pairs = if original_outbound_len + original_inbound_len == 0 {
+                    Vec::new()
+                } else {
+                    let context = l1_context.ok_or_else(|| DeriverError::LocalDiverged {
+                        l2_block: from_block,
+                        detail: Some("native derivation requires authenticated L1 context".into()),
                     })?;
-                    starting_nonce = starting_nonce
-                        .checked_add(prefix_pairs.len() as u64)
-                        .ok_or_else(|| {
-                            DeriverError::L2Provider(format!(
-                                "SYSTEM_ADDRESS nonce overflow over the skipped prefix (tx={tx_hash})"
-                            ))
-                        })?;
+                    let source = eez_protocol::native_source::SourceEntry::new(
+                        cfg.l2_chain_id,
+                        context.parent_hash,
+                        0,
+                    )
+                    .map_err(DeriverError::L2Provider)?;
+                    let all_outbound = outbound
+                        .iter()
+                        .cloned()
+                        .zip(sync_user_txs.iter().cloned())
+                        .collect::<Vec<_>>();
+                    eez_protocol::system_tx::build_cross_chain_sync_pairs(
+                        &all_outbound,
+                        &inbound,
+                        cfg,
+                        source,
+                    )
+                    .map_err(DeriverError::L2Provider)?
+                };
+                let mut pairs = Vec::new();
+                for applied in settlement.applied() {
+                    let index = match applied.role {
+                        eez_l1::EntryRole::Outbound { ordinal } => ordinal,
+                        eez_l1::EntryRole::Inbound { ordinal } => original_outbound_len + ordinal,
+                        _ => continue,
+                    };
+                    pairs.push(
+                        all_pairs
+                            .get(index)
+                            .ok_or_else(|| DeriverError::LocalDiverged {
+                                l2_block: from_block,
+                                detail: Some(
+                                    "applied native ordinal is outside original candidate".into(),
+                                ),
+                            })?
+                            .clone(),
+                    );
                 }
-                let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
-                    &outbound_paired,
-                    &applied_inbound,
-                    cfg,
-                    starting_nonce,
-                )
-                .map_err(|e| {
-                    DeriverError::L2Provider(format!(
-                        "build_cross_chain_sync_pairs(tx={tx_hash}): {e}"
-                    ))
-                })?;
-                // The interleaved list IS the Sync block's system + outbound-user
-                // txs; append any remaining (non-cross-chain) user txs after it.
-                let mut full: Vec<Vec<u8>> =
-                    eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
-                        .into_iter()
-                        .map(|b| b.to_vec())
-                        .collect();
-                for t in &decoded.transactions[sync_user_start + original_outbound_len..] {
-                    full.push(t.clone());
-                }
+                let mut full = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
+                full.extend(
+                    decoded.transactions[sync_user_start + original_outbound_len..]
+                        .iter()
+                        .map(|raw| {
+                            eez_protocol::system_tx::PlannedTransaction::User(raw.clone().into())
+                        }),
+                );
                 event!(
                     name: "eez.deriver.reconcile.sync_block_built",
                     Level::INFO,
@@ -1626,7 +1651,6 @@ where
                     outbound = outbound_paired.len(),
                     inbound = inbound.len(),
                     sync_block_txs = full.len(),
-                    starting_nonce,
                     "rebuilt Sync block",
                 );
                 Some(full)
@@ -1680,7 +1704,32 @@ where
                 .iter()
                 .map(Encodable2718::encoded_2718)
                 .collect();
-            let new_content = sync_block_txs.clone().unwrap_or_default();
+            let current_hash = self.l2_hash_at(from_block)?;
+            let new_content = if settlement.final_state == Some(current_hash) {
+                Vec::new()
+            } else {
+                if settlement.entry_state != Some(current_hash) {
+                    return Err(DeriverError::LocalDiverged {
+                        l2_block: from_block,
+                        detail: Some(
+                            "resume prefix does not match authenticated entry root".into(),
+                        ),
+                    });
+                }
+                let mut plans = existing_txs
+                    .iter()
+                    .map(|raw| {
+                        eez_protocol::system_tx::PlannedTransaction::User(raw.clone().into())
+                    })
+                    .collect::<Vec<_>>();
+                plans.extend(sync_block_txs.clone().unwrap_or_default());
+                let (_, _, bytes) = self.execute_planned_block(
+                    from_block - 1,
+                    &plans,
+                    &BlockHeaderInputs::from_span(decoded, last_index)?,
+                )?;
+                bytes[existing_txs.len()..].to_vec()
+            };
             // The block exists (`stale_boundary` above refused otherwise), so its
             // hash answers whether a previous pass already appended these entries.
             let replay_txs = resume_replay_txs(
@@ -1796,7 +1845,14 @@ where
                 // plus trailing non-cc user txs) was pre-built above; every other
                 // block is its user txs verbatim.
                 let block_txs: Vec<Vec<u8>> = match (is_sync_block, sync_block_txs.as_ref()) {
-                    (true, Some(full)) => full.clone(),
+                    (true, Some(full)) => {
+                        self.execute_planned_block(
+                            l2_block - 1,
+                            full,
+                            &BlockHeaderInputs::from_span(decoded, i)?,
+                        )?
+                        .2
+                    }
                     _ => user_txs.to_vec(),
                 };
                 // Skip only identical blocks: a needless rewrite wedges reth.
@@ -1889,33 +1945,6 @@ where
                 DeriverError::L2Provider(format!("local receipts for Sync block {block} missing"))
             })?;
         Ok(extract_outbound_call_observations(&receipts, eez_l2))
-    }
-
-    /// SYSTEM_ADDRESS account nonce at the L2 parent block. Both
-    /// composer and deriver query this at the same block hash; reth
-    /// is deterministic so they read identical values, which makes
-    /// the native system-tx hashes byte-equal.
-    fn system_address_nonce_at(&self, parent_block_number: u64) -> DeriverResult<u64> {
-        let parent_header = self
-            .inner
-            .l2_provider
-            .sealed_header(parent_block_number)
-            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
-            .ok_or_else(|| {
-                DeriverError::L2Provider(format!(
-                    "local L2 header at parent {parent_block_number} missing"
-                ))
-            })?;
-        let state = self
-            .inner
-            .l2_provider
-            .state_by_block_hash(parent_header.hash())
-            .map_err(|e| DeriverError::L2Provider(e.to_string()))?;
-        let system_address = eez_primitives::SYSTEM_ADDRESS;
-        Ok(state
-            .account_nonce(&system_address)
-            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
-            .unwrap_or(0))
     }
 
     /// Loud-fail if the batch's claimed state-root chain disagrees with

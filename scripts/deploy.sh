@@ -56,7 +56,7 @@ EEZ_DEPLOY_KEY="${EEZ_DEPLOY_KEY:-$EEZ_L1_POSTER_KEY}"
 AUTHORIZED_SIGNER="$(cast wallet address --private-key "$EEZ_PROOF_SIGNER_KEY")"
 PROOF_SYSTEM_VKEY="0x000000000000000000000000${AUTHORIZED_SIGNER#0x}"
 OWNER="$(cast wallet address --private-key "$EEZ_DEPLOY_KEY")"
-EEZ_L2_SYSTEM_ADDRESS="0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076"
+EEZ_L2_SYSTEM_ADDRESS="0xfffffffffffffffffffffffffffffffffffffffe"
 EEZ_L2_RECOVERY_ADDRESS="$(cast to-check-sum-address "$EEZ_L2_RECOVERY_ADDRESS")"
 if [[ "${EEZ_L2_RECOVERY_ADDRESS,,}" == "0x0000000000000000000000000000000000000000" ]]; then
     echo "deploy: EEZ_L2_RECOVERY_ADDRESS must be non-zero" >&2

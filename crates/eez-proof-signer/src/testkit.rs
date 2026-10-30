@@ -10,10 +10,10 @@ use alloy_primitives::{Address, B256, address};
 
 /// Deterministic system-transaction identity used only by tests.
 pub(crate) const TEST_SYSTEM_ADDRESS: Address =
-    address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076");
+    address!("fffffffffffffffffffffffffffffffffffffffe");
 
 /// Native system envelope with empty calldata, for framing tests.
-pub(crate) const SYSTEM_TX: &str = "76d901809442000000000000000000000000000000000000078080";
+pub(crate) const SYSTEM_TX: &str = "45f83e01a0111111111111111111111111111111111111111111111111111111111111111184010000009442000000000000000000000000000000000000078080";
 
 /// Canonical context for reconstructing system transactions in tests; tests
 /// that need a noncanonical variant mutate one field of a fresh copy.
@@ -59,6 +59,11 @@ pub(crate) fn pre_execution_checkpoint(block_hash: B256) -> crate::validate::Sta
         state_root: B256::with_last_byte(0xc0),
         block_hash,
     }
+}
+
+/// Fixed live parent for fixture reconstruction. These unit fixtures mock execution.
+pub(crate) fn native_source(index: u64) -> eez_protocol::native_source::SourceEntry {
+    eez_protocol::native_source::SourceEntry::new(1, B256::repeat_byte(0x99), index).unwrap()
 }
 
 pub(crate) fn live_context() -> eez_protocol::l1_context::LiveSettlementContext {

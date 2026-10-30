@@ -1189,6 +1189,7 @@ mod tests {
                 }],
                 post_state_root: post_root,
                 settlement_evidence: SettlementBlockEvidence {
+                    cumulative_gas_used: Vec::new(),
                     system_sender_flags: Vec::new(),
                     observed_outbound_events: Vec::new(),
                 },

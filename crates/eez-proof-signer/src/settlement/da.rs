@@ -1,6 +1,5 @@
 //! Decoding and exact verification of the batch data-availability payload.
 
-use alloy_consensus::Transaction as _;
 use alloy_primitives::{B256, Bytes};
 use alloy_sol_types::SolValue as _;
 use eez_payload_codec::{Action, DecodedSpan};
@@ -207,6 +206,7 @@ pub(crate) fn verify_da_payload(
     inbound_effects: &AuthorizedInboundEffects<'_>,
     system_transaction_reconstructor: &SystemTransactionReconstructor,
     expected_rollup_id: u64,
+    context: Option<eez_protocol::l1_context::LiveSettlementContext>,
 ) -> Result<(), DaPayloadError> {
     let settling = validated_window.settling_block();
     verify_encoded_da_payload(
@@ -220,6 +220,8 @@ pub(crate) fn verify_da_payload(
         inbound_effects,
         system_transaction_reconstructor,
         expected_rollup_id,
+        context,
+        &settling.settlement_evidence().cumulative_gas_used,
     )
 }
 
@@ -251,6 +253,11 @@ where
         inbound_effects,
         system_transaction_reconstructor,
         expected_rollup_id,
+        Some(eez_protocol::l1_context::LiveSettlementContext {
+            parent_hash: B256::repeat_byte(0x99),
+            timestamp: 1,
+        }),
+        &vec![0; settling.body.transactions.len()],
     )
 }
 
@@ -262,6 +269,8 @@ fn verify_encoded_da_payload<'a, I>(
     inbound_effects: &AuthorizedInboundEffects<'_>,
     system_transaction_reconstructor: &SystemTransactionReconstructor,
     expected_rollup_id: u64,
+    context: Option<eez_protocol::l1_context::LiveSettlementContext>,
+    cumulative_gas_used: &[u64],
 ) -> Result<(), DaPayloadError>
 where
     I: ExactSizeIterator<Item = (u64, &'a EthereumBlock)>,
@@ -307,6 +316,10 @@ where
             &outbound_da_entries,
             inbound_effects,
             system_transaction_reconstructor,
+            context.ok_or_else(|| DaPayloadError::SystemTransactionReconstruction {
+                reason: "missing live source context".into(),
+            })?,
+            cumulative_gas_used,
         )?;
     }
     Ok(())
@@ -561,24 +574,9 @@ fn verify_reconstructed_sync_block(
     outbound_da_entries: &[ExecutionEntrySol],
     inbound_effects: &AuthorizedInboundEffects<'_>,
     reconstructor: &SystemTransactionReconstructor,
+    context: eez_protocol::l1_context::LiveSettlementContext,
+    cumulative_gas_used: &[u64],
 ) -> Result<(), DaPayloadError> {
-    let first_system_position = outbound_effects
-        .iter()
-        .next()
-        .map(AuthorizedOutboundEffect::load_transaction_index)
-        .or_else(|| {
-            inbound_effects
-                .iter()
-                .next()
-                .map(AuthorizedInboundEffect::transaction_index)
-        })
-        .ok_or(DaPayloadError::InvalidEffectTransactionLayout)?;
-    let starting_nonce = block
-        .body
-        .transactions
-        .get(first_system_position)
-        .ok_or(DaPayloadError::InvalidEffectTransactionLayout)?
-        .nonce();
     let outbound_reconstruction_inputs = outbound_effects
         .iter()
         .zip(outbound_da_entries)
@@ -603,10 +601,26 @@ fn verify_reconstructed_sync_block(
         .reconstruct_sync_pairs(
             &outbound_reconstruction_inputs,
             &inbound_reconstruction_entries,
-            starting_nonce,
+            reconstructor
+                .source(context.parent_hash)
+                .map_err(|reason| DaPayloadError::SystemTransactionReconstruction { reason })?,
         )
         .map_err(|reason| DaPayloadError::SystemTransactionReconstruction { reason })?;
-    let reconstructed = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
+    let reconstructed = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
+        .iter()
+        .enumerate()
+        .map(|(i, plan)| {
+            let prior_gas = if i == 0 {
+                0
+            } else {
+                *cumulative_gas_used
+                    .get(i - 1)
+                    .ok_or(DaPayloadError::InvalidEffectTransactionLayout)?
+            };
+            plan.at_position(block.header.gas_limit, prior_gas)
+                .map_err(|reason| DaPayloadError::SystemTransactionReconstruction { reason })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     // The canonical Sync layout contains exactly `2 * outbound + inbound`
     // transactions. Reject a different terminal-block length before comparing

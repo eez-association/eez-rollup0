@@ -10,57 +10,154 @@ use alloy_rlp::{Decodable, Encodable};
 use reth_primitives_traits::InMemorySize;
 
 /// Reserved EIP-2718 type for EEZ's unsigned system transactions.
-pub const SYSTEM_TX_TYPE: u8 = 0x76;
-/// Protocol execution budget. Native transactions carry no configurable gas fields.
-pub const SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
-/// Codeless EEZ privilege domain, distinct from Ethereum's block-level system caller.
-pub const SYSTEM_ADDRESS: Address = address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076");
-/// The L2 execution manager is a protocol predeploy.
+pub const SYSTEM_TX_TYPE: u8 = 0x45;
+/// Upper bound of a native transaction's execution budget: Osaka's EIP-7825
+/// per-transaction cap. Each native transaction encodes exactly
+/// [`system_tx_gas_limit`] of the block's remaining gas,
+/// so this cap is not reserved in the block; only metered use is charged.
+pub const SYSTEM_TX_GAS_CAP: u64 = revm::primitives::eip7825::TX_GAS_LIMIT_CAP;
+/// Execution budget of a native transaction at its position in an L2 block:
+/// the remaining block gas, bounded by [`SYSTEM_TX_GAS_CAP`].
+///
+/// `cumulative_gas_used` is the receipts' cumulative gas of the preceding
+/// transactions, the figure Ethereum's block-gas rule charges. Every execution
+/// that must agree with consensus (block executor, Composer draft, follower and
+/// signer replay) derives the budget here. A budget below the transaction's
+/// intrinsic gas makes the transaction, and therefore the block, invalid.
+#[must_use]
+pub const fn system_tx_gas_limit(block_gas_limit: u64, cumulative_gas_used: u64) -> u64 {
+    let remaining = block_gas_limit.saturating_sub(cumulative_gas_used);
+    if remaining < SYSTEM_TX_GAS_CAP {
+        remaining
+    } else {
+        SYSTEM_TX_GAS_CAP
+    }
+}
+/// Implicit native sender; the native type and verified derivation grant authority.
+pub const SYSTEM_ADDRESS: Address = address!("fffffffffffffffffffffffffffffffffffffffe");
+/// Rollup0 execution-manager predeploy.
 pub const EEZL2_ADDRESS: Address = address!("4200000000000000000000000000000000000007");
 
-/// Canonical wire body: chain ID, nonce, destination, value, calldata.
+/// Canonical six-field wire body: chain ID, source hash, gas, destination, value, calldata.
 /// Signatures and an arbitrary sender are deliberately absent. Authorization is
 /// established by derivation; this type must never enter a public transaction pool.
-#[derive(
-    Clone,
-    Debug,
-    PartialEq,
-    Eq,
-    serde::Deserialize,
-    alloy_rlp::RlpEncodable,
-    alloy_rlp::RlpDecodable,
-)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq, alloy_rlp::RlpEncodable, alloy_rlp::RlpDecodable)]
 pub struct SystemTransaction {
-    #[serde(with = "alloy_serde::quantity")]
+    /// The wire integer is uint256; this runtime supports configured u64 chain IDs.
     pub chain_id: u64,
-    #[serde(with = "alloy_serde::quantity")]
-    pub nonce: u64,
+    pub source_hash: B256,
+    pub gas_limit: u64,
     pub to: Address,
     pub value: U256,
     pub input: Bytes,
 }
 
+impl SystemTransaction {
+    /// Check envelope shape without authorizing its occurrence or execution.
+    /// Chain/profile binding, exact position gas and source identity are checked
+    /// by the executor and settlement reconstruction.
+    pub fn validate(&self) -> Result<(), alloy_rlp::Error> {
+        let cap = match self.to {
+            EEZL2_ADDRESS => SYSTEM_TX_GAS_CAP,
+            _ => {
+                return Err(alloy_rlp::Error::Custom(
+                    "invalid system transaction destination or value",
+                ));
+            }
+        };
+        if self.gas_limit > cap {
+            return Err(alloy_rlp::Error::Custom(
+                "native transaction exceeds its gas cap",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl serde::Serialize for SystemTransaction {
-    /// Ethereum RPC consumers require gas fields and signature placeholders.
-    /// These fixed JSON values do not add gas settings or a signature to the
-    /// native wire body; derivation still supplies its authorization.
+    /// Expose the actual native fields plus fixed Ethereum RPC placeholders.
+    /// Nonce/signature/fee placeholders do not participate in the native hash.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use alloy_primitives::U64;
         use serde::ser::SerializeStruct;
 
-        let mut tx = serializer.serialize_struct("SystemTransaction", 10)?;
+        let mut tx = serializer.serialize_struct("SystemTransaction", 15)?;
         tx.serialize_field("chainId", &U64::from(self.chain_id))?;
-        tx.serialize_field("nonce", &U64::from(self.nonce))?;
+        tx.serialize_field("sourceHash", &self.source_hash)?;
+        tx.serialize_field("nonce", &U64::ZERO)?;
         tx.serialize_field("to", &self.to)?;
         tx.serialize_field("value", &self.value)?;
         tx.serialize_field("input", &self.input)?;
-        tx.serialize_field("gas", &U64::from(SYSTEM_TX_GAS_LIMIT))?;
+        tx.serialize_field("gas", &U64::from(self.gas_limit()))?;
         tx.serialize_field("gasPrice", &U256::ZERO)?;
         tx.serialize_field("v", &U256::ZERO)?;
         tx.serialize_field("r", &U256::ZERO)?;
         tx.serialize_field("s", &U256::ZERO)?;
+        tx.serialize_field("yParity", &U256::ZERO)?;
+        tx.serialize_field("accessList", &[] as &[u8])?;
+        tx.serialize_field("blobVersionedHashes", &[] as &[u8])?;
+        tx.serialize_field("authorizationList", &[] as &[u8])?;
         tx.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SystemTransaction {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Rpc {
+            #[serde(with = "alloy_serde::quantity")]
+            chain_id: u64,
+            source_hash: B256,
+            #[serde(with = "alloy_serde::quantity")]
+            gas: u64,
+            to: Address,
+            value: U256,
+            input: Bytes,
+            nonce: Option<U256>,
+            gas_price: Option<U256>,
+            v: Option<U256>,
+            r: Option<U256>,
+            s: Option<U256>,
+            y_parity: Option<U256>,
+            access_list: Option<Vec<serde::de::IgnoredAny>>,
+            blob_versioned_hashes: Option<Vec<serde::de::IgnoredAny>>,
+            authorization_list: Option<Vec<serde::de::IgnoredAny>>,
+            max_fee_per_gas: Option<U256>,
+            max_priority_fee_per_gas: Option<U256>,
+            max_fee_per_blob_gas: Option<U256>,
+        }
+        let rpc = Rpc::deserialize(deserializer)?;
+        if [rpc.nonce, rpc.gas_price, rpc.v, rpc.r, rpc.s, rpc.y_parity]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_zero())
+            || [
+                rpc.access_list,
+                rpc.blob_versioned_hashes,
+                rpc.authorization_list,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|values| !values.is_empty())
+            || rpc.max_fee_per_gas.is_some()
+            || rpc.max_priority_fee_per_gas.is_some()
+            || rpc.max_fee_per_blob_gas.is_some()
+        {
+            return Err(serde::de::Error::custom(
+                "invalid native RPC placeholder or fee field",
+            ));
+        }
+        let tx = Self {
+            chain_id: rpc.chain_id,
+            source_hash: rpc.source_hash,
+            gas_limit: rpc.gas,
+            to: rpc.to,
+            value: rpc.value,
+            input: rpc.input,
+        };
+        tx.validate().map_err(serde::de::Error::custom)?;
+        Ok(tx)
     }
 }
 
@@ -89,9 +186,7 @@ impl Decodable2718 for SystemTransaction {
             return Err(Eip2718Error::UnexpectedType(ty));
         }
         let tx = Self::decode(buf)?;
-        if tx.to != EEZL2_ADDRESS {
-            return Err(alloy_rlp::Error::Custom("system transaction must target EEZL2").into());
-        }
+        tx.validate()?;
         Ok(tx)
     }
 
@@ -118,19 +213,18 @@ impl SignerRecoverable for SystemTransaction {
     }
 }
 
-/// Expose a fixed execution budget and zero fees through Ethereum's transaction
-/// interface. Native envelopes carry neither gas settings nor fee settings.
+/// Expose the encoded gas budget and zero fee/nonce compatibility placeholders.
 impl Transaction for SystemTransaction {
     fn chain_id(&self) -> Option<u64> {
         Some(self.chain_id)
     }
 
     fn nonce(&self) -> u64 {
-        self.nonce
+        0
     }
 
     fn gas_limit(&self) -> u64 {
-        SYSTEM_TX_GAS_LIMIT
+        self.gas_limit
     }
 
     fn gas_price(&self) -> Option<u128> {
@@ -195,7 +289,7 @@ impl Transaction for SystemTransaction {
 pub enum EezTxEnvelope {
     #[envelope(flatten)]
     Ethereum(reth_ethereum_primitives::TransactionSigned),
-    #[envelope(ty = 118)]
+    #[envelope(ty = 69)]
     System(Sealed<SystemTransaction>),
 }
 
@@ -298,20 +392,19 @@ impl reth_codecs::Compact for EezTxType {
 }
 
 impl alloy_evm::FromRecoveredTx<EezTxEnvelope> for revm::context::TxEnv {
-    /// Native calls use the protocol sender, fixed gas budget, and zero price.
-    /// Keeping type `0x76` selects revm's Custom validation, bypassing Ethereum
-    /// fee checks while retaining nonce, chain ID, and metered gas rules.
+    /// Native calls use the protocol sender, encoded gas budget and zero price.
+    /// The custom handler retains chain and gas checks without a nonce transition.
     fn from_recovered_tx(tx: &EezTxEnvelope, sender: Address) -> Self {
         match tx {
             EezTxEnvelope::Ethereum(tx) => Self::from_recovered_tx(tx, sender),
             EezTxEnvelope::System(tx) => Self {
                 caller: SYSTEM_ADDRESS,
-                gas_limit: SYSTEM_TX_GAS_LIMIT,
+                gas_limit: tx.gas_limit,
                 gas_price: 0,
                 kind: TxKind::Call(tx.to),
                 value: tx.value,
                 data: tx.input.clone(),
-                nonce: tx.nonce,
+                nonce: 0,
                 chain_id: Some(tx.chain_id),
                 tx_type: SYSTEM_TX_TYPE,
                 ..Default::default()
