@@ -19,11 +19,7 @@ impl SystemTransactionReconstructor {
         &self,
         parent_hash: alloy_primitives::B256,
     ) -> Result<eez_protocol::native_source::SourceEntry, String> {
-        Ok(eez_protocol::native_source::LiveSourceContext::new(
-            self.context.l2_chain_id,
-            parent_hash,
-        )?
-        .entry(0))
+        eez_protocol::native_source::SourceEntry::new(self.context.l2_chain_id, parent_hash, 0)
     }
 
     pub(crate) fn new(l2_chain_id: u64, expected_rollup_id: NonZeroU64) -> Self {
