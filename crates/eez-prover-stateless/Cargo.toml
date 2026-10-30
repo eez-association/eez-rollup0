@@ -13,7 +13,7 @@ doc = false
 
 [dependencies]
 eez-primitives.workspace = true
-eez-evm.workspace = true
+eez-evm = { workspace = true, features = ["stateless"] }
 eez-proof-signer.workspace = true
 eez-protocol.workspace = true
 
@@ -48,6 +48,7 @@ eez-proof-signer = { workspace = true, features = ["test-utils"] }
 hex.workspace = true
 prost.workspace = true
 reth-trie-common.workspace = true
+reth-evm-ethereum.workspace = true
 tokio-stream = { workspace = true, features = ["net"] }
 tonic.workspace = true
 
