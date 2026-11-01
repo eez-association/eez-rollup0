@@ -2125,17 +2125,10 @@ where
                     .map_err(|e| format!("SyncBlockState::open: {e}"))
             })
             .and_then(|(state, draft)| {
-                if let BundleTarget::Exact {
-                    block,
-                    timestamp: target_time,
-                } = bundle_target
-                    && (state.anchor.number().checked_add(1) != Some(block)
-                        || target_time != timestamp)
+                if let BundleTarget::Exact { block, .. } = bundle_target
+                    && state.anchor.number().checked_add(1) != Some(block)
                 {
-                    return Err(
-                        "live settlement must extend its intended L1 parent at the target time"
-                            .into(),
-                    );
+                    return Err("live settlement must extend its intended L1 parent".into());
                 }
                 let cap = match bundle_target {
                     BundleTarget::Exact { timestamp, .. } => local

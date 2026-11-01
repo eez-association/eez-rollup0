@@ -182,20 +182,24 @@ async fn read_logs(
         |log: &ScannedLog| matches!(&log.event, Event::Posted(_, ids) if ids.contains(&rollup_id));
     let mut posts = Vec::new();
     for mut block in group_blocks(raw)? {
-        let header = logs
-            .get_block_by_hash(block.hash)
-            .await
-            .map_err(|error| L1Error::Provider(format!("fetch batch inclusion header: {error}")))?
-            .ok_or_else(|| L1Error::Provider("batch inclusion header unavailable".into()))?;
-        if header.header.number != block.number || header.header.hash != block.hash {
-            return Err(L1Error::Provider(
-                "batch inclusion header changed during scan".into(),
-            ));
+        if block.logs.iter().any(lists) {
+            let header = logs
+                .get_block_by_hash(block.hash)
+                .await
+                .map_err(|error| {
+                    L1Error::Provider(format!("fetch batch inclusion header: {error}"))
+                })?
+                .ok_or_else(|| L1Error::Provider("batch inclusion header unavailable".into()))?;
+            if header.header.number != block.number || header.header.hash != block.hash {
+                return Err(L1Error::Provider(
+                    "batch inclusion header changed during scan".into(),
+                ));
+            }
+            block.context = Some(eez_protocol::l1_context::LiveSettlementContext {
+                parent_hash: header.header.parent_hash,
+                timestamp: header.header.timestamp,
+            });
         }
-        block.context = Some(eez_protocol::l1_context::LiveSettlementContext {
-            parent_hash: header.header.parent_hash,
-            timestamp: header.header.timestamp,
-        });
         let number = block.number;
         let block_hash = block.hash;
         let mut calls_by_tx = BTreeMap::new();
@@ -861,6 +865,19 @@ mod tests {
         assert_eq!(first, (id, EOA, &s(&[(0, A)], 0, 1)));
         let next = (posts[1].id.l1_block, posts[1].tx_hash);
         assert_eq!(next, (BLOCK + 1, *tx_y.inner.tx_hash()));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_foreign_only_block_needs_no_header_transaction_or_trace() {
+        let logs = build(&[batch(&[2], vec![theirs()], 1)], &[L(0, 0), P(0)]).0;
+        let (asserter, rpc) = mock();
+        asserter.push_success(&logs);
+        // Only get_logs has an answer; any header, tx or trace request fails.
+        let posts = scan_range(&rpc, &rpc, EEZ, US, BLOCK, BLOCK)
+            .await
+            .expect("foreign-only block needs no additional RPC");
+        assert!(posts.is_empty());
         assert!(asserter.read_q().is_empty());
     }
 
