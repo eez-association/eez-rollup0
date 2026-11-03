@@ -27,6 +27,7 @@ async fn follower(w: &CrossChainWorld, name: &str, trace_rpc: String) -> NodeHan
     let cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(w.cfg.l2_genesis.0.as_path()),
+        ..Default::default()
     };
     NodeHandle::start(name, &cfg, &env).await.unwrap()
 }

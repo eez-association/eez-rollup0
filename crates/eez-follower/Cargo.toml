@@ -13,15 +13,20 @@ eez-deriver.workspace = true
 eez-driver.workspace  = true
 eez-l1.workspace      = true
 eez-node-common = { workspace = true, features = ["l1-startup"] }
+eez-p2p.workspace     = true
 eez-protocol.workspace = true
 eez-prover-stateful.workspace = true
+eez-seq-sig.workspace = true
 
 alloy-consensus.workspace    = true
 alloy-eips.workspace         = true
 alloy-primitives.workspace   = true
-alloy-provider.workspace     = true
 
 reth-chainspec.workspace                  = true
+reth-consensus-common.workspace           = true
+reth-network.workspace                    = true
+reth-network-p2p.workspace                = true
+reth-payload-primitives.workspace         = true
 reth-primitives-traits.workspace          = true
 reth-storage-api.workspace                = true
 
@@ -30,7 +35,6 @@ eyre.workspace      = true
 thiserror.workspace = true
 tokio.workspace     = true
 tracing.workspace   = true
-url.workspace       = true
 
 [lints]
 workspace = true

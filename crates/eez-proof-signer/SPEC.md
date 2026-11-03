@@ -167,7 +167,7 @@ Genesis document supplies its timestamp and genesis fields; a bare
 The stateful backend runs inside `eez-follower` and is configured only through the
 environment. It is enabled when `EEZ_STATEFUL_PROOF_SIGNER_ADDR` is present;
 otherwise the node MUST NOT expose the stateful `Prove` service. It MUST run
-only in follower mode without `EEZ_SEQUENCER_RPC`, so its database view is
+only in follower mode without `EEZ_SEQUENCER_ADDRESS`, so its database view is
 derived from L1 rather than a sequencer's unsafe head.
 
 The stateful service uses the running follower's chain specification and L2
