@@ -415,6 +415,7 @@ pub(super) fn run_settlement(
         &authorized_inbound_effects,
         system_transaction_reconstructor,
         expected_rollup_id.get(),
+        l1_context,
     )?;
 
     let recomputed_public_inputs_hash =

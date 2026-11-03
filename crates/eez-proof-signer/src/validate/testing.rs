@@ -25,7 +25,7 @@ impl SettlementBlockEvidence {
     /// RLP itself and rejects such a block, so no manufactured facts cross the
     /// checked boundary.
     pub(crate) fn from_rlp_for_test(rlp: &[u8]) -> Self {
-        let system_sender_flags = alloy_rlp::decode_exact::<EthereumBlock>(rlp)
+        let system_sender_flags: Vec<bool> = alloy_rlp::decode_exact::<EthereumBlock>(rlp)
             .map(|block| {
                 block
                     .body
@@ -40,6 +40,7 @@ impl SettlementBlockEvidence {
             })
             .unwrap_or_default();
         Self {
+            cumulative_gas_used: vec![0; system_sender_flags.len()],
             system_sender_flags,
             observed_outbound_events: Vec::new(),
         }

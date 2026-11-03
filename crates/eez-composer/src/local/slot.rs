@@ -116,6 +116,7 @@ pub(super) fn transact_err(e: EVMError<EvmDatabaseError<ProviderError>>) -> Exec
 fn fork_err(e: BuildError) -> ExecutorError {
     match e {
         provider @ BuildError::Provider(_) => provider_err(provider),
+        BuildError::Capacity => ExecutorError::Capacity,
         other => evm_err(other),
     }
 }
@@ -516,11 +517,11 @@ impl<CTX, I: Inspector<CTX>> Inspector<CTX> for SkipTopFrame<I> {
 // ── L2 block probe execution ─────────────────────────────────────
 
 /// Snapshot payload for [`InboundL2TargetSession`]: the fork's restore point
-/// plus the delivery nonce cursor, which advances per accepted delivery and
+/// plus the delivery source cursor, which advances per accepted delivery and
 /// must rewind with it.
 struct ProbeSnapshot {
     fork: ForkSnapshot,
-    delivery_nonce: u64,
+    delivery_source: eez_protocol::native_source::SourceEntry,
 }
 
 /// Target-chain session that resolves an inbound call by running the canonical
@@ -534,30 +535,34 @@ struct ProbeSnapshot {
 pub struct InboundL2TargetSession {
     fork: SyncBlockFork,
     cfg: SystemTxContext,
-    /// SYSTEM_ADDRESS nonce for the next delivery this composition appends.
-    delivery_nonce: u64,
+    /// Original full-candidate source of the next delivery.
+    delivery_source: eez_protocol::native_source::SourceEntry,
     this_rollup_id: u64,
 }
 
 impl std::fmt::Debug for InboundL2TargetSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InboundL2TargetSession")
-            .field("delivery_nonce", &self.delivery_nonce)
+            .field("delivery_source", &self.delivery_source)
             .field("this_rollup_id", &self.this_rollup_id)
             .finish_non_exhaustive()
     }
 }
 
 impl InboundL2TargetSession {
-    /// Open over `fork` (a fork of the block prefix) with the phase-2 nonce
+    /// Open over `fork` (a fork of the block prefix) with the phase-2 source
     /// cursor for the first delivery this composition would append.
     #[must_use]
-    pub fn new(fork: SyncBlockFork, cfg: SystemTxContext, delivery_nonce: u64) -> Self {
+    pub fn new(
+        fork: SyncBlockFork,
+        cfg: SystemTxContext,
+        delivery_source: eez_protocol::native_source::SourceEntry,
+    ) -> Self {
         let this_rollup_id = cfg.this_rollup_id;
         Self {
             fork,
             cfg,
-            delivery_nonce,
+            delivery_source,
             this_rollup_id,
         }
     }
@@ -586,15 +591,18 @@ impl InboundL2TargetSession {
     /// Lower one entry to its single delivery system tx at the current cursor.
     fn delivery_tx(&self, entry: &InboundSidecar) -> ExecutorResult<Bytes> {
         let txs =
-            build_inbound_system_txs(std::slice::from_ref(entry), &self.cfg, self.delivery_nonce)
+            build_inbound_system_txs(std::slice::from_ref(entry), &self.cfg, self.delivery_source)
                 .map_err(|e| encoding_err(format!("build_inbound_system_txs: {e}")))?;
-        let [tx] = <[Bytes; 1]>::try_from(txs).map_err(|txs| {
-            encoding_err(format!(
-                "one inbound entry must lower to exactly one delivery tx; got {}",
-                txs.len()
-            ))
-        })?;
-        Ok(tx)
+        let [tx] = <[eez_protocol::system_tx::NativeTransactionPlan; 1]>::try_from(txs).map_err(
+            |txs| {
+                encoding_err(format!(
+                    "one inbound entry must lower to exactly one delivery tx; got {}",
+                    txs.len()
+                ))
+            },
+        )?;
+        tx.at_position(eez_driver::BUILDER_GAS_LIMIT, self.fork.gas_used())
+            .map_err(encoding_err)
     }
 }
 
@@ -632,6 +640,13 @@ impl TargetExecutionSession for InboundL2TargetSession {
         let captured = match inspector.captures.as_slice() {
             [one] => one.clone(),
             [] => {
+                if eez_primitives::system_tx_gas_limit(
+                    eez_driver::BUILDER_GAS_LIMIT,
+                    self.fork.gas_used(),
+                ) < eez_primitives::SYSTEM_TX_GAS_CAP
+                {
+                    return Err(ExecutorError::Capacity);
+                }
                 return Err(encoding_err(format!(
                     "inbound probe never reached the EEZL2→proxy frame for {} \
                      (entry hash or table mismatch); probe success={} output={}",
@@ -648,6 +663,14 @@ impl TargetExecutionSession for InboundL2TargetSession {
             }
         };
 
+        if !captured.success
+            && eez_primitives::system_tx_gas_limit(
+                eez_driver::BUILDER_GAS_LIMIT,
+                self.fork.gas_used(),
+            ) < eez_primitives::SYSTEM_TX_GAS_CAP
+        {
+            return Err(ExecutorError::Capacity);
+        }
         if !captured.success {
             return Err(encoding_err(format!(
                 "inbound target {} reverted during delivery; reverting targets \
@@ -663,17 +686,25 @@ impl TargetExecutionSession for InboundL2TargetSession {
         let final_entry = self.inbound_sidecar_for_call(&req, captured.output.clone())?;
         let final_tx = self.delivery_tx(&final_entry)?;
         let real = self.fork.execute_tx(&final_tx).map_err(fork_err)?;
+        if !real.success
+            && eez_primitives::system_tx_gas_limit(
+                eez_driver::BUILDER_GAS_LIMIT,
+                self.fork.gas_used().saturating_sub(real.gas_used),
+            ) < eez_primitives::SYSTEM_TX_GAS_CAP
+        {
+            return Err(ExecutorError::Capacity);
+        }
         if !real.success {
             return Err(encoding_err(format!(
                 "canonical delivery for {} reverted on the block prefix at \
-                 SYSTEM nonce {}: {}",
-                req.target_address, self.delivery_nonce, real.output
+                 source group {}: {}",
+                req.target_address,
+                self.delivery_source.index(),
+                real.output
             )));
         }
 
-        self.delivery_nonce = self.delivery_nonce.checked_add(1).ok_or_else(|| {
-            encoding_err("SYSTEM_ADDRESS delivery nonce overflow in InboundL2TargetSession")
-        })?;
+        self.delivery_source = self.delivery_source.offset(1).map_err(encoding_err)?;
 
         tracing::debug!(
             target = %req.target_address,
@@ -692,7 +723,7 @@ impl TargetExecutionSession for InboundL2TargetSession {
     fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot> {
         Ok(Box::new(ProbeSnapshot {
             fork: self.fork.snapshot(),
-            delivery_nonce: self.delivery_nonce,
+            delivery_source: self.delivery_source,
         }))
     }
 
@@ -701,7 +732,7 @@ impl TargetExecutionSession for InboundL2TargetSession {
             encoding_err("InboundL2TargetSession::rollback: snapshot type mismatch")
         })?;
         self.fork.restore(snap.fork);
-        self.delivery_nonce = snap.delivery_nonce;
+        self.delivery_source = snap.delivery_source;
         Ok(())
     }
 }
