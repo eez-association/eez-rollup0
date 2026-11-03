@@ -127,9 +127,9 @@ fn fork_err(e: BuildError) -> ExecutorError {
 /// accumulated cache of every effect committed this slot (manager frames and
 /// inbound source sims).
 ///
-/// The anchor never moves during a drain — the bundle lands at least one L1
-/// block later regardless, and a moving base would make claims depend on
-/// wall-clock arrival order (design §5, "L1 base drift").
+/// The anchor never moves during a drain: a live bundle must land in its
+/// immediate child at the bound timestamp. A moving base would make claims
+/// depend on wall-clock arrival order (design §5, "L1 base drift").
 #[derive(Debug)]
 pub struct L1SlotState {
     /// L1 head at drain start; every fork opens its state here.

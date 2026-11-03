@@ -815,6 +815,24 @@ impl SessionRuntime {
                 "this Rollup0 deployment uses calldata settlement without blobs",
             ));
         }
+        let l1_parent_hash = settlement
+            .posting_context
+            .as_ref()
+            .map(|context| {
+                if context.chain_id != 0 || context.parent_number != 0 {
+                    return Err(Status::invalid_argument(
+                        "Rollup0 posting context must use parent/time-only fields",
+                    ));
+                }
+                let context = eez_protocol::l1_context::LiveSettlementContext {
+                    parent_hash: parse_b256("L1 parent hash", &context.parent_hash)?,
+                    timestamp: context.target_timestamp,
+                }
+                .validate()
+                .map_err(Status::invalid_argument)?;
+                Ok(context.parent_hash)
+            })
+            .transpose()?;
         let session = self.session(bound.id).await?;
         // Check the requested range and terminal identity, then snapshot its artifacts and anchor.
         let (anchor, validated_window, start_index, cancellation) = {
@@ -822,20 +840,19 @@ impl SessionRuntime {
             require_epoch(&session, bound.epoch)?;
             let (anchor, window, start_index) =
                 session.select_window(&finalize, terminal_hash, self.limits)?;
+            if let Some(context) = &settlement.posting_context
+                && context.target_timestamp != window.settling_block().decoded().header.timestamp
+            {
+                return Err(Status::invalid_argument(
+                    "Rollup0 posting context must match terminal time",
+                ));
+            }
             // A deadline cancels this attempt, not every later Finalize in the epoch.
             // Controls still cancel the currently installed token under this same lock.
             session.cancellation.cancel();
             session.cancellation = CancellationToken::default();
             (anchor, window, start_index, session.cancellation.clone())
         };
-
-        let l1_parent_hash = settlement.posting_context.as_ref().map(|context| {
-            if context.target_timestamp != validated_window.settling_block().decoded().header.timestamp
-                || context.chain_id != 0 || context.parent_number != 0 {
-                return Err(Status::invalid_argument("Rollup0 posting context must match terminal time and use parent/time-only fields"));
-            }
-            parse_b256("L1 parent hash", &context.parent_hash)
-        }).transpose()?;
         let state = Arc::clone(&self.state);
         match timeout(
             self.limits.request_timeout(),
@@ -2156,6 +2173,88 @@ mod tests {
             runtime.session(b.id).await.unwrap().lock().await.tip().hash,
             B256::repeat_byte(0x22)
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_posting_context_preserves_session_before_a_valid_retry() {
+        let runtime = SessionRuntime::new(
+            state_with_delay(Arc::new(AtomicUsize::new(0)), Duration::ZERO),
+            limits(),
+        );
+        let (bound, _) = runtime.begin(begin()).await.unwrap();
+        let input = block_after(11, B256::repeat_byte(0x11), 0x33);
+        let hash = B256::from_slice(&input.data.as_ref().unwrap().hash);
+        runtime.validate_block(bound, input).await.unwrap();
+        let mut settlement = post_batch(B256::repeat_byte(0x11), hash, 1);
+        let mut batch =
+            eez_protocol::abi::postAndVerifyBatchCall::abi_decode(&settlement.abi_calldata)
+                .unwrap()
+                .batch;
+        batch.blockNumber = u64::MAX;
+        settlement.abi_calldata = eez_protocol::entries::encode_postbatch(&batch);
+        settlement.posting_context = Some(eez_control_rpc::v2::L1PostingContext {
+            parent_hash: vec![0x99; 32],
+            target_timestamp: 0x33,
+            ..Default::default()
+        });
+        let finalize = eez_control_rpc::v2::Finalize {
+            from_block: 11,
+            to_block: 11,
+            terminal_hash: hash.to_vec(),
+            settlement: Some(settlement),
+        };
+        let session = runtime.session(bound.id).await.unwrap();
+        let cancellation = session.lock().await.cancellation.clone();
+        for case in [
+            "chain id",
+            "parent number",
+            "zero parent",
+            "short parent",
+            "long parent",
+            "zero timestamp",
+            "mismatched timestamp",
+        ] {
+            let mut invalid = finalize.clone();
+            let context = invalid
+                .settlement
+                .as_mut()
+                .unwrap()
+                .posting_context
+                .as_mut()
+                .unwrap();
+            match case {
+                "chain id" => context.chain_id = 1,
+                "parent number" => context.parent_number = 1,
+                "zero parent" => context.parent_hash.fill(0),
+                "short parent" => context.parent_hash.truncate(31),
+                "long parent" => context.parent_hash.push(0),
+                "zero timestamp" => context.target_timestamp = 0,
+                "mismatched timestamp" => context.target_timestamp += 1,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                runtime.finalize(bound, invalid).await.unwrap_err().code(),
+                tonic::Code::InvalidArgument,
+                "{case}",
+            );
+            assert!(
+                !cancellation.is_cancelled(),
+                "{case}: replaced cancellation token"
+            );
+            let session = session.lock().await;
+            assert_eq!(session.anchor.number, 10, "{case}");
+            assert_eq!(session.tip().hash, hash, "{case}");
+            assert_eq!(session.blocks.len(), 1, "{case}");
+            assert_eq!(session.proved_through, 10, "{case}");
+            assert_eq!(session.epoch, bound.epoch, "{case}");
+        }
+        // A valid live retry still signs without Resume/Rewind or revalidation.
+        assert_eq!(
+            runtime.finalize(bound, finalize).await.unwrap().proof.len(),
+            65
+        );
+        assert!(cancellation.is_cancelled());
+        assert_eq!(session.lock().await.proved_through, 11);
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ more cases requiring explicit server limits. Together they contain 339 requests,
 | --- | --- |
 | Begin | Correct anchor; unsupported rollup; missing/31/33-byte hashes and roots; number overflow; invalid initial binding; repeated Begin. |
 | Block | Execution; duplicate at/before tip; missing data/witness; hash widths; zero/max/gapped numbers; contradictory parent/hash/RLP; invalid witness then valid retry; cache-parent binding. |
-| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; unsupported blobs/profile inputs, invalid ranges before context checks and malformed Rollup0 posting-context fields; valid retry. |
+| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; unsupported blobs/profile inputs; malformed Rollup0 posting-context fields rejected before range selection; valid retry. |
 | Resume | Progress after half-close and Proof; live takeover; missing/malformed/retired session; nonzero initial epoch; stale transport cannot use the new epoch. |
 | Rewind | Tip, intermediate block and anchor; malformed/unknown/pruned ancestors; stale epoch; removed suffix cannot finalize; promoted anchor survives Resume. |
 | Cancel | Acknowledgement and EOF; retired session cannot resume; cross-stream cancellation denied; another Composer can finish. |
@@ -90,7 +90,11 @@ The runner substitutes server-issued IDs and epochs for recorded placeholders,
 checks session isolation and epoch changes, and preserves literal unknown or
 malformed bindings. It ignores only `Validated.reused` and `Rejected.message`.
 Status, authoritative cursor, binding, public-input hash, ordering and EOF remain
-assertions. Each proof's signature must recover the configured attester over the
+assertions. Malformed posting context rejects with INVALID_ARGUMENT before
+session range selection: this includes the empty context in the invalid-range
+Finalize and nonzero Rollup0 chain-ID/parent-number fields. These context checks
+do not change the proof oracles. Each proof's signature must recover the
+configured attester over the
 expected digest; a different valid ECDSA nonce is allowed. The saved deterministic
 signature is a reference, not a requirement for byte-identical ECDSA output.
 
@@ -122,8 +126,8 @@ SYSTEM/EEZL2 account proof nodes. Block bytes and proof-response digests are unc
 The two-block payload and witness quotas include those extra nodes; the message
 size vectors reduce only their inert code padding to retain the 4096/4097-byte boundary.
 
-Context rejection vectors now pin the applicable validation failures instead
-of blanket UNIMPLEMENTED: an unvalidated Finalize range returns
-FAILED_PRECONDITION, and fields outside the Rollup0 parent/time profile return
-INVALID_ARGUMENT. Both preserve the validated cursor. Nonempty blobs still
+Context rejection vectors pin the applicable validation failures instead of
+blanket UNIMPLEMENTED: malformed Rollup0 posting context returns INVALID_ARGUMENT
+before range selection. With valid context, an unvalidated Finalize range returns
+FAILED_PRECONDITION. Both preserve the validated cursor. Nonempty blobs still
 return UNIMPLEMENTED.

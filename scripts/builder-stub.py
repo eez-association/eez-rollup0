@@ -75,6 +75,8 @@ class Builder:
     block_time = 2
     mode = "forward"
     mining = True
+    # Relay bundles to the upstream instead of mining them; no ticker.
+    passthrough = False
     # Serialises every block the stub mines; Anvil mines nothing else.
     lock = threading.Lock()
     # Target block number -> queued bundle params, in arrival order.
@@ -276,6 +278,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with Builder.lock:
                 return self._result(body, list(Builder.rejected))
         if method == "eth_sendBundle":
+            if Builder.passthrough and Builder.mode == "forward":
+                return None
             try:
                 return self._result(body, Builder.queue(params[0]))
             except (IndexError, KeyError, TypeError, ValueError, RuntimeError) as error:
@@ -319,16 +323,23 @@ def main():
         "--upstream", required=True, help="anvil RPC url (started with --no-mining)"
     )
     p.add_argument("--block-time", type=int, default=2)
+    p.add_argument(
+        "--passthrough",
+        action="store_true",
+        help="relay bundles to a non-Anvil upstream unchanged (drop mode still drops)",
+    )
     args = p.parse_args()
     host, port = args.listen.split(":")
     Builder.upstream = args.upstream
     Builder.block_time = args.block_time
+    Builder.passthrough = args.passthrough
 
     class Reusable(socketserver.ThreadingTCPServer):
         allow_reuse_address = True
         daemon_threads = True
 
-    threading.Thread(target=Builder.tick_forever, daemon=True).start()
+    if not args.passthrough:
+        threading.Thread(target=Builder.tick_forever, daemon=True).start()
     with Reusable((host, int(port)), Handler) as srv:
         srv.serve_forever()
 
