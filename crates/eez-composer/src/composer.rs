@@ -4003,6 +4003,7 @@ where
             }
             b
         };
+        batch.blockNumber = if l1_context.is_some() { u64::MAX } else { 0 };
 
         // Prepend one leading immediate entry (`proxyEntryHash == 0`)
         // covering all L2 effects before the sync block — EEZ.sol drains
@@ -4435,7 +4436,6 @@ where
             // Tests may use a lightweight prover without a witness source.
             None => Vec::new(),
         };
-        batch.blockNumber = if l1_context.is_some() { u64::MAX } else { 0 };
         let proving_ctx = ProvingContext {
             rollup_id,
             from_block: from,
