@@ -558,7 +558,7 @@ fn verify(
     );
     let commitment = commitment.map_err(|e| unsupported(format!("{here}: {e}")))?;
     let mismatch = format!("{here}: call hashes to {commitment}, not {spi}");
-    // Only a co-listed rollup's block-zero customData can explain a mismatch (EEZ.sol:753-762).
+    // A co-listed rollup may return different customData for either supported selector (EEZ.sol:753-762).
     ensure!(commitment == spi || ids.len() > 1, "{mismatch}");
     if commitment != spi {
         return Err(unsupported(mismatch));

@@ -4,7 +4,7 @@
 
 use super::{
     ANVIL_ADDR, ANVIL_KEY_3, CrossChainWorld, DEV_CHAIN_ID, NodeBinary, NodeConfig, NodeHandle,
-    PortLease, SETUP_TIMEOUT, signer_address, wait_for,
+    PortLease, SETUP_TIMEOUT, SYNC_L1_ONLY_ENV, signer_address, wait_for,
 };
 use alloy_primitives::{Address, B256, hex};
 use alloy_provider::{Provider, ProviderBuilder};
@@ -94,6 +94,7 @@ pub async fn spawn_composer(world: &CrossChainWorld, builder_url: &str) -> Resul
         &NodeConfig {
             binary: NodeBinary::Composer,
             genesis_path: Some(&world.cfg.l2_genesis.0),
+            ..Default::default()
         },
         &env,
         port_leases.into(),
@@ -237,12 +238,14 @@ pub async fn spawn_follower(world: &CrossChainWorld, name: &str) -> Result<NodeH
         ("EEZ_L2_BLOCK_TIME_MS", "1000".to_string()),
         ("EEZ_PROOF_TIME_MS", "1000".to_string()),
         ("EEZ_SUBMISSION_SLACK_MS", "100".to_string()),
+        (SYNC_L1_ONLY_ENV, "1".to_string()),
     ];
     NodeHandle::start(
         name,
         &NodeConfig {
             binary: NodeBinary::Follower,
             genesis_path: Some(&world.cfg.l2_genesis.0),
+            ..Default::default()
         },
         &env,
     )
