@@ -84,6 +84,7 @@ standalone chiado-reth.
 cp .env.example .env
 #   EEZ_L1_RPC_URL=<tip chiado RPC>   EEZ_L1_POSTER_KEY=<operator key>
 #   EEZ_PROOF_SIGNER_KEY=<operator key>   (its address becomes the proof system's authorizedSigner)
+#   EEZ_L2_RECOVERY_ADDRESS=<L2 EOA or multisig you control, distinct from the system address>
 EEZ_DEPLOY_SKIP_SIMULATION=1 make deploy-protocol
 ```
 

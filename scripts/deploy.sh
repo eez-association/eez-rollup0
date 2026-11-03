@@ -58,10 +58,12 @@ PROOF_SYSTEM_VKEY="0x000000000000000000000000${AUTHORIZED_SIGNER#0x}"
 OWNER="$(cast wallet address --private-key "$EEZ_DEPLOY_KEY")"
 EEZ_L2_SYSTEM_ADDRESS="0xfffffffffffffffffffffffffffffffffffffffe"
 EEZ_L2_RECOVERY_ADDRESS="$(cast to-check-sum-address "$EEZ_L2_RECOVERY_ADDRESS")"
-if [[ "${EEZ_L2_RECOVERY_ADDRESS,,}" == "0x0000000000000000000000000000000000000000" ]]; then
-    echo "deploy: EEZ_L2_RECOVERY_ADDRESS must be non-zero" >&2
-    exit 1
-fi
+case "$(printf '%s' "$EEZ_L2_RECOVERY_ADDRESS" | tr '[:upper:]' '[:lower:]')" in
+    0x0000000000000000000000000000000000000000|"$EEZ_L2_SYSTEM_ADDRESS")
+        echo "deploy: EEZ_L2_RECOVERY_ADDRESS must be non-zero and differ from the reserved L2 system address" >&2
+        exit 1
+        ;;
+esac
 if [[ "${AUTHORIZED_SIGNER,,}" == "${EEZ_L2_SYSTEM_ADDRESS,,}" ]]; then
     echo "deploy: proof attester must differ from the reserved L2 system address" >&2
     exit 1
