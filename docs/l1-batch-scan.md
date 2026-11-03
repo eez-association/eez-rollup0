@@ -16,9 +16,13 @@ calls + queues   -> ownership   in a call: that post; else the queue's latest li
 owner's bytes    -> settlement  exact entry index; rolling hash and roots checked
 ```
 
-Only transactions holding a post that lists this rollup are fetched; a post
-not listing it is never decoded but still resets its queues.
-An inclusion header is fetched only for blocks with a post listing this rollup.
+Only transactions holding a post that lists this rollup are fetched. Their
+committed calls are ABI-decoded once; only posts listing this rollup have their
+commitments verified. Other posts still reset their queues.
+An inclusion header is fetched only when a decoded live post lists this rollup,
+once per block after fetching its transactions and any required traces. Timeless
+posts need no inclusion-header request. Missing or mismatched inclusion headers
+are retryable `SourceIncomplete` errors carrying the block number.
 Its hash and number must match the logs; its parent hash and timestamp provide
 the context for live settlement verification.
 
