@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use alloy_consensus::Transaction as _;
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_eth::{Log, Transaction};
 use alloy_rpc_types_trace::geth::CallFrame;
 use alloy_sol_types::{SolCall, SolEvent};
@@ -67,13 +67,23 @@ pub(super) struct Consumed {
     index: u64,
 }
 
-/// A committed `postAndVerifyBatch` call into EEZ: the exact bytes, EEZ's
+/// A committed `postAndVerifyBatch` call into EEZ: the decoded batch, EEZ's
 /// `msg.sender`, and the scanned logs of its committed subtree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(super) struct Call {
-    pub input: Bytes,
+    // Defer decode errors until ownership is known: foreign call data is not verified.
+    pub batch: Result<EvmBatch, String>,
     pub from: Address,
     pub logs: usize,
+}
+
+impl Call {
+    fn decode(input: &[u8], from: Address, logs: usize) -> Self {
+        let batch = postAndVerifyBatchCall::abi_decode_validate(input)
+            .map(|call| call.batch)
+            .map_err(|error| error.to_string());
+        Self { batch, from, logs }
+    }
 }
 
 /// Names a log's position for error messages.
@@ -298,11 +308,7 @@ fn parse_tx(block: u64, logs: &[ScannedLog]) -> L1Result<Tx<'_>> {
 pub(super) fn direct_call(tx: &Transaction, eez: Address, logs: usize) -> Option<Call> {
     let input = tx.input();
     let direct = tx.to() == Some(eez) && input.starts_with(&postAndVerifyBatchCall::SELECTOR);
-    direct.then(|| Call {
-        input: input.clone(),
-        from: tx.inner.signer(),
-        logs,
-    })
+    direct.then(|| Call::decode(input, tx.inner.signer(), logs))
 }
 
 /// A traced tx's committed post calls in execution order, and its committed
@@ -327,11 +333,7 @@ pub(super) fn calls_in_tx(
         }
         let inside = if post { Some(out.0.len()) } else { inside };
         if post {
-            out.0.push(Call {
-                input: frame.input.clone(),
-                from: frame.from,
-                logs: 0,
-            });
+            out.0.push(Call::decode(&frame.input, frame.from, 0));
         }
         // Count this frame's own scanned EEZ logs, for the tx and the post it runs in.
         let scanned = frame.logs.iter().filter(|log| {
@@ -533,9 +535,10 @@ fn verify(
     here: &str,
     context: Option<eez_protocol::l1_context::LiveSettlementContext>,
 ) -> L1Result<EvmBatch> {
-    let decoded = postAndVerifyBatchCall::abi_decode_validate(&call.input);
-    let decoded = decoded.map_err(|e| L1Error::Decode(format!("{here}: bad call: {e}")))?;
-    let batch = decoded.batch;
+    let batch = call
+        .batch
+        .as_ref()
+        .map_err(|error| L1Error::Decode(format!("{here}: bad call: {error}")))?;
     // EEZ emits the batch's own rollup list (EEZ.sol:471-475).
     let listed = batch.rollupIdsWithProofSystems.iter().map(|r| r.rollupId);
     let same = listed.eq(ids.iter().copied());
@@ -548,7 +551,7 @@ fn verify(
     // Accept only timeless or the reference manager's live parent/time profile.
     // Other block selectors and blob profiles require separate verification.
     let commitment = batch_shared_public_input_with_context(
-        &batch,
+        batch,
         call.from,
         if batch.blockNumber == u64::MAX {
             context
@@ -563,7 +566,7 @@ fn verify(
     if commitment != spi {
         return Err(unsupported(mismatch));
     }
-    Ok(batch)
+    Ok(batch.clone())
 }
 
 /// A post listing us, while its block is read.
