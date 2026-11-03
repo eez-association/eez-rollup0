@@ -16,8 +16,15 @@ calls + queues   -> ownership   in a call: that post; else the queue's latest li
 owner's bytes    -> settlement  exact entry index; rolling hash and roots checked
 ```
 
-Only transactions holding a post that lists this rollup are fetched; a post
-not listing it is never decoded but still resets its queues.
+Only transactions holding a post that lists this rollup are fetched. Their
+committed calls are ABI-decoded once; only posts listing this rollup have their
+commitments verified. Other posts still reset their queues.
+An inclusion header is fetched only when a decoded live post lists this rollup,
+once per block after fetching its transactions and any required traces. Timeless
+posts need no inclusion-header request. Missing or mismatched inclusion headers
+are retryable `SourceIncomplete` errors carrying the block number.
+Its hash and number must match the logs; its parent hash and timestamp provide
+the context for live settlement verification.
 
 ## Records
 
@@ -56,11 +63,15 @@ Each call whose post lists this rollup is checked against its own `BatchPosted`:
 
 1. the bytes decode as `postAndVerifyBatch`, else `Decode`;
 2. `rollupIdsWithProofSystems[].rollupId` equals `rollupIds`, else `Decode`;
-3. no `blobIndices` and `blockNumber == 0`, else `Unsupported`;
-4. `batch_shared_public_input(batch, sender)` equals `sharedPublicInput`
+3. no `blobIndices`, with `blockNumber == 0` (timeless) or `uint64.max`
+   (the reference manager's live parent/time profile), else `Unsupported`;
+4. `batch_shared_public_input_with_context(batch, sender, context)` equals `sharedPublicInput`
    (`:753-762`), else `Decode`, or `Unsupported` when another listed rollup
-   may bind `customData` the scan cannot reproduce. The proof signer's
-   `public_inputs_hashes` uses the same composition, so the two cannot drift.
+   may bind `customData` the scan cannot reproduce for either selector. Timeless
+   batches use no context and empty custom data. Live batches use the inclusion
+   header's parent hash and timestamp to reproduce
+   `abi.encode(uint256(timestamp), bytes32(parent_hash))`. The proof signer's
+   `public_inputs_hashes_with_context` uses the same composition, so the two cannot drift.
 
 The hash does not bind `immediateEntryCount`, `expectedRootPerRollup` or the
 proofs; the scan reads them from the exact bytes EEZ received.
@@ -135,7 +146,9 @@ A trace costs milliseconds against a 12 s slot.
 ## Unsupported shapes
 
 - **Blobs.** The scan reads no blob data; the composer never sets `blobIndices`.
-- **`blockNumber != 0`.** `customData` comes from the rollup's `getCustomData`,
-  which may read any state, so the call alone cannot recompute the hash.
+- **Other block selectors or custom-data profiles.** Only `blockNumber == 0`
+  with empty custom data and `uint64.max` with the reference manager's inclusion
+  parent/time encoding are supported. Other managers' `getCustomData` may read
+  arbitrary state that the scan cannot reproduce.
 - **`upgradeToAndCall` posts.** They run by `DELEGATECALL` into a proxied EEZ;
   ours is not proxied.

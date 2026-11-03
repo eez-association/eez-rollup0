@@ -329,8 +329,8 @@ fn rejects_a_header_without_post_batch() {
 }
 
 #[test]
-fn requires_an_empty_l1_block_hash() {
-    for actual in [1, 32] {
+fn admits_only_absent_or_nonzero_full_width_l1_parent_hash() {
+    for actual in [1, 31, 32, 33] {
         let mut header_chunk = header(5, 5);
         let Some(prove_chunk::Kind::Header(wire_header)) = &mut header_chunk.kind else {
             unreachable!();
@@ -348,10 +348,17 @@ fn requires_an_empty_l1_block_hash() {
     }
 
     WindowAssembler::start(generous_limits(), header(5, 5)).unwrap();
+    let mut live_header = header(5, 5);
+    let Some(prove_chunk::Kind::Header(wire_header)) = &mut live_header.kind else {
+        unreachable!();
+    };
+    wire_header.post_batch.as_mut().unwrap().l1_block_hash = vec![0x99; 32];
+    let window = assemble([live_header, block(5, 4, 5)]).unwrap();
+    assert_eq!(window.header.l1_parent_hash, Some(B256::repeat_byte(0x99)));
 }
 
 #[test]
-fn nonempty_l1_block_hash_precedes_the_block_quota() {
+fn invalid_l1_block_hash_precedes_the_block_quota() {
     let mut over_quota = header(5, 7);
     let Some(prove_chunk::Kind::Header(wire_header)) = &mut over_quota.kind else {
         unreachable!();

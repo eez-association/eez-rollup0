@@ -43,8 +43,8 @@ where:
 The profile supports exactly one nonzero rollup ID, one nonzero proof-system
 address, and one nonzero proof-system verification key. It does not support
 static entries, nested calls, multiple calls per effect, explicit call gas,
-force-revert spans, blobs, L1 block binding, sender binding, or multiple proof
-systems.
+force-revert spans, blobs, historical L1 block selectors, sender binding, or multiple
+proof systems. Live batches can bind the intended L1 parent and inclusion time.
 
 No failed stage may produce a signature. A successful signature authorizes the
 locally recomputed public-input hash only under all rules in this document.
@@ -269,7 +269,7 @@ The header is admitted only if:
 - `from_block <= to_block`;
 - the inclusive span `to_block - from_block + 1` is representable and no larger
   than `max_request_blocks`; and
-- `post_batch.l1_block_hash` is empty.
+- `post_batch.l1_block_hash` is empty for timeless batches, or the nonzero 32-byte intended L1 parent for live batches.
 
 `post_batch.public_inputs_hash` is a non-authoritative Composer claim and MUST
 be ignored. It is not length-checked and is never signed. Only
@@ -459,7 +459,7 @@ The decoded batch MUST satisfy all of these profile rules:
 6. `immediateStaticEntryCount == 0`.
 7. `immediateEntryCount` equals the complete leading run of mutable entries
    whose `proxyEntryHash == 0`.
-8. `blockNumber == 0`.
+8. `blockNumber == 0` with no L1 context, or `uint64.max` with live parent/time context. Any system transaction requires the live profile.
 9. `blobIndices` is empty.
 10. `bindMsgSenderInPublicInput == false`.
 
@@ -468,7 +468,29 @@ is responsible for inserting the returned signature into the correct proof
 carrier and satisfying the on-chain `proofSystems.length == proofs.length`
 requirement.
 
-This profile assumes the deployed rollup manager returns empty `customData` for
+Live proofs bind `abi.encode(uint256(terminalTimestamp), intendedL1ParentHash)` through `getCustomData(uint64.max)`. The signer takes time from the validated terminal header; v2 must supply that same time. L1 checks actual inclusion time and parent. The signer does not query L1: these are conditional proofs. v2 uses `posting_context` with that parent/time and zero chain ID/parent number.
+
+Ordinary-only batches may use the timeless profile because their execution does
+not require inclusion in a particular L1 block. This lets ordinary history and
+historical catch-up settle later without rejection merely because an intended
+inclusion slot was missed. An empty terminal Sync block can also be timeless:
+eligibility depends on the actual transactions, not the block's scheduling label.
+Timeless settlement still requires a valid proof and matching predecessor/state
+chain; it does not bypass replay protection.
+
+Rich Sync blocks containing system transactions MUST use the live profile to
+coordinate L1 and L2 execution in the intended context. The shared prover
+pipeline enforces this before signing for both backends and both RPC versions:
+it rejects a terminal system transaction without live context, requires the
+context to match the batch selector, and rejects system transactions in
+intermediate blocks. A missed live batch cannot be downgraded to timeless mode.
+
+The smart contract enforces the selected parent/time binding when consuming the
+proof. It does not independently inspect L2 transactions to decide whether
+timeless mode is permissible; that eligibility rule relies on prover validation.
+Changing the selector of an existing proof changes its signed public inputs.
+
+The timeless profile assumes the deployed rollup manager returns empty `customData` for
 `getCustomData(0)`, as the pinned reference `Rollup` does. The configured vkey
 and proof-system address MUST match the deployed manager configuration; the
 signer does not query L1 to confirm them.
@@ -735,7 +757,9 @@ For the supported profile:
 ```text
 staticEntryHashes = []
 blobHashes        = []
-customData        = bytes("")
+customData        = bytes("") for blockNumber == 0
+                  = abi.encode(uint256(terminalTimestamp), intendedL1ParentHash)
+                    for blockNumber == uint64.max
 customDataHash    = H(abi.encode(uint64(expected_rollup_id), customData))
 customDataHashes  = dynamic bytes32[] containing only customDataHash
 boundSender       = address(0)
