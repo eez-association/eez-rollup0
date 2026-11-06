@@ -940,17 +940,18 @@ async fn quorum_prover_rejects_a_foreign_rollup_identity() {
             ..Default::default()
         };
         let (requests, receiver) = tokio::sync::mpsc::channel(1);
-        let mut response = client
-            .prove_stream(tokio_stream::wrappers::ReceiverStream::new(receiver))
-            .await
-            .unwrap()
-            .into_inner();
         requests.send(frame).await.unwrap();
-        let frame = tokio::time::timeout(Duration::from_secs(10), response.message())
-            .await
-            .unwrap()
-            .unwrap()
-            .expect("Begin must receive a protocol response");
+        let frame = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut response = client
+                .prove_stream(tokio_stream::wrappers::ReceiverStream::new(receiver))
+                .await?
+                .into_inner();
+            response.message().await
+        })
+        .await
+        .expect("Begin exchange must complete within its deadline")
+        .unwrap()
+        .expect("Begin must receive a protocol response");
         if foreign {
             assert!(frame.session_id.is_empty());
             assert_eq!(frame.epoch, 0);
