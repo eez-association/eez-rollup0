@@ -24,6 +24,7 @@ use std::sync::Arc;
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider as _;
+use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use eez_driver::{
     BUILDER_GAS_LIMIT, BlockCommitterHandle, MAX_BLOCKS_PER_BATCH, ParentContext, RollupTiming,
@@ -795,12 +796,21 @@ async fn read_rollup_escrow(
     registry: Address,
     rid: u64,
 ) -> Option<U256> {
-    IEEZReader::new(registry, provider)
-        .rollups(rid)
-        .call()
+    let request = alloy_rpc_types_eth::TransactionRequest::default()
+        .to(registry)
+        .input(
+            eez_protocol::abi::rollupsCall { rollupId: rid }
+                .abi_encode()
+                .into(),
+        );
+    let output = provider
+        .call(request)
+        .block(alloy_eips::BlockNumberOrTag::Latest.into())
         .await
+        .ok()?;
+    eez_protocol::abi::rollupsCall::abi_decode_returns(&output)
         .ok()
-        .map(|r| r.etherBalance)
+        .map(|rollup| rollup.etherBalance)
 }
 
 /// Read L1 nonces for inbound senders at `at`.

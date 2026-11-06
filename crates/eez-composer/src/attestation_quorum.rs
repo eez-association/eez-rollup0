@@ -513,14 +513,12 @@ impl QuorumRegistration {
 
 alloy_sol_types::sol! {
     /// The attestation settings of a rollup's manager contract (`Rollup.sol`).
-    #[sol(rpc)]
     interface IRollupAttestationReader {
         function threshold() external view returns (uint256);
         function verificationKey(address proofSystem) external view returns (bytes32);
     }
 
     /// The signer an `ECDSAProofSystem` accepts.
-    #[sol(rpc)]
     interface IEcdsaProofSystemReader {
         function signer() external view returns (address);
     }
@@ -608,10 +606,16 @@ async fn rollup_manager(
     registry: Address,
     rollup_id: u64,
 ) -> Result<Address, RegistrationError> {
-    let manager = crate::composer::IEEZReader::new(registry, provider)
-        .rollups(rollup_id)
-        .call()
+    let call = eez_protocol::abi::rollupsCall {
+        rollupId: rollup_id,
+    };
+    let request = view(registry, &call).0;
+    let output = provider
+        .call(request)
+        .block(BlockNumberOrTag::Latest.into())
         .await
+        .map_err(|error| read_error(registry, &format!("rollups({rollup_id})"), &error))?;
+    let manager = eez_protocol::abi::rollupsCall::abi_decode_returns(&output)
         .map_err(|error| read_error(registry, &format!("rollups({rollup_id})"), &error))?
         .rollupContract;
     if manager == Address::ZERO {
