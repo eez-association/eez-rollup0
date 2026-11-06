@@ -1058,16 +1058,38 @@ impl Harness {
     /// Successful attestations of the signer [`Self::env_with_attesters`]
     /// started for registered attester `index`.
     pub fn attestations_of(&self, index: usize) -> Result<usize> {
+        self.with_attester(index, ProofSignerHandle::successful_attestations)
+    }
+
+    /// Suspend a registered signer before the Composer connects to it.
+    #[cfg(unix)]
+    pub fn pause_attester(&self, index: usize) -> Result<()> {
+        self.with_attester(index, ProofSignerHandle::pause)
+    }
+
+    /// RPC endpoint of a registered signer started by this harness.
+    pub fn attester_endpoint(&self, index: usize) -> Result<String> {
+        self.with_attester(index, |signer| Ok(signer.endpoint().to_owned()))
+    }
+
+    fn with_attester<T>(
+        &self,
+        index: usize,
+        action: impl FnOnce(&ProofSignerHandle) -> Result<T>,
+    ) -> Result<T> {
         let start = self
             .quorum_start
             .get()
             .ok_or_else(|| anyhow!("no attester quorum was started"))?;
-        self.provers
+        let provers = self
+            .provers
             .lock()
-            .map_err(|_| anyhow!("prover registry poisoned"))?
-            .get(start + index)
-            .ok_or_else(|| anyhow!("no signer for attester {index}"))?
-            .successful_attestations()
+            .map_err(|_| anyhow!("prover registry poisoned"))?;
+        action(
+            provers
+                .get(start + index)
+                .ok_or_else(|| anyhow!("no signer for attester {index}"))?,
+        )
     }
 
     /// Every registered attester, in deployment order.

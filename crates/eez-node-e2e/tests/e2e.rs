@@ -807,6 +807,167 @@ async fn quorum_settles_without_an_attester_signing_the_wrong_digest() {
     node.assert_no_process_death();
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quorum_two_of_three_settles_with_an_unresponsive_attester() {
+    let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4, ANVIL_KEY_6], 2)
+        .await
+        .unwrap();
+    let env = harness
+        .env_with_attesters(&[QuorumSigner::Honest; 3])
+        .await
+        .unwrap();
+    // Stop the third server before any proof request. No proof can be in flight.
+    harness.pause_attester(2).unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-unresponsive",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+    let transaction = send_l2_value_transfer_confirmed(
+        &node.l2_rpc_url(),
+        ANVIL_KEY_1,
+        ANVIL_ADDR,
+        U256::from(1u64),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    let provider = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse().unwrap());
+    let receipt = provider
+        .get_transaction_receipt(transaction)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_safe_chain_contains(
+        &node,
+        receipt.block_number.unwrap(),
+        receipt.block_hash.unwrap(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("the healthy quorum must settle the executed value transfer");
+    let chain = harness.chain();
+    chain
+        .wait_for_batches_or_node_failure(2, &[&node], DEFAULT_TIMEOUT)
+        .await
+        .expect("the two responsive attesters must continue settlement");
+    let attesters = registered_pairs(&harness);
+    let mut expected: Vec<Address> = attesters[..2].iter().map(|&(system, _)| system).collect();
+    expected.sort_unstable();
+    let posted = posted_batches(
+        chain.rpc_url(),
+        harness.dep.eez_address,
+        harness.dep.deploy_block,
+        harness.dep.rollup_id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        posted.len() >= 2,
+        "two successful posts must be visible on L1"
+    );
+    for posted in &posted {
+        assert!(
+            posted.succeeded,
+            "a quorum post must not revert: {posted:?}"
+        );
+        assert_eq!(posted.batch.proofSystems, expected);
+        verify_batch_proofs(&posted.batch, &attesters).unwrap();
+    }
+    assert_eq!(harness.attestations_of(2).unwrap(), 0);
+    assert_ne!(
+        chain.snapshot().await.unwrap().rollup_commitment,
+        chain.initial_commitment(),
+        "the healthy quorum must advance the L1 commitment",
+    );
+    node.assert_no_process_death();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quorum_prover_rejects_a_foreign_rollup_identity() {
+    use eez_control_rpc::v2;
+
+    let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4], 2)
+        .await
+        .unwrap();
+    let env = harness
+        .env_with_attesters(&[QuorumSigner::Honest; 2])
+        .await
+        .unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-rollup-identity",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+    harness
+        .chain()
+        .wait_for_batches_or_node_failure(1, &[&node], DEFAULT_TIMEOUT)
+        .await
+        .expect("the configured identities must first settle a real batch");
+    let provider = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse().unwrap());
+    let genesis = provider
+        .get_block_by_number(BlockNumberOrTag::Number(0))
+        .await
+        .unwrap()
+        .unwrap();
+    let begin = v2::Begin {
+        rollup_id: harness.dep.rollup_id,
+        anchor_number: 0,
+        anchor_hash: genesis.header.hash.to_vec(),
+        anchor_state_root: genesis.header.state_root.to_vec(),
+    };
+    let mut client =
+        v2::prover_client::ProverClient::connect(harness.attester_endpoint(0).unwrap())
+            .await
+            .unwrap();
+    for foreign in [false, true] {
+        let mut begin = begin.clone();
+        if foreign {
+            begin.rollup_id += 1;
+        }
+        let frame = v2::ClientFrame {
+            request_id: 1,
+            kind: Some(v2::client_frame::Kind::Begin(begin)),
+            ..Default::default()
+        };
+        let (requests, receiver) = tokio::sync::mpsc::channel(1);
+        let mut response = client
+            .prove_stream(tokio_stream::wrappers::ReceiverStream::new(receiver))
+            .await
+            .unwrap()
+            .into_inner();
+        requests.send(frame).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(10), response.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("Begin must receive a protocol response");
+        if foreign {
+            assert!(frame.session_id.is_empty());
+            assert_eq!(frame.epoch, 0);
+            assert_eq!(frame.request_id, 1);
+            let Some(v2::server_frame::Kind::Rejected(rejected)) = &frame.kind else {
+                panic!("a foreign rollup must be rejected before receiving a session: {frame:?}");
+            };
+            assert_eq!(rejected.code, tonic::Code::Unimplemented as i32);
+        } else {
+            assert!(matches!(frame.kind, Some(v2::server_frame::Kind::Ready(_))));
+            assert_eq!(frame.session_id.len(), 32);
+        }
+        drop(requests);
+    }
+    node.assert_no_process_death();
+}
+
 /// Competing composers retreat across an L1 reorg and reconverge.
 /// They must produce newly attested work before old-prefix agreement can pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
