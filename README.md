@@ -124,9 +124,9 @@ cast block-number --rpc-url http://localhost:18688   # L2 producing
 | **L1→L2 front** (Inbound) | `http://localhost:18999` | send L1-origin cross-chain txs here |
 | **L2→L1 front** (Outbound) | `http://localhost:18998` | send L2-origin cross-chain txs here |
 
-Composer nodes also expose `eez_composerInfo` on the L2 RPC. It takes no
-parameters and returns the configured contracts by name, the EEZ L1 and L2
-chain IDs, and the running composer version:
+Composer nodes also expose `eez_composerInfo` on the L2 RPC and on both
+cross-chain fronts. It takes no parameters and returns the configured contracts
+by name, the EEZ L1 and L2 chain IDs, and the running composer version:
 
 ```json
 {
@@ -147,9 +147,10 @@ chain IDs, and the running composer version:
 
 The two **cross-chain ingress fronts** are transparent proxies:
 `eth_sendRawTransaction` sent to a front is held and composed into the next Sync
-block; every other `eth_*` is forwarded to that front's source-chain RPC. They
-use the compose env `EEZ_L1_XCHAIN_PORT` / `EEZ_L2_XCHAIN_PORT`; both ports are
-required by `eez-composer`. The `eez-follower` binary does not start cross-chain
+block; `eez_composerInfo` is answered by the front itself; every other `eth_*`
+is forwarded to that front's source-chain RPC. They use the compose env
+`EEZ_L1_XCHAIN_PORT` / `EEZ_L2_XCHAIN_PORT`; both ports are required by
+`eez-composer`. The `eez-follower` binary does not start cross-chain
 ingress fronts. Upstreams are `EEZ_L1_RPC_URL` / `EEZ_L2_RPC_URL` respectively.
 
 `EEZ_MAX_USER_TXS_PER_BUNDLE` (compose, default `3`) caps how many user

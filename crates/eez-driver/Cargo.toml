@@ -51,5 +51,8 @@ thiserror.workspace   = true
 tokio.workspace       = true
 tracing.workspace     = true
 
+[dev-dependencies]
+reth-ethereum-primitives.workspace = true
+
 [lints]
 workspace = true

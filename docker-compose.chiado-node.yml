@@ -72,6 +72,8 @@ services:
       EEZ_L1_POSTER_KEY: "${EEZ_L1_POSTER_KEY:?set EEZ_L1_POSTER_KEY}"
       EEZ_L1_BUILDER_RPC_URL: "${EEZ_L1_BUILDER_RPC_URL:?set EEZ_L1_BUILDER_RPC_URL}"
       EEZ_PROVER_URL: http://127.0.0.1:${EEZ_SIGNER_PORT:-50061}
+      # The genesis composer has no peers to sync from.
+      EEZ_SYNC_L1_ONLY: "1"
       EEZ_WITNESS_DB_PATH: /l2/witnesses
       # Embedded chiado L1 (reth_gnosis) — single L1 for the whole node.
       EEZ_L1_CHAIN: chiado
@@ -88,6 +90,8 @@ services:
       # target-block oracle falls back to the embedded L1. Set it in
       # .env.chiado
       EEZ_L1_TARGET_RPC_URL: "${EEZ_L1_TARGET_RPC_URL:-}"
+      # Block-trace RPC; empty uses EEZ_L1_RPC_URL. Set it in .env.chiado.
+      EEZ_L1_TRACE_RPC_URL: "${EEZ_L1_TRACE_RPC_URL:-}"
       # Without this the embedded L1 falls back to the persisted
       # known-peers.json, which fills with cross-network noise and
       # leaves it on 0 peers, unable to backfill.

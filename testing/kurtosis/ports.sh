@@ -36,7 +36,8 @@ eez_devnet_ports_main() {
     l2_rpc="$(eez_devnet_port eez-node l2-rpc)" || return 1
     l1_front="$(eez_devnet_port eez-node l1-xchain)" || return 1
     l2_front="$(eez_devnet_port eez-node l2-xchain)" || return 1
-    proof_signer_grpc="$(eez_devnet_port eez-proof-signer grpc)" || return 1
+    proof_signer_grpc="$(eez_devnet_port eez-proof-signer grpc 2>/dev/null || \
+        eez_devnet_port eez-stateful-prover grpc)" || return 1
     l1_explorer="$(eez_devnet_port l1-blockscout-frontend http 2>/dev/null || true)"
     l2_explorer="$(eez_devnet_port l2-blockscout-frontend http 2>/dev/null || true)"
     l1_explorer_api="$(eez_devnet_port l1-blockscout http 2>/dev/null || true)"

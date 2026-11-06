@@ -81,8 +81,8 @@ pub use executor::{ChainClient, ExecutionRequest, SessionSnapshot, TargetExecuti
 pub use proof_plan::{ProofPlan, ProofPlanInvariantError, RollupProofAssignment};
 #[doc(inline)]
 pub use public_inputs::{
-    PublicInputsError, all_per_ps_hashes, entry_hash, public_inputs_hashes, shared_public_input,
-    static_entry_hash,
+    PublicInputsError, all_per_ps_hashes, batch_shared_public_input, entry_hash,
+    public_inputs_hashes, shared_public_input, static_entry_hash,
 };
 #[doc(inline)]
 pub use rolling_hash::{EntryRollingHash, StaticCallRollingHash};

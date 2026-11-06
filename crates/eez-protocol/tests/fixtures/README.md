@@ -1,7 +1,7 @@
 # Protocol compatibility vectors
 
 These JSON files are small cross-language compatibility oracles for protocol
-commit `855fe0602484750861b4c31502a1a91355d33ed6`. They are not generator output:
+commit `143d87e62cade98bfc122d612638dcaaf1c85633`. They are not generator output:
 the named Solidity tests assert the expected values against the pinned
 contracts, and the Rust tests independently consume the same values. Each Rust
 loader rejects unexpected schema, protocol-commit, or oracle metadata.

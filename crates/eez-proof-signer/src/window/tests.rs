@@ -1,4 +1,5 @@
 use super::*;
+use eez_control_rpc::v1::ExecutionWitness as WireExecutionWitness;
 
 fn limits(max_blocks: usize, max_bytes: usize, max_witness_items: usize) -> WindowLimits {
     WindowLimits {
@@ -77,35 +78,6 @@ fn accepts_a_complete_hash_linked_window_and_preserves_validation_inputs() {
     assert_eq!(blocks[2].claimed_hash, B256::repeat_byte(0x07));
     assert_eq!(blocks[2].rlp, vec![7; 4]);
     assert_eq!(blocks[2].witness.state[0].as_ref(), &[7]);
-}
-
-#[test]
-fn execution_witness_conversion_preserves_every_field() {
-    let witness = into_execution_witness(WireExecutionWitness {
-        state: vec![vec![0x00, 0xff], vec![0x01]],
-        codes: vec![vec![0x02]],
-        keys: vec![vec![], vec![0x03]],
-        headers: vec![vec![0x04, 0x05]],
-    });
-    let bytes = |items: &[alloy_primitives::Bytes]| {
-        items.iter().map(|item| item.to_vec()).collect::<Vec<_>>()
-    };
-    assert_eq!(bytes(&witness.state), [vec![0x00, 0xff], vec![0x01]]);
-    assert_eq!(bytes(&witness.codes), [vec![0x02]]);
-    assert_eq!(bytes(&witness.keys), [vec![], vec![0x03]]);
-    assert_eq!(bytes(&witness.headers), [vec![0x04, 0x05]]);
-}
-
-#[test]
-fn wire_witness_item_count_includes_every_collection() {
-    let witness = WireExecutionWitness {
-        state: vec![Vec::new(); 2],
-        codes: vec![Vec::new()],
-        keys: vec![Vec::new(); 2],
-        headers: vec![Vec::new()],
-    };
-
-    assert_eq!(wire_witness_item_count(&witness), 6);
 }
 
 #[test]

@@ -10,6 +10,8 @@ pub use config::Config;
 
 use std::sync::Arc;
 
+use eez_driver::BlockCommitterHandle;
+use eez_primitives::engine::EezEngineTypes;
 use eez_proof_signer::ServerConfig;
 use reth_chainspec::ChainSpec;
 use reth_storage_api::{BlockHashReader, BlockNumReader, HeaderProvider, StateProviderFactory};
@@ -19,13 +21,19 @@ pub async fn serve<P>(
     config: Config,
     provider: P,
     chain_spec: Arc<ChainSpec>,
+    committer: BlockCommitterHandle<EezEngineTypes>,
     shutdown: impl Future<Output = ()>,
 ) -> eyre::Result<()>
 where
     P: BlockHashReader
+        + reth_storage_api::BlockIdReader
         + BlockNumReader
-        + HeaderProvider<Header = alloy_consensus::Header>
+        + reth_storage_api::BlockReader<
+            Block = eez_primitives::Block,
+            Receipt = eez_primitives::Receipt,
+        > + HeaderProvider<Header = alloy_consensus::Header>
         + StateProviderFactory
+        + Clone
         + std::fmt::Debug
         + Send
         + Sync
@@ -38,7 +46,8 @@ where
         attester,
         limits,
     } = config;
-    let backend = Backend::new(provider, chain_spec, expected_l2_system_address);
+    let backend =
+        Backend::with_committer(provider, chain_spec, expected_l2_system_address, committer);
     eez_proof_signer::serve(
         ServerConfig {
             listen_addr,

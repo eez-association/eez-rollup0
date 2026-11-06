@@ -21,12 +21,22 @@ use reth_node_core::{
     args::{DatadirArgs, NetworkArgs, RpcServerArgs},
     node_config::NodeConfig,
 };
+use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection};
 
 /// Block time for the testing embedded L1. 5s gives the composer a wide
 /// window to land `postBatch + user_tx` in the same L1 block (invariant
 /// 4's atomicity requirement); a 1s window lets dev-reth's auto-mine
 /// split the two `send_raw_transaction` roundtrips across blocks.
 pub const TESTING_L1_BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// HTTP modules of every embedded L1. `debug` serves the block traces the
+/// batch scan reads for batches a contract posted.
+const L1_HTTP_MODULES: [RethRpcModule; 4] = [
+    RethRpcModule::Eth,
+    RethRpcModule::Net,
+    RethRpcModule::Web3,
+    RethRpcModule::Debug,
+];
 
 /// Which L1 chain the embedded L1 NodeBuilder should serve. Selected
 /// by `EEZ_L1_CHAIN` env at startup; defaults to `Testing`.
@@ -175,6 +185,45 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
         auth_port: cfg.auth_port,
         ipcdisable: true,
         ..RpcServerArgs::default()
-    };
+    }
+    .with_http_api(RpcModuleSelection::from(L1_HTTP_MODULES));
     Ok((network_args, rpc_args))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The batch scan traces contract-posted batches over HTTP, so every
+    /// embedded L1 serves `debug` beside the standard modules.
+    #[test]
+    fn every_embedded_l1_serves_debug_beside_the_standard_http_modules() {
+        let cfg = EmbeddedL1Config {
+            dev_chain_spec: reth_chainspec::DEV.clone(),
+            kind: L1ChainKind::Testing,
+            datadir: PathBuf::from("unused"),
+            http_port: 18545,
+            auth_port: 18551,
+            p2p_port: 30444,
+            discv5_port: 30445,
+            jwtsecret: None,
+            trusted_peers: Vec::new(),
+        };
+        let served = [
+            build_testing_node_config(&cfg).expect("testing config").rpc,
+            build_devnet_node_config(&cfg).expect("devnet config").rpc,
+            build_chiado_node_config(&cfg).expect("chiado config").rpc,
+        ];
+        for rpc in served {
+            let api = rpc.http_api.expect("explicit HTTP module selection");
+            for module in [
+                RethRpcModule::Eth,
+                RethRpcModule::Net,
+                RethRpcModule::Web3,
+                RethRpcModule::Debug,
+            ] {
+                assert!(api.contains(&module), "HTTP lacks {module:?}: {api:?}");
+            }
+        }
+    }
 }

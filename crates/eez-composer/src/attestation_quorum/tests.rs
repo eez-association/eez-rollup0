@@ -28,6 +28,8 @@ enum Answer {
     Fail(fn() -> ProverError),
     /// A prover that panics.
     Panic,
+    /// A prevalidation exchange that remains pending until cancelled.
+    Pending,
 }
 
 /// A prover that answers once after `delay`, recording the request it saw.
@@ -37,6 +39,8 @@ struct ScriptedAttester {
     delay: Duration,
     answer: Answer,
     seen: Mutex<Option<ProvingContext>>,
+    prevalidated: Mutex<Option<(u64, ProvingAnchor, B256)>>,
+    prevalidation_dropped: AtomicBool,
     finished: AtomicBool,
 }
 
@@ -47,6 +51,8 @@ impl ScriptedAttester {
             delay: Duration::from_millis(delay_ms),
             answer,
             seen: Mutex::new(None),
+            prevalidated: Mutex::new(None),
+            prevalidation_dropped: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         })
     }
@@ -58,8 +64,31 @@ impl ScriptedAttester {
 
 #[async_trait]
 impl Prover for ScriptedAttester {
+    async fn prevalidate(
+        &self,
+        rollup_id: u64,
+        anchor: ProvingAnchor,
+        block: BlockWitness,
+    ) -> Result<(), ProverError> {
+        *self.prevalidated.lock().unwrap() = Some((rollup_id, anchor, block.hash));
+        match self.answer {
+            Answer::Fail(error) => Err(error()),
+            Answer::Panic => panic!("attester prevalidation crashed"),
+            Answer::Pending => {
+                let _drop = PrevalidationDrop(&self.prevalidation_dropped);
+                std::future::pending().await
+            }
+            _ => Ok(()),
+        }
+    }
+
     async fn prove(&self, ctx: ProvingContext) -> Result<Bytes, ProverError> {
-        let digest = public_inputs_hashes(&ctx.batch, vkey_of(self.key.address())).unwrap()[0];
+        let digest = public_inputs_hashes(
+            &ctx.batch,
+            ctx.verification_key
+                .unwrap_or_else(|| vkey_of(self.key.address())),
+        )
+        .unwrap()[0];
         *self.seen.lock().unwrap() = Some(ctx);
         tokio::time::sleep(self.delay).await;
         self.finished.store(true, Ordering::SeqCst);
@@ -80,6 +109,7 @@ impl Prover for ScriptedAttester {
             Answer::Truncated => Ok(self.sign(digest).slice(..64)),
             Answer::Fail(error) => Err(error()),
             Answer::Panic => panic!("attester crashed"),
+            Answer::Pending => panic!("pending prevalidation must not sign"),
         }
     }
 
@@ -754,4 +784,90 @@ async fn a_lone_attester_proof_goes_to_l1_unchecked() {
         .unwrap();
 
     assert_eq!(systems(&attestations), vec![proof_system(1)]);
+}
+
+#[tokio::test]
+async fn prevalidation_reaches_all_attesters_without_signing_despite_one_failure() {
+    for answer in [REJECTED, Answer::Panic] {
+        let (quorum, provers) = quorum(&[(0, answer), (0, SIGN)], 0);
+        let (anchor, block) = prevalidation_input();
+
+        quorum.prevalidate(7, anchor, block.clone()).await;
+
+        for prover in provers {
+            assert_eq!(
+                *prover.prevalidated.lock().unwrap(),
+                Some((7, anchor, block.hash))
+            );
+            assert!(prover.seen.lock().unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn each_attester_uses_the_registered_opaque_key_for_its_window() {
+    let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN)], 0);
+    let keys = [B256::repeat_byte(0x44), B256::repeat_byte(0x55)];
+    let registration = QuorumRegistration::new(2, keys.into_iter().map(Some).collect()).unwrap();
+
+    let attestations = attest_with(&quorum, registration).await.unwrap();
+
+    assert_eq!(attestations.len(), 2);
+    for (prover, key) in provers.iter().zip(keys) {
+        assert_eq!(
+            prover
+                .seen
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .verification_key,
+            Some(key)
+        );
+    }
+}
+
+fn prevalidation_input() -> (ProvingAnchor, BlockWitness) {
+    let anchor = ProvingAnchor {
+        number: 10,
+        hash: B256::repeat_byte(0x10),
+        state_root: B256::repeat_byte(0x11),
+    };
+    let block = BlockWitness {
+        number: 11,
+        hash: B256::repeat_byte(0x12),
+        parent_hash: anchor.hash,
+        rlp: Bytes::new(),
+        witness: Default::default(),
+    };
+    (anchor, block)
+}
+
+struct PrevalidationDrop<'a>(&'a AtomicBool);
+
+impl Drop for PrevalidationDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn cancelling_prevalidation_drops_every_pending_member_exchange() {
+    let (quorum, provers) = quorum(&[(0, Answer::Pending), (0, Answer::Pending)], 0);
+    let (anchor, block) = prevalidation_input();
+    let mut pending = Box::pin(quorum.prevalidate(7, anchor, block));
+    assert!(futures_util::poll!(pending.as_mut()).is_pending());
+    assert!(
+        provers
+            .iter()
+            .all(|prover| prover.prevalidated.lock().unwrap().is_some())
+    );
+
+    drop(pending);
+
+    assert!(
+        provers
+            .iter()
+            .all(|prover| prover.prevalidation_dropped.load(Ordering::SeqCst))
+    );
 }

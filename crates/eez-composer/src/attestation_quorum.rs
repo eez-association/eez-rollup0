@@ -38,7 +38,7 @@ use eez_l1::BundleTarget;
 use eez_protocol::{
     EvmBatch, abi::RollupIdWithProofSystemsSol, public_inputs::public_inputs_hashes,
 };
-use eez_prover::{Prover, ProverError, ProvingContext};
+use eez_prover::{BlockWitness, Prover, ProverError, ProvingAnchor, ProvingContext};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::time::{Instant, timeout_at};
 use tracing::{Level, event};
@@ -222,6 +222,41 @@ impl AttestationQuorum {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.members.is_empty()
+    }
+
+    /// Prevalidate a committed block with every configured attester. This is
+    /// best effort: final proof collection still verifies registration and proofs.
+    /// Dropping the caller cancels every member exchange.
+    pub async fn prevalidate(&self, rollup_id: u64, anchor: ProvingAnchor, block: BlockWitness) {
+        let number = block.number;
+        let mut pending = FuturesUnordered::new();
+        for member in &self.members {
+            let block = block.clone();
+            pending.push(async move {
+                let result = AssertUnwindSafe(member.prover.prevalidate(rollup_id, anchor, block))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(ProverError::Backend(
+                            "attester prevalidation panicked".to_owned(),
+                        ))
+                    });
+                (member.proof_system, result)
+            });
+        }
+        while let Some((proof_system, result)) = pending.next().await {
+            if let Err(error) = result {
+                event!(
+                    name: "eez.composer.attestation.prevalidate_failed",
+                    Level::WARN,
+                    %proof_system,
+                    number,
+                    anchor = anchor.number,
+                    %error,
+                    "attester prevalidation failed; Finalize will backfill the block",
+                );
+            }
+        }
     }
 
     /// The attesters to ask for the next batch.
@@ -592,7 +627,7 @@ async fn rollup_manager(
 async fn prove_verified(
     member: &QuorumMember,
     vkey: B256,
-    request: ProvingContext,
+    mut request: ProvingContext,
     timing: RollupTiming,
     target: BundleTarget,
 ) -> Result<Bytes, ProverError> {
@@ -603,6 +638,7 @@ async fn prove_verified(
         .first()
         .copied()
         .ok_or_else(|| ProverError::Backend("no public inputs hash".to_owned()))?;
+    request.verification_key = Some(vkey);
     let proof = prove_with_retry(member.prover.as_ref(), request, timing, target).await?;
     verify_proof(&proof, expected, member.attester)?;
     Ok(proof)

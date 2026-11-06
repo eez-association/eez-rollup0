@@ -182,6 +182,15 @@ signer does not need to be a funded transaction-sending account.
 Timing is 12s L1 / 2s L2 → K=6, with `proof + slack = 3000ms < 12000ms`
 (`docker-compose.kurtosis-node.yml`).
 
+Partial-settlement diagnostics:
+
+```bash
+bash testing/kurtosis/scripts/parity-gate-host.sh
+bash testing/kurtosis/scripts/anchor-only-probe.sh
+docker logs eez-node-kurtosis 2>&1 \
+  | testing/kurtosis/scripts/settle-height-check.py
+```
+
 ## Gotchas
 
 - **The JWT is Machine-2-local.** It secures embedded-reth ↔ follower-lighthouse

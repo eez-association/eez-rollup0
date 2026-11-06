@@ -17,12 +17,15 @@ pub enum DriverError {
     /// `None` — typically a "best block doesn't exist" race during startup.
     #[error("no header found at block {block_number}")]
     MissingHeader { block_number: u64 },
-    /// `engine_forkchoiceUpdated` returned a non-`VALID` status.
+    /// `engine_forkchoiceUpdated` rejected the forkchoice state.
     #[error("engine rejected forkchoice update: {0}")]
     InvalidForkchoice(String),
-    /// `engine_newPayload` returned a non-`VALID` status.
+    /// `engine_newPayload` rejected the payload.
     #[error("engine rejected new payload: {0}")]
     InvalidPayload(String),
+    /// The engine has not finished validating a payload or selecting its head.
+    #[error("engine validation pending: {0}")]
+    EngineNotReady(String),
     /// Payload builder returned no payload for an issued ID.
     #[error("payload builder returned no payload for issued id")]
     PayloadMissing,

@@ -17,6 +17,9 @@
 //!
 //! Answered at the door, not held then evicted: a creation has no target, so it
 //! is forwarded to the source chain; a codeless target is rejected with why.
+//!
+//! `eez_composerInfo` is answered at the door too: the protocol's network
+//! harness discovers the deployment through the L1 front.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -240,6 +243,8 @@ struct Ctx {
     validation_provider: RootProvider,
     expected_source_chain_id: u64,
     tx_gas_limit_cap: TxGasLimitCapResolver,
+    /// `eez_composerInfo` result, the same document the L2 RPC serves.
+    composer_info: Arc<Value>,
 }
 
 /// Verify that a configured cross-chain front points at its expected source chain.
@@ -263,8 +268,9 @@ pub async fn validate_cross_chain_front(
 }
 
 /// Run a transparent cross-chain front on `port`, forwarding every `eth_*` to
-/// `upstream_rpc_url` (the source chain's node) and holding intercepted
-/// `eth_sendRawTransaction`s with `direction`. Never returns under normal op.
+/// `upstream_rpc_url` (the source chain's node), holding intercepted
+/// `eth_sendRawTransaction`s with `direction`, and answering `eez_composerInfo`
+/// with `composer_info`. Never returns under normal op.
 ///
 /// # Errors
 /// Fails if the listener can't bind or the reqwest client can't be built.
@@ -277,6 +283,7 @@ pub async fn run_cross_chain_front(
     expected_source_chain_id: u64,
     tx_gas_limit_cap: TxGasLimitCapResolver,
     ready: Arc<std::sync::atomic::AtomicBool>,
+    composer_info: Arc<Value>,
 ) -> eyre::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await?;
@@ -301,6 +308,7 @@ pub async fn run_cross_chain_front(
         validation_provider,
         expected_source_chain_id,
         tx_gas_limit_cap,
+        composer_info,
     };
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -466,9 +474,16 @@ async fn handle(
         ));
     }
 
+    let method = json.get("method").and_then(Value::as_str).unwrap_or("");
+    // Discovery needs neither the upstream nor a reconciled node.
+    if method == crate::composer_rpc::METHOD {
+        return Ok(json_response(
+            crate::composer_rpc::front_response(&json, &ctx.composer_info).to_string(),
+        ));
+    }
+
     // Accepting these before the node is live would strand them in a pool
     // nothing drains. Reads still pass through.
-    let method = json.get("method").and_then(Value::as_str).unwrap_or("");
     if is_submission_method(method) && !ctx.ready.load(std::sync::atomic::Ordering::Relaxed) {
         return Ok(rpc_error(
             json.get("id").cloned().unwrap_or(Value::Null),
@@ -659,8 +674,13 @@ mod tests {
             expected_source_chain_id,
             cap,
             ready,
+            Arc::new(test_composer_info()),
         )
         .await
+    }
+
+    fn test_composer_info() -> Value {
+        serde_json::json!({"version": "front-test"})
     }
 
     fn test_signer() -> PrivateKeySigner {
@@ -1492,6 +1512,44 @@ mod tests {
         assert!(msg.contains("createCrossChainProxy"), "{msg}");
         assert!(msg.contains("resubmit"), "{msg}");
         assert!(pool.pop_all().is_empty(), "a rejected tx must not be held");
+
+        task.abort();
+    }
+
+    /// The protocol's network harness discovers the deployment through the L1
+    /// front, so discovery is answered here, before the node is ready and
+    /// without the upstream.
+    #[tokio::test]
+    async fn composer_info_is_answered_locally_before_ready() {
+        let port = free_port();
+        let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
+        let task = tokio::spawn(run_test_front(
+            port,
+            "http://127.0.0.1:1".into(),
+            Direction::Inbound,
+            Arc::new(HeldPool::new()),
+            provider,
+            1,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
+        wait_for_front(port).await;
+
+        let response: Value = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}"))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eez_composerInfo",
+                "params": [],
+                "id": 4,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["id"], 4, "{response}");
+        assert_eq!(response["result"], test_composer_info(), "{response}");
 
         task.abort();
     }

@@ -141,22 +141,24 @@ pub fn all_per_ps_hashes(
         &custom_data_hashes,
         bound_sender,
     );
+    Ok(per_ps_hashes(plan, shared))
+}
+
+/// Every per-PS hash of a checked `plan` over `shared`.
+fn per_ps_hashes(plan: &ProofPlan, shared: B256) -> Vec<B256> {
     let out: Vec<B256> = (0..plan.proof_systems.len() as u64)
         .map(|k| per_ps_public_inputs_hash(shared, plan, k))
         .collect();
-    // This is the ONE helper both composer and prover call, so logging here
-    // gives the publicInputsHash an audit trail on BOTH sides — an on-chain
-    // `InvalidProof`/hash-mismatch is then diagnosable from the logs.
+    // Every publicInputsHash passes through here, so an on-chain
+    // `InvalidProof` is diagnosable from the logs.
     debug!(
         target: "eez::public_inputs",
         shared = %shared,
-        entry_hashes = entry_hashes.len(),
-        static_entry_hashes = static_entry_hashes.len(),
         proof_systems = plan.proof_systems.len(),
         first_hash = ?out.first(),
-        "all_per_ps_hashes: computed publicInputsHash(es)",
+        "per_ps_hashes: computed publicInputsHash(es)",
     );
-    Ok(out)
+    out
 }
 
 /// Errors produced while reconstructing public inputs from the initial
@@ -183,6 +185,47 @@ pub enum PublicInputsError {
     },
 }
 
+/// `sharedPublicInput` as `EEZ._verifyProofSystemBatch` computes it for `batch`
+/// sent by `sender`. Block zero binds empty `customData` per rollup, and the
+/// sender is bound only when the batch asks. `public_inputs_hashes` builds on
+/// it, so the scan checks exactly what the signer signs.
+pub fn batch_shared_public_input(
+    batch: &EvmBatch,
+    sender: Address,
+) -> Result<B256, PublicInputsError> {
+    if batch.blockNumber != 0 {
+        return Err(PublicInputsError::UnsupportedBlockNumber {
+            block_number: batch.blockNumber,
+        });
+    }
+    if !batch.blobIndices.is_empty() {
+        return Err(PublicInputsError::UnsupportedBlobIndices {
+            count: batch.blobIndices.len(),
+        });
+    }
+    let entry_hashes: Vec<B256> = batch.entries.iter().map(entry_hash).collect();
+    let static_entry_hashes: Vec<B256> =
+        batch.staticEntries.iter().map(static_entry_hash).collect();
+    let custom_data_hashes: Vec<B256> = batch
+        .rollupIdsWithProofSystems
+        .iter()
+        .map(|rollup| custom_data_hash(RollupId(rollup.rollupId), &Bytes::new()))
+        .collect();
+    let bound_sender = if batch.bindMsgSenderInPublicInput {
+        sender
+    } else {
+        Address::ZERO
+    };
+    Ok(shared_public_input(
+        &entry_hashes,
+        &static_entry_hashes,
+        &[],
+        &batch.callData,
+        &custom_data_hashes,
+        bound_sender,
+    ))
+}
+
 /// Compute every per-proof-system hash for the currently supported batch
 /// profile: block number zero, no sender binding, and no blobs.
 ///
@@ -195,20 +238,11 @@ pub enum PublicInputsError {
 /// proof-system carriers.
 #[tracing::instrument(level = "debug", name = "public_inputs_hashes", skip_all, err)]
 pub fn public_inputs_hashes(batch: &EvmBatch, vkey: B256) -> Result<Vec<B256>, PublicInputsError> {
-    if batch.blockNumber != 0 {
-        return Err(PublicInputsError::UnsupportedBlockNumber {
-            block_number: batch.blockNumber,
-        });
-    }
     if batch.bindMsgSenderInPublicInput {
         return Err(PublicInputsError::UnsupportedSenderBinding);
     }
-    if !batch.blobIndices.is_empty() {
-        return Err(PublicInputsError::UnsupportedBlobIndices {
-            count: batch.blobIndices.len(),
-        });
-    }
-
+    // Refuses a nonzero block number and blobs.
+    let shared = batch_shared_public_input(batch, Address::ZERO)?;
     let rollup_assignments: Vec<RollupProofAssignment> = batch
         .rollupIdsWithProofSystems
         .iter()
@@ -227,18 +261,8 @@ pub fn public_inputs_hashes(batch: &EvmBatch, vkey: B256) -> Result<Vec<B256>, P
         rollup_assignments,
         vk_matrix,
     };
-    let entry_hashes: Vec<B256> = batch.entries.iter().map(entry_hash).collect();
-    let static_entry_hashes: Vec<B256> =
-        batch.staticEntries.iter().map(static_entry_hash).collect();
-    all_per_ps_hashes(
-        &plan,
-        &entry_hashes,
-        &static_entry_hashes,
-        &[],
-        &batch.callData,
-        Address::ZERO,
-    )
-    .map_err(Into::into)
+    plan.check_invariants()?;
+    Ok(per_ps_hashes(&plan, shared))
 }
 
 #[cfg(test)]
@@ -461,5 +485,30 @@ mod tests {
             public_inputs_hashes(&batch, vkey),
             Err(PublicInputsError::UnsupportedBlobIndices { count: 1 })
         ));
+    }
+
+    /// No in-profile Solidity vector binds a sender or holds a static entry.
+    #[test]
+    fn batch_shared_public_input_follows_the_supported_profile() {
+        use PublicInputsError::{UnsupportedBlobIndices, UnsupportedBlockNumber};
+        let sender = Address::repeat_byte(0xbe);
+        let base = crate::abi::EvmBatch {
+            staticEntries: vec![StaticExecutionEntrySol::default()],
+            ..Default::default()
+        };
+        let statics = [static_entry_hash(&base.staticEntries[0])];
+        let shared = |bound| shared_public_input(&[], &statics, &[], &Bytes::new(), &[], bound);
+        let (mut bound, mut block, mut blob) = (base.clone(), base.clone(), base.clone());
+        bound.bindMsgSenderInPublicInput = true;
+        block.blockNumber = 7;
+        blob.blobIndices.push(alloy_primitives::U256::ZERO);
+        for (batch, want) in [
+            (&base, Ok(shared(Address::ZERO))),
+            (&bound, Ok(shared(sender))),
+            (&block, Err(UnsupportedBlockNumber { block_number: 7 })),
+            (&blob, Err(UnsupportedBlobIndices { count: 1 })),
+        ] {
+            assert_eq!(batch_shared_public_input(batch, sender), want);
+        }
     }
 }

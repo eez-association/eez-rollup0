@@ -14,6 +14,7 @@ use url::Url;
 use crate::error::{L1Error, L1Result};
 
 const ENV_RPC_URL: &str = "EEZ_L1_RPC_URL";
+const ENV_TRACE_RPC_URL: &str = "EEZ_L1_TRACE_RPC_URL";
 const ENV_BUILDER_RPC_URL: &str = "EEZ_L1_BUILDER_RPC_URL";
 const ENV_TARGET_RPC_URL: &str = "EEZ_L1_TARGET_RPC_URL";
 const ENV_POSTER_KEY: &str = "EEZ_L1_POSTER_KEY";
@@ -26,11 +27,13 @@ const ENV_REGISTRY_DEPLOY_BLOCK: &str = "EEZ_REGISTRY_DEPLOY_BLOCK";
 pub struct L1ReaderConfig {
     /// L1 RPC endpoint (HTTP / HTTPS).
     pub rpc_url: Url,
+    /// L1 RPC serving `debug_traceBlockByHash`, read only for blocks where a
+    /// contract posted a batch for our rollup.
+    pub trace_rpc_url: Url,
     /// Deployed `EEZ` (rollups registry) address.
     pub eez: Address,
-    /// Our rollup's id. Used by the batch-log scanner to filter the
-    /// `L2ExecutionPerformed(rollupId indexed, ...)` event topic so
-    /// each historical batch is tagged winner / loser.
+    /// Our rollup's id. The batch scan reads only posts whose `BatchPosted`
+    /// lists it.
     pub rollup_id: u64,
     /// L1 block where `EEZ` was deployed. Lower bound for historical batch
     /// scans and boot-time source-readiness checks.
@@ -41,6 +44,7 @@ impl std::fmt::Debug for L1ReaderConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("L1ReaderConfig")
             .field("rpc_url", &self.rpc_url.as_str())
+            .field("trace_rpc_url", &self.trace_rpc_url.as_str())
             .field("eez", &self.eez)
             .field("rollup_id", &self.rollup_id)
             .field("deploy_block", &self.deploy_block)
@@ -56,8 +60,10 @@ impl L1ReaderConfig {
     /// Returns [`L1Error::Config`] for any missing required var or
     /// malformed value.
     pub fn from_env() -> L1Result<Self> {
+        let rpc_url = parse_url(ENV_RPC_URL)?;
         Ok(Self {
-            rpc_url: parse_url(ENV_RPC_URL)?,
+            trace_rpc_url: trace_rpc_url(&rpc_url)?,
+            rpc_url,
             eez: parse_address(ENV_EEZ_ADDRESS)?,
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
             deploy_block: parse_u64(ENV_REGISTRY_DEPLOY_BLOCK)?,
@@ -136,6 +142,21 @@ fn parse_url(name: &str) -> L1Result<Url> {
     Url::parse(&require(name)?).map_err(|e| L1Error::Config(format!("{name}: {e}")))
 }
 
+/// `EEZ_L1_TRACE_RPC_URL`, else `rpc_url`: the reader and the watcher both
+/// resolve their trace endpoint here.
+pub(crate) fn trace_rpc_url(rpc_url: &Url) -> L1Result<Url> {
+    resolve_trace_rpc_url(rpc_url, env::var(ENV_TRACE_RPC_URL).ok())
+}
+
+fn resolve_trace_rpc_url(rpc_url: &Url, raw: Option<String>) -> L1Result<Url> {
+    match raw {
+        Some(raw) if !raw.is_empty() => {
+            Url::parse(&raw).map_err(|e| L1Error::Config(format!("{ENV_TRACE_RPC_URL}: {e}")))
+        }
+        _ => Ok(rpc_url.clone()),
+    }
+}
+
 fn parse_address(name: &str) -> L1Result<Address> {
     Address::from_str(&require(name)?).map_err(|e| L1Error::Config(format!("{name}: {e}")))
 }
@@ -150,4 +171,27 @@ fn parse_u64(name: &str) -> L1Result<u64> {
     require(name)?
         .parse::<u64>()
         .map_err(|e| L1Error::Config(format!("{name}: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_trace_rpc_url_defaults_to_the_rpc_url() {
+        let rpc_url = Url::parse("http://logs.example").expect("static url");
+        for (raw, want) in [
+            (None, "http://logs.example/"),
+            (Some(""), "http://logs.example/"),
+            (Some("http://archive.example"), "http://archive.example/"),
+        ] {
+            let got = resolve_trace_rpc_url(&rpc_url, raw.map(String::from)).expect("valid");
+            assert_eq!(got.as_str(), want, "{raw:?}");
+        }
+        let err = resolve_trace_rpc_url(&rpc_url, Some("not a url".into())).expect_err("garbage");
+        assert!(
+            matches!(err, L1Error::Config(ref m) if m.starts_with("EEZ_L1_TRACE_RPC_URL")),
+            "{err}"
+        );
+    }
 }

@@ -787,20 +787,6 @@ fn sim_error_is_insufficient_funds(err: &eez_protocol::ComposerError) -> bool {
     )
 }
 
-alloy_sol_types::sol! {
-    /// Storage getter for `EEZ.rollups[rollupId]` (auto-generated
-    /// from `mapping(uint64 => RollupConfig) public rollups`).
-    /// Returns the three public-getter fields in declaration order;
-    /// this reader consumes `etherBalance`.
-    #[sol(rpc)]
-    interface IEEZReader {
-        function rollups(uint64 rollupId)
-            external
-            view
-            returns (address rollupContract, bytes32 root, uint256 etherBalance);
-    }
-}
-
 /// L1-confirmed escrow (`rollups(rid).etherBalance`) an outbound withdrawal draws
 /// down. `None` on any read failure, so the caller skips this early rejection;
 /// the on-chain escrow check remains authoritative.
@@ -1256,13 +1242,11 @@ where
         our_address: alloy_primitives::Address,
     ) {
         match event {
-            Ok(L1Event::BatchPosted {
-                l1_block_number,
-                tx_hash,
-                submitter,
-                ..
-            }) => {
-                let is_ours = *submitter == our_address;
+            Ok(L1Event::BatchPosted { post, .. }) => {
+                let l1_block_number = post.id.l1_block;
+                let tx_hash = post.tx_hash;
+                let submitter = post.sender;
+                let is_ours = submitter == our_address;
                 if is_ours {
                     event!(
                         name: "eez.composer.batch.confirmed",
@@ -1272,9 +1256,9 @@ where
                         "our batch landed on L1",
                     );
                 } else {
-                    // Log level by whether any rollup expects external
-                    // batches. Per-rollup attribution can refine once the
-                    // BatchPosted event carries rollup_id.
+                    // Only posts listing our rollup arrive here, so this one is
+                    // a peer's. Log level by whether any rollup expects external
+                    // batches.
                     let any_expects_external = self
                         .rollups
                         .values()
@@ -1823,7 +1807,7 @@ where
         rollup: &RollupState<L2>,
         txs: &[HeldTx],
     ) -> Option<HashMap<(Address, Direction), u64>> {
-        let l1_block = rollup.l1_head.last_indexed()?.l1_block_hash;
+        let l1_block = rollup.l1_head.last_indexed()?.post.l1_block_hash;
         let head = self.inner.committer.last_header().hash();
         let mut nonces = match rollup.l2_provider.state_by_block_hash(head) {
             Ok(state) => outbound_source_nonces_for_drain(state.as_ref(), rollup_id, txs),
@@ -1936,6 +1920,7 @@ where
                 event!(
                     name: "eez.composer.recovery.rolled_back",
                     Level::WARN,
+                    event_name = "eez.composer.recovery.rolled_back",
                     rollup_id,
                     sync_height,
                     head = head.number(),
@@ -1977,6 +1962,7 @@ where
                             event!(
                                 name: "eez.composer.recovery.substituted",
                                 Level::WARN,
+                                event_name = "eez.composer.recovery.substituted",
                                 rollup_id,
                                 sync_height,
                                 timestamp,
@@ -2270,7 +2256,7 @@ where
         // ── PHASE 1 — OUTBOUND (L2→L1) ───────────────────────────────
         // Source-sim runs on a fork of the Sync block against the L2 ENTRY
         // client (the L2 follower errors `Unavailable`); the L1 side executes
-        // real `_processNCalls` frames on a fork of the state. On accept the
+        // real `_processL2ToL1Calls` frames on a fork of the state. On accept the
         // canonical `[load, user]` pair extends the block and the L1 frames
         // commit to the state.
         let mut out_iter = outbounds.into_iter();
@@ -3579,6 +3565,7 @@ where
             event_name = "eez.composer.bundle.dispatched",
             rollup_id,
             sync_height,
+            post_batch_hash = %post_batch_hash,
             tx_count = bundle.len(),
             entry_count = total_entries,
             evicted_poison = poison.len(),
@@ -3723,6 +3710,7 @@ where
             event_name = "eez.composer.phase1.bundle.dispatched",
             rollup_id,
             sync_height,
+            post_batch_hash = %post_batch_hash,
             "minimal postBatch dispatched to background observer (leading immediate only)",
         );
         rollup.optimistic.begin(
@@ -3845,9 +3833,11 @@ where
                 continue;
             };
 
+            let post_batch_hash = alloy_primitives::keccak256(&raw);
             event!(
                 name: "eez.composer.emission.historical_chunk",
                 Level::INFO,
+                event_name = "eez.composer.emission.historical_chunk",
                 rollup_id,
                 cursor,
                 boundary,
@@ -3855,10 +3845,10 @@ where
                 span = boundary - cursor,
                 backlog = sync_height - cursor,
                 over_budget,
+                post_batch_hash = %post_batch_hash,
                 "settlement backlog exceeds the batch cap; settling a bounded historical chunk",
             );
 
-            let post_batch_hash = alloy_primitives::keccak256(&raw);
             rollup
                 .optimistic
                 .begin(boundary, post_batch_hash, boundary_parent, Vec::new());
@@ -4045,7 +4035,7 @@ where
             .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
             .l1_head
             .cursor();
-        let pre_block_hash: B256 = {
+        let (pre_block_hash, pre_state_root): (B256, B256) = {
             let h = self
                 .inner
                 .rollups
@@ -4055,7 +4045,7 @@ where
                 .sealed_header(posted)
                 .map_err(|e| format!("sealed_header({posted}): {e}"))?
                 .ok_or_else(|| format!("local L2 header at {posted} missing"))?;
-            h.hash()
+            (h.hash(), h.state_root())
         };
         let immediate_entry = eez_protocol::abi::ExecutionEntrySol {
             rollupUpdates: vec![eez_protocol::abi::RollupUpdateSol {
@@ -4421,9 +4411,15 @@ where
             rollup_id,
             from_block: from,
             to_block: sync_block_number,
+            anchor: Some(eez_prover::ProvingAnchor {
+                number: posted,
+                hash: pre_block_hash,
+                state_root: pre_state_root,
+            }),
             batch: batch.clone(),
             blocks: block_witnesses,
             l1_block_hash: None, // timeless batch (blockNumber 0)
+            verification_key: None,
         };
         let attestations = match round
             .attest(&proving_ctx, self.inner.emission.timing, bundle_target)

@@ -178,7 +178,7 @@ fn collector_credits_are_committed_by_stateless_replay_and_transaction_checkpoin
             witness.clone(),
         );
         assert_eq!(
-            backend.validate(vec![admitted]).unwrap().blocks[0].post_state_root,
+            backend.validate(vec![admitted]).unwrap().blocks[0].post_state_root(),
             collected_root
         );
 

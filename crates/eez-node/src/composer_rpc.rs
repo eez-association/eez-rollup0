@@ -11,6 +11,9 @@ use reth_rpc_eth_api::FullEthApiServer;
 use serde::Serialize;
 use tracing::{Level, event};
 
+/// JSON-RPC method name of composer discovery.
+pub(crate) const METHOD: &str = "eez_composerInfo";
+
 /// Runtime configuration advertised by `eez_composerInfo`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,7 +101,7 @@ where
 
 fn composer_rpc_module(info: ComposerInfo) -> eyre::Result<RpcModule<ComposerInfo>> {
     let mut module = RpcModule::new(info);
-    module.register_method("eez_composerInfo", |params, info, _ext| {
+    module.register_method(METHOD, |params, info, _ext| {
         // Accept the standard zero-argument forms while rejecting actual
         // arguments instead of silently ignoring a client mistake.
         if let Some(raw) = params.as_str() {
@@ -118,9 +121,66 @@ fn composer_rpc_module(info: ComposerInfo) -> eyre::Result<RpcModule<ComposerInf
     Ok(module)
 }
 
+/// Answer one `eez_composerInfo` request on a cross-chain front. The parameter
+/// rule matches the RPC module: none, `[]` or `{}`.
+pub(crate) fn front_response(
+    request: &serde_json::Value,
+    info: &serde_json::Value,
+) -> serde_json::Value {
+    let id = request
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let no_params = match request.get("params") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Array(values)) => values.is_empty(),
+        Some(serde_json::Value::Object(values)) => values.is_empty(),
+        Some(_) => false,
+    };
+    if no_params {
+        return serde_json::json!({"jsonrpc": "2.0", "id": id, "result": info});
+    }
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32602,
+            "message": "eez_composerInfo takes no parameters",
+            "data": request.get("params"),
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composer_info_front_response_accepts_no_params() {
+        let info = serde_json::json!({"version": "test"});
+        for request in [
+            serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": METHOD}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": METHOD, "params": []}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": METHOD, "params": {}}),
+        ] {
+            assert_eq!(
+                front_response(&request, &info),
+                serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": info}),
+                "{request}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_info_front_response_rejects_params() {
+        let request =
+            serde_json::json!({"jsonrpc": "2.0", "id": 8, "method": METHOD, "params": [1]});
+        let response = front_response(&request, &serde_json::json!({"version": "test"}));
+        assert_eq!(response["id"], 8);
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["error"]["data"], serde_json::json!([1]));
+        assert!(response.get("result").is_none(), "{response}");
+    }
 
     #[test]
     fn composer_info_uses_stable_camel_case_schema() {

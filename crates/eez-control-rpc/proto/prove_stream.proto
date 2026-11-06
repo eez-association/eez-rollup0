@@ -9,7 +9,7 @@ import "prove.proto";
 
 service Prover {
   // Baseline sessions end with their stream. Resume optionally retains
-  // progress after disconnect/Proof. No runtime is added by this wire contract.
+  // progress after disconnect/Proof.
   rpc ProveStream(stream ClientFrame) returns (stream ServerFrame);
 }
 
@@ -36,8 +36,9 @@ message ClientFrame {
 message Begin {
   uint64 rollup_id = 1;
   // Execution predecessor and baseline settlement parent. The first expected
-  // block is anchor_number + 1. The prover fetches and verifies the parent's
-  // L1 acceptance independently at Finalize.
+  // block is anchor_number + 1. Parent authorization is profile-specific:
+  // current Rollup0 proofs are conditional; profiles requiring L1 acceptance
+  // have the prover fetch and authenticate it at Finalize (see STREAMING_SPEC.md).
   uint64 anchor_number = 2;
   bytes anchor_hash = 3;
   bytes anchor_state_root = 4;

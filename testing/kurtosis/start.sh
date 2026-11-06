@@ -73,10 +73,15 @@ docker_build() {
 
 # The default `release` profile is already the fast build; set
 # EEZ_OPTIMIZED_BUILD=1 for production (maxperf) binaries.
-release_build_args=()
-if [[ "${EEZ_OPTIMIZED_BUILD:-0}" == "1" ]]; then
-    release_build_args=(--build-arg BUILD_PROFILE=maxperf)
-fi
+docker_release_build() {
+    local cache_scope="$1"
+    shift
+    if [[ "${EEZ_OPTIMIZED_BUILD:-0}" == "1" ]]; then
+        docker_build "$cache_scope" --build-arg BUILD_PROFILE=maxperf "$@"
+    else
+        docker_build "$cache_scope" "$@"
+    fi
+}
 
 if [[ -n "$PREBUILT_BIN_DIR" ]]; then
     PREBUILT_BIN_DIR="$(cd "$PREBUILT_BIN_DIR" && pwd)"
@@ -103,7 +108,7 @@ if [[ "${EEZ_SKIP_NODE_BUILD:-0}" != "1" ]]; then
             "$PREBUILT_BIN_DIR"
     else
         echo "==> building $NODE_IMAGE (fast development profile)"
-        docker_build node "${release_build_args[@]}" -t "$NODE_IMAGE" "$REPO"
+        docker_release_build node -t "$NODE_IMAGE" "$REPO"
     fi
 fi
 
@@ -116,7 +121,7 @@ if [[ "${EEZ_SKIP_PROOF_SIGNER_BUILD:-0}" != "1" ]]; then
             "$PREBUILT_BIN_DIR"
     else
         echo "==> building $PROOF_SIGNER_IMAGE (fast development profile)"
-        docker_build signer "${release_build_args[@]}" \
+        docker_release_build signer \
             -f "$REPO/Dockerfile" --target proof-signer \
             -t "$PROOF_SIGNER_IMAGE" "$REPO"
     fi
@@ -141,13 +146,13 @@ if [[ "${EEZ_PRUNE_BUILD_CACHE:-0}" == "1" ]]; then
 fi
 
 echo "==> kurtosis run (enclave: $ENCLAVE)"
-kurtosis_flags=()
 # The included topology runs without privileged package execution. Keep this
 # opt-in for custom argument files or future package changes that require it.
 if [[ "${KURTOSIS_PRIVILEGED:-0}" == "1" ]]; then
-    kurtosis_flags+=(--privileged)
+    kurtosis run --privileged --enclave "$ENCLAVE" "$HERE" --args-file "$ARGS_FILE"
+else
+    kurtosis run --enclave "$ENCLAVE" "$HERE" --args-file "$ARGS_FILE"
 fi
-kurtosis run "${kurtosis_flags[@]}" --enclave "$ENCLAVE" "$HERE" --args-file "$ARGS_FILE"
 
 cat <<EOF
 

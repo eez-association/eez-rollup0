@@ -17,6 +17,7 @@
 
 pub mod config;
 pub mod error;
+mod fetch;
 pub mod l1_canonical_head;
 pub mod l1_head_stream;
 pub mod l1_reader;
@@ -33,10 +34,10 @@ pub use l1_canonical_head::{BatchRecord, L1CanonicalHead};
 #[doc(inline)]
 pub use l1_head_stream::{L1HeadInfo, L1HeadStream};
 #[doc(inline)]
-pub use l1_reader::{L1Reader, L1Readiness};
+pub use l1_reader::{FinalizedCommitment, L1Reader, L1Readiness};
 #[doc(inline)]
 pub use l1_watcher::{L1Event, L1Watcher, L1WatcherConfig};
 #[doc(inline)]
-pub use scan::{AppliedEntry, BatchLogChunks, EntryRole, ScannedBatch, Settlement};
+pub use scan::{AppliedEntry, BatchLogChunks, EntryRole, Post, PostId, Settlement};
 #[doc(inline)]
 pub use submitter::{BundleTarget, SendOutcome, Submitter};

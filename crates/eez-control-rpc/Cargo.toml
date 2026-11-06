@@ -19,7 +19,12 @@ protoc-bin-vendored = { workspace = true }
 tonic-prost-build   = { workspace = true }
 
 [dev-dependencies]
+alloy-primitives = { workspace = true, features = ["k256"] }
+hex.workspace = true
 proptest = "1"
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
 
 [lints]
 workspace = true
