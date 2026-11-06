@@ -327,7 +327,7 @@ impl RemoteProver {
                 message: format!("connect {}: {error}", self.inner.url),
             })?
             .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
-            .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES);
+            .max_decoding_message_size(eez_control_rpc::MAX_PROVE_RESPONSE_BYTES);
         let response = client
             .prove(tokio_stream::iter(chunks))
             .await
@@ -343,8 +343,11 @@ impl RemoteProver {
         signature: Vec<u8>,
     ) -> ProverResult<Bytes> {
         let hash = verify_attestation(&signature, &public_inputs_hash, self.inner.attester)?;
-        let expected = eez_protocol::public_inputs::public_inputs_hashes(&ctx.batch, self.vkey())
-            .map_err(|error| {
+        let expected = eez_protocol::public_inputs::public_inputs_hashes(
+            &ctx.batch,
+            ctx.verification_key.unwrap_or_else(|| self.vkey()),
+        )
+        .map_err(|error| {
             ProverError::Backend(format!("cannot verify requested public inputs: {error}"))
         })?;
         if expected.len() != 1 || hash != expected[0] {
@@ -1421,6 +1424,7 @@ mod tests {
                     blocks: vec![test_block(11, test_anchor().hash, 0x22)],
                     batch: test_batch(),
                     l1_block_hash: None,
+                    verification_key: None,
                 };
                 let hash = if wrong_batch {
                     B256::repeat_byte(0x7c)
@@ -1438,6 +1442,66 @@ mod tests {
                     fallback.then_some(false)
                 );
                 if wrong_batch {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("does not bind the requested batch")
+                    );
+                } else {
+                    assert_eq!(result.unwrap().len(), 65);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_opaque_keys_bind_v1_and_v2_proofs_to_the_requested_batch() {
+        for streaming in [false, true] {
+            for wrong_key in [false, true] {
+                let key = test_key();
+                let attester = key.address();
+                let registered = B256::repeat_byte(0x44);
+                let ctx = ProvingContext {
+                    rollup_id: 1,
+                    from_block: 11,
+                    to_block: 11,
+                    anchor: streaming.then(test_anchor),
+                    verification_key: Some(registered),
+                    batch: test_batch(),
+                    blocks: vec![test_block(11, test_anchor().hash, 0x22)],
+                    ..Default::default()
+                };
+                let response_key = if wrong_key {
+                    attester.into_word()
+                } else {
+                    registered
+                };
+                let hash =
+                    eez_protocol::public_inputs::public_inputs_hashes(&ctx.batch, response_key)
+                        .unwrap()[0];
+                let url = if streaming {
+                    spawn_streaming_stub(StreamingStub {
+                        signer: key,
+                        hash,
+                        blocks: Arc::default(),
+                        cursor: Arc::new(Mutex::new((0, B256::ZERO))),
+                        cross_wire_block_response: false,
+                        baseline_only: false,
+                        begins: Arc::default(),
+                        stall_first_block: None,
+                    })
+                    .await
+                } else {
+                    spawn_stub(key, hash).await
+                };
+                let prover = RemoteProver::new(url, attester);
+                let result = prover.prove(ctx).await;
+                assert_eq!(
+                    prover.inner.streaming.lock().await.supported,
+                    streaming.then_some(true)
+                );
+                if wrong_key {
                     assert!(
                         result
                             .unwrap_err()
@@ -1577,6 +1641,7 @@ mod tests {
                 batch: test_batch(),
                 blocks: vec![block_11.clone()],
                 l1_block_hash: None,
+                verification_key: None,
             })
             .await
             .unwrap();
@@ -1603,6 +1668,7 @@ mod tests {
                 batch: test_batch(),
                 blocks: vec![block_11, block_12],
                 l1_block_hash: None,
+                verification_key: None,
             })
             .await
             .unwrap();
@@ -1656,6 +1722,7 @@ mod tests {
                     blocks: vec![block],
                     batch: test_batch(),
                     l1_block_hash: None,
+                    verification_key: None,
                 }),
             )
             .await
@@ -1764,6 +1831,7 @@ mod tests {
                 blocks: vec![first.clone(), second, third.clone()],
                 batch: test_batch(),
                 l1_block_hash: None,
+                verification_key: None,
             })
             .await
             .unwrap();
@@ -1822,6 +1890,7 @@ mod tests {
                     blocks: vec![first, second],
                     batch: test_batch(),
                     l1_block_hash: None,
+                    verification_key: None,
                 })
                 .await;
             assert_eq!(begins.load(Ordering::SeqCst), 1);
@@ -1879,6 +1948,7 @@ mod tests {
                             blocks: vec![test_block(11, anchor.hash, 0x99)],
                             batch: test_batch(),
                             l1_block_hash: None,
+                            verification_key: None,
                         })
                         .await
                         .unwrap();
@@ -1909,6 +1979,7 @@ mod tests {
                             },
                             batch: test_batch(),
                             l1_block_hash: None,
+                            verification_key: None,
                         })
                         .await
                         .unwrap();
@@ -1957,6 +2028,7 @@ mod tests {
                 batch: test_batch(),
                 blocks: vec![block_11, block_12],
                 l1_block_hash: None,
+                verification_key: None,
             })
             .await
             .unwrap();

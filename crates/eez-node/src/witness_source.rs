@@ -23,9 +23,10 @@ use alloy_consensus::Header;
 use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{B256, Bytes};
 use alloy_rpc_types_debug::ExecutionWitness;
+use eez_composer::AttestationQuorum;
 use eez_driver::witness::{ExecutionWitnessMode, block_witness};
 use eez_primitives::{Block, EezPrimitives};
-use eez_prover::{BlockWitness, Prover, ProvingAnchor, ProvingWitnessSource};
+use eez_prover::{BlockWitness, ProvingAnchor, ProvingWitnessSource};
 use reth_evm::ConfigureEvm;
 use reth_libmdbx::{DatabaseFlags, Environment, Geometry, WriteFlags};
 use reth_storage_api::{BlockReader, HeaderProvider, StateProviderFactory, TransactionVariant};
@@ -294,7 +295,7 @@ pub async fn run_capture<P, E, F, G>(
     store: WitnessStore,
     provider: P,
     evm_config: E,
-    prover: Arc<dyn Prover>,
+    quorum: Arc<AttestationQuorum>,
     rollup_id: u64,
     posted_floor: F,
     settled_floor: G,
@@ -353,18 +354,9 @@ pub async fn run_capture<P, E, F, G>(
                 while prevalidation.try_join_next().is_some() {}
                 match anchor {
                     Ok(anchor) if number > anchor.number && prevalidation.is_empty() => {
-                        let prover = Arc::clone(&prover);
+                        let quorum = Arc::clone(&quorum);
                         prevalidation.spawn(async move {
-                            if let Err(error) = prover.prevalidate(rollup_id, anchor, bw).await {
-                                event!(
-                                    name: "eez.node.witness_capture.prevalidate_failed",
-                                    Level::WARN,
-                                    number,
-                                    anchor = anchor.number,
-                                    error = %error,
-                                    "prover did not prevalidate a captured block; Finalize will backfill it",
-                                );
-                            }
+                            quorum.prevalidate(rollup_id, anchor, bw).await;
                         });
                     }
                     Err(error) => event!(

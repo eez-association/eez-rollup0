@@ -293,7 +293,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(400)
             return
 
-        response = self._dispatch(body)
+        response = None if isinstance(body, list) else self._dispatch(body)
         if response is not None:
             resp = json.dumps(response).encode()
         else:

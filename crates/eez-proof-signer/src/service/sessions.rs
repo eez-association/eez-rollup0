@@ -1385,6 +1385,7 @@ mod tests {
                 .batch,
             blocks,
             l1_block_hash: None,
+            verification_key: None,
         }
     }
 

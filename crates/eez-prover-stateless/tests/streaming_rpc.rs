@@ -221,6 +221,7 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
         .batch,
         blocks,
         l1_block_hash: None,
+        verification_key: None,
     };
 
     let (_server, endpoint) = start_signer(&oracle, &[]).await;

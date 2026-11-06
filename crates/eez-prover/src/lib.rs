@@ -152,6 +152,10 @@ pub struct ProvingContext {
     /// Parent of `from_block`, including the state root registered on L1.
     /// `None` keeps legacy v1-only prover implementations source-compatible.
     pub anchor: Option<ProvingAnchor>,
+    /// Registry verification key captured for this request by the Composer.
+    /// `None` preserves the prover's single-attester default. This is local
+    /// verification metadata, not a field supplied by the remote prover.
+    pub verification_key: Option<B256>,
     /// The authoritative postBatch payload (proof carriers filled, `proofs[]`
     /// empty). The prover recomputes the `publicInputsHash` from this.
     pub batch: EvmBatch,

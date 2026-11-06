@@ -5,19 +5,19 @@ mod streaming;
 
 use std::time::Duration;
 
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 
 use eez_testkit::signals;
 use eez_testkit::{
-    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
-    ANVIL_KEY_6, BuilderStubMode, Harness, INVALID_PROOF_SELECTOR,
-    INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary, NodeConfig, NodeHandle, SEED_KEY,
-    STAGING_USER_KEY, block_number_and_hash_at, enode, overlay_follower, overlay_seed,
-    override_env, peers_mode, rollup_root_at, safe_block_hash, send_l2_value_transfer,
-    send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
-    wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
+    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_ATTESTER_KEY, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3,
+    ANVIL_KEY_4, ANVIL_KEY_6, BuilderStubMode, Harness, INVALID_PROOF_SELECTOR,
+    INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary, NodeConfig, NodeHandle, QuorumSigner,
+    SEED_KEY, STAGING_USER_KEY, block_number_and_hash_at, enode, overlay_follower, overlay_seed,
+    override_env, peers_mode, posted_batches, rollup_root_at, safe_block_hash,
+    send_l2_value_transfer, send_l2_value_transfer_confirmed, verify_batch_proofs, wait_for,
+    wait_for_latest_height, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
@@ -667,6 +667,305 @@ async fn failure_prover_signer_mismatch() {
     assert_eq!(snapshot.batches_posted, 0);
     assert_eq!(snapshot.executions_performed, 0);
     assert_eq!(snapshot.rollup_commitment, chain.initial_commitment());
+    node.assert_no_process_death();
+}
+
+/// Every registered `(proof system, attester)` pair of `harness`.
+fn registered_pairs(harness: &Harness) -> Vec<(Address, Address)> {
+    harness
+        .attesters()
+        .iter()
+        .map(|registered| (registered.proof_system, registered.attester))
+        .collect()
+}
+
+/// Two attesters and a threshold of two: every batch carries a proof from
+/// each, so neither signer alone can settle the rollup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn happy_case_quorum_two_of_two() {
+    let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4], 2)
+        .await
+        .unwrap();
+    let chain = harness.chain();
+    let env = harness
+        .env_with_attesters(&[QuorumSigner::Honest, QuorumSigner::Honest])
+        .await
+        .unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-two-of-two",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+
+    chain
+        .wait_for_batches(2, DEFAULT_TIMEOUT)
+        .await
+        .expect("the quorum never settled a batch");
+
+    let attesters = registered_pairs(&harness);
+    let mut both: Vec<Address> = attesters.iter().map(|&(ps, _)| ps).collect();
+    both.sort_unstable();
+    let posted = posted_batches(
+        chain.rpc_url(),
+        harness.dep.eez_address,
+        harness.dep.deploy_block,
+        harness.dep.rollup_id,
+    )
+    .await
+    .unwrap();
+    assert!(!posted.is_empty(), "settled batches must be visible on L1");
+    for posted in &posted {
+        assert!(posted.succeeded, "no batch may revert: {posted:?}");
+        assert_eq!(
+            posted.batch.proofSystems, both,
+            "every batch carries both proofs"
+        );
+        verify_batch_proofs(&posted.batch, &attesters).unwrap();
+    }
+    assert_ne!(
+        chain.snapshot().await.unwrap().rollup_commitment,
+        chain.initial_commitment(),
+        "the commitment must have moved off genesis",
+    );
+    node.assert_no_process_death();
+}
+
+/// Two of three attesters, one of which signs over a vkey the manager does not
+/// register. Its proof recovers to the right key, so only the composer's own
+/// check against the registered digest can tell; it is dropped, and the other
+/// two settle every batch without one reverting on L1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quorum_settles_without_an_attester_signing_the_wrong_digest() {
+    let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4, ANVIL_KEY_6], 2)
+        .await
+        .unwrap();
+    let chain = harness.chain();
+    let env = harness
+        .env_with_attesters(&[
+            QuorumSigner::Honest,
+            QuorumSigner::Honest,
+            QuorumSigner::StaleVkey,
+        ])
+        .await
+        .unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-stale-vkey",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+
+    chain
+        .wait_for_batches(2, DEFAULT_TIMEOUT)
+        .await
+        .expect("the honest attesters never settled a batch");
+    wait_for(DEFAULT_TIMEOUT, || async {
+        Ok((harness.attestations_of(2)? > 0).then_some(()))
+    })
+    .await
+    .expect("the stale signer never answered, so its proof was never checked");
+    wait_for(DEFAULT_TIMEOUT, || async {
+        Ok((!node
+            .log_lines_matching(&["prover proof does not bind the requested batch"], 1)
+            .is_empty())
+        .then_some(()))
+    })
+    .await
+    .expect("the prover client never rejected the stale proof by its registered digest check");
+
+    let attesters = registered_pairs(&harness);
+    let stale = attesters[2].0;
+    let posted = posted_batches(
+        chain.rpc_url(),
+        harness.dep.eez_address,
+        harness.dep.deploy_block,
+        harness.dep.rollup_id,
+    )
+    .await
+    .unwrap();
+    assert!(!posted.is_empty(), "settled batches must be visible on L1");
+    for posted in &posted {
+        assert!(posted.succeeded, "no batch may revert: {posted:?}");
+        assert_eq!(
+            posted.batch.proofSystems.len(),
+            2,
+            "the two honest proofs settle each batch"
+        );
+        assert!(
+            !posted.batch.proofSystems.contains(&stale),
+            "the stale proof must never reach L1: {posted:?}",
+        );
+        verify_batch_proofs(&posted.batch, &attesters).unwrap();
+    }
+    node.assert_no_process_death();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quorum_two_of_three_settles_with_an_unresponsive_attester() {
+    let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4, ANVIL_KEY_6], 2)
+        .await
+        .unwrap();
+    let env = harness
+        .env_with_attesters(&[QuorumSigner::Honest; 3])
+        .await
+        .unwrap();
+    // Stop the third server before any proof request. No proof can be in flight.
+    harness.pause_attester(2).unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-unresponsive",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+    let transaction = send_l2_value_transfer_confirmed(
+        &node.l2_rpc_url(),
+        ANVIL_KEY_1,
+        ANVIL_ADDR,
+        U256::from(1u64),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    let provider = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse().unwrap());
+    let receipt = provider
+        .get_transaction_receipt(transaction)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_safe_chain_contains(
+        &node,
+        receipt.block_number.unwrap(),
+        receipt.block_hash.unwrap(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("the healthy quorum must settle the executed value transfer");
+    let chain = harness.chain();
+    chain
+        .wait_for_batches_or_node_failure(2, &[&node], DEFAULT_TIMEOUT)
+        .await
+        .expect("the two responsive attesters must continue settlement");
+    let attesters = registered_pairs(&harness);
+    let mut expected: Vec<Address> = attesters[..2].iter().map(|&(system, _)| system).collect();
+    expected.sort_unstable();
+    let posted = posted_batches(
+        chain.rpc_url(),
+        harness.dep.eez_address,
+        harness.dep.deploy_block,
+        harness.dep.rollup_id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        posted.len() >= 2,
+        "two successful posts must be visible on L1"
+    );
+    for posted in &posted {
+        assert!(
+            posted.succeeded,
+            "a quorum post must not revert: {posted:?}"
+        );
+        assert_eq!(posted.batch.proofSystems, expected);
+        verify_batch_proofs(&posted.batch, &attesters).unwrap();
+    }
+    assert_eq!(harness.attestations_of(2).unwrap(), 0);
+    assert_ne!(
+        chain.snapshot().await.unwrap().rollup_commitment,
+        chain.initial_commitment(),
+        "the healthy quorum must advance the L1 commitment",
+    );
+    node.assert_no_process_death();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quorum_prover_rejects_a_foreign_rollup_identity() {
+    use eez_control_rpc::v2;
+
+    let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4], 2)
+        .await
+        .unwrap();
+    let env = harness
+        .env_with_attesters(&[QuorumSigner::Honest; 2])
+        .await
+        .unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-rollup-identity",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+    harness
+        .chain()
+        .wait_for_batches_or_node_failure(1, &[&node], DEFAULT_TIMEOUT)
+        .await
+        .expect("the configured identities must first settle a real batch");
+    let provider = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse().unwrap());
+    let genesis = provider
+        .get_block_by_number(BlockNumberOrTag::Number(0))
+        .await
+        .unwrap()
+        .unwrap();
+    let begin = v2::Begin {
+        rollup_id: harness.dep.rollup_id,
+        anchor_number: 0,
+        anchor_hash: genesis.header.hash.to_vec(),
+        anchor_state_root: genesis.header.state_root.to_vec(),
+    };
+    let mut client =
+        v2::prover_client::ProverClient::connect(harness.attester_endpoint(0).unwrap())
+            .await
+            .unwrap();
+    for foreign in [false, true] {
+        let mut begin = begin.clone();
+        if foreign {
+            begin.rollup_id += 1;
+        }
+        let frame = v2::ClientFrame {
+            request_id: 1,
+            kind: Some(v2::client_frame::Kind::Begin(begin)),
+            ..Default::default()
+        };
+        let (requests, receiver) = tokio::sync::mpsc::channel(1);
+        requests.send(frame).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut response = client
+                .prove_stream(tokio_stream::wrappers::ReceiverStream::new(receiver))
+                .await?
+                .into_inner();
+            response.message().await
+        })
+        .await
+        .expect("Begin exchange must complete within its deadline")
+        .unwrap()
+        .expect("Begin must receive a protocol response");
+        if foreign {
+            assert!(frame.session_id.is_empty());
+            assert_eq!(frame.epoch, 0);
+            assert_eq!(frame.request_id, 1);
+            let Some(v2::server_frame::Kind::Rejected(rejected)) = &frame.kind else {
+                panic!("a foreign rollup must be rejected before receiving a session: {frame:?}");
+            };
+            assert_eq!(rejected.code, tonic::Code::Unimplemented as i32);
+        } else {
+            assert!(matches!(frame.kind, Some(v2::server_frame::Kind::Ready(_))));
+            assert_eq!(frame.session_id.len(), 32);
+        }
+        drop(requests);
+    }
     node.assert_no_process_death();
 }
 
