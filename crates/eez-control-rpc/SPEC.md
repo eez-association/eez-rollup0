@@ -304,7 +304,7 @@ and cross-language vectors are in
 preflight avoids submitting a response that recovered to the correct attester
 but was signed over the wrong batch hash.
 
-After validation, the Composer MUST change only the proof carrier:
+For a single attester, after validation the Composer MUST change only the proof carrier:
 
 ```text
 assert batch.proofSystems == [ecdsa_proof_system_address]
@@ -325,9 +325,11 @@ as that attester's failure and never enters the batch, because one invalid
 proof reverts the whole batch on-chain.
 
 The Composer MUST NOT modify entries, state updates, rolling hashes,
-`callData`, proof-system assignments, scheduling counts, or any other proved
-batch field after the request. `response.public_inputs_hash` is not inserted
-into the batch; EEZ recomputes it on-chain.
+`callData`, scheduling counts, or any other proved batch field after the
+request. Proof-system assignments MAY change only as described for multiple
+attesters above. For a single attester, they MUST remain as requested.
+`response.public_inputs_hash` is not inserted into the batch; EEZ recomputes
+it on-chain.
 
 Finally, the Composer ABI-encodes `EEZ.postAndVerifyBatch(batch)`, signs the L1
 transaction with its poster key, and sends it to the deployment's EEZ contract.
