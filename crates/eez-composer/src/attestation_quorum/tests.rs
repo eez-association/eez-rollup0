@@ -5,6 +5,7 @@ use std::sync::{
 
 use alloy_primitives::{U256, keccak256};
 use alloy_provider::{ProviderBuilder, mock::Asserter};
+use alloy_sol_types::SolValue;
 use async_trait::async_trait;
 use eez_protocol::EcdsaProofSigner;
 use eez_prover::{ActionableProverFailure, RetryableProverError};
@@ -620,6 +621,11 @@ fn manager() -> Address {
 /// `verificationKey()` and `signer()`.
 fn answering(threshold: u64, members: &[(Answered, Answered)]) -> RootProvider {
     let asserter = Asserter::new();
+    push_registration(&asserter, threshold, members);
+    ProviderBuilder::default().connect_mocked_client(asserter)
+}
+
+fn push_registration(asserter: &Asserter, threshold: u64, members: &[(Answered, Answered)]) {
     asserter.push_success(&word(threshold));
     for (vkey, signer) in members {
         for answer in [vkey, signer] {
@@ -629,7 +635,6 @@ fn answering(threshold: u64, members: &[(Answered, Answered)]) -> RootProvider {
             }
         }
     }
-    ProviderBuilder::default().connect_mocked_client(asserter)
 }
 
 enum Answered {
@@ -653,6 +658,64 @@ async fn registration_reads_the_threshold_vkeys_and_signers() {
     let registration = quorum.registration_at(&provider, manager()).await.unwrap();
 
     assert_eq!(registration, registered(&provers, 2));
+}
+
+/// A shared composer must keep each rollup's manager and live settings separate.
+#[tokio::test]
+async fn manager_cache_separates_rollups_and_registries_and_survives_cloning() {
+    let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN)], 0);
+    let cloned = quorum.clone();
+    let registry_a = Address::repeat_byte(0xa1);
+    let registry_b = Address::repeat_byte(0xb1);
+    let registrations = [
+        (registry_a, 7, Address::repeat_byte(0x91), 1),
+        (registry_a, 8, Address::repeat_byte(0x92), 2),
+        (registry_b, 7, Address::repeat_byte(0x93), 1),
+    ];
+    for (registry, rollup_id, manager, threshold) in registrations {
+        let asserter = Asserter::new();
+        asserter.push_success(&Bytes::from((manager, B256::ZERO, U256::ZERO).abi_encode()));
+        push_registration(
+            &asserter,
+            threshold,
+            &[answers_for(&provers[0]), answers_for(&provers[1])],
+        );
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter);
+        let round = quorum.round(&provider, registry, rollup_id).await.unwrap();
+        let AttestationRound::Quorum { registration, .. } = round else {
+            panic!("two members must use registered quorum settings");
+        };
+        assert_eq!(registration, registered(&provers, threshold as usize));
+    }
+
+    for (registry, rollup_id, manager, old_threshold) in registrations {
+        let threshold = 3 - old_threshold;
+        let provider = answering(
+            threshold,
+            &[answers_for(&provers[0]), answers_for(&provers[1])],
+        );
+        let round = cloned.round(&provider, registry, rollup_id).await.unwrap();
+        let AttestationRound::Quorum { registration, .. } = round else {
+            panic!("two members must use registered quorum settings");
+        };
+        assert_eq!(registration, registered(&provers, threshold as usize));
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("threshold unavailable");
+        for prover in &provers {
+            asserter.push_success(&vkey_of(prover.key.address()));
+            asserter.push_success(&prover.key.address().into_word());
+        }
+        let provider = ProviderBuilder::default().connect_mocked_client(asserter);
+        let error = cloned
+            .round(&provider, registry, rollup_id)
+            .await
+            .unwrap_err();
+        let RegistrationError::Read { contract, call, .. } = error else {
+            panic!("the current manager's threshold failure must be reported: {error:?}");
+        };
+        assert_eq!((contract, call.as_str()), (manager, "threshold()"));
+    }
 }
 
 #[tokio::test]

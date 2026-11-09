@@ -22,8 +22,9 @@
 
 use std::{
     cmp::Reverse,
+    collections::HashMap,
     panic::AssertUnwindSafe,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -157,15 +158,15 @@ pub(crate) enum RegistrationError {
     },
 }
 
-/// The attesters of one rollup and how their proofs are collected.
+/// The attesters shared by the composer and how their proofs are collected.
 #[derive(Debug, Clone)]
 pub struct AttestationQuorum {
     /// Sorted by strictly ascending proof system, the order the registry
     /// requires for `batch.proofSystems`.
     members: Vec<QuorumMember>,
     grace: Duration,
-    /// The rollup's manager contract, looked up once it is registered.
-    manager: OnceLock<Address>,
+    /// Registered managers by registry and rollup, shared by quorum clones.
+    managers: Arc<Mutex<HashMap<(Address, u64), Address>>>,
 }
 
 impl AttestationQuorum {
@@ -203,7 +204,7 @@ impl AttestationQuorum {
         Ok(Self {
             members,
             grace,
-            manager: OnceLock::new(),
+            managers: Arc::default(),
         })
     }
 
@@ -283,11 +284,13 @@ impl AttestationQuorum {
         }
         let deadline = Instant::now() + REGISTRATION_READ_TIMEOUT;
         let registration = timeout_at(deadline, async {
-            let manager = match self.manager.get() {
-                Some(manager) => *manager,
+            let key = (registry, rollup_id);
+            let cached = self.managers.lock().unwrap().get(&key).copied();
+            let manager = match cached {
+                Some(manager) => manager,
                 None => {
                     let manager = rollup_manager(provider, registry, rollup_id).await?;
-                    *self.manager.get_or_init(|| manager)
+                    *self.managers.lock().unwrap().entry(key).or_insert(manager)
                 }
             };
             self.registration_at(provider, manager).await
