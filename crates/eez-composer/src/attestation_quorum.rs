@@ -229,11 +229,12 @@ impl AttestationQuorum {
 
     /// The attesters to ask for the next batch.
     ///
-    /// A lone attester keeps the pre-quorum flow and reads nothing. Otherwise
-    /// the manager's threshold, and the verification key of every configured
-    /// proof system and the signer it accepts, are read for every batch: the
-    /// owner can change the threshold or (de)register a proof system at any
-    /// time, and a batch built against a stale view reverts on-chain.
+    /// A lone attester reads nothing and signs under its prover's default
+    /// verification key. Otherwise the manager's threshold, and the
+    /// verification key of every configured proof system and the signer it
+    /// accepts, are read for every batch: the owner can change the threshold or
+    /// (de)register a proof system at any time, and a batch built against a
+    /// stale view reverts on-chain.
     ///
     /// # Errors
     ///

@@ -5440,7 +5440,7 @@ mod tests {
         }
     }
 
-    /// One attester keeps the floor it had before attestation quorums.
+    /// One attester adds no attestation gas to the floor.
     #[test]
     fn a_single_attester_keeps_the_single_proof_floor() {
         assert_eq!(
