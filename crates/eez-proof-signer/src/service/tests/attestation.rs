@@ -22,6 +22,39 @@ async fn a_stubbed_canonical_outbound_window_returns_a_recoverable_attestation()
 }
 
 #[tokio::test]
+async fn system_transactions_require_live_binding_before_attestation() {
+    // Reuse the successful outbound fixture above. Execution is stubbed, but
+    // the RPC, settlement validation and signature path are real. In
+    // particular, selecting zero without context used to produce a signature.
+    for (block_number, with_context) in [(0, false), (0, true), (u64::MAX, false)] {
+        let (mut batch, block_rlp, _user, call_hash) = canonical_outbound_case();
+        batch.blockNumber = block_number;
+        let validator = StubBackend::with_settlement_evidence(
+            outbound_backend_output(),
+            vec![outbound_evidence(call_hash)],
+        );
+        let state = inner(validator);
+        let server = TestServer::new(Arc::clone(&state)).await;
+        let mut window = single_block_settlement_window(batch, block_rlp);
+        header_mut(&mut window[0])
+            .post_batch
+            .as_mut()
+            .unwrap()
+            .l1_block_hash = if with_context {
+            crate::testkit::live_context().parent_hash.to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let status = server.prove(window).await;
+
+        assert_eq!(status.code(), Code::FailedPrecondition, "{status:?}");
+        assert_eq!(status.message(), "settlement validation rejected");
+        assert_eq!(state.backend.remaining_test_actions().unwrap(), 0);
+    }
+}
+
+#[tokio::test]
 async fn a_stubbed_mixed_outbound_then_inbound_window_returns_an_attestation() {
     let (batch, block_rlp, outbound_call_hash) = mixed_outbound_inbound_case();
     let expected_hash = recompute_test_public_inputs_hash(&batch);
@@ -102,7 +135,11 @@ async fn matching_intermediate_transaction_da_payload_is_attested() {
         transaction_block_chunk(5, 0x04, 0x05, non_system_transaction()),
         block_chunk(6, 0x05, 0x06),
     ];
-    replace_batch_bound_to_window(&mut window, anchor_batch_spanning(5, 6));
+    // Ordinary history followed by an empty terminal Sync block can still
+    // settle without an L1 parent/time constraint.
+    let mut batch = anchor_batch_spanning(5, 6);
+    batch.blockNumber = 0;
+    replace_batch_bound_to_window(&mut window, batch);
 
     let _response = server.attest(window).await;
 }

@@ -129,7 +129,10 @@ fn chunks_for(ctx: &ProvingContext) -> Vec<ProveChunk> {
                 // Empty: the prover recomputes the hash and returns it; we don't
                 // pre-claim it (the batch determines it deterministically).
                 public_inputs_hash: Vec::new(),
-                l1_block_hash: ctx.l1_block_hash.map(|h| h.to_vec()).unwrap_or_default(),
+                l1_block_hash: ctx
+                    .l1_context
+                    .map(|c| c.parent_hash.to_vec())
+                    .unwrap_or_default(),
             }),
         })),
     });
@@ -343,8 +346,12 @@ impl RemoteProver {
         signature: Vec<u8>,
     ) -> ProverResult<Bytes> {
         let hash = verify_attestation(&signature, &public_inputs_hash, self.inner.attester)?;
-        let expected = eez_protocol::public_inputs::public_inputs_hashes(&ctx.batch, self.vkey())
-            .map_err(|error| {
+        let expected = eez_protocol::public_inputs::public_inputs_hashes_with_context(
+            &ctx.batch,
+            self.vkey(),
+            ctx.l1_context,
+        )
+        .map_err(|error| {
             ProverError::Backend(format!("cannot verify requested public inputs: {error}"))
         })?;
         if expected.len() != 1 || hash != expected[0] {
@@ -436,7 +443,12 @@ impl RemoteProver {
         rollup_id: u64,
         anchor: ProvingAnchor,
         blocks: &[BlockWitness],
-        finalize: Option<(u64, u64, PostBatch)>,
+        finalize: Option<(
+            u64,
+            u64,
+            PostBatch,
+            Option<eez_protocol::l1_context::LiveSettlementContext>,
+        )>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>, StreamingError> {
         // One deadline covers lock acquisition, connect, both stream directions and EOF.
         // Dropping the exchange releases its lock; a later Resume recovers accepted work.
@@ -460,15 +472,10 @@ impl RemoteProver {
                     blocks.last().map_or(anchor.number, |block| block.number),
                 )
             },
-            |(from, to, _)| (*from, *to),
+            |(from, to, _, _)| (*from, *to),
         );
         let finalize = finalize
-            .map(|(from_block, to_block, post_batch)| {
-                if !post_batch.l1_block_hash.is_empty() {
-                    return Err(ProverError::Backend(
-                        "Rollup0 streaming does not support L1-bound settlement".into(),
-                    ));
-                }
+            .map(|(from_block, to_block, post_batch, context)| {
                 let terminal = blocks
                     .iter()
                     .find(|block| block.number == to_block)
@@ -482,7 +489,12 @@ impl RemoteProver {
                     settlement: Some(eez_control_rpc::v2::SettlementInput {
                         abi_calldata: post_batch.abi_calldata,
                         blobs: Vec::new(),
-                        posting_context: None,
+                        posting_context: context.map(|context| eez_control_rpc::v2::L1PostingContext {
+                            parent_hash: context.parent_hash.to_vec(),
+                            target_timestamp: context.timestamp,
+                            // Rollup0 authenticates parent/time at L1 proof consumption.
+                            chain_id: 0, parent_number: 0,
+                        }),
                     }),
                 })
             })
@@ -781,8 +793,8 @@ impl Prover for RemoteProver {
             abi_calldata,
             public_inputs_hash: Vec::new(),
             l1_block_hash: ctx
-                .l1_block_hash
-                .map(|hash| hash.to_vec())
+                .l1_context
+                .map(|context| context.parent_hash.to_vec())
                 .unwrap_or_default(),
         };
         match self
@@ -790,7 +802,7 @@ impl Prover for RemoteProver {
                 ctx.rollup_id,
                 anchor,
                 &ctx.blocks,
-                Some((ctx.from_block, ctx.to_block, post_batch)),
+                Some((ctx.from_block, ctx.to_block, post_batch, ctx.l1_context)),
             )
             .await
         {
@@ -1053,7 +1065,7 @@ mod tests {
                     1,
                     test_anchor(),
                     std::slice::from_ref(&input),
-                    Some((11, 11, PostBatch::default())),
+                    Some((11, 11, PostBatch::default(), None)),
                 )
                 .await
                 .map_err(ProverError::from)
@@ -1420,7 +1432,7 @@ mod tests {
                     anchor: fallback.then(test_anchor),
                     blocks: vec![test_block(11, test_anchor().hash, 0x22)],
                     batch: test_batch(),
-                    l1_block_hash: None,
+                    l1_context: None,
                 };
                 let hash = if wrong_batch {
                     B256::repeat_byte(0x7c)
@@ -1576,7 +1588,7 @@ mod tests {
                 anchor: Some(anchor),
                 batch: test_batch(),
                 blocks: vec![block_11.clone()],
-                l1_block_hash: None,
+                l1_context: None,
             })
             .await
             .unwrap();
@@ -1602,7 +1614,7 @@ mod tests {
                 anchor: Some(anchor),
                 batch: test_batch(),
                 blocks: vec![block_11, block_12],
-                l1_block_hash: None,
+                l1_context: None,
             })
             .await
             .unwrap();
@@ -1655,7 +1667,7 @@ mod tests {
                     anchor: Some(anchor),
                     blocks: vec![block],
                     batch: test_batch(),
-                    l1_block_hash: None,
+                    l1_context: None,
                 }),
             )
             .await
@@ -1763,7 +1775,7 @@ mod tests {
                 anchor: Some(anchor),
                 blocks: vec![first.clone(), second, third.clone()],
                 batch: test_batch(),
-                l1_block_hash: None,
+                l1_context: None,
             })
             .await
             .unwrap();
@@ -1821,7 +1833,7 @@ mod tests {
                     anchor: Some(anchor),
                     blocks: vec![first, second],
                     batch: test_batch(),
-                    l1_block_hash: None,
+                    l1_context: None,
                 })
                 .await;
             assert_eq!(begins.load(Ordering::SeqCst), 1);
@@ -1878,7 +1890,7 @@ mod tests {
                             anchor: Some(anchor),
                             blocks: vec![test_block(11, anchor.hash, 0x99)],
                             batch: test_batch(),
-                            l1_block_hash: None,
+                            l1_context: None,
                         })
                         .await
                         .unwrap();
@@ -1908,7 +1920,7 @@ mod tests {
                                 vec![first, second]
                             },
                             batch: test_batch(),
-                            l1_block_hash: None,
+                            l1_context: None,
                         })
                         .await
                         .unwrap();
@@ -1956,7 +1968,7 @@ mod tests {
                 anchor: Some(anchor),
                 batch: test_batch(),
                 blocks: vec![block_11, block_12],
-                l1_block_hash: None,
+                l1_context: None,
             })
             .await
             .unwrap();

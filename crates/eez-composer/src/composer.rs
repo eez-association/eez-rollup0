@@ -765,20 +765,6 @@ fn sim_error_is_insufficient_funds(err: &eez_protocol::ComposerError) -> bool {
     )
 }
 
-alloy_sol_types::sol! {
-    /// Storage getter for `EEZ.rollups[rollupId]` (auto-generated
-    /// from `mapping(uint64 => RollupConfig) public rollups`).
-    /// Returns the three public-getter fields in declaration order;
-    /// this reader consumes `etherBalance`.
-    #[sol(rpc)]
-    interface IEEZReader {
-        function rollups(uint64 rollupId)
-            external
-            view
-            returns (address rollupContract, bytes32 root, uint256 etherBalance);
-    }
-}
-
 /// L1-confirmed escrow (`rollups(rid).etherBalance`) an outbound withdrawal draws
 /// down. `None` on any read failure, so the caller skips this early rejection;
 /// the on-chain escrow check remains authoritative.
@@ -787,10 +773,16 @@ async fn read_rollup_escrow(provider: &alloy_provider::RootProvider, rid: u64) -
         .ok()?
         .parse::<Address>()
         .ok()?;
-    IEEZReader::new(eez, provider)
-        .rollups(rid)
-        .call()
-        .await
+    use alloy_sol_types::SolCall;
+    let req = alloy_rpc_types_eth::TransactionRequest::default()
+        .to(eez)
+        .input(
+            eez_protocol::abi::rollupsCall { rollupId: rid }
+                .abi_encode()
+                .into(),
+        );
+    let out = provider.call(req).await.ok()?;
+    eez_protocol::abi::rollupsCall::abi_decode_returns(&out)
         .ok()
         .map(|r| r.etherBalance)
 }
@@ -1911,6 +1903,7 @@ where
                 event!(
                     name: "eez.composer.recovery.rolled_back",
                     Level::WARN,
+                    event_name = "eez.composer.recovery.rolled_back",
                     rollup_id,
                     sync_height,
                     head = head.number(),
@@ -1952,6 +1945,7 @@ where
                             event!(
                                 name: "eez.composer.recovery.substituted",
                                 Level::WARN,
+                                event_name = "eez.composer.recovery.substituted",
                                 rollup_id,
                                 sync_height,
                                 timestamp,
@@ -2125,6 +2119,11 @@ where
                     .map_err(|e| format!("SyncBlockState::open: {e}"))
             })
             .and_then(|(state, draft)| {
+                if let BundleTarget::Exact { block, .. } = bundle_target
+                    && state.anchor.number().checked_add(1) != Some(block)
+                {
+                    return Err("live settlement must extend its intended L1 parent".into());
+                }
                 let cap = match bundle_target {
                     BundleTarget::Exact { timestamp, .. } => local
                         .l1_entry
@@ -3301,6 +3300,10 @@ where
                 &outbound_user_txs,
                 outbound_target_gas,
                 bundle_target,
+                Some(eez_protocol::l1_context::LiveSettlementContext {
+                    parent_hash: l1_state.anchor.hash(),
+                    timestamp,
+                }),
             )
             .await
             .and_then(|raw| {
@@ -3630,6 +3633,7 @@ where
                 &[], // no outbound user txs
                 0,   // no inline outbound target calls
                 bundle_target,
+                None,
             )
             .await
             .and_then(|raw| {
@@ -3806,6 +3810,7 @@ where
                     &[],
                     0, // no inline outbound target calls
                     historical_target,
+                    None,
                 )
                 .await
                 .map_err(|error| error.to_string())?
@@ -3977,6 +3982,7 @@ where
         outbound_user_txs: &[Bytes],
         outbound_target_gas: u64,
         bundle_target: BundleTarget,
+        l1_context: Option<eez_protocol::l1_context::LiveSettlementContext>,
     ) -> Result<Option<Bytes>, PreparePostBatchError> {
         use alloy_sol_types::SolCall;
         use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
@@ -3997,6 +4003,7 @@ where
             }
             b
         };
+        batch.blockNumber = if l1_context.is_some() { u64::MAX } else { 0 };
 
         // Prepend one leading immediate entry (`proxyEntryHash == 0`)
         // covering all L2 effects before the sync block — EEZ.sol drains
@@ -4440,7 +4447,7 @@ where
             }),
             batch: batch.clone(),
             blocks: block_witnesses,
-            l1_block_hash: None, // timeless batch (blockNumber 0)
+            l1_context,
         };
         let proof = match prove_with_retry(
             self.inner.prover.as_ref(),
