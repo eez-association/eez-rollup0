@@ -10,8 +10,13 @@
 
 use std::sync::Arc;
 
+use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::Address;
+use alloy_provider::{Provider, RootProvider};
+use alloy_rpc_types_eth::TransactionRequest;
+use alloy_sol_types::SolCall;
 use eez_l1::{L1CanonicalHead, L1Error, L1Result};
+use eez_protocol::abi::{rollupsCall, rollupsReturn};
 
 use crate::held_pool::HeldPool;
 use crate::optimistic::OptimisticallyIncluded;
@@ -164,4 +169,24 @@ pub struct RollupState<L2> {
     /// is in flight or settled-but-unfinalized. Always present (empty
     /// map costs nothing); only the cross-chain compose path writes it.
     pub optimistic: Arc<OptimisticallyIncluded>,
+}
+
+/// The registry's record of `rollup_id` at the latest L1 block.
+pub(crate) async fn read_registered_rollup(
+    provider: &RootProvider,
+    registry: Address,
+    rollup_id: u64,
+) -> Result<rollupsReturn, String> {
+    let call = rollupsCall {
+        rollupId: rollup_id,
+    };
+    let request = TransactionRequest::default()
+        .to(registry)
+        .input(call.abi_encode().into());
+    let output = provider
+        .call(request)
+        .block(BlockNumberOrTag::Latest.into())
+        .await
+        .map_err(|error| error.to_string())?;
+    rollupsCall::abi_decode_returns(&output).map_err(|error| error.to_string())
 }

@@ -797,19 +797,8 @@ async fn read_rollup_escrow(
     registry: Address,
     rid: u64,
 ) -> Option<U256> {
-    let request = alloy_rpc_types_eth::TransactionRequest::default()
-        .to(registry)
-        .input(
-            eez_protocol::abi::rollupsCall { rollupId: rid }
-                .abi_encode()
-                .into(),
-        );
-    let output = provider
-        .call(request)
-        .block(alloy_eips::BlockNumberOrTag::Latest.into())
+    crate::rollup::read_registered_rollup(provider, registry, rid)
         .await
-        .ok()?;
-    eez_protocol::abi::rollupsCall::abi_decode_returns(&output)
         .ok()
         .map(|rollup| rollup.etherBalance)
 }

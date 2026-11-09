@@ -36,7 +36,10 @@ use alloy_rpc_client::BatchRequest;
 use alloy_sol_types::SolCall;
 use eez_driver::RollupTiming;
 use eez_l1::BundleTarget;
-use eez_protocol::{EvmBatch, abi::RollupIdWithProofSystemsSol};
+use eez_protocol::{
+    EvmBatch,
+    abi::{RollupIdWithProofSystemsSol, signerCall, thresholdCall, verificationKeyCall},
+};
 use eez_prover::{BlockWitness, Prover, ProverError, ProvingAnchor, ProvingContext};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::{
@@ -45,7 +48,7 @@ use tokio::{
 };
 use tracing::{Level, event};
 
-use crate::prover_retry::prove_with_retry;
+use crate::{prover_retry::prove_with_retry, rollup::read_registered_rollup};
 
 /// Upper bound on the attester set. Every proof system is a verify call the
 /// batch pays for, and the gas floor the composer accepts is sized for this
@@ -276,10 +279,7 @@ impl AttestationQuorum {
     ) -> Result<QuorumRegistration, RegistrationError> {
         let mut batch = BatchRequest::new(provider.client());
         let threshold = batch
-            .add_call(
-                "eth_call",
-                &view(manager, &IRollupAttestationReader::thresholdCall {}),
-            )
+            .add_call("eth_call", &view(manager, &thresholdCall {}))
             .map_err(|error| read_error(manager, "threshold()", &error))?;
         let mut member_reads = Vec::with_capacity(self.members.len());
         for member in &self.members {
@@ -287,15 +287,12 @@ impl AttestationQuorum {
                 "eth_call",
                 &view(
                     manager,
-                    &IRollupAttestationReader::verificationKeyCall {
+                    &verificationKeyCall {
                         proofSystem: member.proof_system,
                     },
                 ),
             );
-            let signer = batch.add_call(
-                "eth_call",
-                &view(member.proof_system, &IEcdsaProofSystemReader::signerCall {}),
-            );
+            let signer = batch.add_call("eth_call", &view(member.proof_system, &signerCall {}));
             member_reads.push((vkey, signer));
         }
         batch
@@ -303,23 +300,24 @@ impl AttestationQuorum {
             .await
             .map_err(|error| read_error(manager, "the attestation settings", &error))?;
 
-        let threshold = decode::<IRollupAttestationReader::thresholdCall>(threshold.await)
-            .map_err(|message| RegistrationError::Read {
+        let threshold = decode::<thresholdCall>(threshold.await).map_err(|message| {
+            RegistrationError::Read {
                 contract: manager,
                 call: "threshold()".to_owned(),
                 message,
-            })?;
+            }
+        })?;
         // The manager accepts any batch once `threshold` proofs verify; zero
         // still needs one proof for the batch to be attested at all.
         let threshold = usize::try_from(threshold).unwrap_or(usize::MAX).max(1);
         let mut vkeys = Vec::with_capacity(self.members.len());
         for (member, (vkey, signer)) in self.members.iter().zip(member_reads) {
             let vkey = match vkey {
-                Ok(vkey) => decode::<IRollupAttestationReader::verificationKeyCall>(vkey.await),
+                Ok(vkey) => decode::<verificationKeyCall>(vkey.await),
                 Err(error) => Err(error.to_string()),
             };
             let signer = match signer {
-                Ok(signer) => decode::<IEcdsaProofSystemReader::signerCall>(signer.await),
+                Ok(signer) => decode::<signerCall>(signer.await),
                 Err(error) => Err(error.to_string()),
             };
             vkeys.push(usable_vkey(member, manager, vkey, signer));
@@ -544,19 +542,6 @@ impl QuorumRegistration {
     }
 }
 
-alloy_sol_types::sol! {
-    /// The attestation settings of a rollup's manager contract (`Rollup.sol`).
-    interface IRollupAttestationReader {
-        function threshold() external view returns (uint256);
-        function verificationKey(address proofSystem) external view returns (bytes32);
-    }
-
-    /// The signer an `ECDSAProofSystem` accepts.
-    interface IEcdsaProofSystemReader {
-        function signer() external view returns (address);
-    }
-}
-
 /// The `eth_call` parameters of a view on `contract` at the latest block.
 fn view(
     contract: Address,
@@ -639,16 +624,8 @@ async fn rollup_manager(
     registry: Address,
     rollup_id: u64,
 ) -> Result<Address, RegistrationError> {
-    let call = eez_protocol::abi::rollupsCall {
-        rollupId: rollup_id,
-    };
-    let request = view(registry, &call).0;
-    let output = provider
-        .call(request)
-        .block(BlockNumberOrTag::Latest.into())
+    let manager = read_registered_rollup(provider, registry, rollup_id)
         .await
-        .map_err(|error| read_error(registry, &format!("rollups({rollup_id})"), &error))?;
-    let manager = eez_protocol::abi::rollupsCall::abi_decode_returns(&output)
         .map_err(|error| read_error(registry, &format!("rollups({rollup_id})"), &error))?
         .rollupContract;
     if manager == Address::ZERO {
