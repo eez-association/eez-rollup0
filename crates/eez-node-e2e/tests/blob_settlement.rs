@@ -114,8 +114,9 @@ async fn blob_settlement_evidence() -> Result<()> {
         while let Some(posts) = reader.next_batch_log_chunk(&mut chunks).await? {
             for post in posts.into_iter().filter(|post| post.id.l1_block <= last) {
                 ensure!(
-                    post.batch.blockNumber == 0,
-                    "nonzero blob batch block number"
+                    matches!(post.batch.blockNumber, 0 | u64::MAX),
+                    "unsupported blob batch block number {}",
+                    post.batch.blockNumber
                 );
                 ensure!(
                     !post.blob_hashes.is_empty(),
