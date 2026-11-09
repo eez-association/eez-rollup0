@@ -799,13 +799,20 @@ async fn a_lone_attester_reads_no_registration() {
     assert_eq!(seen.verification_key, None);
 }
 
+/// Lets the spawned prevalidation exchanges run up to their first await.
+async fn run_spawned() {
+    tokio::time::sleep(Duration::from_millis(10)).await;
+}
+
 #[tokio::test]
 async fn prevalidation_reaches_all_attesters_without_signing_despite_one_failure() {
     for answer in [REJECTED, Answer::Panic] {
         let (quorum, provers) = quorum(&[(0, answer), (0, SIGN)], 0);
         let (anchor, block) = prevalidation_input();
 
-        quorum.prevalidate(7, anchor, block.clone()).await;
+        let mut prevalidation = Prevalidation::new(&quorum);
+        prevalidation.offer(7, anchor, &block);
+        run_spawned().await;
 
         for prover in provers {
             assert_eq!(
@@ -876,18 +883,46 @@ impl Drop for PrevalidationDrop<'_> {
 }
 
 #[tokio::test]
-async fn cancelling_prevalidation_drops_every_pending_member_exchange() {
+async fn a_busy_attester_skips_blocks_without_holding_up_the_others() {
+    let (quorum, provers) = quorum(&[(0, Answer::Pending), (0, SIGN)], 0);
+    let (anchor, first) = prevalidation_input();
+    let second = BlockWitness {
+        number: 12,
+        hash: B256::repeat_byte(0x13),
+        parent_hash: first.hash,
+        ..first.clone()
+    };
+    let mut prevalidation = Prevalidation::new(&quorum);
+
+    prevalidation.offer(7, anchor, &first);
+    run_spawned().await;
+    prevalidation.offer(7, anchor, &second);
+    run_spawned().await;
+
+    let prevalidated = |i: usize| provers[i].prevalidated.lock().unwrap().map(|(.., h)| h);
+    assert_eq!(
+        prevalidated(0),
+        Some(first.hash),
+        "still busy with the first"
+    );
+    assert_eq!(prevalidated(1), Some(second.hash));
+}
+
+#[tokio::test]
+async fn dropping_prevalidation_aborts_every_exchange_in_flight() {
     let (quorum, provers) = quorum(&[(0, Answer::Pending), (0, Answer::Pending)], 0);
     let (anchor, block) = prevalidation_input();
-    let mut pending = Box::pin(quorum.prevalidate(7, anchor, block));
-    assert!(futures_util::poll!(pending.as_mut()).is_pending());
+    let mut prevalidation = Prevalidation::new(&quorum);
+    prevalidation.offer(7, anchor, &block);
+    run_spawned().await;
     assert!(
         provers
             .iter()
             .all(|prover| prover.prevalidated.lock().unwrap().is_some())
     );
 
-    drop(pending);
+    drop(prevalidation);
+    run_spawned().await;
 
     assert!(
         provers

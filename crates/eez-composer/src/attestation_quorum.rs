@@ -39,7 +39,10 @@ use eez_l1::BundleTarget;
 use eez_protocol::{EvmBatch, abi::RollupIdWithProofSystemsSol};
 use eez_prover::{BlockWitness, Prover, ProverError, ProvingAnchor, ProvingContext};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
-use tokio::time::{Instant, timeout_at};
+use tokio::{
+    task::JoinSet,
+    time::{Instant, timeout_at},
+};
 use tracing::{Level, event};
 
 use crate::prover_retry::prove_with_retry;
@@ -221,41 +224,6 @@ impl AttestationQuorum {
         self.members.is_empty()
     }
 
-    /// Prevalidate a committed block with every configured attester. This is
-    /// best effort: final proof collection still verifies registration and proofs.
-    /// Dropping the caller cancels every member exchange.
-    pub async fn prevalidate(&self, rollup_id: u64, anchor: ProvingAnchor, block: BlockWitness) {
-        let number = block.number;
-        let mut pending = FuturesUnordered::new();
-        for member in &self.members {
-            let block = block.clone();
-            pending.push(async move {
-                let result = AssertUnwindSafe(member.prover.prevalidate(rollup_id, anchor, block))
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(ProverError::Backend(
-                            "attester prevalidation panicked".to_owned(),
-                        ))
-                    });
-                (member.proof_system, result)
-            });
-        }
-        while let Some((proof_system, result)) = pending.next().await {
-            if let Err(error) = result {
-                event!(
-                    name: "eez.composer.attestation.prevalidate_failed",
-                    Level::WARN,
-                    %proof_system,
-                    number,
-                    anchor = anchor.number,
-                    %error,
-                    "attester prevalidation failed; Finalize will backfill the block",
-                );
-            }
-        }
-    }
-
     /// The attesters to ask for the next batch.
     ///
     /// A lone attester keeps the pre-quorum flow and reads nothing. Otherwise
@@ -357,6 +325,70 @@ impl AttestationQuorum {
             vkeys.push(usable_vkey(member, manager, vkey, signer));
         }
         QuorumRegistration::new(threshold, vkeys)
+    }
+}
+
+/// Sends committed blocks to the attesters ahead of proving, at most one in
+/// flight per attester: a slow one misses only its own blocks, which Finalize
+/// backfills. Best effort, since proof collection still verifies everything.
+/// Dropping it aborts every exchange in flight.
+#[derive(Debug)]
+pub struct Prevalidation {
+    members: Vec<(QuorumMember, JoinSet<()>)>,
+}
+
+impl Prevalidation {
+    /// No exchange in flight for any member of `quorum`.
+    #[must_use]
+    pub fn new(quorum: &AttestationQuorum) -> Self {
+        let members = quorum.members.iter().cloned();
+        Self {
+            members: members.map(|member| (member, JoinSet::new())).collect(),
+        }
+    }
+
+    /// Send `block` to every attester with no exchange in flight.
+    pub fn offer(&mut self, rollup_id: u64, anchor: ProvingAnchor, block: &BlockWitness) {
+        let number = block.number;
+        for (member, in_flight) in &mut self.members {
+            while in_flight.try_join_next().is_some() {}
+            let proof_system = member.proof_system;
+            if !in_flight.is_empty() {
+                event!(
+                    name: "eez.composer.attestation.prevalidate_busy",
+                    Level::DEBUG,
+                    event_name = "eez.composer.attestation.prevalidate_busy",
+                    %proof_system,
+                    number,
+                    "attester busy prevalidating; Finalize will backfill the block",
+                );
+                continue;
+            }
+            let prover = Arc::clone(&member.prover);
+            let block = block.clone();
+            in_flight.spawn(async move {
+                let result = AssertUnwindSafe(prover.prevalidate(rollup_id, anchor, block))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(ProverError::Backend(
+                            "attester prevalidation panicked".to_owned(),
+                        ))
+                    });
+                if let Err(error) = result {
+                    event!(
+                        name: "eez.composer.attestation.prevalidate_failed",
+                        Level::WARN,
+                        event_name = "eez.composer.attestation.prevalidate_failed",
+                        %proof_system,
+                        number,
+                        anchor = anchor.number,
+                        %error,
+                        "attester prevalidation failed; Finalize will backfill the block",
+                    );
+                }
+            });
+        }
     }
 }
 

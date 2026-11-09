@@ -49,7 +49,7 @@ pub mod rollup;
 
 #[doc(inline)]
 pub use attestation_quorum::{
-    AttestationQuorum, DEFAULT_ATTESTATION_GRACE, QuorumConfigError, QuorumMember,
+    AttestationQuorum, DEFAULT_ATTESTATION_GRACE, Prevalidation, QuorumConfigError, QuorumMember,
 };
 #[doc(inline)]
 pub use composer::{Composer, ComposerConfigError, CrossChainExecCtx};
