@@ -30,8 +30,9 @@ alone. The full suite covers Rollup0's baseline and optional capabilities;
 session controls, shared caching, and concurrent sessions are not baseline
 requirements.
 Blob submissions with calldata still populated are negative tests of blob carrier
-validation; posting context remains unsupported. Blob proof success is covered
-by the stateless streaming integration tests, separately from these vectors.
+validation. Live parent/time posting context is supported. Blob proof success
+is covered by the stateless streaming integration tests, separately from these
+vectors.
 
 These vectors target Rollup0's timeless **conditional-proof
 profile**: a proof binds the transition to its selected parent but does not
