@@ -73,6 +73,8 @@ jobs:
           sudo bash scripts/ci/install-llvm.sh
           echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
           echo "/usr/lib/llvm-22/bin" >> "$GITHUB_PATH"
+      - name: Builder RPC dispatch tests
+        run: python3 -B scripts/test-builder-stub.py
       - name: Unit tests (lib + bins, parallel)
         run: cargo nextest run --locked --cargo-profile ci-e2e --workspace --lib --bins --no-fail-fast
       - name: Protocol integration vectors

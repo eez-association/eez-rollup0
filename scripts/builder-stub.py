@@ -239,6 +239,14 @@ class Builder:
             time.sleep(wait)
 
 
+def _is_builder_request(body):
+    """Identify methods whose behavior belongs to the local builder."""
+    method = body.get("method") if isinstance(body, dict) else None
+    return isinstance(method, str) and (
+        method == "eth_sendBundle" or method.startswith("eez_")
+    )
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
@@ -291,6 +299,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         except Exception:
             self.send_error(400)
+            return
+
+        if isinstance(body, list) and any(_is_builder_request(item) for item in body):
+            self.send_error(400, "builder methods require a single request")
             return
 
         response = None if isinstance(body, list) else self._dispatch(body)
