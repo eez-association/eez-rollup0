@@ -466,6 +466,39 @@ async fn only_retryable_failures_keep_the_window_retryable() {
     );
 }
 
+#[test]
+fn mixed_retryable_failures_preserve_a_non_outage_kind_in_either_order() {
+    for charged_kind in [
+        RetryableProverError::DeadlineExceeded,
+        RetryableProverError::Aborted,
+    ] {
+        for kinds in [
+            [RetryableProverError::Unavailable, charged_kind],
+            [charged_kind, RetryableProverError::Unavailable],
+        ] {
+            let mut tally = Tally::new(3, 2);
+            for (index, kind) in kinds.into_iter().enumerate() {
+                tally.record(
+                    proof_system(index as u8 + 1),
+                    Err(ProverError::Retryable {
+                        kind,
+                        message: "attempt failed".to_owned(),
+                    }),
+                );
+            }
+
+            let error = tally
+                .verdict(1)
+                .expect("one pending attester cannot meet quorum");
+            assert_eq!(
+                error.retryable_kind(),
+                Some(charged_kind),
+                "a mixed failure must not become an outage because of completion order",
+            );
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn one_non_retryable_failure_makes_the_window_a_backend_error() {
     let (quorum, provers) = quorum(&[(0, UNAVAILABLE), (0, REJECTED), (0, SIGN)], 0);

@@ -40,7 +40,9 @@ use eez_protocol::{
     EvmBatch,
     abi::{RollupIdWithProofSystemsSol, signerCall, thresholdCall, verificationKeyCall},
 };
-use eez_prover::{BlockWitness, Prover, ProverError, ProvingAnchor, ProvingContext};
+use eez_prover::{
+    BlockWitness, Prover, ProverError, ProvingAnchor, ProvingContext, RetryableProverError,
+};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::{
     task::JoinSet,
@@ -758,6 +760,14 @@ impl Tally {
             .all(|(_, e)| e.retryable_kind().is_some())
             && let Some(kind) = self.failures.first().and_then(|(_, e)| e.retryable_kind())
         {
+            // Only a window whose failures are all Unavailable is an outage.
+            // Otherwise preserve a charged failure regardless of completion order.
+            let kind = self
+                .failures
+                .iter()
+                .filter_map(|(_, error)| error.retryable_kind())
+                .find(|kind| *kind != RetryableProverError::Unavailable)
+                .unwrap_or(kind);
             return Some(ProverError::Retryable { kind, message });
         }
         Some(ProverError::Backend(message))

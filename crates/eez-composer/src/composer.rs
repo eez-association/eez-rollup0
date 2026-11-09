@@ -34,7 +34,9 @@ use eez_driver::{
 use eez_evm::EezEvmConfig;
 use eez_l1::{BundleTarget, L1Error, L1Event, SendOutcome, Submitter};
 use eez_primitives::engine::EezEngineTypes;
-use eez_prover::{ActionableProverFailure, BlockWitness, ProverError, ProvingContext};
+use eez_prover::{
+    ActionableProverFailure, BlockWitness, ProverError, ProvingContext, RetryableProverError,
+};
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
 use reth_storage_api::{
     BlockReader, BlockSource, StateProvider, StateProviderFactory, TransactionsProvider,
@@ -719,6 +721,25 @@ fn recover_settlement_failure(
     pool.release_in_flight_batch(&evicted);
     pool.push_front_batch(retry);
     outcome
+}
+
+fn recover_prover_failure(
+    pool: &HeldPool,
+    rollup_id: u64,
+    txs: Vec<HeldTx>,
+    error: &ProverError,
+) -> SettlementFailureOutcome {
+    if error.retryable_kind() == Some(RetryableProverError::Unavailable) {
+        // An unavailable backend has not rejected these candidates. Preserve
+        // earlier charged attempts so an outage cannot reset the eviction bound.
+        let requeued = txs.len();
+        pool.push_front_batch(txs);
+        return SettlementFailureOutcome {
+            requeued,
+            evicted: 0,
+        };
+    }
+    recover_settlement_failure(pool, rollup_id, txs, SettlementFailureSource::Prover)
 }
 
 impl From<String> for PreparePostBatchError {
@@ -3488,7 +3509,7 @@ where
                         error = %error,
                         retryable,
                         failure_class = "expected_transient",
-                        "transient proof episode failed; counting one settlement failure and degrading to minimal postBatch",
+                        "transient proof episode failed; recovering candidates and degrading to minimal postBatch",
                     );
                 } else {
                     event!(
@@ -3501,19 +3522,14 @@ where
                         "unexpected proof rejection; possible Composer/prover disagreement; counting one settlement failure and degrading to minimal postBatch",
                     );
                 }
-                let recovery = recover_settlement_failure(
-                    pool,
-                    rollup_id,
-                    survivors,
-                    SettlementFailureSource::Prover,
-                );
+                let recovery = recover_prover_failure(pool, rollup_id, survivors, &error);
                 event!(
                     name: "eez.composer.prover.failure_recovered",
                     Level::WARN,
                     rollup_id,
                     requeued = recovery.requeued,
                     evicted = recovery.evicted,
-                    "prover failure recovered with bounded transaction eviction",
+                    "prover failure recovered",
                 );
                 return self
                     .dispatch_minimal_postbatch(
@@ -5177,6 +5193,98 @@ mod tests {
         );
         assert!(after_second.iter().all(|tx| tx.attempts == 2));
         pool.release_in_flight_batch(&after_second);
+    }
+
+    #[test]
+    fn prover_outage_preserves_candidates_and_prior_attempts_past_the_eviction_limit() {
+        let pool = HeldPool::new();
+        let sender = Address::repeat_byte(0xa);
+        let mut root = held(sender, Direction::Inbound, 0, 1);
+        root.attempts = MAX_BUNDLE_ATTEMPTS - 1;
+        let suffix = held(sender, Direction::Inbound, 1, 2);
+        let independent = held(Address::repeat_byte(0xb), Direction::Outbound, 0, 3);
+        pool.push_contiguous(root.clone(), 0).unwrap();
+        pool.push_contiguous(suffix.clone(), 0).unwrap();
+        pool.push_contiguous(independent.clone(), 0).unwrap();
+        let unavailable = ProverError::Retryable {
+            kind: RetryableProverError::Unavailable,
+            message: "connection refused".to_owned(),
+        };
+
+        for _ in 0..=MAX_BUNDLE_ATTEMPTS {
+            let recovery = recover_prover_failure(&pool, 1, pool.pop_all(), &unavailable);
+            assert_eq!(
+                recovery,
+                SettlementFailureOutcome {
+                    requeued: 3,
+                    evicted: 0,
+                },
+                "an outage must not consume candidate attempts or evict a nonce suffix",
+            );
+        }
+        let remaining = pool.pop_all();
+        assert_eq!(
+            remaining.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+            vec![root.hash, suffix.hash, independent.hash],
+            "recovery must preserve candidates and FIFO order",
+        );
+        assert_eq!(
+            remaining.iter().map(|tx| tx.attempts).collect::<Vec<_>>(),
+            vec![MAX_BUNDLE_ATTEMPTS - 1, 0, 0],
+            "an outage must neither charge nor reset earlier attempts",
+        );
+        assert!(
+            pool.push_contiguous(held(sender, Direction::Inbound, 0, 4), 0)
+                .is_err(),
+            "the original nonce reservation must remain held through the outage",
+        );
+
+        let recovery = recover_prover_failure(
+            &pool,
+            1,
+            remaining,
+            &ProverError::Backend("invalid proof".to_owned()),
+        );
+        assert_eq!(
+            recovery,
+            SettlementFailureOutcome {
+                requeued: 1,
+                evicted: 2,
+            },
+            "the next charged failure must still evict the root and its nonce suffix",
+        );
+        let remaining = pool.pop_all();
+        assert_eq!(remaining[0].hash, independent.hash);
+        assert_eq!(remaining[0].attempts, 1);
+        pool.release_in_flight_batch(&remaining);
+    }
+
+    #[test]
+    fn other_retryable_prover_errors_still_charge_candidate_attempts() {
+        for kind in [
+            RetryableProverError::DeadlineExceeded,
+            RetryableProverError::Aborted,
+        ] {
+            let pool = HeldPool::new();
+            let mut tx = held(Address::repeat_byte(0xa), Direction::Inbound, 0, 1);
+            tx.attempts = MAX_BUNDLE_ATTEMPTS - 1;
+            pool.push_contiguous(tx, 0).unwrap();
+            let error = ProverError::Retryable {
+                kind,
+                message: "attempt failed".to_owned(),
+            };
+
+            let recovery = recover_prover_failure(&pool, 1, pool.pop_all(), &error);
+            assert_eq!(
+                recovery,
+                SettlementFailureOutcome {
+                    requeued: 0,
+                    evicted: 1,
+                },
+                "{kind} must retain the existing eviction bound",
+            );
+            assert!(pool.is_empty());
+        }
     }
 
     #[test]
