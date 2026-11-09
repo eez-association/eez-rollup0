@@ -4019,7 +4019,6 @@ where
         bundle_target: BundleTarget,
         l1_context: Option<eez_protocol::l1_context::LiveSettlementContext>,
     ) -> Result<Option<Bytes>, PreparePostBatchError> {
-        use alloy_sol_types::SolCall;
         use eez_protocol::abi::postAndVerifyBatchCall;
 
         let sync_block_hash = terminal_header.hash();

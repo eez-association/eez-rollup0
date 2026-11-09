@@ -1,7 +1,4 @@
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use alloy_primitives::{U256, keccak256};
 use alloy_provider::{ProviderBuilder, mock::Asserter};
