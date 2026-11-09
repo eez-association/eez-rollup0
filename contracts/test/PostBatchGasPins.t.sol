@@ -60,10 +60,10 @@ contract PostBatchGasPinsTest is Test {
     /// Measured 333_730 (worst rung); pinned at measured x 1.10 rounded up.
     uint256 private constant POSTBATCH_ENTRY_GAS_PIN = 370_000;
 
-    /// Mirrors `POSTBATCH_PROOF_SYSTEM_GAS_PIN` in `crates/eez-composer/src/composer.rs`:
-    /// what each proof system beyond the first adds. Measured 12_264 (sixteen proof
-    /// systems, four entries); pinned at measured x 1.10 rounded up.
-    uint256 private constant POSTBATCH_PROOF_SYSTEM_GAS_PIN = 14_000;
+    /// Mirrors `POSTBATCH_ECDSA_PROOF_SYSTEM_GAS_PIN` in `crates/eez-composer/src/composer.rs`:
+    /// what each `ECDSAProofSystem` beyond the first adds. Measured 12_264 (sixteen
+    /// proof systems, four entries); pinned at measured x 1.10 rounded up.
+    uint256 private constant POSTBATCH_ECDSA_PROOF_SYSTEM_GAS_PIN = 14_000;
 
     uint64 private constant ROLLUP_ID = 1;
     uint256 private constant PROVER_KEY = 0xA11CE;
@@ -157,7 +157,9 @@ contract PostBatchGasPinsTest is Test {
 
         console.log("worst marginal per proof system:", worstMarginal);
         assertLe(
-            worstMarginal, POSTBATCH_PROOF_SYSTEM_GAS_PIN, "observed marginal exceeds POSTBATCH_PROOF_SYSTEM_GAS_PIN"
+            worstMarginal,
+            POSTBATCH_ECDSA_PROOF_SYSTEM_GAS_PIN,
+            "observed marginal exceeds POSTBATCH_ECDSA_PROOF_SYSTEM_GAS_PIN"
         );
     }
 

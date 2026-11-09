@@ -283,7 +283,8 @@ impl std::fmt::Debug for CrossChainWiring {
 /// bundle's inclusion block.
 pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 
-/// Stand-in for each proof when sizing before the attesters run (ECDSA is 65 B).
+/// Stand-in for each proof when sizing before the attesters run. Sized for an
+/// ECDSA proof (65 B), the only kind the prover client accepts.
 const MAX_PROOF_BYTES: usize = 128;
 
 /// Ceiling on a postBatch's gas limit (`EEZ_MAX_POSTBATCH_GAS` overrides): the
@@ -302,14 +303,14 @@ const POSTBATCH_BASE_GAS_PIN: u64 = 160_000;
 /// deploy for a new sender. Same pin test; measured 334k worst case, 10% slack.
 const POSTBATCH_ENTRY_GAS_PIN: u64 = 370_000;
 
-/// Each proof system past the first costs a manager vkey read and a verify
-/// call. Same pin test; measured 12,264 worst case (sixteen), 10% slack.
-const POSTBATCH_PROOF_SYSTEM_GAS_PIN: u64 = 14_000;
+/// Each `ECDSAProofSystem` past the first costs a manager vkey read and its
+/// verify call. Same pin test; measured 12,264 worst case (sixteen), 10% slack.
+const POSTBATCH_ECDSA_PROOF_SYSTEM_GAS_PIN: u64 = 14_000;
 
-/// Execution the extra proofs of a batch carrying `proof_systems` add, calldata
-/// aside.
+/// Execution the extra ECDSA proofs of a batch carrying `proof_systems` add,
+/// calldata aside.
 const fn attestation_gas(proof_systems: u64) -> u64 {
-    POSTBATCH_PROOF_SYSTEM_GAS_PIN.saturating_mul(proof_systems.saturating_sub(1))
+    POSTBATCH_ECDSA_PROOF_SYSTEM_GAS_PIN.saturating_mul(proof_systems.saturating_sub(1))
 }
 
 /// Below this the drain of a batch carrying `proof_systems` proofs admits
@@ -5407,8 +5408,8 @@ mod tests {
             ("POSTBATCH_BASE_GAS_PIN", POSTBATCH_BASE_GAS_PIN),
             ("POSTBATCH_ENTRY_GAS_PIN", POSTBATCH_ENTRY_GAS_PIN),
             (
-                "POSTBATCH_PROOF_SYSTEM_GAS_PIN",
-                POSTBATCH_PROOF_SYSTEM_GAS_PIN,
+                "POSTBATCH_ECDSA_PROOF_SYSTEM_GAS_PIN",
+                POSTBATCH_ECDSA_PROOF_SYSTEM_GAS_PIN,
             ),
         ] {
             let decl = format!("uint256 private constant {name} = ");
@@ -5576,7 +5577,7 @@ mod tests {
         let seven = PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 7);
         assert_eq!(
             seven.projected - single.projected,
-            6 * POSTBATCH_PROOF_SYSTEM_GAS_PIN
+            6 * POSTBATCH_ECDSA_PROOF_SYSTEM_GAS_PIN
         );
         assert_eq!(attestation_gas(0), 0);
         assert_eq!(attestation_gas(1), 0);

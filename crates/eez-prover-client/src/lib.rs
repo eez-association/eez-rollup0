@@ -2126,6 +2126,24 @@ mod tests {
         assert!(matches!(error, ProverError::Backend(_)), "{error:?}");
     }
 
+    /// `ECDSA.recover` rejects both forms, so either would revert the batch.
+    #[test]
+    fn verify_attestation_rejects_raw_recovery_byte_and_high_s() {
+        const SECP256K1N: alloy_primitives::U256 = alloy_primitives::uint!(
+            0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141_U256
+        );
+        let key = test_key();
+        let hash = B256::repeat_byte(0x7c);
+        let valid = sign_65(&key, hash);
+        let mut raw_recovery = valid.clone();
+        raw_recovery[64] -= 27;
+        let low = Signature::try_from(valid.as_slice()).unwrap();
+        let high_s = Signature::new(low.r(), SECP256K1N - low.s(), !low.v()).as_bytes();
+        for proof in [raw_recovery, high_s.to_vec()] {
+            assert!(verify_attestation(&proof, hash.as_slice(), key.address()).is_err());
+        }
+    }
+
     #[test]
     fn verify_attestation_rejects_bad_signature_length() {
         let hash = B256::repeat_byte(0x7c);

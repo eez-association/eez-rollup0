@@ -735,7 +735,7 @@ async fn happy_case_quorum_two_of_two() {
 }
 
 /// Two of three attesters, one of which signs over a vkey the manager does not
-/// register. Its proof recovers to the right key, so only the composer's own
+/// register. Its proof recovers to the right key, so only the prover client's
 /// check against the registered digest can tell; it is dropped, and the other
 /// two settle every batch without one reverting on L1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

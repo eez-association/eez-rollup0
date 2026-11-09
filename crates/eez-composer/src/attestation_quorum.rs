@@ -14,9 +14,9 @@
 //! system, and its proof stays valid in the final batch that lists every
 //! attester that answered.
 //!
-//! `EEZ.sol` reverts the whole batch on one invalid proof, so every proof is
-//! checked here against the digest the composer computes itself before it is
-//! counted, and an attester whose registration cannot be read sits the batch
+//! `EEZ.sol` reverts the whole batch on one invalid proof, so a proof counts
+//! only once its member's prover has verified it against the batch it was asked
+//! to prove, and an attester whose registration cannot be read sits the batch
 //! out: one faulty or hostile attester must not be able to stall settlement
 //! for the others.
 
@@ -30,15 +30,13 @@ use std::{
 
 use alloy_eips::BlockNumberOrTag;
 use alloy_network::{Ethereum, Network, TransactionBuilder};
-use alloy_primitives::{Address, B256, Bytes, Signature};
+use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_client::BatchRequest;
 use alloy_sol_types::SolCall;
 use eez_driver::RollupTiming;
 use eez_l1::BundleTarget;
-use eez_protocol::{
-    EvmBatch, abi::RollupIdWithProofSystemsSol, public_inputs::public_inputs_hashes_with_context,
-};
+use eez_protocol::{EvmBatch, abi::RollupIdWithProofSystemsSol};
 use eez_prover::{BlockWitness, Prover, ProverError, ProvingAnchor, ProvingContext};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::time::{Instant, timeout_at};
@@ -55,9 +53,6 @@ pub const MAX_ATTESTERS: usize = 16;
 /// including the one-time lookup of the manager itself.
 const REGISTRATION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `r || s || v`, the proof `ECDSAProofSystem` verifies.
-const ECDSA_PROOF_BYTES: usize = 65;
-
 /// How long the composer keeps collecting after the threshold is met, so
 /// attesters that answer shortly after the fastest ones are still recorded
 /// on-chain instead of the same fastest subset being included every time.
@@ -71,7 +66,8 @@ pub struct QuorumMember {
     pub proof_system: Address,
     /// The signer that proof system accepts.
     pub attester: Address,
-    /// The prover that returns this attester's proof.
+    /// Returns this attester's proof only after verifying it recovers to
+    /// `attester` over the requested batch, verification key and L1 context.
     pub prover: Arc<dyn Prover>,
 }
 
@@ -367,8 +363,8 @@ impl AttestationQuorum {
 /// The attesters asked for one batch.
 #[derive(Debug)]
 pub(crate) enum AttestationRound<'a> {
-    /// The only configured attester. The composer has no other attester to
-    /// protect from it, so its proof goes to L1 unchecked and L1 is the judge.
+    /// The only configured attester, asked under its prover's default
+    /// verification key: there is no other attester to protect from it.
     Alone(&'a QuorumMember),
     /// Several attesters and the manager's settings for this batch.
     Quorum {
@@ -439,8 +435,10 @@ impl AttestationQuorum {
             .zip(&registration.vkeys)
             .filter_map(|(member, vkey)| vkey.map(|vkey| (member, vkey)))
             .map(|(member, vkey)| async move {
-                let request = single_attester_context(ctx, member.proof_system);
-                let proof = AssertUnwindSafe(prove_verified(member, vkey, request, timing, target))
+                let mut request = single_attester_context(ctx, member.proof_system);
+                request.verification_key = Some(vkey);
+                let prover = member.prover.as_ref();
+                let proof = AssertUnwindSafe(prove_with_retry(prover, request, timing, target))
                     .catch_unwind()
                     .await
                     .unwrap_or_else(|_| {
@@ -628,57 +626,6 @@ async fn rollup_manager(
         });
     }
     Ok(manager)
-}
-
-/// `member`'s proof for `request`, counted only if it verifies.
-async fn prove_verified(
-    member: &QuorumMember,
-    vkey: B256,
-    mut request: ProvingContext,
-    timing: RollupTiming,
-    target: BundleTarget,
-) -> Result<Bytes, ProverError> {
-    // The digest this attester must sign, computed by the same routine the
-    // contract mirrors.
-    let expected = public_inputs_hashes_with_context(&request.batch, vkey, request.l1_context)
-        .map_err(|error| ProverError::Backend(format!("public inputs: {error}")))?
-        .first()
-        .copied()
-        .ok_or_else(|| ProverError::Backend("no public inputs hash".to_owned()))?;
-    request.verification_key = Some(vkey);
-    let proof = prove_with_retry(member.prover.as_ref(), request, timing, target).await?;
-    verify_proof(&proof, expected, member.attester)?;
-    Ok(proof)
-}
-
-/// Accept `proof` only if `ECDSAProofSystem` will: 65 bytes, `v` of 27 or 28,
-/// low `s` (OpenZeppelin `ECDSA.recover` rejects the malleable high half), and
-/// recovering to `attester` over the digest the composer computed.
-fn verify_proof(proof: &[u8], expected: B256, attester: Address) -> Result<(), ProverError> {
-    let invalid = |reason: String| ProverError::Backend(format!("invalid attestation: {reason}"));
-    if proof.len() != ECDSA_PROOF_BYTES {
-        return Err(invalid(format!(
-            "{} bytes, expected {ECDSA_PROOF_BYTES}",
-            proof.len()
-        )));
-    }
-    let v = proof[ECDSA_PROOF_BYTES - 1];
-    if v != 27 && v != 28 {
-        return Err(invalid(format!("recovery byte {v}, expected 27 or 28")));
-    }
-    let signature = Signature::try_from(proof).map_err(|error| invalid(error.to_string()))?;
-    if signature.normalize_s().is_some() {
-        return Err(invalid("high-s signature".to_owned()));
-    }
-    let signer = signature
-        .recover_address_from_prehash(&expected)
-        .map_err(|error| invalid(error.to_string()))?;
-    if signer != attester {
-        return Err(invalid(format!(
-            "recovers to {signer}, not attester {attester}, over digest {expected}"
-        )));
-    }
-    Ok(())
 }
 
 /// Make `proof_systems`, strictly ascending, the ones `batch` settles

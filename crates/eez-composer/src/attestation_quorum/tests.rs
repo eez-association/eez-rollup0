@@ -1,10 +1,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use alloy_primitives::{U256, keccak256};
+use alloy_primitives::{Signature, U256};
 use alloy_provider::{ProviderBuilder, mock::Asserter};
 use alloy_sol_types::SolValue;
 use async_trait::async_trait;
-use eez_protocol::{EcdsaProofSigner, public_inputs::public_inputs_hashes};
+use eez_protocol::{
+    EcdsaProofSigner,
+    public_inputs::{public_inputs_hashes, public_inputs_hashes_with_context},
+};
 use eez_prover::{ActionableProverFailure, RetryableProverError};
 
 use super::*;
@@ -14,14 +17,6 @@ use super::*;
 enum Answer {
     /// A valid proof over the digest of the batch it was asked to prove.
     Sign,
-    /// A proof over some other digest.
-    SignElsewhere,
-    /// A valid signature in its malleable high-s form.
-    SignHighS,
-    /// A valid signature with the 0/1 recovery byte `ECDSA.recover` rejects.
-    SignRawRecovery,
-    /// A proof of the wrong length.
-    Truncated,
     /// A failure returned by the prover.
     Fail(fn() -> ProverError),
     /// A prover that panics.
@@ -93,19 +88,6 @@ impl Prover for ScriptedAttester {
         self.finished.store(true, Ordering::SeqCst);
         match self.answer {
             Answer::Sign => Ok(self.sign(digest)),
-            Answer::SignElsewhere => Ok(self.sign(keccak256(digest))),
-            Answer::SignHighS => {
-                let signature = Signature::try_from(self.sign(digest).as_ref()).unwrap();
-                let high =
-                    Signature::new(signature.r(), SECP256K1N - signature.s(), !signature.v());
-                Ok(Bytes::copy_from_slice(&high.as_bytes()))
-            }
-            Answer::SignRawRecovery => {
-                let mut proof = self.sign(digest).to_vec();
-                proof[64] -= 27;
-                Ok(Bytes::from(proof))
-            }
-            Answer::Truncated => Ok(self.sign(digest).slice(..64)),
             Answer::Fail(error) => Err(error()),
             Answer::Panic => panic!("attester crashed"),
             Answer::Pending => panic!("pending prevalidation must not sign"),
@@ -116,12 +98,6 @@ impl Prover for ScriptedAttester {
         B256::ZERO
     }
 }
-
-/// The secp256k1 group order.
-const SECP256K1N: U256 = U256::from_be_slice(&[
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
-    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
-]);
 
 /// The membership-ticket vkey the devnet registers for an ECDSA signer.
 fn vkey_of(attester: Address) -> B256 {
@@ -351,7 +327,13 @@ async fn every_proof_verifies_against_the_settled_batch() {
     assert_eq!(batch.proofSystems.len(), 3);
     for (index, prover) in provers.iter().enumerate() {
         let digests = public_inputs_hashes(&batch, vkey_of(prover.key.address())).unwrap();
-        verify_proof(&batch.proofs[index], digests[index], prover.key.address()).unwrap();
+        let signature = Signature::try_from(batch.proofs[index].as_ref()).unwrap();
+        assert_eq!(
+            signature
+                .recover_address_from_prehash(&digests[index])
+                .unwrap(),
+            prover.key.address()
+        );
     }
 }
 
@@ -424,38 +406,6 @@ async fn a_lost_quorum_is_reported_without_waiting_for_slow_attesters() {
 
     assert!(matches!(error, ProverError::Backend(_)), "{error:?}");
     assert_eq!(started.elapsed(), Duration::from_millis(10));
-}
-
-#[tokio::test(start_paused = true)]
-async fn invalid_proofs_are_not_counted() {
-    for answer in [
-        Answer::SignElsewhere,
-        Answer::SignHighS,
-        Answer::SignRawRecovery,
-        Answer::Truncated,
-    ] {
-        let (quorum, provers) = quorum(&[(0, SIGN), (0, answer), (0, SIGN)], 0);
-
-        let attestations = attest(&quorum, &provers, 2).await.unwrap();
-
-        assert_eq!(
-            systems(&attestations),
-            vec![proof_system(1), proof_system(3)],
-            "{answer:?} must not reach the batch, where it would revert every proof"
-        );
-    }
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_proof_from_another_key_is_not_counted() {
-    let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN)], 0);
-    let mut members = quorum.members.clone();
-    members[1].attester = Address::repeat_byte(0xee);
-    let quorum = AttestationQuorum::new(members, Duration::ZERO).unwrap();
-
-    let attestations = attest_with(&quorum, registered(&provers, 1)).await.unwrap();
-
-    assert_eq!(systems(&attestations), vec![proof_system(1)]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -827,11 +777,11 @@ async fn a_failed_threshold_read_is_reported() {
     assert_eq!((contract, call.as_str()), (manager(), "threshold()"));
 }
 
-/// One attester keeps the pre-quorum flow: L1 judges its proof, so the
-/// composer neither reads the registration nor checks the proof itself.
+/// One attester reads no registration and is asked under its prover's
+/// default verification key.
 #[tokio::test(start_paused = true)]
-async fn a_lone_attester_proof_goes_to_l1_unchecked() {
-    let (quorum, _) = quorum(&[(0, Answer::SignElsewhere)], 0);
+async fn a_lone_attester_reads_no_registration() {
+    let (quorum, provers) = quorum(&[(0, SIGN)], 0);
     // Any read would fail on the empty mock.
     let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
 
@@ -845,6 +795,8 @@ async fn a_lone_attester_proof_goes_to_l1_unchecked() {
         .unwrap();
 
     assert_eq!(systems(&attestations), vec![proof_system(1)]);
+    let seen = provers[0].seen.lock().unwrap().clone().unwrap();
+    assert_eq!(seen.verification_key, None);
 }
 
 #[tokio::test]
