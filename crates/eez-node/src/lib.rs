@@ -99,9 +99,9 @@ fn attestation_quorum_from_env() -> eyre::Result<eez_composer::AttestationQuorum
 /// `EEZ_PROVERS` lists the attesters as comma-separated
 /// `url=attester=proof_system` triples; each attester's proofs are checked
 /// against its own proof system. Unset or blank, the single attester of
-/// `EEZ_PROVER_URL`, `EEZ_ATTESTER_ADDRESS` and `EEZ_ECDSA_PROOF_SYSTEM_ADDRESS`
-/// is used. `EEZ_ATTESTATION_GRACE_MS` (default 250) is how long collection
-/// continues once the on-chain threshold is met.
+/// [`SINGLE_ATTESTER_VARS`] is used. `EEZ_ATTESTATION_GRACE_MS` (default 250,
+/// also when blank) is how long collection continues once the on-chain
+/// threshold is met.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AttesterConfig {
     attesters: Vec<AttesterSpec>,
@@ -116,18 +116,40 @@ struct AttesterSpec {
     proof_system: Address,
 }
 
+/// The single attester's settings, which `EEZ_PROVERS` takes precedence over.
+const SINGLE_ATTESTER_VARS: [&str; 3] = [
+    "EEZ_PROVER_URL",
+    "EEZ_ATTESTER_ADDRESS",
+    "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS",
+];
+
 impl AttesterConfig {
     fn read(var: impl Fn(&str) -> Option<String>) -> eyre::Result<Self> {
-        let attesters = match var("EEZ_PROVERS").filter(|list| !list.trim().is_empty()) {
-            Some(list) => list
-                .split(',')
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .map(AttesterSpec::parse)
-                .collect::<eyre::Result<Vec<_>>>()?,
+        let set = |name: &str| var(name).filter(|value| !value.trim().is_empty());
+        let attesters = match set("EEZ_PROVERS") {
+            Some(list) => {
+                let ignored: Vec<_> = SINGLE_ATTESTER_VARS
+                    .into_iter()
+                    .filter(|name| set(name).is_some())
+                    .collect();
+                if !ignored.is_empty() {
+                    event!(
+                        name: "eez.node.attestation_quorum.single_attester_vars_ignored",
+                        Level::INFO,
+                        event_name = "eez.node.attestation_quorum.single_attester_vars_ignored",
+                        ignored = ?ignored,
+                        "EEZ_PROVERS lists the attesters; the single-attester variables are ignored",
+                    );
+                }
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(AttesterSpec::parse)
+                    .collect::<eyre::Result<Vec<_>>>()?
+            }
             None => vec![AttesterSpec::legacy(&var)?],
         };
-        let grace = match var("EEZ_ATTESTATION_GRACE_MS") {
+        let grace = match set("EEZ_ATTESTATION_GRACE_MS") {
             Some(ms) => Duration::from_millis(
                 ms.trim()
                     .parse()
@@ -1176,14 +1198,19 @@ mod tests {
         let list = format!(
             " http://a:1?k=v={ATTESTER}={PROOF_SYSTEM} ,, http://b:2={ATTESTER}={PROOF_SYSTEM},"
         );
-        let config = attester_config(&[("EEZ_PROVERS", &list)]).unwrap();
+        let config =
+            attester_config(&[("EEZ_PROVERS", &list), ("EEZ_ATTESTATION_GRACE_MS", " ")]).unwrap();
 
         assert_eq!(
             config.attesters,
             vec![spec("http://a:1?k=v"), spec("http://b:2")],
             "a URL may contain `=`, and blank entries are skipped"
         );
-        assert_eq!(config.grace, eez_composer::DEFAULT_ATTESTATION_GRACE);
+        assert_eq!(
+            config.grace,
+            eez_composer::DEFAULT_ATTESTATION_GRACE,
+            "a blank grace is the default"
+        );
     }
 
     #[test]
