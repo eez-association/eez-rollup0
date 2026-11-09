@@ -36,9 +36,10 @@ message PostBatch {
   // ABI-encoded `EEZ.postAndVerifyBatch` calldata (proof carriers filled,
   // `proofs[]` empty). The prover decodes THIS to recompute publicInputsHash.
   bytes abi_calldata = 1;
-  // 32B — the composer's claimed publicInputsHash; the prover cross-checks it.
+  // Non-authoritative claimed digest. Rollup0 ignores it and recomputes locally.
   bytes public_inputs_hash = 2;
-  // 32B `blockhash(N)` for a block-bound batch, or empty for timeless (0).
+  // Rollup0: nonzero intended L1 parent hash for live cross-chain batches (uint64.max),
+  // or empty for timeless (0). Time is the validated terminal header timestamp.
   bytes l1_block_hash = 3;
 }
 

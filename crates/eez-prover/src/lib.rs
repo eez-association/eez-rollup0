@@ -157,9 +157,9 @@ pub struct ProvingContext {
     pub batch: EvmBatch,
     /// Every window block's RLP + augmented witness, in block order.
     pub blocks: Vec<BlockWitness>,
-    /// `blockhash(N)` for a block-bound batch's `blockNumber = N`; `None` for a
+    /// Intended L1 parent/time for live cross-chain settlement; `None` for a
     /// timeless (0) batch.
-    pub l1_block_hash: Option<B256>,
+    pub l1_context: Option<eez_protocol::l1_context::LiveSettlementContext>,
 }
 
 /// Produces the [`BlockWitness`] for a committed L2 block — the seam by which
