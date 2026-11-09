@@ -20,6 +20,7 @@ use alloy_primitives::{B256, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::SolCall;
 use eez_protocol::abi::{EvmBatch, postAndVerifyBatchCall};
+use eez_protocol::l1_context::LiveSettlementContext;
 use eez_protocol::signer::EcdsaProofSigner;
 use eez_testkit::{
     IValue, OUTBOUND_USER, all_l2_execution_states, onchain_nonce, setup_cross_chain,
@@ -28,13 +29,16 @@ use eez_testkit::{
 
 const TIMEOUT: Duration = Duration::from_mins(6);
 
-/// The first postBatch sitting in the pending pool with enough entries to cut a
-/// strict prefix from: an anchor plus at least two producing entries.
+/// Find a pending batch in the embedded Reth L1, whose development bundle RPC
+/// forwards directly into the pool. Bind the prefix proof to the same L1 parent
+/// and to the timestamp of the exact terminal L2 block the original proof covers.
 async fn pending_batch_with_producing_entries(
     l1_rpc: &str,
+    l2_rpc: &str,
     eez: alloy_primitives::Address,
-) -> Option<(EvmBatch, B256)> {
+) -> Option<(EvmBatch, LiveSettlementContext)> {
     let provider = ProviderBuilder::new().connect_http(l1_rpc.parse().ok()?);
+    let l2 = ProviderBuilder::new().connect_http(l2_rpc.parse().ok()?);
     let pending = provider
         .get_block_by_number(alloy_eips::BlockNumberOrTag::Pending)
         .full()
@@ -45,29 +49,40 @@ async fn pending_batch_with_producing_entries(
             continue;
         }
         let call = postAndVerifyBatchCall::abi_decode(tx.input()).ok()?;
-        // Cutting the prefix must leave at least one immediate entry that can
-        // still apply, or every immediate is stale and the post unwinds with
-        // AllImmediateL2TxsFailed instead of resuming.
-        if call.batch.immediateEntryCount >= U256::from(3) {
-            return Some((call.batch, *tx.inner.hash()));
+        if call.batch.immediateEntryCount >= U256::from(3) && call.batch.blockNumber == u64::MAX {
+            let terminal_hash = call.batch.entries.last()?.rollupUpdates.last()?.newRoot;
+            let terminal = l2.get_block_by_hash(terminal_hash).await.ok()??;
+            return Some((
+                call.batch,
+                LiveSettlementContext {
+                    parent_hash: pending.header.parent_hash,
+                    timestamp: terminal.header.timestamp,
+                },
+            ));
         }
     }
     None
 }
 
-/// Re-attest `batch` and submit it with a tip high enough to order ahead of the
-/// composer's own pending postBatch in the same block.
+/// Re-attest the prefix for the same live target and order it ahead of the
+/// composer's original batch by tip. This deliberately uses the test attester
+/// directly: it tests derivation, not signer authorization.
 async fn post_ahead(
     l1_rpc: &str,
     eez: alloy_primitives::Address,
     sender_key: &str,
     attester_key: &str,
     mut batch: EvmBatch,
+    context: LiveSettlementContext,
 ) -> eyre::Result<B256> {
     let attester =
         EcdsaProofSigner::from_private_key(attester_key.trim_start_matches("0x").parse::<B256>()?)?;
     let vkey = B256::left_padding_from(attester.address().as_slice());
-    let hashes = eez_protocol::public_inputs::public_inputs_hashes(&batch, vkey)?;
+    let hashes = eez_protocol::public_inputs::public_inputs_hashes_with_context(
+        &batch,
+        vkey,
+        Some(context),
+    )?;
     batch.proofs = hashes
         .iter()
         .map(|h| attester.sign_prehash(*h))
@@ -83,10 +98,8 @@ async fn post_ahead(
             alloy_rpc_types_eth::TransactionRequest::default()
                 .to(eez)
                 .input(postAndVerifyBatchCall { batch }.abi_encode().into())
-                // Ordering within the block is by effective tip, and the
-                // composer posts at its configured priority fee. The L1 node
-                // rejects txs whose worst-case fee exceeds its 1 ETH
-                // `--rpc.txfeecap`; this stays under it (4M gas × 200 gwei).
+                // The embedded Reth miner orders by tip. Keep the worst-case
+                // fee below its 1 ETH RPC transaction-fee cap.
                 .max_priority_fee_per_gas(100_000_000_000u128)
                 .max_fee_per_gas(200_000_000_000u128)
                 .gas_limit(4_000_000),
@@ -152,13 +165,16 @@ async fn a_resumed_batch_appends_the_l2_content_of_the_entries_it_settled() {
 
         // Poll tightly: the batch is only pending for part of one L1 slot.
         for _ in 0..80 {
-            if let Some((batch, _)) = pending_batch_with_producing_entries(&l1, eez).await {
+            if let Some((batch, context)) =
+                pending_batch_with_producing_entries(&l1, &l2, eez).await
+            {
                 if post_ahead(
                     &l1,
                     eez,
                     w.cfg.deployer_key,
                     w.cfg.attester_key,
                     strict_prefix(&batch),
+                    context,
                 )
                 .await
                 .is_ok()

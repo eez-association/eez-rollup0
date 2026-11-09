@@ -724,7 +724,7 @@ async fn happy_case_quorum_two_of_two() {
             posted.batch.proofSystems, both,
             "every batch carries both proofs"
         );
-        verify_batch_proofs(&posted.batch, &attesters).unwrap();
+        verify_batch_proofs(&posted.batch, &attesters, None).unwrap();
     }
     assert_ne!(
         chain.snapshot().await.unwrap().rollup_commitment,
@@ -802,7 +802,7 @@ async fn quorum_settles_without_an_attester_signing_the_wrong_digest() {
             !posted.batch.proofSystems.contains(&stale),
             "the stale proof must never reach L1: {posted:?}",
         );
-        verify_batch_proofs(&posted.batch, &attesters).unwrap();
+        verify_batch_proofs(&posted.batch, &attesters, None).unwrap();
     }
     node.assert_no_process_death();
 }
@@ -877,7 +877,7 @@ async fn quorum_two_of_three_settles_with_an_unresponsive_attester() {
             "a quorum post must not revert: {posted:?}"
         );
         assert_eq!(posted.batch.proofSystems, expected);
-        verify_batch_proofs(&posted.batch, &attesters).unwrap();
+        verify_batch_proofs(&posted.batch, &attesters, None).unwrap();
     }
     assert_eq!(harness.attestations_of(2).unwrap(), 0);
     assert_ne!(

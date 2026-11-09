@@ -117,6 +117,9 @@ pub fn eez_node_bin() -> Result<PathBuf> {
 }
 
 pub fn anvil_bin() -> String {
+    if let Ok(path) = std::env::var("EEZ_TEST_ANVIL_BIN") {
+        return path;
+    }
     for path in [
         "/root/.foundry/bin/anvil",
         &format!(
@@ -1181,20 +1184,18 @@ impl Harness {
             Proving::None => {}
             Proving::Single(signer_key) => {
                 let registered = self.attesters[0];
+                let attester = signer_address(signer_key)?;
                 let signer = self
                     .spawn_signer(
                         opts.rollup_id,
                         signer_key,
-                        signer_address(signer_key)?.into_word(),
+                        attester.into_word(),
                         registered.proof_system,
                     )
                     .await?;
                 env.extend([
                     ("EEZ_PROVER_URL", signer.endpoint().to_owned()),
-                    (
-                        "EEZ_ATTESTER_ADDRESS",
-                        format!("{:#x}", signer_address(signer_key)?),
-                    ),
+                    ("EEZ_ATTESTER_ADDRESS", format!("{attester:#x}")),
                 ]);
                 self.provers
                     .lock()
@@ -2800,6 +2801,7 @@ pub async fn posted_batches(
 pub fn verify_batch_proofs(
     batch: &eez_protocol::EvmBatch,
     attesters: &[(Address, Address)],
+    context: Option<eez_protocol::l1_context::LiveSettlementContext>,
 ) -> Result<()> {
     if batch.proofs.len() != batch.proofSystems.len() {
         bail!(
@@ -2814,11 +2816,14 @@ pub fn verify_batch_proofs(
             .find(|(registered, _)| registered == proof_system)
             .map(|&(_, attester)| attester)
             .ok_or_else(|| anyhow!("proof system {proof_system} has no expected attester"))?;
-        let public_inputs_hash =
-            eez_protocol::public_inputs::public_inputs_hashes(batch, attester.into_word())?
-                .get(index)
-                .copied()
-                .ok_or_else(|| anyhow!("no public-input hash for proof system {proof_system}"))?;
+        let public_inputs_hash = eez_protocol::public_inputs::public_inputs_hashes_with_context(
+            batch,
+            attester.into_word(),
+            context,
+        )?
+        .get(index)
+        .copied()
+        .ok_or_else(|| anyhow!("no public-input hash for proof system {proof_system}"))?;
         let recovered = Signature::try_from(proof.as_ref())
             .context("decode posted signature")?
             .recover_address_from_prehash(&public_inputs_hash)
@@ -2867,9 +2872,26 @@ pub async fn assert_latest_batch_signature(
     if call.batch.proofs.is_empty() {
         bail!("posted batch has no proof");
     }
+    let context = if call.batch.blockNumber == u64::MAX {
+        let header = provider
+            .get_block_by_hash(
+                log.block_hash
+                    .ok_or_else(|| anyhow!("BatchPosted log has no block hash"))?,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("batch inclusion block is missing"))?
+            .header;
+        Some(eez_protocol::l1_context::LiveSettlementContext {
+            parent_hash: header.parent_hash,
+            timestamp: header.timestamp,
+        })
+    } else {
+        None
+    };
     verify_batch_proofs(
         &call.batch,
         &[(dep.proof_system_address, expected_attester)],
+        context,
     )
 }
 

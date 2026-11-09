@@ -37,7 +37,7 @@ use alloy_sol_types::SolCall;
 use eez_driver::RollupTiming;
 use eez_l1::BundleTarget;
 use eez_protocol::{
-    EvmBatch, abi::RollupIdWithProofSystemsSol, public_inputs::public_inputs_hashes,
+    EvmBatch, abi::RollupIdWithProofSystemsSol, public_inputs::public_inputs_hashes_with_context,
 };
 use eez_prover::{BlockWitness, Prover, ProverError, ProvingAnchor, ProvingContext};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
@@ -640,7 +640,7 @@ async fn prove_verified(
 ) -> Result<Bytes, ProverError> {
     // The digest this attester must sign, computed by the same routine the
     // contract mirrors.
-    let expected = public_inputs_hashes(&request.batch, vkey)
+    let expected = public_inputs_hashes_with_context(&request.batch, vkey, request.l1_context)
         .map_err(|error| ProverError::Backend(format!("public inputs: {error}")))?
         .first()
         .copied()

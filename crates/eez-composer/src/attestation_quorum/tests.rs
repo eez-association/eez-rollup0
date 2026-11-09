@@ -7,7 +7,7 @@ use alloy_primitives::{U256, keccak256};
 use alloy_provider::{ProviderBuilder, mock::Asserter};
 use alloy_sol_types::SolValue;
 use async_trait::async_trait;
-use eez_protocol::EcdsaProofSigner;
+use eez_protocol::{EcdsaProofSigner, public_inputs::public_inputs_hashes};
 use eez_prover::{ActionableProverFailure, RetryableProverError};
 
 use super::*;
@@ -84,10 +84,11 @@ impl Prover for ScriptedAttester {
     }
 
     async fn prove(&self, ctx: ProvingContext) -> Result<Bytes, ProverError> {
-        let digest = public_inputs_hashes(
+        let digest = public_inputs_hashes_with_context(
             &ctx.batch,
             ctx.verification_key
                 .unwrap_or_else(|| vkey_of(self.key.address())),
+            ctx.l1_context,
         )
         .unwrap()[0];
         *self.seen.lock().unwrap() = Some(ctx);
@@ -869,24 +870,35 @@ async fn prevalidation_reaches_all_attesters_without_signing_despite_one_failure
 
 #[tokio::test]
 async fn each_attester_uses_the_registered_opaque_key_for_its_window() {
-    let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN)], 0);
-    let keys = [B256::repeat_byte(0x44), B256::repeat_byte(0x55)];
-    let registration = QuorumRegistration::new(2, keys.into_iter().map(Some).collect()).unwrap();
+    for live in [false, true] {
+        let (quorum, provers) = quorum(&[(0, SIGN), (0, SIGN)], 0);
+        let keys = [B256::repeat_byte(0x44), B256::repeat_byte(0x55)];
+        let registration =
+            QuorumRegistration::new(2, keys.into_iter().map(Some).collect()).unwrap();
+        let mut ctx = context();
+        if live {
+            ctx.batch.blockNumber = u64::MAX;
+            ctx.l1_context = Some(eez_protocol::l1_context::LiveSettlementContext {
+                parent_hash: B256::repeat_byte(0x99),
+                timestamp: 42,
+            });
+        }
+        let attestations = AttestationRound::Quorum {
+            quorum: &quorum,
+            registration,
+        }
+        .attest(&ctx, timing(), BundleTarget::NextBlock)
+        .await
+        .unwrap();
 
-    let attestations = attest_with(&quorum, registration).await.unwrap();
-
-    assert_eq!(attestations.len(), 2);
-    for (prover, key) in provers.iter().zip(keys) {
-        assert_eq!(
-            prover
-                .seen
-                .lock()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .verification_key,
-            Some(key)
-        );
+        assert_eq!(attestations.len(), 2);
+        for (prover, key) in provers.iter().zip(keys) {
+            let seen = prover.seen.lock().unwrap();
+            let seen = seen.as_ref().unwrap();
+            assert_eq!(seen.verification_key, Some(key));
+            assert_eq!(seen.l1_context, ctx.l1_context);
+            assert_eq!(seen.batch.blockNumber, ctx.batch.blockNumber);
+        }
     }
 }
 

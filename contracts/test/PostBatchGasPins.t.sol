@@ -76,12 +76,23 @@ contract PostBatchGasPinsTest is Test {
     address[] private touched;
 
     function setUp() external {
+        vm.roll(100);
+        vm.warp(1_700_000_000);
+        vm.setBlockhash(99, keccak256("gas pin L1 parent"));
         probe = new PostBatchGasProbe();
     }
 
     function testPostBatchGasPinsCoverTheLadder() external {
+        _checkGasPins(0);
+    }
+
+    function testLivePostBatchGasPinsCoverTheLadder() external {
+        _checkGasPins(type(uint64).max);
+    }
+
+    function _checkGasPins(uint64 blockNumber) private {
         uint256[4] memory ladder = [uint256(1), 2, 10, 50];
-        uint256 base = _rung(0, true);
+        uint256 base = _rung(0, true, 1, blockNumber);
         console.log("base (leading immediate only):", base);
 
         uint256 worstMarginal;
@@ -97,7 +108,7 @@ contract PostBatchGasPinsTest is Test {
             bool preCreated = proxies == 0;
             console.log(preCreated ? "-- established source proxies" : "-- first-ever source proxies");
             for (uint256 i = 0; i < ladder.length; i++) {
-                uint256 gasUsed = _rung(ladder[i], preCreated);
+                uint256 gasUsed = _rung(ladder[i], preCreated, 1, blockNumber);
                 uint256 marginal = (gasUsed - base) / ladder[i];
                 console.log("outbound entries:", ladder[i]);
                 console.log("  gas:", gasUsed);
@@ -120,13 +131,21 @@ contract PostBatchGasPinsTest is Test {
     /// and each adds a manager vkey read, a verify call and its calldata. Swept
     /// up to `MAX_ATTESTERS` (16), on an empty batch and on one carrying entries.
     function testPostBatchGasPinCoversEveryProofSystem() external {
+        _checkProofSystemGasPin(0);
+    }
+
+    function testLivePostBatchGasPinCoversEveryProofSystem() external {
+        _checkProofSystemGasPin(type(uint64).max);
+    }
+
+    function _checkProofSystemGasPin(uint64 blockNumber) private {
         uint256[5] memory counts = [uint256(1), 2, 4, 8, 16];
         uint256[2] memory entries = [uint256(0), 4];
         uint256 worstMarginal;
         for (uint256 e = 0; e < entries.length; e++) {
-            uint256 single = _rung(entries[e], true, 1);
+            uint256 single = _rung(entries[e], true, 1, blockNumber);
             for (uint256 i = 1; i < counts.length; i++) {
-                uint256 gasUsed = _rung(entries[e], true, counts[i]);
+                uint256 gasUsed = _rung(entries[e], true, counts[i], blockNumber);
                 uint256 marginal = (gasUsed - single) / (counts[i] - 1);
                 console.log("outbound entries:", entries[e]);
                 console.log("  proof systems:", counts[i]);
@@ -142,16 +161,12 @@ contract PostBatchGasPinsTest is Test {
         );
     }
 
-    function _rung(uint256 outboundEntries, bool preCreateProxies) private returns (uint256 gasUsed) {
-        return _rung(outboundEntries, preCreateProxies, 1);
-    }
-
     /// A fresh deployment per rung, so every rung pays the same cold start and
     /// the marginal is a clean difference.
     ///
     /// `preCreateProxies` off measures a sender's first settlement, with the
     /// proxy deployed inside the batch.
-    function _rung(uint256 outboundEntries, bool preCreateProxies, uint256 attesters)
+    function _rung(uint256 outboundEntries, bool preCreateProxies, uint256 attesters, uint64 blockNumber)
         private
         returns (uint256 gasUsed)
     {
@@ -160,7 +175,8 @@ contract PostBatchGasPinsTest is Test {
         EmptyTarget target = new EmptyTarget();
         touched.push(address(target));
 
-        bytes memory postCall = _postCall(eez, proofSystems, address(target), outboundEntries, preCreateProxies);
+        bytes memory postCall =
+            _postCall(eez, proofSystems, address(target), outboundEntries, preCreateProxies, blockNumber);
         for (uint256 i = 0; i < touched.length; i++) {
             vm.cool(touched[i]);
         }
@@ -204,11 +220,9 @@ contract PostBatchGasPinsTest is Test {
         ECDSAProofSystem[] memory attesters,
         address target,
         uint256 outboundEntries,
-        bool preCreateProxies
-    )
-        private
-        returns (bytes memory)
-    {
+        bool preCreateProxies,
+        uint64 blockNumber
+    ) private returns (bytes memory) {
         (, bytes32 root,) = eez.rollups(ROLLUP_ID);
         ExecutionEntry[] memory entries = new ExecutionEntry[](1 + outboundEntries);
 
@@ -260,7 +274,7 @@ contract PostBatchGasPinsTest is Test {
             blobIndices: new uint256[](0),
             callData: "",
             proofs: proofs,
-            blockNumber: 0,
+            blockNumber: blockNumber,
             bindMsgSenderInPublicInput: false
         });
         for (uint256 i = 0; i < attesters.length; i++) {
@@ -271,12 +285,7 @@ contract PostBatchGasPinsTest is Test {
 
     /// An outbound settlement entry: `proxyEntryHash == 0` so EEZ.sol drains it
     /// inline, one state delta chaining `currentRoot` to the prior `newRoot`.
-    function _entry(
-        EEZ eez,
-        bytes32 currentRoot,
-        bytes32 newRoot,
-        L2ToL1Call[] memory calls
-    )
+    function _entry(EEZ eez, bytes32 currentRoot, bytes32 newRoot, L2ToL1Call[] memory calls)
         private
         view
         returns (ExecutionEntry memory)
@@ -297,11 +306,7 @@ contract PostBatchGasPinsTest is Test {
 
     /// EEZBase's tagged fold for this shape: the entry seed, then CALL_BEGIN and
     /// CALL_END per call. Every call succeeds with empty return data.
-    function _rollingHash(
-        EEZ eez,
-        RollupUpdate[] memory updates,
-        L2ToL1Call[] memory calls
-    )
+    function _rollingHash(EEZ eez, RollupUpdate[] memory updates, L2ToL1Call[] memory calls)
         private
         view
         returns (bytes32 hash)
@@ -326,14 +331,11 @@ contract PostBatchGasPinsTest is Test {
         }
     }
 
-    /// Mirrors `EEZ._verifyProofSystemBatch` for this single-rollup, timeless
-    /// batch: the hash an attester signs folds only its own vkey.
-    function _publicInputsHash(
-        ProofSystemBatchPerVerificationEntries memory batch,
-        address signer
-    )
+    /// Mirrors `EEZ._verifyProofSystemBatch` for one rollup and one attester,
+    /// including the reference manager's parent/time profile for live batches.
+    function _publicInputsHash(ProofSystemBatchPerVerificationEntries memory batch, address signer)
         private
-        pure
+        view
         returns (bytes32)
     {
         bytes32[] memory entryHashes = new bytes32[](batch.entries.length);
@@ -342,7 +344,9 @@ contract PostBatchGasPinsTest is Test {
         }
 
         bytes32[] memory customDataHashes = new bytes32[](1);
-        customDataHashes[0] = keccak256(abi.encode(ROLLUP_ID, bytes("")));
+        bytes memory customData =
+            batch.blockNumber == 0 ? bytes("") : abi.encode(block.timestamp, blockhash(block.number - 1));
+        customDataHashes[0] = keccak256(abi.encode(ROLLUP_ID, customData));
         bytes32 sharedPublicInput = keccak256(
             abi.encodePacked(
                 abi.encode(entryHashes),

@@ -90,7 +90,10 @@ The runner substitutes server-issued IDs and epochs for recorded placeholders,
 checks session isolation and epoch changes, and preserves literal unknown or
 malformed bindings. It ignores only `Validated.reused` and `Rejected.message`.
 Status, authoritative cursor, binding, public-input hash, ordering and EOF remain
-assertions. Each proof's signature must recover the configured attester over the
+assertions. Malformed posting context rejects with INVALID_ARGUMENT before
+session range selection: this includes the empty context in the invalid-range
+Finalize and nonzero Rollup0 chain-ID/parent-number fields. The original witness
+and proof oracles are unchanged. Each proof's signature must recover the configured attester over the
 expected digest; a different valid ECDSA nonce is allowed. The saved deterministic
 signature is a reference, not a requirement for byte-identical ECDSA output.
 
