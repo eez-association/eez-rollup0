@@ -130,7 +130,10 @@ fn chunks_for(ctx: &ProvingContext) -> Vec<ProveChunk> {
                 // Empty: the prover recomputes the hash and returns it; we don't
                 // pre-claim it (the batch determines it deterministically).
                 public_inputs_hash: Vec::new(),
-                l1_block_hash: ctx.l1_block_hash.map(|h| h.to_vec()).unwrap_or_default(),
+                l1_block_hash: ctx
+                    .l1_context
+                    .map(|c| c.parent_hash.to_vec())
+                    .unwrap_or_default(),
             }),
         })),
     });
@@ -346,10 +349,11 @@ impl RemoteProver {
         let hash = verify_attestation(&signature, &public_inputs_hash, self.inner.attester)?;
         let hashes = eez_blob::versioned_hashes(&ctx.blobs)
             .map_err(|error| ProverError::Backend(format!("request blobs: {error}")))?;
-        let expected = eez_protocol::public_inputs::public_inputs_hashes_with_blobs(
+        let expected = eez_protocol::public_inputs::public_inputs_hashes_with_blobs_and_context(
             &ctx.batch,
             self.vkey(),
             &hashes,
+            ctx.l1_context,
         )
         .map_err(|error| {
             ProverError::Backend(format!("cannot verify requested public inputs: {error}"))
@@ -780,15 +784,17 @@ impl Prover for RemoteProver {
             batch: ctx.batch.clone(),
         }
         .abi_encode();
-        if ctx.l1_block_hash.is_some() {
-            return Err(ProverError::Backend(
-                "Rollup0 streaming does not support L1-bound settlement".into(),
-            ));
-        }
         let settlement = StreamSettlement {
             abi_calldata,
             blobs: ctx.blobs.iter().map(|bytes| bytes.to_vec()).collect(),
-            posting_context: None,
+            posting_context: ctx
+                .l1_context
+                .map(|context| eez_control_rpc::v2::L1PostingContext {
+                    parent_hash: context.parent_hash.to_vec(),
+                    target_timestamp: context.timestamp,
+                    chain_id: 0,
+                    parent_number: 0,
+                }),
         };
         match self
             .stream_exchange(
@@ -1442,7 +1448,7 @@ mod tests {
                     anchor: fallback.then(test_anchor),
                     blocks: vec![test_block(11, test_anchor().hash, 0x22)],
                     batch: test_batch(),
-                    l1_block_hash: None,
+                    l1_context: None,
                     blobs: Vec::new(),
                 };
                 let hash = if wrong_batch {
@@ -1599,7 +1605,7 @@ mod tests {
                 anchor: Some(anchor),
                 batch: test_batch(),
                 blocks: vec![block_11.clone()],
-                l1_block_hash: None,
+                l1_context: None,
                 blobs: Vec::new(),
             })
             .await
@@ -1626,7 +1632,7 @@ mod tests {
                 anchor: Some(anchor),
                 batch: test_batch(),
                 blocks: vec![block_11, block_12],
-                l1_block_hash: None,
+                l1_context: None,
                 blobs: Vec::new(),
             })
             .await
@@ -1680,7 +1686,7 @@ mod tests {
                     anchor: Some(anchor),
                     blocks: vec![block],
                     batch: test_batch(),
-                    l1_block_hash: None,
+                    l1_context: None,
                     blobs: Vec::new(),
                 }),
             )
@@ -1789,7 +1795,7 @@ mod tests {
                 anchor: Some(anchor),
                 blocks: vec![first.clone(), second, third.clone()],
                 batch: test_batch(),
-                l1_block_hash: None,
+                l1_context: None,
                 blobs: Vec::new(),
             })
             .await
@@ -1848,7 +1854,7 @@ mod tests {
                     anchor: Some(anchor),
                     blocks: vec![first, second],
                     batch: test_batch(),
-                    l1_block_hash: None,
+                    l1_context: None,
                     blobs: Vec::new(),
                 })
                 .await;
@@ -1906,7 +1912,7 @@ mod tests {
                             anchor: Some(anchor),
                             blocks: vec![test_block(11, anchor.hash, 0x99)],
                             batch: test_batch(),
-                            l1_block_hash: None,
+                            l1_context: None,
                             blobs: Vec::new(),
                         })
                         .await
@@ -1937,7 +1943,7 @@ mod tests {
                                 vec![first, second]
                             },
                             batch: test_batch(),
-                            l1_block_hash: None,
+                            l1_context: None,
                             blobs: Vec::new(),
                         })
                         .await
@@ -1986,7 +1992,7 @@ mod tests {
                 anchor: Some(anchor),
                 batch: test_batch(),
                 blocks: vec![block_11, block_12],
-                l1_block_hash: None,
+                l1_context: None,
                 blobs: Vec::new(),
             })
             .await

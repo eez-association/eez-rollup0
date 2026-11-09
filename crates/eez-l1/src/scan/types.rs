@@ -36,6 +36,8 @@ pub struct Post {
     /// Blob carrier: the versioned hashes `blobIndices` selected, in
     /// order. Empty for the calldata profile, whose stream is `batch.callData`.
     pub blob_hashes: Vec<B256>,
+    /// Actual inclusion parent/time, read from the exact block containing this post.
+    pub l1_context: Option<eez_protocol::l1_context::LiveSettlementContext>,
     /// What L1 applied of it for our rollup.
     pub settlement: Settlement,
 }

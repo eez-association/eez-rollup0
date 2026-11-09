@@ -7,7 +7,9 @@ use alloy_sol_types::SolValue as _;
 use eez_protocol::EvmBatch;
 use eez_protocol::abi::ProofSystemBatchPerVerificationEntriesSol;
 use eez_protocol::entries::decode_postbatch;
-use eez_protocol::public_inputs::{public_inputs_hashes, public_inputs_hashes_with_blobs};
+use eez_protocol::public_inputs::{
+    public_inputs_hashes_with_blobs_and_context, public_inputs_hashes_with_context,
+};
 use thiserror::Error;
 
 use crate::attest::NonZeroProofSystemVkey;
@@ -106,6 +108,7 @@ pub(crate) enum PublicInputError {
 /// service can reject cheaper settlement failures first.
 pub(crate) struct CheckedPublicInputProfile<'a> {
     canonical_batch: &'a CanonicalPostBatch,
+    context: Option<eez_protocol::l1_context::LiveSettlementContext>,
 }
 
 impl<'a> CheckedPublicInputProfile<'a> {
@@ -114,6 +117,7 @@ impl<'a> CheckedPublicInputProfile<'a> {
         canonical_batch: &'a CanonicalPostBatch,
         expected_rollup_id: NonZeroU64,
         expected_proof_system: Address,
+        context: Option<eez_protocol::l1_context::LiveSettlementContext>,
     ) -> Result<Self, PublicInputError> {
         validate_public_input_structure(
             canonical_batch.as_batch(),
@@ -121,7 +125,7 @@ impl<'a> CheckedPublicInputProfile<'a> {
             expected_proof_system,
             None,
         )?;
-        Ok(Self { canonical_batch })
+        Self::check_context(canonical_batch, context)
     }
 
     /// Check blob carrier fields before DA or KZG work.
@@ -130,6 +134,7 @@ impl<'a> CheckedPublicInputProfile<'a> {
         expected_rollup_id: NonZeroU64,
         expected_proof_system: Address,
         submitted_blob_count: usize,
+        context: Option<eez_protocol::l1_context::LiveSettlementContext>,
     ) -> Result<Self, PublicInputError> {
         validate_public_input_structure(
             canonical_batch.as_batch(),
@@ -137,7 +142,25 @@ impl<'a> CheckedPublicInputProfile<'a> {
             expected_proof_system,
             Some(submitted_blob_count),
         )?;
-        Ok(Self { canonical_batch })
+        Self::check_context(canonical_batch, context)
+    }
+
+    fn check_context(
+        canonical_batch: &'a CanonicalPostBatch,
+        context: Option<eez_protocol::l1_context::LiveSettlementContext>,
+    ) -> Result<Self, PublicInputError> {
+        if (canonical_batch.as_batch().blockNumber == u64::MAX) != context.is_some() {
+            return Err(invalid_structure(
+                "live settlement context does not match batch blockNumber",
+            ));
+        }
+        if let Some(context) = context {
+            context.validate().map_err(invalid_structure)?;
+        }
+        Ok(Self {
+            canonical_batch,
+            context,
+        })
     }
 
     /// Compute the sole canonical hash from this profile-checked batch.
@@ -151,11 +174,16 @@ impl<'a> CheckedPublicInputProfile<'a> {
         verified_da: Option<&VerifiedBlobDa>,
     ) -> Result<RecomputedPublicInputsHash, PublicInputError> {
         let hashes = match verified_da {
-            None => public_inputs_hashes(self.canonical_batch.as_batch(), proof_system_vkey.get()),
-            Some(verified_da) => public_inputs_hashes_with_blobs(
+            None => public_inputs_hashes_with_context(
+                self.canonical_batch.as_batch(),
+                proof_system_vkey.get(),
+                self.context,
+            ),
+            Some(verified_da) => public_inputs_hashes_with_blobs_and_context(
                 self.canonical_batch.as_batch(),
                 proof_system_vkey.get(),
                 verified_da.versioned_hashes(),
+                self.context,
             ),
         }
         .map_err(|error| PublicInputError::Computation(error.to_string()))?;
@@ -188,7 +216,7 @@ pub(crate) fn recompute_public_input_hash(
     expected_proof_system: Address,
 ) -> Result<B256, PublicInputError> {
     let canonical = CanonicalPostBatch(batch.clone());
-    CheckedPublicInputProfile::new(&canonical, expected_rollup_id, expected_proof_system)?
+    CheckedPublicInputProfile::new(&canonical, expected_rollup_id, expected_proof_system, None)?
         .recompute_public_inputs_hash(proof_system_vkey, None)
         .map(RecomputedPublicInputsHash::into_inner)
 }
@@ -281,9 +309,9 @@ fn validate_public_input_structure(
     if let Some(submitted) = blob_count {
         validate_blob_public_input_structure(batch, submitted)?;
     } else {
-        if batch.blockNumber != 0 {
+        if batch.blockNumber != 0 && batch.blockNumber != u64::MAX {
             return Err(invalid_structure(format!(
-                "blockNumber must be zero, got {}",
+                "blockNumber must be zero or the live sentinel, got {}",
                 batch.blockNumber
             )));
         }
@@ -308,9 +336,9 @@ fn validate_blob_public_input_structure(
     batch: &EvmBatch,
     submitted_blob_count: usize,
 ) -> Result<(), PublicInputError> {
-    if batch.blockNumber != 0 {
+    if batch.blockNumber != 0 && batch.blockNumber != u64::MAX {
         return Err(invalid_blob_input(format!(
-            "blob profile blockNumber must be zero, got {}",
+            "blob profile blockNumber must be zero or the live sentinel, got {}",
             batch.blockNumber
         )));
     }

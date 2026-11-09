@@ -2198,6 +2198,11 @@ where
                     .map_err(|e| format!("SyncBlockState::open: {e}"))
             })
             .and_then(|(state, draft)| {
+                if let BundleTarget::Exact { block, .. } = bundle_target
+                    && state.anchor.number().checked_add(1) != Some(block)
+                {
+                    return Err("live settlement must extend its intended L1 parent".into());
+                }
                 let cap = match bundle_target {
                     BundleTarget::Exact { timestamp, .. } => local
                         .l1_entry
@@ -3454,6 +3459,10 @@ where
                 &outbound_user_txs,
                 outbound_target_gas,
                 bundle_target,
+                Some(eez_protocol::l1_context::LiveSettlementContext {
+                    parent_hash: l1_state.anchor.hash(),
+                    timestamp,
+                }),
             )
             .await
             .and_then(|raw| {
@@ -3783,6 +3792,7 @@ where
                 &[], // no outbound user txs
                 0,   // no inline outbound target calls
                 bundle_target,
+                None,
             )
             .await
             .and_then(|raw| {
@@ -3959,6 +3969,7 @@ where
                     &[],
                     0, // no inline outbound target calls
                     historical_target,
+                    None,
                 )
                 .await
                 .map_err(|error| error.to_string())?
@@ -4130,6 +4141,7 @@ where
         outbound_user_txs: &[Bytes],
         outbound_target_gas: u64,
         bundle_target: BundleTarget,
+        l1_context: Option<eez_protocol::l1_context::LiveSettlementContext>,
     ) -> Result<Option<Bytes>, PreparePostBatchError> {
         use alloy_sol_types::SolCall;
         use eez_protocol::abi::{RollupIdWithProofSystemsSol, postAndVerifyBatchCall};
@@ -4150,6 +4162,7 @@ where
             }
             b
         };
+        batch.blockNumber = if l1_context.is_some() { u64::MAX } else { 0 };
 
         // Prepend one leading immediate entry (`proxyEntryHash == 0`)
         // covering all L2 effects before the sync block — EEZ.sol drains
@@ -4640,7 +4653,7 @@ where
             }),
             batch: batch.clone(),
             blocks: block_witnesses,
-            l1_block_hash: None, // timeless batch (blockNumber 0)
+            l1_context,
             blobs,
         };
         let proof = match prove_with_retry(

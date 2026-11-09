@@ -71,12 +71,23 @@ contract PostBatchGasPinsTest is Test {
     address[] private touched;
 
     function setUp() external {
+        vm.roll(100);
+        vm.warp(1_700_000_000);
+        vm.setBlockhash(99, keccak256("gas pin L1 parent"));
         probe = new PostBatchGasProbe();
     }
 
     function testPostBatchGasPinsCoverTheLadder() external {
+        _checkGasPins(0);
+    }
+
+    function testLivePostBatchGasPinsCoverTheLadder() external {
+        _checkGasPins(type(uint64).max);
+    }
+
+    function _checkGasPins(uint64 blockNumber) private {
         uint256[4] memory ladder = [uint256(1), 2, 10, 50];
-        uint256 base = _rung(0, true);
+        uint256 base = _rung(0, true, blockNumber);
         console.log("base (leading immediate only):", base);
 
         uint256 worstMarginal;
@@ -92,7 +103,7 @@ contract PostBatchGasPinsTest is Test {
             bool preCreated = proxies == 0;
             console.log(preCreated ? "-- established source proxies" : "-- first-ever source proxies");
             for (uint256 i = 0; i < ladder.length; i++) {
-                uint256 gasUsed = _rung(ladder[i], preCreated);
+                uint256 gasUsed = _rung(ladder[i], preCreated, blockNumber);
                 uint256 marginal = (gasUsed - base) / ladder[i];
                 console.log("outbound entries:", ladder[i]);
                 console.log("  gas:", gasUsed);
@@ -116,13 +127,21 @@ contract PostBatchGasPinsTest is Test {
     ///
     /// `preCreateProxies` off measures a sender's first settlement, with the
     /// proxy deployed inside the batch.
-    function _rung(uint256 outboundEntries, bool preCreateProxies) private returns (uint256 gasUsed) {
+    function _rung(
+        uint256 outboundEntries,
+        bool preCreateProxies,
+        uint64 blockNumber
+    )
+        private
+        returns (uint256 gasUsed)
+    {
         delete touched;
         (EEZ eez, ECDSAProofSystem proofSystem) = _deployProtocol();
         EmptyTarget target = new EmptyTarget();
         touched.push(address(target));
 
-        bytes memory postCall = _postCall(eez, proofSystem, address(target), outboundEntries, preCreateProxies);
+        bytes memory postCall =
+            _postCall(eez, proofSystem, address(target), outboundEntries, preCreateProxies, blockNumber);
         for (uint256 i = 0; i < touched.length; i++) {
             vm.cool(touched[i]);
         }
@@ -155,7 +174,8 @@ contract PostBatchGasPinsTest is Test {
         ECDSAProofSystem proofSystem,
         address target,
         uint256 outboundEntries,
-        bool preCreateProxies
+        bool preCreateProxies,
+        uint64 blockNumber
     )
         private
         returns (bytes memory)
@@ -208,7 +228,7 @@ contract PostBatchGasPinsTest is Test {
             blobIndices: new uint256[](0),
             callData: "",
             proofs: proofs,
-            blockNumber: 0,
+            blockNumber: blockNumber,
             bindMsgSenderInPublicInput: false
         });
         batch.proofs[0] = _proof(_publicInputsHash(batch));
@@ -273,15 +293,17 @@ contract PostBatchGasPinsTest is Test {
     }
 
     /// Mirrors `EEZ._verifyProofSystemBatch` for this single-rollup,
-    /// single-proof-system, timeless batch.
-    function _publicInputsHash(ProofSystemBatchPerVerificationEntries memory batch) private pure returns (bytes32) {
+    /// single-proof-system batch, using the reference manager's parent/time profile.
+    function _publicInputsHash(ProofSystemBatchPerVerificationEntries memory batch) private view returns (bytes32) {
         bytes32[] memory entryHashes = new bytes32[](batch.entries.length);
         for (uint256 i = 0; i < batch.entries.length; i++) {
             entryHashes[i] = keccak256(abi.encode(batch.entries[i]));
         }
 
         bytes32[] memory customDataHashes = new bytes32[](1);
-        customDataHashes[0] = keccak256(abi.encode(ROLLUP_ID, bytes("")));
+        bytes memory customData =
+            batch.blockNumber == 0 ? bytes("") : abi.encode(block.timestamp, blockhash(block.number - 1));
+        customDataHashes[0] = keccak256(abi.encode(ROLLUP_ID, customData));
         bytes32 sharedPublicInput = keccak256(
             abi.encodePacked(
                 abi.encode(entryHashes),

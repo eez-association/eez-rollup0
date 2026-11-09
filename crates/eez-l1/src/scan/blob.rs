@@ -2,7 +2,7 @@
 
 use alloy_primitives::{Address, B256};
 use eez_protocol::abi::EvmBatch;
-use eez_protocol::public_inputs::batch_shared_public_input_with_blobs;
+use eez_protocol::public_inputs::batch_shared_public_input_with_blobs_and_context;
 
 use crate::error::{L1Error, L1Result};
 
@@ -11,13 +11,18 @@ pub(super) fn commitment(
     hashes: &[B256],
     sender: Address,
     here: &str,
+    context: Option<eez_protocol::l1_context::LiveSettlementContext>,
 ) -> L1Result<(B256, Vec<B256>)> {
-    if batch.blockNumber != 0 || batch.blobIndices.is_empty() || !batch.callData.is_empty() {
+    if (batch.blockNumber != 0 && batch.blockNumber != u64::MAX)
+        || batch.blobIndices.is_empty()
+        || !batch.callData.is_empty()
+    {
         return Err(L1Error::Decode(format!("{here}: invalid blob DA carrier")));
     }
     let selected = selected_hashes(batch, hashes, here)?;
-    let commitment = batch_shared_public_input_with_blobs(batch, sender, &selected)
-        .map_err(|error| L1Error::Decode(format!("{here}: {error}")))?;
+    let commitment =
+        batch_shared_public_input_with_blobs_and_context(batch, sender, &selected, context)
+            .map_err(|error| L1Error::Decode(format!("{here}: {error}")))?;
     Ok((commitment, selected))
 }
 

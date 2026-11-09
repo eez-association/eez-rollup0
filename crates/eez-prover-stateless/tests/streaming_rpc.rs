@@ -209,7 +209,7 @@ fn recorded_window(oracle: &serde_json::Value) -> (Vec<ProveChunk>, ProvingConte
         .unwrap()
         .batch,
         blocks,
-        l1_block_hash: None,
+        l1_context: None,
         blobs: Vec::new(),
     };
 

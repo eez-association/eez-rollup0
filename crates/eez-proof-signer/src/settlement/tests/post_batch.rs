@@ -60,6 +60,7 @@ fn blob_profile(batch: &CanonicalPostBatch, submitted: usize) -> bool {
         expected_rollup_id(),
         EXPECTED_PROOF_SYSTEM,
         submitted,
+        None,
     )
     .is_ok()
 }
@@ -70,9 +71,14 @@ fn blob_profile_checks_shape_before_da() {
     batch.blockNumber = 0;
     batch.blobIndices = vec![U256::ZERO, U256::from(1)];
     assert!(blob_profile(&batch, 2));
-    let checked =
-        CheckedPublicInputProfile::new_blob(&batch, expected_rollup_id(), EXPECTED_PROOF_SYSTEM, 2)
-            .unwrap();
+    let checked = CheckedPublicInputProfile::new_blob(
+        &batch,
+        expected_rollup_id(),
+        EXPECTED_PROOF_SYSTEM,
+        2,
+        None,
+    )
+    .unwrap();
     assert!(
         checked
             .recompute_public_inputs_hash(test_proof_system_vkey(), None)

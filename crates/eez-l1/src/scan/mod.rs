@@ -183,7 +183,7 @@ async fn read_logs(
     let lists =
         |log: &ScannedLog| matches!(&log.event, Event::Posted(_, ids) if ids.contains(&rollup_id));
     let mut posts = Vec::new();
-    for block in group_blocks(raw)? {
+    for mut block in group_blocks(raw)? {
         let number = block.number;
         let block_hash = block.hash;
         let mut calls_by_tx = BTreeMap::new();
@@ -224,6 +224,46 @@ async fn read_logs(
                 }
                 calls_by_tx.insert(index, (tx_calls, committed));
             }
+        }
+        // Decode once while collecting calls. Only a live batch listing us
+        // needs the inclusion header; timeless and foreign posts do not.
+        let live = calls_by_tx
+            .values()
+            .flat_map(|(calls, _)| calls)
+            .any(|call| {
+                call.batch.as_ref().is_ok_and(|batch| {
+                    batch.blockNumber == u64::MAX
+                        && batch
+                            .rollupIdsWithProofSystems
+                            .iter()
+                            .any(|r| r.rollupId == rollup_id)
+                })
+            });
+        if live {
+            let header = logs
+                .get_block_by_hash(block_hash)
+                .await
+                .map_err(|error| {
+                    L1Error::Provider(format!(
+                        "fetch batch inclusion header {block_hash}: {error}"
+                    ))
+                })?
+                .ok_or_else(|| L1Error::SourceIncomplete {
+                    block: number,
+                    detail: format!("batch inclusion header {block_hash} not served yet; retry"),
+                })?;
+            if header.header.number != number || header.header.hash != block_hash {
+                return Err(L1Error::SourceIncomplete {
+                    block: number,
+                    detail: format!(
+                        "batch inclusion header does not match ({number}, {block_hash})"
+                    ),
+                });
+            }
+            block.context = Some(eez_protocol::l1_context::LiveSettlementContext {
+                parent_hash: header.header.parent_hash,
+                timestamp: header.header.timestamp,
+            });
         }
         posts.extend(read_block(&block, &calls_by_tx, rollup_id)?);
     }
@@ -269,9 +309,9 @@ mod tests {
         executeL2TxsCall, postAndVerifyBatchCall,
     };
     use eez_protocol::entries::EntryRole::{self, Anchor as A, Inbound};
-    use eez_protocol::public_inputs::{
-        batch_shared_public_input, batch_shared_public_input_with_blobs,
-    };
+    use eez_protocol::l1_context::LiveSettlementContext;
+    use eez_protocol::public_inputs::batch_shared_public_input_with_blobs;
+    use eez_protocol::public_inputs::batch_shared_public_input_with_context;
     use serde_json::{Value, json};
 
     use super::model::{Call, calls_in_tx, direct_call, group_blocks, read_block};
@@ -289,6 +329,10 @@ mod tests {
     const H2: B256 = B256::repeat_byte(0xC2);
     const I0: EntryRole = Inbound { ordinal: 0 };
     const I1: EntryRole = Inbound { ordinal: 1 };
+    const CONTEXT: LiveSettlementContext = LiveSettlementContext {
+        parent_hash: B256::repeat_byte(0x99),
+        timestamp: 42,
+    };
 
     fn root(n: u8) -> B256 {
         B256::repeat_byte(n)
@@ -347,14 +391,16 @@ mod tests {
     }
 
     fn call(batch: &EvmBatch, from: Address, logs: usize) -> Call {
-        let batch = batch.clone();
-        let input = postAndVerifyBatchCall { batch }.abi_encode().into();
         Call {
-            input,
+            batch: Ok(batch.clone()),
             from,
             logs,
             blob_hashes: Vec::new(),
         }
+    }
+
+    fn input(batch: &EvmBatch) -> Bytes {
+        eez_protocol::entries::encode_postbatch(batch).into()
     }
 
     fn root_log(rollup: u64, root: B256) -> LogData {
@@ -395,7 +441,9 @@ mod tests {
 
     /// The `BatchPosted` EEZ emits for `batch` posted by `sender`.
     fn posted(batch: &EvmBatch, sender: Address) -> LogData {
-        let spi = batch_shared_public_input(batch, sender).expect("supported");
+        let context = (batch.blockNumber == u64::MAX).then_some(CONTEXT);
+        let spi =
+            batch_shared_public_input_with_context(batch, sender, context).expect("supported");
         let ids = batch.rollupIdsWithProofSystems.iter().map(|r| r.rollupId);
         BatchPosted {
             sharedPublicInput: spi,
@@ -733,10 +781,7 @@ mod tests {
 
     #[test]
     fn the_walk_reads_committed_post_calls_only() {
-        let (input, other) = (
-            call(&ours(0, H), EOA, 0).input,
-            executeL2TxsCall::SELECTOR.into(),
-        );
+        let (input, other) = (input(&ours(0, H)), executeL2TxsCall::SELECTOR.into());
         let post = |logs, calls| frame("CALL", EEZ, &input, logs, calls);
         let other_call = |logs| frame("CALL", EEZ, &other, logs, Vec::new());
         let router = |calls| frame("CALL", ROUTER, &Bytes::new(), 0, calls);
@@ -771,8 +816,10 @@ mod tests {
         ];
         for (to, input, direct) in cases {
             let tx = signed_tx(to, input.clone(), 0);
-            let expected = direct.then(|| call(&ours(0, H), EOA, 4));
-            assert_eq!(direct_call(&tx, EEZ, 4), expected, "{to} {input}");
+            let expected = direct.then(|| (ours(0, H).abi_encode(), EOA, 4));
+            let actual = direct_call(&tx, EEZ, 4)
+                .map(|call| (call.batch.unwrap().abi_encode(), call.from, call.logs));
+            assert_eq!(actual, expected, "{to} {input}");
         }
     }
 
@@ -814,6 +861,15 @@ mod tests {
         (served_as(logs, 0, &tx), tx)
     }
 
+    fn serve_inclusion_header(asserter: &Asserter, number: u64, hash: B256) {
+        let mut block = Block::<Transaction>::default();
+        block.header.inner.number = number;
+        block.header.hash = hash;
+        block.header.inner.parent_hash = CONTEXT.parent_hash;
+        block.header.inner.timestamp = CONTEXT.timestamp;
+        asserter.push_success(&block);
+    }
+
     /// The trace endpoint knows the block, then traces `frames`.
     fn serve_trace(asserter: &Asserter, frames: &[(B256, CallFrame)]) {
         asserter.push_success(&Block::<Transaction>::default());
@@ -826,8 +882,8 @@ mod tests {
     #[tokio::test]
     async fn direct_posts_are_read_from_their_txs_and_a_foreign_post_is_never_fetched() {
         let (x, y) = (ours(0, H), ours(2, H2));
-        let tx_x = signed_tx(EEZ, call(&x, EOA, 0).input, 0);
-        let tx_y = signed_tx(EEZ, call(&y, EOA, 0).input, 1);
+        let tx_x = signed_tx(EEZ, input(&x), 0);
+        let tx_y = signed_tx(EEZ, input(&y), 1);
         let steps = [L(0, 0), P(0), Tx(1), L(1, 0), P(1)];
         let first = build(&[x, batch(&[2], vec![theirs()], 1)], &steps).0;
         let mut next = served_as(build(&[y], &[L(0, 0), P(0)]).0, 0, &tx_y);
@@ -855,12 +911,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_foreign_only_block_needs_no_header_transaction_or_trace() {
+        let logs = build(&[batch(&[2], vec![theirs()], 1)], &[L(0, 0), P(0)]).0;
+        let (asserter, rpc) = mock();
+        asserter.push_success(&logs);
+        // Only get_logs has an answer; any header, tx or trace request fails.
+        let posts = scan_range(&rpc, &rpc, EEZ, US, BLOCK, BLOCK)
+            .await
+            .expect("foreign-only block needs no additional RPC");
+        assert!(posts.is_empty());
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn only_live_posts_listing_us_share_an_inclusion_header() {
+        for (direct_live, routed_live, malformed_foreign) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+        ] {
+            let mut x = ours(0, H);
+            let mut y = ours(1, H2);
+            x.blockNumber = if direct_live { u64::MAX } else { 0 };
+            y.blockNumber = if routed_live { u64::MAX } else { 0 };
+            let mut foreign = batch(&[2], vec![theirs()], 1);
+            foreign.blockNumber = u64::MAX;
+            let direct = signed_tx(EEZ, input(&x), 0);
+            let router = signed_tx(ROUTER, Bytes::new(), 1);
+            let logs = build(
+                &[x.clone(), y.clone(), foreign.clone()],
+                &[L(0, 0), P(0), Tx(1), O, L(2, 0), P(2), O, L(1, 0), P(1)],
+            )
+            .0;
+            let foreign_input = if malformed_foreign {
+                postAndVerifyBatchCall::SELECTOR.into()
+            } else {
+                input(&foreign)
+            };
+            let traced = frame(
+                "CALL",
+                ROUTER,
+                &Bytes::new(),
+                0,
+                vec![
+                    frame("CALL", EEZ, &foreign_input, 3, Vec::new()),
+                    frame("CALL", EEZ, &input(&y), 3, Vec::new()),
+                ],
+            );
+            let (asserter, rpc) = mock();
+            asserter.push_success(&served_as(served_as(logs, 0, &direct), 1, &router));
+            asserter.push_success(&direct);
+            asserter.push_success(&router);
+            serve_trace(&asserter, &[(*router.inner.tx_hash(), traced)]);
+            if direct_live || routed_live {
+                serve_inclusion_header(&asserter, BLOCK, HASH);
+            }
+            // A second inclusion-header request, or one for the foreign live post
+            // alone, has no answer. Both returned batches must still verify.
+            let posts = scan_range(&rpc, &rpc, EEZ, US, BLOCK, BLOCK)
+                .await
+                .expect("read");
+            assert_eq!(posts.len(), 2);
+            assert_eq!(posts[0].batch.abi_encode(), x.abi_encode());
+            assert_eq!(posts[1].batch.abi_encode(), y.abi_encode());
+            assert_eq!(posts[0].settlement, s(&[(0, A)], 0, 1));
+            assert_eq!(posts[1].settlement, s(&[(0, A)], 1, 2));
+            let context = (direct_live || routed_live).then_some(CONTEXT);
+            assert_eq!(posts[0].l1_context, context);
+            assert_eq!(posts[1].l1_context, context);
+            assert!(asserter.read_q().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_calls_listing_us_fail_without_an_inclusion_header() {
+        for routed in [false, true] {
+            let malformed: Bytes = postAndVerifyBatchCall::SELECTOR.into();
+            let tx = signed_tx(if routed { ROUTER } else { EEZ }, malformed.clone(), 0);
+            let logs = served_as(build(&[ours(0, H)], &[L(0, 0), P(0)]).0, 0, &tx);
+            let (asserter, rpc) = mock();
+            asserter.push_success(&logs);
+            asserter.push_success(&tx);
+            if routed {
+                let traced = frame("CALL", EEZ, &malformed, 3, Vec::new());
+                serve_trace(&asserter, &[(*tx.inner.tx_hash(), traced)]);
+            }
+            let error = scan_range(&rpc, &rpc, EEZ, US, BLOCK, BLOCK)
+                .await
+                .expect_err("malformed call");
+            assert!(matches!(error, L1Error::Decode(_)), "{error}");
+            assert!(asserter.read_q().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn live_inclusion_header_failures_keep_their_error_class() {
+        let mut live = ours(0, H);
+        live.blockNumber = u64::MAX;
+        let tx = signed_tx(EEZ, input(&live), 0);
+        let logs = served_as(build(&[live], &[L(0, 0), P(0)]).0, 0, &tx);
+        for case in [
+            "missing",
+            "number",
+            "hash",
+            "parent",
+            "timestamp",
+            "transport",
+        ] {
+            let (asserter, rpc) = mock();
+            asserter.push_success(&logs);
+            asserter.push_success(&tx);
+            let mut header = Block::<Transaction>::default();
+            header.header.inner.number = BLOCK;
+            header.header.hash = HASH;
+            header.header.inner.parent_hash = CONTEXT.parent_hash;
+            header.header.inner.timestamp = CONTEXT.timestamp;
+            match case {
+                "number" => header.header.inner.number += 1,
+                "hash" => header.header.hash = B256::ZERO,
+                "parent" => header.header.inner.parent_hash = B256::repeat_byte(0x88),
+                "timestamp" => header.header.inner.timestamp += 1,
+                _ => {}
+            }
+            match case {
+                "missing" => asserter.push_success(&json!(null)),
+                "transport" => asserter.push_failure_msg("header RPC unavailable"),
+                _ => asserter.push_success(&header),
+            }
+            let error = scan_range(&rpc, &rpc, EEZ, US, BLOCK, BLOCK)
+                .await
+                .expect_err(case);
+            let correct = match case {
+                "missing" | "number" | "hash" => {
+                    matches!(error, L1Error::SourceIncomplete { block: BLOCK, .. })
+                }
+                "transport" => matches!(error, L1Error::Provider(_)),
+                _ => matches!(error, L1Error::Decode(_)),
+            };
+            assert!(correct, "{case}: {error}");
+            assert_eq!(
+                error.is_retryable(),
+                !matches!(case, "parent" | "timestamp"),
+                "{case}"
+            );
+            assert!(asserter.read_q().is_empty(), "{case}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_contract_post_traces_its_block_once_and_reads_the_frame() {
         let (x, y) = (ours(0, H), ours(1, H2));
-        let direct = signed_tx(EEZ, call(&x, EOA, 0).input, 0);
+        let direct = signed_tx(EEZ, input(&x), 0);
         let router = signed_tx(ROUTER, Bytes::new(), 1);
         let logs = build(&[x, y.clone()], &[L(0, 0), P(0), Tx(1), O, L(1, 0), P(1)]).0;
-        let into_eez = frame("CALL", EEZ, &call(&y, ROUTER, 0).input, 3, Vec::new());
+        let into_eez = frame("CALL", EEZ, &input(&y), 3, Vec::new());
         let traced = frame("CALL", ROUTER, &Bytes::new(), 0, vec![into_eez]);
         // One FIFO pins the order: logs, the txs, then one trace.
         let (asserter, rpc) = mock();
@@ -890,7 +1096,7 @@ mod tests {
             let selected = vec![root(1), root(2)];
             batch.blobIndices = vec![U256::from(2), U256::ZERO];
             let caller = if routed { ROUTER } else { EOA };
-            let input = call(&batch, caller, 0).input;
+            let input = input(&batch);
             let spi = batch_shared_public_input_with_blobs(&batch, caller, &selected).unwrap();
             let posted = BatchPosted {
                 sharedPublicInput: spi,
@@ -968,7 +1174,7 @@ mod tests {
         let provider = |e: &L1Error| matches!(e, L1Error::Provider(_));
         let decode = |e: &L1Error| matches!(e, L1Error::Decode(_));
         // The trace commits one EEZ log more than get_logs returned, outside the post.
-        let input = call(&ours(0, H), ROUTER, 0).input;
+        let input = input(&ours(0, H));
         let into_eez = frame("CALL", EEZ, &input, 3, vec![]);
         let traced = frame("CALL", ROUTER, &Bytes::new(), 1, vec![into_eez]);
         let extra = json!([{"txHash": tx.inner.tx_hash(), "result": traced}]);
