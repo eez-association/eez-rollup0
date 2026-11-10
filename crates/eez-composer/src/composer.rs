@@ -1801,6 +1801,9 @@ where
             return; // Retain every tx for reorg recovery or a fresh disposition.
         }
         let (spent, culprit) = partial_disposition(&partial.txs, &nonces);
+        // The cursor may cover a rival's batch. Nonces still decide what was
+        // consumed, but only our own canonical post can justify a retry charge.
+        let culprit = culprit.filter(|_| rollup.l1_head.contains_l1_tx(partial.post_batch_hash));
         // Only spent txs can be stranded by a reorg; the re-queued ones are the
         // pool's again.
         let stranded: Vec<crate::HeldTx> = partial

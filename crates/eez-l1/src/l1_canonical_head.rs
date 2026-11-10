@@ -98,6 +98,20 @@ impl L1CanonicalHead {
         self.batches.lock().unwrap().last().copied()
     }
 
+    /// Whether this transaction has a post in the canonical index for this rollup.
+    /// A cursor height alone does not identify whose batch settled it.
+    ///
+    /// # Panics
+    ///
+    /// If the index mutex is poisoned.
+    pub fn contains_l1_tx(&self, tx_hash: B256) -> bool {
+        self.batches
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|record| record.tx_hash == tx_hash)
+    }
+
     /// `true` iff `id` is at or before the indexed tail. Posts arrive in L1
     /// order, so such a post was already seen: indexed, or applied nothing.
     ///
@@ -247,6 +261,46 @@ mod tests {
             tx_hash: B256::ZERO,
             last_l2_block,
         }
+    }
+
+    #[test]
+    fn transaction_membership_tracks_the_canonical_index() {
+        let head = L1CanonicalHead::default();
+        let (a, b, unknown) = (
+            B256::repeat_byte(1),
+            B256::repeat_byte(2),
+            B256::repeat_byte(3),
+        );
+        assert!(!head.contains_l1_tx(a));
+        head.append(BatchRecord {
+            tx_hash: a,
+            ..record(100, 0, 9)
+        });
+        head.append(BatchRecord {
+            tx_hash: b,
+            ..record(101, 0, 10)
+        });
+        for (tx_hash, expected) in [(a, true), (b, true), (unknown, false)] {
+            assert_eq!(head.contains_l1_tx(tx_hash), expected);
+        }
+        head.retreat_on_l1_reorg(100).unwrap();
+        assert!(
+            head.contains_l1_tx(a),
+            "a surviving non-tail post remains canonical"
+        );
+        assert!(
+            !head.contains_l1_tx(b),
+            "a rolled-out post cannot justify a charge"
+        );
+        head.append(BatchRecord {
+            tx_hash: unknown,
+            ..record(102, 0, 10)
+        });
+        assert!(
+            !head.contains_l1_tx(b),
+            "a replacement at the same L2 height is not the old post"
+        );
+        assert!(head.contains_l1_tx(unknown));
     }
 
     /// Another fork at the tail's height is a different block: nothing in it was seen.
