@@ -417,6 +417,22 @@ impl PostBatchGasBudget {
         }
     }
 
+    /// L1 gas one accepted tx adds. Its DA copies cost calldata gas only when
+    /// the batch carries its DA in calldata, not in blobs.
+    fn tx_cost(
+        &self,
+        batch_entries: &[eez_protocol::abi::ExecutionEntrySol],
+        da_entries: &[eez_protocol::abi::ExecutionEntrySol],
+        da_tx: &[u8],
+        target_gas: u64,
+    ) -> TxL1Gas {
+        if self.byte_limit.is_some() {
+            projected_tx_l1_gas(batch_entries, &[], &[], target_gas)
+        } else {
+            projected_tx_l1_gas(batch_entries, da_entries, da_tx, target_gas)
+        }
+    }
+
     fn with_blob_limit(mut self, maximum: Option<usize>) -> Self {
         self.byte_limit =
             maximum.map(|blobs| blobs.saturating_mul(eez_blob::BYTES_PER_BLOB / 32 * 31));
@@ -2669,8 +2685,12 @@ where
                     }
                     // Gate before accept: this entry settles inline, so over
                     // the cap the whole bundle dies silently (invariant 7).
-                    let cost =
-                        projected_tx_l1_gas(&l1_entries, &l1_entries, &held.raw_tx, target_gas);
+                    let cost = candidate_budget.tx_cost(
+                        &l1_entries,
+                        &l1_entries,
+                        &held.raw_tx,
+                        target_gas,
+                    );
                     if !candidate_budget.try_accept(cost) {
                         rejected_cost = Some(
                             projected_postbatch_gas(
@@ -3064,7 +3084,7 @@ where
                     }
                     // Same gate, no target gas: a deferred entry only queues
                     // here, and its L1 half is a separate bundled tx.
-                    let cost = projected_tx_l1_gas(
+                    let cost = candidate_budget.tx_cost(
                         &composition.source.batch.entries,
                         &target_entries,
                         &[],
@@ -6328,6 +6348,19 @@ mod tests {
         );
         assert_eq!(attestation_gas(0), 0);
         assert_eq!(attestation_gas(1), 0);
+    }
+
+    #[test]
+    fn blob_budget_charges_no_calldata_for_da_copies() {
+        let entries = [outbound_entry()];
+        let raw_tx = vec![0x77u8; 180];
+        let calldata = PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1);
+        let blob = calldata.with_blob_limit(Some(1));
+        let in_calldata = calldata.tx_cost(&entries, &entries, &raw_tx, MEASURED_TARGET_GAS);
+        let in_blobs = blob.tx_cost(&entries, &entries, &raw_tx, MEASURED_TARGET_GAS);
+        let batch_only = projected_tx_l1_gas(&entries, &[], &[], MEASURED_TARGET_GAS);
+        assert_eq!(in_blobs.calldata_gas, batch_only.calldata_gas);
+        assert!(in_calldata.calldata_gas > batch_only.calldata_gas + calldata_gas(&raw_tx));
     }
 
     #[test]
