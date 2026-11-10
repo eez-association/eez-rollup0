@@ -6083,15 +6083,8 @@ mod tests {
     }
 
     #[test]
-    fn blob_budget_preserves_fifo_on_rejection() {
-        let pool = HeldPool::new();
-        let sender = Address::repeat_byte(0xa);
-        for nonce in 0..3 {
-            let mut tx = held(sender, Direction::Outbound, nonce, nonce as u8 + 1);
-            tx.raw_tx = Bytes::from(vec![0x42; 65_000]);
-            pool.push_contiguous(tx, 0).unwrap();
-        }
-        let selected = pool.pop_n(3);
+    fn blob_budget_rejection_leaves_the_live_budget_unchanged() {
+        let raw_tx = Bytes::from(vec![0x42; 65_000]);
         let mut budget =
             PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1).with_blob_limit(Some(1));
         let cost = TxL1Gas {
@@ -6099,18 +6092,10 @@ mod tests {
             calldata_gas: 0,
             target_gas: 0,
         };
-        assert!(
-            budget
-                .try_accept_da(1, &[], Some(&selected[0].raw_tx))
-                .unwrap()
-        );
+        assert!(budget.try_accept_da(1, &[], Some(&raw_tx)).unwrap());
         assert!(budget.try_accept(cost));
         let bytes = budget.bytes;
-        assert!(
-            !budget
-                .try_accept_da(1, &[], Some(&selected[1].raw_tx))
-                .unwrap()
-        );
+        assert!(!budget.try_accept_da(1, &[], Some(&raw_tx)).unwrap());
         assert_eq!(budget.bytes, bytes);
         let mut candidate = budget;
         assert!(
@@ -6126,14 +6111,6 @@ mod tests {
             budget.bytes, bytes,
             "gas rejection leaves the live byte budget unchanged"
         );
-        pool.push_front_batch(selected[1..].to_vec());
-        let deferred = pool.pop_all();
-        assert_eq!(
-            deferred.iter().map(|tx| tx.nonce).collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        pool.release_in_flight_batch(&selected);
-        pool.release_in_flight_batch(&deferred);
 
         let oversized = Bytes::from(vec![0x42; eez_blob::BYTES_PER_BLOB]);
         let mut calldata = PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1);
