@@ -97,7 +97,7 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
             "deposit consumed or retained system funds at {url}"
         );
         ensure!(
-            rpc(url, "eth_getTransactionCount", json!([system, "latest"])).await? == "0x1",
+            rpc(url, "eth_getTransactionCount", json!([system, "latest"])).await? == "0x0",
             "deposit nonce at {url}"
         );
     }
@@ -183,7 +183,7 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
             "outbound ETH must remain at the system address on {url}"
         );
         ensure!(
-            rpc(url, "eth_getTransactionCount", json!([system, "latest"])).await? == "0x2",
+            rpc(url, "eth_getTransactionCount", json!([system, "latest"])).await? == "0x0",
             "native nonces differ at {url}"
         );
         ensure!(
@@ -196,10 +196,11 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
         json!({
             "systemGenesisBalance": "0x0", "systemGenesisNonce": "0x0",
             "deposit": deposit, "withdrawal": withdrawal,
-            "finalSystemBalance": withdrawal, "finalSystemNonce": 2,
+            "finalSystemBalance": withdrawal, "finalSystemNonce": 0,
         })
     );
 
+    let mut source_hashes = std::collections::HashSet::new();
     let mut native_count = 0;
     let mut incoming_count = 0;
     let mut load_count = 0;
@@ -219,13 +220,44 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
             .await?;
             ensure!(block == other, "block {number} differs at {url}");
         }
+        let block_gas_limit = u64::from_str_radix(
+            block["gasLimit"].as_str().unwrap().trim_start_matches("0x"),
+            16,
+        )?;
+        let mut cumulative_gas = 0u64;
         for tx in block["transactions"].as_array().unwrap() {
-            if tx["type"] != "0x76" {
+            let native_receipt = rpc(
+                &primary_rpc,
+                "eth_getTransactionReceipt",
+                json!([tx["hash"]]),
+            )
+            .await?;
+            let prior_gas = cumulative_gas;
+            cumulative_gas = u64::from_str_radix(
+                native_receipt["cumulativeGasUsed"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+                16,
+            )?;
+            if tx["type"] != "0x45" {
                 continue;
             }
             native_count += 1;
+            let encoded_gas =
+                u64::from_str_radix(tx["gas"].as_str().unwrap().trim_start_matches("0x"), 16)?;
             ensure!(
-                tx["from"] == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076",
+                encoded_gas == eez_primitives::system_tx_gas_limit(block_gas_limit, prior_gas),
+                "native gas must equal its execution-position budget"
+            );
+            ensure!(tx["nonce"] == "0x0", "native nonce must remain zero");
+            let source_hash = tx["sourceHash"].as_str().expect("native source hash");
+            ensure!(
+                source_hashes.insert(source_hash.to_owned()),
+                "native source repeated: {source_hash}"
+            );
+            ensure!(
+                tx["from"] == "0xfffffffffffffffffffffffffffffffffffffffe",
                 "native caller: {tx}"
             );
             for field in ["r", "s", "v"] {
@@ -250,10 +282,8 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
                 load_count += 1;
             }
             let hash = &tx["hash"];
-            let native_receipt =
-                rpc(&primary_rpc, "eth_getTransactionReceipt", json!([hash])).await?;
             ensure!(
-                native_receipt["type"] == "0x76" && native_receipt["status"] == "0x1",
+                native_receipt["type"] == "0x45" && native_receipt["status"] == "0x1",
                 "native receipt: {native_receipt}"
             );
             ensure!(
@@ -274,7 +304,7 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
             );
             let raw = rpc(&primary_rpc, "eth_getRawTransactionByHash", json!([hash])).await?;
             ensure!(
-                raw.as_str().is_some_and(|raw| raw.starts_with("0x76")),
+                raw.as_str().is_some_and(|raw| raw.starts_with("0x45")),
                 "native raw bytes: {raw}"
             );
             for url in urls {

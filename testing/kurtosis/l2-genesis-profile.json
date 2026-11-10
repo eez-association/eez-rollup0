@@ -1,11 +1,11 @@
 {
   "schemaVersion": 2,
   "rollupId": 1,
-  "systemAddress": "0xEeEEEEeeeEEeeeEeeEEeEEEeeEeeeeeeeeEe0076",
-  "recoveryAddress": "0xEeEEEEeeeEEeeeEeeEEeEEEeeEeeeeeeeeEe0076",
+  "systemAddress": "0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE",
+  "recoveryAddress": "0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE",
   "useGasLeft": false,
   "eezL2Address": "0x4200000000000000000000000000000000000007",
-  "runtimeCodeHash": "0x1417767a1c5309dbe1e371971b81d9f9c9ecab5bcc3572dd5a0728b2eb89fa7f",
-  "genesisStateRoot": "0x98488e0844a191170aac8fb6f20bbe48f9feab4237fe9347d7f86a5da3a9766d",
+  "runtimeCodeHash": "0xc69ddece8e53f35f1a908cdea3b231b7bff91c4498ec052e2c2319147a856cfc",
+  "genesisStateRoot": "0x885db56d6318ffee8a99e27b960cf00de6d6f068d62e275bf95702b943b83c52",
   "foundryVersion": "1.7.1"
 }

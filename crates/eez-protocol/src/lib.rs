@@ -44,6 +44,7 @@ pub mod entries;
 pub mod error;
 pub mod executor;
 pub mod l1_context;
+pub mod native_source;
 pub mod outbound_gate;
 pub mod proof_plan;
 pub mod public_inputs;

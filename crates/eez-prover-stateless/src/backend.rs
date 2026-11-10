@@ -351,6 +351,10 @@ impl Backend {
                 transaction_state_checkpoints,
                 post_state_root,
                 settlement_evidence: SettlementBlockEvidence {
+                    cumulative_gas_used: validated_receipts
+                        .iter()
+                        .map(|r| r.cumulative_gas_used)
+                        .collect(),
                     system_sender_flags,
                     observed_outbound_events,
                 },

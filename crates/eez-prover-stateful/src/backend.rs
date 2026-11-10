@@ -444,6 +444,11 @@ where
                         transaction_state_checkpoints: checkpoints,
                         post_state_root: computed_root,
                         settlement_evidence: SettlementBlockEvidence {
+                            cumulative_gas_used: result
+                                .receipts
+                                .iter()
+                                .map(|r| r.cumulative_gas_used)
+                                .collect(),
                             system_sender_flags: sender_flags,
                             observed_outbound_events: observe_outbound_events(&result.receipts),
                         },
@@ -472,6 +477,7 @@ where
                 transaction_state_checkpoints: checkpoints,
                 post_state_root: block.header().state_root(),
                 settlement_evidence: SettlementBlockEvidence {
+                    cumulative_gas_used: receipts.iter().map(|r| r.cumulative_gas_used).collect(),
                     system_sender_flags: sender_flags,
                     observed_outbound_events,
                 },
@@ -665,6 +671,11 @@ where
             transaction_state_checkpoints: checkpoints,
             post_state_root,
             settlement_evidence: SettlementBlockEvidence {
+                cumulative_gas_used: result
+                    .receipts
+                    .iter()
+                    .map(|r| r.cumulative_gas_used)
+                    .collect(),
                 system_sender_flags: sender_flags,
                 observed_outbound_events,
             },

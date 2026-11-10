@@ -1,11 +1,12 @@
 //! Canonical unsigned L2 system transactions, shared by Composer, Deriver, and
-//! proof verification. Equal entries and parent-state nonces produce identical
+//! proof verification. Equal entries, live sources and execution positions produce identical
 //! EIP-2718 bytes without private material. Sync pairs preserve per-entry ordering.
 
+use crate::native_source::SourceEntry;
 use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::SolCall;
-use eez_primitives::{EEZL2_ADDRESS, SystemTransaction};
+use eez_primitives::{EEZL2_ADDRESS, EezTxEnvelope, SystemTransaction};
 
 use crate::RollupId;
 use crate::abi::{ExecutionEntrySol, L2ExecutionEntrySol, loadExecutionTableCall};
@@ -13,6 +14,68 @@ use crate::entries::{
     InboundSidecar, OutboundEntry, build_l2_incoming_entry, build_l2_outbound_entry,
     encode_execute_incoming,
 };
+
+/// The transaction body determines boundaries; request metadata never does.
+/// Native loads and their immediately following ordinary transaction form one
+/// group, regardless of receipt status. Inbound deliveries are one-transaction
+/// groups. Unpaired ordinary transactions do not end a group.
+/// Keep this cursor with the executed prefix and restore it with speculative
+/// state. A proposed transition takes effect only when its transaction commits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionGroupState {
+    awaiting_user: bool,
+}
+
+impl ExecutionGroupState {
+    /// Propose the next cursor and whether this transaction completes a group.
+    /// This classifies already decoded envelopes, not source/effect authority.
+    pub fn after(self, tx: &EezTxEnvelope) -> Result<(Self, bool), &'static str> {
+        match tx {
+            EezTxEnvelope::Ethereum(_) => Ok(self.after_ordinary()),
+            EezTxEnvelope::System(_) if self.awaiting_user => {
+                Err("native table load must be followed immediately by its user transaction")
+            }
+            EezTxEnvelope::System(native) if native.to == EEZL2_ADDRESS => {
+                if native.input.starts_with(&loadExecutionTableCall::SELECTOR) {
+                    Ok((
+                        Self {
+                            awaiting_user: true,
+                        },
+                        false,
+                    ))
+                } else if native
+                    .input
+                    .starts_with(&crate::entries::EXECUTE_INCOMING_SELECTOR)
+                {
+                    Ok((Self::default(), true))
+                } else {
+                    Err("unsupported native group selector")
+                }
+            }
+            EezTxEnvelope::System(_) => Err("unsupported native group destination"),
+        }
+    }
+
+    /// The ordinary branch, also used for unsigned advisory executions. It
+    /// neither validates a signature nor authorizes the paired origin identity.
+    pub const fn after_ordinary(self) -> (Self, bool) {
+        (
+            Self {
+                awaiting_user: false,
+            },
+            self.awaiting_user,
+        )
+    }
+
+    /// A published block or effect checkpoint cannot end after an unpaired load.
+    pub fn ensure_complete(self) -> Result<(), &'static str> {
+        if self.awaiting_user {
+            Err("block ends inside an outbound load/user group")
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// Public reconstruction inputs shared by Composer, Deriver, and proof validation.
 #[derive(Clone, Debug)]
@@ -26,25 +89,19 @@ pub struct SystemTxContext {
     pub this_rollup_id: u64,
 }
 
-/// Build unsigned L2 inbound system txs from canonical inbound sidecars.
-///
-/// Entries for other rollups are skipped. Raw `ExecutionEntrySol` values must
-/// first pass [`InboundSidecar::try_from`] at the DA/batch ABI boundary.
-///
-/// `starting_nonce` is the SYSTEM_ADDRESS account nonce at the L2
-/// parent block. The function advances locally by one per emitted
-/// tx — callers don't need to thread nonces themselves.
+/// Reconstruct inbound delivery plans from checked sidecars. Foreign entries are
+/// skipped. Source ordinals refer to the complete candidate before filtering.
+/// Gas is resolved only when the preceding transactions have executed.
 ///
 /// # Errors
-///
-/// Returns an error for an invalid predeploy address, entry shape, or nonce overflow.
+/// Reject invalid targets, sidecars and source-index overflow.
 pub fn build_inbound_system_txs(
     entries: &[InboundSidecar],
     cfg: &SystemTxContext,
-    starting_nonce: u64,
-) -> Result<Vec<Bytes>, String> {
-    let mut nonce = starting_nonce;
-    let mut out: Vec<Bytes> = Vec::new();
+    source: SourceEntry,
+) -> Result<Vec<NativeTransactionPlan>, String> {
+    let mut source = source;
+    let mut out: Vec<NativeTransactionPlan> = Vec::new();
     for entry in entries {
         let incoming = entry.incoming_entry();
         if incoming.l2_rollup_id.0 != cfg.this_rollup_id {
@@ -54,46 +111,30 @@ pub fn build_inbound_system_txs(
             build_l2_incoming_entry(incoming.clone()).map_err(|error| error.to_string())?;
         let calldata = encode_execute_incoming(l2_entry);
         let raw = encode_system_tx(
-            nonce,
+            source.hash(),
             cfg.eezl2_address,
             calldata,
             incoming.value,
             cfg.l2_chain_id,
         )?;
-        nonce = nonce.checked_add(1).ok_or_else(|| {
-            "SYSTEM_ADDRESS nonce overflow in build_inbound_system_txs".to_string()
-        })?;
+        source = source.offset(1)?;
         out.push(raw);
     }
     Ok(out)
 }
 
-/// Build SYNC-block `loadExecutionTable` system txs for OUTBOUND L2→L1
-/// deferred entries — ONE tx per entry, mirroring [`build_inbound_system_txs`]'s
-/// one-tx-per-entry shape. Each tx stages a single entry that the
-/// immediately-following user tx's `EEZL2.executeCrossChainCall` consumes,
-/// so the SyncPair block layout is `[load_1 | user_1 | load_2 | user_2 | …]`.
-/// Per-outbound-load is a deliberate FAILURE-ISOLATION choice, NOT forced: a
-/// single `loadExecutionTable([all entries])` followed by N user txs also works
-/// (`entryIndex` is persistent storage advanced by `_consumeAndExecute`). But
-/// `_loadExecutionTable` replaces the table and resets `entryIndex` to zero, so
-/// one load per entry isolates a reverting/desync'd withdrawal — it can't
-/// cascade-desync the cursor for the rest. Given that choice, each load's user
-/// tx must run before the next load wipes the table → the interleaved order.
-///
-/// `starting_nonce` is the SYSTEM_ADDRESS account nonce at the L2 parent
-/// block; advanced by one per emitted tx (callers don't thread nonces).
+/// Reconstruct one table load per outbound group. Each load must immediately
+/// precede its signed user transaction. Rollup0 currently rejects nested tables.
 ///
 /// # Errors
-///
-/// Returns an error for an invalid predeploy address or nonce overflow.
+/// Reject invalid targets and source-index overflow.
 pub fn build_outbound_load_table_txs(
     entries: &[L2ExecutionEntrySol],
     cfg: &SystemTxContext,
-    starting_nonce: u64,
-) -> Result<Vec<Bytes>, String> {
-    let mut nonce = starting_nonce;
-    let mut out: Vec<Bytes> = Vec::new();
+    source: SourceEntry,
+) -> Result<Vec<NativeTransactionPlan>, String> {
+    let mut source = source;
+    let mut out: Vec<NativeTransactionPlan> = Vec::new();
     for entry in entries {
         // One entry per `loadExecutionTable`: the SyncPair pairs each load
         // with its consuming user tx, so a single-element table is correct
@@ -106,18 +147,64 @@ pub fn build_outbound_load_table_txs(
         }
         .abi_encode();
         let raw = encode_system_tx(
-            nonce,
+            source.hash(),
             cfg.eezl2_address,
             calldata,
             U256::ZERO, // loadExecutionTable carries no value
             cfg.l2_chain_id,
         )?;
-        nonce = nonce.checked_add(1).ok_or_else(|| {
-            "SYSTEM_ADDRESS nonce overflow in build_outbound_load_table_txs".to_string()
-        })?;
+        source = source.offset(1)?;
         out.push(raw);
     }
     Ok(out)
+}
+
+/// A locally reconstructed native call, never a received envelope. Source identity
+/// is derived from authenticated context; gas is fixed by its execution position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeTransactionPlan {
+    chain_id: u64,
+    source_hash: B256,
+    value: U256,
+    input: Bytes,
+}
+
+impl NativeTransactionPlan {
+    /// Encode at the actual execution position. Never normalize received bytes.
+    pub fn at_position(&self, block_gas_limit: u64, gas_used: u64) -> Result<Bytes, String> {
+        if gas_used > block_gas_limit {
+            return Err("native position exceeds block gas limit".into());
+        }
+        Ok(SystemTransaction {
+            chain_id: self.chain_id,
+            source_hash: self.source_hash,
+            gas_limit: eez_primitives::system_tx_gas_limit(block_gas_limit, gas_used),
+            to: EEZL2_ADDRESS,
+            value: self.value,
+            input: self.input.clone(),
+        }
+        .encoded_2718()
+        .into())
+    }
+}
+
+/// Local reconstruction input: native gas is resolved after preceding execution;
+/// signed user bytes remain exact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlannedTransaction {
+    /// Reconstructed native call, with position-dependent gas still unresolved.
+    Native(NativeTransactionPlan),
+    /// Exact signed user transaction bytes, never normalized.
+    User(Bytes),
+}
+impl PlannedTransaction {
+    /// Materialize a local plan after its preceding transactions have executed.
+    pub fn at_position(&self, block_gas_limit: u64, gas_used: u64) -> Result<Bytes, String> {
+        match self {
+            Self::Native(plan) => plan.at_position(block_gas_limit, gas_used),
+            Self::User(raw) => Ok(raw.clone()),
+        }
+    }
 }
 
 /// A Sync-block tx pair: a system tx and its OPTIONAL immediately-following
@@ -131,7 +218,7 @@ pub fn build_outbound_load_table_txs(
 #[derive(Clone, Debug)]
 pub struct SyncPair {
     /// The system tx (an unsigned native transaction).
-    pub system_tx: Bytes,
+    pub system_tx: NativeTransactionPlan,
     /// The user tx that consumes `system_tx`'s effect in the SAME block,
     /// immediately after it. `None` for a self-contained system tx.
     pub user_tx: Option<Bytes>,
@@ -149,12 +236,12 @@ pub struct SyncPair {
 /// `to_block` root divergence). For inbound (all `user_tx == None`) it reduces
 /// to `[system_txs…]`, byte-identical to the prior system-first layout.
 #[must_use]
-pub fn interleave_sync_block_txs(pairs: &[SyncPair]) -> Vec<Bytes> {
-    let mut out: Vec<Bytes> = Vec::with_capacity(pairs.len() * 2);
+pub fn interleave_sync_block_txs(pairs: &[SyncPair]) -> Vec<PlannedTransaction> {
+    let mut out = Vec::with_capacity(pairs.len() * 2);
     for pair in pairs {
-        out.push(pair.system_tx.clone());
+        out.push(PlannedTransaction::Native(pair.system_tx.clone()));
         if let Some(user_tx) = &pair.user_tx {
-            out.push(user_tx.clone());
+            out.push(PlannedTransaction::User(user_tx.clone()));
         }
     }
     out
@@ -205,23 +292,15 @@ pub fn check_entry_shape(entry: &ExecutionEntrySol, dir: &str) -> Result<(), Str
     Ok(())
 }
 
-/// Lower ONE outbound L2→L1 entry to its `[load | user]` Sync pairs, starting
-/// at `starting_nonce`.
-///
-/// The per-entry unit [`build_cross_chain_sync_pairs`] builds its PHASE 1
-/// from. The composer appends these pairs to the block as each survivor is
-/// accepted and the post-drain canonical rebuild replays the same per-entry
-/// calls in the same order, so the incremental block and the canonical layout
-/// are byte-identical BY CONSTRUCTION.
+/// Reconstruct one outbound `[load, user]` group at its original source ordinal.
 ///
 /// # Errors
-/// Rejects unsupported entry shapes ([`check_entry_shape`]), an entry with no
-/// `l2ToL1Call`, and signing failures.
+/// Reject unsupported entry shapes and invalid targets.
 pub fn build_outbound_pair(
     entry: &ExecutionEntrySol,
     user_tx: &Bytes,
     cfg: &SystemTxContext,
-    starting_nonce: u64,
+    source: SourceEntry,
 ) -> Result<Vec<SyncPair>, String> {
     check_entry_shape(entry, "outbound")?;
     let call = entry
@@ -238,8 +317,7 @@ pub fn build_outbound_pair(
         success: entry.success,
     })
     .map_err(|error| error.to_string())?;
-    let loads =
-        build_outbound_load_table_txs(std::slice::from_ref(&l2_entry), cfg, starting_nonce)?;
+    let loads = build_outbound_load_table_txs(std::slice::from_ref(&l2_entry), cfg, source)?;
     Ok(loads
         .into_iter()
         .map(|load| SyncPair {
@@ -249,46 +327,19 @@ pub fn build_outbound_pair(
         .collect())
 }
 
-/// THE canonical Sync-block `SyncPair` builder — the SINGLE source of truth
-/// both the composer (to commit the Sync block) and the deriver (to
-/// reconstruct it) call, so the two are byte-identical BY CONSTRUCTION: no
-/// drain-order-vs-two-phase nonce drift, no interleaved-vs-system-first order
-/// drift. (Replaces the two sides independently calling
-/// `build_outbound_load_table_txs` / `build_inbound_system_txs` in their own
-/// order with their own nonce sequencing — the source of the mixed-batch
-/// fork.)
-///
-/// Canonical order (given the per-outbound-load failure-isolation choice +
-/// `_loadExecutionTable`'s table replacement + cursor reset, which
-/// `executeIncomingCrossChainCall` also triggers):
-/// ALL outbound load+user pairs FIRST, THEN all inbound deliveries —
-/// `[load_0,user_0, …, load_{K-1},user_{K-1}, deliver_0, …, deliver_{M-1}]`.
-/// SYSTEM_ADDRESS nonces run strictly in that order from `starting_nonce`:
-/// outbound loads `N..N+K-1`, inbound deliveries `N+K..` (the deriver's
-/// canonical two-phase order, `deriver.rs`). For the value-free A2b target
-/// K=1/M=1 the list is `[load(N), user, deliver(N+1)]`.
-///
-/// `outbound`: each `(L1-shape outbound ExecutionEntrySol, its consuming user
-/// tx)` in canonical (entry) order; the L2→L1 call is rebuilt from
-/// `entry.l2ToL1Calls[0]` (the same lowering both sides apply). `inbound`: the
-/// ABI-encoded inbound sidecars. This mixed-direction ABI boundary converts
-/// them to [`InboundSidecar`] before lowering; L1 settlement entries are rejected.
-/// Canonical entries for other rollups are skipped.
-///
-/// Single-direction degenerates EXACTLY: outbound-only → `[load,user,…]`;
-/// inbound-only → `[deliver,…]` (all `user_tx == None`) — byte-identical to
-/// the pre-refactor per-direction builds.
+/// Canonical full-candidate order: all outbound `[load, user]` groups, then
+/// inbound deliveries. Source ordinals advance once per group, not per tx.
+/// Derivation must assign these before selecting L1-consumed groups.
 ///
 /// # Errors
-/// Rejects unsupported entry shapes, invalid targets, and SYSTEM_ADDRESS
-/// nonce overflow.
+/// Reject unsupported entry shapes, invalid targets and source-index overflow.
 pub fn build_cross_chain_sync_pairs(
     outbound: &[(ExecutionEntrySol, Bytes)],
     inbound: &[ExecutionEntrySol],
     cfg: &SystemTxContext,
-    starting_nonce: u64,
+    source: SourceEntry,
 ) -> Result<Vec<SyncPair>, String> {
-    let mut nonce = starting_nonce;
+    let mut source = source;
     let mut pairs: Vec<SyncPair> = Vec::with_capacity(outbound.len() + inbound.len());
 
     // Validate even foreign inbound entries, which the delivery builder skips.
@@ -302,15 +353,13 @@ pub fn build_cross_chain_sync_pairs(
 
     // Each user must consume its load before the next load resets the execution table.
     for (entry, user_tx) in outbound {
-        let built = build_outbound_pair(entry, user_tx, cfg, nonce)?;
-        nonce = nonce
-            .checked_add(built.len() as u64)
-            .ok_or_else(|| "SYSTEM_ADDRESS nonce overflow (outbound loads)".to_string())?;
+        let built = build_outbound_pair(entry, user_tx, cfg, source)?;
+        source = source.offset(built.len() as u64)?;
         pairs.extend(built);
     }
 
-    // Inbound deliveries continue the nonce sequence after all outbound loads.
-    let deliveries = build_inbound_system_txs(&inbound, cfg, nonce)?;
+    // Inbound groups follow all outbound groups in the full source sequence.
+    let deliveries = build_inbound_system_txs(&inbound, cfg, source)?;
     for d in deliveries {
         pairs.push(SyncPair {
             system_tx: d,
@@ -325,24 +374,21 @@ pub fn build_cross_chain_sync_pairs(
 /// Restrict calls to EEZL2; its incoming-call check requires `value` to match
 /// the value encoded in the calldata.
 fn encode_system_tx(
-    nonce: u64,
+    source_hash: B256,
     to: Address,
     calldata: Vec<u8>,
     value: U256,
     chain_id: u64,
-) -> Result<Bytes, String> {
+) -> Result<NativeTransactionPlan, String> {
     if to != EEZL2_ADDRESS {
         return Err("native system transactions must target the EEZL2 predeploy".to_string());
     }
-    Ok(SystemTransaction {
+    Ok(NativeTransactionPlan {
         chain_id,
-        nonce,
-        to,
+        source_hash,
         value,
         input: calldata.into(),
-    }
-    .encoded_2718()
-    .into())
+    })
 }
 
 #[cfg(test)]
@@ -351,7 +397,7 @@ mod tests {
     use crate::EvmBatch;
     use crate::abi::{L2ToL1CallSol, RollupIdWithProofSystemsSol};
     use crate::entries::{IncomingEntry, decode_postbatch, encode_postbatch};
-    use alloy_primitives::{B256, address};
+    use alloy_primitives::address;
     use eez_primitives::EezTxEnvelope as TransactionSigned;
 
     fn ctx() -> SystemTxContext {
@@ -425,22 +471,25 @@ mod tests {
         }
     }
 
-    /// Decode a native system transaction's nonce.
-    fn nonce_of(raw: &Bytes) -> u64 {
-        use alloy_consensus::Transaction as _;
+    fn source(index: u64) -> SourceEntry {
+        SourceEntry::new(1, B256::repeat_byte(0x99), index).unwrap()
+    }
+    fn source_of(plan: &NativeTransactionPlan) -> B256 {
         use alloy_eips::eip2718::Decodable2718 as _;
-        let mut s: &[u8] = raw.as_ref();
-        TransactionSigned::decode_2718(&mut s)
-            .expect("decode system tx")
-            .nonce()
+        let raw = plan.at_position(30_000_000, 0).unwrap();
+        let TransactionSigned::System(tx) = TransactionSigned::decode_2718_exact(&raw).unwrap()
+        else {
+            panic!("expected native")
+        };
+        tx.source_hash
     }
 
     /// THE A2b property: the canonical builder lays a MIXED slot out in
     /// deriver-canonical order (all outbound load+user pairs, THEN inbound
-    /// deliveries) with strict two-phase SYSTEM_ADDRESS nonces — independent of
+    /// deliveries) with strict two-phase SYSTEM_ADDRESS sources — independent of
     /// the order the (outbound, inbound) args are constructed. K=1/M=1.
     #[test]
-    fn cross_chain_sync_pairs_canonical_order_and_two_phase_nonces() {
+    fn cross_chain_sync_pairs_canonical_order_and_two_phase_sources() {
         let cfg = ctx();
         let n = 5u64;
         let user_tx = Bytes::from(vec![0xde, 0xad]);
@@ -448,7 +497,7 @@ mod tests {
             &[(outbound_entry(), user_tx.clone())],
             &[inbound_entry()],
             &cfg,
-            n,
+            source(n),
         )
         .unwrap();
 
@@ -463,12 +512,16 @@ mod tests {
             pairs[1].user_tx, None,
             "pair[1] = inbound delivery, no user tx"
         );
-        // Two-phase nonces: outbound load = N, inbound delivery = N+1.
-        assert_eq!(nonce_of(&pairs[0].system_tx), n, "outbound load nonce = N");
+        // Two-phase sources: outbound load = N, inbound delivery = N+1.
         assert_eq!(
-            nonce_of(&pairs[1].system_tx),
-            n + 1,
-            "inbound delivery nonce = N+1 (strictly AFTER all outbound loads)",
+            source_of(&pairs[0].system_tx),
+            source(n).hash(),
+            "outbound load source_index = N"
+        );
+        assert_eq!(
+            source_of(&pairs[1].system_tx),
+            source(n + 1).hash(),
+            "inbound delivery source_index = N+1 (strictly AFTER all outbound loads)",
         );
     }
 
@@ -486,7 +539,7 @@ mod tests {
         let mut multi_out = outbound_entry();
         let extra = multi_out.l2ToL1Calls[0].clone();
         multi_out.l2ToL1Calls.push(extra);
-        let err = build_cross_chain_sync_pairs(&[(multi_out, user.clone())], &[], &cfg, 0)
+        let err = build_cross_chain_sync_pairs(&[(multi_out, user.clone())], &[], &cfg, source(0))
             .expect_err("N>=2 outbound must be rejected, not silently truncated");
         assert!(err.contains("multi-call outbound"), "err: {err}");
         assert!(
@@ -502,14 +555,19 @@ mod tests {
         let mut multi_in = inbound_entry();
         let extra_in = multi_in.l2ToL1Calls[0].clone();
         multi_in.l2ToL1Calls.push(extra_in);
-        let err = build_cross_chain_sync_pairs(&[], &[multi_in], &cfg, 0)
+        let err = build_cross_chain_sync_pairs(&[], &[multi_in], &cfg, source(0))
             .expect_err("N>=2 inbound must be rejected");
         assert!(err.contains("multi-call inbound"), "err: {err}");
 
         // A single call still builds fine — the
         // guard is a no-op on the only shape the composer produces today.
-        build_cross_chain_sync_pairs(&[(outbound_entry(), user)], &[inbound_entry()], &cfg, 0)
-            .expect("single-call still builds through the guard");
+        build_cross_chain_sync_pairs(
+            &[(outbound_entry(), user)],
+            &[inbound_entry()],
+            &cfg,
+            source(0),
+        )
+        .expect("single-call still builds through the guard");
     }
 
     #[test]
@@ -518,9 +576,13 @@ mod tests {
         let mut outbound = outbound_entry();
         outbound.l2ToL1Calls.clear();
 
-        let err =
-            build_cross_chain_sync_pairs(&[(outbound, Bytes::from_static(&[0x01]))], &[], &cfg, 0)
-                .expect_err("an outbound entry without a call must not drop its user transaction");
+        let err = build_cross_chain_sync_pairs(
+            &[(outbound, Bytes::from_static(&[0x01]))],
+            &[],
+            &cfg,
+            source(0),
+        )
+        .expect_err("an outbound entry without a call must not drop its user transaction");
 
         assert!(
             err.contains("exactly one l2ToL1Call"),
@@ -534,14 +596,18 @@ mod tests {
 
         let mut outbound = outbound_entry();
         outbound.success = false;
-        let err =
-            build_cross_chain_sync_pairs(&[(outbound, Bytes::from_static(&[0x01]))], &[], &cfg, 0)
-                .expect_err("unsuccessful outbound entries are outside the supported profile");
+        let err = build_cross_chain_sync_pairs(
+            &[(outbound, Bytes::from_static(&[0x01]))],
+            &[],
+            &cfg,
+            source(0),
+        )
+        .expect_err("unsuccessful outbound entries are outside the supported profile");
         assert!(err.contains("unsuccessful outbound"), "err: {err}");
 
         let mut inbound = inbound_entry();
         inbound.success = false;
-        let err = build_cross_chain_sync_pairs(&[], &[inbound], &cfg, 0)
+        let err = build_cross_chain_sync_pairs(&[], &[inbound], &cfg, source(0))
             .expect_err("unsuccessful inbound entries are outside the supported profile");
         assert!(err.contains("unsuccessful inbound"), "err: {err}");
     }
@@ -554,9 +620,9 @@ mod tests {
         let n = 3u64;
         let user = Bytes::from(vec![0x01]);
 
-        // Outbound-only == build_outbound_load_table_txs at the same nonce.
+        // Outbound-only == build_outbound_load_table_txs at the same source_index.
         let out_pairs =
-            build_cross_chain_sync_pairs(&[(outbound_entry(), user.clone())], &[], &cfg, n)
+            build_cross_chain_sync_pairs(&[(outbound_entry(), user.clone())], &[], &cfg, source(n))
                 .unwrap();
         let l2e = build_l2_outbound_entry(OutboundEntry {
             target: outbound_entry().l2ToL1Calls[0].targetAddress,
@@ -569,17 +635,19 @@ mod tests {
         })
         .unwrap();
         let direct_out =
-            build_outbound_load_table_txs(std::slice::from_ref(&l2e), &cfg, n).unwrap();
+            build_outbound_load_table_txs(std::slice::from_ref(&l2e), &cfg, source(n)).unwrap();
         assert_eq!(out_pairs.len(), 1);
         assert_eq!(
             out_pairs[0].system_tx, direct_out[0],
             "outbound-only byte-identical"
         );
 
-        // Inbound-only == build_inbound_system_txs at the same nonce.
-        let in_pairs = build_cross_chain_sync_pairs(&[], &[inbound_entry()], &cfg, n).unwrap();
+        // Inbound-only == build_inbound_system_txs at the same source_index.
+        let in_pairs =
+            build_cross_chain_sync_pairs(&[], &[inbound_entry()], &cfg, source(n)).unwrap();
         let direct_in =
-            build_inbound_system_txs(&inbound_sidecars(&[inbound_entry()]), &cfg, n).unwrap();
+            build_inbound_system_txs(&inbound_sidecars(&[inbound_entry()]), &cfg, source(n))
+                .unwrap();
         assert_eq!(in_pairs.len(), 1);
         assert_eq!(
             in_pairs[0].system_tx, direct_in[0],
@@ -600,12 +668,13 @@ mod tests {
             &[(outbound_entry(), user.clone())],
             &[inbound_entry()],
             &cfg,
-            n,
+            source(n),
         )
         .unwrap();
         let out_rt = round_tripped(&[outbound_entry()])[0].clone();
         let in_rt = round_tripped(&[inbound_entry()])[0].clone();
-        let rebuilt = build_cross_chain_sync_pairs(&[(out_rt, user)], &[in_rt], &cfg, n).unwrap();
+        let rebuilt =
+            build_cross_chain_sync_pairs(&[(out_rt, user)], &[in_rt], &cfg, source(n)).unwrap();
         assert_eq!(emitted.len(), rebuilt.len());
         for (e, r) in emitted.iter().zip(&rebuilt) {
             assert_eq!(
@@ -617,7 +686,7 @@ mod tests {
     }
 
     /// A mid-chain resume rebuilds only the tail, which must be byte-equal to the
-    /// composer's suffix: offset the nonce by txs the prefix EMITS, not entry count.
+    /// composer's suffix: offset the source_index by txs the prefix EMITS, not entry count.
     #[test]
     fn resumed_tail_matches_full_build_when_offset_by_prefix_emitted_txs() {
         let cfg = ctx();
@@ -635,12 +704,12 @@ mod tests {
         let foreign = InboundSidecar::new(foreign).unwrap().as_abi_entry().clone();
         let in1 = inbound_entry();
 
-        // Composer: the whole claimed chain, nonces N.. in emit order.
+        // Composer: the whole claimed chain, sources N.. in emit order.
         let full = build_cross_chain_sync_pairs(
             &[(o0.clone(), u0.clone()), (o1.clone(), u1.clone())],
             &[foreign.clone(), in1.clone()],
             &cfg,
-            n,
+            source(n),
         )
         .unwrap();
         assert_eq!(
@@ -650,17 +719,21 @@ mod tests {
         );
         assert_eq!(
             full.iter()
-                .map(|p| nonce_of(&p.system_tx))
+                .map(|p| source_of(&p.system_tx))
                 .collect::<Vec<_>>(),
-            vec![n, n + 1, n + 2],
+            vec![source(n).hash(), source(n + 1).hash(), source(n + 2).hash()],
         );
 
         // Deriver resume: a competing batch already settled the prefix
         // (1 outbound + the foreign inbound); only the rest ran under this batch.
         let (skip_out, skip_in) = (1usize, 1usize);
-        let prefix =
-            build_cross_chain_sync_pairs(&[(o0, u0)], std::slice::from_ref(&foreign), &cfg, n)
-                .unwrap();
+        let prefix = build_cross_chain_sync_pairs(
+            &[(o0, u0)],
+            std::slice::from_ref(&foreign),
+            &cfg,
+            source(n),
+        )
+        .unwrap();
         assert_eq!(
             prefix.len(),
             1,
@@ -675,8 +748,9 @@ mod tests {
 
         let tail_out = [(o1, u1)];
         let tail_in = [in1];
-        let tail_at =
-            |start: u64| build_cross_chain_sync_pairs(&tail_out, &tail_in, &cfg, start).unwrap();
+        let tail_at = |start: u64| {
+            build_cross_chain_sync_pairs(&tail_out, &tail_in, &cfg, source(start)).unwrap()
+        };
 
         let tail = tail_at(n + prefix.len() as u64);
         assert_eq!(tail.len(), full.len() - prefix.len());
@@ -688,7 +762,7 @@ mod tests {
             assert_eq!(t.user_tx, f.user_tx);
         }
 
-        // Negative control: no offset, or the entry-count offset, re-nonces the
+        // Negative control: no offset, or the entry-count offset, re-sources the
         // tail into different bytes and derivation halts.
         for wrong in [0u64, (skip_out + skip_in) as u64] {
             assert_ne!(
@@ -704,15 +778,20 @@ mod tests {
     #[test]
     fn composer_emit_equals_deriver_rebuild_byte_identical() {
         let cfg = ctx();
-        let nonce = 7u64;
+        let source_index = 7u64;
         let entries = vec![inbound_entry()];
 
-        let emitted = build_inbound_system_txs(&inbound_sidecars(&entries), &cfg, nonce).unwrap();
+        let emitted =
+            build_inbound_system_txs(&inbound_sidecars(&entries), &cfg, source(source_index))
+                .unwrap();
         assert_eq!(emitted.len(), 1, "one inbound entry → one system tx");
 
-        let rebuilt =
-            build_inbound_system_txs(&inbound_sidecars(&round_tripped(&entries)), &cfg, nonce)
-                .unwrap();
+        let rebuilt = build_inbound_system_txs(
+            &inbound_sidecars(&round_tripped(&entries)),
+            &cfg,
+            source(source_index),
+        )
+        .unwrap();
         assert_eq!(
             emitted, rebuilt,
             "composer-emit must equal deriver-rebuild byte-for-byte (Phase-C invariant)",
@@ -720,12 +799,12 @@ mod tests {
     }
 
     /// Canonical EIP-2718 bytes for the native unsigned system transaction
-    /// represented by `inbound_entry()`. The prefix pins type `0x76` and
-    /// the RLP body pins chain ID, nonce, EEZL2 target, value, and calldata.
+    /// represented by `inbound_entry()`. The prefix pins type `0x45` and
+    /// the RLP body pins chain ID, source hash, gas limit, EEZL2 target, value, and calldata.
     #[test]
     fn inbound_system_transaction_golden_vector() {
         const EXPECTED: &str = concat!(
-            "76f9035f010794420000000000000000000000000000000000000780b90344c3fb5f3d00000000000000000000000000",
+            "45f9038401a067fb5da1784078579c726c542563b4577c50fb90652c54566d49b9f170784d37840100000094420000000000000000000000000000000000000780b90344c3fb5f3d00000000000000000000000000",
             "000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000",
             "000320000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000",
             "0000000000000000000000000000000000002047d8d2c330b8e207c17da548b89a3058b10faad241a6b82f88302af38b",
@@ -747,29 +826,37 @@ mod tests {
         );
 
         let entries = [inbound_entry()];
-        let built = build_inbound_system_txs(&inbound_sidecars(&entries), &ctx(), 7).unwrap();
+        let built =
+            build_inbound_system_txs(&inbound_sidecars(&entries), &ctx(), source(7)).unwrap();
         assert_eq!(built.len(), 1);
         assert_eq!(
-            built[0].as_ref(),
+            built[0].at_position(30_000_000, 0).unwrap().as_ref(),
             alloy_primitives::hex::decode(EXPECTED).unwrap(),
             "canonical native inbound system transaction bytes drifted",
         );
     }
 
-    /// Guards against a vacuous pass: the signed bytes MUST vary with the nonce (so the
-    /// equality above is non-trivial), and emit==rebuild must still hold at that nonce.
+    /// Guards against a vacuous pass: the signed bytes MUST vary with the source_index (so the
+    /// equality above is non-trivial), and emit==rebuild must still hold at that source_index.
     #[test]
-    fn byte_identity_is_non_vacuous_and_holds_across_nonces() {
+    fn byte_identity_is_non_vacuous_and_holds_across_sources() {
         let cfg = ctx();
         let entries = vec![inbound_entry()];
-        let at0 = build_inbound_system_txs(&inbound_sidecars(&entries), &cfg, 0).unwrap();
-        let at99 = build_inbound_system_txs(&inbound_sidecars(&entries), &cfg, 99).unwrap();
-        assert_ne!(at0, at99, "different nonce must change the native bytes");
+        let at0 = build_inbound_system_txs(&inbound_sidecars(&entries), &cfg, source(0)).unwrap();
+        let at99 = build_inbound_system_txs(&inbound_sidecars(&entries), &cfg, source(99)).unwrap();
+        assert_ne!(
+            at0, at99,
+            "different source_index must change the native bytes"
+        );
         assert_eq!(
-            build_inbound_system_txs(&inbound_sidecars(&round_tripped(&entries)), &cfg, 99)
-                .unwrap(),
+            build_inbound_system_txs(
+                &inbound_sidecars(&round_tripped(&entries)),
+                &cfg,
+                source(99)
+            )
+            .unwrap(),
             at99,
-            "emit==rebuild at the second nonce too",
+            "emit==rebuild at the second source_index too",
         );
     }
 
@@ -783,7 +870,7 @@ mod tests {
         use crate::entries::{OutboundEntry, build_l2_outbound_entry};
 
         let cfg = ctx();
-        let nonce = 7u64;
+        let source_index = 7u64;
         let entry = build_l2_outbound_entry(OutboundEntry {
             target: address!("00000000000000000000000000000000000000cc"),
             source: address!("00000000000000000000000000000000000000dd"),
@@ -796,7 +883,8 @@ mod tests {
         .unwrap();
 
         let emitted =
-            build_outbound_load_table_txs(std::slice::from_ref(&entry), &cfg, nonce).unwrap();
+            build_outbound_load_table_txs(std::slice::from_ref(&entry), &cfg, source(source_index))
+                .unwrap();
         assert_eq!(
             emitted.len(),
             1,
@@ -812,17 +900,18 @@ mod tests {
         .abi_encode();
         let decoded =
             loadExecutionTableCall::abi_decode(&calldata).expect("loadExecutionTable round-trips");
-        let rebuilt = build_outbound_load_table_txs(&decoded._entries, &cfg, nonce).unwrap();
+        let rebuilt =
+            build_outbound_load_table_txs(&decoded._entries, &cfg, source(source_index)).unwrap();
         assert_eq!(
             emitted, rebuilt,
             "composer-emit must equal deriver-rebuild byte-for-byte"
         );
 
-        // Non-vacuous: the native bytes vary with the nonce.
-        let at99 = build_outbound_load_table_txs(&[entry], &cfg, 99).unwrap();
+        // Non-vacuous: the native bytes vary with the source_index.
+        let at99 = build_outbound_load_table_txs(&[entry], &cfg, source(99)).unwrap();
         assert_ne!(
             emitted, at99,
-            "different nonce must change the native bytes"
+            "different source_index must change the native bytes"
         );
     }
 
@@ -833,10 +922,25 @@ mod tests {
     /// the prior system-first layout.
     #[test]
     fn interleave_sync_block_txs_orders_pairs() {
-        let s1 = Bytes::from(vec![0x11]);
+        let s1 = NativeTransactionPlan {
+            chain_id: 1,
+            source_hash: source(0x11).hash(),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        };
         let u1 = Bytes::from(vec![0xA1]);
-        let s2 = Bytes::from(vec![0x22]);
-        let s3 = Bytes::from(vec![0x33]);
+        let s2 = NativeTransactionPlan {
+            chain_id: 1,
+            source_hash: source(0x22).hash(),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        };
+        let s3 = NativeTransactionPlan {
+            chain_id: 1,
+            source_hash: source(0x33).hash(),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        };
         let u3 = Bytes::from(vec![0xA3]);
 
         let out = interleave_sync_block_txs(&[
@@ -855,12 +959,18 @@ mod tests {
         ]);
         assert_eq!(
             out,
-            vec![s1, u1, s2, s3, u3],
+            vec![
+                PlannedTransaction::Native(s1.clone()),
+                PlannedTransaction::User(u1),
+                PlannedTransaction::Native(s2.clone()),
+                PlannedTransaction::Native(s3),
+                PlannedTransaction::User(u3)
+            ],
             "[s1,u1, s2, s3,u3] — each system tx then its optional user tx, in order",
         );
 
         // All-inbound (every user_tx None) == [system_txs] — behavior-preserving.
-        let sys = [Bytes::from(vec![1]), Bytes::from(vec![2])];
+        let sys = [s1, s2];
         assert_eq!(
             interleave_sync_block_txs(&[
                 SyncPair {
@@ -872,7 +982,9 @@ mod tests {
                     user_tx: None
                 },
             ]),
-            sys.to_vec(),
+            sys.into_iter()
+                .map(PlannedTransaction::Native)
+                .collect::<Vec<_>>(),
             "inbound (no user txs) reduces to the system-only order",
         );
 

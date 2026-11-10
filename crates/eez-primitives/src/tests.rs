@@ -5,7 +5,8 @@ use alloy_primitives::Signature;
 fn system() -> EezTxEnvelope {
     SystemTransaction {
         chain_id: 1,
-        nonce: 0,
+        source_hash: B256::repeat_byte(0x11),
+        gas_limit: SYSTEM_TX_GAS_CAP,
         to: EEZL2_ADDRESS,
         value: U256::ZERO,
         input: Bytes::from_static(&[1, 2, 3, 4]),
@@ -97,8 +98,9 @@ fn engine_block_conversion_preserves_prague_requests_hash() {
 fn native_wire_sender_hash_and_storage_round_trip() {
     let tx = system();
     let bytes = tx.encoded_2718();
-    let expected =
-        alloy_primitives::hex!("76dd0180944200000000000000000000000000000000000007808401020304");
+    let expected = alloy_primitives::hex!(
+        "45f84201a011111111111111111111111111111111111111111111111111111111111111118401000000944200000000000000000000000000000000000007808401020304"
+    );
     assert_eq!(bytes, expected);
     assert_eq!(tx.tx_hash(), &alloy_primitives::keccak256(expected));
     assert_eq!(tx.recover_signer().unwrap(), SYSTEM_ADDRESS);
@@ -128,7 +130,7 @@ fn rejects_malformed_and_trailing_native_bytes() {
     trailing.push(0);
     assert!(EezTxEnvelope::decode_2718_exact(&trailing).is_err());
     let mut wrong_target = bytes;
-    wrong_target[10] ^= 1;
+    wrong_target[45] ^= 1;
     assert!(EezTxEnvelope::decode_2718_exact(&wrong_target).is_err());
     assert!(<EezTxEnvelope as reth_codecs::Decompress>::decompress(&wrong_target).is_err());
 }
@@ -167,13 +169,13 @@ fn native_is_not_a_public_pooled_transaction() {
 fn rpc_serialization_has_native_execution_fields_and_zero_signature_placeholders() {
     let tx = system();
     let json = serde_json::to_value(&tx).unwrap();
-    assert_eq!(json["type"], "0x76");
+    assert_eq!(json["type"], "0x45");
     assert_eq!(json["hash"], serde_json::to_value(tx.tx_hash()).unwrap());
     assert_eq!(json["chainId"], "0x1");
     assert_eq!(json["nonce"], "0x0");
-    assert_eq!(json["gas"], "0x1e8480");
+    assert_eq!(json["gas"], "0x1000000");
     assert_eq!(json["gasPrice"], "0x0");
-    assert_eq!(tx.gas_limit(), SYSTEM_TX_GAS_LIMIT);
+    assert_eq!(tx.gas_limit(), SYSTEM_TX_GAS_CAP);
     assert_eq!(tx.effective_gas_price(Some(100)), 0);
     let rpc = alloy_rpc_types_eth::Transaction::from_transaction(
         alloy_consensus::transaction::Recovered::new_unchecked(tx.clone(), SYSTEM_ADDRESS),
@@ -183,7 +185,7 @@ fn rpc_serialization_has_native_execution_fields_and_zero_signature_placeholders
         },
     );
     let rpc_json = serde_json::to_value(&rpc).unwrap();
-    assert_eq!(rpc_json["gas"], "0x1e8480");
+    assert_eq!(rpc_json["gas"], "0x1000000");
     assert_eq!(rpc_json["gasPrice"], "0x0");
     assert_eq!(
         rpc_json["from"],
@@ -193,7 +195,7 @@ fn rpc_serialization_has_native_execution_fields_and_zero_signature_placeholders
         assert_eq!(json[field], "0x0");
         assert_eq!(rpc_json[field], "0x0");
     }
-    assert!(json.get("yParity").is_none());
+    assert_eq!(json["yParity"], "0x0");
     assert_eq!(serde_json::from_value::<EezTxEnvelope>(json).unwrap(), tx);
 }
 
@@ -238,5 +240,36 @@ fn receipt_type_survives_consensus_and_database_encoding() {
                 assert_eq!(encoded[0], SYSTEM_TX_TYPE);
             }
         }
+    }
+}
+
+#[test]
+fn native_rpc_rejects_forged_ethereum_placeholders() {
+    let valid = serde_json::to_value(system()).unwrap();
+    for field in [
+        "nonce",
+        "gasPrice",
+        "v",
+        "r",
+        "s",
+        "yParity",
+        "maxFeePerGas",
+        "maxPriorityFeePerGas",
+        "maxFeePerBlobGas",
+    ] {
+        let mut forged = valid.clone();
+        forged[field] = serde_json::json!("0x1");
+        assert!(
+            serde_json::from_value::<EezTxEnvelope>(forged).is_err(),
+            "accepted {field}"
+        );
+    }
+    for field in ["accessList", "blobVersionedHashes", "authorizationList"] {
+        let mut forged = valid.clone();
+        forged[field] = serde_json::json!([{}]);
+        assert!(
+            serde_json::from_value::<EezTxEnvelope>(forged).is_err(),
+            "accepted {field}"
+        );
     }
 }

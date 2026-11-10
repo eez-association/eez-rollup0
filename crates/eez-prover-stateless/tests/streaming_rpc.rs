@@ -16,7 +16,7 @@ use prost::Message as _;
 use tokio::net::TcpListener;
 
 const FIXTURE: &str = "captured-devnet-window-84";
-const SYSTEM_ADDRESS: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076";
+const SYSTEM_ADDRESS: &str = "fffffffffffffffffffffffffffffffffffffffe";
 const ATTESTER_KEY: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 
 #[path = "../../eez-control-rpc/conformance/replay.rs"]

@@ -125,8 +125,8 @@ if [[ ! "$system_address" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
     exit 1
 fi
 system_address="$(cast to-check-sum-address "$system_address")"
-if [[ "$(printf '%s' "$system_address" | tr '[:upper:]' '[:lower:]')" != "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076" ]]; then
-    echo "system address must be the reserved native address 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076" >&2
+if [[ "$(printf '%s' "$system_address" | tr '[:upper:]' '[:lower:]')" != "0xfffffffffffffffffffffffffffffffffffffffe" ]]; then
+    echo "system address must be the reserved native address 0xfffffffffffffffffffffffffffffffffffffffe" >&2
     exit 1
 fi
 
