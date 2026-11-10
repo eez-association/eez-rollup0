@@ -265,6 +265,19 @@ sol! {
     function executeOnBehalf(address destination, uint64 callGas, bytes data) external payable;
 }
 
+// The attestation settings a composer reads before collecting proofs: the
+// rollup manager's (`Rollup.sol`) and each `ECDSAProofSystem`'s.
+sol! {
+    /// Distinct proof systems a batch must carry for the rollup.
+    function threshold() external view returns (uint256);
+
+    /// The vkey the manager registers for `proofSystem`, zero if none.
+    function verificationKey(address proofSystem) external view returns (bytes32);
+
+    /// The key an `ECDSAProofSystem` accepts.
+    function signer() external view returns (address);
+}
+
 #[cfg(test)]
 mod selector_locks {
     //! ABI pins from `eez-core-protocol` commit 143d87e.

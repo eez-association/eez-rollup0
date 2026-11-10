@@ -73,6 +73,11 @@ same epoch throughout. A session ID is not a block/proof identity or an
 authentication credential. Shared deployments must authenticate and isolate
 Composers independently of these fields.
 
+The Rollup0 Composer limits each decoded `ServerFrame` to 64 KiB, including
+`Rejected.message` and `Rejected.details`. Provers used with this Composer MUST
+fit replies within that deployment limit. Larger replies fail the RPC without
+yielding a proof. Client encoding limits remain sized for block witnesses.
+
 A response without an authorized binding has empty session_id, zero epoch,
 zero validated_through and empty validated_hash. Otherwise Ready/Rejected
 report the authoritative fully validated cursor and its 32-byte hash, not

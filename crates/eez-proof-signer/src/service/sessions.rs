@@ -1410,6 +1410,7 @@ mod tests {
                 .batch,
             blocks,
             l1_context: None,
+            verification_key: None,
         }
     }
 
