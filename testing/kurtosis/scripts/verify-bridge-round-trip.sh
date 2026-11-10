@@ -2,6 +2,7 @@
 # Deposit through the reference bridge, then withdraw the same amount after
 # both the composer and an independent L1-only follower have derived it.
 set -euo pipefail
+: "${EEZ_NODE_IMAGE:?set EEZ_NODE_IMAGE}"
 export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 
 K="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

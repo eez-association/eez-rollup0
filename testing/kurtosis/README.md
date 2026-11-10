@@ -485,6 +485,7 @@ The suite requires an output directory:
 
 ```bash
 export EEZ_CI_RESULT_DIR="$PWD/artifacts/kurtosis-dev"
+export EEZ_NODE_IMAGE="${EEZ_NODE_IMAGE:-eez-node:ci}"
 mkdir -p "$EEZ_CI_RESULT_DIR"
 
 bash testing/kurtosis/scripts/verify-cross-chain-waves.sh

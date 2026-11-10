@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+: "${EEZ_NODE_IMAGE:?set EEZ_NODE_IMAGE}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULT_DIR="${EEZ_CI_RESULT_DIR:?set EEZ_CI_RESULT_DIR}"
