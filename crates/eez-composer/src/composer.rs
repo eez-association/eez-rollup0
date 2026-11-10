@@ -435,7 +435,7 @@ impl PostBatchGasBudget {
 
     fn with_blob_limit(mut self, maximum: Option<usize>) -> Self {
         self.byte_limit =
-            maximum.map(|blobs| blobs.saturating_mul(eez_blob::BYTES_PER_BLOB / 32 * 31));
+            maximum.map(|blobs| blobs.saturating_mul(eez_payload_codec::LOGICAL_BYTES_PER_BLOB));
         self
     }
 
@@ -6001,7 +6001,7 @@ mod tests {
 
     #[test]
     fn blob_budget_matches_single_transaction_capacity() {
-        let capacity = eez_blob::BYTES_PER_BLOB / 32 * 31;
+        let capacity = eez_payload_codec::LOGICAL_BYTES_PER_BLOB;
         for length in [capacity - 100, capacity - 40, capacity, capacity + 1] {
             let user = Bytes::from(vec![0x42; length]);
             let blocks = [eez_payload_codec::SpanBlock {

@@ -49,7 +49,8 @@ const BYTES_PER_BLOB: usize = 131_072;
 const FIELD_ELEMENT_BYTES: usize = 32;
 const LOGICAL_FIELD_BYTES: usize = 31;
 const FIELD_ELEMENTS_PER_BLOB: usize = BYTES_PER_BLOB / FIELD_ELEMENT_BYTES;
-const LOGICAL_BYTES_PER_BLOB: usize = FIELD_ELEMENTS_PER_BLOB * LOGICAL_FIELD_BYTES;
+/// Stream bytes one blob carries: 31 per field element, whose top byte stays zero.
+pub const LOGICAL_BYTES_PER_BLOB: usize = FIELD_ELEMENTS_PER_BLOB * LOGICAL_FIELD_BYTES;
 
 /// One cross-chain action, in its semantic form.
 ///

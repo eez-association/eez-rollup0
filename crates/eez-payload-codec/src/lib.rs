@@ -39,8 +39,8 @@
 mod container;
 
 pub use container::{
-    Action, DecodedContainer, STREAM_VERSION, decode_blob_container, decode_container,
-    encode_blob_container, encode_container,
+    Action, DecodedContainer, LOGICAL_BYTES_PER_BLOB, STREAM_VERSION, decode_blob_container,
+    decode_container, encode_blob_container, encode_container,
 };
 
 /// A raw EIP-2718 signed transaction, exactly as it enters the block's
