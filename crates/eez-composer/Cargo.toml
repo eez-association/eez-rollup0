@@ -26,6 +26,7 @@ alloy-eips.workspace             = true
 alloy-network.workspace          = true
 alloy-primitives.workspace       = true
 alloy-provider.workspace         = true
+alloy-rpc-client.workspace       = true
 alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-eth.workspace    = true
 alloy-signer-local.workspace     = true
@@ -46,10 +47,11 @@ reth-storage-api.workspace                = true
 revm.workspace = true
 
 # async + diagnostics
-async-trait.workspace = true
-thiserror.workspace   = true
-tokio.workspace       = true
-tracing.workspace     = true
+async-trait.workspace  = true
+futures-util.workspace = true
+thiserror.workspace    = true
+tokio.workspace        = true
+tracing.workspace      = true
 
 [dev-dependencies]
 alloy-transport = { version = "2", default-features = false }

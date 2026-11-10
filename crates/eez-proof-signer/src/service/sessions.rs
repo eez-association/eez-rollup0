@@ -1407,6 +1407,7 @@ mod tests {
             blocks,
             l1_context: None,
             blobs: Vec::new(),
+            verification_key: None,
         }
     }
 

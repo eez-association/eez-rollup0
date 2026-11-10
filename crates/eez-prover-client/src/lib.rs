@@ -33,6 +33,8 @@ use tracing::{Level, event};
 
 // Rollup0 clients require bounded pipelining support from the streaming server.
 const MAX_IN_FLIGHT: usize = 8;
+// Leave room for rejection diagnostics without allocating witness-sized replies.
+const MAX_STREAMING_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// A [`Prover`] backed by the v2 streaming service, with v1 fallback for calldata.
 /// Cheap to clone (`Arc<Inner>`).
@@ -331,7 +333,7 @@ impl RemoteProver {
                 message: format!("connect {}: {error}", self.inner.url),
             })?
             .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
-            .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES);
+            .max_decoding_message_size(eez_control_rpc::MAX_PROVE_RESPONSE_BYTES);
         let response = client
             .prove(tokio_stream::iter(chunks))
             .await
@@ -351,7 +353,7 @@ impl RemoteProver {
             .map_err(|error| ProverError::Backend(format!("request blobs: {error}")))?;
         let expected = eez_protocol::public_inputs::public_inputs_hashes_with_blobs_and_context(
             &ctx.batch,
-            self.vkey(),
+            ctx.verification_key.unwrap_or_else(|| self.vkey()),
             &hashes,
             ctx.l1_context,
         )
@@ -402,7 +404,7 @@ impl RemoteProver {
                 message: format!("connect {}: {error}", self.inner.url),
             })?
             .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
-            .max_decoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES);
+            .max_decoding_message_size(MAX_STREAMING_RESPONSE_BYTES);
         let request_id = state.next_id();
         let expected_session = state.session.as_ref().map(|session| session.id.clone());
         let initial = ClientFrame {
@@ -975,6 +977,105 @@ mod tests {
     struct UnavailableProver;
 
     #[derive(Clone)]
+    struct RejectedStream {
+        message_bytes: usize,
+        details_bytes: usize,
+    }
+
+    #[tonic::async_trait]
+    impl StreamingProverService for RejectedStream {
+        type ProveStreamStream = Pin<Box<dyn Stream<Item = Result<ServerFrame, Status>> + Send>>;
+
+        async fn prove_stream(
+            &self,
+            request: Request<Streaming<ClientFrame>>,
+        ) -> Result<Response<Self::ProveStreamStream>, Status> {
+            let frame = request
+                .into_inner()
+                .message()
+                .await?
+                .ok_or_else(|| Status::invalid_argument("missing Begin"))?;
+            let response = ServerFrame {
+                request_id: frame.request_id,
+                kind: Some(server_frame::Kind::Rejected(
+                    eez_control_rpc::v2::Rejected {
+                        code: Code::InvalidArgument as i32,
+                        message: "m".repeat(self.message_bytes),
+                        details: vec![0x5a; self.details_bytes],
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            };
+            Ok(Response::new(Box::pin(tokio_stream::iter([Ok(response)]))))
+        }
+    }
+
+    async fn receive_rejection(
+        message_bytes: usize,
+        details_bytes: usize,
+    ) -> Result<ServerFrame, StreamingError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(StreamingProverServer::new(RejectedStream {
+                    message_bytes,
+                    details_bytes,
+                }))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let prover = RemoteProver::new(format!("http://{addr}"), Address::ZERO);
+        let anchor = test_anchor();
+        let result = prover
+            .open_stream(
+                &mut StreamingState::default(),
+                Some(StreamBegin {
+                    rollup_id: 1,
+                    anchor_number: anchor.number,
+                    anchor_hash: anchor.hash.to_vec(),
+                    anchor_state_root: anchor.state_root.to_vec(),
+                }),
+                11,
+                11,
+            )
+            .await
+            .map(|(_, _, response)| response);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        result
+    }
+
+    #[tokio::test]
+    async fn streaming_reply_limit_allows_large_rejection_diagnostics() {
+        let size = 32 * 1024 - 64;
+        let response = receive_rejection(size, size).await.unwrap();
+        let Some(server_frame::Kind::Rejected(rejected)) = response.kind else {
+            panic!("expected the original rejection");
+        };
+        assert_eq!(rejected.message, "m".repeat(size));
+        assert_eq!(rejected.details, vec![0x5a; size]);
+    }
+
+    #[tokio::test]
+    async fn streaming_reply_limit_rejects_oversized_messages_and_details() {
+        for (message_bytes, details_bytes) in [(64 * 1024, 0), (0, 64 * 1024)] {
+            let error = ProverError::from(
+                receive_rejection(message_bytes, details_bytes)
+                    .await
+                    .unwrap_err(),
+            );
+            assert!(matches!(error, ProverError::Backend(_)), "{error:?}");
+            assert!(
+                error.to_string().contains("message length too large"),
+                "the transport must reject the frame before decoding: {error}",
+            );
+        }
+    }
+
+    #[derive(Clone)]
     struct StalledStream {
         phase: usize,
         reached: Arc<AtomicUsize>,
@@ -1450,6 +1551,7 @@ mod tests {
                     batch: test_batch(),
                     l1_context: None,
                     blobs: Vec::new(),
+                    verification_key: None,
                 };
                 let hash = if wrong_batch {
                     B256::repeat_byte(0x7c)
@@ -1475,6 +1577,78 @@ mod tests {
                     );
                 } else {
                     assert_eq!(result.unwrap().len(), 65);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_opaque_keys_bind_v1_and_v2_proofs_to_the_requested_batch() {
+        for streaming in [false, true] {
+            for live in [false, true] {
+                for wrong_key in [false, true] {
+                    let key = test_key();
+                    let attester = key.address();
+                    let registered = B256::repeat_byte(0x44);
+                    let mut ctx = ProvingContext {
+                        rollup_id: 1,
+                        from_block: 11,
+                        to_block: 11,
+                        anchor: streaming.then(test_anchor),
+                        verification_key: Some(registered),
+                        batch: test_batch(),
+                        blocks: vec![test_block(11, test_anchor().hash, 0x22)],
+                        ..Default::default()
+                    };
+                    if live {
+                        ctx.batch.blockNumber = u64::MAX;
+                        ctx.l1_context = Some(eez_protocol::l1_context::LiveSettlementContext {
+                            parent_hash: B256::repeat_byte(0x99),
+                            timestamp: 42,
+                        });
+                    }
+                    let response_key = if wrong_key {
+                        attester.into_word()
+                    } else {
+                        registered
+                    };
+                    let hash = eez_protocol::public_inputs::public_inputs_hashes_with_context(
+                        &ctx.batch,
+                        response_key,
+                        ctx.l1_context,
+                    )
+                    .unwrap()[0];
+                    let url = if streaming {
+                        spawn_streaming_stub(StreamingStub {
+                            signer: key,
+                            hash,
+                            blocks: Arc::default(),
+                            cursor: Arc::new(Mutex::new((0, B256::ZERO))),
+                            cross_wire_block_response: false,
+                            baseline_only: false,
+                            begins: Arc::default(),
+                            stall_first_block: None,
+                        })
+                        .await
+                    } else {
+                        spawn_stub(key, hash).await
+                    };
+                    let prover = RemoteProver::new(url, attester);
+                    let result = prover.prove(ctx).await;
+                    assert_eq!(
+                        prover.inner.streaming.lock().await.supported,
+                        streaming.then_some(true)
+                    );
+                    if wrong_key {
+                        assert!(
+                            result
+                                .unwrap_err()
+                                .to_string()
+                                .contains("does not bind the requested batch")
+                        );
+                    } else {
+                        assert_eq!(result.unwrap().len(), 65);
+                    }
                 }
             }
         }
@@ -1607,6 +1781,7 @@ mod tests {
                 blocks: vec![block_11.clone()],
                 l1_context: None,
                 blobs: Vec::new(),
+                verification_key: None,
             })
             .await
             .unwrap();
@@ -1634,6 +1809,7 @@ mod tests {
                 blocks: vec![block_11, block_12],
                 l1_context: None,
                 blobs: Vec::new(),
+                verification_key: None,
             })
             .await
             .unwrap();
@@ -1688,6 +1864,7 @@ mod tests {
                     batch: test_batch(),
                     l1_context: None,
                     blobs: Vec::new(),
+                    verification_key: None,
                 }),
             )
             .await
@@ -1797,6 +1974,7 @@ mod tests {
                 batch: test_batch(),
                 l1_context: None,
                 blobs: Vec::new(),
+                verification_key: None,
             })
             .await
             .unwrap();
@@ -1856,6 +2034,7 @@ mod tests {
                     batch: test_batch(),
                     l1_context: None,
                     blobs: Vec::new(),
+                    verification_key: None,
                 })
                 .await;
             assert_eq!(begins.load(Ordering::SeqCst), 1);
@@ -1914,6 +2093,7 @@ mod tests {
                             batch: test_batch(),
                             l1_context: None,
                             blobs: Vec::new(),
+                            verification_key: None,
                         })
                         .await
                         .unwrap();
@@ -1945,6 +2125,7 @@ mod tests {
                             batch: test_batch(),
                             l1_context: None,
                             blobs: Vec::new(),
+                            verification_key: None,
                         })
                         .await
                         .unwrap();
@@ -1994,6 +2175,7 @@ mod tests {
                 blocks: vec![block_11, block_12],
                 l1_context: None,
                 blobs: Vec::new(),
+                verification_key: None,
             })
             .await
             .unwrap();
@@ -2068,6 +2250,24 @@ mod tests {
         let error = verify_attestation(&signature, different_window_hash.as_slice(), key.address())
             .expect_err("a signature must not authenticate a different window");
         assert!(matches!(error, ProverError::Backend(_)), "{error:?}");
+    }
+
+    /// `ECDSA.recover` rejects both forms, so either would revert the batch.
+    #[test]
+    fn verify_attestation_rejects_raw_recovery_byte_and_high_s() {
+        const SECP256K1N: alloy_primitives::U256 = alloy_primitives::uint!(
+            0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141_U256
+        );
+        let key = test_key();
+        let hash = B256::repeat_byte(0x7c);
+        let valid = sign_65(&key, hash);
+        let mut raw_recovery = valid.clone();
+        raw_recovery[64] -= 27;
+        let low = Signature::try_from(valid.as_slice()).unwrap();
+        let high_s = Signature::new(low.r(), SECP256K1N - low.s(), !low.v()).as_bytes();
+        for proof in [raw_recovery, high_s.to_vec()] {
+            assert!(verify_attestation(&proof, hash.as_slice(), key.address()).is_err());
+        }
     }
 
     #[test]

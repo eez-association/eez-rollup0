@@ -275,10 +275,11 @@ rules are defined in the
 ## 4. Transport behavior
 
 A block witness may exceed gRPC's usual 4 MiB default. Composer implementations
-MUST configure encoding and decoding limits large enough for their generated
-chunks and the deployed prover's advertised limits. They MUST handle
-`ResourceExhausted` when either a per-message or aggregate request limit is
-exceeded.
+MUST configure an encoding limit large enough for their generated chunks and the
+deployed prover's advertised limits. They MUST handle `ResourceExhausted` when
+either a per-message or aggregate request limit is exceeded. The response is a
+hash and a signature, so the Composer SHOULD keep its decoding limit to a few
+KiB: a prover cannot then make it buffer an oversized reply.
 
 The Composer SHOULD apply an end-to-end request deadline that allows time for
 the whole stream and proving operation. A timeout or disconnect does not create
@@ -305,7 +306,7 @@ and cross-language vectors are in
 preflight avoids submitting a response that recovered to the correct attester
 but was signed over the wrong batch hash.
 
-After validation, the Composer MUST change only the proof carrier:
+For a single attester, after validation the Composer MUST change only the proof carrier:
 
 ```text
 assert batch.proofSystems == [ecdsa_proof_system_address]
@@ -313,10 +314,24 @@ assert batch.rollupIdsWithProofSystems == [{ rollupId, proofSystemIndexes: [0] }
 batch.proofs = [response.signature]
 ```
 
+A Composer collecting from several attesters (`EEZ_PROVERS`) sends each one the
+batch naming only that attester's proof system, as above, and validates each
+response against its own registered attester and vkey. Each proof system's
+`publicInputsHash` folds only its own `(rollupId, vkey)`, so every validated
+signature stays valid in the settled batch, which lists the proof systems whose
+responses validated, strictly ascending, with `proofSystemIndexes` `0..k` and
+the signatures in the same order. The Composer reads the manager's `threshold()`
+and each `verificationKey(proofSystem)` for every batch and settles once
+`threshold` responses have validated; a response that fails validation counts
+as that attester's failure and never enters the batch, because one invalid
+proof reverts the whole batch on-chain.
+
 The Composer MUST NOT modify entries, state updates, rolling hashes,
-`callData`, proof-system assignments, scheduling counts, or any other proved
-batch field after the request. `response.public_inputs_hash` is not inserted
-into the batch; EEZ recomputes it on-chain.
+`callData`, scheduling counts, or any other proved batch field after the
+request. Proof-system assignments MAY change only as described for multiple
+attesters above. For a single attester, they MUST remain as requested.
+`response.public_inputs_hash` is not inserted into the batch; EEZ recomputes
+it on-chain.
 
 Finally, the Composer ABI-encodes `EEZ.postAndVerifyBatch(batch)`, signs the L1
 transaction with its poster key, and sends it to the deployment's EEZ contract.

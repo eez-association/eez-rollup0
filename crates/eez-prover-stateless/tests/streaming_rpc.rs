@@ -211,6 +211,7 @@ fn recorded_window(oracle: &serde_json::Value) -> (Vec<ProveChunk>, ProvingConte
         blocks,
         l1_context: None,
         blobs: Vec::new(),
+        verification_key: None,
     };
 
     (window, context)
