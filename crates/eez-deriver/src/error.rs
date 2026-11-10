@@ -63,7 +63,7 @@ pub enum DeriverError {
 
 /// `true` for errors no resync can fix; the deriver stops the node on them.
 /// Blobs missing at a finalized slot stay missing until the source changes,
-/// and a follower without a beacon cannot derive any blob post.
+/// and a missing or misconfigured beacon cannot derive any blob post.
 #[must_use]
 pub(crate) fn is_fatal(err: &DeriverError) -> bool {
     matches!(

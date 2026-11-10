@@ -9,7 +9,7 @@ use tokio::sync::OnceCell;
 use tracing::{Level, event};
 use url::Url;
 
-use crate::{L1Error, L1Result, scan::Post};
+use crate::{L1Error, L1Result, scan::PostId};
 
 #[derive(Debug, Clone, Copy)]
 struct BeaconTiming {
@@ -64,49 +64,66 @@ impl BeaconBlobSource {
     pub(crate) async fn fetch(
         &self,
         provider: &impl Provider,
-        post: &Post,
+        id: &PostId,
+        wanted: &[B256],
     ) -> L1Result<Vec<Vec<u8>>> {
-        let block = post.id.l1_block;
-        let block_hash = post.id.l1_block_hash;
+        let block_hash = id.l1_block_hash;
         let timestamp = provider
             .get_block_by_hash(block_hash)
             .await
             .map_err(|e| L1Error::Provider(format!("get_block({block_hash}): {e}")))?
             .ok_or_else(|| L1Error::SourceIncomplete {
-                block,
+                block: id.l1_block,
                 detail: format!("block {block_hash} is not served; retry"),
             })?
             .header
             .timestamp;
         let slot = self.timing().await?.slot_at(timestamp)?;
-        let filter = post
-            .blob_hashes
+        let filter = wanted
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        // Fulu's `blobs` endpoint, filtered and then whole in case a client
-        // misreads the filter; pre-Fulu nodes only serve sidecars.
+        // A client may reject or mishandle the filter, so any failure falls back
+        // to the whole slot.
+        let filtered = format!("eth/v1/beacon/blobs/{slot}?versioned_hashes={filter}");
+        match self.blobs_at(&filtered, wanted).await {
+            Ok(Some(blobs)) => return Ok(blobs),
+            Ok(None) => {}
+            Err(error) => event!(
+                name: "eez.l1.beacon.filtered_blobs_failed",
+                Level::WARN,
+                slot,
+                error = %error,
+                "filtered blob request failed; fetching the whole slot",
+            ),
+        }
+        // Pre-Fulu nodes only serve sidecars.
         for path in [
-            format!("eth/v1/beacon/blobs/{slot}?versioned_hashes={filter}"),
             format!("eth/v1/beacon/blobs/{slot}"),
             format!("eth/v1/beacon/blob_sidecars/{slot}"),
         ] {
-            let Some(body) = self.get_optional(&path).await? else {
-                continue;
-            };
-            let served = parse_blobs(&body)?;
-            let hashes = eez_blob::versioned_hashes(&served).map_err(|error| {
-                L1Error::Provider(format!("beacon served an invalid blob: {error}"))
-            })?;
-            if let Some(blobs) = select_blobs(hashes, served, &post.blob_hashes) {
+            if let Some(blobs) = self.blobs_at(&path, wanted).await? {
                 return Ok(blobs);
             }
         }
-        Err(self.missing_blobs(post, slot).await?)
+        Err(self.missing_blobs(id, slot).await?)
     }
 
-    async fn missing_blobs(&self, post: &Post, slot: u64) -> L1Result<L1Error> {
+    /// The wanted blobs from one beacon response, re-verified by hash; `None`
+    /// when it is not served or lacks any of them.
+    async fn blobs_at(&self, path: &str, wanted: &[B256]) -> L1Result<Option<Vec<Vec<u8>>>> {
+        let Some(body) = self.get_optional(path).await? else {
+            return Ok(None);
+        };
+        let served = parse_blobs(&body)?;
+        let hashes = eez_blob::versioned_hashes(&served).map_err(|error| {
+            L1Error::Provider(format!("beacon served an invalid blob: {error}"))
+        })?;
+        Ok(select_blobs(hashes, served, wanted))
+    }
+
+    async fn missing_blobs(&self, id: &PostId, slot: u64) -> L1Result<L1Error> {
         // A node still backfilling serves no block at the slot yet.
         let served = self
             .get_optional(&format!("eth/v1/beacon/blinded_blocks/{slot}"))
@@ -121,10 +138,10 @@ impl BeaconBlobSource {
         let finalized = self.get("eth/v1/beacon/headers/finalized").await?;
         let finalized_slot = json_u64(&finalized, "/data/header/message/slot")?;
         Ok(missing_blob_error(
-            post.id.l1_block,
+            id.l1_block,
             slot,
             finalized_slot,
-            served == Some(post.id.l1_block_hash),
+            served == Some(id.l1_block_hash),
         ))
     }
 
@@ -197,14 +214,14 @@ impl BeaconBlobSource {
 
 fn missing_blob_error(block: u64, slot: u64, finalized_slot: u64, block_served: bool) -> L1Error {
     if !block_served {
-        L1Error::SourceIncomplete {
+        L1Error::BeaconLagging {
             block,
             detail: format!(
                 "beacon does not serve this execution block at slot {slot}; retry after synchronization"
             ),
         }
     } else if finalized_slot < slot {
-        L1Error::SourceIncomplete {
+        L1Error::BeaconLagging {
             block,
             detail: format!(
                 "beacon has not finalized blob slot {slot}; retry after synchronization"
@@ -273,15 +290,142 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn missing_blobs_halt_only_for_a_served_block_at_a_finalized_slot() {
-        assert!(missing_blob_error(100, 20, 19, true).is_retryable());
-        for finalized in [20, 21] {
-            assert!(missing_blob_error(100, 20, finalized, false).is_retryable());
-            assert!(matches!(
-                missing_blob_error(100, 20, finalized, true),
-                L1Error::BlobUnavailable { block: 100, .. }
-            ));
+    /// A beacon answering `routes` by path and query; anything else is a 404.
+    async fn beacon(routes: Vec<(String, u16, String)>) -> BeaconBlobSource {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = BufReader::new(&mut socket);
+                let mut line = String::new();
+                request.read_line(&mut line).await.unwrap();
+                let path = line.split(' ').nth(1).unwrap_or_default();
+                let path = path.trim_start_matches('/').to_owned();
+                let mut header = String::new();
+                while request.read_line(&mut header).await.unwrap() > 2 {
+                    header.clear();
+                }
+                let (status, body) = routes
+                    .iter()
+                    .find(|(route, ..)| *route == path)
+                    .map_or((404, String::new()), |(_, status, body)| {
+                        (*status, body.clone())
+                    });
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        BeaconBlobSource::new(url)
+    }
+
+    #[tokio::test]
+    async fn a_missing_blob_halts_only_when_the_beacon_serves_the_block_finalized() {
+        use alloy_provider::ProviderBuilder;
+        use alloy_transport::mock::Asserter;
+        #[derive(Debug)]
+        enum Want {
+            Blob,
+            Lagging,
+            Unavailable,
+            Provider,
+        }
+        let slot = 5_u64;
+        let blob = vec![0_u8; eez_blob::BYTES_PER_BLOB];
+        let mut other = blob.clone();
+        other[31] = 1;
+        let hashes = eez_blob::versioned_hashes(&[&blob[..], &other[..]]).unwrap();
+        let (ours, theirs) = (hashes[0], hashes[1]);
+        let id = PostId {
+            l1_block: 9,
+            l1_block_hash: B256::repeat_byte(9),
+            log_index: 0,
+        };
+        let blobs = |b: &[u8]| json!({ "data": [format!("0x{}", hex::encode(b))] }).to_string();
+        let block = |hash: B256| {
+            json!({ "data": { "message": { "body": {
+                "execution_payload_header": { "block_hash": hash } } } } })
+            .to_string()
+        };
+        let filtered = format!("eth/v1/beacon/blobs/{slot}?versioned_hashes={ours}");
+        let whole = format!("eth/v1/beacon/blobs/{slot}");
+        let blinded = format!("eth/v1/beacon/blinded_blocks/{slot}");
+        let cases = [
+            // A rejected filter falls back to the whole slot.
+            (
+                vec![
+                    (filtered.clone(), 500, String::new()),
+                    (whole.clone(), 200, blobs(&blob)),
+                ],
+                10,
+                Want::Blob,
+            ),
+            // A block the beacon does not serve yet, or serves on another
+            // chain, retries even at a finalized slot.
+            (
+                vec![
+                    (filtered.clone(), 400, String::new()),
+                    (whole.clone(), 200, blobs(&other)),
+                ],
+                10,
+                Want::Lagging,
+            ),
+            (
+                vec![
+                    (whole.clone(), 200, blobs(&other)),
+                    (blinded.clone(), 200, block(theirs)),
+                ],
+                10,
+                Want::Lagging,
+            ),
+            // Only the post's own block, served at a finalized slot, halts.
+            (
+                vec![(blinded.clone(), 200, block(id.l1_block_hash))],
+                4,
+                Want::Lagging,
+            ),
+            (
+                vec![(blinded.clone(), 200, block(id.l1_block_hash))],
+                10,
+                Want::Unavailable,
+            ),
+            // A server error on the whole slot retries rather than halting.
+            (
+                vec![(whole.clone(), 500, String::new())],
+                10,
+                Want::Provider,
+            ),
+        ];
+        for (mut routes, finalized, want) in cases {
+            routes.extend([
+                ("eth/v1/beacon/genesis".into(), 200, json!({ "data": { "genesis_time": "0" } }).to_string()),
+                ("eth/v1/config/spec".into(), 200, json!({ "data": { "SECONDS_PER_SLOT": "12" } }).to_string()),
+                (
+                    "eth/v1/beacon/headers/finalized".into(),
+                    200,
+                    json!({ "data": { "header": { "message": { "slot": finalized.to_string() } } } }).to_string(),
+                ),
+            ]);
+            let source = beacon(routes).await;
+            let asserter = Asserter::new();
+            let mut l1_block =
+                alloy_rpc_types_eth::Block::<alloy_rpc_types_eth::Transaction>::default();
+            l1_block.header.inner.timestamp = slot * 12;
+            asserter.push_success(&l1_block);
+            let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+            let got = source.fetch(&provider, &id, &[ours]).await;
+            let ok = match (&want, &got) {
+                (Want::Blob, Ok(served)) => served == std::slice::from_ref(&blob),
+                (Want::Lagging, Err(L1Error::BeaconLagging { .. }))
+                | (Want::Unavailable, Err(L1Error::BlobUnavailable { .. }))
+                | (Want::Provider, Err(L1Error::Provider(_))) => true,
+                _ => false,
+            };
+            assert!(ok, "{want:?}: {got:?}");
         }
     }
 

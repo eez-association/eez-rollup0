@@ -112,7 +112,8 @@ must match its entry, else `Decode`: `callHash` and `queue` (`:1304-1320`),
 | Variant | Class | Raised for |
 |---|---|---|
 | `Provider` | retryable | transport; a malformed `get_logs` answer; a trace failure other than `-32601`, including a post's transaction failing or missing |
-| `SourceIncomplete` | retryable | two hashes for one block; a transaction or block the endpoint does not serve yet; a missing or mismatched beacon block; blobs missing at an unfinalized slot |
+| `SourceIncomplete` | retryable | two hashes for one block; a transaction or block the endpoint does not serve yet |
+| `BeaconLagging` | retryable | blobs missing while the beacon does not serve the post's execution block, or has not finalized its slot |
 | `BlobUnavailable` | terminal | selected blobs missing at a finalized slot whose execution hash matches the post |
 | `Decode` | terminal | undecodable bytes; a `rollupIds` or commitment mismatch; a grammar, pairing, ownership or entry-match violation |
 | `Unsupported` | terminal | the shapes below; a multi-rollup commitment mismatch; a post not made by a selector `CALL` |
@@ -120,11 +121,13 @@ must match its entry, else `Decode`: `callHash` and `queue` (`:1304-1320`),
 
 The watcher and the settlement observer retry a retryable error on their next
 poll. Boot reconcile retries with backoff, but gives up after
-`BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES` `Provider` errors. A terminal one panics
-the watcher (invariant 7), fails boot reconcile and fails the observed bundle.
-Only derivation fetches blobs: `BlobUnavailable`, or a blob post reached
-without `EEZ_L1_BEACON_URL`, fails boot reconcile or stops the live deriver's
-critical task, shutting down the node.
+`BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES` `Provider` errors, and an L1-only boot
+reads `SourceIncomplete` deep below the head as pruned history and exits;
+`BeaconLagging` is always waited out. A terminal one panics the watcher
+(invariant 7), fails boot reconcile and fails the observed bundle. Only
+derivation fetches blobs: `BlobUnavailable`, or a beacon misconfiguration
+(`EEZ_L1_BEACON_URL` unset, unparsable, or serving another chain), fails boot
+reconcile or stops the live deriver's critical task, shutting down the node.
 
 ## Operation
 

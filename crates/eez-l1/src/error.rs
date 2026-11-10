@@ -25,6 +25,10 @@ pub enum L1Error {
     /// A mined batch's blob data is absent from the configured beacon node.
     #[error("blob data unavailable at block {block}: {detail}")]
     BlobUnavailable { block: u64, detail: String },
+    /// The beacon has not caught up to a post's blobs yet. Unlike
+    /// `SourceIncomplete`, it never means L1 execution history is gone.
+    #[error("beacon lagging at block {block}: {detail}")]
+    BeaconLagging { block: u64, detail: String },
     /// A batch post for our rollup in a shape this node does not read.
     #[error("unsupported L1 batch post at block {block}, log {log_index}: {detail}")]
     Unsupported {
@@ -60,7 +64,10 @@ impl L1Error {
     /// has not caught up.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
-        matches!(self, Self::Provider(_) | Self::SourceIncomplete { .. })
+        matches!(
+            self,
+            Self::Provider(_) | Self::SourceIncomplete { .. } | Self::BeaconLagging { .. }
+        )
     }
 
     /// Retrying cannot change the answer, so readers halt instead of looping.
@@ -94,6 +101,7 @@ mod tests {
             (L1Error::Decode(d()), TERMINAL),
             (L1Error::BlobUnavailable { block, detail: d() }, TERMINAL),
             (L1Error::SourceIncomplete { block, detail: d() }, RETRYABLE),
+            (L1Error::BeaconLagging { block, detail: d() }, RETRYABLE),
             (
                 L1Error::Unsupported {
                     block,
