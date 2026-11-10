@@ -79,28 +79,31 @@ impl BeaconBlobSource {
             .header
             .timestamp;
         let slot = self.timing().await?.slot_at(timestamp)?;
-        // Fulu's `blobs` endpoint first; pre-Fulu nodes only serve sidecars.
-        let body = match self
-            .get_optional(&format!("eth/v1/beacon/blobs/{slot}"))
-            .await?
-        {
-            Some(body) => Some(body),
-            None => {
-                self.get_optional(&format!("eth/v1/beacon/blob_sidecars/{slot}"))
-                    .await?
+        let filter = post
+            .blob_hashes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        // Fulu's `blobs` endpoint, filtered and then whole in case a client
+        // misreads the filter; pre-Fulu nodes only serve sidecars.
+        for path in [
+            format!("eth/v1/beacon/blobs/{slot}?versioned_hashes={filter}"),
+            format!("eth/v1/beacon/blobs/{slot}"),
+            format!("eth/v1/beacon/blob_sidecars/{slot}"),
+        ] {
+            let Some(body) = self.get_optional(&path).await? else {
+                continue;
+            };
+            let served = parse_blobs(&body)?;
+            let hashes = eez_blob::versioned_hashes(&served).map_err(|error| {
+                L1Error::Provider(format!("beacon served an invalid blob: {error}"))
+            })?;
+            if let Some(blobs) = select_blobs(hashes, served, &post.blob_hashes) {
+                return Ok(blobs);
             }
-        };
-        let Some(body) = body else {
-            return Err(self.missing_blobs(post, slot).await?);
-        };
-        let served = parse_blobs(&body)?;
-        let hashes = eez_blob::versioned_hashes(&served).map_err(|error| {
-            L1Error::Provider(format!("beacon served an invalid blob: {error}"))
-        })?;
-        match select_blobs(hashes, served, &post.blob_hashes) {
-            Some(blobs) => Ok(blobs),
-            None => Err(self.missing_blobs(post, slot).await?),
         }
+        Err(self.missing_blobs(post, slot).await?)
     }
 
     async fn missing_blobs(&self, post: &Post, slot: u64) -> L1Result<L1Error> {
