@@ -4716,16 +4716,20 @@ where
             return Ok(None);
         }
 
-        // The fee is re-read since it can rise after the slot's gate.
-        let (blobs, carrier) = if let Some((config, blobs, encoding)) = physical_blobs {
-            let carrier = BlobCarrier {
-                max_fee_per_blob_gas: blob_fee(&ctx.l1_provider, config).await?,
-                sidecar: eez_blob::prepare_blob_sidecar(&blobs, encoding)
-                    .map_err(|e| format!("prepare blob sidecar: {e}"))?,
-            };
-            (blobs.into_iter().map(Bytes::from).collect(), Some(carrier))
-        } else {
-            (Vec::new(), None)
+        // The fee is re-read since it can rise after the slot's gate. Cell
+        // proofs are CPU-heavy, so the sidecar builds on the blocking pool
+        // while the witnesses build and the attesters prove.
+        let (blobs, carrier) = match physical_blobs {
+            Some((config, blobs, encoding)) => {
+                let max_fee_per_blob_gas = blob_fee(&ctx.l1_provider, config).await?;
+                let blobs: Vec<Bytes> = blobs.into_iter().map(Bytes::from).collect();
+                let sidecar_blobs = blobs.clone();
+                let sidecar = tokio::task::spawn_blocking(move || {
+                    eez_blob::prepare_blob_sidecar(&sidecar_blobs, encoding)
+                });
+                (blobs, Some((sidecar, max_fee_per_blob_gas)))
+            }
+            None => (Vec::new(), None),
         };
         // Prove the assembled window (proofs[] empty — not part of the
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
@@ -4811,6 +4815,16 @@ where
             "postBatch anchors: cursor block hash, claimed final Sync block hash",
         );
 
+        let carrier = match carrier {
+            Some((sidecar, max_fee_per_blob_gas)) => Some(BlobCarrier {
+                sidecar: sidecar
+                    .await
+                    .map_err(|e| format!("blob sidecar task: {e}"))?
+                    .map_err(|e| format!("prepare blob sidecar: {e}"))?,
+                max_fee_per_blob_gas,
+            }),
+            None => None,
+        };
         Ok(sign_post_batch_tx(
             &ctx.l1_poster_signer,
             &ctx.l1_provider,
