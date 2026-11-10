@@ -325,6 +325,12 @@ fn rejection_error(response: &ServerFrame, from_block: u64, to_block: u64) -> Op
 
 impl RemoteProver {
     async fn prove_v1(&self, ctx: ProvingContext) -> ProverResult<Bytes> {
+        // The v1 request has no blob field, so a blob batch must not fall back to it.
+        if !ctx.blobs.is_empty() {
+            return Err(ProverError::Backend(
+                "blob settlement requires ProveStream".into(),
+            ));
+        }
         let chunks = chunks_for(&ctx);
         let mut client = ProverClient::connect(self.inner.url.clone())
             .await
@@ -775,11 +781,6 @@ impl Prover for RemoteProver {
         self.inner.proving.send_modify(|count| *count += 1);
         let _priority = ProofPriority(&self.inner.proving);
         let Some(anchor) = ctx.anchor else {
-            if !ctx.blobs.is_empty() {
-                return Err(ProverError::Backend(
-                    "blob settlement requires a streaming anchor".into(),
-                ));
-            }
             return self.prove_v1(ctx).await;
         };
         let abi_calldata = eez_protocol::abi::postAndVerifyBatchCall {
@@ -811,10 +812,7 @@ impl Prover for RemoteProver {
             Ok(None) => Err(ProverError::Backend(
                 "ProveStream Finalize returned no proof".into(),
             )),
-            Err(StreamingError::Unsupported) if ctx.blobs.is_empty() => self.prove_v1(ctx).await,
-            Err(StreamingError::Unsupported) => Err(ProverError::Backend(
-                "ProveStream does not support blob settlement".into(),
-            )),
+            Err(StreamingError::Unsupported) => self.prove_v1(ctx).await,
             Err(StreamingError::Prover(error)) => Err(error),
         }
     }
@@ -1532,7 +1530,11 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.to_string().contains("requires a streaming anchor"));
+        assert!(
+            error
+                .to_string()
+                .contains("blob settlement requires ProveStream")
+        );
     }
 
     /// Both direct v1 and fallback require the registered signer and requested batch.

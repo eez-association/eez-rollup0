@@ -259,10 +259,6 @@ impl SettlementPipelineError {
                 tonic::Code::FailedPrecondition,
                 "settlement validation rejected",
             ),
-            Self::PublicInputs(settlement::PublicInputError::InvalidBlobInput(_)) => (
-                tonic::Code::InvalidArgument,
-                "invalid blob settlement input",
-            ),
             Self::DaPayload(error) => match error {
                 settlement::DaPayloadError::Decode { .. }
                 | settlement::DaPayloadError::TrailingBytes { .. } => {
@@ -360,22 +356,13 @@ pub(super) fn run_settlement(
         )
         .into());
     }
-    let checked_public_input_profile = if blobs.is_empty() {
-        settlement::CheckedPublicInputProfile::new(
-            &canonical_batch,
-            expected_rollup_id,
-            expected_proof_system,
-            l1_context,
-        )?
-    } else {
-        settlement::CheckedPublicInputProfile::new_blob(
-            &canonical_batch,
-            expected_rollup_id,
-            expected_proof_system,
-            blobs.len(),
-            l1_context,
-        )?
-    };
+    let checked_public_input_profile = settlement::CheckedPublicInputProfile::new(
+        &canonical_batch,
+        expected_rollup_id,
+        expected_proof_system,
+        blobs.len(),
+        l1_context,
+    )?;
 
     let verified_state_chain = settlement::verify_state_update_chain(
         &canonical_batch,
@@ -429,28 +416,17 @@ pub(super) fn run_settlement(
 
     // Bind posted transactions and effect sidecars to the validated block bytes,
     // including the reconstructed Sync-block transaction sequence.
-    let recomputed_public_inputs_hash = if blobs.is_empty() {
-        settlement::verify_da_payload(
-            &canonical_batch,
-            validated_window,
-            &authorized_outbound_effects,
-            &authorized_inbound_effects,
-            system_transaction_reconstructor,
-            expected_rollup_id.get(),
-        )?;
-        checked_public_input_profile.recompute_public_inputs_hash(proof_system_vkey, None)?
-    } else {
-        let verified_da = settlement::verify_blob_da_payload(
-            blobs,
-            validated_window,
-            &authorized_outbound_effects,
-            &authorized_inbound_effects,
-            system_transaction_reconstructor,
-            expected_rollup_id.get(),
-        )?;
-        checked_public_input_profile
-            .recompute_public_inputs_hash(proof_system_vkey, Some(&verified_da))?
-    };
+    let verified_da = settlement::verify_da_payload(
+        &canonical_batch,
+        blobs,
+        validated_window,
+        &authorized_outbound_effects,
+        &authorized_inbound_effects,
+        system_transaction_reconstructor,
+        expected_rollup_id.get(),
+    )?;
+    let recomputed_public_inputs_hash = checked_public_input_profile
+        .recompute_public_inputs_hash(proof_system_vkey, &verified_da)?;
     Ok(AttestablePublicInputsHash(recomputed_public_inputs_hash))
 }
 

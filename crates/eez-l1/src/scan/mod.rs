@@ -15,7 +15,6 @@ use tracing::{Level, event};
 use crate::error::{L1Error, L1Result};
 use crate::fetch::trace_block;
 
-mod blob;
 mod model;
 pub mod types;
 
@@ -195,11 +194,11 @@ async fn read_logs(
             let count = tx_logs.len();
             if tx_logs.iter().any(lists) {
                 let tx = fetch_log_transaction(logs, number, block_hash, index, hash).await?;
-                let blob_hashes = tx.blob_versioned_hashes().unwrap_or_default();
                 if let Some(call) = direct_call(&tx, eez, count) {
                     calls_by_tx.insert(index, (vec![call], count));
                 } else {
-                    traced.push((index, hash, blob_hashes.to_vec()));
+                    let blob_hashes = tx.blob_versioned_hashes().unwrap_or_default().to_vec();
+                    traced.push((index, hash, blob_hashes));
                 }
             }
         }
@@ -310,8 +309,9 @@ mod tests {
     };
     use eez_protocol::entries::EntryRole::{self, Anchor as A, Inbound};
     use eez_protocol::l1_context::LiveSettlementContext;
-    use eez_protocol::public_inputs::batch_shared_public_input_with_blobs;
-    use eez_protocol::public_inputs::batch_shared_public_input_with_context;
+    use eez_protocol::public_inputs::{
+        batch_shared_public_input_with_blobs_and_context, batch_shared_public_input_with_context,
+    };
     use serde_json::{Value, json};
 
     use super::model::{Call, calls_in_tx, direct_call, group_blocks, read_block};
@@ -674,6 +674,10 @@ mod tests {
         };
         let other = with(x.clone(), |b| b.callData = vec![0xDB].into());
         let blobs = with(x.clone(), |b| b.blobIndices = vec![Default::default()]);
+        let unindexed = with(x.clone(), |b| {
+            b.callData = Bytes::new();
+            b.blobIndices = vec![U256::MAX];
+        });
         let numbered = with(x.clone(), |b| b.blockNumber = 7);
         let wrong_root = with(x.clone(), |b| b.entries[0].rollupUpdates[0].newRoot = H);
         let duo = batch(&[US, 2], x.entries.clone(), 1);
@@ -690,6 +694,9 @@ mod tests {
         );
         let decode: fn(&L1Error) -> bool = |e| matches!(e, L1Error::Decode(_));
         let unsupported: fn(&L1Error) -> bool = |e| matches!(e, L1Error::Unsupported { .. });
+        // The call serves no blob hashes, so only the message tells this check from the index one.
+        let tail: fn(&L1Error) -> bool =
+            |e| matches!(e, L1Error::Decode(m) if m.contains("callData"));
         #[rustfmt::skip]
         let cases: Vec<(&str, Vec<EvmBatch>, Vec<S>, fn(&L1Error) -> bool)> = vec![
             // Grammar, on rollup 2's logs, which the scan would otherwise ignore.
@@ -716,7 +723,9 @@ mod tests {
                 vec![L(0, 0), Px(0, 1)], decode),
             ("a commitment mismatch, co-listed", vec![duo, duo_other],
                 vec![L(0, 0), Px(0, 1)], unsupported),
-            ("invalid blob carrier", vec![x.clone(), blobs], vec![L(0, 0), Px(0, 1)], decode),
+            ("blobs with callData", vec![x.clone(), blobs], vec![L(0, 0), Px(0, 1)], tail),
+            ("a blob index out of range", vec![x.clone(), unindexed], vec![L(0, 0), Px(0, 1)],
+                decode),
             ("a nonzero blockNumber", vec![x.clone(), numbered], vec![L(0, 0), Px(0, 1)],
                 unsupported),
             // Settlement.
@@ -1089,29 +1098,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blob_posts_select_indexed_blobs_and_reject_invalid_batches() {
+    async fn blob_posts_select_their_indexed_blobs() {
         for routed in [false, true] {
-            let mut batch = blob_post();
+            let mut batch = batch(&[US], vec![anchor(0, 1)], 1);
+            batch.callData = Bytes::new();
+            batch.blobIndices = vec![U256::from(2), U256::ZERO];
             let tx_hashes = vec![root(2), root(0x77), root(1)];
             let selected = vec![root(1), root(2)];
-            batch.blobIndices = vec![U256::from(2), U256::ZERO];
             let caller = if routed { ROUTER } else { EOA };
             let input = input(&batch);
-            let spi = batch_shared_public_input_with_blobs(&batch, caller, &selected).unwrap();
+            let spi =
+                batch_shared_public_input_with_blobs_and_context(&batch, caller, &selected, None)
+                    .unwrap();
             let posted = BatchPosted {
                 sharedPublicInput: spi,
                 rollupIds: vec![US],
             };
-            let data = [
-                root_log(US, root(1)),
-                exec(0, batch.entries[0].rollingHash),
-                posted.encode_log_data(),
-            ];
-            let logs = data
-                .into_iter()
-                .enumerate()
-                .map(|(i, data)| rpc_log(0, i as u64, data))
-                .collect();
+            let mut logs = build(&[batch.clone()], &[L(0, 0)]).0;
+            logs.push(rpc_log(0, 2, posted.encode_log_data()));
             let to = if routed { ROUTER } else { EEZ };
             let tx_input = if routed { Bytes::new() } else { input.clone() };
             let tx = alloy_consensus::TxEip4844 {
@@ -1141,29 +1145,6 @@ mod tests {
             assert_eq!(posts[0].blob_hashes, selected);
             assert_eq!(posts[0].settlement, s(&[(0, A)], 0, 1));
             assert!(asserter.read_q().is_empty());
-        }
-
-        let hashes = [root(0x01), root(0x02)];
-
-        let mut indexed = blob_post();
-        indexed.blobIndices = vec![U256::MAX, U256::ZERO];
-        let tx_hashes = [root(0x02), root(0x77), root(0x01)];
-        assert!(matches!(
-            read_v1(&indexed, &tx_hashes),
-            Err(L1Error::Decode(_))
-        ));
-
-        let mut tail = blob_post();
-        tail.callData = vec![0xDA].into();
-        let mut timeless = blob_post();
-        timeless.blockNumber = 7;
-        for (name, carried, tx_hashes) in [
-            ("calldata tail", tail, &hashes[..]),
-            ("missing blob", blob_post(), &hashes[..1]),
-            ("other blockNumber", timeless, &hashes[..]),
-        ] {
-            let err = read_v1(&carried, tx_hashes).unwrap_err();
-            assert!(matches!(err, L1Error::Decode(_)), "{name}: {err}");
         }
     }
 
@@ -1237,41 +1218,5 @@ mod tests {
         assert!(matches!(err, Err(L1Error::Provider(_))), "{err:?}");
         let left = (chunks.ranges, asserter.read_q().len());
         assert_eq!(left, (vec![(BLOCK, BLOCK + 1)], 1));
-    }
-
-    /// An anchor-only blob batch selecting both of its tx's blobs.
-    fn blob_post() -> EvmBatch {
-        let mut v1 = batch(&[US], vec![anchor(0, 1)], 1);
-        v1.blockNumber = 0;
-        v1.callData = Bytes::new();
-        v1.blobIndices = vec![U256::ZERO, U256::from(1)];
-        v1
-    }
-
-    /// Reads one direct post of `carried` in a tx with `blob_hashes`, whose
-    /// `BatchPosted` commits to `v1` as EEZ computes it.
-    fn read_v1(carried: &EvmBatch, blob_hashes: &[B256]) -> L1Result<Vec<Post>> {
-        let v1 = blob_post();
-        let committed_hashes = [root(0x01), root(0x02)];
-        let spi =
-            batch_shared_public_input_with_blobs(&v1, EOA, &committed_hashes).expect("covered");
-        let applied = &v1.entries[0];
-        let posted = BatchPosted {
-            sharedPublicInput: spi,
-            rollupIds: vec![US],
-        };
-        let logs = [
-            root_log(US, applied.rollupUpdates[0].newRoot),
-            exec(0, applied.rollingHash),
-            posted.encode_log_data(),
-        ];
-        let logs: Vec<_> = (0..)
-            .zip(logs)
-            .map(|(i, data)| rpc_log(0, i, data))
-            .collect();
-        let mut tx_call = call(carried, EOA, logs.len());
-        tx_call.blob_hashes = blob_hashes.to_vec();
-        let calls = Calls::from([(0, (vec![tx_call], logs.len()))]);
-        read_block(&group_blocks(&logs)?.remove(0), &calls, US)
     }
 }

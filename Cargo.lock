@@ -3262,10 +3262,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
- "alloy-network",
  "alloy-primitives",
- "alloy-signer-local",
- "reth-chainspec",
  "thiserror 2.0.18",
 ]
 
@@ -3815,7 +3812,6 @@ dependencies = [
  "alloy-sol-types",
  "async-trait",
  "clap",
- "eez-blob",
  "eez-control-rpc",
  "eez-evm",
  "eez-payload-codec",

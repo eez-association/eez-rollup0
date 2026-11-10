@@ -129,7 +129,7 @@ impl L1Reader {
     ///
     /// [`L1Error::Config`] without a beacon, [`L1Error::Provider`] on RPC or
     /// malformed data, [`L1Error::SourceIncomplete`] while a source catches up,
-    /// and [`L1Error::BlobUnavailable`] for missing/pruned DA.
+    /// and [`L1Error::BlobUnavailable`] for blobs missing at a finalized slot.
     pub async fn post_blobs(&self, post: &Post) -> L1Result<Vec<Vec<u8>>> {
         let beacon = self
             .beacon

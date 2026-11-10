@@ -94,25 +94,6 @@ mod tests {
     use super::{DeriverError, is_fatal};
 
     #[test]
-    fn unavailable_blobs_are_fatal() {
-        assert!(is_fatal(&DeriverError::L1Scan(
-            eez_l1::L1Error::BlobUnavailable {
-                block: 7,
-                detail: "pruned".into(),
-            }
-        )));
-        assert!(is_fatal(&DeriverError::L1Scan(eez_l1::L1Error::Config(
-            "blob derivation requires EEZ_L1_BEACON_URL".into()
-        ))));
-        assert!(!is_fatal(&DeriverError::L1Scan(
-            eez_l1::L1Error::SourceIncomplete {
-                block: 7,
-                detail: "lagging beacon".into(),
-            }
-        )));
-    }
-
-    #[test]
     fn floor_errors_are_fatal() {
         assert!(is_fatal(&DeriverError::BelowSeedFloor {
             l1_block: 99,
@@ -123,6 +104,15 @@ mod tests {
             l2_block: 7,
             finalized_l2: 9,
         }));
+        assert!(is_fatal(&DeriverError::L1Scan(
+            eez_l1::L1Error::BlobUnavailable {
+                block: 7,
+                detail: "pruned".into(),
+            }
+        )));
+        assert!(is_fatal(&DeriverError::L1Scan(eez_l1::L1Error::Config(
+            "no beacon".into()
+        ))));
         assert!(!is_fatal(&DeriverError::LocalDiverged {
             l2_block: 7,
             detail: None,

@@ -144,18 +144,17 @@ endpoint's limits.
 
 Every node deriving blob posts needs `EEZ_L1_BEACON_URL`, including followers
 using the calldata profile. It must serve the same chain as `EEZ_L1_RPC_URL`
-and retain complete blobs for the replay range. Old L1 replay needs a blob
-archive; ordinary beacon retention is finite. After Fulu, use a supernode with
-full column custody or a service that reconstructs blobs
+and retain complete blobs for the whole replay range, which for old L1 takes a
+blob archive. After Fulu, use a supernode with full column custody or a service
+that reconstructs blobs
 ([Beacon API](https://github.com/ethereum/beacon-APIs/blob/master/apis/beacon/blobs/blobs.yaml)).
 The Chiado Compose stack's Lighthouse serves `http://127.0.0.1:6152`; start it
 with `--supernode` for blob mode or use another complete-blob source.
 
-A missing beacon block, an execution-hash mismatch, unfinalized missing blobs
-and transport/server failures retry. Selected blobs missing after the block's
-execution hash matches the post and the slot is finalized fail loudly as
-`BlobUnavailable`. Finality does not establish pruning: repair or replace the
-source so it serves those blobs. The post is never skipped.
+Any beacon `400` reads as not served, which is how a node without full column
+custody refuses blobs. `BlobUnavailable` shows the source lacks finalized blobs,
+not that they were pruned: repair or replace the source. The post is never
+skipped.
 
 ### Trace latency (measured)
 

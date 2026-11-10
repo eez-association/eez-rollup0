@@ -22,9 +22,6 @@ const ATTESTER_KEY: &str = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4
 #[path = "../../eez-control-rpc/conformance/replay.rs"]
 mod replay;
 
-#[path = "streaming_rpc/blobs.rs"]
-mod blobs;
-
 struct SignerProcess(Child);
 
 impl Drop for SignerProcess {
@@ -132,13 +129,27 @@ fn recorded_wire_witness(encoded: &str) -> ExecutionWitness {
     }
 }
 
-fn recorded_window(oracle: &serde_json::Value) -> (Vec<ProveChunk>, ProvingContext) {
-    let expected_hash = fixture_str(oracle, "public_inputs_hash")
+/// The end-to-end regression anchor: a complete window recorded from a live rig,
+/// replayed through the real service.
+///
+/// `postbatch.hex` is the calldata actually mined on L1, correlated to this
+/// window through the composer's settlement record; the digest is the one the
+/// signer attested; the signature is generated independently, so the assertion
+/// compares against a value this service did not produce. The window endpoints
+/// are block hashes — under state-root commitments those fields held a
+/// different kind of value, which is what this pins.
+///
+/// Regenerate with `scripts/capture-signer-window.sh`.
+#[tokio::test]
+async fn captured_window_is_validated_and_signed_by_the_shared_service() {
+    let oracle: serde_json::Value = serde_json::from_str(&fixture("oracle.json")).unwrap();
+    let expected_hash = fixture_str(&oracle, "public_inputs_hash")
         .parse::<B256>()
         .unwrap();
-    let from = fixture_u64(oracle, "from_block");
-    let to = fixture_u64(oracle, "to_block");
-    let rollup_id = NonZeroU64::new(fixture_u64(oracle, "rollup_id")).unwrap();
+    let expected_signature = fixture_hex(fixture_str(&oracle, "expected_test_signature"));
+    let from = fixture_u64(&oracle, "from_block");
+    let to = fixture_u64(&oracle, "to_block");
+    let rollup_id = NonZeroU64::new(fixture_u64(&oracle, "rollup_id")).unwrap();
 
     let mut window = vec![ProveChunk {
         kind: Some(prove_chunk::Kind::Header(ProveHeader {
@@ -214,31 +225,6 @@ fn recorded_window(oracle: &serde_json::Value) -> (Vec<ProveChunk>, ProvingConte
         verification_key: None,
     };
 
-    (window, context)
-}
-
-/// The end-to-end regression anchor: a complete window recorded from a live rig,
-/// replayed through the real service.
-///
-/// `postbatch.hex` is the calldata actually mined on L1, correlated to this
-/// window through the composer's settlement record; the digest is the one the
-/// signer attested; the signature is generated independently, so the assertion
-/// compares against a value this service did not produce. The window endpoints
-/// are block hashes — under state-root commitments those fields held a
-/// different kind of value, which is what this pins.
-///
-/// Regenerate with `scripts/capture-signer-window.sh`.
-#[tokio::test]
-async fn captured_window_is_validated_and_signed_by_the_shared_service() {
-    let oracle: serde_json::Value = serde_json::from_str(&fixture("oracle.json")).unwrap();
-    let expected_hash = fixture_str(&oracle, "public_inputs_hash")
-        .parse::<B256>()
-        .unwrap();
-    let expected_signature = fixture_hex(fixture_str(&oracle, "expected_test_signature"));
-    let (window, context) = recorded_window(&oracle);
-    let rollup_id = NonZeroU64::new(context.rollup_id).unwrap();
-    let anchor = context.anchor.unwrap();
-
     let (_server, endpoint) = start_signer(&oracle, &[]).await;
     let mut client = ProverClient::connect(endpoint.clone()).await.unwrap();
     let response = client
@@ -283,9 +269,10 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
         expected_signature.as_slice()
     );
 
-    // Split the captured empty-block window into two valid adjacent batches.
-    // This exercises the real client's recovery, not just raw wire rejections.
-    let subrange = |range: std::ops::Range<usize>| {
+    // Split the captured empty-block window into two valid adjacent batches,
+    // carrying DA in callData or blobs. This exercises the real client's
+    // recovery, not just raw wire rejections.
+    let subrange = |range: std::ops::Range<usize>, blob: bool| {
         let mut selected = context.clone();
         if range.start > 0 {
             let parent = alloy_rlp::decode_exact::<eez_primitives::Block>(
@@ -317,15 +304,33 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
                 }
             })
             .collect::<Vec<_>>();
-        selected.batch.callData =
-            eez_payload_codec::encode_container(selected.rollup_id, &span, &[])
-                .unwrap()
-                .into();
+        if blob {
+            let blobs =
+                eez_payload_codec::encode_blob_container(selected.rollup_id, &span, &[]).unwrap();
+            selected.batch.callData = Default::default();
+            selected.batch.blobIndices =
+                (0..blobs.len()).map(alloy_primitives::U256::from).collect();
+            selected.blobs = blobs.into_iter().map(Into::into).collect();
+        } else {
+            selected.batch.callData =
+                eez_payload_codec::encode_container(selected.rollup_id, &span, &[])
+                    .unwrap()
+                    .into();
+        }
         eez_protocol::entries::finalize_l1_rolling_hashes(&mut selected.batch).unwrap();
         selected
     };
-    let first = subrange(0..3);
-    let second = subrange(3..6);
+    let first = subrange(0..3, false);
+    let second = subrange(3..6, false);
+
+    // A blob window proves, and still proves after the signer rejects invalid DA.
+    let blob_window = subrange(3..6, true);
+    let blob_prover = RemoteProver::new(endpoint.clone(), signer);
+    blob_prover.prove(blob_window.clone()).await.unwrap();
+    let mut invalid = blob_window.clone();
+    invalid.blobs[0] = vec![0xff; invalid.blobs[0].len()].into();
+    assert!(blob_prover.prove(invalid).await.is_err());
+    blob_prover.prove(blob_window).await.unwrap();
     let charges = window[1..]
         .iter()
         .map(|chunk| {

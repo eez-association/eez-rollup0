@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_eips::{BlockNumberOrTag, Decodable2718};
+use alloy_eips::BlockNumberOrTag;
 use alloy_primitives::{TxHash, hex};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::SolEvent;
@@ -203,18 +203,9 @@ impl Submitter {
                     + NEXT_BLOCK_SLACK
             }
         };
-        // A blob post is a pooled type-3 wrapper carrying its sidecar.
-        let post_batch_hash = if raw_txs[0].first() == Some(&3) {
-            eez_blob::pooled_blob_transaction_hash(&raw_txs[0]).map_err(|error| {
-                L1Error::Submission(format!("send_bundle: decode blob postBatch: {error}"))
-            })?
-        } else {
-            let post_batch_envelope =
-                alloy_consensus::TxEnvelope::decode_2718(&mut raw_txs[0].as_ref()).map_err(
-                    |e| L1Error::Submission(format!("send_bundle: decode postBatch envelope: {e}")),
-                )?;
-            *post_batch_envelope.tx_hash()
-        };
+        let post_batch_hash = eez_blob::post_batch_tx_hash(&raw_txs[0]).map_err(|e| {
+            L1Error::Submission(format!("send_bundle: decode postBatch envelope: {e}"))
+        })?;
         // Dispatch breadcrumb: correlate this postBatch tx to the L1 block we
         // aim it at. `SendOutcome::Included` later carries the ACTUAL inclusion
         // block, so joining on tx_hash gives the N+1 next-slot targeting hit-rate.

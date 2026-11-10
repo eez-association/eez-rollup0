@@ -7,14 +7,12 @@ use alloy_sol_types::SolValue as _;
 use eez_protocol::EvmBatch;
 use eez_protocol::abi::ProofSystemBatchPerVerificationEntriesSol;
 use eez_protocol::entries::decode_postbatch;
-use eez_protocol::public_inputs::{
-    public_inputs_hashes_with_blobs_and_context, public_inputs_hashes_with_context,
-};
+use eez_protocol::public_inputs::public_inputs_hashes_with_blobs_and_context;
 use thiserror::Error;
 
 use crate::attest::NonZeroProofSystemVkey;
 
-use super::da::VerifiedBlobDa;
+use super::da::VerifiedDa;
 
 #[derive(Debug, Error)]
 pub(crate) enum PostBatchDecodeError {
@@ -93,8 +91,6 @@ pub(crate) fn decode_canonical_post_batch(
 pub(crate) enum PublicInputError {
     #[error("invalid public-input structure: {0}")]
     InvalidStructure(String),
-    #[error("invalid blob settlement input: {0}")]
-    InvalidBlobInput(String),
     #[error("public-input hash computation failed: {0}")]
     Computation(String),
     #[error("expected one public-input hash, got {actual}")]
@@ -112,24 +108,9 @@ pub(crate) struct CheckedPublicInputProfile<'a> {
 }
 
 impl<'a> CheckedPublicInputProfile<'a> {
-    /// Validate the expected rollup and single-proof-system profile.
+    /// Validate the expected rollup and single-proof-system profile against the
+    /// submitted blobs; calldata settlement submits none. Runs before DA or KZG work.
     pub(crate) fn new(
-        canonical_batch: &'a CanonicalPostBatch,
-        expected_rollup_id: NonZeroU64,
-        expected_proof_system: Address,
-        context: Option<eez_protocol::l1_context::LiveSettlementContext>,
-    ) -> Result<Self, PublicInputError> {
-        validate_public_input_structure(
-            canonical_batch.as_batch(),
-            expected_rollup_id,
-            expected_proof_system,
-            None,
-        )?;
-        Self::check_context(canonical_batch, context)
-    }
-
-    /// Check blob carrier fields before DA or KZG work.
-    pub(crate) fn new_blob(
         canonical_batch: &'a CanonicalPostBatch,
         expected_rollup_id: NonZeroU64,
         expected_proof_system: Address,
@@ -140,15 +121,8 @@ impl<'a> CheckedPublicInputProfile<'a> {
             canonical_batch.as_batch(),
             expected_rollup_id,
             expected_proof_system,
-            Some(submitted_blob_count),
+            submitted_blob_count,
         )?;
-        Self::check_context(canonical_batch, context)
-    }
-
-    fn check_context(
-        canonical_batch: &'a CanonicalPostBatch,
-        context: Option<eez_protocol::l1_context::LiveSettlementContext>,
-    ) -> Result<Self, PublicInputError> {
         if (canonical_batch.as_batch().blockNumber == u64::MAX) != context.is_some() {
             return Err(invalid_structure(
                 "live settlement context does not match batch blockNumber",
@@ -163,29 +137,22 @@ impl<'a> CheckedPublicInputProfile<'a> {
         })
     }
 
-    /// Compute the sole canonical hash from this profile-checked batch.
-    /// Blob batches require verified DA.
+    /// Compute the sole canonical hash from this profile-checked batch and its
+    /// verified DA.
     ///
-    /// This type does not prove that state, effects, or DA passed their gates;
-    /// the complete settlement job grants that stronger attestation boundary.
+    /// This type does not prove that state or effects passed their gates; the
+    /// complete settlement job grants that stronger attestation boundary.
     pub(crate) fn recompute_public_inputs_hash(
         &self,
         proof_system_vkey: NonZeroProofSystemVkey,
-        verified_da: Option<&VerifiedBlobDa>,
+        verified_da: &VerifiedDa,
     ) -> Result<RecomputedPublicInputsHash, PublicInputError> {
-        let hashes = match verified_da {
-            None => public_inputs_hashes_with_context(
-                self.canonical_batch.as_batch(),
-                proof_system_vkey.get(),
-                self.context,
-            ),
-            Some(verified_da) => public_inputs_hashes_with_blobs_and_context(
-                self.canonical_batch.as_batch(),
-                proof_system_vkey.get(),
-                verified_da.versioned_hashes(),
-                self.context,
-            ),
-        }
+        let hashes = public_inputs_hashes_with_blobs_and_context(
+            self.canonical_batch.as_batch(),
+            proof_system_vkey.get(),
+            verified_da.versioned_hashes(),
+            self.context,
+        )
         .map_err(|error| PublicInputError::Computation(error.to_string()))?;
         let [hash] = hashes.as_slice() else {
             return Err(PublicInputError::HashCount {
@@ -216,9 +183,15 @@ pub(crate) fn recompute_public_input_hash(
     expected_proof_system: Address,
 ) -> Result<B256, PublicInputError> {
     let canonical = CanonicalPostBatch(batch.clone());
-    CheckedPublicInputProfile::new(&canonical, expected_rollup_id, expected_proof_system, None)?
-        .recompute_public_inputs_hash(proof_system_vkey, None)
-        .map(RecomputedPublicInputsHash::into_inner)
+    CheckedPublicInputProfile::new(
+        &canonical,
+        expected_rollup_id,
+        expected_proof_system,
+        0,
+        None,
+    )?
+    .recompute_public_inputs_hash(proof_system_vkey, &VerifiedDa::calldata_for_test())
+    .map(RecomputedPublicInputsHash::into_inner)
 }
 
 /// Validate every signer-specific structural rule before calling
@@ -228,7 +201,7 @@ fn validate_public_input_structure(
     batch: &EvmBatch,
     expected_rollup_id: NonZeroU64,
     expected_proof_system: Address,
-    blob_count: Option<usize>,
+    submitted_blob_count: usize,
 ) -> Result<(), PublicInputError> {
     let [proof_system] = batch.proofSystems.as_slice() else {
         return Err(invalid_structure(format!(
@@ -306,21 +279,25 @@ fn validate_public_input_structure(
         )));
     }
 
-    if let Some(submitted) = blob_count {
-        validate_blob_public_input_structure(batch, submitted)?;
-    } else {
-        if batch.blockNumber != 0 && batch.blockNumber != u64::MAX {
-            return Err(invalid_structure(format!(
-                "blockNumber must be zero or the live sentinel, got {}",
-                batch.blockNumber
-            )));
-        }
-        if !batch.blobIndices.is_empty() {
-            return Err(invalid_structure(format!(
-                "blobIndices must be empty, got {}",
-                batch.blobIndices.len()
-            )));
-        }
+    if batch.blockNumber != 0 && batch.blockNumber != u64::MAX {
+        return Err(invalid_structure(format!(
+            "blockNumber must be zero or the live sentinel, got {}",
+            batch.blockNumber
+        )));
+    }
+    let selected = (0..submitted_blob_count).map(alloy_primitives::U256::from);
+    if !batch.blobIndices.iter().copied().eq(selected) {
+        return Err(invalid_structure(format!(
+            "blobIndices must select all {submitted_blob_count} submitted blobs in order, got {}",
+            batch.blobIndices.len()
+        )));
+    }
+    // Blobs carry the whole DA payload; the calldata tail stays empty.
+    if submitted_blob_count > 0 && !batch.callData.is_empty() {
+        return Err(invalid_structure(format!(
+            "callData must be empty beside blobs, got {} bytes",
+            batch.callData.len()
+        )));
     }
     if batch.bindMsgSenderInPublicInput {
         return Err(invalid_structure(
@@ -332,40 +309,6 @@ fn validate_public_input_structure(
     Ok(())
 }
 
-fn validate_blob_public_input_structure(
-    batch: &EvmBatch,
-    submitted_blob_count: usize,
-) -> Result<(), PublicInputError> {
-    if batch.blockNumber != 0 && batch.blockNumber != u64::MAX {
-        return Err(invalid_blob_input(format!(
-            "blob profile blockNumber must be zero or the live sentinel, got {}",
-            batch.blockNumber
-        )));
-    }
-    if !batch.callData.is_empty() {
-        return Err(invalid_blob_input(format!(
-            "blob profile callData must be empty, got {} bytes",
-            batch.callData.len()
-        )));
-    }
-    if submitted_blob_count == 0 {
-        return Err(invalid_blob_input(
-            "blob profile requires at least one blob",
-        ));
-    }
-    let expected = (0..submitted_blob_count).map(alloy_primitives::U256::from);
-    if !batch.blobIndices.iter().copied().eq(expected) {
-        return Err(invalid_blob_input(format!(
-            "blobIndices must select all {submitted_blob_count} submitted blobs in order"
-        )));
-    }
-    Ok(())
-}
-
 fn invalid_structure(reason: impl Into<String>) -> PublicInputError {
     PublicInputError::InvalidStructure(reason.into())
-}
-
-fn invalid_blob_input(reason: impl Into<String>) -> PublicInputError {
-    PublicInputError::InvalidBlobInput(reason.into())
 }

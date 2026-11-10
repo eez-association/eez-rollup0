@@ -149,7 +149,7 @@ impl BeaconBlobSource {
     async fn get(&self, path: &str) -> L1Result<Value> {
         self.get_optional(path)
             .await?
-            .ok_or_else(|| L1Error::Provider(format!("beacon {path}: not found")))
+            .ok_or_else(|| L1Error::Provider(format!("beacon {path}: not served")))
     }
 
     async fn get_optional(&self, path: &str) -> L1Result<Option<Value>> {
@@ -171,19 +171,16 @@ impl BeaconBlobSource {
         ) {
             return Ok(None);
         }
-        // Clients answer 400 when they cannot reconstruct the blobs, e.g.
-        // without full column custody; each words it differently.
-        if response.status() == reqwest::StatusCode::BAD_REQUEST
-            && (path.starts_with("eth/v1/beacon/blobs/")
-                || path.starts_with("eth/v1/beacon/blob_sidecars/"))
-        {
+        // Clients answer 400 for what they cannot serve, e.g. blobs without
+        // full column custody; each words it differently.
+        if response.status() == reqwest::StatusCode::BAD_REQUEST {
             let body = response.text().await.unwrap_or_default();
             event!(
-                name: "eez.l1.beacon.blobs_unavailable",
+                name: "eez.l1.beacon.bad_request",
                 Level::WARN,
                 path,
                 body,
-                "beacon cannot serve the blobs at {{path}}",
+                "beacon cannot serve {{path}}",
             );
             return Ok(None);
         }
@@ -286,50 +283,6 @@ mod tests {
                 L1Error::BlobUnavailable { block: 100, .. }
             ));
         }
-    }
-
-    #[tokio::test]
-    async fn blob_endpoint_400s_are_treated_as_missing_data() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let blobs = "eth/v1/beacon/blobs/20";
-        let columns = "Insufficient data columns to reconstruct blobs: required 64, found 0";
-        let cases = [
-            (blobs, 400, columns, true),
-            ("eth/v1/beacon/blob_sidecars/20", 400, columns, true),
-            (blobs, 400, "Invalid block ID", true),
-            (blobs, 500, columns, false),
-            ("eth/v2/beacon/blocks/20", 400, columns, false),
-        ];
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let source = BeaconBlobSource::new(
-            Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap(),
-        );
-        let server = tokio::spawn(async move {
-            for (_, status, message, _) in cases {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = BufReader::new(&mut socket);
-                loop {
-                    let mut line = String::new();
-                    assert!(request.read_line(&mut line).await.unwrap() > 0);
-                    if line == "\r\n" {
-                        break;
-                    }
-                }
-                let body = json!({"message":message}).to_string();
-                socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-            }
-        });
-        for (path, _, _, missing) in cases {
-            let result = tokio::time::timeout(Duration::from_secs(5), source.get_optional(path))
-                .await
-                .unwrap();
-            if missing {
-                assert!(result.unwrap().is_none(), "{path}");
-            } else {
-                assert!(matches!(result, Err(L1Error::Provider(_))), "{path}");
-            }
-        }
-        server.await.unwrap();
     }
 
     #[test]

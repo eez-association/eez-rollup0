@@ -40,7 +40,6 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 
 [dev-dependencies]
-eez-blob.workspace = true
 eez-payload-codec.workspace = true
 eez-prover.workspace = true
 eez-prover-client.workspace = true

@@ -190,12 +190,6 @@ pub enum PublicInputsError {
     /// Sender-bound public inputs require the actual transaction sender.
     #[error("public-input hashing currently requires bindMsgSenderInPublicInput == false")]
     UnsupportedSenderBinding,
-    /// Blob hashes cannot be reconstructed from blob indices alone.
-    #[error("public-input hashing currently requires empty blobIndices, got {count}")]
-    UnsupportedBlobIndices {
-        /// Number of unsupported blob indices.
-        count: usize,
-    },
 }
 
 /// `sharedPublicInput` as `EEZ._verifyProofSystemBatch` computes it for `batch`
@@ -216,21 +210,7 @@ pub fn batch_shared_public_input_with_context(
     sender: Address,
     context: Option<crate::l1_context::LiveSettlementContext>,
 ) -> Result<B256, PublicInputsError> {
-    if !batch.blobIndices.is_empty() {
-        return Err(PublicInputsError::UnsupportedBlobIndices {
-            count: batch.blobIndices.len(),
-        });
-    }
     batch_shared_public_input_with_blobs_and_context(batch, sender, &[], context)
-}
-
-/// Compute the shared input with independently derived blob hashes.
-pub fn batch_shared_public_input_with_blobs(
-    batch: &EvmBatch,
-    sender: Address,
-    blob_hashes: &[B256],
-) -> Result<B256, PublicInputsError> {
-    batch_shared_public_input_with_blobs_and_context(batch, sender, blob_hashes, None)
 }
 
 /// Compute the shared input binding both DA blobs and the live L1 parent/time.
@@ -301,21 +281,7 @@ pub fn public_inputs_hashes_with_context(
     vkey: B256,
     context: Option<crate::l1_context::LiveSettlementContext>,
 ) -> Result<Vec<B256>, PublicInputsError> {
-    if !batch.blobIndices.is_empty() {
-        return Err(PublicInputsError::UnsupportedBlobIndices {
-            count: batch.blobIndices.len(),
-        });
-    }
     public_inputs_hashes_with_blobs_and_context(batch, vkey, &[], context)
-}
-
-/// Compute settlement hashes with locally derived blob hashes.
-pub fn public_inputs_hashes_with_blobs(
-    batch: &EvmBatch,
-    vkey: B256,
-    blob_hashes: &[B256],
-) -> Result<Vec<B256>, PublicInputsError> {
-    public_inputs_hashes_with_blobs_and_context(batch, vkey, blob_hashes, None)
 }
 
 /// Compute settlement hashes binding both DA blobs and the live L1 parent/time.
@@ -574,14 +540,17 @@ mod tests {
         batch.blobIndices.push(alloy_primitives::U256::ZERO);
         assert!(matches!(
             public_inputs_hashes(&batch, vkey),
-            Err(PublicInputsError::UnsupportedBlobIndices { count: 1 })
+            Err(PublicInputsError::BlobHashCount {
+                expected: 1,
+                actual: 0
+            })
         ));
     }
 
     /// No in-profile Solidity vector binds a sender or holds a static entry.
     #[test]
     fn batch_shared_public_input_follows_the_supported_profile() {
-        use PublicInputsError::{UnsupportedBlobIndices, UnsupportedBlockNumber};
+        use PublicInputsError::{BlobHashCount, UnsupportedBlockNumber};
         let sender = Address::repeat_byte(0xbe);
         let base = crate::abi::EvmBatch {
             staticEntries: vec![StaticExecutionEntrySol::default()],
@@ -597,7 +566,13 @@ mod tests {
             (&base, Ok(shared(Address::ZERO))),
             (&bound, Ok(shared(sender))),
             (&block, Err(UnsupportedBlockNumber { block_number: 7 })),
-            (&blob, Err(UnsupportedBlobIndices { count: 1 })),
+            (
+                &blob,
+                Err(BlobHashCount {
+                    expected: 1,
+                    actual: 0,
+                }),
+            ),
         ] {
             assert_eq!(batch_shared_public_input(batch, sender), want);
         }

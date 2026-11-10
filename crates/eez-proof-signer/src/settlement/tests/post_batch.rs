@@ -1,15 +1,21 @@
 use super::*;
 use crate::settlement::CheckedPublicInputProfile;
 
-fn assert_structure_rejected(name: &str, batch: &EvmBatch) {
+fn profile(batch: &CanonicalPostBatch, submitted_blobs: usize) -> Result<(), PublicInputError> {
+    CheckedPublicInputProfile::new(
+        batch,
+        expected_rollup_id(),
+        EXPECTED_PROOF_SYSTEM,
+        submitted_blobs,
+        None,
+    )
+    .map(drop)
+}
+
+fn assert_structure_rejected(name: &str, batch: &CanonicalPostBatch, submitted_blobs: usize) {
     assert!(
         matches!(
-            recompute_public_input_hash(
-                batch,
-                test_proof_system_vkey(),
-                expected_rollup_id(),
-                EXPECTED_PROOF_SYSTEM,
-            ),
+            profile(batch, submitted_blobs),
             Err(PublicInputError::InvalidStructure(_))
         ),
         "{name} was accepted"
@@ -52,70 +58,6 @@ fn target_batch_has_a_valid_state_update_chain() {
             .map(|_| ()),
         Ok(())
     );
-}
-
-fn blob_profile(batch: &CanonicalPostBatch, submitted: usize) -> bool {
-    CheckedPublicInputProfile::new_blob(
-        batch,
-        expected_rollup_id(),
-        EXPECTED_PROOF_SYSTEM,
-        submitted,
-        None,
-    )
-    .is_ok()
-}
-
-#[test]
-fn blob_profile_checks_shape_before_da() {
-    let mut batch = target_anchor_batch();
-    batch.blockNumber = 0;
-    batch.blobIndices = vec![U256::ZERO, U256::from(1)];
-    assert!(blob_profile(&batch, 2));
-    let checked = CheckedPublicInputProfile::new_blob(
-        &batch,
-        expected_rollup_id(),
-        EXPECTED_PROOF_SYSTEM,
-        2,
-        None,
-    )
-    .unwrap();
-    assert!(
-        checked
-            .recompute_public_inputs_hash(test_proof_system_vkey(), None)
-            .is_err()
-    );
-
-    let mut wrong_block = batch.clone();
-    wrong_block.blockNumber = u64::MAX;
-    assert!(!blob_profile(&wrong_block, 2));
-
-    let mut calldata_tail = batch.clone();
-    calldata_tail.callData = Bytes::from_static(b"tail");
-    assert!(!blob_profile(&calldata_tail, 2));
-
-    let mut no_blobs = batch.clone();
-    no_blobs.blobIndices.clear();
-    assert!(!blob_profile(&no_blobs, 0));
-
-    let mut noncanonical_indices = batch.clone();
-    noncanonical_indices.blobIndices = vec![U256::ZERO, U256::from(2)];
-    assert!(!blob_profile(&noncanonical_indices, 2));
-
-    assert!(!blob_profile(&batch, 1));
-
-    let mut outbound_prefix = batch.clone();
-    let second_immediate = outbound_prefix.entries[0].clone();
-    outbound_prefix.entries.push(second_immediate);
-    outbound_prefix.immediateEntryCount = U256::from(2);
-    assert!(blob_profile(&outbound_prefix, 2));
-
-    let mut deferred_in_the_immediate_run = outbound_prefix.clone();
-    deferred_in_the_immediate_run.entries[1].proxyEntryHash = B256::repeat_byte(0x11);
-    assert!(!blob_profile(&deferred_in_the_immediate_run, 2));
-
-    let mut sender_bound = batch;
-    sender_bound.bindMsgSenderInPublicInput = true;
-    assert!(!blob_profile(&sender_bound, 2));
 }
 
 #[test]
@@ -277,7 +219,7 @@ fn accepts_only_the_exact_leading_zero_proxy_run_as_immediate() {
     ] {
         let mut batch = valid.clone();
         batch.immediateEntryCount = count;
-        assert_structure_rejected(name, &batch);
+        assert_structure_rejected(name, &batch, 0);
     }
 }
 
@@ -353,11 +295,22 @@ fn rejects_every_public_input_structural_violation() {
     batch.blobIndices.push(U256::ZERO);
     cases.push(("blob index", batch));
 
-    let mut batch = valid;
+    let mut batch = valid.clone();
     batch.bindMsgSenderInPublicInput = true;
     cases.push(("bound sender", batch));
 
     for (name, batch) in &cases {
-        assert_structure_rejected(name, batch);
+        assert_structure_rejected(name, batch, 0);
     }
+
+    // Blobs carry the whole payload: indices select every submitted blob in
+    // order and callData stays empty.
+    let mut blobs = valid;
+    blobs.blobIndices = vec![U256::ZERO, U256::from(1)];
+    profile(&blobs, 2).unwrap();
+    let mut gap = blobs.clone();
+    gap.blobIndices[1] = U256::from(2);
+    assert_structure_rejected("blob index gap", &gap, 2);
+    blobs.callData = Bytes::from_static(b"tail");
+    assert_structure_rejected("callData beside blobs", &blobs, 2);
 }

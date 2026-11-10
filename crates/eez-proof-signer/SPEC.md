@@ -46,13 +46,9 @@ static entries, nested calls, multiple calls per effect, explicit call gas,
 force-revert spans, historical L1 block selectors, sender binding, or multiple
 proof systems. Live batches can bind the intended L1 parent and inclusion time.
 
-The profile supports calldata and blob DA using the stock protocol `Rollup.sol`.
-Both use `blockNumber == 0` with empty `customData` for timeless batches, or
-`uint64.max` with parent/time custom data for live batches. Blob settlement uses
-streaming `Finalize` with physical blobs and live `posting_context` when required; the signer
-derives the blob hashes locally after verifying the same execution and effects
-as calldata. The stream is unchanged apart from `CloseBlobStream` and 31-byte
-field-element packing.
+The profile carries DA in `callData` or, through streaming `Finalize` only, in
+physical blobs, using the stock protocol `Rollup.sol`. Calldata settlement is
+the zero-blob case of the same rules (§7, §11, §12).
 
 No failed stage may produce a signature. A successful signature authorizes the
 locally recomputed public-input hash only under all rules in this document.
@@ -468,8 +464,8 @@ The decoded batch MUST satisfy all of these profile rules:
 7. `immediateEntryCount` equals the complete leading run of mutable entries
    whose `proxyEntryHash == 0`.
 8. `blockNumber == 0` with no L1 context, or `uint64.max` with live parent/time context. Any system transaction requires the live profile.
-9. Calldata batches have empty `blobIndices`. Blob batches have empty `callData`
-   and select every submitted physical blob in order.
+9. `blobIndices` selects every submitted physical blob in order, so it is empty
+   for calldata settlement; `callData` is empty when blobs are submitted.
 10. `bindMsgSenderInPublicInput == false`.
 
 `proofs` is not inspected and is absent from the public-input hash. The caller
@@ -769,11 +765,12 @@ For every mutable entry:
 entryHash[i] = H(abi.encode(batch.entries[i]))
 ```
 
-For the calldata profile:
+For the supported profile:
 
 ```text
 staticEntryHashes = []
-blobHashes        = []
+blobHashes        = versioned hashes the signer derives from the submitted
+                    blobs after DA verification; [] for calldata settlement
 customData        = bytes("") for blockNumber == 0
                   = abi.encode(uint256(terminalTimestamp), intendedL1ParentHash)
                     for blockNumber == uint64.max
@@ -781,9 +778,6 @@ customDataHash    = H(abi.encode(uint64(expected_rollup_id), customData))
 customDataHashes  = dynamic bytes32[] containing only customDataHash
 boundSender       = address(0)
 ```
-
-For blob DA, `blobHashes` are independently derived from the validated physical
-blobs. `callData` is empty; custom data and the remaining fields are unchanged.
 
 The shared input is:
 

@@ -99,15 +99,24 @@ pub(crate) enum DaPayloadError {
     Kzg(String),
 }
 
-/// Versioned hashes derived after blob DA matches validated execution.
+/// DA that matched validated execution, with the versioned hashes of its
+/// blobs (none for calldata settlement). Only [`verify_da_payload`] builds it.
 #[derive(Debug)]
-pub(crate) struct VerifiedBlobDa {
+pub(crate) struct VerifiedDa {
     versioned_hashes: Vec<B256>,
 }
 
-impl VerifiedBlobDa {
+impl VerifiedDa {
     pub(crate) fn versioned_hashes(&self) -> &[B256] {
         &self.versioned_hashes
+    }
+
+    /// Calldata DA for tests that hash a batch without running the DA gate.
+    #[cfg(test)]
+    pub(crate) const fn calldata_for_test() -> Self {
+        Self {
+            versioned_hashes: Vec::new(),
+        }
     }
 }
 
@@ -125,27 +134,23 @@ struct DaPayload {
 }
 
 impl DaPayload {
-    fn decode(encoded_payload: &[u8], expected_rollup_id: u64) -> Result<Self, DaPayloadError> {
-        let container =
-            eez_payload_codec::decode_container(encoded_payload).map_err(|error| match error {
-                eez_payload_codec::CodecError::TrailingBytes(trailing) => {
-                    DaPayloadError::TrailingBytes { trailing }
-                }
-                other => invalid_da_payload(other.to_string()),
-            })?;
-        Self::from_container(container, expected_rollup_id)
-    }
-
-    fn decode_blobs(blobs: &[Vec<u8>], expected_rollup_id: u64) -> Result<Self, DaPayloadError> {
-        let container = eez_payload_codec::decode_blob_container(blobs)
-            .map_err(|error| invalid_da_payload(error.to_string()))?;
-        Self::from_container(container, expected_rollup_id)
-    }
-
-    fn from_container(
-        container: eez_payload_codec::DecodedContainer,
+    /// Decode the payload from the blobs when any were submitted, else from `callData`.
+    fn decode(
+        call_data: &[u8],
+        blobs: &[Vec<u8>],
         expected_rollup_id: u64,
     ) -> Result<Self, DaPayloadError> {
+        let container = if blobs.is_empty() {
+            eez_payload_codec::decode_container(call_data)
+        } else {
+            eez_payload_codec::decode_blob_container(blobs)
+        }
+        .map_err(|error| match error {
+            eez_payload_codec::CodecError::TrailingBytes(trailing) => {
+                DaPayloadError::TrailingBytes { trailing }
+            }
+            other => invalid_da_payload(other.to_string()),
+        })?;
         // Fatal here, unlike the deriver: we are asked to attest THIS batch,
         // and a payload for another rollup is not it.
         if container.rollup_id != expected_rollup_id {
@@ -219,8 +224,8 @@ fn invalid_da_payload(reason: impl Into<String>) -> DaPayloadError {
     }
 }
 
-/// Bind the decoded batch's submitted DA payload to the validated window and
-/// authorized effects.
+/// Bind the submitted DA payload, from the blobs or else the batch `callData`,
+/// to the validated window and authorized effects.
 ///
 /// The preceding blocks carry every transaction verbatim. In the terminal
 /// settling block, system loads and inbound deliveries are omitted while
@@ -229,40 +234,16 @@ fn invalid_da_payload(reason: impl Into<String>) -> DaPayloadError {
 /// byte for byte.
 pub(crate) fn verify_da_payload(
     batch: &CanonicalPostBatch,
-    validated_window: &ValidatedWindow,
-    outbound_effects: &AuthorizedOutboundEffects,
-    inbound_effects: &AuthorizedInboundEffects<'_>,
-    system_transaction_reconstructor: &SystemTransactionReconstructor,
-    expected_rollup_id: u64,
-) -> Result<(), DaPayloadError> {
-    let settling = validated_window.settling_block();
-    verify_decoded_da_payload(
-        DaPayload::decode(&batch.as_batch().callData, expected_rollup_id)?,
-        validated_window
-            .preceding_blocks()
-            .iter()
-            .map(|block| (block.number(), block.decoded())),
-        (settling.number(), settling.decoded()),
-        outbound_effects,
-        inbound_effects,
-        system_transaction_reconstructor,
-        expected_rollup_id,
-    )
-}
-
-/// Verify blob DA against the validated blocks and effects, then derive its
-/// versioned hashes. The blob profile carries the complete stream in blobs.
-pub(crate) fn verify_blob_da_payload(
     blobs: &[Vec<u8>],
     validated_window: &ValidatedWindow,
     outbound_effects: &AuthorizedOutboundEffects,
     inbound_effects: &AuthorizedInboundEffects<'_>,
     system_transaction_reconstructor: &SystemTransactionReconstructor,
     expected_rollup_id: u64,
-) -> Result<VerifiedBlobDa, DaPayloadError> {
+) -> Result<VerifiedDa, DaPayloadError> {
     let settling = validated_window.settling_block();
     verify_decoded_da_payload(
-        DaPayload::decode_blobs(blobs, expected_rollup_id)?,
+        DaPayload::decode(&batch.as_batch().callData, blobs, expected_rollup_id)?,
         validated_window
             .preceding_blocks()
             .iter()
@@ -277,7 +258,7 @@ pub(crate) fn verify_blob_da_payload(
     // Derive the signed hashes only after the payload matches validated execution.
     let versioned_hashes = eez_blob::versioned_hashes(blobs)
         .map_err(|error| DaPayloadError::Kzg(error.to_string()))?;
-    Ok(VerifiedBlobDa { versioned_hashes })
+    Ok(VerifiedDa { versioned_hashes })
 }
 
 /// Raw-input adapter for focused DA unit tests.
@@ -299,7 +280,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let settling = decode_validated_block(settling_block.0, settling_block.1)?;
     verify_decoded_da_payload(
-        DaPayload::decode(encoded_payload, expected_rollup_id)?,
+        DaPayload::decode(encoded_payload, &[], expected_rollup_id)?,
         intermediate_blocks
             .iter()
             .map(|(number, block)| (*number, block)),
@@ -703,7 +684,27 @@ pub(crate) fn encode_da_payload_for(
     blocks: &[Vec<Vec<u8>>],
     entries: &[eez_protocol::abi::ExecutionEntrySol],
 ) -> Vec<u8> {
-    let span: Vec<eez_payload_codec::SpanBlock> = blocks
+    let (span, actions) = test_span_and_actions(rollup_id, blocks, entries);
+    eez_payload_codec::encode_container(rollup_id, &span, &actions).expect("test payload encodes")
+}
+
+/// As [`encode_da_payload`], packed into physical blobs.
+#[cfg(test)]
+pub(crate) fn encode_blob_da_payload(
+    blocks: &[Vec<Vec<u8>>],
+    entries: &[eez_protocol::abi::ExecutionEntrySol],
+) -> Vec<Vec<u8>> {
+    let (span, actions) = test_span_and_actions(1, blocks, entries);
+    eez_payload_codec::encode_blob_container(1, &span, &actions).expect("test blobs encode")
+}
+
+#[cfg(test)]
+fn test_span_and_actions(
+    rollup_id: u64,
+    blocks: &[Vec<Vec<u8>>],
+    entries: &[eez_protocol::abi::ExecutionEntrySol],
+) -> (Vec<eez_payload_codec::SpanBlock>, Vec<Action>) {
+    let span = blocks
         .iter()
         .map(|transactions| eez_payload_codec::SpanBlock {
             transactions: transactions.clone(),
@@ -717,24 +718,5 @@ pub(crate) fn encode_da_payload_for(
                 .expect("test entry projects to an action")
         })
         .collect();
-    eez_payload_codec::encode_container(rollup_id, &span, &actions).expect("test payload encodes")
-}
-
-#[cfg(test)]
-mod blob_kzg_tests {
-    use eez_payload_codec::SpanBlock;
-
-    use super::*;
-
-    #[test]
-    fn rollup0_physical_blob_is_ethereum_kzg_compatible() {
-        let blobs = eez_payload_codec::encode_blob_container(1, &[SpanBlock::default()], &[])
-            .expect("fixture encodes");
-        let hashes = eez_blob::versioned_hashes(&blobs)
-            .expect("Rollup0 packing must produce canonical Ethereum field elements");
-
-        assert_eq!(hashes.len(), 1);
-        assert_eq!(hashes[0][0], 1, "EIP-4844 version byte");
-        assert_ne!(hashes[0], B256::ZERO);
-    }
+    (span, actions)
 }

@@ -254,30 +254,20 @@ fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
     })
 }
 
-/// Blob posting uses the embedded L1 fork schedule and configured slot duration.
+/// Blob posting uses the embedded L1 fork schedule.
 fn blob_posting_from_env(
-    enabled: bool,
     chain_spec: Arc<reth_chainspec::ChainSpec>,
-    slot_duration: Duration,
-) -> eyre::Result<Option<eez_composer::BlobPostingConfig>> {
-    if !enabled {
-        return Ok(None);
-    }
-    eyre::ensure!(
-        !slot_duration.is_zero() && slot_duration.subsec_nanos() == 0,
-        "EEZ_L1_BLOCK_TIME_MS must be a positive whole number of seconds for blob profile",
-    );
+) -> eyre::Result<eez_composer::BlobPostingConfig> {
     let max_fee_per_blob_gas = env::var("EEZ_L1_MAX_FEE_PER_BLOB_GAS")
         .map_err(|_| eyre::eyre!("EEZ_L1_MAX_FEE_PER_BLOB_GAS is required for blob profile"))?
         .parse::<u128>()
         .ok()
         .filter(|cap| *cap > 0)
         .ok_or_else(|| eyre::eyre!("EEZ_L1_MAX_FEE_PER_BLOB_GAS must be a nonzero wei amount"))?;
-    Ok(Some(eez_composer::BlobPostingConfig {
+    Ok(eez_composer::BlobPostingConfig {
         chain_spec,
-        slot_seconds: slot_duration.as_secs(),
         max_fee_per_blob_gas,
-    }))
+    })
 }
 
 /// `EEZ_SEQUENCER_KEY`: the key that signs this composer's heads; unset disables signing.
@@ -724,11 +714,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             l1_poster_signer,
             l1_chain_id: l1_submission_chain_id,
             l1_post_batch_priority_fee,
-            blob_posting: blob_posting_from_env(
-                blob_da,
-                posting_chain_spec,
-                timing.l1_block_time(),
-            )?,
+            blob_posting: blob_da
+                .then(|| blob_posting_from_env(posting_chain_spec))
+                .transpose()?,
             eez_registry,
         });
         event!(
@@ -1393,18 +1381,5 @@ mod tests {
         assert_eq!(specs[1].port_env, "EEZ_L2_XCHAIN_PORT");
         assert_eq!(specs[1].direction, eez_composer::Direction::Outbound);
         assert_eq!(specs[1].expected_source_chain_id, 90_210);
-    }
-
-    #[test]
-    fn blob_posting_rejects_fractional_l1_slots() {
-        let spec = Arc::new(reth_chainspec::ChainSpecBuilder::mainnet().build());
-        for duration in [Duration::ZERO, Duration::from_millis(1500)] {
-            let error = blob_posting_from_env(true, spec.clone(), duration).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("positive whole number of seconds")
-            );
-        }
     }
 }

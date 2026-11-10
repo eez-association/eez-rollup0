@@ -59,7 +59,7 @@ use crate::rollup::RollupState;
 
 mod blob;
 pub use blob::BlobPostingConfig;
-use blob::{BlobCarrier, blob_fee, post_batch_tx_hash, target_blob_limit};
+use blob::{BlobCarrier, blob_fee, blob_stream_len, target_blob_limit};
 
 fn bundle_targets_for_slot(
     target_l1_block: Option<u64>,
@@ -396,10 +396,17 @@ struct PostBatchGasBudget {
     /// Running total, seeded with the leading immediate entry every postBatch
     /// carries. The projection is linear, so costs just add.
     projected: u64,
-    byte_limit: Option<usize>,
-    bytes: usize,
-    floor_bytes: usize,
-    empty_interval_exceeds_blob_limit: bool,
+    /// `None` when the batch carries its DA in calldata.
+    blob: Option<BlobBytes>,
+}
+
+/// Blob stream bytes: the post's capacity, the bytes reserved so far, and
+/// the bytes of an empty interval, the least any later slot reserves.
+#[derive(Debug, Clone, Copy)]
+struct BlobBytes {
+    limit: usize,
+    used: usize,
+    floor: usize,
 }
 
 impl PostBatchGasBudget {
@@ -410,10 +417,7 @@ impl PostBatchGasBudget {
             cap: max_gas.saturating_sub(POSTBATCH_DRAIN_MARGIN),
             projected: projected_postbatch_gas(1, 0, 0)
                 .saturating_add(attestation_gas(proof_systems)),
-            byte_limit: None,
-            bytes: 0,
-            floor_bytes: 0,
-            empty_interval_exceeds_blob_limit: false,
+            blob: None,
         }
     }
 
@@ -426,32 +430,26 @@ impl PostBatchGasBudget {
         da_tx: &[u8],
         target_gas: u64,
     ) -> TxL1Gas {
-        if self.byte_limit.is_some() {
+        if self.blob.is_some() {
             projected_tx_l1_gas(batch_entries, &[], &[], target_gas)
         } else {
             projected_tx_l1_gas(batch_entries, da_entries, da_tx, target_gas)
         }
     }
 
-    fn with_blob_limit(mut self, maximum: Option<usize>) -> Self {
-        self.byte_limit =
-            maximum.map(|blobs| blobs.saturating_mul(eez_payload_codec::LOGICAL_BYTES_PER_BLOB));
-        self
-    }
-
+    /// Charge the blob bytes one held tx adds; only `Accept` charges them.
     fn try_accept_da(
         &mut self,
         rollup_id: u64,
         entries: &[eez_protocol::abi::ExecutionEntrySol],
         user: Option<&Bytes>,
-    ) -> Result<bool, String> {
-        self.empty_interval_exceeds_blob_limit = false;
-        let Some(limit) = self.byte_limit else {
-            return Ok(true);
+    ) -> Result<BlockGasFit, String> {
+        let Some(blob) = &mut self.blob else {
+            return Ok(BlockGasFit::Accept);
         };
         // A full range cannot admit another held tx; defer it to a later slot.
-        if self.bytes >= limit {
-            return Ok(false);
+        if blob.used >= blob.limit {
+            return Ok(BlockGasFit::Defer);
         }
         let actions = entries
             .iter()
@@ -470,19 +468,17 @@ impl PostBatchGasBudget {
             ..Default::default()
         };
         // One envelope per candidate conservatively covers aggregate prefix growth.
-        let contribution = eez_payload_codec::encode_container(rollup_id, &[block], &actions)
-            .map_err(|e| format!("encode drain DA: {e}"))?
-            .len()
-            .saturating_add(1); // CloseBlobStream
-        let next = self.bytes.saturating_add(contribution);
-        if next > limit {
-            // Match acceptance's conservative charge, without interval traffic.
-            self.empty_interval_exceeds_blob_limit =
-                self.floor_bytes.saturating_add(contribution) > limit;
-            return Ok(false);
-        }
-        self.bytes = next;
-        Ok(true)
+        let contribution = blob_stream_len(rollup_id, &[block], &actions)?;
+        let next = blob.used.saturating_add(contribution);
+        Ok(if next <= blob.limit {
+            blob.used = next;
+            BlockGasFit::Accept
+        } else if blob.floor.saturating_add(contribution) > blob.limit {
+            // Not even a range holding one empty interval could take it.
+            BlockGasFit::Unfittable
+        } else {
+            BlockGasFit::Defer
+        })
     }
 
     /// Charge `cost` if it fits. `false` leaves the projection untouched, so the
@@ -502,7 +498,7 @@ impl PostBatchGasBudget {
 }
 
 /// What the drain can do with a pair wanting `declared` gas on a Sync block
-/// that already holds `gas_used`.
+/// that already holds `gas_used`, or with a tx against the batch's blob bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockGasFit {
     /// Room in this block — accept.
@@ -2202,53 +2198,49 @@ where
             outbound_source_nonces_for_drain(state.as_ref(), rollup_id, &drained);
         drop(state);
         // Sized here, before classification, so an error requeues the drain
-        // untouched. Uses the fork allowance the post resolves.
-        let blob_limit = match &ctx.blob_posting {
-            Some(config) => Some(
-                target_blob_limit(&ctx.l1_provider, config, bundle_target)
-                    .await?
-                    .max_blobs,
-            ),
+        // untouched. Uses the fork allowance the post resolves, and reserves the
+        // committed range and terminal metadata before admitting held txs.
+        let blob = match &ctx.blob_posting {
             None => None,
-        };
-        // Reserve the actual committed range and terminal metadata before
-        // admitting held transactions. Include CloseBlobStream in the base.
-        let (blob_base_bytes, floor_bytes) = if blob_limit.is_some() {
-            let from = rollup
-                .l1_head
-                .cursor()
-                .checked_add(1)
-                .ok_or("DA cursor overflow")?;
-            let mut blocks = self.committed_da_blocks(rollup, parent_header, from)?;
-            blocks.push(eez_payload_codec::SpanBlock {
-                beneficiary: suggested_fee_recipient.into_array(),
-                extra_data: eez_driver::BUILDER_EXTRA_DATA.to_vec(),
-                transactions: Vec::new(),
-            });
-            let bytes = eez_payload_codec::encode_container(rollup_id, &blocks, &[])
-                .map_err(|error| format!("encode committed drain DA: {error}"))?
-                .len()
-                .saturating_add(1);
-            // Catch-up ranges may span several intervals. Only the trailing
-            // K blocks define the empty-interval eviction floor; preserve their
-            // beneficiary/extra-data runs, but discard committed transactions.
-            let k = usize::try_from(self.inner.emission.timing.k())
-                .map_err(|error| format!("DA interval overflow: {error}"))?;
-            let empty_interval: Vec<_> = blocks[blocks.len().saturating_sub(k)..]
-                .iter()
-                .map(|block| eez_payload_codec::SpanBlock {
-                    beneficiary: block.beneficiary,
-                    extra_data: block.extra_data.clone(),
+            Some(config) => {
+                let max_blobs = target_blob_limit(
+                    &ctx.l1_provider,
+                    config,
+                    self.inner.emission.timing.l1_block_time(),
+                    bundle_target,
+                )
+                .await?
+                .max_blobs;
+                let from = rollup
+                    .l1_head
+                    .cursor()
+                    .checked_add(1)
+                    .ok_or("DA cursor overflow")?;
+                let mut blocks = self.committed_da_blocks(rollup, parent_header, from)?;
+                blocks.push(eez_payload_codec::SpanBlock {
+                    beneficiary: suggested_fee_recipient.into_array(),
+                    extra_data: eez_driver::BUILDER_EXTRA_DATA.to_vec(),
                     transactions: Vec::new(),
+                });
+                let used = blob_stream_len(rollup_id, &blocks, &[])?;
+                // Catch-up ranges may span several intervals. Only the trailing
+                // K blocks define the empty-interval eviction floor; preserve their
+                // beneficiary/extra-data runs, but discard committed transactions.
+                let k = usize::try_from(self.inner.emission.timing.k())
+                    .map_err(|error| format!("DA interval overflow: {error}"))?;
+                let empty_interval: Vec<_> = blocks[blocks.len().saturating_sub(k)..]
+                    .iter()
+                    .map(|block| eez_payload_codec::SpanBlock {
+                        transactions: Vec::new(),
+                        ..block.clone()
+                    })
+                    .collect();
+                Some(BlobBytes {
+                    limit: max_blobs.saturating_mul(eez_payload_codec::LOGICAL_BYTES_PER_BLOB),
+                    used,
+                    floor: blob_stream_len(rollup_id, &empty_interval, &[])?,
                 })
-                .collect();
-            let floor_bytes = eez_payload_codec::encode_container(rollup_id, &empty_interval, &[])
-                .map_err(|error| format!("encode empty drain interval: {error}"))?
-                .len()
-                .saturating_add(1);
-            (bytes, floor_bytes)
-        } else {
-            (0, 0)
+            }
         };
         let mut source_nonces = inbound_source_nonces_for_drain(
             ctx,
@@ -2402,11 +2394,10 @@ where
         let mut transient: Option<(String, Vec<(usize, HeldTx)>)> = None;
         // Gas and bytes, not the tx cap, bound this bundle; overflow stays
         // held for later slots.
-        let mut budget =
-            PostBatchGasBudget::new(self.inner.emission.max_gas, self.inner.emission.attesters)
-                .with_blob_limit(blob_limit);
-        budget.bytes = blob_base_bytes;
-        budget.floor_bytes = floor_bytes;
+        let mut budget = PostBatchGasBudget {
+            blob,
+            ..PostBatchGasBudget::new(self.inner.emission.max_gas, self.inner.emission.attesters)
+        };
         // Set by a budget cut: the tx that did not fit plus everything after it,
         // owed back to the pool unpenalized.
         let mut deferred: Vec<(usize, HeldTx)> = Vec::new();
@@ -2649,19 +2640,19 @@ where
                     let mut candidate_budget = budget;
                     match candidate_budget.try_accept_da(rollup_id, &l1_entries, Some(&held.raw_tx))
                     {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            if candidate_budget.empty_interval_exceeds_blob_limit {
-                                event!(
-                                    name: "eez.composer.cc_compose.blob_unfittable",
-                                    Level::WARN,
-                                    rollup_id,
-                                    tx_hash = %held.hash,
-                                    "held transaction alone exceeds blob capacity; evicting its nonce suffix",
-                                );
-                                push_poison_root(&mut poison, &mut poison_gaps, held);
-                                continue;
-                            }
+                        Ok(BlockGasFit::Accept) => {}
+                        Ok(BlockGasFit::Unfittable) => {
+                            event!(
+                                name: "eez.composer.cc_compose.blob_unfittable",
+                                Level::WARN,
+                                rollup_id,
+                                tx_hash = %held.hash,
+                                "held transaction alone exceeds blob capacity; evicting its nonce suffix",
+                            );
+                            push_poison_root(&mut poison, &mut poison_gaps, held);
+                            continue;
+                        }
+                        Ok(BlockGasFit::Defer) => {
                             blob_budget_cut = true;
                             deferred = abort_rest(
                                 Some((idx, held)),
@@ -3056,19 +3047,19 @@ where
                     // Commit both projections only after the block append succeeds.
                     let mut candidate_budget = budget;
                     match candidate_budget.try_accept_da(rollup_id, &target_entries, None) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            if candidate_budget.empty_interval_exceeds_blob_limit {
-                                event!(
-                                    name: "eez.composer.cc_compose.blob_unfittable",
-                                    Level::WARN,
-                                    rollup_id,
-                                    tx_hash = %held.hash,
-                                    "held transaction alone exceeds blob capacity; evicting its nonce suffix",
-                                );
-                                push_poison_root(&mut poison, &mut poison_gaps, held);
-                                continue;
-                            }
+                        Ok(BlockGasFit::Accept) => {}
+                        Ok(BlockGasFit::Unfittable) => {
+                            event!(
+                                name: "eez.composer.cc_compose.blob_unfittable",
+                                Level::WARN,
+                                rollup_id,
+                                tx_hash = %held.hash,
+                                "held transaction alone exceeds blob capacity; evicting its nonce suffix",
+                            );
+                            push_poison_root(&mut poison, &mut poison_gaps, held);
+                            continue;
+                        }
+                        Ok(BlockGasFit::Defer) => {
                             blob_budget_cut = true;
                             deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
                             break;
@@ -3261,8 +3252,7 @@ where
                     rollup_id,
                     accepted_count,
                     deferred_count,
-                    bytes = budget.bytes,
-                    limit = budget.byte_limit,
+                    blob = ?budget.blob,
                     "blob byte budget reached; remaining held transactions stay queued",
                 );
             } else if let Some(BlockGasCut { gas_used, declared }) = block_gas_cut {
@@ -3800,10 +3790,8 @@ where
 
         // ── Dispatch the rich L1 bundle and register the optimistic block. ──
         let sync_height = built.header.number();
-        // keccak of the raw EIP-2718 envelope (excluding any blob sidecar) is
-        // the tx's hash — recorded in the ledger so the finality audit can
-        // look up the postBatch receipt.
-        let post_batch_hash = post_batch_tx_hash(&postbatch_raw)?;
+        let post_batch_hash = eez_blob::post_batch_tx_hash(&postbatch_raw)
+            .map_err(|e| format!("postBatch hash: {e}"))?;
         let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivors.len());
         bundle.push(postbatch_raw);
         // Only INBOUND survivors ride the L1 bundle (L1-signed, execute on L1).
@@ -3957,10 +3945,8 @@ where
             }
         };
         let sync_height = empty_built.header.number();
-        // keccak of the raw EIP-2718 envelope (excluding any blob sidecar) is
-        // the tx's hash — recorded in the ledger so the finality audit can
-        // look up the postBatch receipt.
-        let post_batch_hash = post_batch_tx_hash(&minimal_postbatch_raw)?;
+        let post_batch_hash = eez_blob::post_batch_tx_hash(&minimal_postbatch_raw)
+            .map_err(|e| format!("postBatch hash: {e}"))?;
         event!(
             name: "eez.composer.phase1.bundle.dispatched",
             Level::INFO,
@@ -4091,7 +4077,8 @@ where
                 continue;
             };
 
-            let post_batch_hash = post_batch_tx_hash(&raw)?;
+            let post_batch_hash =
+                eez_blob::post_batch_tx_hash(&raw).map_err(|e| format!("postBatch hash: {e}"))?;
             event!(
                 name: "eez.composer.emission.historical_chunk",
                 Level::INFO,
@@ -4626,26 +4613,18 @@ where
         }
         // Blob settlement carries the stream in blobs sized for the target's fork.
         let physical_blobs = if let Some(config) = &ctx.blob_posting {
-            let limit = target_blob_limit(&ctx.l1_provider, config, bundle_target).await?;
+            let limit = target_blob_limit(
+                &ctx.l1_provider,
+                config,
+                self.inner.emission.timing.l1_block_time(),
+                bundle_target,
+            )
+            .await?;
             let blobs = eez_payload_codec::encode_blob_container(rollup_id, &blocks, &actions)
                 .map_err(|e| format!("eez_payload_codec::encode_blob_container: {e}"))?;
-            let maximum = limit.max_blobs;
-            if blobs.len() > maximum {
-                event!(
-                    name: "eez.composer.emission.candidate_over_blob_limit",
-                    Level::DEBUG,
-                    rollup_id,
-                    from,
-                    to = sync_block_number,
-                    blobs = blobs.len(),
-                    maximum,
-                    "candidate range needs more blobs than one settlement tx carries",
-                );
-                return Ok(None);
-            }
             batch.callData = Bytes::new();
             batch.blobIndices = (0..blobs.len()).map(U256::from).collect();
-            Some((config, blobs, limit.sidecar_encoding))
+            Some((config, blobs, limit))
         } else {
             let payload = eez_payload_codec::encode_container(rollup_id, &blocks, &actions)
                 .map_err(|e| format!("eez_payload_codec::encode_container: {e}"))?;
@@ -4670,7 +4649,10 @@ where
         )
         .saturating_add(attestation_gas(self.inner.emission.attesters))
         .max(calldata_floor_gas(&projected));
-        if projected_gas > ceiling {
+        let over_blobs = physical_blobs
+            .as_ref()
+            .is_some_and(|(_, blobs, limit)| blobs.len() > limit.max_blobs);
+        if projected_gas > ceiling || over_blobs {
             event!(
                 name: "eez.composer.emission.candidate_over_budget",
                 Level::DEBUG,
@@ -4680,7 +4662,8 @@ where
                 projected_gas,
                 ceiling,
                 calldata_bytes = projected.len(),
-                "candidate range exceeds the postBatch gas budget",
+                blobs = batch.blobIndices.len(),
+                "candidate range exceeds the postBatch gas or blob budget",
             );
             return Ok(None);
         }
@@ -4689,12 +4672,12 @@ where
         // proofs are CPU-heavy, so the sidecar builds on the blocking pool
         // while the witnesses build and the attesters prove.
         let (blobs, carrier) = match physical_blobs {
-            Some((config, blobs, encoding)) => {
+            Some((config, blobs, limit)) => {
                 let max_fee_per_blob_gas = blob_fee(&ctx.l1_provider, config).await?;
                 let blobs: Vec<Bytes> = blobs.into_iter().map(Bytes::from).collect();
                 let sidecar_blobs = blobs.clone();
                 let sidecar = tokio::task::spawn_blocking(move || {
-                    eez_blob::prepare_blob_sidecar(&sidecar_blobs, encoding)
+                    eez_blob::prepare_blob_sidecar(&sidecar_blobs, limit.sidecar_encoding)
                 });
                 (blobs, Some((sidecar, max_fee_per_blob_gas)))
             }
@@ -5038,7 +5021,7 @@ async fn sign_post_batch_tx(
     max_gas: u64,
     blob: Option<BlobCarrier>,
 ) -> Result<Bytes, String> {
-    use alloy_consensus::TxEip1559;
+    use alloy_consensus::{SignableTransaction as _, TxEip1559, TxEip4844, TxEip4844WithSidecar};
     use alloy_eips::BlockNumberOrTag;
     use alloy_network::TxSignerSync;
     use alloy_primitives::TxKind;
@@ -5079,8 +5062,7 @@ async fn sign_post_batch_tx(
     // Diagnostic only — from the outside a drained poster looks exactly like a
     // dead relay. Don't abort; the tx still lands if the base fee settles.
     let blob_reserve = blob.as_ref().map_or(U256::ZERO, |blob| {
-        let blob_gas =
-            blob.sidecar.versioned_hashes().len() as u64 * alloy_eips::eip4844::DATA_GAS_PER_BLOB;
+        let blob_gas = blob.sidecar.blobs().len() as u64 * alloy_eips::eip4844::DATA_GAS_PER_BLOB;
         U256::from(blob_gas).saturating_mul(U256::from(blob.max_fee_per_blob_gas))
     });
     let required = U256::from(gas_limit)
@@ -5101,19 +5083,30 @@ async fn sign_post_batch_tx(
         );
     }
 
-    if let Some(blob) = blob {
-        let params = eez_blob::BlobTransactionParams {
+    if let Some(BlobCarrier {
+        sidecar,
+        max_fee_per_blob_gas,
+    }) = blob
+    {
+        let tx = TxEip4844 {
             chain_id,
             nonce,
             gas_limit,
             max_fee_per_gas,
             max_priority_fee_per_gas: priority_fee,
-            max_fee_per_blob_gas: blob.max_fee_per_blob_gas,
             to: eez_address,
+            value: U256::ZERO,
+            access_list: alloy_eips::eip2930::AccessList::default(),
+            blob_versioned_hashes: sidecar.versioned_hashes().collect(),
+            max_fee_per_blob_gas,
             input: calldata.into(),
         };
-        return eez_blob::sign_blob_transaction(params, blob.sidecar, signer)
-            .map_err(|e| format!("sign blob postBatch: {e}"));
+        // Pooled network encoding: the relay needs the sidecar beside the tx.
+        let mut pooled = TxEip4844WithSidecar { tx, sidecar };
+        let sig = signer
+            .sign_transaction_sync(&mut pooled)
+            .map_err(|e| format!("sign blob postBatch: {e}"))?;
+        return Ok(pooled.into_signed(sig).encoded_2718().into());
     }
     let mut tx = TxEip1559 {
         chain_id,
@@ -5141,6 +5134,51 @@ mod tests {
     use crate::attestation_quorum::MAX_ATTESTERS;
     use alloy_primitives::TxHash;
     use alloy_sol_types::SolValue as _;
+
+    #[tokio::test]
+    async fn blob_post_is_a_pooled_tx_bound_to_its_sidecar() {
+        use alloy_eips::{Decodable2718 as _, eip4844::env_settings::EnvKzgSettings};
+        use alloy_provider::{ProviderBuilder, mock::Asserter};
+        let signer = alloy_signer_local::PrivateKeySigner::random();
+        let blobs = [vec![0_u8; eez_blob::BYTES_PER_BLOB]];
+        for encoding in [
+            eez_blob::BlobSidecarEncoding::Eip4844,
+            eez_blob::BlobSidecarEncoding::Eip7594,
+        ] {
+            let asserter = Asserter::new();
+            asserter.push_success(&alloy_primitives::U64::from(7));
+            asserter.push_success(&alloy_rpc_types_eth::Block::<
+                alloy_rpc_types_eth::Transaction,
+            >::default());
+            asserter.push_success(&U256::MAX);
+            let raw = sign_post_batch_tx(
+                &signer,
+                &ProviderBuilder::default().connect_mocked_client(asserter),
+                Address::repeat_byte(0x11),
+                vec![0xaa],
+                1,
+                1,
+                DEFAULT_MAX_POSTBATCH_GAS,
+                Some(BlobCarrier {
+                    sidecar: eez_blob::prepare_blob_sidecar(&blobs, encoding).unwrap(),
+                    max_fee_per_blob_gas: 1,
+                }),
+            )
+            .await
+            .unwrap();
+            let pooled = alloy_consensus::Signed::<
+                alloy_consensus::TxEip4844WithSidecar<
+                    alloy_eips::eip7594::BlobTransactionSidecarVariant,
+                >,
+            >::decode_2718_exact(&raw)
+            .unwrap();
+            let tx = pooled.tx();
+            tx.tx
+                .validate_blob(&tx.sidecar, EnvKzgSettings::Default.get())
+                .unwrap();
+            assert_eq!(eez_blob::post_batch_tx_hash(&raw).unwrap(), *pooled.hash());
+        }
+    }
 
     #[test]
     fn catchup_marker_is_unpinned_but_historical_target_keeps_the_l1_block() {
@@ -5326,47 +5364,6 @@ mod tests {
             nonce,
             direction,
         }
-    }
-
-    #[test]
-    fn blob_budget_eviction_preserves_unrelated_traffic() {
-        let pool = HeldPool::new();
-        let sender = Address::repeat_byte(0xa);
-        let mut oversized = held(sender, Direction::Outbound, 0, 1);
-        oversized.raw_tx = Bytes::from(vec![0x42; eez_blob::BYTES_PER_BLOB]);
-        let dependent = held(sender, Direction::Outbound, 1, 2);
-        let inbound = held(sender, Direction::Inbound, 0, 3);
-        let outbound = held(Address::repeat_byte(0xb), Direction::Outbound, 0, 4);
-        for tx in [&oversized, &dependent, &inbound, &outbound] {
-            pool.push_contiguous(tx.clone(), 0).unwrap();
-        }
-
-        // Reject the oversized transaction during draining, then evict its
-        // queued nonce suffix while preserving unrelated transactions.
-        let selected = pool.pop_n(1);
-        assert_eq!(selected[0].hash, oversized.hash);
-        let mut budget =
-            PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1).with_blob_limit(Some(1));
-        assert!(
-            !budget
-                .try_accept_da(1, &[], Some(&selected[0].raw_tx))
-                .unwrap()
-        );
-        let _ = pool.evict_chain_at_or_above(
-            selected[0].sender,
-            selected[0].direction,
-            selected[0].nonce,
-        );
-
-        let remaining = pool.pop_all();
-        assert_eq!(
-            remaining.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
-            vec![inbound.hash, outbound.hash],
-        );
-        pool.release_in_flight_batch(&remaining);
-        // Both reservations must be released to allow resubmission from nonce 0.
-        pool.push_contiguous(oversized, 0).unwrap();
-        pool.push_contiguous(dependent, 0).unwrap();
     }
 
     fn signed_user_tx(gas_limit: u64) -> Bytes {
@@ -5848,155 +5845,32 @@ mod tests {
         blocks
     }
 
+    const ONE_EMPTY_BLOB: BlobBytes = BlobBytes {
+        limit: eez_payload_codec::LOGICAL_BYTES_PER_BLOB,
+        used: 0,
+        floor: 0,
+    };
+
+    fn blob_budget(blob: BlobBytes) -> PostBatchGasBudget {
+        PostBatchGasBudget {
+            blob: Some(blob),
+            ..PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1)
+        }
+    }
+
     #[test]
-    fn blob_budget_empty_interval_never_permanently_defers_at_boundary() {
-        let floor = eez_payload_codec::encode_container(1, &drain_budget_range(false), &[])
-            .unwrap()
-            .len()
-            + 1;
-        // A small budget exercises the same boundary with ordinary-sized inputs.
+    fn blob_budget_defers_behind_interval_traffic_and_evicts_only_the_oversized() {
+        let floor = blob_stream_len(1, &drain_budget_range(false), &[]).unwrap();
+        let base = blob_stream_len(1, &drain_budget_range(true), &[]).unwrap();
         let limit = 4096;
-        assert!(floor < limit);
-        let mut accepted = 0;
-        let mut evicted = 0;
-        for size in (limit - floor - 128)..=(limit - floor + 16) {
-            let mut budget =
-                PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1).with_blob_limit(Some(1));
-            budget.byte_limit = Some(limit);
-            budget.bytes = floor;
-            budget.floor_bytes = floor;
-            let user = Bytes::from(vec![0x42; size]);
-            if budget.try_accept_da(1, &[], Some(&user)).unwrap() {
-                accepted += 1;
-                assert!(!budget.empty_interval_exceeds_blob_limit);
-            } else {
-                evicted += 1;
-                assert!(
-                    budget.empty_interval_exceeds_blob_limit,
-                    "{size} bytes deferred forever"
-                );
-                assert_eq!(budget.bytes, floor, "rejection must not consume capacity");
-            }
-        }
-        assert!(accepted > 0);
-        assert!(evicted > 0);
-    }
-
-    #[test]
-    fn blob_budget_interval_traffic_defers_without_eviction() {
-        let floor = eez_payload_codec::encode_container(1, &drain_budget_range(false), &[])
-            .unwrap()
-            .len()
-            + 1;
-        let base = eez_payload_codec::encode_container(1, &drain_budget_range(true), &[])
-            .unwrap()
-            .len()
-            + 1;
-        assert!(base > floor);
-        let mut budget =
-            PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1).with_blob_limit(Some(1));
-        budget.byte_limit = Some(4096);
-        budget.bytes = base;
-        budget.floor_bytes = floor;
-        let user = Bytes::from(vec![0x42; 3500]);
-        let mut empty = budget;
-        empty.bytes = floor;
-        assert!(empty.try_accept_da(1, &[], Some(&user)).unwrap());
-        assert!(!budget.try_accept_da(1, &[], Some(&user)).unwrap());
-        assert!(!budget.empty_interval_exceeds_blob_limit);
-        assert_eq!(budget.bytes, base);
-    }
-
-    #[test]
-    fn blob_cut_with_no_survivors_requeues_head_and_nonce_suffix() {
-        let pool = HeldPool::new();
-        let sender = Address::repeat_byte(0xa);
-        let head = held(sender, Direction::Outbound, 0, 1);
-        let suffix = held(sender, Direction::Outbound, 1, 2);
-        pool.push_contiguous(head.clone(), 0).unwrap();
-        pool.push_contiguous(suffix.clone(), 0).unwrap();
-        let deferred: Vec<_> = pool.pop_n(2).into_iter().enumerate().collect();
-
-        // A blob cut with no survivors poisons nothing and requeues the deferred set.
-        requeue_unprocessed(&pool, 1, &[], deferred);
-
-        let queued = pool.pop_all();
-        assert_eq!(
-            queued.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
-            vec![head.hash, suffix.hash]
-        );
-        assert!(queued.iter().all(|tx| tx.attempts == 0));
-        pool.release_in_flight_batch(&queued);
-    }
-
-    #[test]
-    fn blob_budget_committed_range_projection_covers_real_stream() {
-        let max_blobs = 1;
-        let mut blocks = drain_budget_range(true);
-        let mut budget =
-            PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1).with_blob_limit(Some(max_blobs));
-        budget.bytes = eez_payload_codec::encode_container(1, &blocks, &[])
-            .unwrap()
-            .len()
-            + 1;
-        budget.floor_bytes =
-            eez_payload_codec::encode_container(1, &drain_budget_range(false), &[])
+        let fit = |used, size| {
+            blob_budget(BlobBytes { limit, used, floor })
+                .try_accept_da(1, &[], Some(&Bytes::from(vec![0x42; size])))
                 .unwrap()
-                .len()
-                + 1;
-        let limit = budget.byte_limit.unwrap();
-        let action = eez_payload_codec::Action {
-            source_rollup_id: 1,
-            target_rollup_id: 0,
-            success: true,
-            data: vec![0x42; 100],
-            return_data: vec![0x24; 100],
-            ..Default::default()
         };
-        let entry =
-            eez_protocol::entries::manifest::entry_from_action(&action, eez_protocol::RollupId(1))
-                .unwrap();
-        // Four candidates would fill an unseeded budget, leaving no room for
-        // the committed range. Keep the length-varint width stable in the probe.
-        let probe_size = 16_384;
-        let probe = eez_payload_codec::SpanBlock {
-            extra_data: eez_driver::BUILDER_EXTRA_DATA.to_vec(),
-            transactions: vec![vec![0x42; probe_size]],
-            ..Default::default()
-        };
-        let overhead =
-            eez_payload_codec::encode_container(1, &[probe], std::slice::from_ref(&action))
-                .unwrap()
-                .len()
-                + 1
-                - probe_size;
-        let user = Bytes::from(vec![0x42; limit / 4 - overhead]);
-        let mut actions = Vec::new();
-        while budget
-            .try_accept_da(1, std::slice::from_ref(&entry), Some(&user))
-            .unwrap()
-        {
-            blocks.last_mut().unwrap().transactions.push(user.to_vec());
-            actions.push(action.clone());
-        }
-        assert!(
-            !actions.is_empty(),
-            "the projection must admit some traffic"
-        );
-        let actual = eez_payload_codec::encode_container(1, &blocks, &actions)
-            .unwrap()
-            .len()
-            + 1;
-        assert!(
-            actual <= budget.bytes,
-            "projection omitted committed range bytes"
-        );
-        assert!(
-            eez_payload_codec::encode_blob_container(1, &blocks, &actions)
-                .unwrap()
-                .len()
-                <= max_blobs
-        );
+        assert_eq!(fit(floor, 3500), BlockGasFit::Accept);
+        assert_eq!(fit(base, 3500), BlockGasFit::Defer);
+        assert_eq!(fit(floor, limit), BlockGasFit::Unfittable);
     }
 
     #[test]
@@ -6009,22 +5883,25 @@ mod tests {
                 extra_data: eez_driver::BUILDER_EXTRA_DATA.to_vec(),
                 ..Default::default()
             }];
-            let expected = eez_payload_codec::encode_blob_container(1, &blocks, &[])
+            let fits = eez_payload_codec::encode_blob_container(1, &blocks, &[])
                 .unwrap()
                 .len()
                 <= 1;
-            let mut budget =
-                PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1).with_blob_limit(Some(1));
+            let mut budget = blob_budget(ONE_EMPTY_BLOB);
             assert_eq!(
                 budget.try_accept_da(1, &[], Some(&user)).unwrap(),
-                expected,
+                if fits {
+                    BlockGasFit::Accept
+                } else {
+                    BlockGasFit::Unfittable
+                },
                 "{length} bytes"
             );
         }
     }
 
     #[test]
-    fn blob_budget_covers_actions_and_count_prefix_growth() {
+    fn blob_budget_projection_covers_the_real_stream() {
         for outbound in [false, true] {
             let action = eez_payload_codec::Action {
                 source_rollup_id: u64::from(outbound),
@@ -6040,16 +5917,17 @@ mod tests {
             )
             .unwrap();
             let user = Bytes::from(vec![0x42; 100]);
-            let mut budget =
-                PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1).with_blob_limit(Some(1));
+            // Seeded with committed traffic, so an unseeded base under-counts.
+            let mut blocks = drain_budget_range(true);
+            let mut budget = blob_budget(BlobBytes {
+                used: blob_stream_len(1, &blocks, &[]).unwrap(),
+                ..ONE_EMPTY_BLOB
+            });
             let mut actions = Vec::new();
-            let mut block = eez_payload_codec::SpanBlock {
-                extra_data: eez_driver::BUILDER_EXTRA_DATA.to_vec(),
-                ..Default::default()
-            };
             while budget
                 .try_accept_da(1, std::slice::from_ref(&entry), outbound.then_some(&user))
                 .unwrap()
+                == BlockGasFit::Accept
             {
                 actions.push(
                     eez_protocol::entries::manifest::action_from_entry(
@@ -6059,66 +5937,22 @@ mod tests {
                     .unwrap(),
                 );
                 if outbound {
-                    block.transactions.push(user.to_vec());
+                    blocks.last_mut().unwrap().transactions.push(user.to_vec());
                 }
-                let bytes =
-                    eez_payload_codec::encode_container(1, std::slice::from_ref(&block), &actions)
-                        .unwrap()
-                        .len()
-                        + 1;
-                assert!(bytes <= budget.bytes);
-                assert!(bytes <= budget.byte_limit.unwrap());
+                let bytes = blob_stream_len(1, &blocks, &actions).unwrap();
+                assert!(bytes <= budget.blob.unwrap().used);
             }
             assert!(
                 actions.len() > 128,
                 "exercise multibyte count and operations-length prefixes"
             );
             assert_eq!(
-                eez_payload_codec::encode_blob_container(1, &[block], &actions)
+                eez_payload_codec::encode_blob_container(1, &blocks, &actions)
                     .unwrap()
                     .len(),
                 1
             );
         }
-    }
-
-    #[test]
-    fn blob_budget_rejection_leaves_the_live_budget_unchanged() {
-        let raw_tx = Bytes::from(vec![0x42; 65_000]);
-        let mut budget =
-            PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1).with_blob_limit(Some(1));
-        let cost = TxL1Gas {
-            entries: 1,
-            calldata_gas: 0,
-            target_gas: 0,
-        };
-        assert!(budget.try_accept_da(1, &[], Some(&raw_tx)).unwrap());
-        assert!(budget.try_accept(cost));
-        let bytes = budget.bytes;
-        assert!(!budget.try_accept_da(1, &[], Some(&raw_tx)).unwrap());
-        assert_eq!(budget.bytes, bytes);
-        let mut candidate = budget;
-        assert!(
-            candidate
-                .try_accept_da(1, &[], Some(&Bytes::from_static(&[1])))
-                .unwrap()
-        );
-        assert!(!candidate.try_accept(TxL1Gas {
-            target_gas: u64::MAX,
-            ..cost
-        }));
-        assert_eq!(
-            budget.bytes, bytes,
-            "gas rejection leaves the live byte budget unchanged"
-        );
-
-        let oversized = Bytes::from(vec![0x42; eez_blob::BYTES_PER_BLOB]);
-        let mut calldata = PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1);
-        assert!(calldata.try_accept_da(1, &[], Some(&oversized)).unwrap());
-        assert_eq!(
-            calldata.bytes, 0,
-            "calldata retains the existing gas-only admission policy"
-        );
     }
 
     #[test]
@@ -6334,7 +6168,7 @@ mod tests {
         let entries = [outbound_entry()];
         let raw_tx = vec![0x77u8; 180];
         let calldata = PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1);
-        let blob = calldata.with_blob_limit(Some(1));
+        let blob = blob_budget(ONE_EMPTY_BLOB);
         let in_calldata = calldata.tx_cost(&entries, &entries, &raw_tx, MEASURED_TARGET_GAS);
         let in_blobs = blob.tx_cost(&entries, &entries, &raw_tx, MEASURED_TARGET_GAS);
         let batch_only = projected_tx_l1_gas(&entries, &[], &[], MEASURED_TARGET_GAS);
@@ -6407,7 +6241,7 @@ mod tests {
         // Pair 1 fits an empty block.
         assert_eq!(
             block_gas_fit(0, pair, BUILDER_GAS_LIMIT),
-            BlockGasFit::Accept,
+            BlockGasFit::Accept
         );
         // Pair 2 sees the burn of pair 1 and does not.
         let after_one = LOAD_BURNED + USER_BURNED;

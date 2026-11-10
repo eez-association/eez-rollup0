@@ -32,9 +32,12 @@ pub(crate) use blocks::{
 pub(crate) use blocks::{
     SettlingBlockObservations, inspect_settling_block, verify_no_intermediate_system_transactions,
 };
-pub(crate) use da::{DaPayloadError, verify_blob_da_payload, verify_da_payload};
+pub(crate) use da::{DaPayloadError, verify_da_payload};
 #[cfg(test)]
-pub(crate) use da::{encode_da_payload, encode_da_payload_for, verify_da_payload_for_test};
+pub(crate) use da::{
+    VerifiedDa, encode_blob_da_payload, encode_da_payload, encode_da_payload_for,
+    verify_da_payload_for_test,
+};
 #[cfg(test)]
 pub(crate) use effect_binding::{BoundEffectSequence, ClaimedEntryShape, ObservedEffectKind};
 pub(crate) use effect_binding::{EffectPrefixError, bind_effects_to_execution};

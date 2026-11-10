@@ -367,6 +367,9 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     });
 
     assert_eq!(run.unwrap().into_inner(), expected_hash);
+    let mut wrong_sidecar = sidecar.clone();
+    wrong_sidecar.l2ToL1Calls[0].data = Bytes::from_static(b"different call");
+    assert_blob_da_settles(&batch, &validated, &[Vec::new()], &sidecar, &wrong_sidecar);
 
     // Removing both the selector and its context must not turn an inbound
     // system transaction into an attestable timeless batch.
@@ -668,10 +671,12 @@ fn a_fully_bound_outbound_effect_is_authorized() {
     // state update projects to the same action — EEZ binds state updates
     // through the entry hashes in the public input, not through the DA. A
     // mismatch therefore has to be a different call.
-    let mut mismatched_da = batch;
+    let mut mismatched_da = batch.clone();
     let mut wrong_call = mismatched_da.entries[1].clone();
     wrong_call.l2ToL1Calls[0].value += alloy_primitives::U256::from(1);
-    mismatched_da.callData = settlement::encode_da_payload(&[vec![user]], &[wrong_call]).into();
+    mismatched_da.callData =
+        settlement::encode_da_payload(&[vec![user.clone()]], std::slice::from_ref(&wrong_call))
+            .into();
     let mismatched_calldata = eez_protocol::entries::encode_postbatch(&mismatched_da);
     let run = run_settlement(SettlementInput {
         l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
@@ -691,215 +696,54 @@ fn a_fully_bound_outbound_effect_is_authorized() {
             settlement::DaPayloadError::ActionMismatch { .. }
         ))
     ));
+    assert_blob_da_settles(
+        &batch,
+        &validated,
+        &[vec![user]],
+        &batch.entries[1],
+        &wrong_call,
+    );
 }
 
-fn inbound_blob_settlement_fixture() -> BlobSettlementFixture {
-    let value = U256::from(7);
-    let (transaction, call_hash, return_data, sidecar) = strict_inbound_transaction(value);
-    let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
-        transactions: vec![transaction],
-        ..Default::default()
-    };
-    let validated = blob_settlement_window(
-        body,
-        validate::SettlementBlockEvidence::for_test(vec![true], Vec::new()),
-    );
-    let mut batch = anchor_batch_spanning(5, 6);
-    batch.entries[0].rollupUpdates[0].newRoot = empty_prefix_candidate();
-    batch.entries.push(ExecutionEntrySol {
-        rollupUpdates: vec![RollupUpdateSol {
-            rollupId: 1,
-            currentRoot: empty_prefix_candidate(),
-            newRoot: block_hash_of(6),
-            etherDelta: eez_protocol::abi::u256_to_i192(value).unwrap(),
-        }],
-        proxyEntryHash: call_hash,
-        l2ToL1Calls: Vec::new(),
-        expectedL1ToL2Calls: Vec::new(),
-        rollingHash: B256::ZERO,
-        destinationRollupId: 1,
-        success: true,
-        returnData: return_data,
-    });
-    eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
-    let action =
-        eez_protocol::entries::manifest::action_from_entry(&sidecar, eez_protocol::RollupId(1))
-            .unwrap();
-    let span = vec![eez_payload_codec::SpanBlock::default(); 2];
-    (batch, validated, span, action)
-}
-
-fn outbound_blob_settlement_fixture() -> BlobSettlementFixture {
-    use reth_primitives_traits::BlockBody as _;
-
-    let (window_pre, _, window_post) = window_endpoints(5, 6);
-    let batch = outbound_batch(window_pre, window_post);
-    let call = &batch.entries[1].l2ToL1Calls[0];
-    let call_hash = eez_protocol::l2_outbound_call_hash(
-        eez_protocol::CallHashInput {
-            call_mode: eez_protocol::CallMode::Mutable,
-            source_address: call.sourceAddress,
-            source_rollup_id: eez_protocol::RollupId(1),
-            target_address: call.targetAddress,
-            target_rollup_id: eez_protocol::RollupId::MAINNET,
-            value: call.value,
-            data: &call.data,
-        },
-        0,
-    );
-    let user_body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
-        transactions: vec![non_system_transaction()],
-        ..Default::default()
-    };
-    let user = user_body
-        .encoded_2718_transactions_iter()
-        .next()
-        .expect("outbound user transaction");
-    let mut sidecar = batch.entries[1].clone();
-    sidecar.rollupUpdates.clear();
-    sidecar.rollingHash = B256::ZERO;
-    let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
-        &[(sidecar.clone(), Bytes::from(user.clone()))],
-        &[],
-        &system_transaction_context(),
-        0,
-    )
-    .unwrap();
-    let transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
-        .into_iter()
-        .map(|raw| {
-            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
-                raw.as_ref(),
-            )
-            .unwrap()
+/// Carry `batch`'s DA in one blob instead of `callData`: it settles to the
+/// hash binding the blob's versioned hash, and a substituted sidecar still
+/// fails the DA gate.
+fn assert_blob_da_settles(
+    batch: &eez_protocol::EvmBatch,
+    validated: &validate::ValidatedWindow,
+    blocks: &[Vec<Vec<u8>>],
+    sidecar: &ExecutionEntrySol,
+    wrong_sidecar: &ExecutionEntrySol,
+) {
+    let mut batch = batch.clone();
+    batch.callData = Bytes::new();
+    batch.blobIndices = vec![U256::ZERO];
+    let reconstructor = test_system_transaction_reconstructor(expected_rollup_id(1));
+    let cancellation = CancellationToken::default();
+    let settle = |blobs: &[Vec<u8>]| {
+        run_settlement(SettlementInput {
+            l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
+            submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+            blobs,
+            validated_window: validated,
+            expected_rollup_id: expected_rollup_id(1),
+            expected_l2_system_address: TEST_SYSTEM_ADDRESS,
+            proof_system_vkey: test_proof_system_vkey(),
+            expected_proof_system: test_proof_system(),
+            system_transaction_reconstructor: &reconstructor,
+            cancellation: &cancellation,
         })
-        .collect();
-    let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
-        transactions,
-        ..Default::default()
     };
-    let validated = blob_settlement_window(
-        body,
-        validate::SettlementBlockEvidence::for_test(
-            vec![true, false],
-            vec![validate::OutboundEventObservation::decoded_for_test(
-                1, 0, call_hash, 0,
-            )],
-        ),
-    );
-    let span = vec![
-        eez_payload_codec::SpanBlock::default(),
-        eez_payload_codec::SpanBlock {
-            transactions: vec![user],
-            ..Default::default()
-        },
-    ];
-    let action =
-        eez_protocol::entries::manifest::action_from_entry(&sidecar, eez_protocol::RollupId(1))
-            .unwrap();
-    (batch, validated, span, action)
-}
-
-fn blob_settlement_window(
-    body: eez_primitives::BlockBody,
-    evidence: validate::SettlementBlockEvidence,
-) -> validate::ValidatedWindow {
-    let transaction_count = body.transactions.len();
-    let settling = validate::ValidatedBlock::for_test(
-        6,
-        alloy_rlp::encode(eez_primitives::Block::new(
-            alloy_consensus::Header {
-                timestamp: 124,
-                ..Default::default()
-            },
-            body,
-        )),
-        evidence,
-    );
-    let preceding = validate::ValidatedBlock::for_test(
-        5,
-        alloy_rlp::encode(eez_primitives::Block::default()),
-        validate::SettlementBlockEvidence::for_test(Vec::new(), Vec::new()),
-    );
-    validate::ValidatedWindow::for_test(
-        block_hash_of(4),
-        block_hash_of(6),
-        vec![preceding],
-        validate::testing::settling_block_for_test(
-            settling,
-            vec![true; transaction_count],
-            vec![
-                pre_execution_checkpoint(empty_prefix_candidate()),
-                checkpoint(transaction_count - 1, block_hash_of(6)),
-            ],
-        ),
+    let blobs = settlement::encode_blob_da_payload(blocks, std::slice::from_ref(sidecar));
+    let expected = eez_protocol::public_inputs::public_inputs_hashes_with_blobs_and_context(
+        &batch,
+        test_proof_system_vkey().get(),
+        &eez_blob::versioned_hashes(&blobs).unwrap(),
+        Some(crate::testkit::live_context()),
     )
-}
-
-type BlobSettlementFixture = (
-    eez_protocol::abi::EvmBatch,
-    validate::ValidatedWindow,
-    Vec<eez_payload_codec::SpanBlock>,
-    eez_payload_codec::Action,
-);
-
-#[tokio::test]
-async fn blob_settlement_rejects_mismatched_and_malformed_da() {
-    for (direction, (mut batch, validated, span, action)) in [
-        ("inbound", inbound_blob_settlement_fixture()),
-        ("outbound", outbound_blob_settlement_fixture()),
-    ] {
-        let blobs =
-            eez_payload_codec::encode_blob_container(1, &span, std::slice::from_ref(&action))
-                .unwrap();
-        batch.blockNumber = u64::MAX;
-        batch.callData = Bytes::new();
-        batch.blobIndices = vec![U256::ZERO];
-        let hashes = eez_blob::versioned_hashes(&blobs).unwrap();
-        let expected = eez_protocol::public_inputs::public_inputs_hashes_with_blobs_and_context(
-            &batch,
-            test_proof_system_vkey().get(),
-            &hashes,
-            Some(eez_protocol::l1_context::LiveSettlementContext {
-                parent_hash: crate::testkit::live_context().parent_hash,
-                timestamp: 124,
-            }),
-        )
-        .unwrap()[0];
-        let cancellation = CancellationToken::default();
-        let reconstructor = test_system_transaction_reconstructor(expected_rollup_id(1));
-        let run = |blobs: &[Vec<u8>]| {
-            run_settlement(SettlementInput {
-                l1_parent_hash: (batch.blockNumber == u64::MAX)
-                    .then(|| crate::testkit::live_context().parent_hash),
-                submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
-                validated_window: &validated,
-                expected_rollup_id: expected_rollup_id(1),
-                expected_l2_system_address: TEST_SYSTEM_ADDRESS,
-                proof_system_vkey: test_proof_system_vkey(),
-                expected_proof_system: test_proof_system(),
-                system_transaction_reconstructor: &reconstructor,
-                cancellation: &cancellation,
-                blobs,
-            })
-        };
-        assert_eq!(run(&blobs).unwrap().into_inner(), expected, "{direction}");
-
-        let mut wrong_action = action;
-        wrong_action.data.push(0xff);
-        let substituted =
-            eez_payload_codec::encode_blob_container(1, &span, &[wrong_action]).unwrap();
-        assert_eq!(
-            run(&substituted).unwrap_err().gate(),
-            "da_payload",
-            "{direction}: mismatched action"
-        );
-        let mut malformed = blobs;
-        malformed[0][0] = 1;
-        assert_eq!(
-            run(&malformed).unwrap_err().gate(),
-            "da_payload",
-            "{direction}: malformed blob"
-        );
-    }
+    .unwrap()[0];
+    assert_eq!(settle(&blobs).unwrap().into_inner(), expected);
+    let substituted =
+        settlement::encode_blob_da_payload(blocks, std::slice::from_ref(wrong_sidecar));
+    assert_eq!(settle(&substituted).unwrap_err().gate(), "da_payload");
 }

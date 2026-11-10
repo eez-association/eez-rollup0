@@ -158,9 +158,6 @@ pub enum CodecError {
     /// A bracket followed a failed return, which terminates the manifest.
     #[error("an action bracket follows a failed return")]
     ActionAfterFailure,
-    /// The blob profile requires at least one physical blob.
-    #[error("blob profile requires at least one physical blob")]
-    NoBlobs,
     /// A physical EIP-4844 blob did not have the required byte length.
     #[error("blob {index} has length {actual}; expected {expected}")]
     InvalidBlobLength {
@@ -179,12 +176,9 @@ pub enum CodecError {
         /// Zero-based field-element position.
         field_index: usize,
     },
-    /// A blob-backed stream omitted its mandatory close marker.
-    #[error("blob stream is missing CloseBlobStream")]
+    /// A blob-backed stream does not end in CloseBlobStream and zero padding.
+    #[error("blob stream does not end in CloseBlobStream and zero padding")]
     CloseBlobStreamMissing,
-    /// Bytes after the close marker must be zero padding.
-    #[error("blob stream has nonzero padding after CloseBlobStream")]
-    NonZeroBlobPadding,
     /// A value did not fit the `uvarint32` domain on encode.
     #[error("{what} = {value} exceeds u32")]
     ValueTooLarge {
@@ -418,14 +412,6 @@ impl<'a> Cursor<'a> {
 
     pub(crate) const fn remaining(&self) -> usize {
         self.body.len() - self.at
-    }
-
-    pub(crate) fn peek(&self) -> Option<u8> {
-        self.body.get(self.at).copied()
-    }
-
-    pub(crate) fn remaining_slice(&self) -> &'a [u8] {
-        &self.body[self.at..]
     }
 
     pub(crate) fn take(&mut self, what: &'static str, len: usize) -> CodecResult<&'a [u8]> {
