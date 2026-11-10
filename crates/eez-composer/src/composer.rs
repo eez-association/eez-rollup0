@@ -3790,8 +3790,10 @@ where
 
         // ── Dispatch the rich L1 bundle and register the optimistic block. ──
         let sync_height = built.header.number();
-        let post_batch_hash = eez_blob::post_batch_tx_hash(&postbatch_raw)
-            .map_err(|e| format!("postBatch hash: {e}"))?;
+        let SignedPostBatch {
+            raw: postbatch_raw,
+            hash: post_batch_hash,
+        } = postbatch_raw;
         let mut bundle: Vec<Bytes> = Vec::with_capacity(1 + survivors.len());
         bundle.push(postbatch_raw);
         // Only INBOUND survivors ride the L1 bundle (L1-signed, execute on L1).
@@ -3945,8 +3947,10 @@ where
             }
         };
         let sync_height = empty_built.header.number();
-        let post_batch_hash = eez_blob::post_batch_tx_hash(&minimal_postbatch_raw)
-            .map_err(|e| format!("postBatch hash: {e}"))?;
+        let SignedPostBatch {
+            raw: minimal_postbatch_raw,
+            hash: post_batch_hash,
+        } = minimal_postbatch_raw;
         event!(
             name: "eez.composer.phase1.bundle.dispatched",
             Level::INFO,
@@ -4077,8 +4081,10 @@ where
                 continue;
             };
 
-            let post_batch_hash =
-                eez_blob::post_batch_tx_hash(&raw).map_err(|e| format!("postBatch hash: {e}"))?;
+            let SignedPostBatch {
+                raw,
+                hash: post_batch_hash,
+            } = raw;
             event!(
                 name: "eez.composer.emission.historical_chunk",
                 Level::INFO,
@@ -4325,7 +4331,7 @@ where
         outbound_target_gas: u64,
         bundle_target: BundleTarget,
         l1_context: Option<eez_protocol::l1_context::LiveSettlementContext>,
-    ) -> Result<Option<Bytes>, PreparePostBatchError> {
+    ) -> Result<Option<SignedPostBatch>, PreparePostBatchError> {
         use eez_protocol::abi::postAndVerifyBatchCall;
 
         let sync_block_hash = terminal_header.hash();
@@ -5001,6 +5007,13 @@ async fn observe_bundle_outcome(
     }
 }
 
+/// A signed postBatch and the hash L1 reports for it, which excludes a blob
+/// post's sidecar.
+struct SignedPostBatch {
+    raw: Bytes,
+    hash: B256,
+}
+
 /// Sign an EIP-1559 or blob L1 transaction for `postAndVerifyBatch` submission.
 ///
 /// Sets `max_priority_fee_per_gas` from the caller (so we can order
@@ -5020,7 +5033,7 @@ async fn sign_post_batch_tx(
     priority_fee: u128,
     max_gas: u64,
     blob: Option<BlobCarrier>,
-) -> Result<Bytes, String> {
+) -> Result<SignedPostBatch, String> {
     use alloy_consensus::{SignableTransaction as _, TxEip1559, TxEip4844, TxEip4844WithSidecar};
     use alloy_eips::BlockNumberOrTag;
     use alloy_network::TxSignerSync;
@@ -5106,7 +5119,11 @@ async fn sign_post_batch_tx(
         let sig = signer
             .sign_transaction_sync(&mut pooled)
             .map_err(|e| format!("sign blob postBatch: {e}"))?;
-        return Ok(pooled.into_signed(sig).encoded_2718().into());
+        let signed = pooled.into_signed(sig);
+        return Ok(SignedPostBatch {
+            hash: *signed.hash(),
+            raw: signed.encoded_2718().into(),
+        });
     }
     let mut tx = TxEip1559 {
         chain_id,
@@ -5125,7 +5142,10 @@ async fn sign_post_batch_tx(
     let signed = TransactionSigned::new_unhashed(Transaction::Eip1559(tx), sig);
     let mut buf = Vec::with_capacity(512);
     signed.encode_2718(&mut buf);
-    Ok(Bytes::from(buf))
+    Ok(SignedPostBatch {
+        hash: *signed.tx_hash(),
+        raw: Bytes::from(buf),
+    })
 }
 
 #[cfg(test)]
@@ -5151,7 +5171,7 @@ mod tests {
                 alloy_rpc_types_eth::Transaction,
             >::default());
             asserter.push_success(&U256::MAX);
-            let raw = sign_post_batch_tx(
+            let SignedPostBatch { raw, hash } = sign_post_batch_tx(
                 &signer,
                 &ProviderBuilder::default().connect_mocked_client(asserter),
                 Address::repeat_byte(0x11),
@@ -5176,7 +5196,9 @@ mod tests {
             tx.tx
                 .validate_blob(&tx.sidecar, EnvKzgSettings::Default.get())
                 .unwrap();
-            assert_eq!(eez_blob::post_batch_tx_hash(&raw).unwrap(), *pooled.hash());
+            // The composer observes `hash`; the submitter derives it from `raw`.
+            assert_eq!(hash, *pooled.hash());
+            assert_eq!(eez_blob::post_batch_tx_hash(&raw).unwrap(), hash);
         }
     }
 
