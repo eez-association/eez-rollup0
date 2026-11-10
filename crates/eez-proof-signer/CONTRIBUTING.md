@@ -58,9 +58,9 @@ See [architecture](docs/architecture.md),
 - Use fork-aware sender facts retained by Stateless. Settlement must not
   independently recover the same signatures under potentially different fork
   rules.
-- Keep the attestation key, expected attester address, L2 system-transaction
-  key, proof-system vkey, and proof-system address as explicit
-  operator-configured bindings.
+- Keep the attestation key, expected attester address, reserved L2 system
+  address, proof-system vkey, and proof-system address as explicit
+  operator-configured bindings. Native system transactions require no private key.
   Never log or preserve private-key input in diagnostics.
 - An attestation does not claim canonical ancestry, sequencer authority, live
   L1 applicability, successful future L1 execution, dispatch mode, or the code

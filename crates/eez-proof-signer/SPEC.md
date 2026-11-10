@@ -116,7 +116,7 @@ Values are classified as follows:
 | Source | Authority and required treatment |
 | --- | --- |
 | Operator configuration | Authoritative for execution-chain rules, expected rollup ID, proof-system address and vkey, attester identity, reserved system address, and resource limits. The deployment MUST use the fixed EEZL2 predeploy and reserved native system address. |
-| Composer stream | Untrusted, including range, hashes, RLP, witness, settlement calldata, and claimed public-input hash. |
+| Composer stream | Untrusted, including range, hashes, RLP, witness, settlement calldata, posting context, and session bindings. |
 | Validation-backend output | Security-critical derived evidence. It MUST be consumed and checked against the corresponding admitted blocks before settlement uses it. The backend is trusted to derive that evidence by the replay rules in section 6. |
 | Pinned EEZ contracts | Authoritative for on-chain ABI layouts, selectors, hashes, and execution behavior. |
 | `eez-protocol` mirrors | Shared local implementations used by the signer; they MUST match the pinned contracts and independent vectors. |
