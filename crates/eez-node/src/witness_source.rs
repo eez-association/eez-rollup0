@@ -23,9 +23,10 @@ use alloy_consensus::Header;
 use alloy_eips::BlockHashOrNumber;
 use alloy_primitives::{B256, Bytes};
 use alloy_rpc_types_debug::ExecutionWitness;
+use eez_composer::Prevalidation;
 use eez_driver::witness::{ExecutionWitnessMode, block_witness};
 use eez_primitives::{Block, EezPrimitives};
-use eez_prover::{BlockWitness, Prover, ProvingAnchor, ProvingWitnessSource};
+use eez_prover::{BlockWitness, ProvingAnchor, ProvingWitnessSource};
 use reth_evm::ConfigureEvm;
 use reth_libmdbx::{DatabaseFlags, Environment, Geometry, WriteFlags};
 use reth_storage_api::{BlockReader, HeaderProvider, StateProviderFactory, TransactionVariant};
@@ -294,7 +295,7 @@ pub async fn run_capture<P, E, F, G>(
     store: WitnessStore,
     provider: P,
     evm_config: E,
-    prover: Arc<dyn Prover>,
+    mut prevalidation: Prevalidation,
     rollup_id: u64,
     posted_floor: F,
     settled_floor: G,
@@ -310,10 +311,8 @@ pub async fn run_capture<P, E, F, G>(
     F: Fn() -> u64 + Send + 'static,
     G: Fn() -> u64 + Send + 'static,
 {
-    // Best-effort network work must never hold up durable witness capture.
-    // At most one request owns a witness; excess blocks remain on disk for Finalize.
-    // JoinSet also aborts the request when capture shuts down or is cancelled.
-    let mut prevalidation = tokio::task::JoinSet::new();
+    // Prevalidation runs in its own tasks, so network work never holds up
+    // durable witness capture; dropping it on shutdown aborts them.
     while let Some(hash) = rx.recv().await {
         let capture_provider = provider.clone();
         let evm_config = evm_config.clone();
@@ -350,22 +349,9 @@ pub async fn run_capture<P, E, F, G>(
                         "persisting captured witness failed",
                     );
                 }
-                while prevalidation.try_join_next().is_some() {}
                 match anchor {
-                    Ok(anchor) if number > anchor.number && prevalidation.is_empty() => {
-                        let prover = Arc::clone(&prover);
-                        prevalidation.spawn(async move {
-                            if let Err(error) = prover.prevalidate(rollup_id, anchor, bw).await {
-                                event!(
-                                    name: "eez.node.witness_capture.prevalidate_failed",
-                                    Level::WARN,
-                                    number,
-                                    anchor = anchor.number,
-                                    error = %error,
-                                    "prover did not prevalidate a captured block; Finalize will backfill it",
-                                );
-                            }
-                        });
+                    Ok(anchor) if number > anchor.number => {
+                        prevalidation.offer(rollup_id, anchor, &bw);
                     }
                     Err(error) => event!(
                         name: "eez.node.witness_capture.anchor_unavailable",
@@ -373,13 +359,6 @@ pub async fn run_capture<P, E, F, G>(
                         number,
                         error = %error,
                         "witness persisted without prevalidation; Finalize will backfill it",
-                    ),
-                    Ok(anchor) if number > anchor.number => event!(
-                        name: "eez.node.witness_capture.prevalidate_busy",
-                        Level::DEBUG,
-                        number,
-                        anchor = anchor.number,
-                        "prevalidation busy; persisted witness will be backfilled by proof submission",
                     ),
                     Ok(_) => {}
                 }
