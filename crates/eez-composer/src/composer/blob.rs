@@ -26,6 +26,30 @@ pub(super) struct BlobCarrier {
     pub(super) max_fee_per_blob_gas: u128,
 }
 
+/// The blob limit at the L1 block a batch targets: its pinned timestamp, else
+/// one slot past the current L1 head.
+pub(super) async fn target_blob_limit(
+    l1_provider: &alloy_provider::RootProvider,
+    config: &BlobPostingConfig,
+    target: eez_l1::BundleTarget,
+) -> Result<eez_blob::ActiveBlobLimit, String> {
+    use alloy_provider::Provider as _;
+    let timestamp = match target {
+        eez_l1::BundleTarget::Exact { timestamp, .. } => timestamp,
+        _ => l1_provider
+            .get_block_by_number(alloy_eips::BlockNumberOrTag::Latest)
+            .await
+            .map_err(|e| format!("get blob L1 head: {e}"))?
+            .ok_or("L1 head unavailable")?
+            .header
+            .timestamp
+            .checked_add(config.slot_seconds)
+            .ok_or("blob target timestamp overflow")?,
+    };
+    eez_blob::blob_limit_at(&config.chain_spec, timestamp)
+        .ok_or_else(|| "no blob fork is active at the blob target".to_owned())
+}
+
 /// Fee headroom over the observed blob base fee, bounded by the operator's cap.
 const BLOB_FEE_HEADROOM: u128 = 2;
 

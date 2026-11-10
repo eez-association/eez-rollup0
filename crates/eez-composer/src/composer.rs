@@ -59,7 +59,7 @@ use crate::rollup::RollupState;
 
 mod blob;
 pub use blob::BlobPostingConfig;
-use blob::{BlobCarrier, blob_fee, post_batch_tx_hash};
+use blob::{BlobCarrier, blob_fee, post_batch_tx_hash, target_blob_limit};
 
 fn bundle_targets_for_slot(
     target_l1_block: Option<u64>,
@@ -2201,53 +2201,15 @@ where
         let outbound_source_nonces =
             outbound_source_nonces_for_drain(state.as_ref(), rollup_id, &drained);
         drop(state);
-        let mut source_nonces = inbound_source_nonces_for_drain(
-            ctx,
-            rollup_id,
-            &drained,
-            alloy_eips::BlockId::latest(),
-        )
-        .await;
-        source_nonces.extend(outbound_source_nonces);
-        let (drained, stale) = partition_stale(drained, &source_nonces);
-        for tx in &stale {
-            event!(
-                name: "eez.composer.cc_compose.stale_nonce_evicted",
-                Level::WARN,
-                rollup_id,
-                tx_hash = %tx.hash,
-                sender = %tx.sender,
-                nonce = tx.nonce,
-                direction = ?tx.direction,
-                "held tx nonce is below its canonical source-chain nonce; evicting stale tx",
-            );
-        }
-        pool.release_in_flight_batch(&stale);
-
-        // Resolve the same target fork allowance used when posting the batch.
-        let blob_limit = if let Some(config) = &ctx.blob_posting {
-            let target = match bundle_target {
-                BundleTarget::Exact { timestamp, .. } => timestamp,
-                _ => {
-                    use alloy_provider::Provider as _;
-                    ctx.l1_provider
-                        .get_block_by_number(alloy_eips::BlockNumberOrTag::Latest)
-                        .await
-                        .map_err(|e| format!("get blob L1 head: {e}"))?
-                        .ok_or("L1 head unavailable")?
-                        .header
-                        .timestamp
-                        .checked_add(config.slot_seconds)
-                        .ok_or("blob timestamp overflow")?
-                }
-            };
-            Some(
-                eez_blob::blob_limit_at(&config.chain_spec, target)
-                    .ok_or("no blob fork active at target")?
+        // Sized here, before classification, so an error requeues the drain
+        // untouched. Uses the fork allowance the post resolves.
+        let blob_limit = match &ctx.blob_posting {
+            Some(config) => Some(
+                target_blob_limit(&ctx.l1_provider, config, bundle_target)
+                    .await?
                     .max_blobs,
-            )
-        } else {
-            None
+            ),
+            None => None,
         };
         // Reserve the actual committed range and terminal metadata before
         // admitting held transactions. Include CloseBlobStream in the base.
@@ -2288,6 +2250,29 @@ where
         } else {
             (0, 0)
         };
+        let mut source_nonces = inbound_source_nonces_for_drain(
+            ctx,
+            rollup_id,
+            &drained,
+            alloy_eips::BlockId::latest(),
+        )
+        .await;
+        source_nonces.extend(outbound_source_nonces);
+        let (drained, stale) = partition_stale(drained, &source_nonces);
+        for tx in &stale {
+            event!(
+                name: "eez.composer.cc_compose.stale_nonce_evicted",
+                Level::WARN,
+                rollup_id,
+                tx_hash = %tx.hash,
+                sender = %tx.sender,
+                nonce = tx.nonce,
+                direction = ?tx.direction,
+                "held tx nonce is below its canonical source-chain nonce; evicting stale tx",
+            );
+        }
+        pool.release_in_flight_batch(&stale);
+
         // ── Slot execution contexts (design §2) ──────────────────────
         // One L1 state pinned at the anchor and one live Sync-block prefix,
         // both advanced only by accepted transactions. Failing to open either
@@ -4641,23 +4626,7 @@ where
         }
         // Blob settlement carries the stream in blobs sized for the target's fork.
         let physical_blobs = if let Some(config) = &ctx.blob_posting {
-            let timestamp = match bundle_target {
-                BundleTarget::Exact { timestamp, .. } => timestamp,
-                _ => {
-                    use alloy_provider::Provider as _;
-                    ctx.l1_provider
-                        .get_block_by_number(alloy_eips::BlockNumberOrTag::Latest)
-                        .await
-                        .map_err(|error| format!("get blob L1 head: {error}"))?
-                        .ok_or("L1 head unavailable")?
-                        .header
-                        .timestamp
-                        .checked_add(config.slot_seconds)
-                        .ok_or("blob target timestamp overflow")?
-                }
-            };
-            let limit = eez_blob::blob_limit_at(&config.chain_spec, timestamp)
-                .ok_or("no blob fork is active at the blob target")?;
+            let limit = target_blob_limit(&ctx.l1_provider, config, bundle_target).await?;
             let blobs = eez_payload_codec::encode_blob_container(rollup_id, &blocks, &actions)
                 .map_err(|e| format!("eez_payload_codec::encode_blob_container: {e}"))?;
             let maximum = limit.max_blobs;
