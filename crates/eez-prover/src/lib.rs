@@ -151,11 +151,18 @@ pub struct ProvingContext {
     pub to_block: u64,
     /// Execution predecessor of `from_block`, including its execution state root.
     pub anchor: ProvingAnchor,
+    /// Registry verification key captured for this request by the Composer.
+    /// `None` preserves the prover's single-attester default. This is local
+    /// verification metadata, not a field supplied by the remote prover.
+    pub verification_key: Option<B256>,
     /// The authoritative postBatch payload (proof carriers filled, `proofs[]`
     /// empty). The prover recomputes the `publicInputsHash` from this.
     pub batch: EvmBatch,
     /// Every window block's RLP + augmented witness, in block order.
     pub blocks: Vec<BlockWitness>,
+    /// Intended L1 parent/time for live cross-chain settlement; `None` for a
+    /// timeless (0) batch.
+    pub l1_context: Option<eez_protocol::l1_context::LiveSettlementContext>,
 }
 
 /// Produces the [`BlockWitness`] for a committed L2 block — the seam by which

@@ -27,7 +27,7 @@ retain only references and supplemental evidence.
 ## Running
 
 Set `EEZ_STATEFUL_PROOF_SIGNER_ADDR` on a follower to enable the service. A
-follower configured with `EEZ_SEQUENCER_RPC` is rejected because this first
+follower configured with `EEZ_SEQUENCER_ADDRESS` is rejected because this first
 implementation deliberately uses an L1-derived-only view.
 
 The service uses the deployment settings shared with the stateless signer:

@@ -15,6 +15,7 @@ pub mod native;
 use std::{
     collections::HashSet,
     fmt::Write as _,
+    net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -45,6 +46,7 @@ use eez_control_rpc::{
 };
 use eez_protocol::EEZL2_ADDRESS;
 use eez_protocol::abi::postAndVerifyBatchCall;
+use reth_network_peers::NodeRecord;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -66,6 +68,10 @@ pub const ANVIL_KEY_6: &str = "0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d
 pub const ANVIL_ATTESTER_KEY: &str =
     "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
 pub const ANVIL_ADDR_3: Address = address!("0x90F79bf6EB2c4f870365E785982E1f101E93b906");
+/// Anvil account #7 signs composer heads. No other role uses it; signing needs no funds.
+pub const SEQUENCER_KEY: &str =
+    "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356";
+pub const SEQUENCER_ADDR: Address = address!("0x14dC79964da2C08b23698B3D3cc7Ca32193d9955");
 /// Unfunded ordinary sender used to stage divergent speculative history.
 pub const STAGING_USER_KEY: &str =
     "0x6f7d72ecb79c8bf1bd8e7c49a1c4a22741ab708f06bb19e5b5d44a6f0934a7c1";
@@ -75,6 +81,10 @@ const L1_BLOCK_TIME_SECS: u64 = 4;
 
 // Consumed by the launcher as `--chain`; never forwarded to `eez-node`.
 const TEST_L2_GENESIS_ENV: &str = "EEZ_TEST_L2_GENESIS_PATH";
+
+// Every node env names its mode. In the default peers mode, a node booting
+// after L1 finalized a settlement waits for peers to serve the history.
+const SYNC_L1_ONLY_ENV: &str = "EEZ_SYNC_L1_ONLY";
 
 const TX_SPAM_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -109,6 +119,9 @@ pub fn eez_node_bin() -> Result<PathBuf> {
 }
 
 pub fn anvil_bin() -> String {
+    if let Ok(path) = std::env::var("EEZ_TEST_ANVIL_BIN") {
+        return path;
+    }
     for path in [
         "/root/.foundry/bin/anvil",
         &format!(
@@ -133,6 +146,8 @@ pub struct Anvil {
 struct AnvilConfig {
     gas_limit: u64,
     genesis_timestamp: u64,
+    /// Anvil finalizes two epochs behind its head; `None` keeps its 32 slots.
+    slots_in_an_epoch: Option<u64>,
 }
 
 impl AnvilConfig {
@@ -140,6 +155,7 @@ impl AnvilConfig {
         Self {
             gas_limit: 30_000_000,
             genesis_timestamp,
+            slots_in_an_epoch: None,
         }
     }
 }
@@ -165,6 +181,9 @@ impl Anvil {
         ]);
         cmd.args(["--gas-limit", &cfg.gas_limit.to_string()]);
         cmd.args(["--timestamp", &cfg.genesis_timestamp.to_string()]);
+        if let Some(slots) = cfg.slots_in_an_epoch {
+            cmd.args(["--slots-in-an-epoch", &slots.to_string()]);
+        }
         cmd.stdout(Stdio::from(log)).stderr(Stdio::from(err_log));
         drop(port_lease);
         let mut child = cmd.spawn().context("spawn anvil")?;
@@ -265,7 +284,7 @@ impl BuilderStubMode {
 }
 
 impl BundleStub {
-    async fn spawn(port_lease: PortLease, upstream: &str) -> Result<Self> {
+    async fn spawn(port_lease: PortLease, upstream: &str, passthrough: bool) -> Result<Self> {
         let port = port_lease.port();
         let script = repo_root().join("scripts/builder-stub.py");
         let listen = format!("127.0.0.1:{port}");
@@ -277,7 +296,12 @@ impl BundleStub {
             .arg(script)
             .args(["--listen", &listen, "--upstream", upstream])
             .arg("--block-time")
-            .arg(L1_BLOCK_TIME_SECS.to_string())
+            .arg(L1_BLOCK_TIME_SECS.to_string());
+        if passthrough {
+            // The L1 is a reth node, not Anvil: relay bundles instead of mining them.
+            command.arg("--passthrough");
+        }
+        command
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err_log));
         drop(port_lease);
@@ -835,36 +859,126 @@ pub struct Harness {
     pub dep: Deployment,
     // The owning tempdir must outlive every node and signer using this genesis.
     l2_genesis: (PathBuf, tempfile::TempDir),
-    // Keep each dedicated signer and its temporary files alive with the harness.
-    provers: std::sync::Mutex<Vec<(ProofSignerHandle, tempfile::TempDir)>>,
+    // Keep the dedicated signers alive with the harness.
+    provers: std::sync::Mutex<Vec<ProofSignerHandle>>,
+    /// Where in `provers` the signers of [`Self::env_with_attesters`] start.
+    quorum_start: std::sync::OnceLock<usize>,
+    // Each composer's witness store, alive as long as the harness.
+    witness_dirs: std::sync::Mutex<Vec<tempfile::TempDir>>,
+    /// Every registered attester, in deployment order. The first is the
+    /// deployment's `proof_system_address`.
+    attesters: Vec<RegisteredAttester>,
+}
+
+/// One attester registered on the harness rollup's manager.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegisteredAttester {
+    /// The `ECDSAProofSystem` that verifies its proofs.
+    pub proof_system: Address,
+    /// The signer that proof system accepts.
+    pub attester: Address,
+    /// The key the attester signs with.
+    pub key: &'static str,
+}
+
+/// How the signer [`Harness::env_with_attesters`] starts for one registered
+/// attester signs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuorumSigner {
+    /// The registered key, over the vkey the manager registers.
+    Honest,
+    /// The registered key, over a vkey the manager does not register: its proof
+    /// recovers to the registered attester, but over a digest L1 does not check.
+    StaleVkey,
 }
 
 impl Harness {
     /// Starts a fixture with L1 and L2 genesis timestamps aligned to wall time.
     pub async fn fresh() -> Result<Self> {
+        Self::with_attesters(&[ANVIL_ATTESTER_KEY], 1).await
+    }
+
+    /// Registers one `ECDSAProofSystem` per attester key on a manager that
+    /// requires `threshold` of them.
+    pub async fn with_attesters(attester_keys: &[&'static str], threshold: u64) -> Result<Self> {
         let ts = now_unix_secs();
         let l2_genesis = write_l2_genesis_at(ts)?;
         let cfg = AnvilConfig::standard(ts);
-        Self::with_anvil_config(cfg, l2_genesis_block_hash_at(ts)?, l2_genesis).await
+        Self::with_anvil_config(
+            cfg,
+            l2_genesis_block_hash_at(ts)?,
+            l2_genesis,
+            attester_keys,
+            threshold,
+        )
+        .await
+    }
+
+    /// [`Self::fresh`] with L1 finalized two blocks behind its head, not 64.
+    pub async fn fresh_with_fast_finality() -> Result<Self> {
+        Self::fresh_with_slots_in_an_epoch(1).await
+    }
+
+    /// [`Self::fresh`] with L1 finalized `2 * slots` blocks behind its head, not 64.
+    pub async fn fresh_with_slots_in_an_epoch(slots: u64) -> Result<Self> {
+        let ts = now_unix_secs();
+        let l2_genesis = write_l2_genesis_at(ts)?;
+        let cfg = AnvilConfig {
+            slots_in_an_epoch: Some(slots),
+            ..AnvilConfig::standard(ts)
+        };
+        Self::with_anvil_config(
+            cfg,
+            l2_genesis_block_hash_at(ts)?,
+            l2_genesis,
+            &[ANVIL_ATTESTER_KEY],
+            1,
+        )
+        .await
     }
 
     async fn with_anvil_config(
         cfg: AnvilConfig,
         initial_state: B256,
         l2_genesis: (PathBuf, tempfile::TempDir),
+        attester_keys: &[&'static str],
+        threshold: u64,
     ) -> Result<Self> {
         let mut anvil = Anvil::spawn_with(PortLease::tcp(), cfg).await?;
-        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url).await?;
+        let stub = BundleStub::spawn(PortLease::tcp(), &anvil.rpc_url, false).await?;
         // Route every harness client through the builder so its snapshot-based
         // block assembly cannot race direct mutations of the backing Anvil.
         anvil.rpc_url.clone_from(&stub.url);
-        let dep = deploy_contracts_with_initial(&anvil.rpc_url, ANVIL_KEY, initial_state).await?;
+        let attesters = attester_keys
+            .iter()
+            .map(|key| signer_address(key))
+            .collect::<Result<Vec<_>>>()?;
+        let (dep, registered) = deploy_contracts_with_initial(
+            &anvil.rpc_url,
+            ANVIL_KEY,
+            initial_state,
+            &attesters,
+            threshold,
+        )
+        .await?;
+        let attesters = registered
+            .into_iter()
+            .zip(attester_keys)
+            .map(|((proof_system, attester), &key)| RegisteredAttester {
+                proof_system,
+                attester,
+                key,
+            })
+            .collect();
         Ok(Self {
             anvil,
             stub,
             dep,
             l2_genesis,
             provers: std::sync::Mutex::new(Vec::new()),
+            quorum_start: std::sync::OnceLock::new(),
+            witness_dirs: std::sync::Mutex::new(Vec::new()),
+            attesters,
         })
     }
 
@@ -883,7 +997,7 @@ impl Harness {
             .lock()
             .map_err(|_| anyhow!("prover registry poisoned"))?
             .iter()
-            .try_fold(0usize, |total, (signer, _)| {
+            .try_fold(0usize, |total, signer| {
                 Ok(total + signer.successful_attestations()?)
             })
     }
@@ -903,24 +1017,19 @@ impl Harness {
     ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
             poster_key: Some(poster_key),
-            proof_signer_key: Some(ANVIL_ATTESTER_KEY),
+            proving: Proving::Single(ANVIL_ATTESTER_KEY),
             rollup_id: self.dep.rollup_id,
             expect_external_batches,
-            sequencer_rpc: None,
         })
         .await
     }
 
-    pub async fn follower_env(
-        &self,
-        sequencer_rpc: Option<&str>,
-    ) -> Result<Vec<(&'static str, String)>> {
+    pub async fn follower_env(&self) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
             poster_key: None,
-            proof_signer_key: None,
+            proving: Proving::None,
             rollup_id: self.dep.rollup_id,
             expect_external_batches: true,
-            sequencer_rpc,
         })
         .await
     }
@@ -936,10 +1045,9 @@ impl Harness {
         let mut env = self
             .env_for_options(NodeEnvOptions {
                 poster_key: Some(poster_key),
-                proof_signer_key: None,
+                proving: Proving::None,
                 rollup_id: self.dep.rollup_id,
                 expect_external_batches: true,
-                sequencer_rpc: None,
             })
             .await?;
         env.extend([
@@ -959,10 +1067,9 @@ impl Harness {
     pub async fn env_with_rollup_id(&self, rollup_id: u64) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
             poster_key: Some(ANVIL_KEY),
-            proof_signer_key: Some(ANVIL_ATTESTER_KEY),
+            proving: Proving::Single(ANVIL_ATTESTER_KEY),
             rollup_id,
             expect_external_batches: false,
-            sequencer_rpc: None,
         })
         .await
     }
@@ -973,10 +1080,84 @@ impl Harness {
     ) -> Result<Vec<(&'static str, String)>> {
         self.env_for_options(NodeEnvOptions {
             poster_key: Some(ANVIL_KEY),
-            proof_signer_key: Some(proof_signer_key),
+            proving: Proving::Single(proof_signer_key),
             rollup_id: self.dep.rollup_id,
             expect_external_batches: false,
-            sequencer_rpc: None,
+        })
+        .await
+    }
+
+    /// A composer that collects proofs from one signer per registered
+    /// attester through `EEZ_PROVERS`, signing as `signers[i]` says. One per
+    /// harness.
+    pub async fn env_with_attesters(
+        &self,
+        signers: &[QuorumSigner],
+    ) -> Result<Vec<(&'static str, String)>> {
+        self.env_for_options(NodeEnvOptions {
+            poster_key: Some(ANVIL_KEY),
+            proving: Proving::Quorum(signers),
+            rollup_id: self.dep.rollup_id,
+            expect_external_batches: false,
+        })
+        .await
+    }
+
+    /// Successful attestations of the signer [`Self::env_with_attesters`]
+    /// started for registered attester `index`.
+    pub fn attestations_of(&self, index: usize) -> Result<usize> {
+        self.with_attester(index, ProofSignerHandle::successful_attestations)
+    }
+
+    /// Suspend a registered signer before the Composer connects to it.
+    #[cfg(unix)]
+    pub fn pause_attester(&self, index: usize) -> Result<()> {
+        self.with_attester(index, ProofSignerHandle::pause)
+    }
+
+    /// RPC endpoint of a registered signer started by this harness.
+    pub fn attester_endpoint(&self, index: usize) -> Result<String> {
+        self.with_attester(index, |signer| Ok(signer.endpoint().to_owned()))
+    }
+
+    fn with_attester<T>(
+        &self,
+        index: usize,
+        action: impl FnOnce(&ProofSignerHandle) -> Result<T>,
+    ) -> Result<T> {
+        let start = self
+            .quorum_start
+            .get()
+            .ok_or_else(|| anyhow!("no attester quorum was started"))?;
+        let provers = self
+            .provers
+            .lock()
+            .map_err(|_| anyhow!("prover registry poisoned"))?;
+        action(
+            provers
+                .get(start + index)
+                .ok_or_else(|| anyhow!("no signer for attester {index}"))?,
+        )
+    }
+
+    /// Every registered attester, in deployment order.
+    pub fn attesters(&self) -> &[RegisteredAttester] {
+        &self.attesters
+    }
+
+    async fn spawn_signer(
+        &self,
+        rollup_id: u64,
+        signer_key: &str,
+        vkey: B256,
+        proof_system: Address,
+    ) -> Result<ProofSignerHandle> {
+        ProofSignerHandle::spawn(&ProofSignerConfig {
+            chain_config: self.l2_genesis_path(),
+            rollup_id,
+            signer_key,
+            vkey,
+            proof_system,
         })
         .await
     }
@@ -1031,6 +1212,7 @@ impl Harness {
                 TEST_L2_GENESIS_ENV,
                 self.l2_genesis.0.to_string_lossy().into_owned(),
             ),
+            (SYNC_L1_ONLY_ENV, "1".to_string()),
         ];
 
         if let Some(poster_key) = opts.poster_key {
@@ -1038,38 +1220,85 @@ impl Harness {
                 ("EEZ_L1_TARGET_RPC_URL", self.anvil.rpc_url.clone()),
                 ("EEZ_L1_BUILDER_RPC_URL", self.stub.url.clone()),
                 ("EEZ_L1_POSTER_KEY", poster_key.to_string()),
+                ("EEZ_SEQUENCER_KEY", SEQUENCER_KEY.to_string()),
             ]);
         }
 
         // Composer tests use the real remote-prover path. Followers omit it.
-        if let Some(signer_key) = opts.proof_signer_key {
-            let genesis = self.l2_genesis_path();
-            let attester = signer_address(signer_key)?;
-            let signer = ProofSignerHandle::spawn(&ProofSignerConfig {
-                chain_config: genesis,
-                rollup_id: opts.rollup_id,
-                signer_key,
-                // Match the client's vkey; L1 still checks its registered signer.
-                vkey: attester.into_word(),
-                proof_system: self.dep.proof_system_address,
-            })
-            .await?;
-            let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
-            env.extend([
-                ("EEZ_PROVER_URL", signer.endpoint().to_owned()),
-                ("EEZ_ATTESTER_ADDRESS", format!("{attester:#x}")),
-                (
-                    "EEZ_WITNESS_DB_PATH",
-                    witness_dir.path().to_string_lossy().into_owned(),
-                ),
-            ]);
-            self.provers
-                .lock()
-                .map_err(|_| anyhow!("prover registry poisoned"))?
-                .push((signer, witness_dir));
+        match opts.proving {
+            Proving::None => {}
+            Proving::Single(signer_key) => {
+                let registered = self.attesters[0];
+                let attester = signer_address(signer_key)?;
+                let signer = self
+                    .spawn_signer(
+                        opts.rollup_id,
+                        signer_key,
+                        attester.into_word(),
+                        registered.proof_system,
+                    )
+                    .await?;
+                env.extend([
+                    ("EEZ_PROVER_URL", signer.endpoint().to_owned()),
+                    ("EEZ_ATTESTER_ADDRESS", format!("{attester:#x}")),
+                ]);
+                self.provers
+                    .lock()
+                    .map_err(|_| anyhow!("prover registry poisoned"))?
+                    .push(signer);
+            }
+            Proving::Quorum(signers) => {
+                if signers.len() != self.attesters.len() {
+                    bail!(
+                        "{} signers for {} registered attesters",
+                        signers.len(),
+                        self.attesters.len()
+                    );
+                }
+                let mut handles = Vec::with_capacity(signers.len());
+                let mut entries = Vec::with_capacity(signers.len());
+                for (registered, signer) in self.attesters.iter().zip(signers) {
+                    let vkey = match signer {
+                        QuorumSigner::Honest => registered.attester.into_word(),
+                        QuorumSigner::StaleVkey => B256::repeat_byte(0x5e),
+                    };
+                    let handle = self
+                        .spawn_signer(
+                            opts.rollup_id,
+                            registered.key,
+                            vkey,
+                            registered.proof_system,
+                        )
+                        .await?;
+                    entries.push(format!(
+                        "{}={:#x}={:#x}",
+                        handle.endpoint(),
+                        registered.attester,
+                        registered.proof_system
+                    ));
+                    handles.push(handle);
+                }
+                let mut provers = self
+                    .provers
+                    .lock()
+                    .map_err(|_| anyhow!("prover registry poisoned"))?;
+                self.quorum_start
+                    .set(provers.len())
+                    .map_err(|_| anyhow!("an attester quorum was already started"))?;
+                provers.extend(handles);
+                env.push(("EEZ_PROVERS", entries.join(",")));
+            }
         }
-        if let Some(sequencer_rpc) = opts.sequencer_rpc {
-            env.push(("EEZ_SEQUENCER_RPC", sequencer_rpc.to_string()));
+        if !matches!(opts.proving, Proving::None) {
+            let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
+            env.push((
+                "EEZ_WITNESS_DB_PATH",
+                witness_dir.path().to_string_lossy().into_owned(),
+            ));
+            self.witness_dirs
+                .lock()
+                .map_err(|_| anyhow!("witness registry poisoned"))?
+                .push(witness_dir);
         }
         Ok(env)
     }
@@ -1077,10 +1306,20 @@ impl Harness {
 
 struct NodeEnvOptions<'a> {
     poster_key: Option<&'a str>,
-    proof_signer_key: Option<&'a str>,
+    proving: Proving<'a>,
     rollup_id: u64,
     expect_external_batches: bool,
-    sequencer_rpc: Option<&'a str>,
+}
+
+/// The proof signers a composer env starts.
+#[derive(Clone, Copy)]
+enum Proving<'a> {
+    /// None: a follower.
+    None,
+    /// One signer with this key for the deployment's proof system.
+    Single(&'a str),
+    /// One signer per registered attester.
+    Quorum(&'a [QuorumSigner]),
 }
 
 pub struct Deployment {
@@ -1259,7 +1498,9 @@ async fn deploy_contracts_with_initial(
     rpc_url: &str,
     key: &str,
     initial_state: B256,
-) -> Result<Deployment> {
+    attesters: &[Address],
+    threshold: u64,
+) -> Result<(Deployment, Vec<(Address, Address)>)> {
     // Anvil signs transactions from its default accounts.
     let signer: PrivateKeySigner = key
         .strip_prefix("0x")
@@ -1280,22 +1521,29 @@ async fn deploy_contracts_with_initial(
     .await?;
     let deploy_block = provider.get_block_number().await?;
 
-    // Keep the authorized attester separate from the poster/deployer key.
-    let attester = signer_address(ANVIL_ATTESTER_KEY)?;
-    let proof_system_address = deploy(
-        &provider,
-        signer_addr,
-        &out.join("ECDSAProofSystem.sol/ECDSAProofSystem.json"),
-        attester.abi_encode(),
-    )
-    .await?;
+    // Keep the authorized attesters separate from the poster/deployer key.
+    let mut registered = Vec::with_capacity(attesters.len());
+    for &attester in attesters {
+        let proof_system = deploy(
+            &provider,
+            signer_addr,
+            &out.join("ECDSAProofSystem.sol/ECDSAProofSystem.json"),
+            attester.abi_encode(),
+        )
+        .await?;
+        registered.push((proof_system, attester));
+    }
+    let proof_system_address = registered
+        .first()
+        .ok_or_else(|| anyhow!("at least one attester is required"))?
+        .0;
 
     // Rollup(address eez) behind a proxy; initialize(address owner, uint256 threshold,
     //        address[] proofSystems, bytes32[] vkeys)
-    let proof_systems: Vec<Address> = vec![proof_system_address];
+    let proof_systems: Vec<Address> = registered.iter().map(|(ps, _)| *ps).collect();
     // vkey embeds the authorized signer address; the registry treats vkey as
     // opaque but checks non-zero + membership (see DeployRollup.s.sol:60).
-    let vkeys: Vec<B256> = vec![attester.into_word()];
+    let vkeys: Vec<B256> = registered.iter().map(|(_, a)| a.into_word()).collect();
     let rollup_implementation = deploy(
         &provider,
         signer_addr,
@@ -1305,7 +1553,7 @@ async fn deploy_contracts_with_initial(
     .await?;
     let initialize = IRollupManager::initializeCall {
         initialOwner: signer_addr,
-        initialThreshold: U256::from(1u64),
+        initialThreshold: U256::from(threshold),
         proofSystems: proof_systems,
         vkeys,
     }
@@ -1341,14 +1589,17 @@ async fn deploy_contracts_with_initial(
     let registry = IEEZ::new(eez_address, &provider);
     let rollup_id = registry.rollupCounter().call().await?.try_into()?;
 
-    Ok(Deployment {
-        eez_address,
-        deploy_block,
-        proof_system_address,
-        rollup_manager_address,
-        rollup_id,
-        initial_commitment: initial_state,
-    })
+    Ok((
+        Deployment {
+            eez_address,
+            deploy_block,
+            proof_system_address,
+            rollup_manager_address,
+            rollup_id,
+            initial_commitment: initial_state,
+        },
+        registered,
+    ))
 }
 
 async fn deploy<P: Provider>(
@@ -1402,6 +1653,10 @@ pub struct NodeHandle {
     /// Owned node database. CI retains it only if this test unwinds in failure.
     owned_datadir: Option<FailureDatadir>,
     pub http_port: u16,
+    /// devp2p RLPx TCP port.
+    pub p2p_port: u16,
+    /// discv5 UDP port; bound only with [`NodeConfig::discovery`].
+    pub discv5_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1450,6 +1705,66 @@ pub struct NodeConfig<'a> {
     /// Explicit node-role executable to launch.
     pub binary: NodeBinary,
     pub genesis_path: Option<&'a std::path::Path>,
+    /// Runs discv5 on loopback instead of `--disable-discovery`; `extra_args`
+    /// must then name `--bootnodes`.
+    pub discovery: bool,
+    /// Appended to the node command line.
+    pub extra_args: Vec<String>,
+}
+
+/// Enode of a loopback node started with `--p2p-secret-key-hex <secret_hex>`.
+pub fn enode(secret_hex: &str, tcp: u16, udp: u16) -> String {
+    let key: secp256k1::SecretKey = secret_hex
+        .trim_start_matches("0x")
+        .parse()
+        .expect("secret_hex is a 32-byte hex secp256k1 key");
+    // Display adds `?discport=<udp>`; without it discv5 bootstraps against the TCP port.
+    NodeRecord::from_secret_key(SocketAddr::from((Ipv4Addr::LOCALHOST, tcp)), &key)
+        .with_udp_port(udp)
+        .to_string()
+}
+
+/// A free loopback TCP port for a listener set through env, such as `EEZ_P2P_LISTEN`.
+/// No other testkit lease reuses it.
+pub fn unused_tcp_port() -> u16 {
+    PortLease::tcp().port()
+}
+
+/// devp2p key of the overlay seed, so its enode is known before it starts.
+pub const SEED_KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+/// Makes a composer the overlay seed under [`SEED_KEY`]: it publishes its
+/// signed heads and serves blocks to the followers that find it.
+pub fn overlay_seed(cfg: &mut NodeConfig<'_>, env: &mut Vec<(&'static str, String)>) {
+    cfg.discovery = true;
+    // The bootnodes guard needs an entry; the seed's own is a no-op.
+    cfg.extra_args.extend([
+        "--p2p-secret-key-hex".into(),
+        SEED_KEY.into(),
+        "--bootnodes".into(),
+        enode(SEED_KEY, 0, 0),
+    ]);
+    env.push(overlay_listen());
+}
+
+/// Makes a follower find `seed` through its bootnode and follow its signed heads.
+pub fn overlay_follower(
+    seed: &NodeHandle,
+    cfg: &mut NodeConfig<'_>,
+    env: &mut Vec<(&'static str, String)>,
+) {
+    cfg.discovery = true;
+    cfg.extra_args.extend([
+        "--bootnodes".into(),
+        enode(SEED_KEY, seed.p2p_port, seed.discv5_port),
+    ]);
+    env.push(overlay_listen());
+    env.push(("EEZ_SEQUENCER_ADDRESS", format!("{SEQUENCER_ADDR:#x}")));
+}
+
+fn overlay_listen() -> (&'static str, String) {
+    let port = unused_tcp_port();
+    ("EEZ_P2P_LISTEN", format!("/ip4/127.0.0.1/tcp/{port}"))
 }
 
 impl NodeHandle {
@@ -1477,6 +1792,7 @@ impl NodeHandle {
         let http_lease = PortLease::tcp();
         let ws_lease = PortLease::tcp();
         let p2p_lease = PortLease::tcp();
+        let discv5_lease = PortLease::udp();
         let l1_http_lease = PortLease::http_pair();
         let l1_auth_lease = PortLease::tcp();
         // Embedded L1 uses this numeric port for RLPx TCP and discovery UDP.
@@ -1488,6 +1804,7 @@ impl NodeHandle {
         let http_port = http_lease.port();
         let ws_port = ws_lease.port();
         let p2p_port = p2p_lease.port();
+        let discv5_port = discv5_lease.port();
         let l1_http_port = l1_http_lease.port();
         let l1_auth_port = l1_auth_lease.port();
         let l1_p2p_port = l1_p2p_lease.port();
@@ -1499,6 +1816,7 @@ impl NodeHandle {
             http_lease,
             ws_lease,
             p2p_lease,
+            discv5_lease,
             l1_http_lease,
             l1_auth_lease,
             l1_p2p_lease,
@@ -1549,7 +1867,6 @@ impl NodeHandle {
                 &authrpc_port.to_string(),
                 "--port",
                 &p2p_port.to_string(),
-                "--disable-discovery",
                 "--ipcdisable",
             ])
             .stderr(stderr)
@@ -1565,6 +1882,25 @@ impl NodeHandle {
                 "CARGO_HOME",
                 std::env::var("CARGO_HOME").unwrap_or_default(),
             );
+        if cfg.discovery {
+            // discv4 would bind its default UDP port on every node, so only discv5 runs, on
+            // a leased port. `--addr` and `--disable-nat` keep 127.0.0.1 in the ENR for
+            // peers to dial, and 1 s bootstrap lookups find them within seconds.
+            cmd.args([
+                "--addr",
+                "127.0.0.1",
+                "--disable-discv4-discovery",
+                "--disable-dns-discovery",
+                "--disable-nat",
+                "--discovery.v5.port",
+                &discv5_port.to_string(),
+                "--discovery.v5.bootstrap.lookup-interval",
+                "1",
+            ]);
+        } else {
+            cmd.arg("--disable-discovery");
+        }
+        cmd.args(&cfg.extra_args);
         cmd.env("EEZ_L1_HTTP_PORT", l1_http_port.to_string())
             .env("EEZ_L1_AUTH_PORT", l1_auth_port.to_string())
             .env("EEZ_L1_P2P_PORT", l1_p2p_port.to_string())
@@ -1593,6 +1929,8 @@ impl NodeHandle {
             _keep_alive: log_tempdir.into_iter().collect(),
             owned_datadir: None,
             http_port,
+            p2p_port,
+            discv5_port,
         })
     }
 
@@ -2437,7 +2775,113 @@ pub async fn batches_posted(l1_rpc: &str, eez: Address, from_block: u64) -> Resu
     count_events(l1_rpc, eez, IEEZ::BatchPosted::SIGNATURE_HASH, from_block).await
 }
 
-/// Recomputes the latest batch's public-input hash and verifies its signature.
+/// One mined `postAndVerifyBatch` for a rollup.
+#[derive(Clone, Debug)]
+pub struct PostedBatch {
+    pub tx_hash: B256,
+    pub sender: Address,
+    pub calldata: Bytes,
+    pub succeeded: bool,
+    pub batch: eez_protocol::EvmBatch,
+}
+
+/// Every mined `postAndVerifyBatch` to `eez` naming `rollup_id` since
+/// `from_block`, in L1 order.
+pub async fn posted_batches(
+    l1_rpc: &str,
+    eez: Address,
+    from_block: u64,
+    rollup_id: u64,
+) -> Result<Vec<PostedBatch>> {
+    let provider = ProviderBuilder::new().connect_http(l1_rpc.parse()?);
+    let latest = provider.get_block_number().await?;
+    let mut posted = Vec::new();
+    for block_number in from_block..=latest {
+        let Some(block) = provider
+            .get_block_by_number(BlockNumberOrTag::Number(block_number))
+            .full()
+            .await?
+        else {
+            continue;
+        };
+        for transaction in block.transactions.txns() {
+            if transaction.inner.to() != Some(eez)
+                || !transaction
+                    .inner
+                    .input()
+                    .starts_with(&eez_protocol::abi::postAndVerifyBatchCall::SELECTOR)
+            {
+                continue;
+            }
+            let call =
+                eez_protocol::abi::postAndVerifyBatchCall::abi_decode(transaction.inner.input())?;
+            if !call
+                .batch
+                .rollupIdsWithProofSystems
+                .iter()
+                .any(|rollup| rollup.rollupId == rollup_id)
+            {
+                continue;
+            }
+            let tx_hash = *transaction.inner.tx_hash();
+            let receipt = provider
+                .get_transaction_receipt(tx_hash)
+                .await?
+                .ok_or_else(|| anyhow!("postAndVerifyBatch receipt {tx_hash} is missing"))?;
+            posted.push(PostedBatch {
+                tx_hash,
+                sender: transaction.inner.signer(),
+                calldata: transaction.inner.input().clone(),
+                succeeded: receipt.status(),
+                batch: call.batch,
+            });
+        }
+    }
+    Ok(posted)
+}
+
+/// Checks that `batch` carries one proof per proof system, each recovering to
+/// the attester `attesters` names for its proof system over that proof
+/// system's public-input hash.
+pub fn verify_batch_proofs(
+    batch: &eez_protocol::EvmBatch,
+    attesters: &[(Address, Address)],
+    context: Option<eez_protocol::l1_context::LiveSettlementContext>,
+) -> Result<()> {
+    if batch.proofs.len() != batch.proofSystems.len() {
+        bail!(
+            "batch carries {} proofs for {} proof systems",
+            batch.proofs.len(),
+            batch.proofSystems.len()
+        );
+    }
+    for (index, (proof_system, proof)) in batch.proofSystems.iter().zip(&batch.proofs).enumerate() {
+        let attester = attesters
+            .iter()
+            .find(|(registered, _)| registered == proof_system)
+            .map(|&(_, attester)| attester)
+            .ok_or_else(|| anyhow!("proof system {proof_system} has no expected attester"))?;
+        let public_inputs_hash = eez_protocol::public_inputs::public_inputs_hashes_with_context(
+            batch,
+            attester.into_word(),
+            context,
+        )?
+        .get(index)
+        .copied()
+        .ok_or_else(|| anyhow!("no public-input hash for proof system {proof_system}"))?;
+        let recovered = Signature::try_from(proof.as_ref())
+            .context("decode posted signature")?
+            .recover_address_from_prehash(&public_inputs_hash)
+            .context("recover posted signature")?;
+        if recovered != attester {
+            bail!("proof for {proof_system} recovered {recovered}, expected {attester}");
+        }
+    }
+    Ok(())
+}
+
+/// Recomputes the latest batch's public-input hashes and verifies every proof
+/// against `expected_attester`, the deployment's only attester.
 pub async fn assert_latest_batch_signature(
     l1_rpc: &str,
     dep: &Deployment,
@@ -2470,26 +2914,30 @@ pub async fn assert_latest_batch_signature(
         .await?
         .ok_or_else(|| anyhow!("postAndVerifyBatch transaction is missing"))?;
     let call = eez_protocol::abi::postAndVerifyBatchCall::abi_decode(transaction.inner.input())?;
-    let proof = call
-        .batch
-        .proofs
-        .first()
-        .ok_or_else(|| anyhow!("posted batch has no proof"))?;
-    let public_inputs_hash = eez_protocol::public_inputs::public_inputs_hashes(
-        &call.batch,
-        expected_attester.into_word(),
-    )?
-    .into_iter()
-    .next()
-    .ok_or_else(|| anyhow!("posted batch has no public-input hash"))?;
-    let signature = Signature::try_from(proof.as_ref()).context("decode posted signature")?;
-    let recovered = signature
-        .recover_address_from_prehash(&public_inputs_hash)
-        .context("recover posted signature")?;
-    if recovered != expected_attester {
-        bail!("posted proof recovered {recovered}, expected {expected_attester}");
+    if call.batch.proofs.is_empty() {
+        bail!("posted batch has no proof");
     }
-    Ok(())
+    let context = if call.batch.blockNumber == u64::MAX {
+        let header = provider
+            .get_block_by_hash(
+                log.block_hash
+                    .ok_or_else(|| anyhow!("BatchPosted log has no block hash"))?,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("batch inclusion block is missing"))?
+            .header;
+        Some(eez_protocol::l1_context::LiveSettlementContext {
+            parent_hash: header.parent_hash,
+            timestamp: header.timestamp,
+        })
+    } else {
+        None
+    };
+    verify_batch_proofs(
+        &call.batch,
+        &[(dep.proof_system_address, expected_attester)],
+        context,
+    )
 }
 
 async fn latest_l2_execution_root_at(
@@ -2674,6 +3122,12 @@ pub async fn wait_for_safe_chain_contains(
         }
     })
     .await
+}
+
+/// Switches a node env from the testkit's L1-only default to peers mode.
+pub fn peers_mode(env: &mut Vec<(&'static str, String)>) {
+    env.retain(|(key, _)| *key != SYNC_L1_ONLY_ENV);
+    env.push((SYNC_L1_ONLY_ENV, "0".to_string()));
 }
 
 /// Return `env` with `key`'s value replaced by `value`. No-op if `key`
@@ -3559,6 +4013,7 @@ impl CrossChainConfig {
                 self.l1_genesis.0.to_string_lossy().into_owned(),
             ),
             ("EEZ_L1_POSTER_KEY", self.poster_key.to_string()),
+            ("EEZ_SEQUENCER_KEY", SEQUENCER_KEY.to_string()),
             ("EEZL2_ADDRESS", format!("{EEZL2_ADDRESS:#x}")),
             (
                 "EEZ_L1_BLOCK_TIME_MS",
@@ -3597,6 +4052,7 @@ impl CrossChainConfig {
                 TEST_L2_GENESIS_ENV,
                 self.l2_genesis.0.to_string_lossy().into_owned(),
             ),
+            (SYNC_L1_ONLY_ENV, "1".to_string()),
         ]
     }
 }
@@ -3638,6 +4094,8 @@ pub struct CrossChainWorld {
     /// Present only in signer-mutation tests.
     pub prover_proxy: Option<ProverProxyHandle>,
     pub proof_signer: ProofSignerHandle,
+    /// Present only in worlds from [`setup_cross_chain_with_builder_stub`].
+    builder: Option<BundleStub>,
     _witness_dir: tempfile::TempDir,
     _datadir: FailureDatadir,
 }
@@ -3789,6 +4247,7 @@ impl CrossChainWorld {
                         | "EEZ_L1_P2P_PORT"
                         | "EEZ_L1_XCHAIN_PORT"
                         | "EEZ_L2_XCHAIN_PORT"
+                        | "EEZ_SEQUENCER_KEY"
                 )
             })
             .map(|(key, mut value)| {
@@ -3798,6 +4257,17 @@ impl CrossChainWorld {
                 (key, value)
             })
             .collect()
+    }
+
+    /// Select how the relay stub treats the composer's next bundles.
+    pub async fn set_builder_mode(&self, mode: BuilderStubMode) -> Result<()> {
+        self.builder
+            .as_ref()
+            .context(
+                "world has no builder stub; start it with setup_cross_chain_with_builder_stub",
+            )?
+            .set_mode(mode)
+            .await
     }
 }
 
@@ -4468,14 +4938,21 @@ pub async fn run_scenarios(
 
 /// Start the shared cross-chain fixture.
 pub async fn setup_cross_chain() -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(None, None, &[]).await
+    setup_cross_chain_inner(None, None, &[], false).await
+}
+
+/// Start the fixture with the composer's bundles routed through the relay stub,
+/// and the composer as the overlay seed (see [`overlay_seed`]).
+/// The stub forwards only single-transaction bundles, so inbound calls cannot settle here.
+pub async fn setup_cross_chain_with_builder_stub() -> Result<CrossChainWorld> {
+    setup_cross_chain_inner(None, None, &[], true).await
 }
 
 /// Start the fixture with additional node environment variables.
 pub async fn setup_cross_chain_with_env(
     extra_env: &[(&'static str, String)],
 ) -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(None, None, extra_env).await
+    setup_cross_chain_inner(None, None, extra_env, false).await
 }
 
 /// Starts the fixture with a mutation proxy and expected attester override.
@@ -4483,7 +4960,7 @@ pub async fn setup_cross_chain_proxied(
     mutation: ProverMutation,
     attester: Address,
 ) -> Result<CrossChainWorld> {
-    setup_cross_chain_inner(Some(mutation), Some(attester), &[]).await
+    setup_cross_chain_inner(Some(mutation), Some(attester), &[], false).await
 }
 
 pub async fn setup_cross_chain_empty_call() -> Result<CrossChainEmptyCallWorld> {
@@ -4630,6 +5107,7 @@ async fn setup_cross_chain_inner(
     mutation: Option<ProverMutation>,
     attester_override: Option<Address>,
     extra_env: &[(&'static str, String)],
+    builder_stub: bool,
 ) -> Result<CrossChainWorld> {
     let mut cfg = CrossChainConfig::new()?;
     let signer_attester = signer_address(cfg.attester_key)?;
@@ -4653,6 +5131,11 @@ async fn setup_cross_chain_inner(
     let attester = attester_override.unwrap_or(signer_attester);
     let witness_dir = tempfile::tempdir().context("witness DB tempdir")?;
     let mut datadir = FailureDatadir::new("eez-cross-chain")?;
+    let builder = if builder_stub {
+        Some(BundleStub::spawn(PortLease::tcp(), &cfg.l1_rpc_url(), true).await?)
+    } else {
+        None
+    };
     let mut env = cfg.env();
     env.extend([
         ("EEZ_PROVER_URL", prover_url.to_string()),
@@ -4662,16 +5145,23 @@ async fn setup_cross_chain_inner(
             witness_dir.path().to_string_lossy().into_owned(),
         ),
     ]);
+    if let Some(builder) = &builder {
+        env.push(("EEZ_L1_BUILDER_RPC_URL", builder.url.clone()));
+    }
     // Before the assertion below, so caller-supplied vars are checked too.
     env.extend_from_slice(extra_env);
     assert!(
         !env.iter().any(|(name, _)| *name == "EEZ_PROOF_SIGNER_KEY"),
         "remote composer environment must not contain the proof-signer key",
     );
+    let mut node_cfg = NodeConfig::default();
+    if builder_stub {
+        overlay_seed(&mut node_cfg, &mut env);
+    }
     let node = NodeHandle::spawn_with_reservations(
         "node",
         datadir.path(),
-        &NodeConfig::default(),
+        &node_cfg,
         &env,
         cfg.take_port_leases(),
     )?;
@@ -4779,6 +5269,7 @@ async fn setup_cross_chain_inner(
         outbound_wrapper,
         prover_proxy,
         proof_signer,
+        builder,
         _witness_dir: witness_dir,
         _datadir: datadir,
     })

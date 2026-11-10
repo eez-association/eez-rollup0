@@ -5,18 +5,19 @@ mod streaming;
 
 use std::time::Duration;
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types_eth::BlockNumberOrTag;
 
 use eez_testkit::signals;
 use eez_testkit::{
-    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3, ANVIL_KEY_4,
-    ANVIL_KEY_6, BuilderStubMode, Harness, INVALID_PROOF_SELECTOR,
-    INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary, NodeConfig, NodeHandle, STAGING_USER_KEY,
-    block_number_and_hash_at, override_env, safe_block_hash, send_l2_value_transfer,
-    send_l2_value_transfer_confirmed, wait_for, wait_for_latest_height,
-    wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
+    ANVIL_ADDR, ANVIL_ADDR_3, ANVIL_ATTESTER_KEY, ANVIL_KEY, ANVIL_KEY_1, ANVIL_KEY_2, ANVIL_KEY_3,
+    ANVIL_KEY_4, ANVIL_KEY_6, BuilderStubMode, Harness, INVALID_PROOF_SELECTOR,
+    INVALID_PROOF_SYSTEM_CONFIG_SELECTOR, NodeBinary, NodeConfig, NodeHandle, QuorumSigner,
+    SEED_KEY, STAGING_USER_KEY, block_number_and_hash_at, enode, overlay_follower, overlay_seed,
+    override_env, peers_mode, posted_batches, rollup_root_at, safe_block_hash,
+    send_l2_value_transfer, send_l2_value_transfer_confirmed, verify_batch_proofs, wait_for,
+    wait_for_latest_height, wait_for_new_attested_safe_block, wait_for_safe_chain_contains,
     wait_for_safe_prefix_convergence, wait_for_safe_state,
 };
 
@@ -35,6 +36,7 @@ async fn multi_composer_intra_batch_suffix_replay_converges() {
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(genesis),
+        ..Default::default()
     };
 
     let primary_dir = tempfile::tempdir().unwrap();
@@ -96,7 +98,7 @@ async fn multi_composer_intra_batch_suffix_replay_converges() {
     drop(mirror);
 
     let follower_env = override_env(
-        harness.follower_env(None).await.unwrap(),
+        harness.follower_env().await.unwrap(),
         "RUST_LOG",
         "warn,eez_deriver=info,eez_l1=info",
     );
@@ -436,7 +438,7 @@ async fn happy_case_composer_sustained() {
         "event-state consistency holds across restart",
     );
 
-    let follower_env = harness.follower_env(None).await.unwrap();
+    let follower_env = harness.follower_env().await.unwrap();
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         ..Default::default()
@@ -665,6 +667,305 @@ async fn failure_prover_signer_mismatch() {
     assert_eq!(snapshot.batches_posted, 0);
     assert_eq!(snapshot.executions_performed, 0);
     assert_eq!(snapshot.rollup_commitment, chain.initial_commitment());
+    node.assert_no_process_death();
+}
+
+/// Every registered `(proof system, attester)` pair of `harness`.
+fn registered_pairs(harness: &Harness) -> Vec<(Address, Address)> {
+    harness
+        .attesters()
+        .iter()
+        .map(|registered| (registered.proof_system, registered.attester))
+        .collect()
+}
+
+/// Two attesters and a threshold of two: every batch carries a proof from
+/// each, so neither signer alone can settle the rollup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn happy_case_quorum_two_of_two() {
+    let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4], 2)
+        .await
+        .unwrap();
+    let chain = harness.chain();
+    let env = harness
+        .env_with_attesters(&[QuorumSigner::Honest, QuorumSigner::Honest])
+        .await
+        .unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-two-of-two",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+
+    chain
+        .wait_for_batches(2, DEFAULT_TIMEOUT)
+        .await
+        .expect("the quorum never settled a batch");
+
+    let attesters = registered_pairs(&harness);
+    let mut both: Vec<Address> = attesters.iter().map(|&(ps, _)| ps).collect();
+    both.sort_unstable();
+    let posted = posted_batches(
+        chain.rpc_url(),
+        harness.dep.eez_address,
+        harness.dep.deploy_block,
+        harness.dep.rollup_id,
+    )
+    .await
+    .unwrap();
+    assert!(!posted.is_empty(), "settled batches must be visible on L1");
+    for posted in &posted {
+        assert!(posted.succeeded, "no batch may revert: {posted:?}");
+        assert_eq!(
+            posted.batch.proofSystems, both,
+            "every batch carries both proofs"
+        );
+        verify_batch_proofs(&posted.batch, &attesters, None).unwrap();
+    }
+    assert_ne!(
+        chain.snapshot().await.unwrap().rollup_commitment,
+        chain.initial_commitment(),
+        "the commitment must have moved off genesis",
+    );
+    node.assert_no_process_death();
+}
+
+/// Two of three attesters, one of which signs over a vkey the manager does not
+/// register. Its proof recovers to the right key, so only the prover client's
+/// check against the registered digest can tell; it is dropped, and the other
+/// two settle every batch without one reverting on L1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quorum_settles_without_an_attester_signing_the_wrong_digest() {
+    let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4, ANVIL_KEY_6], 2)
+        .await
+        .unwrap();
+    let chain = harness.chain();
+    let env = harness
+        .env_with_attesters(&[
+            QuorumSigner::Honest,
+            QuorumSigner::Honest,
+            QuorumSigner::StaleVkey,
+        ])
+        .await
+        .unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-stale-vkey",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+
+    chain
+        .wait_for_batches(2, DEFAULT_TIMEOUT)
+        .await
+        .expect("the honest attesters never settled a batch");
+    wait_for(DEFAULT_TIMEOUT, || async {
+        Ok((harness.attestations_of(2)? > 0).then_some(()))
+    })
+    .await
+    .expect("the stale signer never answered, so its proof was never checked");
+    wait_for(DEFAULT_TIMEOUT, || async {
+        Ok((!node
+            .log_lines_matching(&["prover proof does not bind the requested batch"], 1)
+            .is_empty())
+        .then_some(()))
+    })
+    .await
+    .expect("the prover client never rejected the stale proof by its registered digest check");
+
+    let attesters = registered_pairs(&harness);
+    let stale = attesters[2].0;
+    let posted = posted_batches(
+        chain.rpc_url(),
+        harness.dep.eez_address,
+        harness.dep.deploy_block,
+        harness.dep.rollup_id,
+    )
+    .await
+    .unwrap();
+    assert!(!posted.is_empty(), "settled batches must be visible on L1");
+    for posted in &posted {
+        assert!(posted.succeeded, "no batch may revert: {posted:?}");
+        assert_eq!(
+            posted.batch.proofSystems.len(),
+            2,
+            "the two honest proofs settle each batch"
+        );
+        assert!(
+            !posted.batch.proofSystems.contains(&stale),
+            "the stale proof must never reach L1: {posted:?}",
+        );
+        verify_batch_proofs(&posted.batch, &attesters, None).unwrap();
+    }
+    node.assert_no_process_death();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quorum_two_of_three_settles_with_an_unresponsive_attester() {
+    let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4, ANVIL_KEY_6], 2)
+        .await
+        .unwrap();
+    let env = harness
+        .env_with_attesters(&[QuorumSigner::Honest; 3])
+        .await
+        .unwrap();
+    // Stop the third server before any proof request. No proof can be in flight.
+    harness.pause_attester(2).unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-unresponsive",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+    let transaction = send_l2_value_transfer_confirmed(
+        &node.l2_rpc_url(),
+        ANVIL_KEY_1,
+        ANVIL_ADDR,
+        U256::from(1u64),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .unwrap();
+    let provider = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse().unwrap());
+    let receipt = provider
+        .get_transaction_receipt(transaction)
+        .await
+        .unwrap()
+        .unwrap();
+    wait_for_safe_chain_contains(
+        &node,
+        receipt.block_number.unwrap(),
+        receipt.block_hash.unwrap(),
+        DEFAULT_TIMEOUT,
+    )
+    .await
+    .expect("the healthy quorum must settle the executed value transfer");
+    let chain = harness.chain();
+    chain
+        .wait_for_batches_or_node_failure(2, &[&node], DEFAULT_TIMEOUT)
+        .await
+        .expect("the two responsive attesters must continue settlement");
+    let attesters = registered_pairs(&harness);
+    let mut expected: Vec<Address> = attesters[..2].iter().map(|&(system, _)| system).collect();
+    expected.sort_unstable();
+    let posted = posted_batches(
+        chain.rpc_url(),
+        harness.dep.eez_address,
+        harness.dep.deploy_block,
+        harness.dep.rollup_id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        posted.len() >= 2,
+        "two successful posts must be visible on L1"
+    );
+    for posted in &posted {
+        assert!(
+            posted.succeeded,
+            "a quorum post must not revert: {posted:?}"
+        );
+        assert_eq!(posted.batch.proofSystems, expected);
+        verify_batch_proofs(&posted.batch, &attesters, None).unwrap();
+    }
+    assert_eq!(harness.attestations_of(2).unwrap(), 0);
+    assert_ne!(
+        chain.snapshot().await.unwrap().rollup_commitment,
+        chain.initial_commitment(),
+        "the healthy quorum must advance the L1 commitment",
+    );
+    node.assert_no_process_death();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quorum_prover_rejects_a_foreign_rollup_identity() {
+    use eez_control_rpc::v1;
+
+    let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4], 2)
+        .await
+        .unwrap();
+    let env = harness
+        .env_with_attesters(&[QuorumSigner::Honest; 2])
+        .await
+        .unwrap();
+    let datadir = tempfile::tempdir().unwrap();
+    let node = NodeHandle::start_with_datadir(
+        "quorum-rollup-identity",
+        datadir.path(),
+        &NodeConfig::default(),
+        &env,
+    )
+    .await
+    .unwrap();
+    harness
+        .chain()
+        .wait_for_batches_or_node_failure(1, &[&node], DEFAULT_TIMEOUT)
+        .await
+        .expect("the configured identities must first settle a real batch");
+    let provider = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse().unwrap());
+    let genesis = provider
+        .get_block_by_number(BlockNumberOrTag::Number(0))
+        .await
+        .unwrap()
+        .unwrap();
+    let begin = v1::Begin {
+        rollup_id: harness.dep.rollup_id,
+        anchor_number: 0,
+        anchor_hash: genesis.header.hash.to_vec(),
+        anchor_state_root: genesis.header.state_root.to_vec(),
+    };
+    let mut client =
+        v1::prover_client::ProverClient::connect(harness.attester_endpoint(0).unwrap())
+            .await
+            .unwrap();
+    for foreign in [false, true] {
+        let mut begin = begin.clone();
+        if foreign {
+            begin.rollup_id += 1;
+        }
+        let frame = v1::ClientFrame {
+            request_id: 1,
+            kind: Some(v1::client_frame::Kind::Begin(begin)),
+            ..Default::default()
+        };
+        let (requests, receiver) = tokio::sync::mpsc::channel(1);
+        requests.send(frame).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut response = client
+                .prove_stream(tokio_stream::wrappers::ReceiverStream::new(receiver))
+                .await?
+                .into_inner();
+            response.message().await
+        })
+        .await
+        .expect("Begin exchange must complete within its deadline")
+        .unwrap()
+        .expect("Begin must receive a protocol response");
+        if foreign {
+            assert!(frame.session_id.is_empty());
+            assert_eq!(frame.epoch, 0);
+            assert_eq!(frame.request_id, 1);
+            let Some(v1::server_frame::Kind::Rejected(rejected)) = &frame.kind else {
+                panic!("a foreign rollup must be rejected before receiving a session: {frame:?}");
+            };
+            assert_eq!(rejected.code, tonic::Code::Unimplemented as i32);
+        } else {
+            assert!(matches!(frame.kind, Some(v1::server_frame::Kind::Ready(_))));
+            assert_eq!(frame.session_id.len(), 32);
+        }
+        drop(requests);
+    }
     node.assert_no_process_death();
 }
 
@@ -924,16 +1225,21 @@ async fn based_mode_logs_peer_batch_as_expected_external() {
     peer.assert_no_process_death();
 }
 
+/// An L1-derived follower; with `seed`, it also follows the seed's signed heads.
 async fn spawn_follower(
     name: &str,
     harness: &Harness,
-    seq_rpc: Option<&str>,
+    seed: Option<&NodeHandle>,
 ) -> anyhow::Result<NodeHandle> {
-    let env = harness.follower_env(seq_rpc).await?;
-    let cfg = NodeConfig {
+    let mut env = harness.follower_env().await?;
+    let mut cfg = NodeConfig {
         binary: NodeBinary::Follower,
         ..Default::default()
     };
+    if let Some(seed) = seed {
+        overlay_follower(seed, &mut cfg, &mut env);
+        env = override_env(env, "RUST_LOG", "warn,eez_follower::unsafe_head=info");
+    }
     NodeHandle::start(name, &cfg, &env).await
 }
 
@@ -967,64 +1273,46 @@ async fn happy_case_follower_l1_derived() {
     seq.assert_no_process_death();
 }
 
-/// Sequencer RPC advances unsafe state while L1 remains safe-authoritative.
+/// Follower B finds the network from the seed's bootnode, receives heads over
+/// gossip, and fetches their ancestors from devp2p peers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn happy_case_follower_sequencer_rpc() {
+async fn follower_follows_over_p2p() {
     let harness = Harness::fresh().await.unwrap();
-    let chain = harness.chain();
-    let seq = NodeHandle::start("seq", &NodeConfig::default(), &harness.env().await.unwrap())
+    let (mut seq_cfg, mut seq_env) = (NodeConfig::default(), harness.env().await.unwrap());
+    overlay_seed(&mut seq_cfg, &mut seq_env);
+    let seq = NodeHandle::start("seq", &seq_cfg, &seq_env).await.unwrap();
+    let a = spawn_follower("follower-a", &harness, Some(&seq))
         .await
         .unwrap();
 
+    wait_for_latest_height(&seq, 10, DEFAULT_TIMEOUT)
+        .await
+        .expect("composer did not reach block 10");
+    let b = spawn_follower("follower-b", &harness, Some(&seq))
+        .await
+        .unwrap();
+
+    // `imported >= 2` means the ancestors came from devp2p peers.
     let seq_rpc = seq.l2_rpc_url();
-    let follower_env = override_env(
-        harness.follower_env(Some(&seq_rpc)).await.unwrap(),
-        "RUST_LOG",
-        "warn,eez_follower::unsafe_head=info",
-    );
-    let follower_cfg = NodeConfig {
-        binary: NodeBinary::Follower,
-        ..Default::default()
-    };
-    let follower = NodeHandle::start("follower", &follower_cfg, &follower_env)
-        .await
-        .unwrap();
-
-    chain
-        .wait_for_batches(2, DEFAULT_TIMEOUT)
-        .await
-        .expect("sequencer landed batches");
-    wait_for_safe_state(
-        &follower,
-        &chain,
-        chain.initial_commitment(),
-        DEFAULT_TIMEOUT,
-    )
-    .await
-    .expect("follower did not catch up via L1 replay");
-
-    wait_for_safe_prefix_convergence(&[&seq, &follower], 1, DEFAULT_TIMEOUT)
-        .await
-        .expect("follower safe block never matched the sequencer chain");
-
-    let follower_head_signals = [
-        signals::FOLLOWER_HEAD_ADVANCED,
-        signals::FOLLOWER_HEAD_SYNCING,
-    ];
-    let unsafe_head_events_before = follower.count_signals(&follower_head_signals).unwrap();
-    seq.run_tx_spammer(ANVIL_KEY_1);
-    wait_for(DEFAULT_TIMEOUT, || {
-        std::future::ready(
-            follower
-                .count_signals(&follower_head_signals)
-                .map(|n| (n > unsafe_head_events_before).then_some(())),
-        )
+    wait_for(DEFAULT_TIMEOUT, || async {
+        for s in b.signals_since(0)? {
+            if s.name != signals::FOLLOWER_HEAD_ADVANCED || s.u64("imported")? < 2 {
+                continue;
+            }
+            let n = s.u64("block.number")?;
+            let at_seq = block_number_and_hash_at(&seq_rpc, BlockNumberOrTag::Number(n)).await?;
+            if at_seq == Some((n, s.b256("block.hash")?)) {
+                return Ok(Some(()));
+            }
+        }
+        Ok(None)
     })
     .await
-    .expect("follower never reported a sequencer-RPC unsafe-head FCU outcome");
+    .expect("follower B never adopted a gossiped head with peer-fetched ancestors");
 
-    follower.assert_no_process_death();
-    seq.assert_no_process_death();
+    for node in [&seq, &a, &b] {
+        node.assert_no_process_death();
+    }
 }
 
 /// An L1-only follower retreats, replays the replacement suffix, and converges
@@ -1041,9 +1329,10 @@ async fn happy_case_follower_l1_reorg_recovers() {
     let follower_cfg = NodeConfig {
         binary: NodeBinary::Follower,
         genesis_path: Some(genesis),
+        ..Default::default()
     };
     let seq_env = harness.env().await.unwrap();
-    let follower_env = harness.follower_env(None).await.unwrap();
+    let follower_env = harness.follower_env().await.unwrap();
     let (seq, follower) = tokio::try_join!(
         NodeHandle::start("seq", &seq_cfg, &seq_env),
         NodeHandle::start("follower", &follower_cfg, &follower_env),
@@ -1089,18 +1378,17 @@ async fn happy_case_follower_l1_reorg_recovers() {
 async fn happy_case_follower_cross_safe_parity() {
     let harness = Harness::fresh().await.unwrap();
     let chain = harness.chain();
-    let seq = NodeHandle::start("seq", &NodeConfig::default(), &harness.env().await.unwrap())
-        .await
-        .unwrap();
+    let (mut seq_cfg, mut seq_env) = (NodeConfig::default(), harness.env().await.unwrap());
+    overlay_seed(&mut seq_cfg, &mut seq_env);
+    let seq = NodeHandle::start("seq", &seq_cfg, &seq_env).await.unwrap();
     chain
         .wait_for_batches(2, DEFAULT_TIMEOUT)
         .await
         .expect("sequencer landed batches");
 
-    let seq_rpc = seq.l2_rpc_url();
     let (f_l1, f_seq) = tokio::try_join!(
         spawn_follower("f_l1", &harness, None),
-        spawn_follower("f_seq", &harness, Some(&seq_rpc)),
+        spawn_follower("f_seq", &harness, Some(&seq)),
     )
     .unwrap();
     wait_for_safe_state(&f_l1, &chain, chain.initial_commitment(), DEFAULT_TIMEOUT)
@@ -1119,35 +1407,41 @@ async fn happy_case_follower_cross_safe_parity() {
     seq.assert_no_process_death();
 }
 
-/// A rogue unsafe source cannot move the follower's L1-derived safe head.
-/// A structured signal proves the follower polled the rogue source.
+/// Heads signed by a key other than the configured sequencer's are rejected:
+/// the follower's head never takes them and its L1-derived safe head holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     let harness = Harness::fresh().await.unwrap();
     let chain = harness.chain();
     let genesis = harness.l2_genesis_path();
 
-    let seq_cfg = NodeConfig {
+    let mut seq_cfg = NodeConfig {
         genesis_path: Some(genesis),
         ..Default::default()
     };
-    let seq = NodeHandle::start("seq", &seq_cfg, &harness.env().await.unwrap())
-        .await
-        .unwrap();
+    let mut seq_env = harness.env().await.unwrap();
+    overlay_seed(&mut seq_cfg, &mut seq_env);
+    let seq = NodeHandle::start("seq", &seq_cfg, &seq_env).await.unwrap();
     seq.run_tx_spammer(ANVIL_KEY_1);
 
-    // The already-running L1 Anvil is an incompatible Ethereum chain and is
-    // sufficient to exercise unsafe-head rejection without another L2 node.
-    let rogue_rpc = harness.anvil.rpc_url.clone();
+    let mut follower_cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        genesis_path: Some(genesis),
+        ..Default::default()
+    };
+    let mut follower_env = harness.follower_env().await.unwrap();
+    overlay_follower(&seq, &mut follower_cfg, &mut follower_env);
+    // The real sequencer, trusted under another address: every head it signs is rogue.
     let follower_env = override_env(
-        harness.follower_env(Some(&rogue_rpc)).await.unwrap(),
+        follower_env,
+        "EEZ_SEQUENCER_ADDRESS",
+        &format!("{ANVIL_ADDR:#x}"),
+    );
+    let follower_env = override_env(
+        follower_env,
         "RUST_LOG",
         "warn,eez_follower::unsafe_head=info",
     );
-    let follower_cfg = NodeConfig {
-        binary: NodeBinary::Follower,
-        genesis_path: Some(genesis),
-    };
     let follower = NodeHandle::start("follower", &follower_cfg, &follower_env)
         .await
         .unwrap();
@@ -1161,21 +1455,24 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
     .await
     .expect("follower safe head did not reach a non-genesis attested root while on the rogue");
 
-    // Stop canonical batch production and let any already-submitted batch land
-    // before fixing the safe anchor used by this assertion.
-    drop(seq);
+    // Stop settlement but keep the rogue signing, and let any already-submitted
+    // batch land before fixing the safe anchor used by this assertion.
+    harness
+        .set_builder_mode(BuilderStubMode::Drop)
+        .await
+        .expect("stop settlement");
     chain
         .wait_for_l1_blocks(1, Duration::from_secs(15))
         .await
-        .expect("L1 did not flush after stopping the composer");
+        .expect("L1 did not flush after stopping settlement");
     let final_state = chain
         .snapshot()
         .await
         .unwrap()
         .latest_execution_root
-        .expect("composer settled a batch before stopping");
+        .expect("composer settled a batch before settlement stopped");
     // An arbitrary historical attestation is insufficient here: a final batch
-    // may have landed while the composer was shutting down.
+    // may have landed while settlement was stopping.
     wait_for(DEFAULT_TIMEOUT, || async {
         Ok((safe_block_hash(&follower.l2_rpc_url()).await? == Some(final_state)).then_some(()))
     })
@@ -1186,34 +1483,33 @@ async fn happy_case_follower_rogue_sequencer_safe_head_holds() {
         .unwrap()
         .expect("follower has a safe head");
 
-    // The rogue RPC is Anvil. Force its unrelated block number above the L2
-    // safe height, making its ancestry locally unknown rather than a
-    // timing-dependent equal-height/below-safe conflict.
-    while chain.block_number().await.unwrap() <= safe_before.0 {
-        chain.mine().await.unwrap();
-    }
-    let syncing_pattern = ["reth accepted sequencer head as a sync target"];
-    let syncing_before = follower.log_count_matching(&syncing_pattern).unwrap();
-    wait_for(DEFAULT_TIMEOUT, || {
-        std::future::ready(
-            follower
-                .log_count_matching(&syncing_pattern)
-                .map(|count| (count > syncing_before).then_some(())),
-        )
-    })
-    .await
-    .expect("follower did not offer the unknown rogue head as a sync target");
-
+    let rejected_before = follower.count_signal(signals::P2P_MESSAGE_REJECTS).unwrap();
+    chain
+        .wait_for_l1_blocks(3, Duration::from_secs(30))
+        .await
+        .expect("L1 did not advance three blocks");
+    assert!(
+        follower.count_signal(signals::P2P_MESSAGE_REJECTS).unwrap() > rejected_before,
+        "follower must reject the heads the rogue keeps signing",
+    );
+    assert_eq!(
+        follower
+            .count_signal(signals::FOLLOWER_HEAD_ADVANCED)
+            .unwrap(),
+        0,
+        "a rogue head must never move the follower's head",
+    );
     let safe_after = block_number_and_hash_at(&follower.l2_rpc_url(), BlockNumberOrTag::Safe)
         .await
         .unwrap();
     assert_eq!(
         safe_after,
         Some(safe_before),
-        "processing the rogue sync target must not move the L1-derived safe head",
+        "rogue heads must not move the L1-derived safe head",
     );
 
     follower.assert_no_process_death();
+    seq.assert_no_process_death();
 }
 
 /// A late follower backfills the complete pre-existing batch history.
@@ -1258,4 +1554,221 @@ async fn happy_case_follower_deep_backfill_late_join() {
 
     follower.assert_no_process_death();
     seq.assert_no_process_death();
+}
+
+/// A fresh peers-mode follower syncs the history below L1-finalized from its
+/// trusted peer through reth's pipeline, and scans L1 only from there; one
+/// without peers waits at genesis and never derives from L1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_follower_syncs_history_from_peers() {
+    let harness = Harness::fresh_with_fast_finality().await.unwrap();
+    let composer = peers_composer(&harness).await;
+
+    // reth backfills with its pipeline only past DEFAULT_BACKFILL_RUN_THRESHOLD = EPOCH_SLOTS = 32
+    // (engine/primitives/src/config.rs:28); a shorter gap is downloaded block by block.
+    let (finalized_l1, height, root) = wait_for(DEFAULT_TIMEOUT, || async {
+        Ok(finalized_root(&harness, &composer)
+            .await?
+            .filter(|(_, height, _)| *height > 32))
+    })
+    .await
+    .expect("L1 never finalized a root above L2 block 32");
+
+    let mut follower_env = harness.follower_env().await.unwrap();
+    peers_mode(&mut follower_env);
+    let follower_cfg = |extra_args| NodeConfig {
+        binary: NodeBinary::Follower,
+        extra_args,
+        ..Default::default()
+    };
+    let lonely = NodeHandle::start("follower-no-peers", &follower_cfg(vec![]), &follower_env)
+        .await
+        .unwrap();
+    let waiting = wait_for(Duration::from_secs(40), || async {
+        Ok(lonely
+            .signals_since(0)?
+            .into_iter()
+            .find(|s| s.name == signals::NODE_SYNC_WAITING_FOR_PEERS))
+    })
+    .await
+    .expect("a follower without peers never reported waiting for them");
+    assert_eq!(
+        waiting.u64("peers").unwrap(),
+        0,
+        "the lonely follower has a peer"
+    );
+    // Checked again at the end, after it has waited through the other follower's sync.
+    let still_waiting = || async {
+        let latest = block_number_and_hash_at(&lonely.l2_rpc_url(), BlockNumberOrTag::Latest)
+            .await
+            .unwrap();
+        assert_eq!(
+            latest.map(|(n, _)| n),
+            Some(0),
+            "follower without peers left genesis"
+        );
+        assert_eq!(
+            lonely
+                .count_signal(signals::DERIVER_CATCH_UP_START)
+                .unwrap(),
+            0,
+            "follower without peers derived from L1",
+        );
+    };
+    still_waiting().await;
+
+    let trusted = vec![
+        "--trusted-peers".into(),
+        enode(SEED_KEY, composer.p2p_port, composer.discv5_port),
+    ];
+    let synced = NodeHandle::start("follower-synced", &follower_cfg(trusted), &follower_env)
+        .await
+        .unwrap();
+    wait_for_safe_chain_contains(&synced, height, root, DEFAULT_TIMEOUT)
+        .await
+        .expect("follower never synced to the L1-finalized root");
+    // reth reports the synced root as safe before boot reaches the L1 scan.
+    let first_scan = wait_for(DEFAULT_TIMEOUT, || async {
+        Ok(synced
+            .signals_since(0)?
+            .into_iter()
+            .find(|s| s.name == signals::DERIVER_CATCH_UP_START))
+    })
+    .await
+    .expect("synced follower never scanned L1");
+    // The seeded scan starts at the follower's own F, never below the one read here.
+    assert!(
+        first_scan.u64("from_l1_block").unwrap() >= finalized_l1,
+        "synced follower scanned L1 from below L1-finalized",
+    );
+    // No head source moves safe now, so passing it takes a batch the Deriver reconciled from L1.
+    let (seeded_safe, _) = block_number_and_hash_at(&synced.l2_rpc_url(), BlockNumberOrTag::Safe)
+        .await
+        .unwrap()
+        .expect("synced follower has a safe block");
+    wait_for_safe_prefix_convergence(&[&composer, &synced], seeded_safe + 1, DEFAULT_TIMEOUT)
+        .await
+        .expect("synced follower never reconciled an L1 batch past its seed");
+
+    still_waiting().await;
+    for node in [&composer, &lonely, &synced] {
+        node.assert_no_process_death();
+    }
+}
+
+/// A peers-mode follower restarted more than 32 blocks below L1-finalized
+/// rewinds to its own finalized block, syncs the rest from its peer through
+/// reth's pipeline, and scans L1 only from F.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_restart_below_finalized_resyncs_from_peers() {
+    let harness = Harness::fresh_with_fast_finality().await.unwrap();
+    let composer = peers_composer(&harness).await;
+    let mut env = harness.follower_env().await.unwrap();
+    peers_mode(&mut env);
+    // At threshold 0 reth persists every block, so the kill keeps a finalized block above genesis.
+    let cfg = NodeConfig {
+        binary: NodeBinary::Follower,
+        extra_args: vec![
+            "--trusted-peers".into(),
+            enode(SEED_KEY, composer.p2p_port, composer.discv5_port),
+            "--engine.persistence-threshold".into(),
+            "0".into(),
+        ],
+        ..Default::default()
+    };
+    let datadir = tempfile::tempdir().unwrap();
+    let last_head = {
+        let first = NodeHandle::start_with_datadir("follower-first", datadir.path(), &cfg, &env)
+            .await
+            .unwrap();
+        let rpc = first.l2_rpc_url();
+        wait_for(DEFAULT_TIMEOUT, || async {
+            let finalized = block_number_and_hash_at(&rpc, BlockNumberOrTag::Finalized).await?;
+            Ok(finalized.filter(|(number, _)| *number > 0))
+        })
+        .await
+        .expect("follower never finalized an L1-settled batch");
+        // reth writes a finalized FCU to disk only with the next block it saves.
+        let head = wait_for_latest_height(&first, 0, DEFAULT_TIMEOUT).await;
+        let later = wait_for_latest_height(&first, head.unwrap().number + 1, DEFAULT_TIMEOUT)
+            .await
+            .expect("follower never saved a block after finalizing");
+        // Persistence trails the head; one L1 block lets it flush.
+        harness
+            .chain()
+            .wait_for_l1_blocks(1, Duration::from_secs(20))
+            .await
+            .unwrap();
+        first.assert_no_process_death();
+        later.number
+    };
+
+    let (finalized_l1, height, root) = wait_for(DEFAULT_TIMEOUT, || async {
+        Ok(finalized_root(&harness, &composer)
+            .await?
+            .filter(|(_, height, _)| *height > last_head + 32))
+    })
+    .await
+    .expect("L1 never finalized a root 32 blocks past the stopped follower");
+    let restarted =
+        NodeHandle::start_with_datadir("follower-restarted", datadir.path(), &cfg, &env)
+            .await
+            .unwrap();
+    let first_signal = |name: &'static str| {
+        let node = &restarted;
+        wait_for(DEFAULT_TIMEOUT, move || async move {
+            Ok(node.signals_since(0)?.into_iter().find(|s| s.name == name))
+        })
+    };
+    // Waiting for peers means the Sync path, not Seed; a best block above 0 means it rewound to f > 0.
+    let syncing = first_signal(signals::NODE_SYNC_WAITING_FOR_PEERS)
+        .await
+        .expect("restarted follower never synced from peers");
+    assert!(syncing.u64("local_best").unwrap() > 0, "rewound to genesis");
+    wait_for_safe_chain_contains(&restarted, height, root, DEFAULT_TIMEOUT)
+        .await
+        .expect("restarted follower never reached the L1-finalized root");
+    let first_scan = first_signal(signals::DERIVER_CATCH_UP_START)
+        .await
+        .expect("restarted follower never scanned L1");
+    assert!(
+        first_scan.u64("from_l1_block").unwrap() >= finalized_l1,
+        "restarted follower scanned L1 from below L1-finalized",
+    );
+    wait_for_safe_prefix_convergence(&[&composer, &restarted], height + 1, DEFAULT_TIMEOUT)
+        .await
+        .expect("restarted follower never reconciled an L1 batch past the root");
+    restarted.assert_no_process_death();
+    composer.assert_no_process_death();
+}
+
+/// A peers-mode composer under [`SEED_KEY`], with traffic.
+async fn peers_composer(harness: &Harness) -> NodeHandle {
+    let mut env = harness.env().await.unwrap();
+    peers_mode(&mut env);
+    let cfg = NodeConfig {
+        extra_args: vec!["--p2p-secret-key-hex".into(), SEED_KEY.into()],
+        ..Default::default()
+    };
+    let composer = NodeHandle::start("composer", &cfg, &env).await.unwrap();
+    composer.run_tx_spammer(ANVIL_KEY_1);
+    composer
+}
+
+/// L1's finalized block F, and the height and hash of the root L1 stores at F
+/// once `node` holds it.
+async fn finalized_root(
+    harness: &Harness,
+    node: &NodeHandle,
+) -> anyhow::Result<Option<(u64, u64, B256)>> {
+    let l1 = ProviderBuilder::new().connect_http(harness.anvil.rpc_url.parse()?);
+    let Some(finalized) = l1.get_block_by_number(BlockNumberOrTag::Finalized).await? else {
+        return Ok(None);
+    };
+    let f = finalized.header.number;
+    let (eez, rollup_id) = (harness.dep.eez_address, harness.dep.rollup_id);
+    let root = rollup_root_at(&harness.anvil.rpc_url, eez, rollup_id, Some(f)).await?;
+    let l2 = ProviderBuilder::new().connect_http(node.l2_rpc_url().parse()?);
+    let block = l2.get_block_by_hash(root).await?;
+    Ok(block.map(|block| (f, block.header.number, root)))
 }

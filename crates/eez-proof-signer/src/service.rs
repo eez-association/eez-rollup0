@@ -18,9 +18,6 @@ pub(crate) use settlement_job::AttestablePublicInputsHash;
 /// request-byte limit may lower the effective per-message limit.
 const MAX_DECODING_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 
-/// Responses carry bounded cursors, rejection details, or one attestation.
-const MAX_ENCODING_MESSAGE_BYTES: usize = 1024;
-
 /// Named construction inputs for [`ServiceLimits`].
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceLimitsParams {
@@ -144,7 +141,7 @@ impl ProveSvc {
         let message_bytes = self.sessions.limits.max_decoding_message_bytes();
         ProverServer::new(self)
             .max_decoding_message_size(message_bytes)
-            .max_encoding_message_size(MAX_ENCODING_MESSAGE_BYTES)
+            .max_encoding_message_size(eez_control_rpc::MAX_PROVE_RESPONSE_BYTES)
     }
 }
 

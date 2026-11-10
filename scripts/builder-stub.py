@@ -75,6 +75,8 @@ class Builder:
     block_time = 2
     mode = "forward"
     mining = True
+    # Relay bundles to the upstream instead of mining them; no ticker.
+    passthrough = False
     # Serialises every block the stub mines; Anvil mines nothing else.
     lock = threading.Lock()
     # Target block number -> queued bundle params, in arrival order.
@@ -237,6 +239,14 @@ class Builder:
             time.sleep(wait)
 
 
+def _is_builder_request(body):
+    """Identify methods whose behavior belongs to the local builder."""
+    method = body.get("method") if isinstance(body, dict) else None
+    return isinstance(method, str) and (
+        method == "eth_sendBundle" or method.startswith("eez_")
+    )
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
@@ -276,6 +286,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with Builder.lock:
                 return self._result(body, list(Builder.rejected))
         if method == "eth_sendBundle":
+            if Builder.passthrough and Builder.mode == "forward":
+                return None
             try:
                 return self._result(body, Builder.queue(params[0]))
             except (IndexError, KeyError, TypeError, ValueError, RuntimeError) as error:
@@ -289,7 +301,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(400)
             return
 
-        response = self._dispatch(body)
+        if isinstance(body, list) and any(_is_builder_request(item) for item in body):
+            self.send_error(400, "builder methods require a single request")
+            return
+
+        response = None if isinstance(body, list) else self._dispatch(body)
         if response is not None:
             resp = json.dumps(response).encode()
         else:
@@ -319,16 +335,23 @@ def main():
         "--upstream", required=True, help="anvil RPC url (started with --no-mining)"
     )
     p.add_argument("--block-time", type=int, default=2)
+    p.add_argument(
+        "--passthrough",
+        action="store_true",
+        help="relay bundles to a non-Anvil upstream unchanged (drop mode still drops)",
+    )
     args = p.parse_args()
     host, port = args.listen.split(":")
     Builder.upstream = args.upstream
     Builder.block_time = args.block_time
+    Builder.passthrough = args.passthrough
 
     class Reusable(socketserver.ThreadingTCPServer):
         allow_reuse_address = True
         daemon_threads = True
 
-    threading.Thread(target=Builder.tick_forever, daemon=True).start()
+    if not args.passthrough:
+        threading.Thread(target=Builder.tick_forever, daemon=True).start()
     with Reusable((host, int(port)), Handler) as srv:
         srv.serve_forever()
 

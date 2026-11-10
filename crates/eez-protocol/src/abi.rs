@@ -114,6 +114,11 @@ sol! {
 
     function executeL2Txs(uint64 rollupId) external returns (bytes);
 
+    function rollups(uint64 rollupId)
+        external
+        view
+        returns (address rollupContract, bytes32 root, uint256 etherBalance);
+
     function staticCrossChainCall(address sourceAddress, bytes callData) external view returns (bytes);
 
     event BatchPosted(bytes32 sharedPublicInput, uint64[] rollupIds);
@@ -258,6 +263,19 @@ sol! {
     /// `CrossChainProxy.executeOnBehalf` — forwards `value` + `data` to
     /// `destination` when the caller is the manager.
     function executeOnBehalf(address destination, uint64 callGas, bytes data) external payable;
+}
+
+// The attestation settings a composer reads before collecting proofs: the
+// rollup manager's (`Rollup.sol`) and each `ECDSAProofSystem`'s.
+sol! {
+    /// Distinct proof systems a batch must carry for the rollup.
+    function threshold() external view returns (uint256);
+
+    /// The vkey the manager registers for `proofSystem`, zero if none.
+    function verificationKey(address proofSystem) external view returns (bytes32);
+
+    /// The key an `ECDSAProofSystem` accepts.
+    function signer() external view returns (address);
 }
 
 #[cfg(test)]

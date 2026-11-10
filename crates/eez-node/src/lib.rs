@@ -7,40 +7,40 @@
 //!
 mod bundle_rpc;
 mod composer_rpc;
+mod head_signer;
 mod ingress;
 mod l1_embedded;
 mod witness_source;
 
 use std::{collections::HashMap, env, str::FromStr, sync::Arc, time::Duration};
 
+use alloy_consensus::{BlockHeader as _, Header, transaction::TxHashRef as _};
 use alloy_primitives::{Address, B256};
 use alloy_provider::Provider as _;
 use alloy_signer_local::PrivateKeySigner;
 use eez_composer::composer::CrossChainWiring;
 use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
-use eez_deriver::{Deriver, DeriverError};
+use eez_deriver::Deriver;
 use eez_driver::{
     BlockCommitterHandle, DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, RollupTiming,
     Sequencer, SyncSlotComposerHandle, spawn_l1_anchored,
 };
 use eez_l1::{
-    L1CanonicalHead, L1Error, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
+    L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
 };
 use eez_node_common::EezNode;
 use eez_node_common::{
-    L2NodeBuilder, NoRoleArgs, node_cli, read_checkpoint_dir, wait_for_l1_ready,
-    warn_on_deprecated_env,
+    L2NodeBuilder, NoRoleArgs, boot, node_cli, sync_mode_from_env, wait_for_idle_engine,
+    wait_for_l1_ready, warn_on_deprecated_env,
 };
+use eez_primitives::engine::EezEngineTypes;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
+use reth_network::{NetworkInfo as _, PeersInfo as _};
 use reth_node_ethereum::EthereumNode;
+use reth_storage_api::{BlockReader, HeaderProvider};
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
-const BOOT_CATCH_UP_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
-const BOOT_CATCH_UP_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
-/// ~15 min at the capped backoff: outlasts a restarting L1, but a permanently
-/// refused RPC call still surfaces as an exit.
-const BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES: u32 = 32;
 const L1_CHAIN_ID_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Witness-capture resources selected by the mandatory composer prover.
@@ -53,7 +53,7 @@ enum WitnessCapture {
 }
 
 struct ComposerProving {
-    prover: Arc<dyn eez_prover::Prover>,
+    quorum: eez_composer::AttestationQuorum,
     witness_capture: WitnessCapture,
 }
 
@@ -63,6 +63,154 @@ impl WitnessCapture {
             Self::Remote { sender, .. } => sender.clone(),
         }
     }
+}
+
+/// The attesters the composer collects proofs from.
+fn attestation_quorum_from_env() -> eyre::Result<eez_composer::AttestationQuorum> {
+    let config = AttesterConfig::read(|name| env::var(name).ok())?;
+    let members = config
+        .attesters
+        .into_iter()
+        .map(|spec| eez_composer::QuorumMember {
+            proof_system: spec.proof_system,
+            attester: spec.attester,
+            prover: Arc::new(eez_prover_client::RemoteProver::new(
+                spec.url,
+                spec.attester,
+            )),
+        })
+        .collect();
+    let quorum = eez_composer::AttestationQuorum::new(members, config.grace)
+        .map_err(|e| eyre::eyre!("attester set: {e}"))?;
+    event!(
+        name: "eez.node.attestation_quorum.configured",
+        Level::INFO,
+        event_name = "eez.node.attestation_quorum.configured",
+        attesters = quorum.len(),
+        proof_systems = ?quorum.proof_systems().collect::<Vec<_>>(),
+        grace_ms = u64::try_from(config.grace.as_millis()).unwrap_or(u64::MAX),
+        "attester set configured; the threshold is read from the rollup manager",
+    );
+    Ok(quorum)
+}
+
+/// The attester set as the environment configures it.
+///
+/// `EEZ_PROVERS` lists the attesters as comma-separated
+/// `url=attester=proof_system` triples; each attester's proofs are checked
+/// against its own proof system. Unset or blank, the single attester of
+/// [`SINGLE_ATTESTER_VARS`] is used. `EEZ_ATTESTATION_GRACE_MS` (default 250,
+/// also when blank) is how long collection continues once the on-chain
+/// threshold is met.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttesterConfig {
+    attesters: Vec<AttesterSpec>,
+    grace: Duration,
+}
+
+/// One configured attester.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttesterSpec {
+    url: String,
+    attester: Address,
+    proof_system: Address,
+}
+
+/// The single attester's settings, which `EEZ_PROVERS` takes precedence over.
+const SINGLE_ATTESTER_VARS: [&str; 3] = [
+    "EEZ_PROVER_URL",
+    "EEZ_ATTESTER_ADDRESS",
+    "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS",
+];
+
+impl AttesterConfig {
+    fn read(var: impl Fn(&str) -> Option<String>) -> eyre::Result<Self> {
+        let set = |name: &str| var(name).filter(|value| !value.trim().is_empty());
+        let attesters = match set("EEZ_PROVERS") {
+            Some(list) => {
+                let ignored: Vec<_> = SINGLE_ATTESTER_VARS
+                    .into_iter()
+                    .filter(|name| set(name).is_some())
+                    .collect();
+                if !ignored.is_empty() {
+                    event!(
+                        name: "eez.node.attestation_quorum.single_attester_vars_ignored",
+                        Level::INFO,
+                        event_name = "eez.node.attestation_quorum.single_attester_vars_ignored",
+                        ignored = ?ignored,
+                        "EEZ_PROVERS lists the attesters; the single-attester variables are ignored",
+                    );
+                }
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(AttesterSpec::parse)
+                    .collect::<eyre::Result<Vec<_>>>()?
+            }
+            None => vec![AttesterSpec::legacy(&var)?],
+        };
+        let grace = match set("EEZ_ATTESTATION_GRACE_MS") {
+            Some(ms) => Duration::from_millis(
+                ms.trim()
+                    .parse()
+                    .map_err(|e| eyre::eyre!("EEZ_ATTESTATION_GRACE_MS `{ms}`: {e}"))?,
+            ),
+            None => eez_composer::DEFAULT_ATTESTATION_GRACE,
+        };
+        Ok(Self { attesters, grace })
+    }
+}
+
+impl AttesterSpec {
+    /// One `url=attester=proof_system` entry of `EEZ_PROVERS`, split from the
+    /// right so a URL may itself contain `=`.
+    fn parse(entry: &str) -> eyre::Result<Self> {
+        let mut parts = entry.rsplitn(3, '=');
+        let (Some(proof_system), Some(attester), Some(url)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(eyre::eyre!(
+                "EEZ_PROVERS entry `{entry}` is not `url=attester=proof_system`"
+            ));
+        };
+        let field = |name: &str| format!("EEZ_PROVERS entry `{entry}`: {name}");
+        Ok(Self {
+            url: parse_prover_url(url, &field("url"))?,
+            attester: parse_address(attester, &field("attester"))?,
+            proof_system: parse_address(proof_system, &field("proof system"))?,
+        })
+    }
+
+    fn legacy(var: &impl Fn(&str) -> Option<String>) -> eyre::Result<Self> {
+        let read = |name: &str| {
+            var(name).ok_or_else(|| {
+                eyre::eyre!("{name} is required for composer proving when EEZ_PROVERS is unset")
+            })
+        };
+        Ok(Self {
+            url: parse_prover_url(&read("EEZ_PROVER_URL")?, "EEZ_PROVER_URL")?,
+            attester: parse_address(&read("EEZ_ATTESTER_ADDRESS")?, "EEZ_ATTESTER_ADDRESS")?,
+            proof_system: parse_address(
+                &read("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS")?,
+                "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS",
+            )?,
+        })
+    }
+}
+
+/// `name` labels the value in the error.
+fn parse_prover_url(url: &str, name: &str) -> eyre::Result<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(eyre::eyre!("{name}: prover URL must not be empty"));
+    }
+    Ok(url.to_owned())
+}
+
+/// `name` labels the value in the error.
+fn parse_address(value: &str, name: &str) -> eyre::Result<Address> {
+    Address::from_str(value.trim())
+        .map_err(|e| eyre::eyre!("{name}: `{value}` is not an address: {e}"))
 }
 
 /// Embedded L1 reth handle — owned by `main` for the node lifetime so
@@ -85,16 +233,7 @@ pub fn run_composer() -> eyre::Result<()> {
 }
 
 fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
-    let url = env::var("EEZ_PROVER_URL")
-        .map_err(|_| eyre::eyre!("EEZ_PROVER_URL is required for composer proving"))?;
-    if url.trim().is_empty() {
-        return Err(eyre::eyre!("EEZ_PROVER_URL must not be empty"));
-    }
-    let attester = env::var("EEZ_ATTESTER_ADDRESS")
-        .map_err(|_| eyre::eyre!("EEZ_ATTESTER_ADDRESS is required for composer proving"))?;
-    let attester =
-        Address::from_str(attester.trim()).map_err(|e| eyre::eyre!("EEZ_ATTESTER_ADDRESS: {e}"))?;
-    let prover = eez_prover_client::RemoteProver::new(url, attester);
+    let quorum = attestation_quorum_from_env()?;
     let (sender, receiver) = mpsc::unbounded_channel::<B256>();
     let witness_db_path =
         env::var("EEZ_WITNESS_DB_PATH").unwrap_or_else(|_| "eez-witnesses".to_owned());
@@ -106,13 +245,25 @@ fn composer_proving_from_env() -> eyre::Result<ComposerProving> {
         "persistent witness store opened",
     );
     Ok(ComposerProving {
-        prover: Arc::new(prover),
+        quorum,
         witness_capture: WitnessCapture::Remote {
             sender,
             receiver,
             store,
         },
     })
+}
+
+/// `EEZ_SEQUENCER_KEY`: the key that signs this composer's heads; unset disables signing.
+fn sequencer_key_from_env() -> eyre::Result<Option<PrivateKeySigner>> {
+    match env::var("EEZ_SEQUENCER_KEY") {
+        // The parse error is dropped on purpose: it must never echo the key.
+        Ok(value) => PrivateKeySigner::from_str(value.trim())
+            .map(Some)
+            .map_err(|_| eyre::eyre!("EEZ_SEQUENCER_KEY is not a valid private key")),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(eyre::eyre!("EEZ_SEQUENCER_KEY is not valid unicode")),
+    }
 }
 
 fn optional_address_from_env(name: &str) -> eyre::Result<Option<Address>> {
@@ -135,9 +286,18 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     );
 
     warn_on_deprecated_env();
+    let sync_mode = sync_mode_from_env()?;
+    let sequencer_key = sequencer_key_from_env()?;
+    if sequencer_key.is_none() {
+        event!(
+            name: "eez.node.head_signer.disabled",
+            Level::WARN,
+            "EEZ_SEQUENCER_KEY not set; this composer does not sign heads",
+        );
+    }
     // Fail before launching either reth if no usable prover is configured.
     let ComposerProving {
-        prover,
+        quorum,
         witness_capture,
     } = composer_proving_from_env()?;
     let eez_registry: Address =
@@ -288,6 +448,14 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         },
     );
     let front_composer_info = Arc::new(serde_json::to_value(&composer_info)?);
+    let rollup_config = RollupConfig::from_env(
+        eez_evm::fee_collector(&builder.config().chain.genesis.config)?.unwrap_or_default(),
+    )?;
+    // Read before launch so a misconfiguration fails fast.
+    let p2p_config = eez_p2p::P2pConfig::from_env(l2_chain_id, rollup_config.rollup_id)?;
+    if p2p_config.is_some() && sequencer_key.is_none() {
+        eyre::bail!("EEZ_P2P_LISTEN requires EEZ_SEQUENCER_KEY on a composer");
+    }
     let handle = builder
         .node(EezNode)
         .extend_rpc_modules(move |ctx| {
@@ -302,6 +470,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     let payload_builder_handle = handle.node.payload_builder_handle.clone();
     let beacon_engine_handle = handle.node.add_ons_handle.beacon_engine_handle.clone();
     let task_executor = handle.node.task_executor.clone();
+    let network = handle.node.network.clone();
 
     // Shared L1-confirmed L2 head. Created unconditionally so the
     // Sequencer's speculative-depth limit can be wired even when
@@ -311,6 +480,12 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
 
     let timing = RollupTiming::from_env()?;
 
+    // Env reads come first so a bad L1 env fails at startup, not after a backfill.
+    let submitter_config = SubmitterConfig::from_env()?;
+    let l1_watcher_config = L1WatcherConfig::from_env()?;
+
+    // The committer reads reth's head, which a resumed backfill is still moving.
+    wait_for_idle_engine(|| network.is_syncing()).await;
     let block_committer = BlockCommitterHandle::spawn_from_provider(
         &provider,
         beacon_engine_handle,
@@ -322,14 +497,9 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_MAX_SPECULATIVE_DEPTH);
 
-    let submitter_config = SubmitterConfig::from_env()?;
     let deploy_block = submitter_config.reader.deploy_block;
-    let rollup_config = RollupConfig::from_env(
-        eez_evm::fee_collector(&chain_spec.genesis.config)?.unwrap_or_default(),
-    )?;
     let attributes = EthAttributesBuilder::new(chain_spec.clone())
         .with_fee_recipient(rollup_config.fee_recipient);
-    let l1_watcher_config = L1WatcherConfig::from_env()?;
 
     let submitter = Submitter::new(submitter_config);
     // Handle only — polling starts after boot catch-up fixes the
@@ -493,13 +663,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             .map_err(|_| eyre::eyre!("EEZ_L1_POSTER_KEY required for L1 postBatch signing"))?;
         let l1_poster_signer =
             PrivateKeySigner::from_bytes(&B256::from_str(l1_poster_key.trim_start_matches("0x"))?)?;
-        let ecdsa_proof_system_address: Address =
-            Address::from_str(&env::var("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS").map_err(|_| {
-                eyre::eyre!(
-                    "EEZ_ECDSA_PROOF_SYSTEM_ADDRESS required for L1 postBatch \
-                         proofSystems[0]"
-                )
-            })?)?;
         // 10 gwei comfortably exceeds the smoke user_tx's
         // 2-gwei priority fee, so dev-reth's payload builder
         // orders postBatch ahead of the user_tx within the
@@ -522,7 +685,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             l1_poster_signer,
             l1_chain_id: l1_submission_chain_id,
             l1_post_batch_priority_fee,
-            ecdsa_proof_system_address,
+            eez_registry,
         });
         event!(
             name: "eez.node.evm_composer.ready",
@@ -573,14 +736,14 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                 // Purge floor = L1-FINALIZED height (a reorg could un-settle a posted batch).
                 let cap_l1_head = Arc::clone(&l1_head);
                 let cap_finalized_head = Arc::clone(&l1_head);
-                let cap_prover = Arc::clone(&prover);
+                let cap_prevalidation = eez_composer::Prevalidation::new(&quorum);
                 task_executor.spawn_critical_task("eez-witness-capture", async move {
                     witness_source::run_capture(
                         rx,
                         cap_store,
                         cap_provider,
                         cap_evm,
-                        cap_prover,
+                        cap_prevalidation,
                         rollup_id,
                         move || cap_l1_head.cursor(),
                         move || cap_finalized_head.finalized_l2(),
@@ -600,7 +763,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         };
         let composer = Composer::new(
             rollups,
-            prover,
+            quorum,
             evm_config,
             cross_chain,
             block_committer.clone(),
@@ -669,7 +832,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
-        read_checkpoint_dir(),
+        sync_mode.deriver_boot(),
     );
 
     // Bind before the L1 wait so port checks see a live front. Submissions are
@@ -707,67 +870,24 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     }
 
     let l1_reader = submitter.reader();
-    wait_for_l1_ready(&l1_reader, deploy_block, l1_source_chain_id).await?;
+    let probe = sync_mode.readiness_probe(deploy_block);
+    wait_for_l1_ready(&l1_reader, probe, l1_source_chain_id).await?;
     for (expected_chain_id, provider) in &xchain_checks {
         ingress::validate_cross_chain_front(provider, *expected_chain_id).await?;
     }
 
-    let mut catch_up_retry_delay = BOOT_CATCH_UP_INITIAL_RETRY_DELAY;
-    let mut catch_up_attempts = 0_u64;
-    let mut transport_failures = 0_u32;
-    let (l1_seed_number, l1_seed_hash) = loop {
-        match deriver.catch_up_with_seed().await {
-            Ok(seed) => break seed,
-            Err(err)
-                if matches!(&err, DeriverError::L1Scan(L1Error::Provider(_))) && {
-                    transport_failures += 1;
-                    transport_failures >= BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES
-                } =>
-            {
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.transport_exhausted",
-                    Level::ERROR,
-                    mode = "composer",
-                    transport_failures,
-                    error = %err,
-                    "L1 transport kept failing during boot catch-up; the endpoint is likely refusing a call we need, not merely unreachable",
-                );
-                return Err(eyre::eyre!(
-                    "boot-time deriver catch_up gave up after {transport_failures} L1 transport failures: {err}"
-                ));
-            }
-            Err(err) if matches!(&err, DeriverError::L1Scan(l1) if l1.is_retryable()) => {
-                catch_up_attempts += 1;
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.source_incomplete",
-                    Level::WARN,
-                    mode = "composer",
-                    attempts = catch_up_attempts,
-                    retry_delay_secs = catch_up_retry_delay.as_secs(),
-                    error = %err,
-                    "boot-time catch_up could not read all L1 source data yet; retrying before starting L1-active tasks",
-                );
-                tokio::time::sleep(catch_up_retry_delay).await;
-                catch_up_retry_delay = Duration::from_secs(
-                    catch_up_retry_delay
-                        .as_secs()
-                        .saturating_mul(2)
-                        .min(BOOT_CATCH_UP_MAX_RETRY_DELAY.as_secs()),
-                );
-            }
-            Err(err) => {
-                event!(
-                    name: "eez.node.deriver.boot_catch_up.failed",
-                    Level::ERROR,
-                    event_name = "eez.node.deriver.boot_catch_up.failed",
-                    mode = "composer",
-                    error = %err,
-                    "boot-time catch_up failed; refusing to start L1-active tasks before reconciliation",
-                );
-                return Err(eyre::eyre!("boot-time deriver catch_up failed: {err}"));
-            }
-        }
-    };
+    let (l1_seed_number, l1_seed_hash) = boot(
+        sync_mode,
+        &provider,
+        &block_committer,
+        &deriver,
+        &l1_reader,
+        || network.num_connected_peers(),
+        "composer",
+    )
+    .await?;
+    drop_unsettled_tail(&provider, &block_committer, l1_head.cursor()).await?;
+
     event!(
         name: "eez.node.deriver.spawned",
         Level::INFO,
@@ -781,6 +901,41 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         deriver_run.run(deriver_events).await;
     });
 
+    // Signing only after boot: a syncing composer would sign stale heads under
+    // the newest version, which followers prefer.
+    if let Some(key) = sequencer_key {
+        let domain = eez_seq_sig::HeadDomain {
+            l2_chain_id,
+            registry: eez_registry,
+            rollup_id: rollup_config.rollup_id,
+        };
+        let head_store = head_signer::SignedHeadStore::default();
+        if let Some(cfg) = p2p_config {
+            let overlay = eez_p2p::Overlay::new(
+                cfg,
+                eez_p2p::keypair(&network.secret_key().secret_bytes())?,
+                eez_p2p::Validator::new(domain, key.address()),
+                eez_node_common::discover(network),
+            )?;
+            task_executor
+                .spawn_critical_task("eez-p2p", overlay.run(Some(head_store.subscribe()), None));
+        }
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?;
+        task_executor.spawn_critical_task(
+            "eez-head-signer",
+            head_signer::run_head_signer(
+                block_committer.subscribe_head(),
+                provider.clone(),
+                eez_seq_sig::HeadSigner::new(key, domain, now_ms),
+                head_store,
+            ),
+        );
+    }
+
     event!(name: "eez.node.sequencer.spawned", Level::INFO, mode = "composer", "spawning eez sequencer (L1-anchored)");
     task_executor.spawn_critical_task("eez-sequencer", async move {
         sequencer.run().await;
@@ -793,7 +948,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     });
 
     // Start polling last: every consumer is subscribed and catch-up
-    // covered [deploy_block, seed], so the watcher owns all blocks
+    // covered every block up to its seed, so the watcher owns all blocks
     // strictly after its seed — no startup scan gap.
     task_executor.spawn_critical_task(
         "eez-l1-watcher",
@@ -802,6 +957,45 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     xchain_ready.store(true, std::sync::atomic::Ordering::Relaxed);
 
     handle.wait_for_node_exit().await
+}
+
+/// Rewinds the head to `settled`, L1's cursor, and returns how many transactions
+/// the dropped blocks held. A restarted composer lost the optimistic ledger
+/// that could post them, and reth's rewind doesn't return them to its pool.
+async fn drop_unsettled_tail<P>(
+    provider: &P,
+    committer: &BlockCommitterHandle<EezEngineTypes>,
+    settled: u64,
+) -> eyre::Result<usize>
+where
+    P: BlockReader<Block = eez_primitives::Block> + HeaderProvider<Header = Header>,
+{
+    let head = committer.last_header().number();
+    if head <= settled {
+        return Ok(0);
+    }
+    let mut tx_hashes = Vec::new();
+    for number in settled + 1..=head {
+        let block = provider
+            .block_by_number(number)?
+            .ok_or_else(|| eyre::eyre!("no local block at L2 height {number}"))?;
+        tx_hashes.extend(block.body.transactions.iter().map(|tx| *tx.tx_hash()));
+    }
+    let target = provider
+        .sealed_header(settled)?
+        .ok_or_else(|| eyre::eyre!("no local header at settled L2 height {settled}"))?;
+    committer.reorg_to(target).await?;
+    event!(
+        name: "eez.node.composer.unsettled_tail.dropped",
+        Level::WARN,
+        event_name = "eez.node.composer.unsettled_tail.dropped",
+        from = settled + 1,
+        to = head,
+        tx_count = tx_hashes.len(),
+        ?tx_hashes,
+        "dropped the L2 blocks L1 has not settled; their transactions are lost and users resubmit",
+    );
+    Ok(tx_hashes.len())
 }
 
 /// Read the L1 rollup id from env. Defaults to `0` to match the bridge
@@ -979,6 +1173,118 @@ fn build_embedded_l1_config() -> eyre::Result<l1_embedded::EmbeddedL1Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ATTESTER: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+    const PROOF_SYSTEM: &str = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
+
+    fn attester_config(vars: &[(&str, &str)]) -> eyre::Result<AttesterConfig> {
+        let vars: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        AttesterConfig::read(|name| vars.get(name).cloned())
+    }
+
+    fn spec(url: &str) -> AttesterSpec {
+        AttesterSpec {
+            url: url.to_owned(),
+            attester: Address::from_str(ATTESTER).unwrap(),
+            proof_system: Address::from_str(PROOF_SYSTEM).unwrap(),
+        }
+    }
+
+    #[test]
+    fn provers_list_splits_each_entry_from_the_right() {
+        let list = format!(
+            " http://a:1?k=v={ATTESTER}={PROOF_SYSTEM} ,, http://b:2={ATTESTER}={PROOF_SYSTEM},"
+        );
+        let config =
+            attester_config(&[("EEZ_PROVERS", &list), ("EEZ_ATTESTATION_GRACE_MS", " ")]).unwrap();
+
+        assert_eq!(
+            config.attesters,
+            vec![spec("http://a:1?k=v"), spec("http://b:2")],
+            "a URL may contain `=`, and blank entries are skipped"
+        );
+        assert_eq!(
+            config.grace,
+            eez_composer::DEFAULT_ATTESTATION_GRACE,
+            "a blank grace is the default"
+        );
+    }
+
+    #[test]
+    fn provers_entry_with_a_missing_field_is_refused() {
+        let err = attester_config(&[("EEZ_PROVERS", &format!("http://a:1={ATTESTER}"))])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not `url=attester=proof_system`"), "{err}");
+
+        let err = attester_config(&[("EEZ_PROVERS", &format!("={ATTESTER}={PROOF_SYSTEM}"))])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("url: prover URL must not be empty"), "{err}");
+
+        let err = attester_config(&[("EEZ_PROVERS", &format!("http://a:1=0x12={PROOF_SYSTEM}"))])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(": attester: `0x12` is not an address"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn blank_provers_list_falls_back_to_the_single_attester_variables() {
+        let config = attester_config(&[
+            ("EEZ_PROVERS", "  "),
+            ("EEZ_PROVER_URL", "http://signer:50051"),
+            ("EEZ_ATTESTER_ADDRESS", ATTESTER),
+            ("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS", PROOF_SYSTEM),
+            ("EEZ_ATTESTATION_GRACE_MS", " 40 "),
+        ])
+        .unwrap();
+
+        assert_eq!(config.attesters, vec![spec("http://signer:50051")]);
+        assert_eq!(config.grace, Duration::from_millis(40));
+    }
+
+    #[test]
+    fn single_attester_errors_name_the_variable_at_fault() {
+        let err = attester_config(&[("EEZ_PROVER_URL", "http://signer:50051")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("EEZ_ATTESTER_ADDRESS is required for composer proving"),
+            "{err}"
+        );
+
+        let err = attester_config(&[
+            ("EEZ_PROVER_URL", "http://signer:50051"),
+            ("EEZ_ATTESTER_ADDRESS", ATTESTER),
+            ("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS", "nope"),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.starts_with("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS: `nope` is not an address"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn malformed_grace_is_refused() {
+        let err = attester_config(&[
+            (
+                "EEZ_PROVERS",
+                &format!("http://a:1={ATTESTER}={PROOF_SYSTEM}"),
+            ),
+            ("EEZ_ATTESTATION_GRACE_MS", "250ms"),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("EEZ_ATTESTATION_GRACE_MS `250ms`"), "{err}");
+    }
 
     #[test]
     fn l1_rollup_id_defaults_only_when_absent() {

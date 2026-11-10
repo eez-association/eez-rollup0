@@ -133,7 +133,10 @@ fn interior_candidate() -> B256 {
 }
 
 fn anchor_batch_for(rollup_id: u64) -> eez_protocol::EvmBatch {
-    let mut batch = eez_protocol::EvmBatch::default();
+    let mut batch = eez_protocol::EvmBatch {
+        blockNumber: u64::MAX,
+        ..Default::default()
+    };
     batch.entries.push(ExecutionEntrySol {
         rollupUpdates: vec![RollupUpdateSol {
             rollupId: rollup_id,
@@ -243,7 +246,7 @@ fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256
         transactions,
         ..Default::default()
     };
-    let block = eez_primitives::Block::new(Default::default(), body);
+    let block = eez_primitives::Block::new(crate::testkit::block_header(), body);
     batch.callData =
         settlement::encode_da_payload(&[vec![user.clone()]], &[sidecar.clone()]).into();
     (batch, alloy_rlp::encode(block), user, call_hash)
@@ -317,7 +320,7 @@ fn mixed_outbound_inbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, B256) {
         transactions,
         ..Default::default()
     };
-    let block = eez_primitives::Block::new(Default::default(), body);
+    let block = eez_primitives::Block::new(crate::testkit::block_header(), body);
     batch.callData = settlement::encode_da_payload(
         &[vec![user]],
         &[outbound_sidecar.clone(), inbound_sidecar.clone()],
@@ -384,6 +387,14 @@ impl TestWindow {
 
 fn public_input_post_batch_for(batch: eez_protocol::EvmBatch) -> WireSettlementInput {
     WireSettlementInput {
+        posting_context: (batch.blockNumber == u64::MAX).then(|| {
+            let context = crate::testkit::live_context();
+            eez_control_rpc::v1::L1PostingContext {
+                parent_hash: context.parent_hash.to_vec(),
+                target_timestamp: context.timestamp,
+                ..Default::default()
+            }
+        }),
         abi_calldata: eez_protocol::entries::encode_postbatch(&batch),
         ..WireSettlementInput::default()
     }
@@ -409,13 +420,16 @@ fn public_input_post_batch_for_empty_blocks(
 }
 
 fn recompute_test_public_inputs_hash(batch: &eez_protocol::EvmBatch) -> B256 {
-    settlement::recompute_public_input_hash(
-        batch,
-        test_proof_system_vkey(),
+    settlement::CheckedPublicInputProfile::new(
+        &settlement::CanonicalPostBatch::from_decoded_for_test(batch.clone()),
         expected_rollup_id(1),
         test_proof_system(),
+        (batch.blockNumber == u64::MAX).then(crate::testkit::live_context),
     )
     .unwrap()
+    .recompute_public_inputs_hash(test_proof_system_vkey())
+    .unwrap()
+    .into_inner()
 }
 
 #[track_caller]
@@ -457,7 +471,10 @@ fn block_chunk(number: u64, parent: u8, hash: u8) -> BlockWitness {
         number,
         hash: vec![hash; 32],
         parent_hash: vec![parent; 32],
-        rlp: alloy_rlp::encode(eez_primitives::Block::default()),
+        rlp: alloy_rlp::encode(eez_primitives::Block::new(
+            crate::testkit::block_header(),
+            eez_primitives::BlockBody::default(),
+        )),
         witness: Some(ExecutionWitness {
             state: vec![vec![number as u8]],
             ..Default::default()
@@ -595,7 +612,7 @@ fn transactions_block_chunk(
         transactions,
         ..Default::default()
     };
-    let consensus_block = eez_primitives::Block::new(Default::default(), body);
+    let consensus_block = eez_primitives::Block::new(crate::testkit::block_header(), body);
     let mut chunk = block_chunk(number, parent, hash);
     chunk.rlp = alloy_rlp::encode(consensus_block);
     chunk

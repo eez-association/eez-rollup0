@@ -29,6 +29,7 @@ impl AttestablePublicInputsHash {
 /// values remain borrowed from the validated window owned by the worker.
 pub(super) struct SettlementInput<'a> {
     pub(super) submitted_post_batch_calldata: Vec<u8>,
+    pub(super) l1_parent_hash: Option<B256>,
     pub(super) validated_window: &'a validate::ValidatedWindow,
     pub(super) expected_rollup_id: NonZeroU64,
     pub(super) expected_l2_system_address: Address,
@@ -210,6 +211,7 @@ pub(super) fn run_settlement(
 ) -> Result<AttestablePublicInputsHash, SettlementPipelineError> {
     let SettlementInput {
         submitted_post_batch_calldata,
+        l1_parent_hash,
         validated_window,
         expected_rollup_id,
         expected_l2_system_address,
@@ -221,10 +223,31 @@ pub(super) fn run_settlement(
     ensure_settlement_active(cancellation)?;
     let settling_block = validated_window.settling_block();
     let canonical_batch = settlement::decode_canonical_post_batch(submitted_post_batch_calldata)?;
+    let l1_context =
+        l1_parent_hash.map(
+            |parent_hash| eez_protocol::l1_context::LiveSettlementContext {
+                parent_hash,
+                timestamp: settling_block.decoded().header.timestamp,
+            },
+        );
+    if settling_block
+        .decoded()
+        .body
+        .transactions
+        .iter()
+        .any(|tx| matches!(tx, eez_primitives::EezTxEnvelope::System(_)))
+        && l1_context.is_none()
+    {
+        return Err(settlement::PublicInputError::InvalidStructure(
+            "native execution requires live L1 context".into(),
+        )
+        .into());
+    }
     let checked_public_input_profile = settlement::CheckedPublicInputProfile::new(
         &canonical_batch,
         expected_rollup_id,
         expected_proof_system,
+        l1_context,
     )?;
 
     let verified_state_chain = settlement::verify_state_update_chain(
