@@ -78,6 +78,7 @@ PY
 FOLLOWER_RPC="http://127.0.0.1:$follower_port"
 FOLLOWER=$(docker run -d --network host \
     --mount "type=bind,src=$DEPLOY_DIR,dst=/genesis,readonly" \
+    -e EEZ_SYNC_L1_ONLY=1 \
     -e EEZ_L1_RPC_URL="$L1" -e EEZ_L1_CHAIN_ID="$(cast chain-id --rpc-url "$L1")" \
     -e EEZ_REGISTRY_ADDRESS -e EEZ_REGISTRY_DEPLOY_BLOCK -e EEZ_ROLLUP_ID -e EEZL2_ADDRESS \
     -e EEZ_L1_BLOCK_TIME_MS="$(yaml_value l1_block_time_ms)" \
