@@ -169,7 +169,11 @@ impl Fixture {
         &self.composer.inner.rollups[&1]
     }
 
-    fn prepare(&self, direction: Direction) -> (Vec<HeldTx>, crate::optimistic::FailedBatch) {
+    fn prepare(
+        &self,
+        direction: Direction,
+        canonical_batch: B256,
+    ) -> (Vec<HeldTx>, crate::optimistic::FailedBatch) {
         let rollup = self.rollup();
         let txs: Vec<_> = (0..3u8)
             .map(|n| HeldTx {
@@ -193,7 +197,7 @@ impl Fixture {
         rollup
             .l1_head
             .append(record(100, 9, B256::repeat_byte(0x90)));
-        rollup.l1_head.append(record(101, 10, BATCH));
+        rollup.l1_head.append(record(101, 10, canonical_batch));
         rollup.optimistic.resolve_below_cursor(10);
         rollup
             .l2_provider
@@ -233,6 +237,7 @@ impl Fixture {
 
     fn assert_requeued(&self, expected: &[HeldTx]) {
         let queued = self.rollup().held_pool.pop_all();
+        let on_chain = expected[0].nonce;
         let identity = |txs: &[HeldTx]| {
             txs.iter()
                 .map(|tx| (tx.hash, tx.sender, tx.direction, tx.nonce, tx.attempts))
@@ -250,16 +255,18 @@ impl Fixture {
             assert!(
                 self.rollup()
                     .held_pool
-                    .push_contiguous(replacement, 0)
+                    .push_contiguous(replacement, on_chain)
                     .is_err()
             );
         }
         self.rollup().held_pool.release_in_flight_batch(&queued);
         // No reservation is stranded after the recovered transactions are released.
-        self.rollup()
-            .held_pool
-            .push_contiguous(expected[0].clone(), 0)
-            .unwrap();
+        for tx in expected {
+            self.rollup()
+                .held_pool
+                .push_contiguous(tx.clone(), on_chain)
+                .unwrap();
+        }
     }
 }
 
@@ -277,7 +284,7 @@ async fn deriver_first_retreat(direction: Direction) {
     let rpc = Asserter::new();
     rpc.push_success(&"0x0"); // Surviving ancestor has not consumed nonce 0.
     let fixture = Fixture::new(ProviderBuilder::default().connect_mocked_client(rpc));
-    let (txs, partial) = fixture.prepare(direction);
+    let (txs, partial) = fixture.prepare(direction, BATCH);
     let guard = fixture.composer.inner.committer.begin_reconcile().await;
     fixture.retreat_deriver().await;
     // The stale selection survives the Deriver retreat. Composer has not
@@ -346,7 +353,7 @@ async fn same_height_replacement_invalidates_pending_nonce_reads() {
 async fn retreat_during_nonce_read(replace: bool) {
     let (provider, server, mut seen, reply) = nonce_barrier().await;
     let fixture = Fixture::new(provider);
-    let (txs, partial) = fixture.prepare(Direction::Inbound);
+    let (txs, partial) = fixture.prepare(Direction::Inbound, BATCH);
     let recovery = fixture
         .composer
         .recover_partial_batch(1, fixture.rollup(), partial);
@@ -391,7 +398,7 @@ async fn retreat_during_nonce_read(replace: bool) {
 async fn composer_first_reorg_invalidates_pending_partial_disposition() {
     let (provider, server, mut seen, reply) = nonce_barrier().await;
     let fixture = Fixture::new(provider);
-    let (txs, partial) = fixture.prepare(Direction::Inbound);
+    let (txs, partial) = fixture.prepare(Direction::Inbound, BATCH);
     let recovery = fixture
         .composer
         .recover_partial_batch(1, fixture.rollup(), partial);
@@ -410,4 +417,110 @@ async fn composer_first_reorg_invalidates_pending_partial_disposition() {
     fixture.assert_requeued(&txs);
     server.stop().unwrap();
     server.stopped().await;
+}
+
+#[tokio::test]
+async fn lost_races_preserve_inbound_attempts_and_nonce_suffix() {
+    lost_races(Direction::Inbound).await;
+}
+
+#[tokio::test]
+async fn lost_races_preserve_outbound_attempts_and_nonce_suffix() {
+    lost_races(Direction::Outbound).await;
+}
+
+async fn lost_races(direction: Direction) {
+    let rpc = Asserter::new();
+    let fixture = Fixture::new(ProviderBuilder::default().connect_mocked_client(rpc.clone()));
+    let winner = B256::repeat_byte(0xb2);
+    let (txs, _) = fixture.prepare(direction, winner);
+    fixture
+        .rollup()
+        .l2_provider
+        .add_account(SENDER, ExtendedAccount::new(0, U256::ZERO));
+    // Every lost race must preserve even a transaction with two prior attempts.
+    // Exercise more races than the eviction bound, with both a batched and a
+    // queued nonce suffix. Canonical winners never include these transactions.
+    for round in 0..=MAX_BUNDLE_ATTEMPTS {
+        rpc.push_success(&"0x0");
+        if round > 0 {
+            let height = 10 + u64::from(round);
+            let rollup = fixture.rollup();
+            let _guard = fixture.composer.inner.committer.begin_reconcile().await;
+            fixture
+                .composer
+                .inner
+                .committer
+                .reorg_to(header(height))
+                .await
+                .unwrap();
+            rollup
+                .optimistic
+                .begin(height, BATCH, header(height - 1), rollup.held_pool.pop_n(2));
+            rollup
+                .l1_head
+                .append(record(101 + u64::from(round), height, winner));
+            assert!(rollup.optimistic.resolve_below_cursor(height).is_empty());
+        }
+        let partial = fixture
+            .rollup()
+            .optimistic
+            .partial_to_dispose(10 + u64::from(round))
+            .unwrap();
+        fixture
+            .composer
+            .recover_partial_batch(1, fixture.rollup(), partial)
+            .await;
+        fixture.assert_requeued(&txs);
+        // All transactions are back in the pool; no ledger copy may restore a
+        // duplicate on a subsequent reorg.
+        assert!(fixture.rollup().optimistic.take_rolled_out(9).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn own_partial_batch_still_charges_the_culprit() {
+    for direction in [Direction::Inbound, Direction::Outbound] {
+        let rpc = Asserter::new();
+        rpc.push_success(&"0x0");
+        let fixture = Fixture::new(ProviderBuilder::default().connect_mocked_client(rpc));
+        let (txs, partial) = fixture.prepare(direction, BATCH);
+        fixture
+            .rollup()
+            .l2_provider
+            .add_account(SENDER, ExtendedAccount::new(0, U256::ZERO));
+        fixture
+            .composer
+            .recover_partial_batch(1, fixture.rollup(), partial)
+            .await;
+        assert!(
+            fixture.rollup().held_pool.is_empty(),
+            "an attributable third failure still evicts the nonce suffix"
+        );
+        assert!(fixture.rollup().optimistic.take_rolled_out(9).is_empty());
+        let mut replacement = txs[0].clone();
+        replacement.hash = B256::repeat_byte(0xee);
+        fixture
+            .rollup()
+            .held_pool
+            .push_contiguous(replacement, 0)
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn lost_race_retains_spent_transactions_for_reorg_without_charging_the_tail() {
+    for direction in [Direction::Inbound, Direction::Outbound] {
+        let rpc = Asserter::new();
+        rpc.push_success(&"0x1"); // The winner consumed nonce 0, but not nonce 1.
+        let fixture = Fixture::new(ProviderBuilder::default().connect_mocked_client(rpc));
+        let (txs, partial) = fixture.prepare(direction, B256::repeat_byte(0xb2));
+        fixture
+            .composer
+            .recover_partial_batch(1, fixture.rollup(), partial)
+            .await;
+        fixture.assert_requeued(&txs[1..]);
+        fixture.notify_composer();
+        fixture.assert_requeued(&txs);
+    }
 }
