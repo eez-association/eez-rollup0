@@ -5154,6 +5154,9 @@ async fn sign_post_batch_tx(
 }
 
 #[cfg(test)]
+mod recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::attestation_quorum::MAX_ATTESTERS;
