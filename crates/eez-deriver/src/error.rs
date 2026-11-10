@@ -62,7 +62,8 @@ pub enum DeriverError {
 }
 
 /// `true` for errors no resync can fix; the deriver stops the node on them.
-/// Blobs missing at a finalized slot stay missing until the source changes.
+/// Blobs missing at a finalized slot stay missing until the source changes,
+/// and a follower without a beacon cannot derive any blob post.
 #[must_use]
 pub(crate) fn is_fatal(err: &DeriverError) -> bool {
     matches!(
@@ -70,7 +71,9 @@ pub(crate) fn is_fatal(err: &DeriverError) -> bool {
         DeriverError::BelowSeedFloor { .. }
             | DeriverError::Unseeded
             | DeriverError::FinalizedResume { .. }
-            | DeriverError::L1Scan(eez_l1::L1Error::BlobUnavailable { .. })
+            | DeriverError::L1Scan(
+                eez_l1::L1Error::BlobUnavailable { .. } | eez_l1::L1Error::Config(_)
+            )
     )
 }
 
@@ -98,6 +101,9 @@ mod tests {
                 detail: "pruned".into(),
             }
         )));
+        assert!(is_fatal(&DeriverError::L1Scan(eez_l1::L1Error::Config(
+            "blob derivation requires EEZ_L1_BEACON_URL".into()
+        ))));
         assert!(!is_fatal(&DeriverError::L1Scan(
             eez_l1::L1Error::SourceIncomplete {
                 block: 7,

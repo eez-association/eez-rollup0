@@ -122,8 +122,9 @@ The watcher and the settlement observer retry a retryable error on their next
 poll. Boot reconcile retries with backoff, but gives up after
 `BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES` `Provider` errors. A terminal one panics
 the watcher (invariant 7), fails boot reconcile and fails the observed bundle.
-Only derivation fetches blobs: `BlobUnavailable` fails boot reconcile or stops
-the live deriver's critical task, shutting down the node.
+Only derivation fetches blobs: `BlobUnavailable`, or a blob post reached
+without `EEZ_L1_BEACON_URL`, fails boot reconcile or stops the live deriver's
+critical task, shutting down the node.
 
 ## Operation
 
