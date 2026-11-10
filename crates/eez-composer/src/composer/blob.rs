@@ -29,89 +29,40 @@ pub(super) struct BlobCarrier {
 /// Fee headroom over the observed blob base fee, bounded by the operator's cap.
 const BLOB_FEE_HEADROOM: u128 = 2;
 
-/// Prepare the type-3 transaction sidecar and blob fee.
-pub(super) async fn prepare_blob_post(
+/// The blob fee a post offers now; an error while the base fee is over the
+/// operator's cap, since no post could land.
+pub(super) async fn blob_fee(
     l1_provider: &alloy_provider::RootProvider,
     config: &BlobPostingConfig,
-    blobs: &[Vec<u8>],
-    encoding: eez_blob::BlobSidecarEncoding,
-) -> Result<BlobCarrier, String> {
+) -> Result<u128, String> {
     use alloy_provider::Provider as _;
-    // A cap below the current blob base fee cannot land; refuse before proving.
-    let blob_base_fee = l1_provider
+    let base_fee = l1_provider
         .get_blob_base_fee()
         .await
         .map_err(|e| format!("eth_blobBaseFee: {e}"))?;
-    if blob_base_fee > config.max_fee_per_blob_gas {
-        return Err(format!(
-            "blob base fee {blob_base_fee} exceeds EEZ_L1_MAX_FEE_PER_BLOB_GAS {}; deferring the post",
+    offered_blob_fee(base_fee, config.max_fee_per_blob_gas).ok_or_else(|| {
+        format!(
+            "blob base fee {base_fee} exceeds EEZ_L1_MAX_FEE_PER_BLOB_GAS {}; deferring the post",
             config.max_fee_per_blob_gas,
-        ));
-    }
-    let max_fee_per_blob_gas = blob_base_fee
-        .saturating_mul(BLOB_FEE_HEADROOM)
-        .clamp(1, config.max_fee_per_blob_gas);
-    let sidecar = eez_blob::prepare_blob_sidecar(blobs, encoding)
-        .map_err(|e| format!("prepare blob sidecar: {e}"))?;
-    Ok(BlobCarrier {
-        sidecar,
-        max_fee_per_blob_gas,
+        )
     })
+}
+
+/// Headroom over `base_fee`, bounded by `cap`; `None` when `base_fee` is over `cap`.
+fn offered_blob_fee(base_fee: u128, cap: u128) -> Option<u128> {
+    (base_fee <= cap).then(|| base_fee.saturating_mul(BLOB_FEE_HEADROOM).clamp(1, cap))
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::U256;
-    use alloy_provider::ProviderBuilder;
-    use alloy_transport::mock::Asserter;
-
     use super::*;
 
-    fn config() -> BlobPostingConfig {
-        BlobPostingConfig {
-            chain_spec: std::sync::Arc::new(
-                reth_chainspec::ChainSpecBuilder::mainnet()
-                    .cancun_activated()
-                    .build(),
-            ),
-            slot_seconds: 12,
-            max_fee_per_blob_gas: 50,
-        }
-    }
-
-    fn mocked() -> (Asserter, alloy_provider::RootProvider) {
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::default().connect_mocked_client(asserter.clone());
-        (asserter, provider)
-    }
-
-    #[tokio::test]
-    async fn a_blob_post_uses_a_landable_blob_fee() {
-        let blobs = vec![vec![0_u8; eez_blob::BYTES_PER_BLOB]];
-        let encoding = eez_blob::BlobSidecarEncoding::Eip4844;
-        let (asserter, provider) = mocked();
-        asserter.push_success(&U256::from(10));
-        let carrier = prepare_blob_post(&provider, &config(), &blobs, encoding)
-            .await
-            .unwrap();
-        assert_eq!(
-            carrier.max_fee_per_blob_gas, 20,
-            "2x headroom under the cap"
-        );
-        assert_eq!(carrier.sidecar.versioned_hashes().len(), 1);
-
-        // Twice the base fee would pass the cap, so the cap is offered.
-        let (asserter, provider) = mocked();
-        asserter.push_success(&U256::from(40));
-        let carrier = prepare_blob_post(&provider, &config(), &blobs, encoding)
-            .await
-            .unwrap();
-        assert_eq!(carrier.max_fee_per_blob_gas, 50);
-
-        // Above the cap the post cannot land, so it is refused before proving.
-        let (asserter, provider) = mocked();
-        asserter.push_success(&U256::from(51));
-        let refused = prepare_blob_post(&provider, &config(), &blobs, encoding).await;
-        assert!(refused.is_err_and(|e| e.contains("deferring")));
+    #[test]
+    fn a_blob_post_offers_headroom_under_the_cap() {
+        assert_eq!(offered_blob_fee(10, 50), Some(20));
+        assert_eq!(offered_blob_fee(40, 50), Some(50));
+        assert_eq!(offered_blob_fee(0, 50), Some(1));
+        assert_eq!(offered_blob_fee(50, 50), Some(50));
+        assert_eq!(offered_blob_fee(51, 50), None);
     }
 }

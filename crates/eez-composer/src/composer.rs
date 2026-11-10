@@ -59,7 +59,7 @@ use crate::rollup::RollupState;
 
 mod blob;
 pub use blob::BlobPostingConfig;
-use blob::{BlobCarrier, post_batch_tx_hash, prepare_blob_post};
+use blob::{BlobCarrier, blob_fee, post_batch_tx_hash};
 
 fn bundle_targets_for_slot(
     target_l1_block: Option<u64>,
@@ -1625,6 +1625,20 @@ where
                 cursor,
                 parent_number,
                 "previous postBatch unresolved; committing Sync block without emission this slot",
+            );
+            return self.build_empty_slot_block(rollup, &parent_header, timestamp);
+        }
+        // Over the fee cap no blob post can land, so nothing is composed until
+        // the fee falls; held transactions wait uncharged.
+        if let Some(config) = &cc.exec_ctx.blob_posting
+            && let Err(error) = blob_fee(&cc.exec_ctx.l1_provider, config).await
+        {
+            event!(
+                name: "eez.composer.sync_slot.blob_fee_unavailable",
+                Level::WARN,
+                rollup_id,
+                error = %error,
+                "no landable blob fee; committing Sync block without emission this slot",
             );
             return self.build_empty_slot_block(rollup, &parent_header, timestamp);
         }
@@ -4702,8 +4716,13 @@ where
             return Ok(None);
         }
 
+        // The fee is re-read since it can rise after the slot's gate.
         let (blobs, carrier) = if let Some((config, blobs, encoding)) = physical_blobs {
-            let carrier = prepare_blob_post(&ctx.l1_provider, config, &blobs, encoding).await?;
+            let carrier = BlobCarrier {
+                max_fee_per_blob_gas: blob_fee(&ctx.l1_provider, config).await?,
+                sidecar: eez_blob::prepare_blob_sidecar(&blobs, encoding)
+                    .map_err(|e| format!("prepare blob sidecar: {e}"))?,
+            };
             (blobs.into_iter().map(Bytes::from).collect(), Some(carrier))
         } else {
             (Vec::new(), None)
