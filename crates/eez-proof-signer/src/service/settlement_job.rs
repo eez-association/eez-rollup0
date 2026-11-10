@@ -120,6 +120,7 @@ pub(super) fn validate_and_settle(
         expected_proof_system: state.attester.expected_proof_system(),
         system_transaction_reconstructor: &state.system_transaction_reconstructor,
         cancellation,
+        blobs: &[],
     })?;
 
     Ok(AttestationMaterial {
@@ -143,6 +144,7 @@ pub(super) struct SettlementInput<'a> {
     pub(super) expected_proof_system: Address,
     pub(super) system_transaction_reconstructor: &'a settlement::SystemTransactionReconstructor,
     pub(super) cancellation: &'a CancellationToken,
+    pub(super) blobs: &'a [Vec<u8>],
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -271,6 +273,10 @@ impl SettlementPipelineError {
                     tonic::Code::Internal,
                     "validation backend returned invalid output",
                 ),
+                settlement::DaPayloadError::Kzg { .. } => (
+                    tonic::Code::Internal,
+                    "blob commitment derivation failed",
+                ),
                 settlement::DaPayloadError::BlockCount { .. }
                 | settlement::DaPayloadError::UnexpectedItems { .. }
                 | settlement::DaPayloadError::ProjectedTransactionCount { .. }
@@ -325,6 +331,7 @@ pub(super) fn run_settlement(
         expected_proof_system,
         system_transaction_reconstructor,
         cancellation,
+        blobs,
     } = input;
     ensure_settlement_active(cancellation)?;
     let settling_block = validated_window.settling_block();
@@ -353,6 +360,7 @@ pub(super) fn run_settlement(
         &canonical_batch,
         expected_rollup_id,
         expected_proof_system,
+        blobs.len(),
         l1_context,
     )?;
 
@@ -408,17 +416,17 @@ pub(super) fn run_settlement(
 
     // Bind posted transactions and effect sidecars to the validated block bytes,
     // including the reconstructed Sync-block transaction sequence.
-    settlement::verify_da_payload(
+    let verified_da = settlement::verify_da_payload(
         &canonical_batch,
+        blobs,
         validated_window,
         &authorized_outbound_effects,
         &authorized_inbound_effects,
         system_transaction_reconstructor,
         expected_rollup_id.get(),
     )?;
-
-    let recomputed_public_inputs_hash =
-        checked_public_input_profile.recompute_public_inputs_hash(proof_system_vkey)?;
+    let recomputed_public_inputs_hash = checked_public_input_profile
+        .recompute_public_inputs_hash(proof_system_vkey, &verified_da)?;
     Ok(AttestablePublicInputsHash(recomputed_public_inputs_hash))
 }
 

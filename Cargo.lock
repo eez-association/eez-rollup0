@@ -3257,6 +3257,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eez-blob"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "eez-composer"
 version = "0.1.0"
 dependencies = [
@@ -3270,7 +3280,9 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-signer-local",
  "alloy-sol-types",
+ "alloy-transport",
  "async-trait",
+ "eez-blob",
  "eez-driver",
  "eez-evm",
  "eez-l1",
@@ -3437,6 +3449,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "alloy-transport",
+ "eez-blob",
  "eez-protocol",
  "fail",
  "reqwest 0.12.28",
@@ -3673,6 +3686,7 @@ dependencies = [
  "alloy-rpc-types-debug",
  "alloy-sol-types",
  "async-trait",
+ "eez-blob",
  "eez-control-rpc",
  "eez-payload-codec",
  "eez-primitives",
@@ -3737,6 +3751,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "async-trait",
+ "eez-blob",
  "eez-control-rpc",
  "eez-protocol",
  "eez-prover",

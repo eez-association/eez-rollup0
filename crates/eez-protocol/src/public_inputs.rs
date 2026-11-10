@@ -179,15 +179,17 @@ pub enum PublicInputsError {
         /// Unsupported `batch.blockNumber` value.
         block_number: u64,
     },
+    /// Independently derived hashes must cover the selected indices exactly.
+    #[error("blob hash count {actual} does not match blobIndices count {expected}")]
+    BlobHashCount {
+        /// Number selected by the canonical batch.
+        expected: usize,
+        /// Number derived from the submitted physical blobs.
+        actual: usize,
+    },
     /// Sender-bound public inputs require the actual transaction sender.
     #[error("public-input hashing currently requires bindMsgSenderInPublicInput == false")]
     UnsupportedSenderBinding,
-    /// Blob hashes cannot be reconstructed from blob indices alone.
-    #[error("public-input hashing currently requires empty blobIndices, got {count}")]
-    UnsupportedBlobIndices {
-        /// Number of unsupported blob indices.
-        count: usize,
-    },
 }
 
 /// `sharedPublicInput` as `EEZ._verifyProofSystemBatch` computes it for `batch`
@@ -208,6 +210,16 @@ pub fn batch_shared_public_input_with_context(
     sender: Address,
     context: Option<crate::l1_context::LiveSettlementContext>,
 ) -> Result<B256, PublicInputsError> {
+    batch_shared_public_input_with_blobs_and_context(batch, sender, &[], context)
+}
+
+/// Compute the shared input binding both DA blobs and the live L1 parent/time.
+pub fn batch_shared_public_input_with_blobs_and_context(
+    batch: &EvmBatch,
+    sender: Address,
+    blob_hashes: &[B256],
+    context: Option<crate::l1_context::LiveSettlementContext>,
+) -> Result<B256, PublicInputsError> {
     let custom_data = match (batch.blockNumber, context) {
         (0, None) => Bytes::new(),
         (u64::MAX, Some(context)) => context
@@ -219,9 +231,10 @@ pub fn batch_shared_public_input_with_context(
             });
         }
     };
-    if !batch.blobIndices.is_empty() {
-        return Err(PublicInputsError::UnsupportedBlobIndices {
-            count: batch.blobIndices.len(),
+    if blob_hashes.len() != batch.blobIndices.len() {
+        return Err(PublicInputsError::BlobHashCount {
+            expected: batch.blobIndices.len(),
+            actual: blob_hashes.len(),
         });
     }
     let entry_hashes: Vec<B256> = batch.entries.iter().map(entry_hash).collect();
@@ -240,7 +253,7 @@ pub fn batch_shared_public_input_with_context(
     Ok(shared_public_input(
         &entry_hashes,
         &static_entry_hashes,
-        &[],
+        blob_hashes,
         &batch.callData,
         &custom_data_hashes,
         bound_sender,
@@ -268,11 +281,25 @@ pub fn public_inputs_hashes_with_context(
     vkey: B256,
     context: Option<crate::l1_context::LiveSettlementContext>,
 ) -> Result<Vec<B256>, PublicInputsError> {
+    public_inputs_hashes_with_blobs_and_context(batch, vkey, &[], context)
+}
+
+/// Compute settlement hashes binding both DA blobs and the live L1 parent/time.
+pub fn public_inputs_hashes_with_blobs_and_context(
+    batch: &EvmBatch,
+    vkey: B256,
+    blob_hashes: &[B256],
+    context: Option<crate::l1_context::LiveSettlementContext>,
+) -> Result<Vec<B256>, PublicInputsError> {
     if batch.bindMsgSenderInPublicInput {
         return Err(PublicInputsError::UnsupportedSenderBinding);
     }
-    // Validates the selected context profile and rejects blobs.
-    let shared = batch_shared_public_input_with_context(batch, Address::ZERO, context)?;
+    let shared = batch_shared_public_input_with_blobs_and_context(
+        batch,
+        Address::ZERO,
+        blob_hashes,
+        context,
+    )?;
     let rollup_assignments: Vec<RollupProofAssignment> = batch
         .rollupIdsWithProofSystems
         .iter()
@@ -513,14 +540,17 @@ mod tests {
         batch.blobIndices.push(alloy_primitives::U256::ZERO);
         assert!(matches!(
             public_inputs_hashes(&batch, vkey),
-            Err(PublicInputsError::UnsupportedBlobIndices { count: 1 })
+            Err(PublicInputsError::BlobHashCount {
+                expected: 1,
+                actual: 0
+            })
         ));
     }
 
     /// No in-profile Solidity vector binds a sender or holds a static entry.
     #[test]
     fn batch_shared_public_input_follows_the_supported_profile() {
-        use PublicInputsError::{UnsupportedBlobIndices, UnsupportedBlockNumber};
+        use PublicInputsError::{BlobHashCount, UnsupportedBlockNumber};
         let sender = Address::repeat_byte(0xbe);
         let base = crate::abi::EvmBatch {
             staticEntries: vec![StaticExecutionEntrySol::default()],
@@ -536,7 +566,13 @@ mod tests {
             (&base, Ok(shared(Address::ZERO))),
             (&bound, Ok(shared(sender))),
             (&block, Err(UnsupportedBlockNumber { block_number: 7 })),
-            (&blob, Err(UnsupportedBlobIndices { count: 1 })),
+            (
+                &blob,
+                Err(BlobHashCount {
+                    expected: 1,
+                    actual: 0,
+                }),
+            ),
         ] {
             assert_eq!(batch_shared_public_input(batch, sender), want);
         }

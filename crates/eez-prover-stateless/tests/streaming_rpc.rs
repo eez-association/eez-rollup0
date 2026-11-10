@@ -221,6 +221,7 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
         .batch,
         blocks,
         l1_context: None,
+        blobs: Vec::new(),
         verification_key: None,
     };
 
@@ -268,9 +269,10 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
         expected_signature.as_slice()
     );
 
-    // Split the captured empty-block window into two valid adjacent batches.
-    // This exercises the real client's recovery, not just raw wire rejections.
-    let subrange = |range: std::ops::Range<usize>| {
+    // Split the captured empty-block window into two valid adjacent batches,
+    // carrying DA in callData or blobs. This exercises the real client's
+    // recovery, not just raw wire rejections.
+    let subrange = |range: std::ops::Range<usize>, blob: bool| {
         let mut selected = context.clone();
         if range.start > 0 {
             let parent = alloy_rlp::decode_exact::<eez_primitives::Block>(
@@ -302,15 +304,33 @@ async fn captured_window_is_validated_and_signed_by_the_shared_service() {
                 }
             })
             .collect::<Vec<_>>();
-        selected.batch.callData =
-            eez_payload_codec::encode_container(selected.rollup_id, &span, &[])
-                .unwrap()
-                .into();
+        if blob {
+            let blobs =
+                eez_payload_codec::encode_blob_container(selected.rollup_id, &span, &[]).unwrap();
+            selected.batch.callData = Default::default();
+            selected.batch.blobIndices =
+                (0..blobs.len()).map(alloy_primitives::U256::from).collect();
+            selected.blobs = blobs.into_iter().map(Into::into).collect();
+        } else {
+            selected.batch.callData =
+                eez_payload_codec::encode_container(selected.rollup_id, &span, &[])
+                    .unwrap()
+                    .into();
+        }
         eez_protocol::entries::finalize_l1_rolling_hashes(&mut selected.batch).unwrap();
         selected
     };
-    let first = subrange(0..3);
-    let second = subrange(3..6);
+    let first = subrange(0..3, false);
+    let second = subrange(3..6, false);
+
+    // A blob window proves, and still proves after the signer rejects invalid DA.
+    let blob_window = subrange(3..6, true);
+    let blob_prover = RemoteProver::new(endpoint.clone(), signer);
+    blob_prover.prove(blob_window.clone()).await.unwrap();
+    let mut invalid = blob_window.clone();
+    invalid.blobs[0] = vec![0xff; invalid.blobs[0].len()].into();
+    assert!(blob_prover.prove(invalid).await.is_err());
+    blob_prover.prove(blob_window).await.unwrap();
     let charges = window[1..]
         .iter()
         .map(|chunk| {
