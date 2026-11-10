@@ -8,7 +8,7 @@ use eez_protocol::{
     EcdsaProofSigner,
     public_inputs::{public_inputs_hashes, public_inputs_hashes_with_context},
 };
-use eez_prover::{ActionableProverFailure, RetryableProverError};
+use eez_prover::ActionableProverFailure;
 
 use super::*;
 
