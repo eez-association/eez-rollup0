@@ -19,64 +19,48 @@ public chain and rollup identity without a private key.
 
 Prefer environment injection of the attestation key from a secret manager over
 command-line flags, which may be visible in shell history or process listings.
-The checked-in [`.env.example`](../.env.example) contains placeholders only.
+The checked-in [`.env.example`](../../eez-prover-stateless/.env.example) contains placeholders only.
 
 ## Network exposure
 
 Loopback is the safe default. The gRPC protocol does not authenticate peers, so
 a non-loopback listener needs an authenticated transport, private network,
-firewall, or equivalent control. Single-flight admission limits concurrent
-work; it is not authentication and does not stop an authorized-but-buggy client
-from holding the slot with a slow stream.
+firewall, or equivalent control. Resource quotas bound work but do not
+authenticate callers.
 
-## Capacity model
+## Capacity and deadlines
 
-The service has one global active-request slot. The following controls remain
-independent:
+The runtime bounds active streams and retained sessions. Per-session block,
+byte and witness-item quotas apply even when execution is reused. Tonic's
+message limit bounds decoding independently. Stateless execution has a bounded
+worker pool; stateful imports and checkpoint replay coordinate with the
+follower's reconciliation lock.
 
-- per-message gRPC decode size;
-- aggregate known-field protobuf bytes;
-- declared block count;
-- aggregate witness item count;
-- per-message idle timeout; and
-- end-to-end request deadline.
+Idle timeouts cover stream waits. Operation deadlines bound block execution
+and Finalize, including its attestation preparation and settlement. Timed-out
+execution can finish in the background while holding its backend permit or
+guard. Only fully checked evidence may enter a cache; expired or superseded
+operations cannot sign.
 
-An overlap returns `Unavailable` immediately and may be retried later. Local
-quota violations return `ResourceExhausted` and require changing the request or
-the configured limit. Clients can therefore classify the failure from the
-canonical status code without parsing its message.
+Quota failures return `ResourceExhausted`; transient transport/backend failures
+use their canonical status codes. The Composer can restart a retained session
+at the exact range predecessor when its history fills a quota. A window that
+cannot fit a fresh session remains rejected.
 
-## Deadlines and shutdown
-
-The idle timeout covers each wait for the next chunk or EOF. The absolute
-request deadline covers ingestion through signing. Both are checked for
-monotonic-clock overflow at startup.
-
-EVM execution and individual settlement gates are synchronous. When an RPC
-times out, cancellation asks the worker to stop at the next safe boundary; it
-does not interrupt the current work unit. Until the worker exits, retries are
-rejected because the slot is still occupied.
-
-Ctrl-C, and SIGTERM on Unix, stop new acceptance and begin tonic's drain. The
-signal does not cancel an already admitted RPC: tonic first lets it run until
-completion or its request deadline. The process then waits for any detached
-worker to reach a cancellation boundary or complete and release the slot.
-Supervisors should therefore allow the remaining request deadline plus the
-worst-case non-interruptible cancellation tail. A forced kill trades bounded
-shutdown time for abandoning validation mid-computation.
+Ctrl-C and SIGTERM stop listener acceptance and drain active streams. Allow
+for non-interruptible execution when setting a supervisor's shutdown grace.
 
 ## Tracing
 
 `RUST_LOG` controls filtering and defaults to `info`. Invalid filter syntax is
-a startup error. Request spans carry a request ID, peer address, validator,
-expected and wire rollup IDs, range, and block count once known.
+a startup error. Session events identify accepted ranges, validation failures
+and signed hashes.
 
 - `info` records startup configuration without secrets and successful
   attestations.
 - `warn` records expected operational or composer-controlled refusals.
-- `error` records invariant failures, worker failures, and signing failures.
-- `debug` adds admission, pipeline, progress, and operator-configured chain detail.
-- `trace` adds per-block validation and derived execution summaries.
+- `debug` adds session and operator-configured chain detail.
+- `trace` adds per-block validation summaries.
 
 Use `request_id`, `phase`, `grpc_code`, and `gate` when present to correlate a
 refusal. The daemon intentionally returns stable public status messages while

@@ -46,8 +46,7 @@ where
         attester,
         limits,
     } = config;
-    let backend =
-        Backend::with_committer(provider, chain_spec, expected_l2_system_address, committer);
+    let backend = Backend::new(provider, chain_spec, expected_l2_system_address, committer);
     eez_proof_signer::serve(
         ServerConfig {
             listen_addr,

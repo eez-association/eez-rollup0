@@ -1,4 +1,4 @@
-//! Resumable `prove.v2` session runtime.
+//! Resumable `prove.v1` session runtime.
 
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use alloy_primitives::B256;
-use eez_control_rpc::v2::prover_server::Prover;
-use eez_control_rpc::v2::{
+use eez_control_rpc::v1::prover_server::Prover;
+use eez_control_rpc::v1::{
     Cancelled, ClientFrame, Proof, Ready, Rejected, ServerFrame, Validated, client_frame,
     server_frame,
 };
@@ -20,7 +20,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{Level, event, warn};
 
-use super::settlement_job::{PipelineError, SettlementInput, run_settlement};
+use super::settlement_job::{SettlementInput, run_settlement};
 use super::{ProveSvc, ServiceLimits, ServiceState};
 use crate::cancel::CancellationToken;
 use crate::validate::{
@@ -66,7 +66,7 @@ impl Session {
     /// Select a nonempty window from the prefix whose continuity append maintains.
     fn select_window(
         &self,
-        finalize: &eez_control_rpc::v2::Finalize,
+        finalize: &eez_control_rpc::v1::Finalize,
         terminal_hash: B256,
         limits: ServiceLimits,
     ) -> Result<(BlockAnchor, ValidatedWindow, usize), Status> {
@@ -135,12 +135,12 @@ struct BoundSession {
 
 type FrameError = (Option<BoundSession>, Status);
 
-/// Shared by every v2 service clone. Session state is private; only immutable,
+/// Shared by every service clone. Session state is private; only immutable,
 /// completely checked block artifacts cross session bounds.
 #[derive(Debug)]
 pub(super) struct SessionRuntime {
     state: Arc<ServiceState>,
-    limits: ServiceLimits,
+    pub(super) limits: ServiceLimits,
     registry: Mutex<Registry>,
     active_streams: AtomicUsize,
     idle: Notify,
@@ -556,7 +556,7 @@ impl SessionRuntime {
     /// Create a retained session at the supplied anchor and return its initial binding and cursor.
     async fn begin(
         &self,
-        begin: eez_control_rpc::v2::Begin,
+        begin: eez_control_rpc::v1::Begin,
     ) -> Result<(BoundSession, Ready), Status> {
         if begin.rollup_id != self.state.expected_rollup_id.get() {
             return Err(Status::unimplemented("session rollup identity rejected"));
@@ -710,7 +710,7 @@ impl SessionRuntime {
     async fn validate_block(
         &self,
         bound: BoundSession,
-        block: eez_control_rpc::v2::Block,
+        block: eez_control_rpc::v1::Block,
     ) -> Result<Validated, Status> {
         let submitted = block
             .data
@@ -802,7 +802,7 @@ impl SessionRuntime {
     async fn finalize(
         &self,
         bound: BoundSession,
-        mut finalize: eez_control_rpc::v2::Finalize,
+        mut finalize: eez_control_rpc::v1::Finalize,
     ) -> Result<Proof, Status> {
         let started = Instant::now();
         let terminal_hash = parse_b256("terminal hash", &finalize.terminal_hash)?;
@@ -881,7 +881,7 @@ impl SessionRuntime {
         }
         let worker_cancellation = cancellation.clone();
         let worker = tokio::task::spawn_blocking(move || {
-            let hash = run_settlement(SettlementInput {
+            run_settlement(SettlementInput {
                 submitted_post_batch_calldata: settlement.abi_calldata,
                 l1_parent_hash,
                 validated_window: &validated_window,
@@ -892,13 +892,14 @@ impl SessionRuntime {
                 system_transaction_reconstructor: &state.system_transaction_reconstructor,
                 cancellation: &worker_cancellation,
             })
-            .map_err(PipelineError::Settlement)?;
-            Ok::<_, PipelineError>(hash)
         });
 
         let hash = match timeout(remaining, worker).await {
             Ok(Ok(Ok(hash))) => hash,
-            Ok(Ok(Err(error))) => return Err(error.status()),
+            Ok(Ok(Err(error))) => {
+                warn!(gate = error.gate(), %error, "session settlement rejected");
+                return Err(error.status());
+            }
             Ok(Err(error)) => {
                 warn!(?error, "session finalization worker failed");
                 return Err(Status::internal("session finalization worker failed"));
@@ -948,7 +949,7 @@ impl SessionRuntime {
 impl Prover for ProveSvc {
     type ProveStreamStream = ResponseStream;
 
-    /// Start the v2 RPC handler and return its server-frame response stream.
+    /// Start the streaming RPC handler and return its server-frame response stream.
     async fn prove_stream(
         &self,
         request: Request<Streaming<ClientFrame>>,
@@ -1056,7 +1057,7 @@ fn validated_response(artifact: &ValidatedBlock, reused: bool) -> Validated {
 
 fn validation_status(error: ValidationError) -> Status {
     warn!(%error, "stream validation failed");
-    PipelineError::Validation(error).status()
+    error.status()
 }
 
 fn server_frame(bound: BoundSession, request_id: u64, kind: server_frame::Kind) -> ServerFrame {
@@ -1119,8 +1120,8 @@ mod tests {
     use alloy_primitives::{Address, Bytes, U256, b256};
     use alloy_rpc_types_debug::ExecutionWitness;
     use alloy_sol_types::SolCall as _;
+    use eez_control_rpc::v1::prover_client::ProverClient as StreamingClient;
     use eez_control_rpc::v1::{BlockWitness, ExecutionWitness as WireWitness};
-    use eez_control_rpc::v2::prover_client::ProverClient as StreamingClient;
     use eez_protocol::abi::{ExecutionEntrySol, RollupIdWithProofSystemsSol, RollupUpdateSol};
     use eez_prover::{Prover as _, ProvingAnchor, ProvingContext};
     use eez_prover_client::RemoteProver;
@@ -1129,9 +1130,7 @@ mod tests {
     use crate::attest::Attester;
     use crate::service::tests::TestServer;
     use crate::testkit::TEST_SYSTEM_ADDRESS;
-    use crate::validate::{
-        BackendBlockOutput, BackendWindowOutput, SettlementBlockEvidence, ValidationBackend,
-    };
+    use crate::validate::{BackendBlockOutput, SettlementBlockEvidence, ValidationBackend};
     use tokio_stream::wrappers::ReceiverStream as TokioReceiverStream;
 
     #[derive(Debug, Clone)]
@@ -1154,15 +1153,6 @@ mod tests {
 
         fn expected_l2_system_address(&self) -> Address {
             TEST_SYSTEM_ADDRESS
-        }
-
-        fn validate_blocks(
-            &self,
-            _blocks: &[AdmittedBlock],
-            _witnesses: &mut [ExecutionWitness],
-            _cancellation: &CancellationToken,
-        ) -> Result<BackendWindowOutput, ValidationError> {
-            unreachable!("v1 is not used by this test")
         }
 
         fn validate_anchor(&self, _anchor: BlockAnchor) -> Result<(), ValidationError> {
@@ -1210,20 +1200,16 @@ mod tests {
                     observed_outbound_events: Vec::new(),
                 },
             };
-            let output = crate::validate::testing::check_test_output(
-                block,
-                output,
-                parent.state_root,
-                true,
-            )?;
+            let output =
+                crate::validate::testing::check_test_output(block, output, parent.state_root)?;
             let mut blocks = self.blocks.lock().await;
             let cached = blocks.entry(block.claimed_hash()).or_insert(output);
             Ok((Arc::clone(cached), false))
         }
     }
 
-    fn begin() -> eez_control_rpc::v2::Begin {
-        eez_control_rpc::v2::Begin {
+    fn begin() -> eez_control_rpc::v1::Begin {
+        eez_control_rpc::v1::Begin {
             rollup_id: 1,
             anchor_number: 10,
             anchor_hash: vec![0x11; 32],
@@ -1301,7 +1287,7 @@ mod tests {
         )
     }
 
-    fn block() -> eez_control_rpc::v2::Block {
+    fn block() -> eez_control_rpc::v1::Block {
         let block = eez_primitives::Block::new(
             alloy_consensus::Header {
                 state_root: B256::repeat_byte(0x33),
@@ -1309,7 +1295,7 @@ mod tests {
             },
             eez_primitives::BlockBody::default(),
         );
-        eez_control_rpc::v2::Block {
+        eez_control_rpc::v1::Block {
             data: Some(BlockWitness {
                 number: 11,
                 hash: vec![0x22; 32],
@@ -1323,7 +1309,7 @@ mod tests {
         }
     }
 
-    fn block_after(number: u64, parent_hash: B256, marker: u8) -> eez_control_rpc::v2::Block {
+    fn block_after(number: u64, parent_hash: B256, marker: u8) -> eez_control_rpc::v1::Block {
         let header = alloy_consensus::Header {
             number,
             parent_hash,
@@ -1333,7 +1319,7 @@ mod tests {
         };
         let hash = header.hash_slow();
         let block = eez_primitives::Block::new(header, eez_primitives::BlockBody::default());
-        eez_control_rpc::v2::Block {
+        eez_control_rpc::v1::Block {
             data: Some(BlockWitness {
                 number,
                 hash: hash.to_vec(),
@@ -1351,7 +1337,7 @@ mod tests {
         anchor: B256,
         terminal: B256,
         block_count: usize,
-    ) -> eez_control_rpc::v2::SettlementInput {
+    ) -> eez_control_rpc::v1::SettlementInput {
         let mut batch = eez_protocol::EvmBatch::default();
         batch.entries.push(ExecutionEntrySol {
             rollupUpdates: vec![RollupUpdateSol {
@@ -1377,7 +1363,7 @@ mod tests {
         batch.callData =
             crate::settlement::encode_da_payload_for(1, &vec![Vec::new(); block_count], &[]).into();
         eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
-        eez_control_rpc::v2::SettlementInput {
+        eez_control_rpc::v1::SettlementInput {
             abi_calldata: eez_protocol::entries::encode_postbatch(&batch),
             ..Default::default()
         }
@@ -1404,7 +1390,7 @@ mod tests {
             rollup_id: 1,
             from_block: blocks[0].number,
             to_block: terminal.number,
-            anchor: Some(anchor),
+            anchor,
             batch: eez_protocol::abi::postAndVerifyBatchCall::abi_decode(&calldata)
                 .unwrap()
                 .batch,
@@ -1571,7 +1557,7 @@ mod tests {
                     let error = runtime
                         .finalize(
                             BoundSession { id, epoch },
-                            eez_control_rpc::v2::Finalize {
+                            eez_control_rpc::v1::Finalize {
                                 from_block: 11,
                                 to_block: 14,
                                 terminal_hash: pair[1].hash.to_vec(),
@@ -1625,7 +1611,7 @@ mod tests {
         let fourth_hash = B256::from_slice(&fourth.data.as_ref().unwrap().hash);
         runtime.validate_block(bound, first.clone()).await.unwrap();
         runtime.validate_block(bound, second.clone()).await.unwrap();
-        let finalize = eez_control_rpc::v2::Finalize {
+        let finalize = eez_control_rpc::v1::Finalize {
             from_block: 11,
             to_block: 12,
             terminal_hash: second_hash.to_vec(),
@@ -1690,7 +1676,7 @@ mod tests {
             assert_eq!(
                 session
                     .select_window(
-                        &eez_control_rpc::v2::Finalize {
+                        &eez_control_rpc::v1::Finalize {
                             from_block: from,
                             to_block: to,
                             ..Default::default()
@@ -2046,7 +2032,7 @@ mod tests {
         );
         let runtime = Arc::clone(&service.sessions);
         let server = TestServer::with_service(service).await;
-        let mut client = server.streaming_client().await;
+        let mut client = server.client().await;
         let (old_requests, mut old_responses) = open_stream(
             &mut client,
             ClientFrame {
@@ -2071,7 +2057,7 @@ mod tests {
                 session_id: original.session_id.clone(),
                 request_id: 2,
                 epoch: 0,
-                kind: Some(client_frame::Kind::Resume(eez_control_rpc::v2::Resume {})),
+                kind: Some(client_frame::Kind::Resume(eez_control_rpc::v1::Resume {})),
             },
         )
         .await;
@@ -2104,7 +2090,7 @@ mod tests {
                 session_id: resumed.session_id,
                 request_id: 3,
                 epoch: resumed.epoch,
-                kind: Some(client_frame::Kind::Rewind(eez_control_rpc::v2::Rewind {
+                kind: Some(client_frame::Kind::Rewind(eez_control_rpc::v1::Rewind {
                     ancestor_hash: vec![0x11; 32],
                 })),
             })
@@ -2158,7 +2144,7 @@ mod tests {
                     session_id: a.id.to_vec(),
                     request_id: 3,
                     epoch: a.epoch,
-                    kind: Some(client_frame::Kind::Cancel(eez_control_rpc::v2::Cancel {})),
+                    kind: Some(client_frame::Kind::Cancel(eez_control_rpc::v1::Cancel {})),
                 },
             )
             .await
@@ -2192,12 +2178,12 @@ mod tests {
                 .batch;
         batch.blockNumber = u64::MAX;
         settlement.abi_calldata = eez_protocol::entries::encode_postbatch(&batch);
-        settlement.posting_context = Some(eez_control_rpc::v2::L1PostingContext {
+        settlement.posting_context = Some(eez_control_rpc::v1::L1PostingContext {
             parent_hash: vec![0x99; 32],
             target_timestamp: 0x33,
             ..Default::default()
         });
-        let finalize = eez_control_rpc::v2::Finalize {
+        let finalize = eez_control_rpc::v1::Finalize {
             from_block: 11,
             to_block: 11,
             terminal_hash: hash.to_vec(),
@@ -2267,7 +2253,7 @@ mod tests {
         let input = block_after(11, B256::repeat_byte(0x11), 0x33);
         let hash = B256::from_slice(&input.data.as_ref().unwrap().hash);
         runtime.validate_block(bound, input).await.unwrap();
-        let finalize = eez_control_rpc::v2::Finalize {
+        let finalize = eez_control_rpc::v1::Finalize {
             from_block: 11,
             to_block: 11,
             terminal_hash: hash.to_vec(),
@@ -2303,7 +2289,7 @@ mod tests {
                 limits,
             ))
             .await;
-            let mut client = server.streaming_client().await;
+            let mut client = server.client().await;
             let (requests, mut responses) = open_stream(
                 &mut client,
                 ClientFrame {
@@ -2366,7 +2352,7 @@ mod tests {
             limits(),
         );
         let server = TestServer::with_service(service).await;
-        let mut client = server.streaming_client().await;
+        let mut client = server.client().await;
         let (requests, mut responses) = open_stream(
             &mut client,
             ClientFrame {
@@ -2403,7 +2389,7 @@ mod tests {
             (4, client_frame::Kind::Block(block_after(12, hash, 0x12))),
             (
                 5,
-                client_frame::Kind::Rewind(eez_control_rpc::v2::Rewind {
+                client_frame::Kind::Rewind(eez_control_rpc::v1::Rewind {
                     ancestor_hash: vec![0xff; 32],
                 }),
             ),
@@ -2447,7 +2433,7 @@ mod tests {
             limits(),
         );
         let server = TestServer::with_service(service).await;
-        let mut client = server.streaming_client().await;
+        let mut client = server.client().await;
         let (requests, mut responses) = open_stream(
             &mut client,
             ClientFrame {
@@ -2474,7 +2460,7 @@ mod tests {
                 session_id: ready.session_id,
                 request_id: 3,
                 epoch: ready.epoch,
-                kind: Some(client_frame::Kind::Cancel(eez_control_rpc::v2::Cancel {})),
+                kind: Some(client_frame::Kind::Cancel(eez_control_rpc::v1::Cancel {})),
             })
             .await
             .unwrap();
@@ -2500,7 +2486,7 @@ mod tests {
             limits_with_timeouts(Duration::from_millis(20), Duration::from_secs(1)),
         );
         let server = TestServer::with_service(service).await;
-        let mut client = server.streaming_client().await;
+        let mut client = server.client().await;
         let (requests, mut responses) = open_stream(
             &mut client,
             ClientFrame {

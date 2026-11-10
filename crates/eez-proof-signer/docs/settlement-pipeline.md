@@ -39,8 +39,7 @@ flowchart LR
     PI --> HASH[RecomputedPublicInputsHash]
     DA --> HASH
     HASH --> AUTH[AttestablePublicInputsHash]
-    AUTH --> MATERIAL[AttestationMaterial]
-    MATERIAL --> SIGN[Attest]
+    AUTH --> SIGN[Attest]
 ```
 
 1. `post_batch` exact-decodes and canonical round-trips the full calldata into
@@ -50,7 +49,7 @@ flowchart LR
    one-rollup, one-proof-system shape to the configured deployment and requires
    `blockNumber = uint64.max` exactly when live context is supplied. Ordinary-only
    batches may remain timeless. The profile retains the typed capability needed
-   for later hash computation; it never accepts the wire hash as authoritative.
+   for later hash computation; the request contains no public-input hash.
 3. `state_chain` requires exactly one expected-rollup state update per entry and a
    continuous commitment chain from `ValidatedWindow.window_pre_block_hash` to
    `window_post_block_hash`.
@@ -75,9 +74,8 @@ flowchart LR
    requires byte equality with the validated settling block.
 9. Only after every gate passes does `CheckedPublicInputProfile` construct
    `RecomputedPublicInputsHash`. The complete job then wraps it as
-   `AttestablePublicInputsHash`; `AttestationMaterial` carries that stronger
-   capability and the validated endpoint roots to the async RPC for signing
-   and audit logging.
+   `AttestablePublicInputsHash` and returns it directly to the session runtime
+   for signing.
 
 ## Why the order matters
 
@@ -114,7 +112,7 @@ outbound shapes, and ambiguous evidence reject before signing. Refer to
 | [`inbound.rs`](../src/settlement/inbound.rs) | Strict inbound observation and entry authorization |
 | [`outbound.rs`](../src/settlement/outbound.rs) | Event-to-entry outbound authorization |
 | [`da.rs`](../src/settlement/da.rs) | Borrowed payload parsing and exact transaction/sidecar reconstruction |
-| [`system_transactions.rs`](../src/settlement/system_transactions.rs) | System-key validation and `SystemTransactionReconstructor` context |
+| [`system_transactions.rs`](../src/settlement/system_transactions.rs) | `SystemTransactionReconstructor` context and unsigned Sync-pair reconstruction |
 
 ## Attestation boundary
 
@@ -123,8 +121,8 @@ the derived profile terms listed in `SPEC.md` section 12. Other batch carriers,
 including scheduling counts and proof bytes, are constrained only by admission
 and are not direct signature commitments. `RecomputedPublicInputsHash` proves
 local profile-checked computation, while only the complete settlement job can
-grant the attestable capability after every gate. The signing API accepts
-neither the weaker type nor the Composer-supplied wire hash. The signature
+grant the attestable capability after every gate. The signing API requires
+`AttestablePublicInputsHash` and cannot accept the weaker type. The signature
 proves neither that L1 will apply the transition nor that an expected outbound
 call will succeed in the future. Live-root checks, actual L1 execution, and
 dispatch scheduling remain outside this daemon's observation.

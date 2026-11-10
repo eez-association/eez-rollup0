@@ -4439,11 +4439,11 @@ where
             rollup_id,
             from_block: from,
             to_block: sync_block_number,
-            anchor: Some(eez_prover::ProvingAnchor {
+            anchor: eez_prover::ProvingAnchor {
                 number: posted,
                 hash: pre_block_hash,
                 state_root: pre_state_root,
-            }),
+            },
             batch: batch.clone(),
             blocks: block_witnesses,
             l1_context,

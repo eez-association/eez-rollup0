@@ -1,7 +1,7 @@
 # eez-proof-signer
 
 `eez-proof-signer` is the shared EEZ validation and attestation service
-library. It admits one Composer-streamed L2 block window, checks execution
+library. It admits resumable Composer sessions, checks execution
 evidence returned by a configured backend, binds the supported settlement
 effects and DA payload to that evidence, and signs the independently
 recomputed public-input hash.
@@ -14,7 +14,7 @@ recomputed public-input hash.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) records contributor constraints and verification
   commands.
 
-The service is single-flight and fails closed: any admission, validation,
-settlement, deadline, or signing failure returns no signature. Backend
+The service supports concurrent sessions and fails closed: any admission,
+validation, settlement, deadline, or signing failure returns no signature. Backend
 implementations live in [`eez-prover-stateless`](../eez-prover-stateless) and
 [`eez-prover-stateful`](../eez-prover-stateful).

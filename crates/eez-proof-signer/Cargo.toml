@@ -40,6 +40,7 @@ getrandom.workspace = true
 stateless-reth.workspace = true
 
 [dev-dependencies]
+tonic-prost.workspace = true
 # Recorded calldata fixture decoding.
 hex.workspace = true
 serde_json.workspace = true
