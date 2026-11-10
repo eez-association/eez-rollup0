@@ -6,6 +6,7 @@ use alloy_primitives::{B256, hex};
 use alloy_provider::Provider;
 use serde_json::Value;
 use tokio::sync::OnceCell;
+use tracing::{Level, event};
 use url::Url;
 
 use crate::{L1Error, L1Result, scan::Post};
@@ -90,7 +91,7 @@ impl BeaconBlobSource {
             }
         };
         let Some(body) = body else {
-            return Err(self.missing_blobs(block, slot).await?);
+            return Err(self.missing_blobs(post, slot).await?);
         };
         let served = parse_blobs(&body)?;
         let hashes = eez_blob::versioned_hashes(&served).map_err(|error| {
@@ -98,14 +99,30 @@ impl BeaconBlobSource {
         })?;
         match select_blobs(hashes, served, &post.blob_hashes) {
             Some(blobs) => Ok(blobs),
-            None => Err(self.missing_blobs(block, slot).await?),
+            None => Err(self.missing_blobs(post, slot).await?),
         }
     }
 
-    async fn missing_blobs(&self, block: u64, slot: u64) -> L1Result<L1Error> {
+    async fn missing_blobs(&self, post: &Post, slot: u64) -> L1Result<L1Error> {
+        // A node still backfilling serves no block at the slot yet.
+        let served = self
+            .get_optional(&format!("eth/v1/beacon/blinded_blocks/{slot}"))
+            .await?
+            .map(|block| {
+                json_b256(
+                    &block,
+                    "/data/message/body/execution_payload_header/block_hash",
+                )
+            })
+            .transpose()?;
         let finalized = self.get("eth/v1/beacon/headers/finalized").await?;
         let finalized_slot = json_u64(&finalized, "/data/header/message/slot")?;
-        Ok(missing_blob_error(block, slot, finalized_slot))
+        Ok(missing_blob_error(
+            post.id.l1_block,
+            slot,
+            finalized_slot,
+            served == Some(post.id.l1_block_hash),
+        ))
     }
 
     async fn timing(&self) -> L1Result<BeaconTiming> {
@@ -151,23 +168,21 @@ impl BeaconBlobSource {
         ) {
             return Ok(None);
         }
+        // Clients answer 400 when they cannot reconstruct the blobs, e.g.
+        // without full column custody; each words it differently.
         if response.status() == reqwest::StatusCode::BAD_REQUEST
             && (path.starts_with("eth/v1/beacon/blobs/")
                 || path.starts_with("eth/v1/beacon/blob_sidecars/"))
         {
-            let body = response
-                .json::<Value>()
-                .await
-                .map_err(|error| L1Error::Provider(format!("beacon {path}: {error}")))?;
-            if let Some(message) = body["message"].as_str().filter(|message| {
-                message.starts_with("Insufficient data columns to reconstruct blobs:")
-            }) {
-                tracing::warn!(path, message, "beacon blob data unavailable");
-                return Ok(None);
-            }
-            return Err(L1Error::Provider(format!(
-                "beacon {path}: 400 Bad Request: {body}"
-            )));
+            let body = response.text().await.unwrap_or_default();
+            event!(
+                name: "eez.l1.beacon.blobs_unavailable",
+                Level::WARN,
+                path,
+                body,
+                "beacon cannot serve the blobs at {{path}}",
+            );
+            return Ok(None);
         }
         let response = response
             .error_for_status()
@@ -180,8 +195,15 @@ impl BeaconBlobSource {
     }
 }
 
-fn missing_blob_error(block: u64, slot: u64, finalized_slot: u64) -> L1Error {
-    if finalized_slot < slot {
+fn missing_blob_error(block: u64, slot: u64, finalized_slot: u64, block_served: bool) -> L1Error {
+    if !block_served {
+        L1Error::SourceIncomplete {
+            block,
+            detail: format!(
+                "beacon does not serve this execution block at slot {slot}; retry after synchronization"
+            ),
+        }
+    } else if finalized_slot < slot {
         L1Error::SourceIncomplete {
             block,
             detail: format!(
@@ -192,7 +214,7 @@ fn missing_blob_error(block: u64, slot: u64, finalized_slot: u64) -> L1Error {
         L1Error::BlobUnavailable {
             block,
             detail: format!(
-                "beacon does not serve the block or all selected blobs at finalized slot {slot}; use a supernode retaining this history"
+                "beacon serves the block but not all selected blobs at finalized slot {slot}; use a supernode retaining this history"
             ),
         }
     }
@@ -228,6 +250,14 @@ fn parse_blobs(body: &Value) -> L1Result<Vec<Vec<u8>>> {
         .collect()
 }
 
+fn json_b256(value: &Value, pointer: &str) -> L1Result<B256> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .and_then(|hash| hash.parse().ok())
+        .ok_or_else(|| L1Error::Provider(format!("beacon response: invalid {pointer}")))
+}
+
 fn json_u64(value: &Value, pointer: &str) -> L1Result<u64> {
     let invalid = || L1Error::Provider(format!("beacon response: invalid {pointer}"));
     match value.pointer(pointer).ok_or_else(invalid)? {
@@ -244,26 +274,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_blobs_wait_for_finality_but_halt_for_lost_history() {
-        assert!(missing_blob_error(100, 20, 19).is_retryable());
+    fn missing_blobs_halt_only_for_a_served_block_at_a_finalized_slot() {
+        assert!(missing_blob_error(100, 20, 19, true).is_retryable());
         for finalized in [20, 21] {
+            assert!(missing_blob_error(100, 20, finalized, false).is_retryable());
             assert!(matches!(
-                missing_blob_error(100, 20, finalized),
+                missing_blob_error(100, 20, finalized, true),
                 L1Error::BlobUnavailable { block: 100, .. }
             ));
-            assert!(missing_blob_error(100, 20, finalized).is_terminal());
         }
     }
 
     #[tokio::test]
-    async fn only_insufficient_columns_are_treated_as_missing_data() {
+    async fn blob_endpoint_400s_are_treated_as_missing_data() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         let blobs = "eth/v1/beacon/blobs/20";
         let columns = "Insufficient data columns to reconstruct blobs: required 64, found 0";
         let cases = [
             (blobs, 400, columns, true),
             ("eth/v1/beacon/blob_sidecars/20", 400, columns, true),
-            (blobs, 400, "Invalid block ID", false),
+            (blobs, 400, "Invalid block ID", true),
             (blobs, 500, columns, false),
             ("eth/v2/beacon/blocks/20", 400, columns, false),
         ];
