@@ -16,7 +16,8 @@ It does not cover L1 derivation, settlement or the block format. Those are in
 The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in
 RFC 2119. Byte strings are hex. RLP is Ethereum's recursive length prefix:
 integers are big-endian with no leading zeros, and zero is the empty string
-`0x80`. Decoding is strict. Each of these is invalid:
+`0x80`. Decoding is strict, except for typed transactions inside a block
+([§4.1](#41-envelope)). Each of these is invalid:
 - a non-canonical integer, such as one with leading zeros or `0x8105`;
 - a non-canonical length prefix;
 - an integer wider than its field;
@@ -25,7 +26,13 @@ integers are big-endian with no leading zeros, and zero is the empty string
 The reference implementation is eez-node ([Appendix B](#appendix-b-reference-implementation)).
 Where this spec describes what the reference accepts rather than what a
 sender produces, it says so. A client MUST accept the same inputs, so that
-nodes reach the same verdict on the same message.
+nodes reach the same verdict on the same message. This matters because:
+- nodes relay only the first copy of each claim ([§5](#5-validation));
+- the signature doesn't cover the message bytes, so any relay can re-encode
+  a message.
+
+A client that rejects a copy the reference accepts can miss that head
+entirely.
 
 ## 1. Model
 
@@ -174,17 +181,38 @@ head     = [rollupId, number, blockHash, parentHash, epochMs, counter]
   bodies:
   - a legacy transaction is an RLP list;
   - a typed transaction, `0x76` included, is an RLP string holding
-    `type ‖ payload`.
+    `type ‖ payload`. Senders MUST wrap it this way with the exact length.
+    Receivers MUST also accept the forms the reference accepts:
+    - the bare `type ‖ payload` bytes, with no wrapper;
+    - a wrapper whose declared length differs from the transaction's, as
+      long as at least that many bytes remain in the transactions list. The
+      wrapper's header must still be canonical, so `0x81` before the type
+      byte is invalid.
 
-  The header fields follow the L2 chain's fork schedule, which its genesis
-  sets. This spec doesn't define them.
+    The reference reads the string header, then decodes the transaction from
+    the type byte, ignoring the declared length (alloy keeps this for
+    backwards compatibility). The transactions root is computed from the
+    decoded transactions, so such a copy has the same header hash.
+
+  The header is checked only for shape here, not against the L2 fork
+  schedule, which its genesis sets:
+  - It has the 15 base Ethereum header fields, then any prefix of
+    `baseFeePerGas`, `withdrawalsRoot`, `blobGasUsed`, `excessBlobGas`,
+    `parentBeaconBlockRoot`, `requestsHash`, `blockAccessListHash` and
+    `slotNumber`.
+  - `number`, `gasLimit`, `gasUsed`, `timestamp`, `baseFeePerGas`,
+    `blobGasUsed`, `excessBlobGas` and `slotNumber` are 64-bit; `difficulty`
+    is 256-bit; `nonce` is 8 bytes.
 
   Each transaction MUST decode as one of these:
   - a legacy transaction;
   - type `0x01`, `0x02` or `0x04`;
   - type `0x03`, without its sidecar. It decodes here, but block execution
     rejects it;
-  - type `0x76` ([`native-system-transactions.md`](native-system-transactions.md)).
+  - type `0x76`, with payload `rlp([chainId, nonce, to, value, input])`
+    ([`native-system-transactions.md`](native-system-transactions.md)). A
+    `to` other than EEZL2 (`0x4200000000000000000000000000000000000007`)
+    fails to decode.
 
 ### 4.2 Message
 
@@ -201,6 +229,13 @@ block format, not the framed format.
 - Snappy allows many encodings of one input. A receiver MUST accept any valid
   encoding. Different encoders produce different bytes and so different
   message ids ([§6.3](#63-gossipsub)).
+- The preamble is a little-endian base-128 varint.
+  - Senders MUST write it minimally.
+  - The reference reads up to 10 bytes and accepts redundant continuation
+    bytes. It silently drops bits above 64. The value must then be at most
+    `MAX_MESSAGE_SIZE`, and equal the decompressed length.
+  - Receivers MUST accept the same, though some Snappy libraries reject a
+    preamble longer than 5 bytes.
 
 A signer SHOULD attach the block. The reference always attaches it, rewinds
 included. A receiver MUST accept an envelope without one.
@@ -252,6 +287,10 @@ encoding.
   head of each source is accepted again.
 - A head with the same counter and `blockHash` as its source's latest is a
   duplicate, whatever its other fields.
+- `number` and `parentHash` are checked only against an attached block.
+  Without one, the follower uses the claim's values for its checks in
+  [§10](#10-follower-fork-choice). It imports the block fetched by
+  `blockHash` even if its number or parent differs from the claim.
 
 ## 6. Head overlay
 
@@ -278,9 +317,11 @@ can't be dialed from discovery.
 - One topic, `TOPIC`. The topic id is the string itself, not a hash of it.
 - Messages are anonymous, and the sequencer signature is the only
   authentication:
-  - publishers MUST leave `from`, `seqno`, `signature` and `key` empty;
+  - publishers MUST omit `from`, `seqno`, `signature` and `key`;
   - receivers MUST reject a message that carries `from`, `seqno` or
-    `signature`;
+    `signature`. A field that is present but zero-length counts as carried;
+  - such a rejected message MUST NOT enter the seen-message cache, so it
+    can't suppress a clean copy with the same id;
   - the reference accepts, and relays, a message that carries only `key`.
     Ethereum consensus's `StrictNoSign` would reject it.
 
@@ -352,8 +393,9 @@ L2 execution clients peer over devp2p (RLPx) with the `eth` protocol.
 - **Status:**
   - `networkId` is `L2_CHAIN_ID`;
   - the genesis hash and the EIP-2124 fork id come from the L2 genesis;
-  - for `eth/66` to `eth/68`, the total difficulty never changes after
-    genesis, because every L2 block has difficulty 0.
+  - for `eth/66` to `eth/68`, the reference sends total difficulty 0. It
+    sends 0 at startup, then the genesis `terminalTotalDifficulty`, which
+    is 0 in EEZ genesis files.
 - **Versions:** the reference EL (reth) offers `eth/66` to `eth/71`. It
   doesn't offer `snap`. A peer therefore syncs by downloading headers and
   bodies and executing them.
@@ -381,7 +423,10 @@ L2 execution clients peer over devp2p (RLPx) with the `eth` protocol.
 A sequencer:
 - MUST sign every change of its canonical L2 head, including rewinds and
   replacements. Examples: a failed settlement rolled back, a block rebuilt
-  after partial settlement, a retreat after an L1 reorg.
+  after partial settlement, a retreat after an L1 reorg. The reference falls
+  short in two cases: a head whose block stays unreadable for 1 s, and a
+  head whose read or signing fails. Either stays unsigned until the head
+  changes again.
 - MAY skip intermediate heads it never exposed. Followers fetch the ancestors
   by hash.
 - MUST NOT sign heads until it has caught up at startup. Caught up means it
@@ -413,38 +458,42 @@ For each candidate in order:
      different hash.
 
    A head that this doesn't prove in conflict goes on to step 2.
-2. **Fetch.** Walk back from `blockHash` through parent hashes to the first
+2. **Hold.** If the node's L1 derivation has read a settlement above its safe
+   head, stop and adopt nothing. Heights L1 has settled MUST NOT be
+   rewritten, even before safe reaches them.
+3. **Fetch.** Walk back from `blockHash` through parent hashes to the first
    locally known block, fetching unknown blocks by hash
    ([§8](#8-execution-layer-networking)). The walk is at most
    `MAX_ANCESTRY_WALK` blocks. A head more than `MAX_ANCESTRY_WALK` above the
-   highest block on the local canonical chain waits for L1 derivation. The
-   reference asks any connected peer for up to 64 blocks per request, with a
-   2 s timeout.
-3. **Stop on unknown ancestry.** If the ancestry can't be fetched, stop. Don't
+   highest block on the local canonical chain waits for L1 derivation: stop,
+   without trying lower candidates. The reference asks any connected peer
+   for up to 64 blocks per request, with a 2 s timeout.
+4. **Stop on unknown ancestry.** If the ancestry can't be fetched, stop. Don't
    try lower candidates: unknown ancestry is not a conflict, and a lower
    version must not win because a block is missing.
-4. **Fork point.** The first locally known block MUST descend from safe. A
-   conflict skips to the next candidate; an unverifiable result stops.
-5. **Import** the fetched blocks in order, executing each, and set the unsafe
+5. **Fork point.** Check the hold again. Then the first locally known block
+   MUST descend from safe. A conflict skips to the next candidate; an
+   unverifiable result stops.
+6. **Import** the fetched blocks in order, executing each, and set the unsafe
    head to the candidate. If the candidate is already local, rewind or
    advance to it. If a block fails to import, stop and retry on the next run.
 
-The ancestry walks in steps 1 and 4 read at most `MAX_ANCESTRY_WALK` local
+The ancestry walks in steps 1 and 5 read at most `MAX_ANCESTRY_WALK` local
 headers. A walk that runs out, or reaches a block not held locally, proves
 nothing: it is unverifiable, not a conflict.
 
 The follower re-runs this on every accepted head and once per
 `L2_BLOCK_TIME`.
 
-- **Settled heights.** A follower MUST NOT rewrite L2 heights L1 has settled.
-  It knows them from its own L1 derivation, which can read a settlement
-  before its safe head moves there.
 - **Safe moving back.** After an L1 reorg moves safe back, candidates that
   conflicted with the old safe are checked again.
 - **Failover.** A sequencer that stops publishing keeps the highest version.
-  It stops being a candidate once L1 settles a block its chain doesn't
-  contain. The follower then moves to the next source, about one settlement
-  later. With no candidate, the unsafe head stays where it is.
+  It blocks lower candidates until its head provably conflicts with safe.
+  That happens once safe reaches its height, or earlier if the follower still
+  holds that chain. Once L1 settles another block, the dead chain's blocks
+  usually leave the follower and its peers, so its ancestry turns
+  unverifiable rather than conflicting. The follower then moves to the next
+  source. With no candidate, the unsafe head stays where it is.
 
 ## 11. Joining: history from peers
 
@@ -494,12 +543,15 @@ would close this; it is under discussion.
 - **Flooding:**
   - sizes are capped before decompression;
   - messages are validated before they are relayed;
-  - duplicates are detected by claim, so re-encodings don't spread.
+  - a node relays only the first copy of each claim, whatever its encoding,
+    so re-encodings of a seen head don't spread.
 
   v0 has no peer scoring.
 - **Malleability:** v0 receivers accept several encodings of one signature
-  ([§3.3](#33-signature-encoding)). They are duplicates of the same claim, and
-  a coming version rejects them.
+  ([§3.3](#33-signature-encoding)), and of a block's typed transactions
+  ([§4.1](#41-envelope)). Any relay can produce them, since the signature
+  doesn't cover the message bytes. Each is a duplicate of the same claim. A
+  coming version rejects the extra signature encodings.
 - **Withholding:** with no usable head, a follower still follows L1. Safe
   keeps advancing.
 
