@@ -91,8 +91,8 @@ fn min_replacement_fee(replaced: u128) -> u128 {
     replaced.saturating_add(required_increase)
 }
 
-/// L2 blocks a [refused](HeldPool::refuse) tx stays held. reth re-adds a
-/// reorg's dropped txs right after it, so this is only a margin.
+/// Minimum L2 blocks a [refused](HeldPool::refuse) tx stays held. reth re-adds
+/// a reorg's dropped txs right after it, so this is only a margin.
 const REFUSED_BLOCKS: u64 = 64;
 
 /// All pool state under one lock, so queue membership, hash dedupe and
@@ -377,9 +377,10 @@ impl HeldPool {
             || state.refused.contains_key(hash)
     }
 
-    /// Hold `hashes` for [`REFUSED_BLOCKS`] L2 blocks past `height`: cross-chain
-    /// txs in blocks a reorg is about to drop, which this pool may release first
-    /// or never have held.
+    /// Hold `hashes` for at least [`REFUSED_BLOCKS`] L2 blocks past `height`.
+    ///
+    /// They are cross-chain txs in blocks a reorg is about to drop, which this
+    /// pool may release first or never have held. Expired ones go on the next call.
     pub fn refuse(&self, hashes: impl IntoIterator<Item = TxHash>, height: u64) {
         let mut state = self.state.lock().expect("held_pool mutex poisoned");
         state.refused.retain(|_, until| *until > height);

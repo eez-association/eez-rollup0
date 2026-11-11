@@ -609,7 +609,7 @@ const fn grid_aligned_cap(requested: u64, k: u64) -> u64 {
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryOutcome {
-    /// A rollback and/or sibling commit landed — the caller's slot parent is stale.
+    /// The empty sibling landed, so the caller's slot parent is stale.
     HeadMoved,
     /// Nothing was committed (bail, stale verdict, or nothing to roll back).
     HeadUnchanged,

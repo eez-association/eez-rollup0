@@ -12,8 +12,8 @@
 //!   ([`OptimisticallyIncluded::take_finalized`]) — a missed-reorg
 //!   backstop (invariant 7).
 //! - **Failed**: the observer only marks it
-//!   ([`OptimisticallyIncluded::mark_failed`]); recovery (reorg to the parent,
-//!   substitute an empty sibling, re-push unburned txs) runs at the next slot
+//!   ([`OptimisticallyIncluded::mark_failed`]); recovery (commit an empty
+//!   sibling over the block, re-push unburned txs) runs at the next slot
 //!   event, serialized against the Sequencer and Deriver to close the TOCTOU
 //!   ([`OptimisticallyIncluded::take_failed_for_recovery`]).
 //! - **Cursor-confirmed**: the Deriver's cursor passing the Sync height
@@ -55,7 +55,7 @@ pub struct FailedBatch {
     /// EIP-2718 envelope) — preserved across reinsert so the finality
     /// audit can still locate the receipt.
     pub post_batch_hash: TxHash,
-    /// The Sync block's parent — the reorg target if the block landed.
+    /// The Sync block's parent, which its empty sibling builds on.
     pub parent: SealedHeader<alloy_consensus::Header>,
     /// The user txs whose effects the block carried.
     pub txs: Vec<HeldTx>,
