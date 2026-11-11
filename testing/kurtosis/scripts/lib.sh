@@ -86,11 +86,13 @@ receipt_status() { # <hash> <rpc> → "1" mined-ok, "0x0" reverted, "missing" no
 send_front() { # <front_url> <raw_tx> <expected_hash> — eth_sendRawTransaction to a front
     # Fronts refuse submissions until the node reconciles with L1, so wait that
     # out; any other error — or a changed hash — is fatal (invariant 7 is LOUD).
-    local front="$1" raw="$2" expected="$3" resp rc returned i
-    for ((i = 0; i < 120; i++)); do
+    local front="$1" raw="$2" expected="$3" resp rc=0 returned left
+    local deadline=$((SECONDS + 120))
+    while (( SECONDS < deadline )); do
+        left=$((deadline - SECONDS))
         # `if`, not a bare `resp=$(...)`: under `set -e` a failed curl would end
         # the script before the message below.
-        if resp=$(curl -sS --max-time 10 -X POST "$front" -H 'Content-Type: application/json' \
+        if resp=$(curl -sS --max-time "$((left < 10 ? left : 10))" -X POST "$front" -H 'Content-Type: application/json' \
             -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}" 2>/dev/null); then
             rc=0
         else
