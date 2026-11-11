@@ -647,6 +647,9 @@ fn dispose_recovered_txs(
     landed: &[alloy_primitives::TxHash],
     charge_attempt: bool,
 ) {
+    // Releasing or evicting a tx can come before reth re-adds it from the
+    // dropped block, which would mine it as a plain L2 call.
+    pool.refuse(txs.iter().map(|tx| tx.hash), sync_height);
     let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(txs.len());
     let mut release: Vec<crate::HeldTx> = Vec::new();
     let mut dropped = 0usize;
@@ -2029,8 +2032,6 @@ where
             // canonical, the sibling is a reorg, so reth's pool takes back its pure
             // L2 txs. Head elsewhere → nothing to substitute.
             if head.number() >= sync_height || head.hash() == failed.parent.hash() {
-                // Disposal below can release a tx before reth re-adds it.
-                pool.refuse(failed.txs.iter().map(|tx| tx.hash), sync_height);
                 let timestamp = failed
                     .parent
                     .timestamp()
@@ -5358,6 +5359,10 @@ mod tests {
 
         dispose_recovered_txs(1, &pool, 100, drained, &[], true);
         assert_eq!(pool.len(), 0, "at MAX_BUNDLE_ATTEMPTS the tx is evicted");
+        assert!(
+            pool.holds(&TxHash::repeat_byte(0xD1)),
+            "an evicted tx stays refused, so reth cannot re-add it from the dropped block",
+        );
     }
 
     fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {

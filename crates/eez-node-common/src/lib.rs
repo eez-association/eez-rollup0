@@ -78,12 +78,25 @@ where
         "--disable-tx-gossip",
         "--debug.startup-sync-state-idle",
     ] {
+        // An operator's own copy stands: clap rejects a second one.
         let name = flag.split_once('=').map_or(flag, |(name, _)| name);
-        if !argv.iter().any(|a| a.starts_with(name)) {
+        let given = |a: &String| {
+            a == name
+                || a.strip_prefix(name)
+                    .is_some_and(|value| value.starts_with('='))
+        };
+        if !argv.iter().any(given) {
             argv.push(flag.to_owned());
         }
     }
     let cli = Cli::<EthereumChainSpecParser, Ext>::try_parse_from(argv)?;
+    if let Commands::Node(node) = &cli.command
+        && node.rpc.rpc_state_cache.max_cached_tx_hashes != 0
+    {
+        eyre::bail!(
+            "--rpc-cache.max-cached-tx-hashes must be 0; the cache would serve txs from unwound blocks"
+        );
+    }
     // Parsed flags include reth's aliases and its `--dev` default. Without bootnodes,
     // reth dials mainnet's for a custom chain.
     if let Commands::Node(node) = &cli.command
@@ -312,12 +325,30 @@ mod tests {
             &["node", "-d"][..],
             &["node", "-d", "--disable-tx-gossip"],
             &["node", "-d", "--debug.startup-sync-state-idle"],
+            &["node", "-d", "--rpc-cache.max-cached-tx-hashes=0"],
+            &["node", "-d", "--rpc-cache.max-cached-tx-hashes", "0"],
         ] {
             let Commands::Node(node) = parse(argv).unwrap().command else {
                 panic!("not the node command");
             };
             assert!(node.network.disable_tx_gossip, "{argv:?}");
             assert!(node.debug.startup_sync_state_idle, "{argv:?}");
+            assert_eq!(node.rpc.rpc_state_cache.max_cached_tx_hashes, 0, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn cli_refuses_a_tx_hash_cache() {
+        for argv in [
+            &["node", "-d", "--rpc-cache.max-cached-tx-hashes=30000"][..],
+            &["node", "-d", "--rpc-cache.max-cached-tx-hashes", "30000"],
+        ] {
+            let err = parse(argv).unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("--rpc-cache.max-cached-tx-hashes must be 0"),
+                "{argv:?}: {err}"
+            );
         }
     }
 }

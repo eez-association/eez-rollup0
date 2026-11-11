@@ -379,8 +379,9 @@ impl HeldPool {
 
     /// Hold `hashes` for at least [`REFUSED_BLOCKS`] L2 blocks past `height`.
     ///
-    /// They are cross-chain txs in blocks a reorg is about to drop, which this
-    /// pool may release first or never have held. Expired ones go on the next call.
+    /// They are cross-chain txs in blocks a reorg drops, which this pool may
+    /// release before reth re-adds them, or never have held. Expired ones go on
+    /// the next call.
     pub fn refuse(&self, hashes: impl IntoIterator<Item = TxHash>, height: u64) {
         let mut state = self.state.lock().expect("held_pool mutex poisoned");
         state.refused.retain(|_, until| *until > height);
