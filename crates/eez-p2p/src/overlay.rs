@@ -22,7 +22,6 @@ use libp2p::{
     },
     tcp, yamux,
 };
-use sha2::{Digest, Sha256};
 use tokio::sync::{
     mpsc::{self, error::TrySendError},
     watch,
@@ -151,7 +150,7 @@ impl Overlay {
             // The sequencer signature is the authentication, so messages carry no author.
             .validation_mode(ValidationMode::Anonymous)
             .validate_messages()
-            .message_id_fn(|m| MessageId::from(Sha256::digest(&m.data).to_vec()))
+            .message_id_fn(|m| MessageId::new(&wire::message_id(m.topic.as_str(), &m.data)))
             .max_transmit_size(MAX_MESSAGE_SIZE + 64 * 1024)
             .build()?;
         let gossip = gossipsub::Behaviour::new_with_transform(
