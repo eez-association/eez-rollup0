@@ -133,6 +133,88 @@ mod tests {
         assert!(payload.is_empty());
     }
 
+    /// The test vector in `docs/sequencer-p2p-spec.md`; change both together.
+    #[test]
+    fn spec_vector() {
+        use alloy_primitives::{address, b256, hex};
+        use alloy_signer::SignerSync;
+        use alloy_signer_local::PrivateKeySigner;
+        use eez_seq_sig::HeadDomain;
+        use sha2::{Digest, Sha256};
+
+        let key: PrivateKeySigner =
+            "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+                .parse()
+                .unwrap();
+        let domain = HeadDomain {
+            l2_chain_id: 1337,
+            registry: address!("5FbDB2315678afecb367f032d93F642f64180aa3"),
+            rollup_id: 1,
+        };
+        let head = HeadClaim {
+            rollup_id: 1,
+            number: 7,
+            block_hash: B256::repeat_byte(0xbb),
+            parent_hash: B256::repeat_byte(0xaa),
+            epoch_ms: 1_700_000_000_000,
+            counter: 1,
+        };
+        assert_eq!(
+            key.address(),
+            address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
+        );
+        assert_eq!(
+            domain.eip712().separator(),
+            b256!("7bcd13c41deec50e6183399b45bf4a4676869087cef8d68623fe7ff72b7f8f9c")
+        );
+        let hash = head.signing_hash(&domain);
+        assert_eq!(
+            hash,
+            b256!("876ed57393bba41ad8986fcdf6d080462b817110409e235077e7d1544f83247e")
+        );
+        let signature = key.sign_hash_sync(&hash).unwrap().as_bytes();
+        assert_eq!(
+            signature,
+            hex!(
+                "5814195620ef379cdaf95e08a52978644c6b5457e238f204541021875ebebf3e"
+                "3e59167b938e5bff0d15a010c87b6f0d2523e7cf1e90960b03ac8e86dc0fa658"
+                "1b"
+            )
+        );
+        let data = encode(&Envelope {
+            head,
+            signature: Bytes::from(signature.to_vec()),
+            block: None,
+        })
+        .unwrap();
+        let rlp = snap::raw::Decoder::new().decompress_vec(&data).unwrap();
+        assert_eq!(
+            rlp,
+            hex!(
+                "f892f84c0107"
+                "a0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                "a0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                "86018bcfe5680001"
+                "b8415814195620ef379cdaf95e08a52978644c6b5457e238f204541021875ebebf3e"
+                "3e59167b938e5bff0d15a010c87b6f0d2523e7cf1e90960b03ac8e86dc0fa6581b"
+                "80"
+            )
+        );
+        assert_eq!(
+            data,
+            hex!(
+                "94011cf892f84c0107a0bb7a010004a0aa7a0100f04b86018bcfe5680001b841"
+                "5814195620ef379cdaf95e08a52978644c6b5457e238f204541021875ebebf3e"
+                "3e59167b938e5bff0d15a010c87b6f0d2523e7cf1e90960b03ac8e86dc0fa658"
+                "1b80"
+            )
+        );
+        assert_eq!(
+            Sha256::digest(&data).as_slice(),
+            hex!("65cd4ff00b3116504c276cbe89085cab1f24b74956fb5cd6f3a621b4f7fbac57")
+        );
+    }
+
     #[test]
     fn oversize_is_rejected() {
         let big = envelope(Some(Bytes::from(vec![0u8; MAX_MESSAGE_SIZE + 1])));
