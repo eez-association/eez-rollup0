@@ -16,23 +16,24 @@ It does not cover L1 derivation, settlement or the block format. Those are in
 The key words MUST, MUST NOT, SHOULD, SHOULD NOT and MAY are used as in
 RFC 2119. Byte strings are hex. RLP is Ethereum's recursive length prefix:
 integers are big-endian with no leading zeros, and zero is the empty string
-`0x80`. Decoding is strict, except for typed transactions inside a block
-([§4.1](#41-envelope)). Each of these is invalid:
+`0x80`. Decoding is strict. Each of these is invalid:
 - a non-canonical integer, such as one with leading zeros or `0x8105`;
 - a non-canonical length prefix;
 - an integer wider than its field;
 - a list with missing or extra elements.
 
 The reference implementation is eez-node ([Appendix B](#appendix-b-reference-implementation)).
-Where this spec describes what the reference accepts rather than what a
-sender produces, it says so. A client MUST accept the same inputs, so that
-nodes reach the same verdict on the same message. This matters because:
+
+Every part of a message has exactly one valid encoding, except its Snappy
+compression ([§4.2](#42-message)). A receiver MUST reject every other
+encoding, even when its library decodes it, so that all nodes reach the same
+verdict on the same message. This matters because:
 - nodes relay only the first copy of each claim ([§5](#5-validation));
 - the signature doesn't cover the message bytes, so any relay can re-encode
   a message.
 
-A client that rejects a copy the reference accepts can miss that head
-entirely.
+If one client accepted a copy that another rejects, a relay could send that
+copy first, and the stricter client would miss the head.
 
 ## 1. Model
 
@@ -125,24 +126,19 @@ one is valid on the other.
 ### 3.3 Signature encoding
 
 The signature is 65 bytes: `r ‖ s ‖ v`, with `r` and `s` as 32-byte
-big-endian integers.
+big-endian integers. Signers and receivers follow one rule:
+- the length is exactly 65 bytes;
+- `v` is 27 or 28, that is 27 + y-parity;
+- `r` and `s` are non-zero and below `n`, the secp256k1 group order, and
+  `s ≤ n/2`;
+- recovery from the signing hash succeeds. The signer is the recovered
+  address.
 
-A signer MUST produce `v ∈ {27, 28}` (27 + y-parity) and `s ≤ n/2`, where `n`
-is the secp256k1 group order.
-
-A receiver in v0 accepts exactly what the reference accepts:
-- the length MUST be exactly 65 bytes;
-- `v` MUST be one of:
-  - 0 or 1, giving parity `v`;
-  - 27 or 28, giving parity `v − 27`;
-  - 35 to 255, giving parity `(v − 35) mod 2`;
-- an `s` above `n/2` is accepted: the receiver replaces it with `n − s` and
-  flips the parity before recovery;
-- `r` and `s` MUST be valid non-zero scalars, and recovery MUST succeed;
-- the signer is the address recovered from the signing hash.
-
-A coming version restricts receivers to the signer rule (`v ∈ {27, 28}` and
-low `s`). Signers that follow the rule today stay valid.
+A receiver MUST reject any other signature, even where its library accepts
+it. That includes other encodings of a valid signature:
+- `v` as 0 or 1;
+- `v` as an EIP-155 value;
+- the high `s` value `n − s` with the parity flipped.
 
 ### 3.4 Versions and sources
 
@@ -180,19 +176,15 @@ head     = [rollupId, number, blockHash, parentHash, epochMs, counter]
   `withdrawalsRoot`. Receivers MUST accept both forms. As in Ethereum block
   bodies:
   - a legacy transaction is an RLP list;
-  - a typed transaction, `0x76` included, is an RLP string holding
-    `type ‖ payload`. Senders MUST wrap it this way with the exact length.
-    Receivers MUST also accept the forms the reference accepts:
-    - the bare `type ‖ payload` bytes, with no wrapper;
-    - a wrapper whose declared length differs from the transaction's, as
-      long as at least that many bytes remain in the transactions list. The
-      wrapper's header must still be canonical, so `0x81` before the type
-      byte is invalid.
+  - a typed transaction, `0x76` included, is an RLP string holding exactly
+    `type ‖ payload`.
 
-    The reference reads the string header, then decodes the transaction from
-    the type byte, ignoring the declared length (alloy keeps this for
-    backwards compatibility). The transactions root is computed from the
-    decoded transactions, so such a copy has the same header hash.
+  The block MUST be in canonical form. A receiver re-encodes the block it
+  decoded, and rejects it if the bytes differ. Some decoders accept other
+  forms, such as a typed transaction with no string wrapper, or with a wrong
+  declared length; alloy does, for backwards compatibility. The transactions
+  root is computed from the decoded transactions, so such a block has the
+  same hash as the canonical one. Only this rule rejects it.
 
   The header is checked only for shape here, not against the L2 fork
   schedule, which its genesis sets:
@@ -229,13 +221,12 @@ block format, not the framed format.
 - Snappy allows many encodings of one input. A receiver MUST accept any valid
   encoding. Different encoders produce different bytes and so different
   message ids ([§6.3](#63-gossipsub)).
-- The preamble is a little-endian base-128 varint.
-  - Senders MUST write it minimally.
-  - The reference reads up to 10 bytes and accepts redundant continuation
-    bytes. It silently drops bits above 64. The value must then be at most
-    `MAX_MESSAGE_SIZE`, and equal the decompressed length.
-  - Receivers MUST accept the same, though some Snappy libraries reject a
-    preamble longer than 5 bytes.
+- The preamble is the uncompressed length as a little-endian base-128
+  varint, in its minimal form: when it has more than one byte, the last one
+  is non-zero. A receiver MUST reject any other preamble. Under the size cap,
+  a valid preamble is at most 4 bytes.
+  - Some Snappy libraries accept a padded preamble. A receiver that uses one
+    MUST check the preamble itself.
 
 A signer SHOULD attach the block. The reference always attaches it, rewinds
 included. A receiver MUST accept an envelope without one.
@@ -250,7 +241,7 @@ decides the verdict.
 3. **Signer:** recover the signer ([§3.3](#33-signature-encoding)). It MUST be
    `SEQUENCER`. A malformed signature or the wrong signer: Reject.
 4. **Block**, when present:
-   - it decodes as one EEZ block with no trailing bytes
+   - it decodes as one EEZ block in canonical form, with no trailing bytes
      ([§4.1](#41-envelope)). An unknown transaction type or a malformed
      transaction fails;
    - its body matches its header:
@@ -278,9 +269,8 @@ A node remembers at most `MAX_SOURCES` sources. When a new source would
 exceed that, the node evicts the source with the lowest `(epochMs, signer)`.
 If that is the new source itself, the verdict is Ignore.
 
-Duplicates are detected by claim, not by bytes. A re-encoded copy of a seen
-head is therefore ignored. So is a copy whose signature has another accepted
-encoding.
+Duplicates are detected by claim, not by bytes. A copy of a seen head under
+another Snappy encoding is therefore ignored.
 
 - `now_ms` is the local wall clock.
 - A source's latest head is kept in memory only. After a restart, the first
@@ -318,15 +308,13 @@ can't be dialed from discovery.
 - Messages are anonymous, and the sequencer signature is the only
   authentication:
   - publishers MUST omit `from`, `seqno`, `signature` and `key`;
-  - receivers MUST reject a message that carries `from`, `seqno` or
-    `signature`. A field that is present but zero-length counts as carried;
-  - such a rejected message MUST NOT enter the seen-message cache, so it
-    can't suppress a clean copy with the same id;
-  - the reference accepts, and relays, a message that carries only `key`.
-    Ethereum consensus's `StrictNoSign` would reject it.
-
-  A receiver MUST NOT reject on `key` alone. The message id ignores `key`, so
-  a rejected keyed copy would share its id with the honest message.
+  - receivers MUST reject a message that carries any of them, as Ethereum
+    consensus's `StrictNoSign` does. A field that is present but zero-length
+    counts as carried;
+  - the message id ignores these fields, so a rejected copy shares its id
+    with the clean message. A receiver MUST reject it before it counts the
+    id as seen or sends `IDONTWANT` for it. Otherwise the rejected copy holds
+    back the clean one.
 - The message id is `SHA-256(data)`, the full 32 bytes, computed over the
   compressed message.
   - This differs from Ethereum consensus, which hashes a domain plus the
@@ -547,11 +535,11 @@ would close this; it is under discussion.
     so re-encodings of a seen head don't spread.
 
   v0 has no peer scoring.
-- **Malleability:** v0 receivers accept several encodings of one signature
-  ([§3.3](#33-signature-encoding)), and of a block's typed transactions
-  ([§4.1](#41-envelope)). Any relay can produce them, since the signature
-  doesn't cover the message bytes. Each is a duplicate of the same claim. A
-  coming version rejects the extra signature encodings.
+- **Malleability:** the signature doesn't cover the message bytes, so any
+  relay can re-compress a message. The copy is a duplicate of the same claim.
+  Everything else has one valid encoding ([§3.3](#33-signature-encoding),
+  [§4.1](#41-envelope), [§4.2](#42-message)), and messages carrying
+  gossipsub's author fields are rejected ([§6.3](#63-gossipsub)).
 - **Withholding:** with no usable head, a follower still follows L1. Safe
   keeps advancing.
 
@@ -559,7 +547,6 @@ would close this; it is under discussion.
 
 The topic suffix `/0` and the EIP-712 `version` change together on any
 incompatible change. Planned changes include:
-- the strict signature rule ([§3.3](#33-signature-encoding));
 - the signer set read from L1;
 - peer scoring;
 - multisig signers.

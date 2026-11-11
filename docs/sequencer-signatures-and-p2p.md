@@ -165,8 +165,6 @@ Peers mode follows the spec's joining procedure. Code is in
   `finalized` must mean for bridges.
 - **Blob DA**, when it comes, needs a beacon endpoint for the window.
 - **Old history's DA isn't re-checked:** v0 trusts L1 settlements.
-- **The receiver accepts several signature encodings** (spec §3.3). A strict
-  rule is coming.
 
 ## Decisions
 
@@ -198,6 +196,8 @@ Peers mode follows the spec's joining procedure. Code is in
   composers follows L1 facts, not timers.
 - Anonymous gossipsub, with the sequencer signature as the only
   authentication; Reject without peer penalties until peer scoring lands.
+  Anonymous mode doesn't reject `key`, so a data transform (`NoKey`) does,
+  before gossipsub marks the message id seen.
 - The reth node key is the overlay identity.
 - The unsafe tail uses the follower's own fetcher, not reth's sync. reth
   checks safe only after it canonicalizes a synced head.
