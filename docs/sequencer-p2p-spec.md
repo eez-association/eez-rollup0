@@ -25,7 +25,8 @@ integers are big-endian with no leading zeros, and zero is the empty string
 The reference implementation is eez-node ([Appendix B](#appendix-b-reference-implementation)).
 
 Every part of a message has exactly one valid encoding, except its Snappy
-compression ([§4.2](#42-message)). A receiver MUST reject every other
+compression ([§4.2](#42-message)), and every Snappy encoding of a message has
+the same message id ([§6.3](#63-gossipsub)). A receiver MUST reject every other
 encoding, even when its library decodes it, so that all nodes reach the same
 verdict on the same message. This matters because:
 - nodes relay only the first copy of each claim ([§5](#5-validation));
@@ -219,8 +220,8 @@ block format, not the framed format.
   accepts a compressed message slightly over `MAX_MESSAGE_SIZE`.
 - A receiver MUST reject trailing bytes after the envelope.
 - Snappy allows many encodings of one input. A receiver MUST accept any valid
-  encoding. Different encoders produce different bytes and so different
-  message ids ([§6.3](#63-gossipsub)).
+  encoding. The message id is computed over the decompressed bytes, so every
+  encoding of one envelope has the same id ([§6.3](#63-gossipsub)).
 - The preamble is the uncompressed length as a little-endian base-128
   varint, in its minimal form: when it has more than one byte, the last one
   is non-zero. A receiver MUST reject any other preamble. Under the size cap,
@@ -269,8 +270,8 @@ A node remembers at most `MAX_SOURCES` sources. When a new source would
 exceed that, the node evicts the source with the lowest `(epochMs, signer)`.
 If that is the new source itself, the verdict is Ignore.
 
-Duplicates are detected by claim, not by bytes. A copy of a seen head under
-another Snappy encoding is therefore ignored.
+Duplicates are detected by claim, not by bytes. A copy of a seen head with a
+different envelope, such as one without its block, is therefore ignored.
 
 - `now_ms` is the local wall clock.
 - A source's latest head is kept in memory only. After a restart, the first
@@ -315,13 +316,18 @@ can't be dialed from discovery.
     with the clean message. A receiver MUST reject it before it counts the
     id as seen or sends `IDONTWANT` for it. Otherwise the rejected copy holds
     back the clean one.
-- The message id is `SHA-256(data)`, the full 32 bytes, computed over the
-  compressed message.
-  - This differs from Ethereum consensus, which hashes a domain plus the
-    decompressed bytes and keeps 20 bytes.
-  - Two encoders can give one head two ids, so `IHAVE`, `IWANT` and
-    `IDONTWANT` may carry it twice. [§5](#5-validation) still ignores the
-    second copy.
+- The message id is the one Ethereum consensus has used since Altair. It is
+  20 bytes:
+  - when `data` passes the Snappy checks of [§4.2](#42-message) (a minimal
+    preamble, within `MAX_MESSAGE_SIZE`, and a body that decompresses):
+    `SHA-256(0x01000000 ‖ len ‖ TOPIC ‖ snappy_decompress(data))[:20]`;
+  - otherwise: `SHA-256(0x00000000 ‖ len ‖ TOPIC ‖ data)[:20]`. The message
+    is then rejected;
+  - `len` is the byte length of `TOPIC` as a little-endian `uint64`.
+
+  Every Snappy encoding of one envelope has the same id, so gossipsub drops
+  a re-compressed copy as a duplicate. Copies that share an id have the same
+  decompressed bytes and therefore get the same verdict.
 - A node MUST validate a message ([§5](#5-validation)) before forwarding it,
   and report the verdict: Accept forwards, Ignore and Reject don't. v0 doesn't
   score peers, so Reject only stops the message.
@@ -531,12 +537,14 @@ would close this; it is under discussion.
 - **Flooding:**
   - sizes are capped before decompression;
   - messages are validated before they are relayed;
-  - a node relays only the first copy of each claim, whatever its encoding,
-    so re-encodings of a seen head don't spread.
+  - gossipsub drops re-compressed copies as duplicates, and
+    [§5](#5-validation) ignores any other copy of a seen claim, so copies of
+    a seen head don't spread.
 
   v0 has no peer scoring.
 - **Malleability:** the signature doesn't cover the message bytes, so any
-  relay can re-compress a message. The copy is a duplicate of the same claim.
+  relay can re-compress a message. The copy has the same message id, so
+  gossipsub drops it as a duplicate.
   Everything else has one valid encoding ([§3.3](#33-signature-encoding),
   [§4.1](#41-envelope), [§4.2](#42-message)), and messages carrying
   gossipsub's author fields are rejected ([§6.3](#63-gossipsub)).
@@ -570,6 +578,7 @@ Outputs:
 |---|---|
 | domain separator | `0x7bcd13c41deec50e6183399b45bf4a4676869087cef8d68623fe7ff72b7f8f9c` |
 | signing hash | `0x876ed57393bba41ad8986fcdf6d080462b817110409e235077e7d1544f83247e` |
+| `TOPIC` | `/eez/1337/1/heads/0` (19 bytes) |
 
 Signature (RFC 6979):
 
@@ -601,8 +610,8 @@ Message, as Snappy-compressed by the reference (one valid encoding):
 1b80
 ```
 
-Its message id is
-`65cd4ff00b3116504c276cbe89085cab1f24b74956fb5cd6f3a621b4f7fbac57`.
+Its message id, which every valid encoding of the envelope shares, is
+`6250c5aba00e64adabb092b22cd646288363e2d4`.
 
 The test `spec_vector` in `crates/eez-p2p/src/wire.rs` pins these values.
 

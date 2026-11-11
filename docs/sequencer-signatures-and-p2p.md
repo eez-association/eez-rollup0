@@ -198,6 +198,10 @@ Peers mode follows the spec's joining procedure. Code is in
   authentication; Reject without peer penalties until peer scoring lands.
   Anonymous mode doesn't reject `key`, so a data transform (`NoKey`) does,
   before gossipsub marks the message id seen.
+- Ethereum consensus's message id, so other clients can reuse their code and
+  a re-compressed copy is a duplicate. rust-libp2p computes the id before its
+  duplicate check, so every received copy is decompressed for its id, and the
+  first one again for validation.
 - The reth node key is the overlay identity.
 - The unsafe tail uses the follower's own fetcher, not reth's sync. reth
   checks safe only after it canonicalizes a synced head.
