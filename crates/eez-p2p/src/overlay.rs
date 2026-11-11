@@ -1,5 +1,5 @@
 use std::{
-    env, fmt,
+    env, fmt, io,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -10,8 +10,8 @@ use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder,
     connection_limits::{self, ConnectionLimits},
     gossipsub::{
-        self, IdentTopic, MessageAcceptance, MessageAuthenticity, MessageId, PublishError,
-        ValidationMode,
+        self, DataTransform, IdentTopic, IdentityTransform, MessageAcceptance, MessageAuthenticity,
+        MessageId, PublishError, RawMessage, TopicHash, ValidationMode,
     },
     identity::Keypair,
     multiaddr::Protocol,
@@ -93,8 +93,27 @@ pub type Discover = Box<dyn Fn() -> Vec<Multiaddr> + Send>;
 /// Gossipsub, plus a cap on inbound connections.
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    gossip: gossipsub::Behaviour,
+    gossip: gossipsub::Behaviour<NoKey>,
     limits: connection_limits::Behaviour,
+}
+
+/// Rejects a message that carries `key`, as anonymous mode already rejects `from`,
+/// `seqno` and `signature`. The transform runs before gossipsub marks the message id
+/// seen or sends IDONTWANT for it, so a keyed copy can't hold back the clean one.
+#[derive(Clone, Copy, Debug, Default)]
+struct NoKey;
+
+impl DataTransform for NoKey {
+    fn inbound_transform(&self, raw: RawMessage) -> io::Result<gossipsub::Message> {
+        if raw.key.is_some() {
+            return Err(io::Error::other("message carries a key"));
+        }
+        IdentityTransform.inbound_transform(raw)
+    }
+
+    fn outbound_transform(&self, topic: &TopicHash, data: Vec<u8>) -> io::Result<Vec<u8>> {
+        IdentityTransform.outbound_transform(topic, data)
+    }
 }
 
 /// Gossipsub swarm that validates every head before relaying it.
@@ -135,8 +154,12 @@ impl Overlay {
             .message_id_fn(|m| MessageId::from(Sha256::digest(&m.data).to_vec()))
             .max_transmit_size(MAX_MESSAGE_SIZE + 64 * 1024)
             .build()?;
-        let gossip = gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossip_config)
-            .map_err(|e| eyre!("gossipsub: {e}"))?;
+        let gossip = gossipsub::Behaviour::new_with_transform(
+            MessageAuthenticity::Anonymous,
+            gossip_config,
+            NoKey,
+        )
+        .map_err(|e| eyre!("gossipsub: {e}"))?;
         let limits = connection_limits::Behaviour::new(
             ConnectionLimits::default()
                 .with_max_established_incoming(Some(MAX_INBOUND_PEERS))
@@ -496,6 +519,22 @@ mod tests {
             err.to_string().contains("DNS multiaddrs are not supported"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn keyed_message_is_rejected() {
+        let raw = |key| RawMessage {
+            source: None,
+            data: vec![1],
+            sequence_number: None,
+            topic: TopicHash::from_raw("t"),
+            signature: None,
+            key,
+            validated: false,
+        };
+        assert!(NoKey.inbound_transform(raw(None)).is_ok());
+        assert!(NoKey.inbound_transform(raw(Some(vec![]))).is_err());
+        assert!(NoKey.inbound_transform(raw(Some(vec![1]))).is_err());
     }
 
     #[test]

@@ -5,6 +5,10 @@ use eez_seq_sig::{Envelope, HeadClaim};
 /// Cap on the uncompressed message, checked before allocating.
 pub const MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
+/// Bytes of the Snappy length preamble; four 7-bit groups hold any length up to the cap.
+const MAX_PREAMBLE_LEN: usize = 4;
+const _: () = assert!(MAX_MESSAGE_SIZE < 1 << (7 * MAX_PREAMBLE_LEN));
+
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
     #[error("message of {0} bytes exceeds the cap")]
@@ -64,10 +68,7 @@ pub fn encode(envelope: &Envelope) -> Result<Vec<u8>, WireError> {
 
 /// Inverse of [`encode`]; never panics on malformed input.
 pub fn decode(data: &[u8]) -> Result<Envelope, WireError> {
-    let len = snap::raw::decompress_len(data).map_err(|e| WireError::Snappy(e.to_string()))?;
-    if len > MAX_MESSAGE_SIZE {
-        return Err(WireError::TooLarge(len));
-    }
+    uncompressed_len(data)?;
     let rlp = snap::raw::Decoder::new()
         .decompress_vec(data)
         .map_err(|e| WireError::Snappy(e.to_string()))?;
@@ -88,6 +89,27 @@ pub fn decode(data: &[u8]) -> Result<Envelope, WireError> {
         signature: w.signature,
         block: (!w.block.is_empty()).then_some(w.block),
     })
+}
+
+/// The uncompressed length from the Snappy preamble, a little-endian base-128 varint.
+/// Only its minimal encoding is accepted; snap alone also takes padded ones.
+fn uncompressed_len(data: &[u8]) -> Result<usize, WireError> {
+    let mut len = 0;
+    for (i, &byte) in data.iter().take(MAX_PREAMBLE_LEN).enumerate() {
+        len |= usize::from(byte & 0x7f) << (7 * i);
+        if byte & 0x80 == 0 {
+            if i > 0 && byte == 0 {
+                return Err(WireError::Snappy("non-minimal length preamble".into()));
+            }
+            if len > MAX_MESSAGE_SIZE {
+                return Err(WireError::TooLarge(len));
+            }
+            return Ok(len);
+        }
+    }
+    Err(WireError::Snappy(
+        "truncated or oversized length preamble".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -213,6 +235,22 @@ mod tests {
             Sha256::digest(&data).as_slice(),
             hex!("65cd4ff00b3116504c276cbe89085cab1f24b74956fb5cd6f3a621b4f7fbac57")
         );
+    }
+
+    #[test]
+    fn padded_preamble_is_rejected() {
+        let data = encode(&envelope(None)).unwrap();
+        // A zero continuation byte pads the varint without changing its value.
+        let end = data.iter().position(|b| b & 0x80 == 0).unwrap() + 1;
+        let mut padded = data[..end].to_vec();
+        padded[end - 1] |= 0x80;
+        padded.push(0);
+        padded.extend_from_slice(&data[end..]);
+        assert!(snap::raw::Decoder::new().decompress_vec(&padded).is_ok());
+        assert!(matches!(decode(&padded), Err(WireError::Snappy(_))));
+        for truncated in [&[][..], &[0x94], &[0xff; 4]] {
+            assert!(matches!(decode(truncated), Err(WireError::Snappy(_))));
+        }
     }
 
     #[test]
