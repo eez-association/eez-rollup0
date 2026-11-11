@@ -88,8 +88,19 @@ send_front() { # <front_url> <raw_tx> <expected_hash> — eth_sendRawTransaction
     # out; any other error — or a changed hash — is fatal (invariant 7 is LOUD).
     local front="$1" raw="$2" expected="$3" resp rc returned i
     for ((i = 0; i < 120; i++)); do
-        resp=$(curl -sS --max-time 10 -X POST "$front" -H 'Content-Type: application/json' \
-            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}" 2>/dev/null); rc=$?
+        # `if`, not a bare `resp=$(...)`: under `set -e` a failed curl would end
+        # the script before the message below.
+        if resp=$(curl -sS --max-time 10 -X POST "$front" -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":1}" 2>/dev/null); then
+            rc=0
+        else
+            rc=$?
+        fi
+        # Refused (7), empty reply (52) or reset (56): the front isn't up yet.
+        if (( rc == 7 || rc == 52 || rc == 56 )); then
+            sleep 1
+            continue
+        fi
         # Empty body = no answer. Without this the checks below miss and a tx
         # that was NEVER SENT reports success.
         (( rc == 0 )) && [[ -n "$resp" ]] \
@@ -105,7 +116,7 @@ send_front() { # <front_url> <raw_tx> <expected_hash> — eth_sendRawTransaction
             || { echo "    ✗ front changed the submitted transaction: $resp" >&2; return 1; }
         return 0
     done
-    echo "    ✗ front still starting up after 120s" >&2
+    echo "    ✗ front still starting up after 120s (last curl rc=$rc)" >&2
     return 1
 }
 
