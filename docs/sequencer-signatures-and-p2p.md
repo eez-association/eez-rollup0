@@ -64,7 +64,10 @@ Startup rules:
     watch.
 
   A head replaced before its block is readable is skipped, and so is every
-  intermediate head the signer never read.
+  intermediate head the signer never read. Some heads also stay unsigned
+  until the head changes again: a head whose block stays unreadable for 1 s,
+  or whose read or signing fails, is logged and not retried. That falls short
+  of the spec's "sign every change".
 - **The overlay** publishes from that store. The signer starts only after boot
   ([Boot](#boot)), so a syncing composer never signs stale heads under its new
   epoch.
@@ -73,7 +76,9 @@ Startup rules:
 
 - **The overlay** validates each message and reports the verdict to gossipsub
   before forwarding. Accepted heads reach the follower through a bounded
-  channel with `try_send`; when it is full, the head is dropped with a WARN.
+  channel with `try_send`. When the channel is full, the head is dropped with a
+  WARN and not retried. The overlay has already recorded the head, so it
+  ignores later copies. The follower catches up on the next newer head.
   Rejects are summarised in one WARN per 5 s dial tick
   (`eez.p2p.message.rejects`).
 - **The head follower** (`eez-follower/src/unsafe_head.rs`) runs the spec's
@@ -124,7 +129,9 @@ Peers mode follows the spec's joining procedure. Code is in
   block.
   - It fails with "L1 history incomplete" when L1 no longer serves a block it
     needs.
-  - Once its scan passes `F`, the local chain must hold `H_F`.
+  - Once its scan passes `F`, the local chain must hold `H_F`. If the first
+    read of `F` fails transiently, boot logs
+    `eez.node.sync.history_check_skipped` and skips this check.
   - A restart from the checkpoint keeps reth's finalized block, capped at the
     checkpoint's L2 block.
 - **Composers then drop their unsettled tail** (`drop_unsettled_tail`):

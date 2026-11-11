@@ -109,8 +109,11 @@ SignedHead(uint64 rollupId,uint64 number,bytes32 blockHash,bytes32 parentHash,ui
 - The signing hash is
   `keccak256(0x1901 ‖ domainSeparator ‖ hashStruct(SignedHead))`.
 
-`REGISTRY` in the domain keeps two deployments that share an L2 chain id
-apart.
+`REGISTRY` in the domain separates two deployments on one L1 that share an
+L2 chain id. The domain doesn't name the L1 chain, though. Deployments on
+different L1s with the same `L2_CHAIN_ID`, `REGISTRY` and `ROLLUP_ID` share a
+domain and a topic. They MUST NOT share a sequencer key, or a head signed for
+one is valid on the other.
 
 ### 3.3 Signature encoding
 
@@ -165,8 +168,10 @@ head     = [rollupId, number, blockHash, parentHash, epochMs, counter]
 - `signature` is a byte string (65 bytes; see [§3.3](#33-signature-encoding)).
 - `block` is a byte string. When present, it holds the block's consensus
   encoding, wrapped once more as an RLP string. The empty string means no
-  block. The encoding is `rlp([header, transactions, ommers, withdrawals])`,
-  as in Ethereum block bodies:
+  block. The encoding is `rlp([header, transactions, ommers])`, plus
+  `withdrawals` as a fourth element exactly when the header has a
+  `withdrawalsRoot`. Receivers MUST accept both forms. As in Ethereum block
+  bodies:
   - a legacy transaction is an RLP list;
   - a typed transaction, `0x76` included, is an RLP string holding
     `type ‖ payload`.
