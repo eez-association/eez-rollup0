@@ -79,6 +79,7 @@ impl HeadTracker {
 mod tests {
     use super::*;
     use crate::HeadClaim;
+    use reth_primitives_traits::SealedBlock;
 
     fn head(epoch_ms: u64, counter: u64, hash: u8) -> VerifiedHead {
         VerifiedHead {
@@ -91,7 +92,7 @@ mod tests {
                 counter,
             },
             signer: Address::repeat_byte(1),
-            block: None,
+            block: SealedBlock::seal_slow(eez_primitives::Block::default()),
         }
     }
 

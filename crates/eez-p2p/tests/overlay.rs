@@ -42,12 +42,16 @@ fn heads(signer: u8, every: Duration, count: u64) -> watch::Receiver<Option<Enve
     let mut signer = HeadSigner::new(key(signer), DOMAIN, now_ms());
     tokio::spawn(async move {
         for number in 1..=count {
-            let header = SealedHeader::seal_slow(Header {
-                number,
-                ..Default::default()
-            });
-            // An empty block goes over the wire as none: a bare signed head.
-            let head = signer.sign(&header, Bytes::new()).unwrap();
+            let block = eez_primitives::Block {
+                header: Header {
+                    number,
+                    ..Default::default()
+                },
+                body: Default::default(),
+            };
+            let header = SealedHeader::seal_slow(block.header.clone());
+            let rlp = Bytes::from(alloy_rlp::encode(&block));
+            let head = signer.sign(&header, rlp).unwrap();
             if tx.send(Some(head)).is_err() {
                 return;
             }
