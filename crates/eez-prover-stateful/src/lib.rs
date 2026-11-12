@@ -11,7 +11,7 @@ pub use config::Config;
 use std::sync::Arc;
 
 use eez_driver::BlockCommitterHandle;
-use eez_primitives::engine::EezEngineTypes;
+use eez_engine::EezEngineTypes;
 use eez_proof_signer::ServerConfig;
 use reth_chainspec::ChainSpec;
 use reth_storage_api::{BlockHashReader, BlockNumReader, HeaderProvider, StateProviderFactory};

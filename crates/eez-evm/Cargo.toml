@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-eez-primitives.workspace = true
+eez-primitives = { workspace = true, features = ["revm"] }
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-genesis.workspace = true
@@ -20,6 +20,9 @@ reth-primitives-traits.workspace = true
 reth-storage-errors.workspace = true
 revm.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+eez-engine.workspace = true
 
 [lints]
 workspace = true

@@ -218,9 +218,9 @@ fn main() {
     println!();
     println!("######## FULL TX DECODE (block-major) ########");
     use alloy_consensus::Transaction as _;
+    use alloy_consensus::transaction::SignerRecoverable as _;
     use alloy_eips::eip2718::Decodable2718 as _;
     use eez_primitives::EezTxEnvelope as TransactionSigned;
-    use reth_primitives_traits::SignerRecoverable as _;
     let from_block = 501u64;
     // map flat tx index -> L2 block
     let mut flat_to_block: Vec<u64> = Vec::new();

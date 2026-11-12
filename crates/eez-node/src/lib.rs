@@ -25,6 +25,7 @@ use eez_driver::{
     BlockCommitterHandle, DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, RollupTiming,
     Sequencer, SyncSlotComposerHandle, spawn_l1_anchored,
 };
+use eez_engine::EezEngineTypes;
 use eez_l1::{
     L1CanonicalHead, L1HeadStream, L1Watcher, L1WatcherConfig, Submitter, SubmitterConfig,
 };
@@ -33,7 +34,6 @@ use eez_node_common::{
     L2NodeBuilder, NoRoleArgs, boot, node_cli, sync_mode_from_env, wait_for_idle_engine,
     wait_for_l1_ready, warn_on_deprecated_env,
 };
-use eez_primitives::engine::EezEngineTypes;
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_network::{NetworkInfo as _, PeersInfo as _};
 use reth_node_ethereum::EthereumNode;

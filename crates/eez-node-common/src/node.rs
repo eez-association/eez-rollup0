@@ -7,8 +7,9 @@
 
 use crate::{EezNetworkBuilder, EezPayloadBuilder, EezPoolBuilder, HeldTxs};
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes};
+use eez_engine::EezEngineTypes;
 use eez_evm::EezEvmConfig;
-use eez_primitives::{Block, EezPrimitives, EezTxEnvelope, engine::EezEngineTypes};
+use eez_primitives::{Block, EezPrimitives, EezTxEnvelope};
 use reth_chainspec::ChainSpec;
 use reth_engine_primitives::{EngineApiValidator, PayloadValidator};
 use reth_ethereum_consensus::EthBeaconConsensus;
