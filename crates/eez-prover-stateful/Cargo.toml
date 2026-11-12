@@ -29,7 +29,6 @@ reth-revm.workspace = true
 reth-storage-api.workspace = true
 reth-payload-primitives.workspace = true
 revm.workspace = true
-stateless-reth.workspace = true
 
 async-trait.workspace = true
 eyre.workspace = true

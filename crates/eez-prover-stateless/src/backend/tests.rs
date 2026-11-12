@@ -6,7 +6,7 @@ use alloy_primitives::{B256, Bytes, Log, Signature, U256, b256};
 use alloy_sol_types::SolEvent as _;
 use eez_primitives::{EezTxEnvelope as TransactionSigned, Receipt as EthereumReceipt};
 use eez_proof_signer::EEZL2_ADDRESS;
-use eez_proof_signer::validate::{CheckpointAt, DecodedOutboundEvent, OutboundEventObservation};
+use eez_proof_signer::validate::{DecodedOutboundEvent, OutboundEventObservation};
 use eez_proof_signer::window::testing::admitted_block_with_witness;
 use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
 use reth_primitives_traits::SignerRecoverable as _;
@@ -1108,4 +1108,58 @@ fn corrupt_witness_data_is_rejected_by_stateless() {
         Backend::new(fixture_chain_config(), TEST_SYSTEM_ADDRESS).validate(vec![input]),
         Err(ValidationError::Rejected(_))
     ));
+}
+
+// The signer library (used by the stateful backend) and the stateless fork
+// each carry `candidate_block_hash`; both backends must seal identical
+// candidates.
+#[test]
+fn candidate_block_hash_matches_the_stateless_fork() {
+    use eez_primitives::EezPrimitives;
+    use eez_proof_signer::validate::support::candidate_block_hash;
+    use reth_primitives_traits::SealedHeader;
+
+    let (admitted, _) = checkpoint_fixture();
+    let block = alloy_rlp::decode_exact::<Block>(admitted.rlp()).unwrap();
+    let transactions = &block.body.transactions;
+    assert!(!transactions.is_empty());
+    let receipts = (0..transactions.len())
+        .map(|index| EthereumReceipt {
+            success: index % 2 == 0,
+            cumulative_gas_used: 21_000 * (index as u64 + 1),
+            logs: vec![outbound_log(
+                EEZL2_ADDRESS,
+                B256::with_last_byte(index as u8),
+            )],
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let settling = SealedHeader::seal_slow(block.header.clone());
+    for prefix in 0..=transactions.len() {
+        let state_root = B256::with_last_byte(prefix as u8);
+        let ours = candidate_block_hash::<EezPrimitives>(
+            &settling,
+            &transactions[..prefix],
+            &receipts[..prefix],
+            state_root,
+        )
+        .unwrap();
+        let fork = stateless_reth::candidate_block_hash::<EezPrimitives>(
+            &settling,
+            &transactions[..prefix],
+            &receipts[..prefix],
+            state_root,
+        )
+        .unwrap();
+        assert_eq!(ours, fork, "prefix {prefix}");
+    }
+
+    let mut header = block.header;
+    header.block_access_list_hash = Some(B256::ZERO);
+    let settling = SealedHeader::seal_slow(header);
+    assert!(candidate_block_hash::<EezPrimitives>(&settling, &[], &[], B256::ZERO).is_err());
+    assert!(
+        stateless_reth::candidate_block_hash::<EezPrimitives>(&settling, &[], &[], B256::ZERO)
+            .is_err()
+    );
 }

@@ -22,8 +22,8 @@ use eez_proof_signer::validate::support::{
     observe_outbound_events, system_sender_flags,
 };
 use eez_proof_signer::validate::{
-    AdmittedBlock, BackendBlockOutput, BackendWindowOutput, BlockAnchor, SettlementBlockEvidence,
-    StateCheckpoint, ValidatedBlock, ValidationBackend, ValidationError,
+    AdmittedBlock, BackendBlockOutput, BackendWindowOutput, BlockAnchor, CheckpointAt,
+    SettlementBlockEvidence, StateCheckpoint, ValidatedBlock, ValidationBackend, ValidationError,
 };
 #[cfg(test)]
 use eez_proof_signer::window::testing::admitted_block_parts_mut;
@@ -38,6 +38,22 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, trace};
 
 mod chain_config;
+
+// The signer library names its own `CheckpointAt` so it stays free of the
+// stateless fork; these map it at the backend boundary.
+const fn to_stateless_checkpoint(at: CheckpointAt) -> stateless_reth::CheckpointAt {
+    match at {
+        CheckpointAt::PreExecution => stateless_reth::CheckpointAt::PreExecution,
+        CheckpointAt::Transaction(index) => stateless_reth::CheckpointAt::Transaction(index),
+    }
+}
+
+const fn from_stateless_checkpoint(at: stateless_reth::CheckpointAt) -> CheckpointAt {
+    match at {
+        stateless_reth::CheckpointAt::PreExecution => CheckpointAt::PreExecution,
+        stateless_reth::CheckpointAt::Transaction(index) => CheckpointAt::Transaction(index),
+    }
+}
 
 use chain_config::{ChainDocumentKind, load_chain_document};
 
@@ -205,7 +221,8 @@ impl Backend {
         let mut prepared_settling_block = blocks
             .last()
             .map(|admitted| {
-                let recovered_block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
+                let recovered_block =
+                    decode_match_and_recover_signers(admitted, &*self.chain_spec)?;
                 let (checkpoint_plan, system_sender_flags) =
                     CheckpointPlan::for_block(&recovered_block, expected_l2_system_address);
                 Ok(PreparedSettlingBlock {
@@ -220,25 +237,25 @@ impl Backend {
             check_cancellation(cancellation, index, total_blocks)?;
             let block_started = Instant::now();
             let block_ordinal = index + 1;
-            let (recovered_block, checkpoint_plan, system_sender_flags) = if block_ordinal
-                == total_blocks
-            {
-                let prepared = prepared_settling_block.take().ok_or_else(|| {
-                    ValidationError::InternalInvariant(
-                        "prepared settling block unexpectedly missing".to_owned(),
+            let (recovered_block, checkpoint_plan, system_sender_flags) =
+                if block_ordinal == total_blocks {
+                    let prepared = prepared_settling_block.take().ok_or_else(|| {
+                        ValidationError::InternalInvariant(
+                            "prepared settling block unexpectedly missing".to_owned(),
+                        )
+                    })?;
+                    (
+                        prepared.block,
+                        Some(prepared.checkpoint_plan),
+                        prepared.system_sender_flags,
                     )
-                })?;
-                (
-                    prepared.block,
-                    Some(prepared.checkpoint_plan),
-                    prepared.system_sender_flags,
-                )
-            } else {
-                let recovered_block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
-                let system_sender_flags =
-                    system_sender_flags(&recovered_block, expected_l2_system_address);
-                (recovered_block, None, system_sender_flags)
-            };
+                } else {
+                    let recovered_block =
+                        decode_match_and_recover_signers(admitted, &*self.chain_spec)?;
+                    let system_sender_flags =
+                        system_sender_flags(&recovered_block, expected_l2_system_address);
+                    (recovered_block, None, system_sender_flags)
+                };
             let block_number = recovered_block.header().number;
             let timestamp = recovered_block.header().timestamp;
             let transaction_count = recovered_block.body().transactions.len();
@@ -258,12 +275,17 @@ impl Backend {
             let witness = std::mem::take(witness);
             let (stateless_output, transaction_state_checkpoints) = match checkpoint_plan {
                 Some(plan) if !plan.positions().is_empty() => {
+                    let positions = plan
+                        .positions()
+                        .iter()
+                        .map(|at| to_stateless_checkpoint(*at))
+                        .collect::<Vec<_>>();
                     let output = stateless_validation_recovered_with_state_checkpoints(
                         recovered_block.execution_input(),
                         witness,
                         Arc::clone(&self.chain_spec),
                         self.evm_config.clone(),
-                        plan.positions(),
+                        &positions,
                     )
                     .map_err(|error| map_stateless_error(block_number, error))?;
                     let checkpoints = output
@@ -271,7 +293,7 @@ impl Backend {
                         .checkpoints
                         .into_iter()
                         .map(|checkpoint| StateCheckpoint {
-                            at: checkpoint.at,
+                            at: from_stateless_checkpoint(checkpoint.at),
                             state_root: checkpoint.state_root,
                             block_hash: checkpoint.block_hash,
                         })

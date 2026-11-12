@@ -25,7 +25,7 @@ alloy-rlp.workspace = true
 alloy-rpc-types-debug.workspace = true
 alloy-sol-types.workspace = true
 
-reth-chainspec.workspace = true
+alloy-hardforks.workspace = true
 reth-primitives-traits.workspace = true
 
 eyre.workspace = true
@@ -38,7 +38,6 @@ tonic.workspace = true
 tracing.workspace = true
 getrandom.workspace = true
 
-stateless-reth.workspace = true
 
 [dev-dependencies]
 # Recorded calldata fixture decoding.

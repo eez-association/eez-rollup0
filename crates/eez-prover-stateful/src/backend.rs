@@ -21,8 +21,8 @@ use eez_primitives::EezPrimitives;
 use eez_primitives::Receipt as EthereumReceipt;
 use eez_proof_signer::cancel::CancellationToken;
 use eez_proof_signer::validate::support::{
-    CheckpointPlan, check_cancellation, decode_match_and_recover_signers, observe_outbound_events,
-    system_sender_flags,
+    CheckpointPlan, candidate_block_hash, check_cancellation, decode_match_and_recover_signers,
+    observe_outbound_events, system_sender_flags,
 };
 use eez_proof_signer::validate::{
     AdmittedBlock, BackendBlockOutput, BackendWindowOutput, BlockAnchor, CheckpointAt,
@@ -48,7 +48,6 @@ use reth_storage_api::{
 };
 use revm::database::states::bundle_state::BundleRetention;
 use revm::state::bal::Bal;
-use stateless_reth::candidate_block_hash;
 use tracing::{debug, trace};
 
 const MAX_CACHED_CHECKPOINT_BLOCKS: usize = 32_768;
@@ -266,7 +265,7 @@ where
         tokio::time::timeout(request_timeout, async {
             admitted.check_parent(parent)?;
 
-            let block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
+            let block = decode_match_and_recover_signers(admitted, &*self.chain_spec)?;
             let number = block.header().number();
             let consensus = EthBeaconConsensus::new(Arc::clone(&self.chain_spec));
             consensus
@@ -515,7 +514,7 @@ where
     let settling_block = blocks
         .last()
         .expect("the admitted stateful window was checked as nonempty");
-    let recovered_settling_block = decode_match_and_recover_signers(settling_block, chain_spec)?;
+    let recovered_settling_block = decode_match_and_recover_signers(settling_block, &**chain_spec)?;
     let (settling_checkpoint_plan, settling_sender_flags) =
         CheckpointPlan::for_block(&recovered_settling_block, expected_l2_system_address);
     let mut prepared_settling_block = Some((
@@ -589,7 +588,7 @@ where
             })?;
             (block, plan.positions().to_vec(), flags)
         } else {
-            let block = decode_match_and_recover_signers(admitted, chain_spec)?;
+            let block = decode_match_and_recover_signers(admitted, &**chain_spec)?;
             let flags = system_sender_flags(&block, expected_l2_system_address);
             (block, Vec::new(), flags)
         };
