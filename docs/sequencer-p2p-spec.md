@@ -170,9 +170,10 @@ head     = [rollupId, number, blockHash, parentHash, epochMs, counter]
 - `rollupId`, `number`, `epochMs` and `counter` are RLP integers.
 - `blockHash` and `parentHash` are 32-byte strings.
 - `signature` is a byte string (65 bytes; see [§3.3](#33-signature-encoding)).
-- `block` is a byte string. When present, it holds the block's consensus
-  encoding, wrapped once more as an RLP string. The empty string means no
-  block. The encoding is `rlp([header, transactions, ommers])`, plus
+- `block` is a byte string holding the block's consensus encoding, wrapped
+  once more as an RLP string. Every envelope carries its block, rewinds
+  included, and a receiver MUST reject one without it. The encoding is
+  `rlp([header, transactions, ommers])`, plus
   `withdrawals` as a fourth element exactly when the header has a
   `withdrawalsRoot`. Receivers MUST accept both forms. As in Ethereum block
   bodies:
@@ -229,9 +230,6 @@ block format, not the framed format.
   - Some Snappy libraries accept a padded preamble. A receiver that uses one
     MUST check the preamble itself.
 
-A signer SHOULD attach the block. The reference always attaches it, rewinds
-included. A receiver MUST accept an envelope without one.
-
 ## 5. Validation
 
 A node checks every received message in this order. The first failing step
@@ -241,7 +239,7 @@ decides the verdict.
 2. **Rollup:** `rollupId` MUST equal `ROLLUP_ID`. Otherwise Reject.
 3. **Signer:** recover the signer ([§3.3](#33-signature-encoding)). It MUST be
    `SEQUENCER`. A malformed signature or the wrong signer: Reject.
-4. **Block**, when present:
+4. **Block:**
    - it decodes as one EEZ block in canonical form, with no trailing bytes
      ([§4.1](#41-envelope)). An unknown transaction type or a malformed
      transaction fails;
@@ -270,18 +268,14 @@ A node remembers at most `MAX_SOURCES` sources. When a new source would
 exceed that, the node evicts the source with the lowest `(epochMs, signer)`.
 If that is the new source itself, the verdict is Ignore.
 
-Duplicates are detected by claim, not by bytes. A copy of a seen head with a
-different envelope, such as one without its block, is therefore ignored.
+Duplicates are detected by claim, not by bytes, so a copy of a seen head is
+ignored even if its signature bytes differ.
 
 - `now_ms` is the local wall clock.
 - A source's latest head is kept in memory only. After a restart, the first
   head of each source is accepted again.
 - A head with the same counter and `blockHash` as its source's latest is a
   duplicate, whatever its other fields.
-- `number` and `parentHash` are checked only against an attached block.
-  Without one, the follower uses the claim's values for its checks in
-  [§10](#10-follower-fork-choice). It imports the block fetched by
-  `blockHash` even if its number or parent differs from the claim.
 
 ## 6. Head overlay
 
@@ -455,8 +449,9 @@ For each candidate in order:
 2. **Hold.** If the node's L1 derivation has read a settlement above its safe
    head, stop and adopt nothing. Heights L1 has settled MUST NOT be
    rewritten, even before safe reaches them.
-3. **Fetch.** Walk back from `blockHash` through parent hashes to the first
-   locally known block, fetching unknown blocks by hash
+3. **Fetch.** Walk back from the head's block, which came with it, through
+   parent hashes to the first locally known block, fetching unknown blocks by
+   hash
    ([§8](#8-execution-layer-networking)). The walk is at most
    `MAX_ANCESTRY_WALK` blocks. A head more than `MAX_ANCESTRY_WALK` above the
    highest block on the local canonical chain waits for L1 derivation: stop,
@@ -569,49 +564,74 @@ Inputs:
 | signer | `0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266` |
 | `L2_CHAIN_ID` | 1337 |
 | `REGISTRY` | `0x5FbDB2315678afecb367f032d93F642f64180aa3` |
-| claim | `rollupId` 1, `number` 7, `blockHash` `0xbb…bb`, `parentHash` `0xaa…aa`, `epochMs` 1 700 000 000 000, `counter` 1 |
-| block | none |
+| block | the empty block below |
+| claim | `rollupId` 1, `number` 7, `blockHash` the block's hash, `parentHash` `0xaa…aa`, `epochMs` 1 700 000 000 000, `counter` 1 |
+
+Block RLP (612 bytes), with every fork through Prague active and no
+transactions:
+
+```text
+f90261                    the block
+f9025b                    its header
+  a0 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  parentHash
+  a0 1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347  ommersHash
+  94 f39fd6e51aad88f6f4ce6ab8827279cfffb92266                          beneficiary
+  a0 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  stateRoot
+  a0 56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421  transactionsRoot
+  a0 56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421  receiptsRoot
+  b90100, then 256 zero bytes                                          logsBloom
+  80                                                                   difficulty
+  07                                                                   number
+  84 01c9c380                                                          gasLimit
+  80                                                                   gasUsed
+  84 6553f100                                                          timestamp
+  80                                                                   extraData
+  a0 0000000000000000000000000000000000000000000000000000000000000000  mixHash
+  88 0000000000000000                                                  nonce
+  07                                                                   baseFeePerGas
+  a0 56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421  withdrawalsRoot
+  80                                                                   blobGasUsed
+  80                                                                   excessBlobGas
+  a0 0000000000000000000000000000000000000000000000000000000000000000  parentBeaconBlockRoot
+  a0 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  requestsHash
+c0                        transactions
+c0                        ommers
+c0                        withdrawals
+```
 
 Outputs:
 
 | Output | Value |
 |---|---|
+| block hash | `0xd122d407ef1f4b4722b48ba4dd225fa5cba50a2b95a1265585060f0464dcce25` |
 | domain separator | `0x7bcd13c41deec50e6183399b45bf4a4676869087cef8d68623fe7ff72b7f8f9c` |
-| signing hash | `0x876ed57393bba41ad8986fcdf6d080462b817110409e235077e7d1544f83247e` |
+| signing hash | `0x14fb14f7072872b45edee4f4136fb40bce291cc9baacd928b65157800681e090` |
 | `TOPIC` | `/eez/1337/1/heads/0` (19 bytes) |
+| message id | `81d7c145eb07b6c067870afb26ccda4aabdff8e7` |
 
 Signature (RFC 6979):
 
 ```text
-5814195620ef379cdaf95e08a52978644c6b5457e238f204541021875ebebf3e
-3e59167b938e5bff0d15a010c87b6f0d2523e7cf1e90960b03ac8e86dc0fa658
+b20d4045602cae51e6f1643093554ef17df9768a187ff79de73bce7eb5d3ac24
+615548d39c40635eaa905b70dbde2c4c41a37339564e7026e16600a0e65a2932
 1b
 ```
 
-Envelope RLP (148 bytes):
+Envelope RLP (763 bytes):
 
 ```text
-f892 f84c 01 07
-  a0 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+f902f8 f84c 01 07
+  a0 d122d407ef1f4b4722b48ba4dd225fa5cba50a2b95a1265585060f0464dcce25
   a0 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   86 018bcfe56800
   01
-b841 5814195620ef379cdaf95e08a52978644c6b5457e238f204541021875ebebf3e
-     3e59167b938e5bff0d15a010c87b6f0d2523e7cf1e90960b03ac8e86dc0fa6581b
-80
+b841 b20d4045602cae51e6f1643093554ef17df9768a187ff79de73bce7eb5d3ac24
+     615548d39c40635eaa905b70dbde2c4c41a37339564e7026e16600a0e65a29321b
+b90264 followed by the 612-byte block RLP above
 ```
 
-Message, as Snappy-compressed by the reference (one valid encoding):
-
-```text
-94011cf892f84c0107a0bb7a010004a0aa7a0100f04b86018bcfe5680001b841
-5814195620ef379cdaf95e08a52978644c6b5457e238f204541021875ebebf3e
-3e59167b938e5bff0d15a010c87b6f0d2523e7cf1e90960b03ac8e86dc0fa658
-1b80
-```
-
-Its message id, which every valid encoding of the envelope shares, is
-`6250c5aba00e64adabb092b22cd646288363e2d4`.
+The message is any valid Snappy encoding of the envelope RLP. Every such
+encoding has the message id above.
 
 The test `spec_vector` in `crates/eez-p2p/src/wire.rs` pins these values.
 
