@@ -15,8 +15,8 @@ use alloy_eips::Decodable2718;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT};
+use eez_engine::EezEngineTypes;
 use eez_evm::{EezEvmConfig, ensure_supported_transaction};
-use eez_primitives::engine::EezEngineTypes;
 use eez_primitives::{Block, EezTxEnvelope as TransactionSigned};
 use reth_chainspec::EthereumHardforks;
 use reth_evm::{

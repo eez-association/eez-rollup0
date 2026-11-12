@@ -6,7 +6,6 @@
 //! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/engine-primitives/src/lib.rs>
 //! and <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/engine-primitives/src/payload.rs>.
 
-use crate::{Block, EezPrimitives};
 use alloy_eips::eip7685::Requests;
 use alloy_primitives::{Bytes, U256};
 use alloy_rpc_types_engine::{
@@ -16,6 +15,7 @@ use alloy_rpc_types_engine::{
     ExecutionPayloadSidecar, ExecutionPayloadV1, ExecutionPayloadV3, ExecutionPayloadV4,
     PayloadAttributes, PraguePayloadFields,
 };
+use eez_primitives::{Block, EezPrimitives};
 use reth_engine_primitives::EngineTypes;
 use reth_ethereum_engine_primitives::{BuiltPayloadConversionError, EthBuiltPayload};
 use reth_payload_primitives::{BuiltPayload, PayloadTypes};
@@ -203,3 +203,6 @@ impl EngineTypes for EezEngineTypes {
     type ExecutionPayloadEnvelopeV5 = ExecutionPayloadEnvelopeV5;
     type ExecutionPayloadEnvelopeV6 = ExecutionPayloadEnvelopeV6;
 }
+
+#[cfg(test)]
+mod tests;

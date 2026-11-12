@@ -9,6 +9,7 @@ default-run            = "eez-follower"
 
 [dependencies]
 eez-primitives.workspace = true
+eez-engine.workspace = true
 eez-deriver.workspace = true
 eez-driver.workspace  = true
 eez-l1.workspace      = true

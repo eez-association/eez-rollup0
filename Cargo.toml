@@ -6,6 +6,7 @@ members = [
     "crates/eez-control-rpc",
     "crates/eez-deriver",
     "crates/eez-driver",
+    "crates/eez-engine",
     "crates/eez-follower",
     "crates/eez-l1",
     "crates/eez-node",
@@ -190,6 +191,7 @@ eez-blob           = { path = "crates/eez-blob" }
 eez-composer       = { path = "crates/eez-composer" }
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }
+eez-engine         = { path = "crates/eez-engine" }
 eez-follower       = { path = "crates/eez-follower" }
 eez-l1             = { path = "crates/eez-l1" }
 eez-node           = { path = "crates/eez-node" }

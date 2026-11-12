@@ -31,9 +31,9 @@ use eez_driver::{
     SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
     witness::{ExecutionWitnessMode, block_witness},
 };
+use eez_engine::EezEngineTypes;
 use eez_evm::EezEvmConfig;
 use eez_l1::{BundleTarget, L1Error, L1Event, SendOutcome, Submitter};
-use eez_primitives::engine::EezEngineTypes;
 use eez_prover::{
     ActionableProverFailure, BlockWitness, ProverError, ProvingContext, RetryableProverError,
 };

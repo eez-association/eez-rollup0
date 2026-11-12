@@ -8,6 +8,7 @@ description            = "Node-backed proof-signer backend for an L1-derived EEZ
 
 [dependencies]
 eez-primitives.workspace = true
+eez-engine.workspace = true
 eez-evm.workspace = true
 eez-proof-signer.workspace = true
 eez-driver.workspace = true
