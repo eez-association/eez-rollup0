@@ -19,7 +19,7 @@ use eez_primitives::Block;
 use eez_primitives::EezPrimitives;
 use eez_primitives::Receipt as EthereumReceipt;
 use eez_proof_signer::validate::support::{
-    CheckpointPlan, decode_match_and_recover_signers, observe_outbound_events,
+    CheckpointPlan, candidate_block_hash, decode_match_and_recover_signers, observe_outbound_events,
 };
 use eez_proof_signer::validate::{
     AdmittedBlock, BackendBlockOutput, BlockAnchor, CheckpointAt, SettlementBlockEvidence,
@@ -43,7 +43,6 @@ use reth_storage_api::{
 };
 use revm::database::states::bundle_state::BundleRetention;
 use revm::state::bal::Bal;
-use stateless_reth::candidate_block_hash;
 
 const MAX_CACHED_CHECKPOINT_BLOCKS: usize = 32_768;
 

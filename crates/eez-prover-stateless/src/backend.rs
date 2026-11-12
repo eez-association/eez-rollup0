@@ -20,8 +20,8 @@ use eez_proof_signer::validate::support::{
     CheckpointPlan, decode_match_and_recover_signers, observe_outbound_events,
 };
 use eez_proof_signer::validate::{
-    AdmittedBlock, BackendBlockOutput, BlockAnchor, SettlementBlockEvidence, StateCheckpoint,
-    ValidatedBlock, ValidationBackend, ValidationError,
+    AdmittedBlock, BackendBlockOutput, BlockAnchor, CheckpointAt, SettlementBlockEvidence,
+    StateCheckpoint, ValidatedBlock, ValidationBackend, ValidationError,
 };
 use lru::LruCache;
 use reth_chainspec::ChainSpec;
@@ -34,6 +34,22 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, trace};
 
 mod chain_config;
+
+// The signer library names its own `CheckpointAt` so it stays free of the
+// stateless fork; these map it at the backend boundary.
+const fn to_stateless_checkpoint(at: CheckpointAt) -> stateless_reth::CheckpointAt {
+    match at {
+        CheckpointAt::PreExecution => stateless_reth::CheckpointAt::PreExecution,
+        CheckpointAt::Transaction(index) => stateless_reth::CheckpointAt::Transaction(index),
+    }
+}
+
+const fn from_stateless_checkpoint(at: stateless_reth::CheckpointAt) -> CheckpointAt {
+    match at {
+        stateless_reth::CheckpointAt::PreExecution => CheckpointAt::PreExecution,
+        stateless_reth::CheckpointAt::Transaction(index) => CheckpointAt::Transaction(index),
+    }
+}
 
 use chain_config::{ChainDocumentKind, load_chain_document};
 
@@ -161,12 +177,17 @@ impl Backend {
             .map_err(|error| map_stateless_error(number, error))?;
             (output, Vec::new())
         } else {
+            let positions = plan
+                .positions()
+                .iter()
+                .map(|at| to_stateless_checkpoint(*at))
+                .collect::<Vec<_>>();
             let output = stateless_validation_recovered_with_state_checkpoints(
                 block.execution_input(),
                 witness,
                 Arc::clone(&self.chain_spec),
                 self.evm_config.clone(),
-                plan.positions(),
+                &positions,
             )
             .map_err(|error| map_stateless_error(number, error))?;
             let checkpoints = output
@@ -174,7 +195,7 @@ impl Backend {
                 .checkpoints
                 .into_iter()
                 .map(|checkpoint| StateCheckpoint {
-                    at: checkpoint.at,
+                    at: from_stateless_checkpoint(checkpoint.at),
                     state_root: checkpoint.state_root,
                     block_hash: checkpoint.block_hash,
                 })
