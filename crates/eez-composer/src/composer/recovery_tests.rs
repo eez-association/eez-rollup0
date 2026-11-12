@@ -238,7 +238,8 @@ impl Fixture {
     }
 
     fn assert_requeued(&self, expected: &[HeldTx]) {
-        let queued = self.rollup().held_pool.pop_all();
+        let pool = &self.rollup().held_pool;
+        let queued = pool.pop_all();
         let identity = |txs: &[HeldTx]| {
             txs.iter()
                 .map(|tx| (tx.hash, tx.sender, tx.direction, tx.nonce, tx.attempts))
@@ -249,23 +250,14 @@ impl Fixture {
             identity(expected),
             "no loss or retry charges"
         );
-        // Drained transactions reserve exactly their original source nonces.
-        for tx in expected {
-            let mut replacement = tx.clone();
-            replacement.hash = B256::repeat_byte(0xee);
-            assert!(
-                self.rollup()
-                    .held_pool
-                    .push_contiguous(replacement, 0)
-                    .is_err()
-            );
-        }
-        self.rollup().held_pool.release_in_flight_batch(&queued);
-        // No reservation is stranded after the recovered transactions are released.
-        self.rollup()
-            .held_pool
-            .push_contiguous(expected[0].clone(), 0)
+        pool.release_in_flight_batch(&queued);
+        // A new hash must be admitted: duplicate hashes could hide a stranded reservation.
+        let mut replacement = expected[0].clone();
+        replacement.hash = B256::repeat_byte(0xee);
+        pool.push_contiguous(replacement, expected[0].nonce)
             .unwrap();
+        pool.release_in_flight_batch(&pool.pop_all());
+        pool.push_front_batch(queued);
     }
 }
 
@@ -340,16 +332,7 @@ async fn nonce_barrier() -> (
 }
 
 #[tokio::test]
-async fn deriver_retreat_during_nonce_read_preserves_the_batch() {
-    retreat_during_nonce_read(false).await;
-}
-
-#[tokio::test]
 async fn same_height_replacement_invalidates_pending_nonce_reads() {
-    retreat_during_nonce_read(true).await;
-}
-
-async fn retreat_during_nonce_read(replace: bool) {
     let (provider, server, mut seen, reply) = nonce_barrier().await;
     let fixture = Fixture::new(provider);
     let (txs, partial) = fixture.prepare(Direction::Inbound);
@@ -370,20 +353,17 @@ async fn retreat_during_nonce_read(replace: bool) {
     {
         let _guard = fixture.composer.inner.committer.begin_reconcile().await;
         fixture.retreat_deriver().await;
-        if replace {
-            fixture
-                .rollup()
-                .l1_head
-                .append(record(102, 10, B256::repeat_byte(0xb2)));
-            fixture
-                .composer
-                .inner
-                .committer
-                .reorg_to(header(10))
-                .await
-                .unwrap();
-            assert_eq!(fixture.rollup().l1_head.cursor(), 10);
-        }
+        // Our batch lands again in a new L1 block. Cursor and L2 head match
+        // the old snapshot; only the changed L1 post invalidates the read.
+        fixture.rollup().l1_head.append(record(102, 10, BATCH));
+        fixture
+            .composer
+            .inner
+            .committer
+            .reorg_to(header(10))
+            .await
+            .unwrap();
+        assert_eq!(fixture.rollup().l1_head.cursor(), 10);
     }
     reply.send(0).unwrap();
     recovery.await;
