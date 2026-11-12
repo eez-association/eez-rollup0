@@ -87,6 +87,9 @@ fn error_class(error: &CodecError) -> &'static str {
         CodecError::NonEmptyTransactionData => "NON_EMPTY_TRANSACTION_DATA",
         CodecError::InvalidTargetRollup { .. } => "INVALID_TARGET_ROLLUP",
         CodecError::ActionAfterFailure => "ACTION_AFTER_FAILURE",
+        CodecError::InvalidBlobLength { .. } => "INVALID_BLOB_LENGTH",
+        CodecError::NonCanonicalFieldElement { .. } => "NON_CANONICAL_FIELD_ELEMENT",
+        CodecError::CloseBlobStreamMissing => "CLOSE_BLOB_STREAM_MISSING",
         CodecError::ValueTooLarge { .. } => "VALUE_TOO_LARGE",
     }
 }

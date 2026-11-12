@@ -164,6 +164,8 @@ pub struct ProvingContext {
     /// Intended L1 parent/time for live cross-chain settlement; `None` for a
     /// timeless (0) batch.
     pub l1_context: Option<eez_protocol::l1_context::LiveSettlementContext>,
+    /// Physical DA blobs in transaction order.
+    pub blobs: Vec<Bytes>,
 }
 
 /// Produces the [`BlockWitness`] for a committed L2 block — the seam by which

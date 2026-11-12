@@ -16,6 +16,7 @@ eez-control-rpc.workspace = true
 # Canonical `postAndVerifyBatch` ABI types and codec.
 eez-protocol.workspace = true
 eez-payload-codec.workspace = true
+eez-blob.workspace = true
 
 alloy-consensus.workspace = true
 alloy-eips.workspace = true

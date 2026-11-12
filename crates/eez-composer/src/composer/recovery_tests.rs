@@ -99,6 +99,7 @@ impl Fixture {
             eez: Address::ZERO,
             rollup_id: 1,
             deploy_block: 0,
+            beacon_url: None,
         };
         let submitter = Submitter::new(SubmitterConfig {
             builder_rpc_url: reader.rpc_url.clone(),
@@ -151,6 +152,7 @@ impl Fixture {
                     l1_chain_id: 1,
                     l1_post_batch_priority_fee: 0,
                     eez_registry: Address::ZERO,
+                    blob_posting: None,
                 }),
                 local: crate::local::LocalComposeClients {
                     l1_entry: client.clone(),
@@ -191,9 +193,13 @@ impl Fixture {
             rollup.held_pool.push_contiguous(tx.clone(), 0).unwrap();
         }
         // One suffix is in the batch and one remains queued outside it.
-        rollup
-            .optimistic
-            .begin(10, BATCH, header(9), rollup.held_pool.pop_n(2));
+        rollup.optimistic.begin(
+            10,
+            BATCH,
+            header(9),
+            header(10).hash(),
+            rollup.held_pool.pop_n(2),
+        );
         rollup
             .l1_head
             .append(record(100, 9, B256::repeat_byte(0x90)));
@@ -454,9 +460,13 @@ async fn lost_races(direction: Direction) {
                 .reorg_to(header(height))
                 .await
                 .unwrap();
-            rollup
-                .optimistic
-                .begin(height, BATCH, header(height - 1), rollup.held_pool.pop_n(2));
+            rollup.optimistic.begin(
+                height,
+                BATCH,
+                header(height - 1),
+                header(height).hash(),
+                rollup.held_pool.pop_n(2),
+            );
             rollup
                 .l1_head
                 .append(record(101 + u64::from(round), height, winner));

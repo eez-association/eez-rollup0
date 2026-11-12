@@ -24,7 +24,7 @@ pub use payload::EezPayloadBuilder;
 mod payload_builder;
 mod pool;
 mod pool_transaction;
-pub use pool::EezPoolBuilder;
+pub use pool::{EezPoolBuilder, HeldTxs};
 
 /// Per M-MIMALLOC-APPS — meaningful win on allocation-heavy workloads.
 #[global_allocator]
@@ -66,20 +66,37 @@ fn l2_cli<Ext>(mut argv: Vec<String>) -> eyre::Result<Cli<EthereumChainSpecParse
 where
     Ext: clap::Args + std::fmt::Debug,
 {
-    // Engine API FCUs may intentionally unwind the L2 head during recovery.
+    // Engine API FCUs may intentionally unwind the L2 head during recovery. An
+    // unwind sends reth no reorg notification, so its RPC tx-hash cache would
+    // keep serving the dropped blocks' txs: run without that cache.
     // Transactions enter only through the sequencer's ingress, never devp2p gossip.
     // Sync state reads Syncing only while reth backfills, so boot can wait it out.
     for flag in [
         "--engine.always-process-payload-attributes-on-canonical-head",
         "--engine.allow-unwind-canonical-header",
+        "--rpc-cache.max-cached-tx-hashes=0",
         "--disable-tx-gossip",
         "--debug.startup-sync-state-idle",
     ] {
-        if !argv.iter().any(|a| a == flag) {
+        // An operator's own copy stands: clap rejects a second one.
+        let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+        let given = |a: &String| {
+            a == name
+                || a.strip_prefix(name)
+                    .is_some_and(|value| value.starts_with('='))
+        };
+        if !argv.iter().any(given) {
             argv.push(flag.to_owned());
         }
     }
     let cli = Cli::<EthereumChainSpecParser, Ext>::try_parse_from(argv)?;
+    if let Commands::Node(node) = &cli.command
+        && node.rpc.rpc_state_cache.max_cached_tx_hashes != 0
+    {
+        eyre::bail!(
+            "--rpc-cache.max-cached-tx-hashes must be 0; the cache would serve txs from unwound blocks"
+        );
+    }
     // Parsed flags include reth's aliases and its `--dev` default. Without bootnodes,
     // reth dials mainnet's for a custom chain.
     if let Commands::Node(node) = &cli.command
@@ -308,12 +325,30 @@ mod tests {
             &["node", "-d"][..],
             &["node", "-d", "--disable-tx-gossip"],
             &["node", "-d", "--debug.startup-sync-state-idle"],
+            &["node", "-d", "--rpc-cache.max-cached-tx-hashes=0"],
+            &["node", "-d", "--rpc-cache.max-cached-tx-hashes", "0"],
         ] {
             let Commands::Node(node) = parse(argv).unwrap().command else {
                 panic!("not the node command");
             };
             assert!(node.network.disable_tx_gossip, "{argv:?}");
             assert!(node.debug.startup_sync_state_idle, "{argv:?}");
+            assert_eq!(node.rpc.rpc_state_cache.max_cached_tx_hashes, 0, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn cli_refuses_a_tx_hash_cache() {
+        for argv in [
+            &["node", "-d", "--rpc-cache.max-cached-tx-hashes=30000"][..],
+            &["node", "-d", "--rpc-cache.max-cached-tx-hashes", "30000"],
+        ] {
+            let err = parse(argv).unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("--rpc-cache.max-cached-tx-hashes must be 0"),
+                "{argv:?}: {err}"
+            );
         }
     }
 }
