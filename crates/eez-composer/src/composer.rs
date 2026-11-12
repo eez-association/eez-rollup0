@@ -609,7 +609,7 @@ const fn grid_aligned_cap(requested: u64, k: u64) -> u64 {
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryOutcome {
-    /// A rollback and/or sibling commit landed — the caller's slot parent is stale.
+    /// The empty sibling landed, so the caller's slot parent is stale.
     HeadMoved,
     /// Nothing was committed (bail, stale verdict, or nothing to roll back).
     HeadUnchanged,
@@ -647,6 +647,9 @@ fn dispose_recovered_txs(
     landed: &[alloy_primitives::TxHash],
     charge_attempt: bool,
 ) {
+    // Releasing or evicting a tx can come before reth re-adds it from the
+    // dropped block, which would mine it as a plain L2 call.
+    pool.refuse(txs.iter().map(|tx| tx.hash), sync_height);
     let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(txs.len());
     let mut release: Vec<crate::HeldTx> = Vec::new();
     let mut dropped = 0usize;
@@ -1960,8 +1963,7 @@ where
     ) -> RecoveryOutcome {
         let sync_height = failed.sync_height;
         let pool = rollup.held_pool.as_ref();
-        // Set by the two operations that move the head: the rollback and the
-        // sibling commit.
+        // Set when the sibling commit moves the head.
         let mut outcome = RecoveryOutcome::HeadUnchanged;
         let committer = &self.inner.committer;
         let mut landed = Vec::new();
@@ -2004,54 +2006,45 @@ where
             // roll it back again, and every postBatch in between
             // anchors against the wrong root.
             if rollup.l1_head.cursor() >= sync_height {
-                pool.release_in_flight_batch(&failed.txs);
+                // The cursor proves the height settled, not that these txs ran: a
+                // rival or partial batch may have settled it. Back in the ledger
+                // below the cursor, the entry goes to nonce disposition.
+                rollup.optimistic.reinsert_failed(failed);
                 event!(
                     name: "eez.composer.recovery.stale_verdict",
                     Level::WARN,
                     rollup_id,
                     sync_height,
                     cursor = rollup.l1_head.cursor(),
-                    "failure verdict is stale — Deriver confirmed the batch from L1; dropping recovery",
+                    "failure verdict is stale — Deriver confirmed the height from L1; its txs go to nonce disposition",
                 );
                 return RecoveryOutcome::HeadUnchanged;
             }
             let head = committer.last_header();
-            if head.number() >= sync_height {
-                if let Err(err) = committer.reorg_to(failed.parent.clone()).await {
-                    event!(
-                        name: "eez.composer.recovery.reorg_failed",
-                        Level::ERROR,
-                        rollup_id,
-                        sync_height,
-                        error = %err,
-                        "reorg_to failed; keeping entry Failed — next slot retries",
-                    );
-                    rollup.optimistic.reinsert_failed(failed);
-                    return RecoveryOutcome::HeadUnchanged;
-                }
-                outcome = RecoveryOutcome::HeadMoved;
-                event!(
-                    name: "eez.composer.recovery.rolled_back",
-                    Level::WARN,
-                    event_name = "eez.composer.recovery.rolled_back",
-                    rollup_id,
-                    sync_height,
-                    head = head.number(),
-                    "bundle failed on L1; optimistic Sync block rolled back to parent",
-                );
-            } else {
+            // Replace only the block that failed: another can hold its height after
+            // an L1-reorg retreat, or when its commit bailed after the batch began.
+            let replaces = head.number() >= sync_height
+                && match rollup.l2_provider.block_hash(sync_height) {
+                    Ok(hash) => hash == Some(failed.block),
+                    Err(_) => {
+                        rollup.optimistic.reinsert_failed(failed);
+                        return RecoveryOutcome::HeadUnchanged;
+                    }
+                };
+            if !replaces {
                 event!(
                     name: "eez.composer.recovery.not_committed",
                     Level::INFO,
                     rollup_id,
                     sync_height,
                     head = head.number(),
-                    "failed Sync block never became canonical; nothing to roll back",
+                    "failed Sync block is not canonical; nothing to roll back",
                 );
             }
-            // Still under the reconcile guard, so nothing slips between the
-            // reorg and the replacement. Head elsewhere → nothing to substitute.
-            if committer.last_header().hash() == failed.parent.hash() {
+            // Still under the reconcile guard. Committed while the failed branch is
+            // canonical, the sibling is a reorg, so reth's pool takes back its pure
+            // L2 txs. Head elsewhere → nothing to substitute.
+            if replaces || head.hash() == failed.parent.hash() {
                 let timestamp = failed
                     .parent
                     .timestamp()
@@ -2088,7 +2081,7 @@ where
                             rollup_id,
                             sync_height,
                             error = %err,
-                            "empty-sibling commit failed; head stays at the parent and Catchup rebuilds",
+                            "empty-sibling commit failed",
                         ),
                     },
                     Err(err) => event!(
@@ -2097,9 +2090,15 @@ where
                         rollup_id,
                         sync_height,
                         error = %err,
-                        "empty-sibling build failed; head stays at the parent and Catchup rebuilds",
+                        "empty-sibling build failed",
                     ),
                 }
+            }
+            // The failed block stays canonical until a sibling replaces it, so keep
+            // the entry Failed for the next slot. A rewind would lose the pure L2 txs.
+            if replaces && matches!(outcome, RecoveryOutcome::HeadUnchanged) {
+                rollup.optimistic.reinsert_failed(failed);
+                return RecoveryOutcome::HeadUnchanged;
             }
         }
         dispose_recovered_txs(
@@ -3822,6 +3821,7 @@ where
             sync_height,
             post_batch_hash,
             parent_header.clone(),
+            built.header.hash(),
             survivors,
         );
         self.spawn_bundle_observer(
@@ -3964,6 +3964,7 @@ where
             sync_height,
             post_batch_hash,
             parent_header.clone(),
+            empty_built.header.hash(),
             Vec::new(),
         );
         self.spawn_bundle_observer(
@@ -4100,9 +4101,13 @@ where
                 "settlement backlog exceeds the batch cap; settling a bounded historical chunk",
             );
 
-            rollup
-                .optimistic
-                .begin(boundary, post_batch_hash, boundary_parent, Vec::new());
+            rollup.optimistic.begin(
+                boundary,
+                post_batch_hash,
+                boundary_parent,
+                boundary_header.hash(),
+                Vec::new(),
+            );
             // A past terminal cannot carry a timestamp pin, but the bundle can
             // still target the exact L1 slot that triggered this composition.
             self.spawn_bundle_observer(
@@ -5373,6 +5378,10 @@ mod tests {
 
         dispose_recovered_txs(1, &pool, 100, drained, &[], true);
         assert_eq!(pool.len(), 0, "at MAX_BUNDLE_ATTEMPTS the tx is evicted");
+        assert!(
+            pool.holds(&TxHash::repeat_byte(0xD1)),
+            "an evicted tx stays refused, so reth cannot re-add it from the dropped block",
+        );
     }
 
     fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {

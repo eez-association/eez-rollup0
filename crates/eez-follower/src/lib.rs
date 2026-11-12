@@ -88,7 +88,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     let system_address = eez_primitives::SYSTEM_ADDRESS;
 
     let handle = builder
-        .node(EezNode)
+        .node(EezNode::default())
         .launch_with_debug_capabilities()
         .await?;
 
@@ -140,6 +140,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         Arc::clone(&l1_head),
         Some(system_tx_cfg),
         sync_mode.deriver_boot(),
+        None,
     );
 
     let probe = sync_mode.readiness_probe(deploy_block);
