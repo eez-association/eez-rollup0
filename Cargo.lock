@@ -3625,6 +3625,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-signer",
  "alloy-signer-local",
+ "eez-primitives",
  "eez-seq-sig",
  "eyre",
  "futures-util",

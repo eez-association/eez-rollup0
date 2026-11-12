@@ -38,7 +38,6 @@ struct WireHead {
 struct WireEnvelope {
     head: WireHead,
     signature: Bytes,
-    // Empty means no block.
     block: Bytes,
 }
 
@@ -55,7 +54,7 @@ pub fn encode(envelope: &Envelope) -> Result<Vec<u8>, WireError> {
             counter: h.counter,
         },
         signature: envelope.signature.clone(),
-        block: envelope.block.clone().unwrap_or_default(),
+        block: envelope.block.clone(),
     };
     let mut rlp = Vec::with_capacity(wire.length());
     wire.encode(&mut rlp);
@@ -89,7 +88,7 @@ pub fn decode(data: &[u8]) -> Result<Envelope, WireError> {
             counter: w.head.counter,
         },
         signature: w.signature,
-        block: (!w.block.is_empty()).then_some(w.block),
+        block: w.block,
     })
 }
 
@@ -145,7 +144,7 @@ fn uncompressed_len(data: &[u8]) -> Result<usize, WireError> {
 mod tests {
     use super::*;
 
-    fn envelope(block: Option<Bytes>) -> Envelope {
+    fn envelope(block: Bytes) -> Envelope {
         Envelope {
             head: HeadClaim {
                 rollup_id: 1,
@@ -162,16 +161,14 @@ mod tests {
 
     #[test]
     fn wire_round_trips() {
-        for block in [None, Some(Bytes::from(vec![0xc0, 1, 2, 3]))] {
-            let e = envelope(block);
-            assert_eq!(decode(&encode(&e).unwrap()).unwrap(), e);
-        }
+        let e = envelope(Bytes::from(vec![0xc0, 1, 2, 3]));
+        assert_eq!(decode(&encode(&e).unwrap()).unwrap(), e);
     }
 
     #[test]
     fn layout_is_head_signature_block() {
         let rlp = snap::raw::Decoder::new()
-            .decompress_vec(&encode(&envelope(None)).unwrap())
+            .decompress_vec(&encode(&envelope(Bytes::from(vec![0xc0]))).unwrap())
             .unwrap();
         let outer = alloy_rlp::Header::decode(&mut rlp.as_slice()).unwrap();
         assert!(outer.list);
@@ -180,13 +177,17 @@ mod tests {
         assert!(head.list);
         payload = &payload[head.payload_length..];
         assert_eq!(Bytes::decode(&mut payload).unwrap().len(), 65);
-        assert_eq!(Bytes::decode(&mut payload).unwrap().len(), 0);
+        assert_eq!(
+            Bytes::decode(&mut payload).unwrap(),
+            Bytes::from(vec![0xc0])
+        );
         assert!(payload.is_empty());
     }
 
     /// The test vector in `docs/sequencer-p2p-spec.md`; change both together.
     #[test]
     fn spec_vector() {
+        use alloy_consensus::{Header, constants::EMPTY_ROOT_HASH};
         use alloy_primitives::{address, b256, hex};
         use alloy_signer::SignerSync;
         use alloy_signer_local::PrivateKeySigner;
@@ -201,14 +202,48 @@ mod tests {
             registry: address!("5FbDB2315678afecb367f032d93F642f64180aa3"),
             rollup_id: 1,
         };
+        // An empty block in the shape every fork at genesis gives: Prague fields, no withdrawals.
+        let block = eez_primitives::Block {
+            header: Header {
+                parent_hash: B256::repeat_byte(0xaa),
+                beneficiary: key.address(),
+                state_root: B256::repeat_byte(0xcc),
+                number: 7,
+                gas_limit: 30_000_000,
+                timestamp: 1_700_000_000,
+                base_fee_per_gas: Some(7),
+                withdrawals_root: Some(EMPTY_ROOT_HASH),
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                parent_beacon_block_root: Some(B256::ZERO),
+                // SHA-256 of nothing: no execution-layer requests.
+                requests_hash: Some(b256!(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                )),
+                ..Default::default()
+            },
+            body: eez_primitives::BlockBody {
+                withdrawals: Some(Default::default()),
+                ..Default::default()
+            },
+        };
+        let block_rlp = alloy_rlp::encode(&block);
+        assert_eq!(block_rlp.len(), 612);
+        // The header list, then empty transactions, ommers and withdrawals.
+        assert!(block_rlp.starts_with(&hex!("f90261f9025b")));
+        assert!(block_rlp.ends_with(&hex!("c0c0c0")));
         let head = HeadClaim {
             rollup_id: 1,
             number: 7,
-            block_hash: B256::repeat_byte(0xbb),
+            block_hash: block.header.hash_slow(),
             parent_hash: B256::repeat_byte(0xaa),
             epoch_ms: 1_700_000_000_000,
             counter: 1,
         };
+        assert_eq!(
+            head.block_hash,
+            b256!("d122d407ef1f4b4722b48ba4dd225fa5cba50a2b95a1265585060f0464dcce25")
+        );
         assert_eq!(
             key.address(),
             address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266")
@@ -220,56 +255,46 @@ mod tests {
         let hash = head.signing_hash(&domain);
         assert_eq!(
             hash,
-            b256!("876ed57393bba41ad8986fcdf6d080462b817110409e235077e7d1544f83247e")
+            b256!("14fb14f7072872b45edee4f4136fb40bce291cc9baacd928b65157800681e090")
         );
         let signature = key.sign_hash_sync(&hash).unwrap().as_bytes();
         assert_eq!(
             signature,
             hex!(
-                "5814195620ef379cdaf95e08a52978644c6b5457e238f204541021875ebebf3e"
-                "3e59167b938e5bff0d15a010c87b6f0d2523e7cf1e90960b03ac8e86dc0fa658"
+                "b20d4045602cae51e6f1643093554ef17df9768a187ff79de73bce7eb5d3ac24"
+                "615548d39c40635eaa905b70dbde2c4c41a37339564e7026e16600a0e65a2932"
                 "1b"
             )
         );
-        let data = encode(&Envelope {
+        let envelope = Envelope {
             head,
             signature: Bytes::from(signature.to_vec()),
-            block: None,
-        })
-        .unwrap();
+            block: Bytes::from(block_rlp.clone()),
+        };
+        assert!(envelope.clone().verify(&domain, key.address()).is_ok());
+        let data = encode(&envelope).unwrap();
         let rlp = snap::raw::Decoder::new().decompress_vec(&data).unwrap();
-        assert_eq!(
-            rlp,
-            hex!(
-                "f892f84c0107"
-                "a0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                "a0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                "86018bcfe5680001"
-                "b8415814195620ef379cdaf95e08a52978644c6b5457e238f204541021875ebebf3e"
-                "3e59167b938e5bff0d15a010c87b6f0d2523e7cf1e90960b03ac8e86dc0fa6581b"
-                "80"
-            )
+        let prefix = hex!(
+            "f902f8f84c0107"
+            "a0d122d407ef1f4b4722b48ba4dd225fa5cba50a2b95a1265585060f0464dcce25"
+            "a0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "86018bcfe5680001"
+            "b841b20d4045602cae51e6f1643093554ef17df9768a187ff79de73bce7eb5d3ac24"
+            "615548d39c40635eaa905b70dbde2c4c41a37339564e7026e16600a0e65a29321b"
+            "b90264"
         );
-        assert_eq!(
-            data,
-            hex!(
-                "94011cf892f84c0107a0bb7a010004a0aa7a0100f04b86018bcfe5680001b841"
-                "5814195620ef379cdaf95e08a52978644c6b5457e238f204541021875ebebf3e"
-                "3e59167b938e5bff0d15a010c87b6f0d2523e7cf1e90960b03ac8e86dc0fa658"
-                "1b80"
-            )
-        );
+        assert_eq!(rlp, [&prefix[..], &block_rlp].concat());
         let topic = crate::topic(domain.l2_chain_id, domain.rollup_id);
         assert_eq!(topic, "/eez/1337/1/heads/0");
         assert_eq!(
             message_id(&topic, &data),
-            hex!("6250c5aba00e64adabb092b22cd646288363e2d4")
+            hex!("81d7c145eb07b6c067870afb26ccda4aabdff8e7")
         );
     }
 
     #[test]
     fn padded_preamble_is_rejected() {
-        let data = encode(&envelope(None)).unwrap();
+        let data = encode(&envelope(Bytes::from(vec![0xc0]))).unwrap();
         // A zero continuation byte pads the varint without changing its value.
         let end = data.iter().position(|b| b & 0x80 == 0).unwrap() + 1;
         let mut padded = data[..end].to_vec();
@@ -286,7 +311,7 @@ mod tests {
     #[test]
     fn every_snappy_encoding_has_one_id() {
         let topic = "/eez/1/1/heads/0";
-        let data = encode(&envelope(None)).unwrap();
+        let data = encode(&envelope(Bytes::from(vec![0xc0]))).unwrap();
         let rlp = snap::raw::Decoder::new().decompress_vec(&data).unwrap();
         // The same RLP as one Snappy literal: the same preamble, tag 60 << 2, then the
         // length minus one in one byte.
@@ -312,7 +337,7 @@ mod tests {
 
     #[test]
     fn oversize_is_rejected() {
-        let big = envelope(Some(Bytes::from(vec![0u8; MAX_MESSAGE_SIZE + 1])));
+        let big = envelope(Bytes::from(vec![0u8; MAX_MESSAGE_SIZE + 1]));
         assert!(matches!(encode(&big), Err(WireError::TooLarge(_))));
         let compressed = snap::raw::Encoder::new()
             .compress_vec(&vec![0u8; MAX_MESSAGE_SIZE + 1])

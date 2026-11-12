@@ -6,20 +6,20 @@ use reth_primitives_traits::SealedBlock;
 
 use crate::{HeadClaim, HeadDomain};
 
-/// A claim, its 65-byte `r‖s‖v` signature and optionally the consensus-RLP block.
+/// A claim, its 65-byte `r‖s‖v` signature and its consensus-RLP block.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Envelope {
     pub head: HeadClaim,
     pub signature: Bytes,
-    pub block: Option<Bytes>,
+    pub block: Bytes,
 }
 
 #[derive(Clone, Debug)]
 pub struct VerifiedHead {
     pub claim: HeadClaim,
     pub signer: Address,
-    pub block: Option<SealedBlock<eez_primitives::Block>>,
+    pub block: SealedBlock<eez_primitives::Block>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -95,17 +95,15 @@ impl Envelope {
         if signer != authorized {
             return Err(VerifyError::UnauthorizedSigner(signer));
         }
-        let block = block.map(|rlp| decode_block(&rlp)).transpose()?;
-        if let Some(b) = &block {
-            if b.hash() != head.block_hash {
-                return Err(VerifyError::BlockMismatch("hash"));
-            }
-            if b.parent_hash != head.parent_hash {
-                return Err(VerifyError::BlockMismatch("parent"));
-            }
-            if b.number != head.number {
-                return Err(VerifyError::BlockMismatch("number"));
-            }
+        let block = decode_block(&block)?;
+        if block.hash() != head.block_hash {
+            return Err(VerifyError::BlockMismatch("hash"));
+        }
+        if block.parent_hash != head.parent_hash {
+            return Err(VerifyError::BlockMismatch("parent"));
+        }
+        if block.number != head.number {
+            return Err(VerifyError::BlockMismatch("number"));
         }
         Ok(VerifiedHead {
             claim: head,
@@ -170,7 +168,7 @@ mod tests {
         let v = env.verify(&domain(), s.address()).unwrap();
         assert_eq!(v.claim, claim);
         assert_eq!(v.signer, s.address());
-        assert_eq!(v.block.unwrap().hash(), header.hash());
+        assert_eq!(v.block.hash(), header.hash());
         assert_eq!(s.sign(&header, rlp).unwrap().head.counter, 2);
     }
 
@@ -278,6 +276,18 @@ mod tests {
                 Err(VerifyError::BadSignature(_))
             ));
         }
+    }
+
+    #[test]
+    fn missing_block_is_rejected() {
+        let mut s = signer();
+        let (header, rlp) = block(7);
+        let mut env = s.sign(&header, rlp).unwrap();
+        env.block = Bytes::new();
+        assert!(matches!(
+            env.verify(&domain(), s.address()),
+            Err(VerifyError::BlockDecode(_))
+        ));
     }
 
     #[test]

@@ -323,7 +323,7 @@ where
             if self.held()? {
                 return Ok(());
             }
-            let fetched = fetch_missing(&self.local, &self.blocks, at, head.block.as_ref()).await;
+            let fetched = fetch_missing(&self.local, &self.blocks, &head.block).await;
             let missing = match fetched {
                 Ok(missing) => missing,
                 Err(err @ FollowerError::Ahead { .. }) => {
@@ -440,13 +440,12 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Walks back from `target` (its block, if in hand) to the first locally known
-/// block, fetching the unknown ones from `source` in batches.
+/// Walks back from `target` to the first locally known block, fetching the
+/// unknown ancestors from `source` in batches.
 async fn fetch_missing<P, S>(
     local: &P,
     source: &S,
-    target: BlockNumHash,
-    target_block: Option<&SealedBlock<Block>>,
+    target: &SealedBlock<Block>,
 ) -> Result<Missing, FollowerError>
 where
     P: HeaderProvider<Header = Header> + BlockNumReader,
@@ -463,11 +462,11 @@ where
         });
     }
     let mut blocks = Vec::new();
-    let mut batch = Vec::from_iter(target_block.cloned()).into_iter();
+    let mut batch = vec![target.clone()].into_iter();
     let BlockNumHash {
         mut number,
         mut hash,
-    } = target;
+    } = target.num_hash();
     loop {
         if let Some(header) = local
             .header(hash)
@@ -896,9 +895,7 @@ mod tests {
         local.insert_canonical(b0.hash(), b0.header().clone());
         let remote = serving(std::slice::from_ref(&b1));
 
-        let missing = fetch_missing(&local, &remote, b2.num_hash(), Some(&b2))
-            .await
-            .unwrap();
+        let missing = fetch_missing(&local, &remote, &b2).await.unwrap();
 
         assert_eq!(missing.fork_point.hash(), b0.hash());
         let hashes: Vec<_> = missing.blocks.iter().map(SealedBlock::hash).collect();
@@ -911,7 +908,7 @@ mod tests {
         let mut local = MockLocal::default();
         local.insert_canonical(b0.hash(), b0.header().clone());
 
-        let missing = fetch_missing(&local, &MapSource::default(), b0.num_hash(), Some(&b0))
+        let missing = fetch_missing(&local, &MapSource::default(), &b0)
             .await
             .unwrap();
 
@@ -932,9 +929,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = fetch_missing(&local, &remote, b2.num_hash(), Some(&b2))
-            .await
-            .unwrap_err();
+        let err = fetch_missing(&local, &remote, &b2).await.unwrap_err();
 
         assert!(
             matches!(err, FollowerError::BadAncestor { requested, got }
@@ -952,9 +947,7 @@ mod tests {
         let mut local = MockLocal::default();
         local.insert_canonical(hash(0xee), header(target.number, hash(0xed)));
 
-        let err = fetch_missing(&local, &remote, target.num_hash(), Some(target))
-            .await
-            .unwrap_err();
+        let err = fetch_missing(&local, &remote, target).await.unwrap_err();
 
         assert!(matches!(err, FollowerError::Unverifiable { .. }), "{err}");
     }
@@ -967,14 +960,9 @@ mod tests {
         let target = block(MAX_ANCESTRY_WALK + 1, hash(0xaa), 0);
 
         // Any fetch from the empty remote would fail as "not served" instead.
-        let err = fetch_missing(
-            &local,
-            &MapSource::default(),
-            target.num_hash(),
-            Some(&target),
-        )
-        .await
-        .unwrap_err();
+        let err = fetch_missing(&local, &MapSource::default(), &target)
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, FollowerError::Ahead { .. }), "{err}");
     }
@@ -987,9 +975,7 @@ mod tests {
         let remote = serving(&chain);
         let target = &chain[150];
 
-        let missing = fetch_missing(&local, &remote, target.num_hash(), Some(target))
-            .await
-            .unwrap();
+        let missing = fetch_missing(&local, &remote, target).await.unwrap();
 
         // Each batch is the gap left to the local head, capped at FETCH_BATCH.
         assert_eq!(*remote.counts.borrow(), [64, 64, 21]);
