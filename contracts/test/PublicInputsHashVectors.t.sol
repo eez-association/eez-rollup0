@@ -218,10 +218,14 @@ contract PublicInputsHashVectorsTest is Test {
         eez.postAndVerifyBatch(batch);
     }
 
+    /// The batch also carries a blob and a state update, so this covers direct
+    /// blob settlement on the stock protocol rollup.
     function testECDSAProofCannotBeReusedForDifferentCallData() external {
         uint256 signerKey = 0xA11CE;
         address signer = vm.addr(signerKey);
         bytes32 vkey = bytes32(uint256(uint160(signer)));
+        bytes32 initialState = bytes32(uint256(0x1111));
+        bytes32 nextState = bytes32(uint256(0x2222));
 
         EEZ eez = new EEZ(address(0xDEAD));
         ECDSAProofSystem proofSystem = new ECDSAProofSystem(signer);
@@ -229,20 +233,36 @@ contract PublicInputsHashVectorsTest is Test {
         proofSystems[0] = address(proofSystem);
         bytes32[] memory vkeys = _singleton(vkey);
         Rollup rollup = deployRollup(address(eez), address(this), 1, proofSystems, vkeys);
-        uint64 rollupId = eez.registerRollup(address(rollup), bytes32(uint256(0x1111)));
+        uint64 rollupId = eez.registerRollup(address(rollup), initialState);
 
         ProofSystemBatchPerVerificationEntries memory batch = _emptyBatch();
+        batch.blobIndices = new uint256[](1);
         batch.proofSystems = proofSystems;
         batch.proofs = new bytes[](1);
         batch.rollupIdsWithProofSystems = _assignments1(rollupId, 0);
+        batch.immediateEntryCount = 1;
+        batch.entries = new ExecutionEntry[](1);
+        batch.entries[0].rollupUpdates = new RollupUpdate[](1);
+        batch.entries[0].rollupUpdates[0] =
+            RollupUpdate({rollupId: rollupId, currentRoot: initialState, newRoot: nextState, etherDelta: 0});
+        batch.entries[0].l2ToL1Calls = new L2ToL1Call[](0);
+        batch.entries[0].expectedL1ToL2Calls = new ExpectedL1ToL2Call[](0);
+        bytes32 statesHash = keccak256(abi.encodePacked(bytes32(0), rollupId, initialState));
+        batch.entries[0].rollingHash = keccak256(abi.encodePacked(statesHash, bytes32(0)));
+        batch.entries[0].destinationRollupId = rollupId;
+        batch.entries[0].success = true;
+        bytes32[] memory blobHashes = _singleton(bytes32(uint256(0x0101)));
+        vm.blobhashes(blobHashes);
 
-        bytes32 shared = _shared(batch, _emptyCustomData(1), address(0));
+        bytes32 shared = _shared(batch, blobHashes, _emptyCustomData(1), address(0));
         bytes32 signedHash = _publicInput(shared, _singleton(rollupId), vkeys);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, signedHash);
         bytes memory signature = abi.encodePacked(r, s, v);
 
         batch.proofs[0] = signature;
         eez.postAndVerifyBatch(batch);
+        (, bytes32 settledRoot,) = eez.rollups(rollupId);
+        assertEq(settledRoot, nextState);
 
         batch.callData = hex"01";
         vm.expectRevert(EEZ.InvalidProof.selector);

@@ -3257,6 +3257,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "eez-blob"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "eez-composer"
 version = "0.1.0"
 dependencies = [
@@ -3270,7 +3280,9 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-signer-local",
  "alloy-sol-types",
+ "alloy-transport",
  "async-trait",
+ "eez-blob",
  "eez-driver",
  "eez-evm",
  "eez-l1",
@@ -3441,6 +3453,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "alloy-transport",
+ "eez-blob",
  "eez-protocol",
  "fail",
  "reqwest 0.12.28",
@@ -3616,6 +3629,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-signer",
  "alloy-signer-local",
+ "eez-primitives",
  "eez-seq-sig",
  "eyre",
  "futures-util",
@@ -3677,6 +3691,7 @@ dependencies = [
  "alloy-rpc-types-debug",
  "alloy-sol-types",
  "async-trait",
+ "eez-blob",
  "eez-control-rpc",
  "eez-payload-codec",
  "eez-primitives",
@@ -3741,6 +3756,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "async-trait",
+ "eez-blob",
  "eez-control-rpc",
  "eez-protocol",
  "eez-prover",
@@ -3831,6 +3847,7 @@ name = "eez-seq-sig"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-serde",
@@ -4839,9 +4856,9 @@ checksum = "b07f60793ff0a4d9cef0f18e63b5357e06209987153a64648c972c1e5aff336f"
 
 [[package]]
 name = "hickory-net"
-version = "0.26.1"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2295ed2f9c31e471e1428a8f88a3f0e1f4b27c15049592138d1eebe9c35b183"
+checksum = "c480823ed7c2c5d0f09c41020cb6b7c28029ce60ec42dc942158dcf22f8e0a4d"
 dependencies = [
  "async-trait",
  "cfg-if",
@@ -4849,7 +4866,7 @@ dependencies = [
  "futures-channel",
  "futures-io",
  "futures-util",
- "hickory-proto 0.26.1",
+ "hickory-proto 0.26.3",
  "idna",
  "ipnet",
  "jni 0.22.4",
@@ -4889,9 +4906,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-proto"
-version = "0.26.1"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bab31817bfb44672a252e97fe81cd0c18d1b2cf892108922f6818820df8c643"
+checksum = "12b92608f679a6fa515dd1d15c1ff89443026e391200a2c840c7afcba482893d"
 dependencies = [
  "data-encoding",
  "idna",
@@ -4931,14 +4948,14 @@ dependencies = [
 
 [[package]]
 name = "hickory-resolver"
-version = "0.26.1"
+version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0d58d28879ceecde6607729660c2667a081ccdc082e082675042793960f178c"
+checksum = "3f3da5255c95d5a716857d54b5b8f4e8d67c3484d3beaaaae2ce25063b3ba981"
 dependencies = [
  "cfg-if",
  "futures-util",
  "hickory-net",
- "hickory-proto 0.26.1",
+ "hickory-proto 0.26.3",
  "ipconfig",
  "ipnet",
  "jni 0.22.4",
@@ -9093,7 +9110,7 @@ dependencies = [
  "dashmap",
  "data-encoding",
  "enr",
- "hickory-resolver 0.26.1",
+ "hickory-resolver 0.26.3",
  "linked_hash_set",
  "reth-ethereum-forks",
  "reth-network-peers",

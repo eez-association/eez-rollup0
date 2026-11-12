@@ -11,6 +11,7 @@ eez-prover.workspace      = true
 eez-control-rpc.workspace = true
 # Encode ProvingContext.batch → postAndVerifyBatch calldata for the wire.
 eez-protocol.workspace    = true
+eez-blob.workspace        = true
 
 alloy-primitives.workspace = true
 alloy-sol-types.workspace  = true

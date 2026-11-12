@@ -428,10 +428,14 @@ fn recompute_test_public_inputs_hash(batch: &eez_protocol::EvmBatch) -> B256 {
         &settlement::CanonicalPostBatch::from_decoded_for_test(batch.clone()),
         expected_rollup_id(1),
         test_proof_system(),
+        0,
         (batch.blockNumber == u64::MAX).then(crate::testkit::live_context),
     )
     .unwrap()
-    .recompute_public_inputs_hash(test_proof_system_vkey())
+    .recompute_public_inputs_hash(
+        test_proof_system_vkey(),
+        &settlement::VerifiedDa::calldata_for_test(),
+    )
     .unwrap()
     .into_inner()
 }

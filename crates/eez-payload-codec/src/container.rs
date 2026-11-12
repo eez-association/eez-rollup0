@@ -1,8 +1,8 @@
-//! The EEZ message stream carried in `batch.callData`.
+//! The EEZ message stream carried in blobs or `batch.callData`.
 //!
 //! `eez-core-protocol/docs/blobs/BLOB_FORMAT_SPEC.md` defines one continuous
 //! stream: the batch's blobs in order, with `callData` appended after the last
-//! blob. We publish no blobs yet, so `callData` IS the whole stream — the same
+//! blob. For calldata-only batches, `callData` IS the whole stream — the same
 //! format with an empty blob portion, not a framing of our own.
 //!
 //! ```text
@@ -11,8 +11,9 @@
 //!           ‖ ( Initiate ‖ Call ‖ Return ‖ Finish ) *   # one bracket per action
 //! ```
 //!
-//! `CloseBlobStream` (type 1) ends the blob portion and is invalid inside the
-//! `callData` tail, so a zero-blob stream never emits one.
+//! `CloseBlobStream` (type 1) ends the blob portion (§2.1, §5 cond. 2) and is
+//! invalid inside the `callData` tail (cond. 3), so a zero-blob stream has
+//! nowhere legal to put it and never emits one. Open with the spec owner.
 //!
 //! Wire conventions (§1.1): scalars little-endian fixed-width, `address` 20
 //! bytes, `u256` 32 bytes little-endian, every `bytes` field length-prefixed
@@ -22,11 +23,6 @@
 //! structured is up to the chain" — so Rollup0's `0x00 ‖ native_block_span_v0`
 //! rides inside it verbatim. Nothing here extends it: the span's start comes
 //! from the settled parent EEZ names, not from a field of our own.
-//!
-//! INTERIM CALLDATA PROFILE, not full blob-format compliance: §2.1 and §5
-//! cond. 2 want `CloseBlobStream` in the blob portion, cond. 3 forbids it in
-//! the tail, and a zero-blob stream has nowhere legal to put it. Open with the
-//! spec owner.
 
 use crate::{CodecError, CodecResult, Cursor, DecodedSpan, SpanBlock};
 use tracing::warn;
@@ -35,6 +31,7 @@ use tracing::warn;
 pub const STREAM_VERSION: u8 = 0x00;
 
 const MSG_CHAIN_OPERATION: u8 = 2;
+const MSG_CLOSE_BLOB_STREAM: u8 = 1;
 const MSG_INITIATE: u8 = 3;
 const MSG_CALL: u8 = 4;
 const MSG_RETURN_SUCCESS: u8 = 6;
@@ -43,6 +40,13 @@ const MSG_FINISH: u8 = 10;
 
 /// Width of a `u256` field, in bytes.
 const VALUE_BYTES: usize = 32;
+
+const BYTES_PER_BLOB: usize = 131_072;
+const FIELD_ELEMENT_BYTES: usize = 32;
+const LOGICAL_FIELD_BYTES: usize = 31;
+const FIELD_ELEMENTS_PER_BLOB: usize = BYTES_PER_BLOB / FIELD_ELEMENT_BYTES;
+/// Stream bytes one blob carries: 31 per field element, whose top byte stays zero.
+pub const LOGICAL_BYTES_PER_BLOB: usize = FIELD_ELEMENTS_PER_BLOB * LOGICAL_FIELD_BYTES;
 
 /// One cross-chain action, in its semantic form.
 ///
@@ -143,6 +147,30 @@ pub fn encode_container(
     Ok(out)
 }
 
+/// Encode blob profile into complete, canonical physical blobs.
+pub fn encode_blob_container(
+    rollup_id: u64,
+    blocks: &[SpanBlock],
+    actions: &[Action],
+) -> CodecResult<Vec<Vec<u8>>> {
+    let mut stream = encode_container(rollup_id, blocks, actions)?;
+    stream.push(MSG_CLOSE_BLOB_STREAM);
+    Ok(pack_blobs(stream))
+}
+
+/// Pack a closed stream into physical blobs, zero-padded to the last blob: each
+/// 31-byte chunk becomes a zero high byte then the chunk reversed, as
+/// [`decode_blob_container`] reads it back.
+fn pack_blobs(mut stream: Vec<u8>) -> Vec<Vec<u8>> {
+    stream.resize(stream.len().next_multiple_of(LOGICAL_BYTES_PER_BLOB), 0);
+    let mut packed = Vec::with_capacity(stream.len() / LOGICAL_FIELD_BYTES * FIELD_ELEMENT_BYTES);
+    for chunk in stream.chunks(LOGICAL_FIELD_BYTES) {
+        packed.push(0);
+        packed.extend(chunk.iter().rev());
+    }
+    packed.chunks(BYTES_PER_BLOB).map(<[u8]>::to_vec).collect()
+}
+
 /// Decode an EEZ message stream from `batch.callData`.
 ///
 /// A malformed stream is rejected whole (§5): an unknown version, an unknown
@@ -186,6 +214,35 @@ pub fn decode_container(payload: &[u8]) -> CodecResult<DecodedContainer> {
         span,
         actions,
     })
+}
+
+/// Decode complete physical blobs under the blob profile.
+pub fn decode_blob_container(blobs: &[Vec<u8>]) -> CodecResult<DecodedContainer> {
+    let mut stream = Vec::with_capacity(blobs.len() * LOGICAL_BYTES_PER_BLOB);
+    for (blob_index, blob) in blobs.iter().enumerate() {
+        if blob.len() != BYTES_PER_BLOB {
+            return Err(CodecError::InvalidBlobLength {
+                index: blob_index,
+                actual: blob.len(),
+                expected: BYTES_PER_BLOB,
+            });
+        }
+        for (field_index, field) in blob.as_chunks::<FIELD_ELEMENT_BYTES>().0.iter().enumerate() {
+            if field[0] != 0 {
+                return Err(CodecError::NonCanonicalFieldElement {
+                    blob_index,
+                    field_index,
+                });
+            }
+            stream.extend(field[1..].iter().rev());
+        }
+    }
+    // The stream ends at its last non-zero byte, which must be CloseBlobStream;
+    // only zero padding may follow it.
+    match stream.iter().rposition(|byte| *byte != 0) {
+        Some(end) if stream[end] == MSG_CLOSE_BLOB_STREAM => decode_container(&stream[..end]),
+        _ => Err(CodecError::CloseBlobStreamMissing),
+    }
 }
 
 fn decode_action(cur: &mut Cursor<'_>, rollup_id: u64) -> CodecResult<Action> {
@@ -340,6 +397,94 @@ mod tests {
     fn round_trips_an_empty_manifest() {
         let encoded = encode_container(ROLLUP, &span(), &[]).unwrap();
         assert!(decode_container(&encoded).unwrap().actions.is_empty());
+    }
+
+    #[test]
+    fn blob_codec_preserves_actions_across_blob_boundaries() {
+        for length in [
+            30,
+            31,
+            32,
+            LOGICAL_BYTES_PER_BLOB - 1,
+            LOGICAL_BYTES_PER_BLOB + 1,
+        ] {
+            let mut item = action(true);
+            item.data = (0..length).map(|i| i as u8).collect();
+            item.return_data = vec![0xab; length];
+            let actions = vec![item];
+            let calldata = encode_container(ROLLUP, &span(), &actions).unwrap();
+            let blobs = encode_blob_container(ROLLUP, &span(), &actions).unwrap();
+            assert!(blobs.iter().all(|blob| blob.len() == BYTES_PER_BLOB));
+            let decoded = decode_blob_container(&blobs).unwrap();
+            assert_eq!(decoded, decode_container(&calldata).unwrap());
+            assert_eq!(decoded.actions, actions);
+        }
+        let blocks = vec![SpanBlock {
+            transactions: vec![vec![0x42; LOGICAL_BYTES_PER_BLOB]],
+            ..Default::default()
+        }];
+        let blobs = encode_blob_container(ROLLUP, &blocks, &[]).unwrap();
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(
+            decode_blob_container(&blobs).unwrap().span.transactions[0].len(),
+            LOGICAL_BYTES_PER_BLOB
+        );
+    }
+
+    #[test]
+    fn blob_codec_rejects_bad_framing_padding_and_routes() {
+        let valid = encode_blob_container(ROLLUP, &span(), &[]).unwrap();
+        let mut field = valid.clone();
+        field[0][0] = 1;
+        assert!(matches!(
+            decode_blob_container(&field),
+            Err(CodecError::NonCanonicalFieldElement { .. })
+        ));
+        // A stray marker in the padding is rejected too, just at the real marker.
+        for stray in [MSG_CLOSE_BLOB_STREAM, 2] {
+            let mut padding = valid.clone();
+            *padding[0].last_mut().unwrap() = stray;
+            assert!(decode_blob_container(&padding).is_err());
+        }
+        let mut truncated = valid;
+        truncated[0].pop();
+        assert!(matches!(
+            decode_blob_container(&truncated),
+            Err(CodecError::InvalidBlobLength { index: 0, .. })
+        ));
+        assert_eq!(
+            decode_blob_container(&[]),
+            Err(CodecError::CloseBlobStreamMissing)
+        );
+
+        let mut route = encode_container(ROLLUP, &span(), &[action(true)]).unwrap();
+        let target_at = first_bracket_offset() + 11;
+        route[target_at..target_at + 8].copy_from_slice(&(ROLLUP + 1).to_le_bytes());
+        let expected = decode_container(&route).unwrap_err();
+        route.push(MSG_CLOSE_BLOB_STREAM);
+        assert_eq!(decode_blob_container(&pack_blobs(route)), Err(expected));
+
+        let stream = encode_container(ROLLUP, &span(), &[]).unwrap();
+        let mut doubled = stream.clone();
+        doubled.extend_from_slice(&stream[1..]);
+        doubled.push(MSG_CLOSE_BLOB_STREAM);
+        for invalid in [stream, doubled] {
+            assert!(decode_blob_container(&pack_blobs(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn physical_blob_packing_matches_the_field_element_layout() {
+        let stream = alloy_primitives::hex!(
+            "800102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e"
+        );
+        let expected = alloy_primitives::hex!(
+            "001e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020180"
+        );
+        assert_eq!(
+            &pack_blobs(stream.to_vec())[0][..FIELD_ELEMENT_BYTES],
+            expected
+        );
     }
 
     /// The stream opens exactly as the spec defines: protocol version byte,

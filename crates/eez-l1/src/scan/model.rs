@@ -14,7 +14,7 @@ use eez_protocol::abi::{
     L2ExecutionPerformed, L2TxSkipped, SCANNED_TOPICS, postAndVerifyBatchCall,
 };
 use eez_protocol::entries::{EntryRole, entry_roles};
-use eez_protocol::public_inputs::batch_shared_public_input_with_context;
+use eez_protocol::public_inputs::batch_shared_public_input_with_blobs_and_context;
 
 use super::types::{AppliedEntry, Post, PostId, Settlement};
 use crate::error::{L1Error, L1Result};
@@ -75,14 +75,20 @@ pub(super) struct Call {
     pub batch: Result<EvmBatch, String>,
     pub from: Address,
     pub logs: usize,
+    pub blob_hashes: Vec<B256>,
 }
 
 impl Call {
-    fn decode(input: &[u8], from: Address, logs: usize) -> Self {
+    fn decode(input: &[u8], from: Address, logs: usize, blob_hashes: &[B256]) -> Self {
         let batch = postAndVerifyBatchCall::abi_decode_validate(input)
             .map(|call| call.batch)
             .map_err(|error| error.to_string());
-        Self { batch, from, logs }
+        Self {
+            batch,
+            from,
+            logs,
+            blob_hashes: blob_hashes.to_vec(),
+        }
     }
 }
 
@@ -308,7 +314,8 @@ fn parse_tx(block: u64, logs: &[ScannedLog]) -> L1Result<Tx<'_>> {
 pub(super) fn direct_call(tx: &Transaction, eez: Address, logs: usize) -> Option<Call> {
     let input = tx.input();
     let direct = tx.to() == Some(eez) && input.starts_with(&postAndVerifyBatchCall::SELECTOR);
-    direct.then(|| Call::decode(input, tx.inner.signer(), logs))
+    let blobs = tx.blob_versioned_hashes().unwrap_or_default();
+    direct.then(|| Call::decode(input, tx.inner.signer(), logs, blobs))
 }
 
 /// A traced tx's committed post calls in execution order, and its committed
@@ -333,7 +340,7 @@ pub(super) fn calls_in_tx(
         }
         let inside = if post { Some(out.0.len()) } else { inside };
         if post {
-            out.0.push(Call::decode(&frame.input, frame.from, 0));
+            out.0.push(Call::decode(&frame.input, frame.from, 0, &[]));
         }
         // Count this frame's own scanned EEZ logs, for the tx and the post it runs in.
         let scanned = frame.logs.iter().filter(|log| {
@@ -510,11 +517,13 @@ fn label(
             l1_block_hash: block.hash,
             log_index: tx.logs[end.last].log_index,
         };
+        let (batch, blob_hashes) = verify(call, spi, ids, &id, &here, block.context)?;
         let post = Post {
             id,
             tx_hash: head.tx_hash,
             sender: call.from,
-            batch: verify(call, spi, ids, &id, &here, block.context)?,
+            batch,
+            blob_hashes,
             l1_context: block.context,
             settlement: Settlement::NONE,
         };
@@ -534,7 +543,7 @@ fn verify(
     id: &PostId,
     here: &str,
     context: Option<eez_protocol::l1_context::LiveSettlementContext>,
-) -> L1Result<EvmBatch> {
+) -> L1Result<(EvmBatch, Vec<B256>)> {
     let batch = call
         .batch
         .as_ref()
@@ -548,17 +557,25 @@ fn verify(
         log_index: id.log_index,
         detail,
     };
+    // The stream rides in blobs or in callData, never both.
+    let carrier = batch.blobIndices.is_empty() || batch.callData.is_empty();
+    ensure!(carrier, "{here}: blob carrier with callData");
+    // BLOBHASH(i) reads the outer tx's i-th versioned hash.
+    let blob = |index: &U256| {
+        let hash = usize::try_from(*index)
+            .ok()
+            .and_then(|i| call.blob_hashes.get(i).copied());
+        hash.ok_or_else(|| L1Error::Decode(format!("{here}: blob index {index} is out of range")))
+    };
+    let blob_hashes: Vec<_> = batch
+        .blobIndices
+        .iter()
+        .map(blob)
+        .collect::<L1Result<_>>()?;
     // Accept only timeless or the reference manager's live parent/time profile.
-    // Other block selectors and blob profiles require separate verification.
-    let commitment = batch_shared_public_input_with_context(
-        batch,
-        call.from,
-        if batch.blockNumber == u64::MAX {
-            context
-        } else {
-            None
-        },
-    );
+    let context = context.filter(|_| batch.blockNumber == u64::MAX);
+    let commitment =
+        batch_shared_public_input_with_blobs_and_context(batch, call.from, &blob_hashes, context);
     let commitment = commitment.map_err(|e| unsupported(format!("{here}: {e}")))?;
     let mismatch = format!("{here}: call hashes to {commitment}, not {spi}");
     // A co-listed rollup may return different customData for either supported selector (EEZ.sol:753-762).
@@ -566,7 +583,7 @@ fn verify(
     if commitment != spi {
         return Err(unsupported(mismatch));
     }
-    Ok(batch.clone())
+    Ok((batch.clone(), blob_hashes))
 }
 
 /// A post listing us, while its block is read.

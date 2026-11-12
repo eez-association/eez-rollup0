@@ -1433,6 +1433,7 @@ mod tests {
             sender: Address::ZERO,
             l1_context: None,
             batch: eez_protocol::abi::EvmBatch::default(),
+            blob_hashes: Vec::new(),
             settlement: crate::scan::Settlement::NONE,
         }
     }
