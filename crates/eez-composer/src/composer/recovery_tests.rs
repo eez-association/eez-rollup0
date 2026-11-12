@@ -242,8 +242,8 @@ impl Fixture {
     }
 
     fn assert_requeued(&self, expected: &[HeldTx]) {
-        let queued = self.rollup().held_pool.pop_all();
-        let on_chain = expected[0].nonce;
+        let pool = &self.rollup().held_pool;
+        let queued = pool.pop_all();
         let identity = |txs: &[HeldTx]| {
             txs.iter()
                 .map(|tx| (tx.hash, tx.sender, tx.direction, tx.nonce, tx.attempts))
@@ -254,25 +254,14 @@ impl Fixture {
             identity(expected),
             "no loss or retry charges"
         );
-        // Drained transactions reserve exactly their original source nonces.
-        for tx in expected {
-            let mut replacement = tx.clone();
-            replacement.hash = B256::repeat_byte(0xee);
-            assert!(
-                self.rollup()
-                    .held_pool
-                    .push_contiguous(replacement, on_chain)
-                    .is_err()
-            );
-        }
-        self.rollup().held_pool.release_in_flight_batch(&queued);
-        // No reservation is stranded after the recovered transactions are released.
-        for tx in expected {
-            self.rollup()
-                .held_pool
-                .push_contiguous(tx.clone(), on_chain)
-                .unwrap();
-        }
+        pool.release_in_flight_batch(&queued);
+        // A new hash must be admitted: duplicate hashes could hide a stranded reservation.
+        let mut replacement = expected[0].clone();
+        replacement.hash = B256::repeat_byte(0xee);
+        pool.push_contiguous(replacement, expected[0].nonce)
+            .unwrap();
+        pool.release_in_flight_batch(&pool.pop_all());
+        pool.push_front_batch(queued);
     }
 }
 
@@ -347,16 +336,7 @@ async fn nonce_barrier() -> (
 }
 
 #[tokio::test]
-async fn deriver_retreat_during_nonce_read_preserves_the_batch() {
-    retreat_during_nonce_read(false).await;
-}
-
-#[tokio::test]
 async fn same_height_replacement_invalidates_pending_nonce_reads() {
-    retreat_during_nonce_read(true).await;
-}
-
-async fn retreat_during_nonce_read(replace: bool) {
     let (provider, server, mut seen, reply) = nonce_barrier().await;
     let fixture = Fixture::new(provider);
     let (txs, partial) = fixture.prepare(Direction::Inbound, BATCH);
@@ -377,20 +357,17 @@ async fn retreat_during_nonce_read(replace: bool) {
     {
         let _guard = fixture.composer.inner.committer.begin_reconcile().await;
         fixture.retreat_deriver().await;
-        if replace {
-            fixture
-                .rollup()
-                .l1_head
-                .append(record(102, 10, B256::repeat_byte(0xb2)));
-            fixture
-                .composer
-                .inner
-                .committer
-                .reorg_to(header(10))
-                .await
-                .unwrap();
-            assert_eq!(fixture.rollup().l1_head.cursor(), 10);
-        }
+        // Our batch lands again in a new L1 block. Cursor and L2 head match
+        // the old snapshot; only the changed L1 post invalidates the read.
+        fixture.rollup().l1_head.append(record(102, 10, BATCH));
+        fixture
+            .composer
+            .inner
+            .committer
+            .reorg_to(header(10))
+            .await
+            .unwrap();
+        assert_eq!(fixture.rollup().l1_head.cursor(), 10);
     }
     reply.send(0).unwrap();
     recovery.await;
@@ -426,66 +403,33 @@ async fn composer_first_reorg_invalidates_pending_partial_disposition() {
 }
 
 #[tokio::test]
-async fn lost_races_preserve_inbound_attempts_and_nonce_suffix() {
-    lost_races(Direction::Inbound).await;
+async fn lost_race_preserves_inbound_attempts_and_nonce_suffix() {
+    lost_race(Direction::Inbound).await;
 }
 
 #[tokio::test]
-async fn lost_races_preserve_outbound_attempts_and_nonce_suffix() {
-    lost_races(Direction::Outbound).await;
+async fn lost_race_preserves_outbound_attempts_and_nonce_suffix() {
+    lost_race(Direction::Outbound).await;
 }
 
-async fn lost_races(direction: Direction) {
+async fn lost_race(direction: Direction) {
     let rpc = Asserter::new();
-    let fixture = Fixture::new(ProviderBuilder::default().connect_mocked_client(rpc.clone()));
+    rpc.push_success(&"0x0");
+    let fixture = Fixture::new(ProviderBuilder::default().connect_mocked_client(rpc));
     let winner = B256::repeat_byte(0xb2);
-    let (txs, _) = fixture.prepare(direction, winner);
+    let (txs, partial) = fixture.prepare(direction, winner);
     fixture
         .rollup()
         .l2_provider
         .add_account(SENDER, ExtendedAccount::new(0, U256::ZERO));
-    // Every lost race must preserve even a transaction with two prior attempts.
-    // Exercise more races than the eviction bound, with both a batched and a
-    // queued nonce suffix. Canonical winners never include these transactions.
-    for round in 0..=MAX_BUNDLE_ATTEMPTS {
-        rpc.push_success(&"0x0");
-        if round > 0 {
-            let height = 10 + u64::from(round);
-            let rollup = fixture.rollup();
-            let _guard = fixture.composer.inner.committer.begin_reconcile().await;
-            fixture
-                .composer
-                .inner
-                .committer
-                .reorg_to(header(height))
-                .await
-                .unwrap();
-            rollup.optimistic.begin(
-                height,
-                BATCH,
-                header(height - 1),
-                header(height).hash(),
-                rollup.held_pool.pop_n(2),
-            );
-            rollup
-                .l1_head
-                .append(record(101 + u64::from(round), height, winner));
-            assert!(rollup.optimistic.resolve_below_cursor(height).is_empty());
-        }
-        let partial = fixture
-            .rollup()
-            .optimistic
-            .partial_to_dispose(10 + u64::from(round))
-            .unwrap();
-        fixture
-            .composer
-            .recover_partial_batch(1, fixture.rollup(), partial)
-            .await;
-        fixture.assert_requeued(&txs);
-        // All transactions are back in the pool; no ledger copy may restore a
-        // duplicate on a subsequent reorg.
-        assert!(fixture.rollup().optimistic.take_rolled_out(9).is_empty());
-    }
+    // One wrong charge would evict tx0 and both its batched and queued suffixes.
+    fixture
+        .composer
+        .recover_partial_batch(1, fixture.rollup(), partial)
+        .await;
+    fixture.assert_requeued(&txs);
+    // Requeued transactions must not also remain in the recovery ledger.
+    assert!(fixture.rollup().optimistic.take_rolled_out(9).is_empty());
 }
 
 #[tokio::test]

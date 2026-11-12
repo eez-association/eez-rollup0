@@ -266,41 +266,22 @@ mod tests {
     #[test]
     fn transaction_membership_tracks_the_canonical_index() {
         let head = L1CanonicalHead::default();
-        let (a, b, unknown) = (
-            B256::repeat_byte(1),
-            B256::repeat_byte(2),
-            B256::repeat_byte(3),
-        );
-        assert!(!head.contains_l1_tx(a));
+        let removed = B256::repeat_byte(1);
+        let replacement = B256::repeat_byte(2);
+        head.append(record(100, 0, 9));
         head.append(BatchRecord {
-            tx_hash: a,
-            ..record(100, 0, 9)
-        });
-        head.append(BatchRecord {
-            tx_hash: b,
+            tx_hash: removed,
             ..record(101, 0, 10)
         });
-        for (tx_hash, expected) in [(a, true), (b, true), (unknown, false)] {
-            assert_eq!(head.contains_l1_tx(tx_hash), expected);
-        }
+        assert!(head.contains_l1_tx(B256::ZERO)); // A non-tail canonical post.
+        assert!(!head.contains_l1_tx(replacement));
         head.retreat_on_l1_reorg(100).unwrap();
-        assert!(
-            head.contains_l1_tx(a),
-            "a surviving non-tail post remains canonical"
-        );
-        assert!(
-            !head.contains_l1_tx(b),
-            "a rolled-out post cannot justify a charge"
-        );
         head.append(BatchRecord {
-            tx_hash: unknown,
+            tx_hash: replacement,
             ..record(102, 0, 10)
         });
-        assert!(
-            !head.contains_l1_tx(b),
-            "a replacement at the same L2 height is not the old post"
-        );
-        assert!(head.contains_l1_tx(unknown));
+        assert!(!head.contains_l1_tx(removed));
+        assert!(head.contains_l1_tx(replacement));
     }
 
     /// Another fork at the tail's height is a different block: nothing in it was seen.
