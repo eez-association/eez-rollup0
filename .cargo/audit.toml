@@ -40,15 +40,6 @@ ignore = [
     # Requires a transitive dependency to move to 0.3.x; we log via 0.3
     # ourselves.
     "RUSTSEC-2025-0055",
-    # hickory-proto 0.25.2 DNS parsing panics and memory amplification, fixed
-    # only in 0.26.2+. Cargo.lock lists 0.25.2 because libp2p 0.56's `tokio`
-    # feature names `libp2p-mdns?/tokio` and `libp2p-dns?/tokio`, but nothing
-    # builds it. The hickory we build (reth's DNS discovery) is 0.26.3.
-    # libp2p 0.57 drops 0.25.
-    "RUSTSEC-2026-0487",
-    "RUSTSEC-2026-0489",
-    "RUSTSEC-2026-0490",
-    "RUSTSEC-2026-0491",
 ]
 
 [output]
