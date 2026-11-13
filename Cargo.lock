@@ -3529,7 +3529,9 @@ dependencies = [
  "alloy-evm",
  "alloy-genesis",
  "alloy-primitives",
+ "alloy-rlp",
  "alloy-rpc-types-engine",
+ "alloy-trie",
  "eez-engine",
  "eez-primitives",
  "reth-chainspec",
@@ -3538,6 +3540,7 @@ dependencies = [
  "reth-primitives-traits",
  "reth-storage-errors",
  "revm",
+ "serde",
  "serde_json",
 ]
 

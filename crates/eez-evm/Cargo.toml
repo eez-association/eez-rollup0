@@ -23,6 +23,10 @@ serde_json.workspace = true
 
 [dev-dependencies]
 eez-engine.workspace = true
+# Golden fixture replay (tests/golden.rs).
+alloy-rlp.workspace = true
+alloy-trie = { workspace = true, features = ["ethereum"] }
+serde.workspace = true
 
 [lints]
 workspace = true
