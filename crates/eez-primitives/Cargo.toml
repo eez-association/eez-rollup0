@@ -8,7 +8,7 @@ rust-version.workspace = true
 [features]
 default = ["serde"]
 serde = []
-# revm `TxEnv` conversions for the revm-based proof signer (`prover/`).
+# revm `TxEnv` conversions for the revm-based proof signer (provers).
 revm = ["dep:revm", "dep:alloy-evm"]
 
 [dependencies]
@@ -20,7 +20,7 @@ reth-codecs.workspace = true
 reth-primitives-traits = { workspace = true, features = ["serde", "reth-codec"] }
 serde.workspace = true
 
-# Shared with the `prover/` workspace: no git-pinned reth or EVM crates here.
+# Shared with the signer in provers: no git-pinned reth or EVM crates here.
 # Explicit versions, not `workspace = true`, so they outlive the node's own revm.
 revm = { version = "43", optional = true, default-features = false, features = [
     "optional_balance_check",

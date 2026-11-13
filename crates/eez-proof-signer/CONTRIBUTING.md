@@ -24,8 +24,9 @@ the spec are appropriate in repository documentation.
 
 ## Current implementation
 
-- Production backends live in `eez-prover-stateless` and
-  `eez-prover-stateful`; both inherit this crate's service pipeline.
+- Production backends live in `eez-prover-stateless` (provers, see
+  `docs/provers.md`) and `eez-prover-stateful`; both inherit this crate's
+  service pipeline.
 - Sessions own bounded prefixes and fence asynchronous work with epochs.
 - Backends validate one block at a time, own reusable evidence and execution
   limits, and must bind every cache hit to submitted bytes and the exact parent.
@@ -126,7 +127,8 @@ cargo check --package eez-proof-signer --all-targets --locked
 cargo clippy --package eez-proof-signer --all-targets --all-features --locked -- -D warnings
 cargo test --package eez-proof-signer --locked
 RUSTDOCFLAGS='-D warnings' cargo doc --package eez-proof-signer --no-deps --locked
-cargo test --package eez-prover-stateless --package eez-prover-stateful --locked
+cargo test --package eez-prover-stateful --locked
+scripts/provers-cargo.sh test --package eez-prover-stateless
 ```
 
 Before updating the dependency pin, verify the fork change from a checkout of
