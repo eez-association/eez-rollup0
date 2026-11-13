@@ -405,10 +405,10 @@ fn proof_signer_binary() -> Result<PathBuf> {
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("target profile directory is not valid UTF-8"))?;
         // The signer builds from the provers/ submodule against this
-        // checkout's crates, into this target directory.
-        let target_dir = target_profile
-            .parent()
-            .ok_or_else(|| anyhow!("target profile directory has no parent"))?;
+        // checkout's crates, into the workspace target directory. Cargo
+        // nests a configured target triple below it, so the binary lands
+        // next to this test executable.
+        let target_dir = cargo_target_directory()?;
         let mut command = Command::new("bash");
         command
             .current_dir(repo_root())
@@ -433,6 +433,25 @@ fn proof_signer_binary() -> Result<PathBuf> {
     path.is_file()
         .then_some(path)
         .ok_or_else(|| anyhow!("eez-proof-signer build completed without producing the binary"))
+}
+
+/// The workspace target directory as Cargo resolves it (`CARGO_TARGET_DIR`,
+/// `build.target-dir`), without any target triple.
+fn cargo_target_directory() -> Result<PathBuf> {
+    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .current_dir(repo_root())
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .output()
+        .context("run cargo metadata")?;
+    if !output.status.success() {
+        bail!("cargo metadata failed with {}", output.status);
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse cargo metadata")?;
+    metadata["target_directory"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("cargo metadata has no target_directory"))
 }
 
 /// Configuration for one real `eez-proof-signer` process.
