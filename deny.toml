@@ -63,7 +63,6 @@ allow-git = [
     "https://github.com/paradigmxyz/revmc",
     # Interim reth fork carrying the genesis-unwind fix; see Cargo.toml [patch].
     "https://github.com/debjit-bw/reth",
-    "https://github.com/eez-association/stateless",
     "https://github.com/gnosischain/reth_gnosis",
     "https://github.com/gnosischain/rust-primitives.git",
     "https://github.com/sigp/discv5",

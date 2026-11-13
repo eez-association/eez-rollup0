@@ -49,7 +49,7 @@ flowchart LR
 | [`window.rs`](../src/window.rs) | Streamed structural admission and aggregate resource accounting |
 | [`validate.rs`](../src/validate.rs) | Checked-block evidence contract and shared evidence-shape checks; v1 window assembly |
 | [`validate/support.rs`](../src/validate/support.rs) | Identity-bound decoding/recovery, checkpoint planning, and checked-block construction |
-| [`eez-prover-stateless`](../../eez-prover-stateless/src/backend.rs) | Witness-backed execution, checked-block cache, scheduling and execution deadlines |
+| [`eez-prover-stateless`](https://github.com/eez-association/provers/blob/main/stateless-ecdsa/crates/eez-prover-stateless/src/backend.rs) (provers) | Witness-backed execution, checked-block cache, scheduling and execution deadlines |
 | [`eez-prover-stateful`](../../eez-prover-stateful/src/backend.rs) | Reth-backed execution/cache, checked supplemental checkpoints, current safe ancestry and forkchoice |
 | [`settlement/`](../src/settlement.rs) | Focused batch, block, state, inbound, outbound, and DA gates |
 | [`attest.rs`](../src/attest.rs) | Attestation identity and typed attestable-hash signing |

@@ -23,8 +23,9 @@ use alloy_consensus::Header;
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use eez_driver::BlockCommitterHandle;
+use eez_engine::EezEngineTypes;
 use eez_l1::L1CanonicalHead;
-use eez_primitives::{Block, BlockBody, engine::EezEngineTypes};
+use eez_primitives::{Block, BlockBody};
 use eez_seq_sig::{HeadTracker, VerifiedHead};
 use reth_consensus_common::validation::validate_body_against_header;
 use reth_network_p2p::{

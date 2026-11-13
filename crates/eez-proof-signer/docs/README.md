@@ -75,7 +75,7 @@ only when one flat test file would obscure the same ownership boundary:
   and quotas;
 - [`src/validate/tests.rs`](../src/validate/tests.rs) covers the backend-neutral
   backend-output contract;
-- [`eez-prover-stateless/src/backend/tests.rs`](../../eez-prover-stateless/src/backend/tests.rs)
+- [`eez-prover-stateless/src/backend/tests.rs`](https://github.com/eez-association/provers/blob/main/stateless-ecdsa/crates/eez-prover-stateless/src/backend/tests.rs)
   covers witness-backed replay and evidence;
 - [`eez-prover-stateful/src/backend/tests.rs`](../../eez-prover-stateful/src/backend/tests.rs)
   covers follower-backed replay and canonical snapshot handling;

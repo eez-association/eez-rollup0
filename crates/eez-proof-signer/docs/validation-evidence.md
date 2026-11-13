@@ -38,7 +38,7 @@ flowchart TB
 
 ## Startup initialization
 
-At startup, [`eez-prover-stateless/src/backend.rs`](../../eez-prover-stateless/src/backend.rs) loads the
+At startup, [`eez-prover-stateless/src/backend.rs`](https://github.com/eez-association/provers/blob/main/stateless-ecdsa/crates/eez-prover-stateless/src/backend.rs) loads the
 operator-configured Alloy `ChainConfig` or complete `Genesis` document once,
 then builds the Reth `ChainSpec` and EVM configuration shared by every request.
 

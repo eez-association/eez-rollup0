@@ -148,7 +148,7 @@ fn decoded_block_checks_execution_evidence_before_it_can_be_shared() {
     ] {
         let decoded = support::decode_match_and_recover_signers(
             &admitted,
-            &reth_chainspec::ChainSpec::default(),
+            &alloy_hardforks::EthereumChainHardforks::new([]),
         )
         .unwrap();
         let mut output = backend_output_for(std::slice::from_ref(&admitted))

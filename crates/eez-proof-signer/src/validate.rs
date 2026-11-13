@@ -117,9 +117,24 @@ pub(crate) fn wire_witness_item_count(witness: &WireExecutionWitness) -> usize {
 }
 
 /// Where a candidate is sealed: the pre-execution seal or a transaction
-/// boundary. Re-exported from the validator so both backends and this contract
-/// name one type.
-pub use stateless_reth::CheckpointAt;
+/// boundary. Both backends and this contract name this one type. Variant order
+/// is execution order, so the derived `Ord` is the order a request must be in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CheckpointAt {
+    /// After the pre-execution system calls (EIP-2935/4788), before transaction 0.
+    PreExecution,
+    /// Immediately after the transaction at this zero-based position.
+    Transaction(usize),
+}
+
+impl std::fmt::Display for CheckpointAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreExecution => write!(f, "pre-execution"),
+            Self::Transaction(index) => write!(f, "transaction {index}"),
+        }
+    }
+}
 
 /// One checkpoint position's replay outputs: the cumulative state root and the
 /// hash of the candidate block sealed over that prefix.

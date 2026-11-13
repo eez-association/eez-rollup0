@@ -14,15 +14,15 @@ use alloy_eips::eip7928::compute_block_access_list_hash;
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_debug::ExecutionWitness;
 use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome};
+use eez_engine::EezEngineTypes;
 use eez_evm::EezEvmConfig;
 use eez_primitives::Block;
 use eez_primitives::EezPrimitives;
 use eez_primitives::Receipt as EthereumReceipt;
-use eez_primitives::engine::EezEngineTypes;
 use eez_proof_signer::cancel::CancellationToken;
 use eez_proof_signer::validate::support::{
-    CheckpointPlan, check_cancellation, decode_match_and_recover_signers, observe_outbound_events,
-    system_sender_flags,
+    CheckpointPlan, candidate_block_hash, check_cancellation, decode_match_and_recover_signers,
+    observe_outbound_events, system_sender_flags,
 };
 use eez_proof_signer::validate::{
     AdmittedBlock, BackendBlockOutput, BackendWindowOutput, BlockAnchor, CheckpointAt,
@@ -48,7 +48,6 @@ use reth_storage_api::{
 };
 use revm::database::states::bundle_state::BundleRetention;
 use revm::state::bal::Bal;
-use stateless_reth::candidate_block_hash;
 use tracing::{debug, trace};
 
 const MAX_CACHED_CHECKPOINT_BLOCKS: usize = 32_768;

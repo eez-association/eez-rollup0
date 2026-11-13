@@ -1195,12 +1195,13 @@ one byte (`0x00` or `0x01`).
 
 The principal sources for this specification are:
 
-- `../eez-prover-stateless/src/config.rs`, `src/service.rs`, and `src/service/`
-  for configuration, request lifetime, deadlines, and error mapping;
+- `eez-prover-stateless/src/config.rs` (provers), `src/service.rs`, and
+  `src/service/` for configuration, request lifetime, deadlines, and error
+  mapping;
 - `src/window.rs` and `../eez-control-rpc/proto/prove.proto` for wire admission;
-- `src/validate.rs`, `src/validate/support.rs`,
-  `../eez-prover-stateless/src/backend.rs`, and
-  `../eez-prover-stateless/src/backend/chain_config.rs` for replay evidence;
+- `src/validate.rs`, `src/validate/support.rs`, and provers'
+  `eez-prover-stateless/src/backend.rs` and
+  `eez-prover-stateless/src/backend/chain_config.rs` for replay evidence;
 - `../eez-prover-stateful/src/config.rs`,
   `../eez-prover-stateful/src/backend.rs`, and `../eez-follower/src/lib.rs` for the
   follower-hosted stateful profile;

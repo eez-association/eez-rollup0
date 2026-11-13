@@ -483,5 +483,5 @@ A Composer implementation SHOULD test:
   `ECDSAProofSystem` contracts.
 
 The captured successful request in
-[`captured-devnet-window-84`](../eez-prover-stateless/tests/fixtures/captured-devnet-window-84/README.md)
+[`captured-devnet-window-84`](https://github.com/eez-association/provers/blob/main/stateless-ecdsa/crates/eez-prover-stateless/tests/fixtures/captured-devnet-window-84/README.md)
 provides a complete positive window and expected public-input hash.
