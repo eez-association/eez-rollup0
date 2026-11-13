@@ -1,188 +1,448 @@
-//! Native deposit minting and fee collection around the Ethereum EVM.
+//! The EEZ evm2 type family: Ethereum transaction handling plus native `0x76`
+//! deposits and genesis-configured fee collection.
 //!
-//! Delegates execution and inspector dispatch to Alloy 0.39.0's [`EthEvm`]:
-//! <https://github.com/alloy-rs/alloy-evm/blob/ba6f83b80aba8cf005175f4d776d8b90796c72d9/crates/evm/src/eth/mod.rs>.
+//! Ethereum transactions run evm2's standard handlers with [`EezTxHooks`], which
+//! credit the burned base fee to the fee collector. Native transactions run
+//! [`native`], built from the same public handler pieces.
 
-use alloy_evm::{
-    Database, EthEvm, EthEvmFactory, Evm, EvmEnv, EvmFactory, eth::EthEvmContext,
-    precompiles::PrecompilesMap,
+use alloy_consensus::{Transaction, Typed2718, transaction::Recovered};
+use alloy_eips::{eip2930::AccessList, eip7702::SignedAuthorization};
+use alloy_primitives::{Address, B256, Bytes, ChainId, TxKind, U256};
+use eez_primitives::{
+    EEZL2_ADDRESS, EezTxEnvelope, SYSTEM_ADDRESS, SYSTEM_TX_GAS_LIMIT, SYSTEM_TX_TYPE,
+    SystemTransaction,
 };
-use alloy_primitives::{Address, Bytes, TxKind, U256};
-use eez_primitives::{EEZL2_ADDRESS, SYSTEM_ADDRESS, SYSTEM_TX_GAS_LIMIT, SYSTEM_TX_TYPE};
-use revm::{
-    Inspector,
-    context::{BlockEnv, CfgEnv, TxEnv},
-    context_interface::{
-        Cfg, JournalTr, Transaction,
-        journaled_state::account::JournaledAccountTr,
-        result::{EVMError, HaltReason, ResultAndState},
+use evm2::{
+    BaseEvmConfigSelector, Evm, EvmFeatures, EvmTypesHost, SpecId, TxResult,
+    env::TxEnvExt,
+    ethereum::{
+        self as eth, TxEnvelope, default_settle_gas, eip1559, eip2930, eip4844, eip7702, legacy,
     },
-    inspector::NoOpInspector,
-    primitives::hardfork::SpecId,
-    state::Account,
+    handler::{GasSettlement, TxHandlerHooks},
+    interpreter::GasTracker,
+    registry::{HandlerError, HandlerResult, TxRegistry, TxRequest, handler},
 };
+use std::fmt;
 
-pub struct EezEvm<DB: Database, I> {
-    ethereum: EthEvm<DB, I, PrecompilesMap>,
-    fee_collector: Option<Address>,
+/// EEZ evm2 type family: evm2's Ethereum types with [`EezEvmTx`] as the
+/// transaction and the fee collector carried per EVM.
+#[derive(Debug, Clone, Copy)]
+pub struct EezEvmTypes(());
+
+impl EvmTypesHost for EezEvmTypes {
+    type ConfigSelector = BaseEvmConfigSelector;
+    type SpecId = SpecId;
+    type Tx = EezEvmTx;
+    type EvmExt = EezEvmExt;
+    type MessageExt = ();
+    type MessageResultExt = ();
+    type TxEnvExt = ();
+    type TxResultExt = ();
+    type BlockEnvExt = ();
+    type Host<'a> = Evm<'a, Self>;
 }
 
-impl<DB: Database, I> std::fmt::Debug for EezEvm<DB, I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EezEvm").finish_non_exhaustive()
-    }
+/// Per-EVM EEZ state, set by [`EezEvmFactory`] when it creates an EVM.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EezEvmExt {
+    /// Receives the base fee Ethereum burns. Absent (Ethereum L1 simulation), the
+    /// base fee is burned.
+    pub fee_collector: Option<Address>,
 }
 
-impl<DB: Database, I: Inspector<EthEvmContext<DB>>> Evm for EezEvm<DB, I> {
-    type DB = DB;
-    type Tx = TxEnv;
-    type Error = EVMError<DB::Error>;
-    type HaltReason = HaltReason;
-    type Spec = SpecId;
-    type BlockEnv = BlockEnv;
-    type Precompiles = PrecompilesMap;
-    type Inspector = I;
+/// Transaction executed by the EEZ EVM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EezEvmTx {
+    /// An Ethereum transaction.
+    Ethereum(TxEnvelope),
+    /// A native system transaction (`0x76`). It keeps its fields so the handler
+    /// re-validates the protocol sender and target.
+    System(SystemTransaction),
+}
 
-    fn block(&self) -> &BlockEnv {
-        self.ethereum.block()
-    }
-
-    fn cfg_env(&self) -> &CfgEnv {
-        self.ethereum.cfg_env()
-    }
-
-    fn chain_id(&self) -> u64 {
-        self.ethereum.chain_id()
-    }
-
-    /// Mint native value before Ethereum's validation and transfer, preserving
-    /// existing system funds. Revm errors discard the mint; reverted or halted
-    /// calls need the explicit rollback below. The native TxEnv supplies zero fees.
-    /// `EthEvm::transact_raw` dispatches to `inspect_tx` when its inspector is enabled,
-    /// so all paths below preserve the inspector installed by our factory.
-    fn transact_raw(&mut self, tx: TxEnv) -> Result<ResultAndState, Self::Error> {
-        if tx.tx_type != SYSTEM_TX_TYPE {
-            let Some(collector) = self.fee_collector else {
-                return self.ethereum.transact_raw(tx);
-            };
-            if self.cfg_env().is_fee_charge_disabled() {
-                return self.ethereum.transact_raw(tx);
-            }
-            // Ethereum has already deducted these fees and will refund unused
-            // gas and reward the beneficiary. Restore only the amount it burns.
-            // The minimum also handles simulations with base-fee checks disabled.
-            let base_fee = if self.cfg_env().spec.is_enabled_in(SpecId::LONDON) {
-                u128::from(self.block().basefee)
-                    .min(tx.effective_gas_price(u128::from(self.block().basefee)))
-            } else {
-                0
-            };
-            let mut output = self.ethereum.transact_raw(tx)?;
-            let fee = U256::from(base_fee) * U256::from(output.result.tx_gas_used());
-            if !fee.is_zero() {
-                // Load only after execution: preloading would warm the collector
-                // and change BALANCE/CALL gas costs in the transaction itself.
-                let account = match output.state.entry(collector) {
-                    revm::primitives::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                    revm::primitives::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(Account::from(
-                            self.ethereum
-                                .db_mut()
-                                .basic(collector)
-                                .map_err(EVMError::Database)?
-                                .unwrap_or_default(),
-                        ))
-                    }
-                };
-                // Preserve Ethereum's account lifecycle. A balance credit does
-                // not cancel deletion of a selfdestructed collector contract.
-                account.info.balance = account
-                    .info
-                    .balance
-                    .checked_add(fee)
-                    .ok_or_else(|| EVMError::Custom("fee collector balance overflow".into()))?;
-                account.mark_touch();
-            }
-            return Ok(output);
+impl EezEvmTx {
+    const fn ethereum(&self) -> Option<&TxEnvelope> {
+        match self {
+            Self::Ethereum(tx) => Some(tx),
+            Self::System(_) => None,
         }
-        // Direct TxEnv callers bypass envelope conversion; enforce native sender,
-        // target, and gas rules here before executing or minting value.
-        if tx.caller != SYSTEM_ADDRESS
-            || tx.kind != TxKind::Call(EEZL2_ADDRESS)
-            || tx.gas_limit != SYSTEM_TX_GAS_LIMIT
-            || tx.gas_price != 0
-        {
-            return Err(EVMError::Custom(
-                "invalid native system caller, target, or gas fields".into(),
+    }
+
+    const fn system(&self) -> Option<&SystemTransaction> {
+        match self {
+            Self::System(tx) => Some(tx),
+            Self::Ethereum(_) => None,
+        }
+    }
+}
+
+impl From<EezTxEnvelope> for EezEvmTx {
+    fn from(tx: EezTxEnvelope) -> Self {
+        match tx {
+            EezTxEnvelope::Ethereum(tx) => Self::Ethereum(tx.into()),
+            EezTxEnvelope::System(tx) => Self::System(tx.into_inner()),
+        }
+    }
+}
+
+impl reth_evm::FromRecoveredTx<EezTxEnvelope> for EezEvmTx {
+    fn from_recovered_tx(tx: Recovered<EezTxEnvelope>) -> Self {
+        tx.into_inner().into()
+    }
+}
+
+impl reth_evm::FromTxWithEncoded<EezTxEnvelope> for EezEvmTx {}
+
+/// Ethereum's signed envelope, for the env-deriving `EthEvmConfig`.
+type TransactionSigned = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>;
+
+impl reth_evm::FromRecoveredTx<TransactionSigned> for EezEvmTx {
+    fn from_recovered_tx(tx: Recovered<TransactionSigned>) -> Self {
+        Self::Ethereum(tx.into_inner().into())
+    }
+}
+
+impl reth_evm::FromTxWithEncoded<TransactionSigned> for EezEvmTx {}
+
+impl reth_evm::TransactionEnvMut for EezEvmTx {
+    /// Native transactions have a protocol-fixed gas budget.
+    fn set_gas_limit(&mut self, gas_limit: u64) {
+        if let Self::Ethereum(tx) = self {
+            tx.set_gas_limit(gas_limit);
+        }
+    }
+
+    /// Native transactions carry no access list.
+    fn set_access_list(&mut self, access_list: AccessList) {
+        if let Self::Ethereum(tx) = self {
+            tx.set_access_list(access_list);
+        }
+    }
+}
+
+impl Typed2718 for EezEvmTx {
+    fn ty(&self) -> u8 {
+        match self {
+            Self::Ethereum(tx) => tx.ty(),
+            Self::System(_) => SYSTEM_TX_TYPE,
+        }
+    }
+}
+
+macro_rules! delegate {
+    ($self:ident, $tx:ident => $expr:expr) => {
+        match $self {
+            Self::Ethereum($tx) => $expr,
+            Self::System($tx) => $expr,
+        }
+    };
+}
+
+impl Transaction for EezEvmTx {
+    fn chain_id(&self) -> Option<ChainId> {
+        delegate!(self, tx => tx.chain_id())
+    }
+    fn nonce(&self) -> u64 {
+        delegate!(self, tx => tx.nonce())
+    }
+    fn gas_limit(&self) -> u64 {
+        match self {
+            Self::Ethereum(tx) => tx.gas_limit(),
+            Self::System(_) => SYSTEM_TX_GAS_LIMIT,
+        }
+    }
+    fn gas_price(&self) -> Option<u128> {
+        delegate!(self, tx => tx.gas_price())
+    }
+    fn max_fee_per_gas(&self) -> u128 {
+        delegate!(self, tx => tx.max_fee_per_gas())
+    }
+    fn max_priority_fee_per_gas(&self) -> Option<u128> {
+        delegate!(self, tx => tx.max_priority_fee_per_gas())
+    }
+    fn max_fee_per_blob_gas(&self) -> Option<u128> {
+        delegate!(self, tx => tx.max_fee_per_blob_gas())
+    }
+    fn priority_fee_or_price(&self) -> u128 {
+        delegate!(self, tx => tx.priority_fee_or_price())
+    }
+    fn effective_gas_price(&self, base_fee: Option<u64>) -> u128 {
+        delegate!(self, tx => tx.effective_gas_price(base_fee))
+    }
+    fn is_dynamic_fee(&self) -> bool {
+        delegate!(self, tx => tx.is_dynamic_fee())
+    }
+    fn kind(&self) -> TxKind {
+        delegate!(self, tx => tx.kind())
+    }
+    fn is_create(&self) -> bool {
+        delegate!(self, tx => tx.is_create())
+    }
+    fn value(&self) -> U256 {
+        delegate!(self, tx => tx.value())
+    }
+    fn input(&self) -> &Bytes {
+        delegate!(self, tx => tx.input())
+    }
+    fn access_list(&self) -> Option<&AccessList> {
+        delegate!(self, tx => tx.access_list())
+    }
+    fn blob_versioned_hashes(&self) -> Option<&[B256]> {
+        delegate!(self, tx => tx.blob_versioned_hashes())
+    }
+    fn authorization_list(&self) -> Option<&[SignedAuthorization]> {
+        delegate!(self, tx => tx.authorization_list())
+    }
+}
+
+/// Rejections specific to EEZ execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EezEvmError {
+    /// A native transaction not from the protocol sender to the EEZL2 predeploy.
+    InvalidNativeTransaction,
+    /// The native deposit would overflow the system balance.
+    NativeDepositOverflow,
+    /// The fee credit would overflow the collector balance.
+    FeeCollectorOverflow,
+}
+
+impl fmt::Display for EezEvmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidNativeTransaction => "invalid native system caller or target",
+            Self::NativeDepositOverflow => "native deposit balance overflow",
+            Self::FeeCollectorOverflow => "fee collector balance overflow",
+        })
+    }
+}
+
+impl std::error::Error for EezEvmError {}
+
+/// Hooks for Ethereum transactions: credit the base fee Ethereum burns to the
+/// fee collector.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EezTxHooks;
+
+impl TxHandlerHooks<EezEvmTypes> for EezTxHooks {
+    /// After Ethereum's refund and beneficiary reward, credit
+    /// `min(basefee, effective price) × gas used`. The minimum also covers
+    /// simulations with base-fee checks off. Only from London, only with fee
+    /// charging on, and only a non-zero amount: a zero credit would touch the
+    /// collector and change state.
+    fn settle_transaction(
+        host: &mut Evm<'_, EezEvmTypes>,
+        _envelope: &EezEvmTx,
+        gas: GasSettlement<EezEvmTypes>,
+    ) -> HandlerResult<TxResult<EezEvmTypes>> {
+        let gas_price = gas.gas_price;
+        let result = default_settle_gas(host, gas)?;
+        let Some(collector) = host.ext().fee_collector else {
+            return Ok(result);
+        };
+        if !host.spec_id().enables(SpecId::LONDON) || !host.feature(EvmFeatures::FEE_CHARGE) {
+            return Ok(result);
+        }
+        let fee = host.block().basefee.min(gas_price) * U256::from(result.tx_gas_used());
+        if !fee.is_zero() {
+            let mut account = host.state_mut().account(&collector)?;
+            let balance = account
+                .balance()
+                .checked_add(fee)
+                .ok_or_else(|| HandlerError::external(EezEvmError::FeeCollectorOverflow))?;
+            account.set_balance(balance);
+        }
+        Ok(result)
+    }
+}
+
+/// The transaction registry for `spec_id`: evm2's Ethereum handlers at their
+/// forks with [`EezTxHooks`], and the native handler at every fork.
+pub fn eez_tx_registry(spec_id: SpecId) -> TxRegistry<EezEvmTypes, TxResult<EezEvmTypes>> {
+    type T = EezEvmTypes;
+    type H = EezTxHooks;
+
+    let mut registry = TxRegistry::new()
+        .with_handler(
+            0,
+            |tx: &EezEvmTx| tx.ethereum().and_then(TxEnvelope::as_legacy),
+            handler(
+                legacy::prepare_with_hooks::<T, H>,
+                legacy::execute_prepared::<T, H>,
+            ),
+        )
+        .with_handler(
+            SYSTEM_TX_TYPE,
+            EezEvmTx::system,
+            handler(native::prepare, native::execute),
+        );
+    if spec_id.enables(SpecId::BERLIN) {
+        registry.register(
+            1,
+            |tx: &EezEvmTx| tx.ethereum().and_then(TxEnvelope::as_eip2930),
+            handler(
+                eip2930::prepare_with_hooks::<T, H>,
+                eip2930::execute_prepared::<T, H>,
+            ),
+        );
+    }
+    if spec_id.enables(SpecId::LONDON) {
+        registry.register(
+            2,
+            |tx: &EezEvmTx| tx.ethereum().and_then(TxEnvelope::as_eip1559),
+            handler(
+                eip1559::prepare_with_hooks::<T, H>,
+                eip1559::execute_prepared::<T, H>,
+            ),
+        );
+    }
+    if spec_id.enables(SpecId::CANCUN) {
+        registry.register(
+            3,
+            |tx: &EezEvmTx| tx.ethereum().and_then(TxEnvelope::as_eip4844),
+            handler(
+                eip4844::prepare_with_hooks::<T, H>,
+                eip4844::execute_prepared::<T, H>,
+            ),
+        );
+    }
+    if spec_id.enables(SpecId::PRAGUE) {
+        registry.register(
+            4,
+            |tx: &EezEvmTx| tx.ethereum().and_then(TxEnvelope::as_eip7702),
+            handler(
+                eip7702::prepare_with_hooks::<T, H>,
+                eip7702::execute_prepared::<T, H>,
+            ),
+        );
+    }
+    registry
+}
+
+/// The native `0x76` handler: Ethereum's legacy handler without gas-price
+/// validation or the upfront fee charge, around a minted deposit.
+///
+/// The mint precedes the sender's balance check and the frame checkpoint, so a
+/// failed call keeps it; the handler restores the pre-mint balance. Any
+/// validation error discards the whole transaction state, mint included.
+mod native {
+    use super::{
+        EEZL2_ADDRESS, EezEvmError, EezEvmTypes, GasSettlement, GasTracker, HandlerError,
+        HandlerResult, SYSTEM_ADDRESS, SYSTEM_TX_GAS_LIMIT, SystemTransaction, TxEnvExt, TxKind,
+        TxRequest, TxResult, U256, default_settle_gas, eth,
+    };
+
+    pub(super) struct Prepared {
+        intrinsic: u64,
+        floor_gas: u64,
+        sender_nonce: u64,
+        previous_balance: U256,
+    }
+
+    pub(super) fn prepare(
+        req: &mut TxRequest<'_, '_, EezEvmTypes, SystemTransaction>,
+    ) -> HandlerResult<Prepared> {
+        let caller = req.tx.signer();
+        let tx = req.tx.inner();
+        if caller != SYSTEM_ADDRESS || tx.to != EEZL2_ADDRESS {
+            return Err(HandlerError::external(
+                EezEvmError::InvalidNativeTransaction,
             ));
         }
-        if tx.value.is_zero() {
-            return self.ethereum.transact_raw(tx);
-        }
+        let to = TxKind::Call(tx.to);
+        let version = req.host.version();
+        eth::validate_chain_id(version, Some(tx.chain_id), true)?;
+        eth::validate_tx_gas_limit_cap(version, SYSTEM_TX_GAS_LIMIT)?;
+        eth::validate_block_gas_limit(version, SYSTEM_TX_GAS_LIMIT, req.host.block().gas_limit)?;
+        eth::validate_nonce_not_overflow(tx.nonce)?;
+        let (intrinsic, floor_gas) =
+            eth::intrinsic_and_floor_gas(version, caller, to, &tx.input, 0, 0, tx.value);
+        eth::validate_intrinsic_gas(SYSTEM_TX_GAS_LIMIT, intrinsic, 0)?;
+        eth::validate_floor_gas(SYSTEM_TX_GAS_LIMIT, floor_gas)?;
+        eth::validate_execution_gas_limit_cap(version, SYSTEM_TX_GAS_LIMIT, intrinsic, floor_gas)?;
 
-        let journal = &mut self.ethereum.ctx_mut().journaled_state;
-        let funding = journal
-            .load_account_with_code_mut(SYSTEM_ADDRESS)
-            .map_err(EVMError::Database)
-            .and_then(|mut account| {
-                let balance = *account.balance();
-                let funded = balance
+        let previous_balance = {
+            let mut system = req.host.state_mut().account(&SYSTEM_ADDRESS)?;
+            let previous = system.balance();
+            if !tx.value.is_zero() {
+                let funded = previous
                     .checked_add(tx.value)
-                    .ok_or_else(|| EVMError::Custom("native deposit balance overflow".into()))?;
-                account.set_balance(funded);
-                Ok(balance)
-            });
-        let previous_balance = match funding {
-            Ok(balance) => balance,
-            Err(error) => {
-                // These errors occur before Ethereum's transact/finalize path.
-                // Discard the loaded state so the next transaction starts clean.
-                journal.finalize();
-                return Err(error);
+                    .ok_or_else(|| HandlerError::external(EezEvmError::NativeDepositOverflow))?;
+                system.set_balance(funded);
             }
+            previous
         };
-        let mut output = self.ethereum.transact_raw(tx)?;
-        if !output.result.is_success() {
-            // The outer call already rolled back all transfers, but the mint
-            // precedes that call's checkpoint. Remove only that mint; retain
-            // the normal nonce increment and the receipt's metered gas usage.
-            output
-                .state
-                .get_mut(&SYSTEM_ADDRESS)
-                .expect("executed native transaction has a caller account")
-                .info
-                .balance = previous_balance;
+        let sender_nonce =
+            eth::validate_sender_and_bump_nonce(req.host, caller, tx.nonce, tx.value)?;
+        eth::warm_base_accounts(req.host, to);
+        Ok(Prepared {
+            intrinsic,
+            floor_gas,
+            sender_nonce,
+            previous_balance,
+        })
+    }
+
+    pub(super) fn execute(
+        req: TxRequest<'_, '_, EezEvmTypes, SystemTransaction>,
+        prepared: Prepared,
+    ) -> HandlerResult<TxResult<EezEvmTypes>> {
+        let Prepared {
+            intrinsic,
+            floor_gas,
+            sender_nonce,
+            previous_balance,
+        } = prepared;
+        let caller = req.tx.signer();
+        let tx = req.tx.inner();
+        let (execution_gas_limit, reservoir) =
+            eth::initial_gas_and_reservoir(req.host.version(), SYSTEM_TX_GAS_LIMIT, intrinsic, 0);
+        *req.host.tx_env_mut() = TxEnvExt {
+            origin: caller,
+            gas_price: U256::ZERO,
+            chain_id: U256::from(req.host.version().chain_id),
+            ..TxEnvExt::default()
+        };
+        let mut tx_gas =
+            GasTracker::new_with_execution_gas_and_reservoir(execution_gas_limit, reservoir);
+        let frame = eth::prepare_initial_frame(
+            req.host,
+            caller,
+            sender_nonce,
+            TxKind::Call(tx.to),
+            &tx.input,
+            tx.value,
+            &mut tx_gas,
+        )?;
+        let result = eth::execute_initial_frame(
+            req.host,
+            frame,
+            &mut tx_gas,
+            execution_gas_limit,
+            reservoir,
+        )?;
+        if !result.is_success() && !tx.value.is_zero() {
+            // The frame rolled back the transfer but not the mint before it.
+            req.host
+                .state_mut()
+                .account(&SYSTEM_ADDRESS)?
+                .set_balance(previous_balance);
         }
-        Ok(output)
-    }
-
-    fn transact_system_call(
-        &mut self,
-        caller: Address,
-        contract: Address,
-        data: Bytes,
-    ) -> Result<ResultAndState, Self::Error> {
-        self.ethereum.transact_system_call(caller, contract, data)
-    }
-
-    fn finish(self) -> (DB, EvmEnv) {
-        self.ethereum.finish()
-    }
-
-    fn set_inspector_enabled(&mut self, enabled: bool) {
-        self.ethereum.set_inspector_enabled(enabled);
-    }
-
-    fn components(&self) -> (&DB, &I, &PrecompilesMap) {
-        self.ethereum.components()
-    }
-
-    fn components_mut(&mut self) -> (&mut DB, &mut I, &mut PrecompilesMap) {
-        self.ethereum.components_mut()
+        default_settle_gas(
+            req.host,
+            GasSettlement {
+                caller,
+                gas_price: U256::ZERO,
+                gas_limit: SYSTEM_TX_GAS_LIMIT,
+                floor_gas,
+                initial_state_gas: 0,
+                state_refund: 0,
+                result,
+            },
+        )
     }
 }
 
-/// Installs identical minting and fee routing for ordinary and inspected execution.
+/// Creates EEZ EVMs: the registry above and the configured fee collector.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EezEvmFactory {
     fee_collector: Option<Address>,
@@ -194,32 +454,19 @@ impl EezEvmFactory {
     }
 }
 
-impl EvmFactory for EezEvmFactory {
-    type Evm<DB: Database, I: Inspector<EthEvmContext<DB>>> = EezEvm<DB, I>;
-    type Context<DB: Database> = EthEvmContext<DB>;
-    type Tx = TxEnv;
-    type Error<DBError: revm::database_interface::DBErrorMarker> = EVMError<DBError>;
-    type HaltReason = HaltReason;
-    type Spec = SpecId;
-    type BlockEnv = BlockEnv;
-    type Precompiles = PrecompilesMap;
+impl reth_evm_ethereum::EvmFactory for EezEvmFactory {
+    type Types = EezEvmTypes;
+    type SpecId = SpecId;
 
-    fn create_evm<DB: Database>(&self, db: DB, input: EvmEnv) -> EezEvm<DB, NoOpInspector> {
-        EezEvm {
-            ethereum: EthEvmFactory::default().create_evm(db, input),
-            fee_collector: self.fee_collector,
-        }
+    fn spec_id(&self, spec: SpecId) -> SpecId {
+        spec
     }
 
-    fn create_evm_with_inspector<DB: Database, I: Inspector<Self::Context<DB>>>(
-        &self,
-        db: DB,
-        input: EvmEnv,
-        inspector: I,
-    ) -> EezEvm<DB, I> {
-        EezEvm {
-            ethereum: EthEvmFactory::default().create_evm_with_inspector(db, input, inspector),
-            fee_collector: self.fee_collector,
-        }
+    fn tx_registry(&self, spec: SpecId) -> TxRegistry<EezEvmTypes, TxResult<EezEvmTypes>> {
+        eez_tx_registry(spec)
+    }
+
+    fn configure_evm(&self, evm: &mut Evm<'_, EezEvmTypes>) {
+        evm.ext_mut().fee_collector = self.fee_collector;
     }
 }

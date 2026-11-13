@@ -1,36 +1,30 @@
 //! Adapts Ethereum execution to EEZ transaction and receipt types.
 //!
-//! The pinned `EthEvmConfig` fixes its primitives to Ethereum types, which cannot
-//! represent native type `0x76`. This wrapper selects `EezPrimitives`, preserves
-//! the native receipt type, and decodes native transactions in Engine payloads.
-//! Ethereum transaction execution, gas accounting, block assembly, and header
-//! environment are reused. L2 block processing keeps EIP-2935 but disables
-//! beacon-root updates and consensus-layer requests. L1 composition only uses
-//! transaction simulation, bypassing block processing. `eez-primitives` defines
-//! the zero-fee native TxEnv; `evm` adds deposit minting, rollback, and
-//! genesis-configured fee collection.
+//! reth's `EthEvmConfig` fixes its primitives to Ethereum types, which cannot
+//! represent native type `0x76`. This configuration selects `EezPrimitives` and
+//! the EEZ evm2 type family ([`EezEvmTypes`]), preserves the native receipt
+//! type, and decodes native transactions in Engine payloads. Ethereum
+//! environments, gas accounting and block assembly are reused. L2 block
+//! processing keeps EIP-2935 but has no beacon roots, withdrawals or
+//! consensus-layer requests ([`block`]). L1 composition only uses transaction
+//! simulation, bypassing block processing.
 //!
 //! Configuration adapted from reth's `EthEvmConfig` at the pinned revision:
-//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/evm/src/lib.rs>.
-//! Receipt construction follows Alloy 0.39.0's Ethereum receipt builder:
-//! <https://github.com/alloy-rs/alloy-evm/blob/ba6f83b80aba8cf005175f4d776d8b90796c72d9/crates/evm/src/eth/receipt_builder.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.11.0/crates/ethereum/evm/src/lib.rs>.
 
 use alloy_consensus::{Header, Typed2718};
 use alloy_eips::Decodable2718;
-use alloy_evm::eth::{
-    EthBlockExecutionCtx, EthBlockExecutorFactory,
-    receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx},
-    spec::EthExecutorSpec,
-};
 use alloy_primitives::{Address, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_primitives::{Block, EezPrimitives, EezTxEnvelope, EezTxType, Receipt};
-use reth_chainspec::{ChainSpec, EthChainSpec, Hardforks};
+use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, Hardforks};
 use reth_evm::{
-    ConfigureEngineEvm, ConfigureEvm, Evm, EvmEnv, EvmEnvFor, ExecutableTxIterator,
-    ExecutionCtxFor, NextBlockEnvAttributes,
+    ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor,
+    NextBlockEnvAttributes, ReceiptBuilder, ReceiptBuilderCtx,
 };
-use reth_evm_ethereum::{EthBlockAssembler, EthEvmConfig};
+use reth_evm_ethereum::{
+    EthBlockAssembler, EthBlockExecutionCtx, EthBlockExecutorFactory, EthEvmConfig, EthEvmEnv,
+};
 use reth_primitives_traits::{
     SealedBlock, SealedHeader, SignedTransaction, transaction::error::InvalidTransactionError,
 };
@@ -39,8 +33,8 @@ use std::{borrow::Cow, fmt, sync::Arc};
 
 mod block;
 mod evm;
-pub use block::EezBlockExecutorFactory;
-pub use evm::EezEvmFactory;
+pub use block::{EezBlockExecutor, EezBlockExecutorFactory};
+pub use evm::{EezEvmError, EezEvmExt, EezEvmFactory, EezEvmTx, EezEvmTypes, EezTxHooks};
 
 /// Read the consensus fee destination. Absence retains historical Ethereum fee
 /// burning, including Ethereum L1 simulation. A configured value must be an address.
@@ -52,17 +46,12 @@ pub fn fee_collector(config: &alloy_genesis::ChainConfig) -> Result<Option<Addre
         .transpose()
 }
 
-/// Maximum declared `tx.gas` accepted by the current EVM rules.
-/// Amsterdam allows the envelope limit to include separately metered state gas,
-/// so only its regular-gas accounting uses the configured cap.
+/// Maximum declared `tx.gas` accepted by the current EVM rules, `None` when uncapped.
+/// Under EIP-8037 `tx.gas` is bounded by the total cap, not the execution cap.
 #[must_use]
-pub fn declared_tx_gas_limit_cap(cfg: &impl revm::context_interface::Cfg) -> Option<u64> {
-    if cfg.is_amsterdam_eip8037_enabled() {
-        None
-    } else {
-        let cap = cfg.tx_gas_limit_cap();
-        (cap != u64::MAX).then_some(cap)
-    }
+pub fn declared_tx_gas_limit_cap(version: &evm2::Version) -> Option<u64> {
+    let cap = version.tx_gas_caps().0;
+    (cap != u64::MAX).then_some(cap)
 }
 
 /// Enforce L2 transaction support during construction and replay. The underlying
@@ -116,18 +105,33 @@ impl ReceiptBuilder for EezReceiptBuilder {
 
     /// Preserve native type `0x76` in the receipt root; Ethereum's receipt builder
     /// only accepts its own type enum. Status, gas, and logs are unchanged.
-    fn build_receipt<E: Evm>(&self, ctx: ReceiptBuilderCtx<'_, EezTxType, E>) -> Receipt {
+    fn build_receipt<T: evm2::EvmTypes>(
+        &self,
+        ctx: ReceiptBuilderCtx<EezTxType, evm2::TxResult<T>>,
+    ) -> Receipt {
+        let ReceiptBuilderCtx {
+            tx_type,
+            result,
+            cumulative_gas_used,
+        } = ctx;
         Receipt {
-            tx_type: ctx.tx_type,
-            success: ctx.result.is_success(),
-            cumulative_gas_used: ctx.cumulative_gas_used,
-            logs: ctx.result.into_logs(),
+            tx_type,
+            success: result.status,
+            cumulative_gas_used,
+            logs: result.logs,
         }
     }
 }
 
+/// Copies an environment derived for Ethereum types into the EEZ type family.
+/// Both share the spec, runtime version and block environment.
+fn eez_env(env: EthEvmEnv) -> EthEvmEnv<EezEvmTypes> {
+    EthEvmEnv::new_with_version(env.spec, env.block, env.version)
+}
+
 #[derive(Debug, Clone)]
 pub struct EezEvmConfig<C = ChainSpec> {
+    /// Derives environments and contexts; never executes.
     ethereum: EthEvmConfig<C>,
     executor: EezBlockExecutorFactory<C>,
 }
@@ -139,7 +143,11 @@ impl<C: EthChainSpec> EezEvmConfig<C> {
         Ok(Self {
             ethereum: EthEvmConfig::new(chain_spec.clone()),
             executor: EezBlockExecutorFactory {
-                ethereum: EthBlockExecutorFactory::new(EezReceiptBuilder, chain_spec, factory),
+                ethereum: EthBlockExecutorFactory::new_with_receipt_builder(
+                    EezReceiptBuilder,
+                    chain_spec,
+                    factory,
+                ),
             },
         })
     }
@@ -149,7 +157,7 @@ impl<C: EthChainSpec> EezEvmConfig<C> {
     }
 }
 
-impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> ConfigureEvm
+impl<C: EthChainSpec<Header = Header> + EthereumHardforks + Hardforks + 'static> ConfigureEvm
     for EezEvmConfig<C>
 {
     type Primitives = EezPrimitives;
@@ -166,18 +174,18 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
         &self.ethereum.block_assembler
     }
 
-    fn evm_env(&self, header: &Header) -> Result<EvmEnv, Self::Error> {
-        self.ethereum.evm_env(header).map_err(AnyError::new)
+    fn evm_env(&self, header: &Header) -> Result<EvmEnvFor<Self>, Self::Error> {
+        let Ok(env) = self.ethereum.evm_env(header);
+        Ok(eez_env(env))
     }
 
     fn next_evm_env(
         &self,
         parent: &Header,
         attributes: &NextBlockEnvAttributes,
-    ) -> Result<EvmEnv, Self::Error> {
-        self.ethereum
-            .next_evm_env(parent, attributes)
-            .map_err(AnyError::new)
+    ) -> Result<EvmEnvFor<Self>, Self::Error> {
+        let Ok(env) = self.ethereum.next_evm_env(parent, attributes);
+        Ok(eez_env(env))
     }
 
     /// Reject blobs on block import and stateless proof replay, then reuse
@@ -185,7 +193,10 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<Block>,
-    ) -> Result<EthBlockExecutionCtx<'a>, Self::Error> {
+    ) -> Result<EthBlockExecutionCtx<'a>, Self::Error>
+    where
+        Self: 'a,
+    {
         ensure_no_withdrawals(
             block
                 .body()
@@ -224,19 +235,17 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static> C
                 .as_ref()
                 .map_or(0, |withdrawals| withdrawals.len()),
         )?;
-        self.ethereum
-            .context_for_next_block(parent, attributes)
-            .map_err(AnyError::new)
+        let Ok(ctx) = self.ethereum.context_for_next_block(parent, attributes);
+        Ok(ctx)
     }
 }
 
-impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static>
+impl<C: EthChainSpec<Header = Header> + EthereumHardforks + Hardforks + 'static>
     ConfigureEngineEvm<ExecutionData> for EezEvmConfig<C>
 {
     fn evm_env_for_payload(&self, payload: &ExecutionData) -> Result<EvmEnvFor<Self>, Self::Error> {
-        self.ethereum
-            .evm_env_for_payload(payload)
-            .map_err(AnyError::new)
+        let Ok(env) = self.ethereum.evm_env_for_payload(payload);
+        Ok(eez_env(env))
     }
 
     fn context_for_payload<'a>(
@@ -244,9 +253,8 @@ impl<C: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static>
         payload: &'a ExecutionData,
     ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
         ensure_no_withdrawals(payload.payload.withdrawals().map_or(0, Vec::len))?;
-        self.ethereum
-            .context_for_payload(payload)
-            .map_err(AnyError::new)
+        let Ok(ctx) = self.ethereum.context_for_payload(payload);
+        Ok(ctx)
     }
 
     /// Decode native envelopes and reject blobs before Engine replay. Native
