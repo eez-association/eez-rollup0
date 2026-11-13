@@ -4,3 +4,8 @@
 	# The gitlink pins the protocol revision. Upgrade it deliberately by
 	# checking out the desired revision in the submodule and committing the
 	# resulting gitlink change.
+[submodule "provers"]
+	path = provers
+	url = https://github.com/eez-association/provers.git
+	# The gitlink pins the stateless proof signer (stateless-ecdsa/). Upgrade
+	# it the same way as eez-core-protocol.
