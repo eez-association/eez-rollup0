@@ -89,6 +89,8 @@ jobs:
         run: scripts/provers-cargo.sh nextest run --cargo-profile ci-e2e --target-dir target --workspace --no-fail-fast
       - name: Payload conformance vectors
         run: cargo nextest run --locked --cargo-profile ci-e2e -p eez-payload-codec --test conformance --no-fail-fast
+      - name: EVM golden fixtures (node EVM, fixtures from provers/)
+        run: cargo nextest run --locked --cargo-profile ci-e2e -p eez-evm --test golden --no-fail-fast
 
   contract-tests:
     name: Contract Tests
