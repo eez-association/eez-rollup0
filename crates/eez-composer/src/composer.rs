@@ -1866,11 +1866,35 @@ where
         partial: crate::optimistic::FailedBatch,
     ) {
         let sync_height = partial.sync_height;
-        // A guess would drop a tx that must return, or re-queue one whose nonce
-        // is gone and lose it on a later reorg.
-        let Some(nonces) = self.source_nonces(rollup_id, rollup, &partial.txs).await else {
+        let Some(l1_tip) = rollup.l1_head.last_indexed() else {
             return;
         };
+        let l2_head = self.inner.committer.last_header().hash();
+        // A guess would drop a tx that must return, or re-queue one whose nonce
+        // is gone and lose it on a later reorg.
+        let Some(nonces) = self
+            .source_nonces(
+                rollup_id,
+                rollup,
+                &partial.txs,
+                l1_tip.post.l1_block_hash,
+                l2_head,
+            )
+            .await
+        else {
+            return;
+        };
+        // Keep slow nonce RPCs outside the reconcile guard. Deriver changes
+        // the index and head under it, so validate the exact snapshots before
+        // claiming the ledger entry or mutating the pool. A height check alone
+        // misses a retreat followed by a same-height replacement.
+        let _guard = self.inner.committer.begin_reconcile().await;
+        if rollup.l1_head.cursor() < sync_height
+            || rollup.l1_head.last_indexed().map(|tip| tip.post) != Some(l1_tip.post)
+            || self.inner.committer.last_header().hash() != l2_head
+        {
+            return; // Retain every tx for reorg recovery or a fresh disposition.
+        }
         let (spent, culprit) = partial_disposition(&partial.txs, &nonces);
         // Only spent txs can be stranded by a reorg; the re-queued ones are the
         // pool's again.
@@ -1922,9 +1946,9 @@ where
         rollup_id: u64,
         rollup: &RollupState<L2>,
         txs: &[HeldTx],
+        l1_block: B256,
+        head: B256,
     ) -> Option<HashMap<(Address, Direction), u64>> {
-        let l1_block = rollup.l1_head.last_indexed()?.post.l1_block_hash;
-        let head = self.inner.committer.last_header().hash();
         let mut nonces = match rollup.l2_provider.state_by_block_hash(head) {
             Ok(state) => outbound_source_nonces_for_drain(state.as_ref(), rollup_id, txs),
             Err(error) => {
@@ -5152,6 +5176,9 @@ async fn sign_post_batch_tx(
         raw: Bytes::from(buf),
     })
 }
+
+#[cfg(test)]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
