@@ -4,10 +4,11 @@
 # dependency-layer caching — reth is a large, rarely-changing tree, so
 # the cooked-deps layer is reused across code changes.
 #
-# The build is self-contained in `crates/` and `Cargo.{toml,lock}`; the
+# The node build is self-contained in `crates/` and `Cargo.{toml,lock}`; the
 # Solidity protocol submodule and `contracts/` are NOT needed (ABI is
-# inline `sol!`). Contract deploys are a separate `forge` step (see
-# scripts/deploy.sh + README).
+# inline `sol!`). The proof-signer target also needs the provers/ submodule.
+# Contract deploys are a separate `forge` step (see scripts/deploy.sh +
+# README).
 
 # ── chef base: toolchain + system deps reth/mdbx/secp256k1 need ───────
 FROM rust:1.95-bookworm AS chef
@@ -51,7 +52,7 @@ COPY --from=planner /build/recipe.json recipe.json
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     cargo chef cook --profile "$BUILD_PROFILE" --recipe-path recipe.json \
-        --package eez-node --package eez-follower --package eez-prover-stateless
+        --package eez-node --package eez-follower
 # Workspace sources; only this layer rebuilds on first-party code changes.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -60,18 +61,32 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     --mount=type=cache,id=eez-node-target,target=/build/target,sharing=locked \
     cargo build --profile "$BUILD_PROFILE" -p eez-node --bin eez-composer --example genesis_state_root --example genesis_block_hash \
     && cargo build --profile "$BUILD_PROFILE" -p eez-follower --bin eez-follower \
-    && cargo build --locked --profile "$BUILD_PROFILE" -p eez-prover-stateless --bin eez-proof-signer \
-    && cp "target/$BUILD_PROFILE/eez-proof-signer" /build/eez-proof-signer \
     && cp "target/$BUILD_PROFILE/eez-composer" /build/eez-composer \
     && cp "target/$BUILD_PROFILE/eez-follower" /build/eez-follower \
     && cp "target/$BUILD_PROFILE/examples/genesis_state_root" /build/genesis_state_root \
     && cp "target/$BUILD_PROFILE/examples/genesis_block_hash" /build/genesis_block_hash
 
-# CI builds this target after the node image, reusing the same builder layers.
+# ── prover-builder: the stateless signer from the provers/ submodule ──
+# A separate workspace with its own lockfile (reth v2.7.0 + revm), built against
+# this checkout's crates by scripts/provers-cargo.sh. Those crates inherit from
+# the root Cargo.toml, so the root manifest and crates/ are copied too.
+FROM chef AS prover-builder
+ARG BUILD_PROFILE=release
+COPY Cargo.toml ./
+COPY crates ./crates
+COPY scripts/provers-cargo.sh ./scripts/provers-cargo.sh
+COPY provers/stateless-ecdsa ./provers/stateless-ecdsa
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=eez-prover-target,target=/build/target,sharing=locked \
+    bash scripts/provers-cargo.sh build --profile "$BUILD_PROFILE" --target-dir target \
+        -p eez-prover-stateless --bin eez-proof-signer \
+    && cp "target/$BUILD_PROFILE/eez-proof-signer" /build/eez-proof-signer
+
 FROM debian:bookworm-slim AS proof-signer
 RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder --chmod=0555 /build/eez-proof-signer /usr/local/bin/eez-proof-signer
+COPY --from=prover-builder --chmod=0555 /build/eez-proof-signer /usr/local/bin/eez-proof-signer
 WORKDIR /app
 USER 65532:65532
 EXPOSE 50061/tcp

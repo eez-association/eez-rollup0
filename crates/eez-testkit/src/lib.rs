@@ -404,15 +404,24 @@ fn proof_signer_binary() -> Result<PathBuf> {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("target profile directory is not valid UTF-8"))?;
-        let mut command = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-        command.current_dir(repo_root()).args([
-            "build",
-            "--locked",
-            "-p",
-            "eez-prover-stateless",
-            "--bin",
-            "eez-proof-signer",
-        ]);
+        // The signer builds from the provers/ submodule against this
+        // checkout's crates, into this target directory.
+        let target_dir = target_profile
+            .parent()
+            .ok_or_else(|| anyhow!("target profile directory has no parent"))?;
+        let mut command = Command::new("bash");
+        command
+            .current_dir(repo_root())
+            .args([
+                "scripts/provers-cargo.sh",
+                "build",
+                "-p",
+                "eez-prover-stateless",
+                "--bin",
+                "eez-proof-signer",
+            ])
+            .arg("--target-dir")
+            .arg(target_dir);
         if profile != "debug" {
             command.args(["--profile", profile]);
         }
