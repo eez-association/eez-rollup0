@@ -16,5 +16,5 @@ recomputed public-input hash.
 
 The service is single-flight and fails closed: any admission, validation,
 settlement, deadline, or signing failure returns no signature. Backend
-implementations live in [`eez-prover-stateless`](../eez-prover-stateless) and
+implementations live in [`eez-prover-stateless`](https://github.com/eez-association/provers/tree/main/stateless-ecdsa/crates/eez-prover-stateless) (provers) and
 [`eez-prover-stateful`](../eez-prover-stateful).
