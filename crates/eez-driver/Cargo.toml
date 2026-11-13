@@ -13,7 +13,7 @@ witness = [
     "dep:eez-prover",
     "dep:eyre",
     "dep:reth-evm",
-    "dep:reth-revm",
+    "dep:evm2",
     "dep:reth-trie",
     "dep:alloy-rlp",
     "dep:alloy-rpc-types-debug",
@@ -29,11 +29,11 @@ eez-l1.workspace = true
 reth-chainspec.workspace                  = true
 reth-engine-primitives.workspace          = true
 reth-ethereum-engine-primitives.workspace = true
-reth-evm = { workspace = true, optional = true }
+reth-evm = { workspace = true, features = ["witness"], optional = true }
+evm2 = { workspace = true, optional = true }
 reth-payload-builder.workspace            = true
 reth-payload-primitives.workspace         = true
 reth-primitives-traits.workspace          = true
-reth-revm = { workspace = true, features = ["witness"], optional = true }
 reth-storage-api.workspace                = true
 reth-trie = { workspace = true, optional = true }
 

@@ -12,7 +12,8 @@ use reth_engine_primitives::{BeaconEngineMessage, OnForkChoiceUpdated};
 use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
 use reth_storage_api::errors::provider::ProviderResult;
 use reth_storage_api::{
-    AccountReader, BytecodeReader, StateProofProvider, StateProviderBox, StorageRootProvider,
+    AccountReader, BytecodeReader, HashedPostStateProvider, StateProofProvider, StateProviderBox,
+    StateRootProvider, StorageRootProvider,
 };
 use reth_trie_common::updates::TrieUpdates;
 use reth_trie_common::{
@@ -22,6 +23,17 @@ use reth_trie_common::{
 };
 
 use super::*;
+
+/// A replay over `provider`'s state.
+fn replay(provider: impl StateProvider + Clone + Send + 'static) -> Replay {
+    Replay {
+        db: CacheDB::new(Db::new(StateProviderDatabase::new(
+            (Box::new(provider.clone()) as Box<dyn StateProvider + Send>).into_evm_state_provider(),
+        ))),
+        bundle: BundleState::default(),
+        provider: Box::new(provider),
+    }
+}
 
 fn admitted(number: u64, parent_hash: B256, state_root: B256) -> AdmittedBlock {
     admitted_block(Block {
@@ -492,7 +504,7 @@ reth_storage_api::macros::delegate_impls_to_as_ref!(
     StateProofProvider {
         fn proof(&self, input: TrieInput, address: Address, slots: &[B256]) -> ProviderResult<AccountProof>;
         fn multiproof(&self, input: TrieInput, targets: MultiProofTargets) -> ProviderResult<MultiProof>;
-        fn multiproof_v2(&self, input: TrieInput, targets: MultiProofTargetsV2) -> ProviderResult<DecodedMultiProofV2>;
+        fn multiproof_v2(&self, targets: MultiProofTargetsV2, requires_masks: bool) -> ProviderResult<DecodedMultiProofV2>;
         fn witness(&self, input: TrieInput, target: HashedPostState, mode: ExecutionWitnessMode) -> ProviderResult<Vec<Bytes>>;
     }
     StateProvider {
@@ -501,12 +513,9 @@ reth_storage_api::macros::delegate_impls_to_as_ref!(
 );
 
 impl HashedPostStateProvider for HistoryCheckpointProvider {
-    fn hashed_post_state(
-        &self,
-        state: &revm::database::BundleState,
-    ) -> ProviderResult<HashedPostState> {
+    fn hashed_post_state(&self, state: &BundleState) -> ProviderResult<HashedPostState> {
         Ok(HashedPostState::from_bundle_state::<KeccakKeyHasher>(
-            state.state(),
+            &state.state,
         ))
     }
 }
@@ -769,7 +778,7 @@ fn checkpoint_plan_is_not_limited_before_the_provider_is_read() {
 #[test]
 fn execution_errors_preserve_retryability() {
     let invalid_composition = execution_error(BlockExecutionError::Validation(
-        reth_evm::block::BlockValidationError::msg("invalid transaction"),
+        reth_evm::BlockValidationError::msg("invalid transaction"),
     ));
     assert!(matches!(invalid_composition, ValidationError::Rejected(_)));
 
@@ -809,19 +818,15 @@ fn empty_checkpoint_execution_retains_transaction_state() {
     );
     let provider: MockEthProvider = MockEthProvider::new();
     provider.add_account(sender, ExtendedAccount::new(0, U256::from(u64::MAX)));
-    let mut state = State::builder()
-        .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(
-            Box::new(provider) as Box<dyn StateProvider + Send>,
-        )))
-        .with_bundle_update()
-        .build();
+    let mut replay = replay(provider);
 
-    execute_block(&evm_config, &mut state, &block).unwrap();
+    execute_block(&evm_config, &mut replay, &block).unwrap();
 
     assert_eq!(
-        state
-            .bundle_state
-            .account(&sender)
+        replay
+            .bundle
+            .state
+            .get(&sender)
             .and_then(|account| account.info.as_ref())
             .map(|account| account.nonce),
         Some(1),
@@ -1065,16 +1070,11 @@ fn empty_checkpoint_includes_eip_2935_and_matches_the_composer_anchor() {
         checkpoint_root,
         history_value: U256::from_be_slice(parent.hash().as_slice()),
     };
-    let mut state = State::builder()
-        .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(
-            Box::new(checkpoint_provider) as Box<dyn StateProvider + Send>,
-        )))
-        .with_bundle_update()
-        .build();
+    let mut replay = replay(checkpoint_provider);
 
     let (_, checkpoints, _) = execute_block_with_state_checkpoints(
         &evm_config,
-        &mut state,
+        &mut replay,
         &composer_block.block,
         &[CheckpointAt::PreExecution],
     )
@@ -1156,16 +1156,11 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
         // actual EEZ EVM must mint the deposit without a prefunded system account.
         let provider: MockEthProvider = MockEthProvider::new();
         provider.add_state_root(B256::repeat_byte(0x11));
-        let mut state = State::builder()
-            .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(
-                Box::new(provider) as Box<dyn StateProvider + Send>,
-            )))
-            .with_bundle_update()
-            .build();
+        let mut replay = replay(provider);
         let result = if with_checkpoints {
             let (result, checkpoints, _) = execute_block_with_state_checkpoints(
                 &evm_config,
-                &mut state,
+                &mut replay,
                 &block,
                 &[CheckpointAt::Transaction(0)],
             )
@@ -1174,7 +1169,7 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
             assert_eq!(checkpoints[0].at, CheckpointAt::Transaction(0));
             result
         } else {
-            execute_block(&evm_config, &mut state, &block).unwrap()
+            execute_block(&evm_config, &mut replay, &block).unwrap()
         };
         assert_eq!(result.receipts.len(), 1);
         assert!(result.receipts[0].success);
@@ -1182,18 +1177,20 @@ fn native_deposits_execute_in_both_stateful_replay_paths() {
             result.receipts[0].tx_type,
             eez_primitives::EezTxType::System
         );
-        let system = state
-            .bundle_state
-            .account(&SYSTEM_ADDRESS)
+        let system = replay
+            .bundle
+            .state
+            .get(&SYSTEM_ADDRESS)
             .unwrap()
             .info
             .as_ref()
             .unwrap();
         assert_eq!(system.nonce, 1);
         assert_eq!(system.balance, U256::ZERO);
-        let recipient = state
-            .bundle_state
-            .account(&EEZL2_ADDRESS)
+        let recipient = replay
+            .bundle
+            .state
+            .get(&EEZL2_ADDRESS)
             .unwrap()
             .info
             .as_ref()
@@ -1225,23 +1222,18 @@ fn beacon_withdrawals_are_rejected_in_both_stateful_replay_paths() {
     );
     for with_checkpoints in [false, true] {
         let provider: MockEthProvider = MockEthProvider::new();
-        let mut state = State::builder()
-            .with_database(StateProviderDatabase::new(EvmStateProviderAdapter(
-                Box::new(provider) as Box<dyn StateProvider + Send>,
-            )))
-            .with_bundle_update()
-            .build();
+        let mut replay = replay(provider);
         let error = if with_checkpoints {
-            execute_block_with_state_checkpoints(&evm_config, &mut state, &block, &[]).unwrap_err()
+            execute_block_with_state_checkpoints(&evm_config, &mut replay, &block, &[]).unwrap_err()
         } else {
-            execute_block(&evm_config, &mut state, &block).unwrap_err()
+            execute_block(&evm_config, &mut replay, &block).unwrap_err()
         };
-        assert!(matches!(error, ValidationError::Rejected(_)));
+        assert!(matches!(error, ValidationError::Rejected(_)), "{error}");
         assert!(
             error
                 .to_string()
                 .contains("L2 blocks cannot contain beacon withdrawals")
         );
-        assert!(state.bundle_state.state.is_empty());
+        assert!(replay.bundle.state.is_empty());
     }
 }

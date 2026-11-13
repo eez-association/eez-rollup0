@@ -8,16 +8,12 @@
 use std::sync::Arc;
 
 use alloy_primitives::Address;
-use eez_evm::EezEvmConfig;
+use eez_evm::{EezEvmConfig, EezEvmTx};
 use eez_primitives::EezTxEnvelope as TransactionSigned;
-use reth_evm::{ConfigureEvm, Evm as _};
-use reth_primitives_traits::SignerRecoverable;
-use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_storage_api::{
-    BlockNumReader, EvmStateProviderAdapter, HeaderProvider, StateProviderBox, StateProviderFactory,
-};
-use revm::DatabaseCommit;
-use revm::context::result::EVMError;
+use evm2::{TxResultWithState, registry::HandlerError};
+use reth_evm::{ConfigureEvm, EvmEnvFor};
+use reth_primitives_traits::{Recovered, SignerRecoverable};
+use reth_storage_api::{BlockNumReader, HeaderProvider, StateProviderFactory};
 
 use crate::{OverlayChannelHandle, SessionInspectorFactory, new_overlay_channel};
 use eez_protocol::{
@@ -27,6 +23,7 @@ use eez_protocol::{
 
 use super::provider::{ChainProvider, HeaderReader, StateSnapshotProvider};
 use super::session::LocalExecutionSession;
+use super::sim::SimState;
 
 /// Discriminates how this client operates within the composition.
 ///
@@ -118,7 +115,7 @@ impl LocalChainClient {
             .evm_config
             .evm_env(header)
             .map_err(|error| format!("build source EVM environment: {error}"))?;
-        Ok(eez_evm::declared_tx_gas_limit_cap(&env.cfg_env))
+        Ok(eez_evm::declared_tx_gas_limit_cap(&env.version))
     }
 
     /// Resolve the transaction-gas cap for a known next-block timestamp.
@@ -254,12 +251,12 @@ impl LocalChainClient {
     /// [`ExecutorError::Decode`] when the raw tx cannot be decoded or its
     /// signer recovered, [`ExecutorError::Provider`] when the backing store
     /// fails mid-execution, plus any error a nested dispatch raises.
-    pub fn simulate_source_tx_on(
+    pub(crate) fn simulate_source_tx_on(
         &self,
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
-        state: &mut State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>,
-        evm_env: reth_evm::EvmEnvFor<EezEvmConfig>,
+        state: &mut SimState,
+        evm_env: &EvmEnvFor<EezEvmConfig>,
     ) -> ExecutorResult<()> {
         self.source_sim(raw_tx, dispatcher, state, evm_env)
     }
@@ -270,8 +267,8 @@ impl LocalChainClient {
         &self,
         raw_tx: Vec<u8>,
         dispatcher: &mut CompositionBuilder,
-        state: &mut State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>,
-        evm_env: reth_evm::EvmEnvFor<EezEvmConfig>,
+        state: &mut SimState,
+        evm_env: &EvmEnvFor<EezEvmConfig>,
     ) -> ExecutorResult<()> {
         use alloy_eips::eip2718::Decodable2718;
 
@@ -297,44 +294,45 @@ impl LocalChainClient {
             "simulating source tx for cross-chain call detection"
         );
 
-        let recovered = reth_primitives_traits::Recovered::new_unchecked(tx, signer);
-        let tx_env = self.provider.evm_config.tx_env(&recovered);
+        let tx = Recovered::new_unchecked(EezEvmTx::from(tx), signer);
 
         // The source-simulation inspector dispatches every detected proxy CALL
         // through the composition builder, which records calls in preorder.
         // Attach the cache channel around each downstream dispatch.
-        let inspector = self.inspector_factory().build(dispatcher);
-        let mut evm =
-            self.provider
-                .evm_config
-                .evm_with_env_and_inspector(&mut *state, evm_env, inspector);
-        let (gas_used, success, changes) = match evm.transact(tx_env) {
-            Ok(r) => (r.result.tx_gas_used(), r.result.is_success(), Some(r.state)),
+        let mut inspector = self.inspector_factory().build(dispatcher);
+        let outcome = state.transact(
+            &self.provider.evm_config,
+            evm_env,
+            &tx,
+            Some(&mut inspector),
+        );
+        let (gas_used, success, pending) = match outcome {
+            Ok(TxResultWithState {
+                result,
+                pending_state,
+                ..
+            }) => (
+                result.tx_gas_used(),
+                result.is_success(),
+                Some(pending_state),
+            ),
             // The backing store is unreachable — that is the slot's problem, not
             // the tx's, so it must not degrade into an empty composition (which
             // the drain reads as poison and evicts on).
-            Err(EVMError::Database(e)) => return Err(ExecutorError::Provider(e.into())),
+            Err(HandlerError::Database(e)) => return Err(ExecutorError::Provider(e.into())),
             // Rejected before execution (nonce, balance, fee). Same outcome as a
             // revert — no calls, so the drain evicts — but named for what it is.
-            Err(EVMError::Transaction(e)) => {
+            Err(e) => {
                 tracing::warn!(%e, "source tx rejected at validation; it records no cross-chain call");
                 (0, false, None)
             }
-            Err(e) => {
-                tracing::warn!(%e, "source sim could not execute; tx will be evicted downstream");
-                (0, false, None)
-            }
         };
-        let inspector_error = evm.inspector_mut().take_error();
-        drop(evm);
-
-        if let Some(err) = inspector_error {
+        if let Some(err) = inspector.take_error() {
             return Err(err);
         }
-        // The trait-method caller's `State` is function-local, so committing
-        // into it is unobservable there; the fork caller needs the writes.
-        if let Some(changes) = changes {
-            state.commit(changes);
+        // Later simulations on the same fork must see this tx's writes.
+        if let Some(pending) = pending {
+            state.commit(&pending);
         }
 
         tracing::info!(gas_used, success, "source simulation complete");

@@ -24,11 +24,8 @@ reth-evm.workspace                        = true
 reth-payload-primitives.workspace         = true
 reth-primitives-traits.workspace          = true
 reth-provider.workspace                   = true
-reth-revm.workspace                       = true
 reth-storage-api.workspace                = true
 
-# revm — required by reth-evm's State builder
-revm.workspace = true
 
 # alloy
 alloy-consensus.workspace        = true

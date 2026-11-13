@@ -22,13 +22,12 @@ use eez_primitives::EezTxEnvelope as TransactionSigned;
 use eez_primitives::SYSTEM_TX_TYPE;
 use eez_protocol::outbound_gate::OutboundCallObservation;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
+use reth_evm::database::StateProviderDatabase;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes, execute::BlockBuilder};
 use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody, SealedHeader, SignedTransaction};
 use reth_provider::StateProviderFactory;
-use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::{BlockReader, ReceiptProvider, StateProvider, TransactionsProvider};
-use revm::database::State;
 use tokio::sync::broadcast;
 use tracing::{Level, event};
 
@@ -842,12 +841,7 @@ where
                 );
                 DeriverError::L2Provider(e.to_string())
             })?;
-        let state_db =
-            StateProviderDatabase::new(state_provider.as_ref().into_evm_state_provider());
-        let mut db = State::builder()
-            .with_database(state_db)
-            .with_bundle_update()
-            .build();
+        let db = StateProviderDatabase::new(state_provider.as_ref().into_evm_state_provider());
 
         // Chainspec-aware deriver
         // prevents STF mismatches w.r.t. payload builder
@@ -870,7 +864,7 @@ where
         let mut builder = self
             .inner
             .evm_config
-            .builder_for_next_block(&mut db, &parent_header, attributes)
+            .builder_for_next_block(db, &parent_header, attributes)
             .map_err(|e| DeriverError::L2Provider(format!("builder_for_next_block failed: {e}")))?;
 
         builder

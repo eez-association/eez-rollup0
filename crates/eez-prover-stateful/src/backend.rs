@@ -1,7 +1,7 @@
 //! Node-backed execution evidence.
 //!
 //! Legacy v1 requests open historical state and replay a complete window into
-//! a disposable revm overlay. Streaming v2 requests import candidate unsafe
+//! a disposable EVM overlay. Streaming v2 requests import candidate unsafe
 //! blocks through the follower's existing Reth engine and retain only checked
 //! identities/evidence; Reth remains the owner of blocks and execution state.
 
@@ -29,25 +29,21 @@ use eez_proof_signer::validate::{
     SettlementBlockEvidence, StateCheckpoint, ValidatedBlock, ValidatedWindow, ValidationBackend,
     ValidationError,
 };
+use evm2::evm::{CacheDB, Db};
 use lru::LruCache;
 use reth_chainspec::ChainSpec;
 use reth_consensus::{Consensus as _, HeaderValidator as _};
 use reth_ethereum_consensus::{EthBeaconConsensus, validate_block_post_execution};
-use reth_evm::block::BlockExecutionError;
-use reth_evm::execute::BlockExecutor as _;
-use reth_evm::{ConfigureEvm as _, Evm as _};
-use reth_execution_types::BlockExecutionResult;
+use reth_evm::database::StateProviderDatabase;
+use reth_evm::execute::{BlockExecutor as _, Executor as _};
+use reth_evm::{BlockExecutionError, BundleState, ConfigureEvm as _};
+use reth_execution_types::{BlockExecutionResult, BundleSource};
 use reth_payload_primitives::PayloadTypes as _;
 use reth_primitives_traits::{RecoveredBlock, SealedHeader};
-use reth_revm::State;
-use reth_revm::database::StateProviderDatabase;
 use reth_storage_api::{
     BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, EvmStateProviderAdapter,
-    HashedPostStateProvider, HeaderProvider, StateProvider, StateProviderFactory,
-    StateRootProvider,
+    HeaderProvider, StateProvider, StateProviderFactory,
 };
-use revm::database::states::bundle_state::BundleRetention;
-use revm::state::bal::Bal;
 use tracing::{debug, trace};
 
 const MAX_CACHED_CHECKPOINT_BLOCKS: usize = 32_768;
@@ -393,22 +389,15 @@ where
                     let checked = tokio::task::spawn_blocking(move || {
                     // Keep reconciliation serialized until replay really finishes, including on timeout.
                     let _forkchoice_guard = forkchoice_guard;
-                    let parent_state =
-                        provider.state_by_block_hash(parent.hash).map_err(|error| {
-                            ValidationError::Unavailable(format!(
-                                "Reth cannot open pending parent state for block {number}: {error}"
-                            ))
-                        })?;
-                    let mut state = State::builder()
-                        .with_database(StateProviderDatabase::new(
-                            parent_state.into_evm_state_provider(),
+                    let mut replay = Replay::open(&provider, parent.hash).map_err(|error| {
+                        ValidationError::Unavailable(format!(
+                            "Reth cannot open pending parent state for block {number}: {error}"
                         ))
-                        .with_bundle_update()
-                        .build();
+                    })?;
                     let (result, checkpoints, block_access_list_hash) =
                         execute_block_with_state_checkpoints(
                             &evm_config,
-                            &mut state,
+                            &mut replay,
                             &block,
                             checkpoint_plan.positions(),
                         )?;
@@ -424,7 +413,7 @@ where
                             "stateful terminal-candidate replay rejected block {number}: {error}"
                         ))
                     })?;
-                    let computed_root = state_root(&state)?;
+                    let computed_root = replay.state_root()?;
                     if computed_root != block.header().state_root() {
                         return Err(ValidationError::Rejected(format!(
                             "stateful terminal-candidate replay of block {number} produced root \
@@ -560,19 +549,11 @@ where
                 "local canonical header {anchor_number} is not available",
             ))
         })?;
-    let anchor_state = provider
-        .state_by_block_hash(claimed_anchor_hash)
-        .map_err(|error| {
-            ValidationError::Unavailable(format!(
-                "local node cannot open state for canonical anchor block {anchor_number}: {error}",
-            ))
-        })?;
-    let mut state = State::builder()
-        .with_database(StateProviderDatabase::new(
-            anchor_state.into_evm_state_provider(),
+    let mut replay = Replay::open(provider, claimed_anchor_hash).map_err(|error| {
+        ValidationError::Unavailable(format!(
+            "local node cannot open state for canonical anchor block {anchor_number}: {error}",
         ))
-        .with_bundle_update()
-        .build();
+    })?;
     let mut previous_header = SealedHeader::new(anchor_header, claimed_anchor_hash);
     let consensus = EthBeaconConsensus::new(Arc::clone(chain_spec));
     let mut outputs = Vec::with_capacity(total_blocks);
@@ -616,14 +597,14 @@ where
             && block.header().block_access_list_hash().is_none()
         {
             (
-                execute_block(evm_config, &mut state, &block)?,
+                execute_block(evm_config, &mut replay, &block)?,
                 Vec::new(),
                 None,
             )
         } else {
             execute_block_with_state_checkpoints(
                 evm_config,
-                &mut state,
+                &mut replay,
                 &block,
                 &checkpoint_positions,
             )?
@@ -641,7 +622,7 @@ where
             ))
         })?;
 
-        let post_state_root = state_root(&state)?;
+        let post_state_root = replay.state_root()?;
         if post_state_root != block.header().state_root() {
             return Err(ValidationError::Rejected(format!(
                 "stateful replay of block {number} produced root {post_state_root}, header claims {}",
@@ -649,7 +630,11 @@ where
             )));
         }
         let pre_state_root = previous_header.state_root();
-        state.block_hashes.insert(number, block.hash());
+        replay
+            .db
+            .cache
+            .block_hashes
+            .insert(alloy_primitives::U256::from(number), block.hash());
         previous_header = block.sealed_block().clone_sealed_header();
 
         let receipt_successes = result
@@ -718,33 +703,77 @@ where
     Ok(())
 }
 
+type ReplayDb =
+    CacheDB<Db<StateProviderDatabase<EvmStateProviderAdapter<Box<dyn StateProvider + Send>>>>>;
+
+/// One replay over a parent state: executed blocks are committed to `db` and
+/// accumulated in `bundle`. Roots are computed against `provider`, a second
+/// handle on the same parent state, so they can be taken while an executor
+/// borrows `db`.
+struct Replay {
+    db: ReplayDb,
+    bundle: BundleState,
+    provider: Box<dyn StateProvider + Send>,
+}
+
+impl Replay {
+    fn open<P: StateProviderFactory>(
+        factory: &P,
+        hash: B256,
+    ) -> reth_storage_api::errors::ProviderResult<Self> {
+        let state = factory.state_by_block_hash(hash)?;
+        Ok(Self {
+            db: CacheDB::new(Db::new(StateProviderDatabase::new(
+                state.into_evm_state_provider(),
+            ))),
+            bundle: BundleState::default(),
+            provider: factory.state_by_block_hash(hash)?,
+        })
+    }
+
+    fn commit(&mut self, block: BundleState) {
+        self.db.commit_source(&BundleSource(&block));
+        self.bundle.extend(block);
+    }
+
+    fn state_root(&self) -> Result<B256, ValidationError> {
+        state_root(self.provider.as_ref(), &self.bundle)
+    }
+}
+
+/// Root of the parent state plus `bundle`.
+fn state_root(
+    provider: &(dyn StateProvider + Send),
+    bundle: &BundleState,
+) -> Result<B256, ValidationError> {
+    let hashed_state = provider.hashed_post_state(bundle).map_err(provider_error)?;
+    provider.state_root(hashed_state).map_err(provider_error)
+}
+
 /// Use Reth's normal block flow when no checkpoints or BAL output are needed.
 fn execute_block(
     evm_config: &EezEvmConfig,
-    state: &mut State<
-        StateProviderDatabase<EvmStateProviderAdapter<Box<dyn StateProvider + Send>>>,
-    >,
+    replay: &mut Replay,
     block: &RecoveredBlock<Block>,
 ) -> Result<BlockExecutionResult<EthereumReceipt>, ValidationError> {
-    state.bal_state.bal_builder = None;
-    let executor = evm_config
-        .executor_for_block(state, block)
-        .map_err(|error| {
-            ValidationError::Rejected(format!("stateful block context rejected: {error}"))
-        })?;
-    let result = executor
-        .execute_block(block.transactions_recovered())
+    // reth's executor reports a rejected block context as an internal error,
+    // so check it here to keep the block rejected.
+    evm_config
+        .context_for_block(block.sealed_block())
+        .map_err(context_error)?;
+    let output = evm_config
+        .executor(&mut replay.db)
+        .execute(block)
         .map_err(execution_error)?;
-    state.merge_transitions(BundleRetention::Reverts);
-    Ok(result)
+    replay.commit(output.state);
+    Ok(output.result)
 }
 
-/// Execute transactions individually to capture checkpoints and BAL indices.
+/// Execute transactions individually to capture checkpoints and BAL output.
+/// A checkpoint roots the replay so far plus a snapshot of this block's state.
 fn execute_block_with_state_checkpoints(
     evm_config: &EezEvmConfig,
-    state: &mut State<
-        StateProviderDatabase<EvmStateProviderAdapter<Box<dyn StateProvider + Send>>>,
-    >,
+    replay: &mut Replay,
     block: &RecoveredBlock<Block>,
     checkpoint_positions: &[CheckpointAt],
 ) -> Result<
@@ -755,35 +784,33 @@ fn execute_block_with_state_checkpoints(
     ),
     ValidationError,
 > {
-    let has_bal = block.header().block_access_list_hash().is_some();
-    let (result, checkpoints) = {
+    let Replay {
+        db,
+        bundle,
+        provider,
+    } = replay;
+    let checkpoint_root = |block_state: BundleState| {
+        let mut cumulative = bundle.clone();
+        cumulative.extend(block_state);
+        state_root(provider.as_ref(), &cumulative)
+    };
+    let (output, block_access_list, checkpoints) = {
         let mut executor = evm_config
-            .executor_for_block(state, block)
-            .map_err(|error| {
-                ValidationError::Rejected(format!("stateful block context rejected: {error}"))
-            })?;
-        if has_bal {
-            executor.evm_mut().db_mut().bal_state.bal_builder = Some(Bal::new());
-        } else {
-            executor.evm_mut().db_mut().bal_state.bal_builder = None;
+            .executor_for_block(&mut *db, block.sealed_block())
+            .map_err(context_error)?;
+        if block.header().block_access_list_hash().is_some() {
+            executor.enable_block_access_list_builder();
         }
         executor
             .apply_pre_execution_changes()
             .map_err(execution_error)?;
-        if has_bal {
-            executor.evm_mut().db_mut().bump_bal_index();
-        }
 
         let mut checkpoints = Vec::with_capacity(checkpoint_positions.len());
         let mut next_checkpoint = checkpoint_positions.iter().copied().peekable();
         // Sealed before the loop: the anchor's candidate is this block holding
         // no transactions, after the pre-block system calls have run.
         if next_checkpoint.peek() == Some(&CheckpointAt::PreExecution) {
-            let state_root = {
-                let db = executor.evm_mut().db_mut();
-                db.merge_transitions(BundleRetention::Reverts);
-                state_root(db)?
-            };
+            let state_root = checkpoint_root(executor.block_state().clone().into_bundle())?;
             let block_hash =
                 candidate_block_hash::<EezPrimitives>(block.sealed_header(), &[], &[], state_root)
                     .map_err(|error| {
@@ -802,15 +829,8 @@ fn execute_block_with_state_checkpoints(
             executor
                 .execute_transaction(transaction)
                 .map_err(execution_error)?;
-            if has_bal {
-                executor.evm_mut().db_mut().bump_bal_index();
-            }
             if next_checkpoint.peek() == Some(&CheckpointAt::Transaction(transaction_index)) {
-                let state_root = {
-                    let db = executor.evm_mut().db_mut();
-                    db.merge_transitions(BundleRetention::Reverts);
-                    state_root(db)?
-                };
+                let state_root = checkpoint_root(executor.block_state().clone().into_bundle())?;
                 let block_hash = candidate_block_hash::<EezPrimitives>(
                     block.sealed_header(),
                     &block.body().transactions[..=transaction_index],
@@ -830,27 +850,16 @@ fn execute_block_with_state_checkpoints(
                 next_checkpoint.next();
             }
         }
-        let result = executor
-            .apply_post_execution_changes()
+        let (output, block_access_list) = executor
+            .finish_with_block_access_list()
             .map_err(execution_error)?;
-        (result, checkpoints)
+        (output, block_access_list, checkpoints)
     };
-    state.merge_transitions(BundleRetention::Reverts);
-    let block_access_list_hash = state
-        .take_built_alloy_bal()
+    replay.commit(output.state);
+    let block_access_list_hash = block_access_list
         .as_ref()
         .map(|list| compute_block_access_list_hash(list));
-    Ok((result, checkpoints, block_access_list_hash))
-}
-
-fn state_root(
-    state: &State<StateProviderDatabase<EvmStateProviderAdapter<Box<dyn StateProvider + Send>>>>,
-) -> Result<B256, ValidationError> {
-    let provider = &state.database.0;
-    let hashed_state = provider
-        .hashed_post_state(&state.bundle_state)
-        .map_err(provider_error)?;
-    provider.state_root(hashed_state).map_err(provider_error)
+    Ok((output.result, checkpoints, block_access_list_hash))
 }
 
 fn canonical_hash<P: BlockHashReader>(provider: &P, number: u64) -> Result<B256, ValidationError> {
@@ -864,6 +873,10 @@ fn canonical_hash<P: BlockHashReader>(provider: &P, number: u64) -> Result<B256,
 
 fn provider_error(error: impl std::fmt::Display) -> ValidationError {
     ValidationError::Unavailable(format!("local node provider failed: {error}"))
+}
+
+fn context_error(error: impl std::fmt::Display) -> ValidationError {
+    ValidationError::Rejected(format!("stateful block context rejected: {error}"))
 }
 
 fn execution_error(error: BlockExecutionError) -> ValidationError {
