@@ -51,6 +51,8 @@ multiple-versions = "allow"
 # as a wildcard; their exact commits are pinned in Cargo.lock.
 # Report it, do not fail on it — `sources` below is the real gate for those.
 wildcards = "warn"
+# The node executes on evm2 only; revm lives in the prover workspace.
+deny = [{ name = "revm" }, { name = "alloy-evm" }]
 
 [sources]
 unknown-registry = "deny"
@@ -59,11 +61,10 @@ unknown-git = "deny"
 # deliberate, reviewed change rather than a silent one.
 allow-git = [
     "https://github.com/paradigmxyz/reth",
-    # reth v2.7.0 declares revmc (its `jit` backend) as a git dependency.
-    "https://github.com/paradigmxyz/revmc",
-    # Interim reth fork carrying the genesis-unwind fix; see Cargo.toml [patch].
-    "https://github.com/debjit-bw/reth",
+    # reth v2.11.0 patches its core crates to reth-core; see Cargo.toml [patch].
+    "https://github.com/paradigmxyz/reth-core",
+    # Interim evm2 fork carrying `Clone` on `BlockState`; see Cargo.toml [patch].
+    "https://github.com/debjit-bw/evm2",
     "https://github.com/gnosischain/reth_gnosis",
     "https://github.com/gnosischain/rust-primitives.git",
-    "https://github.com/sigp/discv5",
 ]
