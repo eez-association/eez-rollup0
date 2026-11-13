@@ -265,7 +265,7 @@ where
         tokio::time::timeout(request_timeout, async {
             admitted.check_parent(parent)?;
 
-            let block = decode_match_and_recover_signers(admitted, &*self.chain_spec)?;
+            let block = decode_match_and_recover_signers(admitted, &self.chain_spec)?;
             let number = block.header().number();
             let consensus = EthBeaconConsensus::new(Arc::clone(&self.chain_spec));
             consensus
@@ -514,7 +514,7 @@ where
     let settling_block = blocks
         .last()
         .expect("the admitted stateful window was checked as nonempty");
-    let recovered_settling_block = decode_match_and_recover_signers(settling_block, &**chain_spec)?;
+    let recovered_settling_block = decode_match_and_recover_signers(settling_block, chain_spec)?;
     let (settling_checkpoint_plan, settling_sender_flags) =
         CheckpointPlan::for_block(&recovered_settling_block, expected_l2_system_address);
     let mut prepared_settling_block = Some((
@@ -588,7 +588,7 @@ where
             })?;
             (block, plan.positions().to_vec(), flags)
         } else {
-            let block = decode_match_and_recover_signers(admitted, &**chain_spec)?;
+            let block = decode_match_and_recover_signers(admitted, chain_spec)?;
             let flags = system_sender_flags(&block, expected_l2_system_address);
             (block, Vec::new(), flags)
         };
