@@ -21,6 +21,7 @@ alloy-eips.workspace                      = true
 reth-chainspec.workspace                  = true
 reth-db.workspace                         = true
 reth-discv5.workspace                     = true
+enr.workspace                             = true
 reth-ethereum-cli.workspace               = true
 reth-ethereum-engine-primitives.workspace = true
 reth-ethereum-payload-builder.workspace   = true
@@ -64,9 +65,8 @@ reth-engine-primitives.workspace = true
 reth-payload-primitives.workspace = true
 reth-evm-ethereum.workspace = true
 reth-provider.workspace = true
-reth-revm.workspace = true
 reth-storage-api.workspace = true
-revm.workspace = true
+evm2.workspace = true
 
 [dev-dependencies]
 alloy-consensus.workspace = true

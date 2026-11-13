@@ -1,9 +1,9 @@
-//! Payload construction adapted from reth-ethereum-payload-builder at v2.7.0
+//! Payload construction adapted from reth-ethereum-payload-builder at v2.11.0
 //! (MIT/Apache-2.0). The pinned upstream builder fixes Ethereum primitives; this
 //! adapter uses EEZ types and excludes blob transactions from L2 payloads.
 //!
 //! Upstream source at the pinned revision:
-//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/payload/src/lib.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.11.0/crates/ethereum/payload/src/lib.rs>.
 
 use alloy_consensus::{Transaction, transaction::TxHashRef};
 use alloy_primitives::U256;
@@ -18,23 +18,24 @@ use reth_basic_payload_builder::{
 };
 use reth_chainspec::{ChainSpecProvider, EthereumHardforks};
 use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
-use reth_errors::{BlockExecutionError, BlockValidationError, ConsensusError};
+use reth_errors::ConsensusError;
 use reth_evm::{
-    ConfigureEvm, Evm, NextBlockEnvAttributes,
-    block::TxResult,
-    execute::{BlockBuilder, BlockBuilderOutcome},
+    ConfigureEvm, EvmEnv as _, NextBlockEnvAttributes, OnStateHook as _,
+    database::StateProviderDatabase,
+    execute::{
+        BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockExecutor as _,
+        BlockValidationError,
+    },
 };
 use reth_execution_cache::{CachedStateMetrics, CachedStateMetricsSource, CachedStateProvider};
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::PayloadAttributes;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use reth_revm::{database::StateProviderDatabase, db::State};
 use reth_storage_api::{EvmStateProvider, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
     ValidPoolTransaction, error::InvalidPoolTransactionError,
 };
-use revm::context_interface::{Block as _, Cfg as _};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -126,8 +127,8 @@ where
 }
 
 /// Builds a Live L2 payload from the best non-blob transactions in the pool.
-/// Copied from upstream `reth-ethereum-payload-builder` at `v2.7.0`, with
-/// EEZ types substituted and the blob-transaction and skip-state-root paths
+/// Copied from upstream `reth-ethereum-payload-builder` at `v2.11.0`, with
+/// EEZ types substituted and the blob-transaction, JIT and skip-state-root paths
 /// removed: every L2 block carries its own computed state root.
 #[inline]
 pub fn build_payload<EvmConfig, Client, Tx, F>(
@@ -164,6 +165,8 @@ where
         CachedStateProvider::new(
             &evm_state_provider,
             execution_cache.cache().clone(),
+            // It's ok to recreate the cache every time, because it's cheap to do so for a vanilla
+            // Ethereum builder every 12s.
             Some(CachedStateMetrics::zeroed(
                 CachedStateMetricsSource::Builder,
             )),
@@ -177,59 +180,61 @@ where
     );
     let chain_spec = client.chain_spec();
     let is_amsterdam = chain_spec.is_amsterdam_active_at_timestamp(attributes.timestamp());
-    let mut db = State::builder()
-        .with_database(cached_reads.as_db_mut(state))
-        .with_bundle_update()
-        .with_bal_builder_if(is_amsterdam)
-        .build();
+    let gas_limit = builder_config
+        .gas_limit_with_target(parent_header.gas_limit, attributes.target_gas_limit());
 
+    debug!(
+        target: "payload_builder",
+        id = %payload_id,
+        parent_header = ?parent_header.hash(),
+        parent_number = parent_header.number,
+        "building payload"
+    );
+
+    let cached_db = cached_reads.as_db_mut(state);
+    let next_block_env_attributes = NextBlockEnvAttributes {
+        timestamp: attributes.timestamp(),
+        suggested_fee_recipient: attributes.suggested_fee_recipient,
+        prev_randao: attributes.prev_randao,
+        gas_limit,
+        parent_beacon_block_root: attributes.parent_beacon_block_root(),
+        withdrawals: attributes.withdrawals.clone().map(Into::into),
+        extra_data: builder_config.extra_data.clone(),
+        slot_number: attributes.slot_number(),
+    };
     let mut builder = evm_config
-        .builder_for_next_block(
-            &mut db,
-            &parent_header,
-            NextBlockEnvAttributes {
-                timestamp: attributes.timestamp(),
-                suggested_fee_recipient: attributes.suggested_fee_recipient,
-                prev_randao: attributes.prev_randao,
-                gas_limit: builder_config
-                    .gas_limit_with_target(parent_header.gas_limit, attributes.target_gas_limit()),
-                parent_beacon_block_root: attributes.parent_beacon_block_root(),
-                withdrawals: attributes.withdrawals.clone().map(Into::into),
-                extra_data: builder_config.extra_data.clone(),
-                slot_number: attributes.slot_number(),
-            },
-        )
+        .builder_for_next_block(cached_db, &parent_header, next_block_env_attributes)
         .map_err(PayloadBuilderError::other)?;
-
-    debug!(target: "payload_builder", id=%payload_id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "building new payload");
-    let mut cumulative_tx_gas_used = 0;
-    let mut block_regular_gas_used = 0;
-    let mut block_state_gas_used = 0;
-    let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
-    let tx_gas_limit_cap = builder.evm_mut().cfg_env().tx_gas_limit_cap();
-    let base_fee = builder.evm_mut().block().basefee();
-
-    let mut best_txs = best_txs(BestTransactionsAttributes::new(base_fee, None));
-    best_txs.skip_blobs();
-    let mut total_fees = U256::ZERO;
-
-    // Stream state diffs so the state-root task can compute the root alongside execution.
-    if let Some(task) = state_root_handle.as_mut() {
-        builder
-            .evm_mut()
-            .db_mut()
-            .set_state_hook(Some(Box::new(task.take_state_hook())));
+    if is_amsterdam {
+        builder.executor_mut().enable_block_access_list_builder();
     }
+    let base_fee = builder.evm_env().block_base_fee();
+    let separate_block_gas = builder.evm_env().uses_separate_block_gas();
+    let regular_gas_limit_cap = builder.evm_env().regular_gas_limit_cap();
+
+    // If we have a state-root task, wire a state hook that streams per-tx state
+    // diffs. The executor reports whether it forwards them; without that the task
+    // would wait for updates that never come.
+    let use_state_root_task = if let Some(task) = state_root_handle.as_mut() {
+        let mut hook = task.take_state_hook();
+        builder.set_state_hook(move |state| hook.on_state(state))
+    } else {
+        false
+    };
 
     builder.apply_pre_execution_changes().map_err(|err| {
         warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
         PayloadBuilderError::Internal(err.into())
     })?;
 
+    let mut best_txs = best_txs(BestTransactionsAttributes::new(base_fee, None));
+    best_txs.skip_blobs();
+    let mut total_fees = U256::ZERO;
+    let mut cumulative_tx_gas_used = 0u64;
+    let mut block_regular_gas_used = 0u64;
+    let mut block_state_gas_used = 0u64;
     let mut block_transactions_rlp_length = 0;
-
-    let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp);
-
+    let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp());
     let withdrawals_rlp_length = attributes
         .withdrawals
         .as_ref()
@@ -237,26 +242,31 @@ where
         .unwrap_or(0);
 
     while let Some(pool_tx) = best_txs.next() {
-        let exceeds_gas_limit = if is_amsterdam {
-            let regular_available_gas = block_gas_limit.saturating_sub(block_regular_gas_used);
-            let state_available_gas = block_gas_limit.saturating_sub(block_state_gas_used);
-            let regular_tx_gas_limit = pool_tx.gas_limit().min(tx_gas_limit_cap);
+        // check if the job was cancelled, if so we can exit early
+        if cancel.is_cancelled() {
+            return Ok(BuildOutcome::Cancelled);
+        }
 
-            if regular_tx_gas_limit > regular_available_gas {
-                Some((regular_tx_gas_limit, regular_available_gas))
-            } else if pool_tx.gas_limit() > state_available_gas {
-                Some((pool_tx.gas_limit(), state_available_gas))
+        // ensure we still have capacity for this transaction
+        let exceeds_gas_limit = if separate_block_gas {
+            let regular_available = gas_limit.saturating_sub(block_regular_gas_used);
+            let state_available = gas_limit.saturating_sub(block_state_gas_used);
+            let regular_limit = pool_tx.gas_limit().min(regular_gas_limit_cap);
+            if regular_limit > regular_available {
+                Some((regular_limit, regular_available))
+            } else if pool_tx.gas_limit() > state_available {
+                Some((pool_tx.gas_limit(), state_available))
             } else {
                 None
             }
         } else {
-            let block_available_gas = block_gas_limit.saturating_sub(cumulative_tx_gas_used);
-            (pool_tx.gas_limit() > block_available_gas)
-                .then_some((pool_tx.gas_limit(), block_available_gas))
+            let available = gas_limit.saturating_sub(cumulative_tx_gas_used);
+            (pool_tx.gas_limit() > available).then_some((pool_tx.gas_limit(), available))
         };
-
         if let Some((transaction_gas_limit, block_available_gas)) = exceeds_gas_limit {
-            // Skipping this nonce also excludes dependent transactions from the candidate.
+            // we can't fit this transaction into the block, so we need to mark it as invalid
+            // which also removes all dependent transaction from the iterator before we can
+            // continue
             best_txs.mark_invalid(
                 &pool_tx,
                 InvalidPoolTransactionError::ExceedsGasLimit(
@@ -267,14 +277,9 @@ where
             continue;
         }
 
-        if cancel.is_cancelled() {
-            return Ok(BuildOutcome::Cancelled);
-        }
-
+        // convert tx to a signed transaction
         let tx = pool_tx.to_consensus();
-
         let tx_rlp_len = tx.inner().length();
-
         let estimated_block_size_with_tx =
             block_transactions_rlp_length + tx_rlp_len + withdrawals_rlp_length + 1024; // 1Kb of overhead for the block header
 
@@ -291,18 +296,17 @@ where
 
         let miner_fee = tx.effective_tip_per_gas(base_fee);
         let tx_hash = *tx.tx_hash();
-
-        let mut tx_regular_gas_used = 0;
-        let gas_output = match builder.execute_transaction_with_result_closure(tx, |result| {
-            tx_regular_gas_used = result.result().result.gas().block_regular_gas_used();
-        }) {
+        let gas_output = match builder.execute_transaction(tx) {
             Ok(gas_output) => gas_output,
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                 error, ..
             })) => {
                 if error.is_nonce_too_low() {
+                    // if the nonce is too low, we can skip this transaction
                     trace!(target: "payload_builder", %error, ?tx_hash, "skipping nonce too low transaction");
                 } else {
+                    // if the transaction is invalid, we can skip it and all of its
+                    // descendants
                     trace!(target: "payload_builder", %error, ?tx_hash, "skipping invalid transaction and its descendants");
                     best_txs.mark_invalid(
                         &pool_tx,
@@ -331,21 +335,26 @@ where
                 );
                 continue;
             }
+            // this is an error that we should treat as fatal for this attempt
             Err(err) => return Err(PayloadBuilderError::evm(err)),
         };
 
         block_transactions_rlp_length += tx_rlp_len;
 
+        // update and add to total fees
         let gas_used = gas_output.tx_gas_used();
         let miner_fee = miner_fee.expect("fee is always valid; execution succeeded");
         total_fees += U256::from(miner_fee) * U256::from(gas_used);
         cumulative_tx_gas_used += gas_used;
-        block_regular_gas_used += tx_regular_gas_used;
+        block_regular_gas_used += gas_output.regular_gas_used();
         block_state_gas_used += gas_output.state_gas_used();
     }
 
+    // check if we have a better block
     if !is_better_payload(best_payload.as_ref(), total_fees) {
+        // Release db
         drop(builder);
+        // can skip building the block
         return Ok(BuildOutcome::Aborted {
             fees: total_fees,
             cached_reads,
@@ -357,35 +366,44 @@ where
         block,
         block_access_list,
         ..
-    } = if let Some(mut task) = state_root_handle {
-        // Dropping the hook signals the state-root task to finalize before we wait for its root.
-        builder.evm_mut().db_mut().set_state_hook(None);
-
-        match task.state_root() {
+    } = if use_state_root_task {
+        let mut task = state_root_handle.expect("state-root task exists if hook was installed");
+        // The state-root task has been computing incrementally alongside tx execution.
+        // This waits for the final root hash; most work is already done. Fall back
+        // to a sync state root if the trie pipeline fails.
+        builder.finish_with_state_root(state_provider.as_ref(), |_| match task.state_root() {
             Ok(outcome) => {
-                debug!(target: "payload_builder", id=%payload_id, state_root=?outcome.state_root, job = task.name(), "received state root from state-root job");
-                builder.finish(
-                    state_provider.as_ref(),
-                    Some((
-                        outcome.state_root,
-                        Arc::unwrap_or_clone(outcome.trie_updates),
-                    )),
-                )?
+                debug!(
+                    target: "payload_builder",
+                    id = %payload_id,
+                    state_root = ?outcome.state_root,
+                    job = task.name(),
+                    "received state root from state-root job"
+                );
+                Ok(Some((
+                    outcome.state_root,
+                    Arc::unwrap_or_clone(outcome.trie_updates),
+                )))
             }
             Err(err) => {
-                warn!(target: "payload_builder", id=%payload_id, %err, "state-root job failed, falling back to sync state root");
-                builder.finish(state_provider.as_ref(), None)?
+                warn!(target: "payload_builder", id = %payload_id, %err, "state-root job failed, falling back to sync state root");
+                Ok(None)
             }
-        }
+        })?
     } else {
         builder.finish(state_provider.as_ref(), None)?
     };
 
     let requests = chain_spec
-        .is_prague_active_at_timestamp(attributes.timestamp)
+        .is_prague_active_at_timestamp(attributes.timestamp())
         .then_some(execution_result.requests);
 
-    debug!(target: "payload_builder", id=%payload_id, sealed_block_header = ?block.sealed_header(), "sealed built block");
+    debug!(
+        target: "payload_builder",
+        id = %payload_id,
+        sealed_block_header = ?block.sealed_header(),
+        "sealed built block"
+    );
 
     if is_osaka && block.rlp_length() > MAX_RLP_BLOCK_SIZE {
         return Err(PayloadBuilderError::other(ConsensusError::BlockTooLarge {

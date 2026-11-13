@@ -1,66 +1,36 @@
-//! Overlay primitives for shared-source-state nested dispatch.
+//! Shared source state for nested dispatch that re-enters a rollup.
 //!
-//! When a target-session inspector dispatches a nested call back to
-//! the entry rollup (e.g. L2→L1 during flash-loan or reentrant), the
-//! nested call needs to see source-sim's in-flight state — direct
-//! counterpart to how reth's revm executes nested CALL opcodes by
-//! sharing the live `State<DB>`.
+//! Dispatch is synchronous: the source EVM stays suspended inside its
+//! inspector while the target runs. When the target calls back into the
+//! source rollup, the re-entered session must see the source's in-flight
+//! state, and the source must see what the session wrote.
 //!
-//! The inspector's synchronous dispatch keeps
-//! source-sim's `evm.transact`, target-session execution, and
-//! nested-back-to-entry dispatch all on the same OS thread — no
-//! Send/Sync requirements, no cross-thread cloning. The re-entered
-//! session opens a fresh `State<DB>` preloaded with the published
-//! snapshot via `StateBuilder::with_cached_prestate`, runs the nested
-//! call against it, and publishes its post-execute cache; the
-//! suspended inspector then applies the cache delta as journal
-//! entries onto source-sim's live state.
-//!
-//! Sharing works through `CacheState` because revm's `State<DB>`
-//! itself lacks `Clone`: `with_cached_prestate` preloads a fresh
-//! `State` with a cloned cache, reading cold data from a fresh
-//! database instance. (`clone_state` in this module's tests guards
-//! that assumption against revm field drift.)
-//!
-//! # Crate-layering invariants
-//!
-//! This module stays independent of `reth_*`; it needs only `revm` and is
-//! colocated with its sole consumer in `eez-composer`. The actual nested-call
-//! execution and diff-apply path lives in this crate's `inspector` module,
-//! which has the necessary `&mut Context` access during `Inspector::call`.
+//! [`OverlayChannel`] carries both directions as evm2 [`Cache`]s. The
+//! inspector pushes a snapshot of its live state before dispatching; a
+//! re-entered session opens over that snapshot and publishes the writes of
+//! each execution; after the dispatch the inspector replays those writes
+//! through the source journal with [`apply_overlay_writes`], so a later revert
+//! of the source frame undoes them.
 
 use std::sync::{Arc, Mutex};
 
-use revm::context_interface::journaled_state::account::JournaledAccountTr;
-use revm::context_interface::{ContextTr, Host, JournalTr};
-use revm::database::{AccountStatus, CacheState, states::CacheAccount};
-use revm::primitives::Address;
+use alloy_primitives::Address;
+use evm2::evm::{Cache, State};
 
 /// Cache exchange for nested dispatches that re-enter a suspended rollup.
 ///
-/// # Why it exists
+/// - `snapshots` holds this rollup's live state at each pending dispatch. A
+///   session that re-enters the rollup opens over the latest one.
+/// - `writes` holds the writes of each execution of a re-entered session. The
+///   suspended inspector takes the ones published during its dispatch.
 ///
-/// During nested dispatch, the caller's revm state remains mutably borrowed.
-/// A re-entered session therefore cannot borrow that state directly. This
-/// channel transfers cache snapshots across the dispatch boundary using two
-/// LIFO stacks:
-///
-/// - `source_cache` stores this rollup's live cache before dispatch. A session
-///   that re-enters the rollup peeks at the latest snapshot when it opens.
-///
-/// - `overlay_cache` stores the cache produced by a re-entered session. The
-///   suspended inspector pops it after dispatch and applies the diff through
-///   [`apply_overlay_diff`].
-///
-/// Stacks keep recursive re-entry snapshots paired with their call frames.
-/// All access is same-thread; a poisoned lock means a dispatch panicked
-/// mid-exchange, so methods panic rather than silently dropping state.
+/// Both are stacks, so recursive re-entry pairs each frame with its own
+/// entries. All access is same-thread; a poisoned lock means a dispatch
+/// panicked mid-exchange, so methods panic rather than silently dropping state.
 #[derive(Debug, Default)]
 pub struct OverlayChannel {
-    /// Stack of pre-dispatch cache snapshots.
-    source_cache: Mutex<Vec<CacheState>>,
-    /// Stack of post-execute cache snapshots.
-    overlay_cache: Mutex<Vec<CacheState>>,
+    snapshots: Mutex<Vec<Cache>>,
+    writes: Mutex<Vec<Cache>>,
 }
 
 /// A poisoned lock means a panic escaped mid-exchange; continuing would
@@ -68,36 +38,48 @@ pub struct OverlayChannel {
 const POISONED: &str = "overlay channel mutex poisoned by a panicked dispatch";
 
 impl OverlayChannel {
-    /// Clear all snapshots at a transaction-composition boundary.
+    /// Clear all entries at a transaction-composition boundary.
     pub fn reset(&self) {
-        self.source_cache.lock().expect(POISONED).clear();
-        self.overlay_cache.lock().expect(POISONED).clear();
+        self.snapshots.lock().expect(POISONED).clear();
+        self.writes.lock().expect(POISONED).clear();
     }
 
-    /// Push a pre-dispatch cache snapshot for this rollup.
-    pub fn push_pre_snapshot(&self, cache: CacheState) {
-        self.source_cache.lock().expect(POISONED).push(cache);
+    /// Push this rollup's live state before a dispatch.
+    pub fn push_pre_snapshot(&self, cache: Cache) {
+        self.snapshots.lock().expect(POISONED).push(cache);
     }
 
-    /// Pop the matching pre-dispatch snapshot at the end of the
-    /// inspector frame.
-    pub fn pop_pre_snapshot(&self) -> Option<CacheState> {
-        self.source_cache.lock().expect(POISONED).pop()
+    /// Pop the snapshot pushed for the finished dispatch.
+    pub fn pop_pre_snapshot(&self) -> Option<Cache> {
+        self.snapshots.lock().expect(POISONED).pop()
     }
 
-    /// Clone the latest pre-dispatch snapshot for a re-entered session.
-    pub fn peek_pre_snapshot(&self) -> Option<CacheState> {
-        self.source_cache.lock().expect(POISONED).last().cloned()
+    /// Clone the latest snapshot for a re-entered session.
+    pub fn peek_pre_snapshot(&self) -> Option<Cache> {
+        self.snapshots.lock().expect(POISONED).last().cloned()
     }
 
-    /// Push the cache produced by a re-entered session.
-    pub fn push_post_cache(&self, cache: CacheState) {
-        self.overlay_cache.lock().expect(POISONED).push(cache);
+    /// Publish the writes of one execution of this rollup's session.
+    pub fn push_writes(&self, writes: Cache) {
+        self.writes.lock().expect(POISONED).push(writes);
     }
 
-    /// Pop the cache produced by the latest re-entered session.
-    pub fn pop_post_cache(&self) -> Option<CacheState> {
-        self.overlay_cache.lock().expect(POISONED).pop()
+    /// Number of published writes, marking the start of a dispatch.
+    pub fn writes_len(&self) -> usize {
+        self.writes.lock().expect(POISONED).len()
+    }
+
+    /// Take the writes published since `mark`, merged in publication order.
+    pub fn take_writes_since(&self, mark: usize) -> Option<Cache> {
+        let mut writes = self.writes.lock().expect(POISONED);
+        if writes.len() <= mark {
+            return None;
+        }
+        let mut merged = Cache::default();
+        for cache in writes.drain(mark..) {
+            merged.merge(cache);
+        }
+        Some(merged)
     }
 }
 
@@ -110,354 +92,177 @@ pub fn new_overlay_channel() -> OverlayChannelHandle {
     Arc::new(OverlayChannel::default())
 }
 
-// Note on trait choice:
-//
-// Reads on the OTHER direction of the overlay flow (source-sim
-// inspector snapshotting cache before dispatch) go through `Host::sload`
-// / `Host::load_account_info_skip_cold_load` so they pick up mid-tx
-// journal writes. The natural symmetry would be `Host::sstore` here.
-//
-// We can't use it: `Host::sstore_skip_cold_load` delegates to
-// `JournalImpl::sstore_skip_cold_load` which calls
-// `inner.sstore_assume_account_present(...)`. The "assume present"
-// check is stricter than `JournalTr::load_account`'s warm-up — even
-// after explicitly loading the account, the journal returns
-// `ColdLoadSkipped`. The plain `JournalTr::sstore(addr, key, value)`
-// path (which calls `load_account_mut` internally and panics on cold
-// load via `unwrap_db_error`) is the only one that actually works
-// for our explicitly-warmed flow.
-//
-// Balance writes go through `JournaledAccountTr::set_balance` —
-// `Host` exposes `balance(addr)` for reads but no public setter.
-
-/// Errors surfaced by the overlay diff-apply path.
-///
-/// SELFDESTRUCT is explicitly out of scope: revm's `JournalInner`
-/// exposes no public method to mark an account destroyed from
-/// outside, and the in-tree fixtures (`flash-loan`,
-/// `reentrantCrossChainCalls`) don't destroy accounts. If the nested
-/// state's cache shows a destroyed account that the source state
-/// does not, the apply path surfaces this loud error rather than
-/// silently miscomposing.
+/// Errors surfaced by [`apply_overlay_writes`].
 #[derive(Debug, thiserror::Error)]
 pub enum OverlayError {
-    /// The nested state shows an account in `SelfDestructed` state
-    /// that the source state does not. Out of scope for the overlay
-    /// diff-apply path.
-    #[error("SELFDESTRUCT mutation at {address}: out of scope for overlay diff-apply")]
-    Selfdestruct {
-        /// Address of the destroyed account.
+    /// The re-entered session created, destroyed or wiped an account. The
+    /// source journal can replay value writes only, not account lifecycles.
+    #[error("account {address} was created or destroyed in a re-entered session")]
+    Lifecycle {
+        /// Address of the created or destroyed account.
         address: Address,
     },
-    /// Source-state journal returned a database error while loading an
-    /// account during diff-apply. Surfaced verbatim (Display).
-    #[error("source state load_account({address}) failed: {message}")]
+    /// The source state could not load an account or slot.
+    #[error("source state load of {address} failed: {message}")]
     SourceLoad {
         /// Address whose load failed.
         address: Address,
-        /// Underlying database error rendered via Display.
-        message: String,
-    },
-    /// `journal.sstore` failed during diff-apply.
-    #[error("source state sstore({address}, {key}) failed: {message}")]
-    SourceSstore {
-        /// Address whose storage write failed.
-        address: Address,
-        /// Storage key whose write failed.
-        key: revm::primitives::StorageKey,
-        /// Underlying database error rendered via Display.
+        /// Underlying database error.
         message: String,
     },
 }
 
-/// Whether the overlay introduced or changed a destroyed account.
-fn has_unsupported_destruction(
-    before: &CacheState,
-    address: &Address,
-    after_account: &CacheAccount,
-) -> bool {
-    after_account.status.was_destroyed() && before.accounts.get(address) != Some(after_account)
-}
-
-/// Apply the per-account, per-slot delta between two cache snapshots
-/// onto a live revm context's source state, via journal entries so the
-/// outer transaction's revert semantics propagate naturally.
+/// Replay a re-entered session's writes on the suspended source state.
 ///
-/// # When this is called
-///
-/// The inspector hook fires for a cross-chain CALL, snapshots the
-/// source cache as `before`, publishes it on the overlay channel, and
-/// drives the dispatch. A nested dispatch back into this rollup opens
-/// its session preloaded with `before` and publishes its post-execute
-/// cache; after the outer dispatch returns, the inspector pops that
-/// cache as `after` and calls this function on the source EVM context.
-///
-/// # Mutation classes
-///
-/// In scope for the diff-apply path:
-///
-/// - **Storage writes:** for each account in `after`, for each storage
-///   slot whose value differs from `before`, emit
-///   `ctx.journal_mut().sstore(addr, key, value)`. The journal entry
-///   gives revert-safety (a user-tx revert in source-sim unwinds the
-///   diff-applied entries together with source-sim's own writes).
-///
-/// - **Balance changes:** for each account whose balance differs,
-///   emit `ctx.journal_mut().load_account_mut(addr).set_balance(...)`.
-///   `set_balance` is the load-bearing primitive — `balance_incr` on
-///   `JournalTr` is increment-only (`U256` no-wrap on decrease), and
-///   overlay flows commonly involve net decreases on one side and
-///   increases on the other. Going through `load_account_mut` reaches
-///   `JournaledAccountTr::set_balance` which mutates the journaled
-///   account directly.
-///
-/// Out of scope — surfaced as `Err(OverlayError::*)` or skipped:
-///
-/// - **SELFDESTRUCT:** loud failure via [`OverlayError::Selfdestruct`].
-///   No public revm API to mark an account destroyed from outside, and
-///   `flash-loan` / `reentrantCrossChainCalls` don't destroy accounts.
-///
-/// - **Code installation, nonce changes:** rare in overlay-relevant
-///   patterns (`flash-loan`, `reentrant`); deferred. A future commit
-///   can extend the function with `set_code` / `set_nonce` calls.
-///
-/// - **Transient storage:** EIP-1153 auto-clears at end of transaction;
-///   no diff-apply needed.
-///
-/// # Idempotency
-///
-/// The inspector pops both channel stacks around this call. Calling it
-/// twice on the same `(before, after)` is well-defined but emits
-/// redundant journal entries; callers should not do this.
+/// Balances, nonces and slots are written through the source journal, so a
+/// revert of the frame that dispatched the call undoes them with the rest of
+/// the frame.
 ///
 /// # Errors
 ///
-/// - [`OverlayError::Selfdestruct`] if the overlay's cache shows an
-///   account whose status flipped to destroyed during overlay execution.
-/// - [`OverlayError::SourceLoad`] / [`OverlayError::SourceSstore`] if
-///   the source state's database or journal surfaces an error during
-///   apply.
-pub fn apply_overlay_diff<CTX>(
-    ctx: &mut CTX,
-    before: &CacheState,
-    after: &CacheState,
-) -> Result<(), OverlayError>
-where
-    CTX: ContextTr + Host,
-{
-    for (addr, after_acc) in &after.accounts {
-        // A destroyed account can be carried unchanged from the source
-        // snapshot. Only a new or changed destruction is a mutation that
-        // this diff-apply path cannot represent.
-        if has_unsupported_destruction(before, addr, after_acc) {
-            return Err(OverlayError::Selfdestruct { address: *addr });
-        }
-        if after_acc.status.was_destroyed() {
-            continue;
-        }
-
-        // Filter: only apply for accounts the overlay actually modified.
-        // `Loaded` / `LoadedEmptyEIP161` / `LoadedNotExisting` mark
-        // accounts the overlay merely *read* (cold-load to populate
-        // the cache); applying their info to source is a no-op at best
-        // and a "set_balance to disk value" misstep at worst.
-        if !matches!(
-            after_acc.status,
-            AccountStatus::Changed | AccountStatus::InMemoryChange
-        ) {
-            continue;
-        }
-
-        let Some(after_plain) = after_acc.account.as_ref() else {
-            continue;
+/// [`OverlayError::Lifecycle`] when the writes create, destroy or wipe an
+/// account; [`OverlayError::SourceLoad`] when the source state cannot load an
+/// account or slot.
+pub fn apply_overlay_writes(state: &mut State<'_>, writes: &Cache) -> Result<(), OverlayError> {
+    let load_err = |address: Address, error: evm2::DatabaseError| OverlayError::SourceLoad {
+        address,
+        message: error.to_string(),
+    };
+    for (address, info) in &writes.accounts {
+        let Some(info) = info else {
+            return Err(OverlayError::Lifecycle { address: *address });
         };
-        let before_plain = before.accounts.get(addr).and_then(|a| a.account.as_ref());
-
-        // Per-account warming. Both sstore and set_balance assume the
-        // account is already journaled; outside the EVM's normal CALL/
-        // SLOAD path we do the load explicitly. `load_account_mut`
-        // also gives us a `JournaledAccount` for the balance set; we
-        // bind it for the balance branch and let it drop before sstore.
-        // (`load_account` is the lighter-weight version — used here
-        // for the storage-only branch to avoid pulling code.)
-        let balance_changed =
-            before_plain.is_some_and(|b| b.info.balance != after_plain.info.balance);
-
-        if balance_changed {
-            let mut loaded = ctx.journal_mut().load_account_mut(*addr).map_err(|e| {
-                OverlayError::SourceLoad {
-                    address: *addr,
-                    message: format!("{e:?}"),
-                }
-            })?;
-            loaded.data.set_balance(after_plain.info.balance);
-            // `loaded` borrow ends here so the `sstore` calls below
-            // can re-borrow `ctx.journal_mut()`.
-        } else {
-            // Warm the account so the subsequent `sstore` calls don't
-            // hit `JournalLoadError::ColdLoadSkipped` (which the
-            // public `sstore` method panics on via
-            // `unwrap_db_error`).
-            ctx.journal_mut()
-                .load_account(*addr)
-                .map_err(|e| OverlayError::SourceLoad {
-                    address: *addr,
-                    message: format!("{e:?}"),
-                })?;
+        let mut account = state
+            .account(address)
+            .map_err(|error| load_err(*address, error))?;
+        if account.code_hash() != info.code_hash {
+            return Err(OverlayError::Lifecycle { address: *address });
         }
-
-        // Iterate after's storage; emit sstore for every slot whose
-        // value differs from before.
-        for (key, after_val) in &after_plain.storage {
-            let before_val = before_plain
-                .and_then(|b| b.storage.get(key).copied())
-                .unwrap_or_default();
-            if before_val == *after_val {
-                continue;
-            }
-            ctx.journal_mut()
-                .sstore(*addr, *key, *after_val)
-                .map_err(|e| OverlayError::SourceSstore {
-                    address: *addr,
-                    key: *key,
-                    message: format!("{e:?}"),
-                })?;
+        if account.balance() != info.balance {
+            account.set_balance(info.balance);
+        }
+        if account.nonce() != info.nonce {
+            account.set_nonce(info.nonce);
         }
     }
-
+    for (address, storage) in &writes.storage {
+        if storage.wiped {
+            return Err(OverlayError::Lifecycle { address: *address });
+        }
+        for (key, value) in &storage.slots {
+            state
+                .storage_slot(address, *key)
+                .map_err(|error| load_err(*address, error))?
+                .set(*value);
+        }
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use revm::database::{EmptyDB, State};
+    use alloy_primitives::U256;
+    use evm2::evm::{AccountInfo, InMemoryDB};
 
-    #[test]
-    fn overlay_cache_snapshots_are_lifo() {
-        let marker = Address::with_last_byte(0x22);
-        let channel = OverlayChannel::default();
-        let first = CacheState::default();
-        let mut second = CacheState::default();
-        second.insert_not_existing(marker);
-
-        channel.push_pre_snapshot(first.clone());
-        channel.push_pre_snapshot(second.clone());
-        assert_eq!(channel.peek_pre_snapshot(), Some(second.clone()));
-        assert_eq!(channel.pop_pre_snapshot(), Some(second.clone()));
-        assert_eq!(channel.pop_pre_snapshot(), Some(first.clone()));
-        assert_eq!(channel.pop_pre_snapshot(), None);
-
-        channel.push_post_cache(first.clone());
-        channel.push_post_cache(second.clone());
-        assert_eq!(channel.pop_post_cache(), Some(second));
-        assert_eq!(channel.pop_post_cache(), Some(first));
-        assert_eq!(channel.pop_post_cache(), None);
+    fn cache_with_slot(address: Address, value: u64) -> Cache {
+        let mut cache = Cache::default();
+        cache
+            .storage
+            .entry(address)
+            .or_default()
+            .slots
+            .insert(U256::ZERO, U256::from(value));
+        cache
     }
 
     #[test]
-    fn reset_clears_both_overlay_stacks() {
+    fn snapshots_are_lifo_and_writes_drain_from_the_mark() {
+        let address = Address::with_last_byte(0x22);
         let channel = OverlayChannel::default();
-        channel.push_pre_snapshot(CacheState::default());
-        channel.push_post_cache(CacheState::default());
+        channel.push_pre_snapshot(cache_with_slot(address, 1));
+        channel.push_pre_snapshot(cache_with_slot(address, 2));
+        assert_eq!(
+            channel.peek_pre_snapshot(),
+            Some(cache_with_slot(address, 2))
+        );
+        assert_eq!(
+            channel.pop_pre_snapshot(),
+            Some(cache_with_slot(address, 2))
+        );
+        assert_eq!(
+            channel.pop_pre_snapshot(),
+            Some(cache_with_slot(address, 1))
+        );
+        assert_eq!(channel.pop_pre_snapshot(), None);
+
+        channel.push_writes(cache_with_slot(address, 1));
+        let mark = channel.writes_len();
+        assert_eq!(channel.take_writes_since(mark), None);
+        channel.push_writes(cache_with_slot(address, 2));
+        channel.push_writes(cache_with_slot(address, 3));
+        // Later writes win; the entry published before the mark stays.
+        assert_eq!(
+            channel.take_writes_since(mark),
+            Some(cache_with_slot(address, 3))
+        );
+        assert_eq!(channel.writes_len(), 1);
 
         channel.reset();
-
-        assert_eq!(channel.pop_pre_snapshot(), None);
-        assert_eq!(channel.pop_post_cache(), None);
+        assert_eq!(channel.writes_len(), 0);
     }
 
-    /// Field-by-field clone of revm [`State<DB>`], constructed literally so a
-    /// field addition in a future revm version breaks this test's compile —
-    /// the drift guard for the cache-sharing assumptions in the live overlay
-    /// path (`with_cached_prestate`).
-    fn clone_state<DB: Clone>(src: &State<DB>) -> State<DB> {
-        State {
-            cache: src.cache.clone(),
-            database: src.database.clone(),
-            transition_state: src.transition_state.clone(),
-            bundle_state: src.bundle_state.clone(),
-            use_preloaded_bundle: src.use_preloaded_bundle,
-            block_hashes: src.block_hashes.clone(),
-            bal_state: src.bal_state.clone(),
-            // A commit callback, not state; the overlay path never installs one.
-            state_hook: None,
+    #[test]
+    fn writes_replay_through_the_source_journal() {
+        let address = Address::with_last_byte(0x33);
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(&address, AccountInfo::empty().with_balance(U256::from(5)));
+        let mut state = State::new(db);
+        let checkpoint = state.checkpoint();
+
+        let mut writes = cache_with_slot(address, 7);
+        writes.accounts.insert(
+            address,
+            Some(
+                AccountInfo::empty()
+                    .with_balance(U256::from(9))
+                    .with_nonce(1),
+            ),
+        );
+        apply_overlay_writes(&mut state, &writes).unwrap();
+        assert_eq!(
+            state.storage_slot_untracked(&address, &U256::ZERO).unwrap(),
+            U256::from(7)
+        );
+        let info = state.account_info_untracked(&address).unwrap().unwrap();
+        assert_eq!((info.balance, info.nonce), (U256::from(9), 1));
+
+        state.rollback(
+            checkpoint,
+            evm2::Version::new(evm2::SpecId::PRAGUE).features,
+        );
+        assert_eq!(
+            state.storage_slot_untracked(&address, &U256::ZERO).unwrap(),
+            U256::ZERO
+        );
+        let info = state.account_info_untracked(&address).unwrap().unwrap();
+        assert_eq!((info.balance, info.nonce), (U256::from(5), 0));
+    }
+
+    #[test]
+    fn account_lifecycles_are_rejected() {
+        let address = Address::with_last_byte(0x44);
+        let mut state = State::new(InMemoryDB::default());
+
+        let mut deleted = Cache::default();
+        deleted.accounts.insert(address, None);
+        let mut wiped = Cache::default();
+        wiped.storage.entry(address).or_default().wipe();
+        for writes in [deleted, wiped] {
+            assert!(matches!(
+                apply_overlay_writes(&mut state, &writes),
+                Err(OverlayError::Lifecycle { address: a }) if a == address
+            ));
         }
-    }
-
-    /// Regression: `clone_state` must produce a struct literally
-    /// equivalent to the source. Any divergence (a field accidentally
-    /// not cloned, a field whose Clone impl drifted) shows up as a
-    /// non-equal Debug rendering of one of the seven fields.
-    #[test]
-    fn clone_state_field_parity_default() {
-        let src: State<EmptyDB> = State::builder().with_database(EmptyDB::default()).build();
-        let cloned = clone_state(&src);
-
-        assert_eq!(format!("{:?}", src.cache), format!("{:?}", cloned.cache));
-        assert_eq!(
-            format!("{:?}", src.transition_state),
-            format!("{:?}", cloned.transition_state),
-        );
-        assert_eq!(
-            format!("{:?}", src.bundle_state),
-            format!("{:?}", cloned.bundle_state),
-        );
-        assert_eq!(src.use_preloaded_bundle, cloned.use_preloaded_bundle);
-        assert_eq!(
-            format!("{:?}", src.block_hashes),
-            format!("{:?}", cloned.block_hashes),
-        );
-        assert_eq!(
-            format!("{:?}", src.bal_state),
-            format!("{:?}", cloned.bal_state),
-        );
-    }
-
-    #[test]
-    fn unchanged_destroyed_account_is_not_a_new_selfdestruct() {
-        let address = Address::ZERO;
-        let mut before = CacheState::default();
-        before
-            .accounts
-            .insert(address, CacheAccount::new_destroyed());
-        let after = before.clone();
-
-        assert!(!has_unsupported_destruction(
-            &before,
-            &address,
-            &after.accounts[&address],
-        ));
-    }
-
-    #[test]
-    fn new_or_changed_destroyed_account_remains_unsupported() {
-        let address = Address::ZERO;
-        let before = CacheState::default();
-        let mut after = CacheState::default();
-        after
-            .accounts
-            .insert(address, CacheAccount::new_destroyed());
-
-        assert!(has_unsupported_destruction(
-            &before,
-            &address,
-            &after.accounts[&address],
-        ));
-
-        let mut before = after.clone();
-        after.accounts.get_mut(&address).unwrap().status = AccountStatus::DestroyedAgain;
-        assert!(has_unsupported_destruction(
-            &before,
-            &address,
-            &after.accounts[&address],
-        ));
-
-        before.accounts.get_mut(&address).unwrap().status = AccountStatus::Loaded;
-        assert!(has_unsupported_destruction(
-            &before,
-            &address,
-            &after.accounts[&address],
-        ));
     }
 }

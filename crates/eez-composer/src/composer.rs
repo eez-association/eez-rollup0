@@ -190,8 +190,8 @@ fn compose_crosschain(
     entry_client: &crate::local::LocalChainClient,
     raw_tx: &[u8],
     sessions: SlotSessions,
-    source_state: &mut crate::local::build::DraftDb,
-    source_env: reth_evm::EvmEnvFor<EezEvmConfig>,
+    source_state: &mut crate::local::sim::SimState,
+    source_env: &reth_evm::EvmEnvFor<EezEvmConfig>,
 ) -> eez_protocol::ComposerResult<(eez_protocol::Composition, SlotSessions, u64)> {
     use eez_protocol::ChainClient as _;
     use eez_protocol::composition::Rollup;
@@ -1154,11 +1154,11 @@ fn append_and_execute(
 
 /// Take the L1 session's accumulated effects for commit into the slot's state.
 /// The payload shape is pinned by `L1TargetSession::checkpoint`: a boxed
-/// `CacheState` and nothing else.
+/// `Cache` and nothing else.
 fn take_l1_cache(
     sessions: &mut SlotSessions,
     l1_rollup_id: eez_protocol::RollupId,
-) -> Result<revm::database::CacheState, String> {
+) -> Result<evm2::evm::Cache, String> {
     let mut session = sessions
         .remove(&l1_rollup_id)
         .ok_or_else(|| format!("composition returned no session for L1 rollup {l1_rollup_id}"))?;
@@ -1166,9 +1166,9 @@ fn take_l1_cache(
         .checkpoint()
         .map_err(|e| format!("L1 session checkpoint: {e}"))?;
     snapshot
-        .downcast::<revm::database::CacheState>()
+        .downcast::<evm2::evm::Cache>()
         .map(|cache| *cache)
-        .map_err(|_e| "L1 session checkpoint payload is not a CacheState".to_owned())
+        .map_err(|_e| "L1 session checkpoint payload is not a Cache".to_owned())
 }
 
 /// Hex of the first 32 bytes of a revert/return payload, for event messages.
@@ -2498,7 +2498,6 @@ where
             };
             let sessions = seed_session(cc.entry_rollup_id, l1_exec);
             let (state, env) = l2_fork.state_and_env();
-            let env = env.clone();
             let sim = compose_crosschain(
                 cc,
                 eez_protocol::RollupId(rollup_id),
@@ -2967,7 +2966,7 @@ where
                 held.raw_tx.as_ref(),
                 sessions,
                 &mut l1_fork,
-                l1_env,
+                &l1_env,
             );
             match sim {
                 Ok((composition, _sessions, _probe_gas)) => {
@@ -3172,7 +3171,7 @@ where
                     sync_txs.extend(deliveries);
                     // The source fork carries the L1 user tx's committed writes;
                     // later inbound sims must observe them (design §4 step 6).
-                    l1_state.cache = l1_fork.cache;
+                    l1_state.cache = l1_fork.into_cache();
 
                     let target_count = target_entries.len();
                     pending_in.extend(target_entries);

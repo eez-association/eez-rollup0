@@ -206,7 +206,7 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_BUFFER);
         let overlay = eez_p2p::Overlay::new(
             cfg,
-            eez_p2p::keypair(&network.secret_key().secret_bytes())?,
+            eez_p2p::keypair(&network.secret_key().to_secret_bytes())?,
             eez_p2p::Validator::new(head_domain, sequencer_address),
             eez_node_common::discover(network.clone()),
         )?;

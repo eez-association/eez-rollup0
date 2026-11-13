@@ -25,10 +25,9 @@ reth-ethereum-consensus.workspace = true
 reth-evm.workspace = true
 reth-execution-types.workspace = true
 reth-primitives-traits.workspace = true
-reth-revm.workspace = true
 reth-storage-api.workspace = true
 reth-payload-primitives.workspace = true
-revm.workspace = true
+evm2.workspace = true
 
 async-trait.workspace = true
 eyre.workspace = true
