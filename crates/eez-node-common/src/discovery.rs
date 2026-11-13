@@ -1,12 +1,10 @@
 //! Advertises the overlay port in reth's discv5 ENR and reads it back from discovered peers.
 
 use eez_p2p::Discover;
+use enr::EnrPublicKey;
 use libp2p::{Multiaddr, multiaddr::Protocol};
 use reth_chainspec::{EnrForkIdEntry, ForkId, Hardforks};
-use reth_discv5::{
-    ConfigBuilder, NetworkStackId,
-    discv5::enr::{Enr, EnrKey, EnrPublicKey},
-};
+use reth_discv5::{ConfigBuilder, Enr, EnrKey, NetworkStackId};
 use reth_network::{
     NetworkHandle, NetworkManager, NetworkPrimitives, PeersInfo, primitives::BasicNetworkPrimitives,
 };
@@ -130,10 +128,14 @@ mod tests {
             .fork(NetworkStackId::ETH, ours)
             .build();
         // The discv5 table holds `Enr<CombinedKey>`, so test that key type.
-        let enr = |c: &Config| EnrCombinedKeyWrapper::from(build_local_enr(&sk, c).0).0;
+        let enr = |c: &Config| {
+            EnrCombinedKeyWrapper::try_from(build_local_enr(&sk, c).0)
+                .unwrap()
+                .0
+        };
         let with_entry = enr(&advertise(base.clone(), 9100));
         let without_entry = enr(&base);
-        let peer = eez_p2p::keypair(&sk.secret_bytes())
+        let peer = eez_p2p::keypair(&sk.to_secret_bytes())
             .unwrap()
             .public()
             .to_peer_id();
