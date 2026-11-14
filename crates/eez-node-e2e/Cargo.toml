@@ -7,6 +7,14 @@ rust-version.workspace = true
 description            = "Cross-role integration tests for eez node binaries."
 publish                = false
 
+[features]
+blob-e2e = []
+
+[[test]]
+name = "blob_settlement"
+path = "tests/blob_settlement.rs"
+required-features = ["blob-e2e"]
+
 [dependencies]
 eez-primitives.workspace = true
 eez-follower.workspace = true
@@ -31,6 +39,8 @@ alloy-rpc-types-eth.workspace = true
 alloy-signer-local.workspace = true
 alloy-sol-types.workspace = true
 anyhow = "1"
+eez-l1.workspace = true
+eez-payload-codec.workspace = true
 eez-control-rpc.workspace = true
 eez-protocol.workspace = true
 eez-testkit.workspace = true
