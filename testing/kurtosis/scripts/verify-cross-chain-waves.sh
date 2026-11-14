@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+: "${EEZ_NODE_IMAGE:?set EEZ_NODE_IMAGE}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULT_DIR="${EEZ_CI_RESULT_DIR:?set EEZ_CI_RESULT_DIR}"
@@ -23,3 +24,5 @@ run_check "cross-chain-wave-mixed-pure" \
     bash "$HERE/cross-chain-wave.sh"
 
 run_check "state-chaining" bash "$HERE/verify-state-chaining.sh"
+
+run_check "bridge-round-trip" bash "$HERE/verify-bridge-round-trip.sh"
