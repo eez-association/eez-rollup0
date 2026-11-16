@@ -57,7 +57,7 @@ impl HeadSigner {
         Ok(Envelope {
             head,
             signature: Bytes::from(sig.as_bytes().to_vec()),
-            block: Some(block_rlp),
+            block: block_rlp,
         })
     }
 }
