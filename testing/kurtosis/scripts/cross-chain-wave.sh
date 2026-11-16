@@ -313,7 +313,7 @@ run_waves() {
     # Per-tx metadata for the confirmed-view tally: "hash|side|kind|arg".
     # side=in|out; kind=set|noret|wrap|dep|wd.
     local TX_META=()
-    local IN_HASHES=() OUT_HASHES=()
+    local IN_HASHES=() OUT_HASHES=() PURE_HASHES=()
     local REV_IN_HASHES=() REV_OUT_HASHES=()
     local REV_IN_NONCE=0 REV_OUT_NONCE=0
 
@@ -376,14 +376,18 @@ run_waves() {
     }
 
     submit_pure_filler() {
-        local count="$1" j raw
+        local count="$1" j raw hash
         for ((j=0; j<count; j++)); do
             raw=$(cast mktx --chain-id "$L2_CHAIN_ID" --private-key "$HH_KEY_PURE" --nonce "$PURE_NONCE" \
                 --gas-limit 21000 --gas-price "$(gas_price_for "$L2")" --priority-gas-price "$PRIORITY_GAS_PRICE" \
-                --value 100000000 "$PURE_RECIPIENT" 2>&1)
-            [[ "$raw" =~ ^0x[0-9a-fA-F]+$ ]] || break
-            curl -s -X POST "$L2" -H 'Content-Type: application/json' \
-                -d "{\"jsonrpc\":\"2.0\",\"method\":\"eth_sendRawTransaction\",\"params\":[\"$raw\"],\"id\":9}" >/dev/null
+                --value 100000000 "$PURE_RECIPIENT") || return 1
+            [[ "$raw" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "    ✗ filler mktx failed: $raw" >&2; return 1; }
+            hash=$(cast keccak "$raw") || return 1
+            send_front "$L2" "$raw" "$hash" || return 1
+            PURE_HASHES+=("$hash")
+            if [[ -n "${EEZ_WAVE_TX_MANIFEST:-}" ]]; then
+                printf '%s|pure\n' "$hash" >>"$EEZ_WAVE_TX_MANIFEST" || return 1
+            fi
             PURE_NONCE=$((PURE_NONCE + 1))
             sleep 1
         done
@@ -421,7 +425,10 @@ run_waves() {
             OUT_WAVE_TARGET="$OUT_NONCE"
             echo "    outbound: 4 ops via L2 front (set/noret/wd/wrap)"
         fi
-        (( do_pure )) && { submit_pure_filler "$FILLER_PER_GAP"; echo "    pure: $FILLER_PER_GAP L2 filler txs"; }
+        if (( do_pure )); then
+            submit_pure_filler "$FILLER_PER_GAP" || exit 1
+            echo "    pure: $FILLER_PER_GAP L2 filler txs"
+        fi
         if (( w < WAVES )); then
             if (( do_in )); then
                 wait_nonce_at_least "$L1" "$HH_ADDR_IN" "$IN_WAVE_TARGET" "inbound sender" || exit 1
@@ -434,15 +441,16 @@ run_waves() {
     done
 
     # ── Wait for inclusion ─────────────────────────────────────────────
-    # inbound → L1 receipts, outbound → L2 receipts.
-    local total=$(( ${#IN_HASHES[@]} + ${#OUT_HASHES[@]} ))
+    # Inbound receipts are on L1. Outbound and filler receipts are on L2.
+    local total=$(( ${#IN_HASHES[@]} + ${#OUT_HASHES[@]} + ${#PURE_HASHES[@]} ))
     echo
-    echo "==> waiting up to ${RECEIPT_WAIT_SECS}s for $total cross-chain inclusions"
+    echo "==> waiting up to ${RECEIPT_WAIT_SECS}s for $total transaction inclusions"
     local wait_end=$(( SECONDS + RECEIPT_WAIT_SECS )) confirmed evicted h last_line=""
     while (( SECONDS < wait_end )); do
         confirmed=0
         for h in "${IN_HASHES[@]:-}";  do [[ -n "$h" && "$(receipt_status "$h" "$L1")" == "1" ]] && confirmed=$((confirmed+1)); done
         for h in "${OUT_HASHES[@]:-}"; do [[ -n "$h" && "$(receipt_status "$h" "$L2")" == "1" ]] && confirmed=$((confirmed+1)); done
+        for h in "${PURE_HASHES[@]:-}"; do [[ -n "$h" && "$(receipt_status "$h" "$L2")" == "1" ]] && confirmed=$((confirmed+1)); done
         refresh_node_log
         evicted=$(grep -c '"event_name":"eez.composer.cc_compose.poison_eviction_completed"' \
             "$NODE_LOG" 2>/dev/null || true); evicted=${evicted:-0}
@@ -452,9 +460,19 @@ run_waves() {
         sleep 5
     done
     if (( confirmed != total )); then
-        echo "    ✗ only $confirmed/$total cross-chain transactions succeeded" >&2
+        echo "    ✗ only $confirmed/$total transactions succeeded" >&2
         exit 1
     fi
+    local pure_height=0 receipt height
+    for h in "${PURE_HASHES[@]:-}"; do
+        [[ -n "$h" ]] || continue
+        receipt=$(receipt_json "$h" "$L2")
+        height=$(jq -er '.result.blockNumber' <<<"$receipt")
+        height=$(cast to-dec "$height")
+        if (( height > pure_height )); then
+            pure_height="$height"
+        fi
+    done
     # ── Confirmed view (only receipt-confirmed ops count) ──────────────
     local m mh mside mkind marg
     local IN_LAST_VALUE="" IN_LAST_NORET="" IN_DEP_SUM=0
@@ -592,7 +610,7 @@ run_waves() {
             L2_BLOCK_HASH=$(jq -r '.hash' <<<"$SAFE_BLOCK")
             L1_RECHECK=$(retry cast call "$EEZ_REGISTRY_ADDRESS" 'rollups(uint64)(address,bytes32,uint256)' \
                 "$EEZ_ROLLUP_ID" --rpc-url "$L1" | sed -n '2p' | tr -d '[:space:]')
-            if [[ "${L1_TRACKED,,}" == "${L1_RECHECK,,}" \
+            if (( L2_SAFE >= pure_height )) && [[ "${L1_TRACKED,,}" == "${L1_RECHECK,,}" \
                 && "${L1_RECHECK,,}" == "${L2_BLOCK_HASH,,}" ]]; then
                 commitment_matched=1
                 break
@@ -602,7 +620,7 @@ run_waves() {
         if (( commitment_matched )); then
             echo "    ✓ L1 rollups($EEZ_ROLLUP_ID) commitment == L2 safe block hash at height $L2_SAFE"
         else
-            echo "    ✗ L1 commitment $L1_RECHECK != L2 safe block hash $L2_BLOCK_HASH at height $L2_SAFE"; ok_all=0
+            echo "    ✗ L2 safe checkpoint $L2_BLOCK_HASH at height $L2_SAFE did not converge with L1 commitment $L1_RECHECK through filler height $pure_height"; ok_all=0
         fi
         if (( L2_SAFE >= LAST_SETTLED )); then
             echo "    ✓ L2 safe head reached settled height: $L2_SAFE"

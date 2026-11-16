@@ -203,61 +203,91 @@ def run(plan, args):
             ),
         )
 
+    l2_env = {
+        "EEZ_L1_CHAIN_ID": chain_id,
+        "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
+        "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 2000)),
+        "EEZ_PROOF_TIME_MS": str(eez.get("proof_time_ms", 5000)),
+        "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 2500)),
+        "EEZ_L2_DATADIR": "/data/l2",
+        "EEZ_L2_HTTP_PORT": str(L2_RPC_PORT),
+        "EEZ_L2_AUTH_PORT": str(L2_ENGINE_PORT),
+        "EEZ_L2_P2P_PORT": str(L2_P2P_PORT),
+        "EEZ_SYNC_L1_ONLY": "1",
+    }
+    if settlement_profile == "blob":
+        l2_env["EEZ_L1_BEACON_URL"] = participants[0].cl_context.beacon_http_url
+
     # eez-node: embedded L1, composer, L2, and cross-chain fronts.
-    eez_env = {
+    eez_env = dict(l2_env)
+    eez_env.update({
         "EEZ_L1_CHAIN": "devnet",
         "EEZ_L1_CHAIN_PATH": "/genesis/genesis.json",
         "EEZ_L1_JWT_SECRET": "/jwt/jwtsecret",
         "EEZ_L1_HTTP_PORT": str(EMBEDDED_L1_RPC_PORT),
         "EEZ_L1_AUTH_PORT": str(EMBEDDED_L1_ENGINE_PORT),
-        "EEZ_L1_CHAIN_ID": chain_id,
         "EEZ_L1_RPC_URL": "http://127.0.0.1:{}".format(EMBEDDED_L1_RPC_PORT),
         "EEZ_L1_TARGET_RPC_URL": l1_el.rpc_http_url,
         "EEZ_L1_BUILDER_RPC_URL": builder_rpc,
         "EEZ_L1_TRUSTED_PEERS": l1_el.enode,
-        "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
-        "EEZ_L2_BLOCK_TIME_MS": str(eez.get("l2_block_time_ms", 2000)),
-        "EEZ_PROOF_TIME_MS": str(eez.get("proof_time_ms", 5000)),
-        "EEZ_SUBMISSION_SLACK_MS": str(eez.get("submission_slack_ms", 2500)),
         "EEZ_MAX_SPECULATIVE_DEPTH": str(eez.get("max_speculative_depth", 0)),
         "EEZ_MAX_USER_TXS_PER_BUNDLE": str(eez.get("max_user_txs_per_bundle", 3)),
         "EEZ_L1_POSTER_KEY": poster_key,
         "EEZ_PROVER_URL": "http://{}:{}".format(prover_service, PROOF_SIGNER_GRPC_PORT),
         "EEZ_WITNESS_DB_PATH": "/data/witnesses",
-        "EEZ_L2_DATADIR": "/data/l2",
-        "EEZ_L2_HTTP_PORT": str(L2_RPC_PORT),
         "EEZ_L2_RPC_URL": "http://127.0.0.1:{}".format(L2_RPC_PORT),
         "EEZ_L1_XCHAIN_PORT": str(L1_XCHAIN_PORT),
         "EEZ_L2_XCHAIN_PORT": str(L2_XCHAIN_PORT),
-        "EEZ_L2_AUTH_PORT": str(L2_ENGINE_PORT),
-        "EEZ_L2_P2P_PORT": str(L2_P2P_PORT),
         "EEZL2_ADDRESS": "0x4200000000000000000000000000000000000007",
-        "EEZ_SYNC_L1_ONLY": "1",  # the genesis composer has no peers to sync from
-    }
+    })
 
     if settlement_profile == "blob":
-        eez_env.update({
-            "EEZ_L1_BEACON_URL": participants[0].cl_context.beacon_http_url,
-            "EEZ_L1_MAX_FEE_PER_BLOB_GAS": str(eez.get("max_fee_per_blob_gas", 1000000000)),
-        })
+        eez_env["EEZ_L1_MAX_FEE_PER_BLOB_GAS"] = str(eez.get("max_fee_per_blob_gas", 1000000000))
 
-    node_cmd = " ".join(
-        [
-            "set -eu;",
-            "test -f /out/deployments.env;",
-            "set -a; . /out/deployments.env; set +a;",
-            "exec eez-composer node",
-            "--chain=/out/l2-genesis.json",
-            "--datadir=$EEZ_L2_DATADIR",
-            "--log.stdout.format=json",
-            "--log.file.max-files=0",
-            "--http --http.addr=0.0.0.0 --http.port=$EEZ_L2_HTTP_PORT --http.api=eth,net,web3,debug,trace",
-            "--authrpc.addr=127.0.0.1 --authrpc.port=$EEZ_L2_AUTH_PORT",
-            "--port=$EEZ_L2_P2P_PORT --discovery.port=$EEZ_L2_P2P_PORT",
-            "--discovery.v5.port=$((EEZ_L2_P2P_PORT+1))",
-            "--ipcdisable --disable-discovery",
-        ]
-    )
+    load_deployments = "set -eu; test -f /out/deployments.env; set -a; . /out/deployments.env; set +a;"
+    l2_node_args = [
+        "--chain=/out/l2-genesis.json",
+        "--datadir=$EEZ_L2_DATADIR",
+        "--log.stdout.format=json",
+        "--log.file.max-files=0",
+        "--http --http.addr=0.0.0.0 --http.port=$EEZ_L2_HTTP_PORT --http.api=eth,net,web3,debug,trace",
+        "--authrpc.addr=127.0.0.1 --authrpc.port=$EEZ_L2_AUTH_PORT",
+        "--port=$EEZ_L2_P2P_PORT --discovery.port=$EEZ_L2_P2P_PORT",
+        "--discovery.v5.port=$((EEZ_L2_P2P_PORT+1))",
+        "--ipcdisable --disable-discovery",
+    ]
+    node_cmd = " ".join([load_deployments, "exec eez-composer node"] + l2_node_args)
+
+    if settlement_profile == "blob":
+        # Independent L2 verifier: no EL peers or signed-head overlay.
+        # Every block must be reconstructed from canonical L1 data.
+        follower_env = dict(l2_env)
+        follower_env.update({
+            "EEZ_L1_RPC_URL": l1_el.rpc_http_url,
+            "RUST_LOG": "info",
+        })
+        follower_cmd = " ".join(
+            [load_deployments, "exec eez-follower node"] +
+            l2_node_args +
+            ["--max-outbound-peers=0", "--max-inbound-peers=0"]
+        )
+        plan.add_service(
+            name="eez-l2-follower",
+            config=ServiceConfig(
+                image=eez.get("eez_node_image", "eez-node:dev"),
+                ports={
+                    "l2-rpc": PortSpec(
+                        number=L2_RPC_PORT,
+                        transport_protocol="TCP",
+                        application_protocol="http",
+                    ),
+                },
+                files={"/out": deploy.files_artifacts[0]},
+                env_vars=follower_env,
+                entrypoint=["/bin/sh", "-c"],
+                cmd=[follower_cmd],
+            ),
+        )
 
     # Follower beacon drives eez-node's embedded reth over the engine API.
     plan.add_service(

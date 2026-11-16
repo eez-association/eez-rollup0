@@ -30,7 +30,7 @@ cleanup() {
     trap - EXIT
     if (( started )); then
         kurtosis enclave inspect "$KURTOSIS_ENCLAVE" >"$EEZ_CI_RESULT_DIR/enclave.txt" 2>&1 || true
-        for service in eez-node eez-proof-signer eez-follower; do
+        for service in eez-node eez-proof-signer eez-l2-follower eez-follower; do
             timeout 30s kurtosis service logs "$KURTOSIS_ENCLAVE" "$service" \
                 >"$EEZ_CI_RESULT_DIR/$service.log" 2>&1 || true
         done
@@ -89,4 +89,5 @@ else
     cargo test --locked -p eez-node-e2e --features blob-e2e --test blob_settlement -- --nocapture \
         2>&1 | tee "$EEZ_CI_RESULT_DIR/blob-evidence.log"
 fi
+bash "$HERE/scripts/verify-follower.sh" 2>&1 | tee "$EEZ_CI_RESULT_DIR/checks/follower.log"
 echo "blob settlement E2E PASS"

@@ -227,14 +227,16 @@ async fn blob_settlement_evidence() -> Result<()> {
             !transactions.trim().is_empty(),
             "{mode}: no submitted transactions"
         );
+        let mut saw_pure = false;
         for line in transactions.lines() {
             let (hash, side) = line.split_once('|').context("malformed wave transaction")?;
             let hash: B256 = hash.parse()?;
-            if side == "out" {
+            if matches!(side, "out" | "pure") {
                 ensure!(
                     published_transactions.contains(&hash),
-                    "{mode}: outbound transaction {hash} absent from blob DA"
+                    "{mode}: {side} transaction {hash} absent from blob DA"
                 );
+                saw_pure |= side == "pure";
             } else {
                 ensure!(side == "in", "unknown wave direction");
                 let receipt = rpc(
@@ -268,6 +270,9 @@ async fn blob_settlement_evidence() -> Result<()> {
                     );
                 }
             }
+        }
+        if mode == "mixed-pure" {
+            ensure!(saw_pure, "{mode}: no pure L2 filler transactions recorded");
         }
         if mode == "inbound" || mode == "mixed" || mode == "mixed-pure" {
             ensure!(inbound > 0, "{mode}: no inbound blob settlement observed");
