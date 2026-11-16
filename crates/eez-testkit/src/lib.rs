@@ -382,8 +382,8 @@ fn test_log_destination(name: &str) -> Result<(PathBuf, Option<tempfile::TempDir
     Ok((path, Some(dir)))
 }
 
-fn proof_signer_binary() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("EEZ_TEST_PROOF_SIGNER_BIN") {
+fn prover_binary(package: &str, binary: &str, override_env: &str) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os(override_env) {
         return Ok(path.into());
     }
     let current = std::env::current_exe().context("current test executable")?;
@@ -391,7 +391,7 @@ fn proof_signer_binary() -> Result<PathBuf> {
         .parent()
         .and_then(std::path::Path::parent)
         .ok_or_else(|| anyhow!("test executable has no target profile directory"))?;
-    let path = target_profile.join(format!("eez-proof-signer{}", std::env::consts::EXE_SUFFIX));
+    let path = target_profile.join(format!("{binary}{}", std::env::consts::EXE_SUFFIX));
     if path.is_file() {
         return Ok(path);
     }
@@ -418,23 +418,26 @@ fn proof_signer_binary() -> Result<PathBuf> {
                 "scripts/provers-cargo.sh",
                 "build",
                 "-p",
-                "eez-prover-stateless",
+                package,
                 "--bin",
-                "eez-proof-signer",
+                binary,
             ])
             .arg("--target-dir")
-            .arg(target_dir);
+            .arg(target_dir)
+            .env("CARGO_INCREMENTAL", "0");
         if profile != "debug" {
             command.args(["--profile", profile]);
         }
-        let status = command.status().context("build eez-proof-signer")?;
+        let status = command
+            .status()
+            .with_context(|| format!("build {binary}"))?;
         if !status.success() {
-            bail!("building eez-proof-signer failed with {status}");
+            bail!("building {binary} failed with {status}");
         }
     }
     path.is_file()
         .then_some(path)
-        .ok_or_else(|| anyhow!("eez-proof-signer build completed without producing the binary"))
+        .ok_or_else(|| anyhow!("{binary} build completed without producing the binary"))
 }
 
 /// The workspace target directory as Cargo resolves it (`CARGO_TARGET_DIR`,
@@ -487,7 +490,11 @@ impl ProofSignerHandle {
         let working_dir = tempfile::tempdir().context("proof signer working directory")?;
         let log = std::fs::File::create(&log_path).context("create proof signer log")?;
         let err_log = log.try_clone().context("clone proof signer log")?;
-        let mut command = Command::new(proof_signer_binary()?);
+        let mut command = Command::new(prover_binary(
+            "eez-prover-stateless",
+            "eez-proof-signer",
+            "EEZ_TEST_PROOF_SIGNER_BIN",
+        )?);
         command
             // The signer also loads dotenv at startup. Keep its explicitly
             // constructed test environment isolated from repository config.
@@ -1702,6 +1709,7 @@ pub enum NodeBinary {
     #[default]
     Composer,
     Follower,
+    StatefulProver,
 }
 
 impl NodeBinary {
@@ -1709,10 +1717,18 @@ impl NodeBinary {
         match self {
             Self::Composer => "eez-composer",
             Self::Follower => "eez-follower",
+            Self::StatefulProver => "eez-prover-stateful",
         }
     }
 
     fn path(self) -> Result<PathBuf> {
+        if matches!(self, Self::StatefulProver) {
+            return prover_binary(
+                "eez-prover-stateful",
+                "eez-prover-stateful",
+                "EEZ_TEST_STATEFUL_PROVER_BIN",
+            );
+        }
         let name = self.name();
         if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{name}")) {
             return Ok(path.into());

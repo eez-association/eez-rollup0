@@ -14,8 +14,6 @@ members = [
     "crates/eez-node-e2e",
     "crates/eez-p2p",
     "crates/eez-payload-codec",
-    "crates/eez-proof-signer",
-    "crates/eez-prover-stateful",
     "crates/eez-protocol",
     "crates/eez-primitives",
     "crates/eez-evm",
@@ -193,17 +191,15 @@ eez-l1             = { path = "crates/eez-l1" }
 eez-node           = { path = "crates/eez-node" }
 eez-node-common    = { path = "crates/eez-node-common" }
 eez-payload-codec  = { path = "crates/eez-payload-codec" }
-eez-proof-signer   = { path = "crates/eez-proof-signer" }
 eez-protocol       = { path = "crates/eez-protocol" }
 eez-prover         = { path = "crates/eez-prover" }
-eez-prover-stateful  = { path = "crates/eez-prover-stateful" }
 eez-testkit        = { path = "crates/eez-testkit" }
 
 # Interim: reth main at the merge of paradigmxyz/reth#27622 (fa9e76a), via the
 # debjit-bw/reth fork because a patch cannot point back at its own source. Every
 # reth crate is redirected, including those reth_gnosis pulls by tag, so the
 # graph keeps one reth source. Remove once a reth release carries #27622; see
-# docs/RETH-V2.7-MIGRATION.md. The signer (provers/stateless-ecdsa) carries the
+# docs/RETH-V2.7-MIGRATION.md. The signer (provers/ecdsa) carries the
 # same patch.
 [patch."https://github.com/paradigmxyz/reth"]
 reth                            = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }

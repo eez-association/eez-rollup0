@@ -3819,39 +3819,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eez-proof-signer"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-hardforks",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-rpc-types-debug",
- "alloy-sol-types",
- "async-trait",
- "eez-blob",
- "eez-control-rpc",
- "eez-payload-codec",
- "eez-primitives",
- "eez-protocol",
- "eez-prover",
- "eez-prover-client",
- "eyre",
- "getrandom 0.3.4",
- "hex",
- "prost",
- "reth-primitives-traits",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tracing",
-]
-
-[[package]]
 name = "eez-protocol"
 version = "0.1.0"
 dependencies = [
@@ -3899,44 +3866,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tracing",
-]
-
-[[package]]
-name = "eez-prover-stateful"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-rpc-types-debug",
- "alloy-rpc-types-engine",
- "async-trait",
- "eez-composer",
- "eez-driver",
- "eez-engine",
- "eez-evm",
- "eez-primitives",
- "eez-proof-signer",
- "eyre",
- "lru 0.16.4",
- "reth-chain-state",
- "reth-chainspec",
- "reth-consensus",
- "reth-engine-primitives",
- "reth-ethereum-consensus",
- "reth-evm",
- "reth-execution-types",
- "reth-payload-builder",
- "reth-payload-primitives",
- "reth-primitives-traits",
- "reth-provider",
- "reth-revm",
- "reth-storage-api",
- "reth-trie-common",
- "revm",
- "tokio",
  "tracing",
 ]
 

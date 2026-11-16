@@ -28,6 +28,9 @@ rebuild the whole L2 chain from L1 alone. The supported L1 is Gnosis **Chiado**
 
 `eez-proof-signer` statelessly re-executes each proposed batch and validates
 its settlement effects before signing the recomputed public-input hash.
+`eez-prover-stateful` provides the same service using its own revm follower and
+local L2 database. Both backends and their shared signer live in the
+[provers repository](docs/provers.md); the ordinary follower stays here.
 `ECDSAProofSystem` verifies that hash-bound attestation on L1. This is not yet
 a succinct validity proof, but the deployed verifier no longer accepts an
 unbound mock signature. The

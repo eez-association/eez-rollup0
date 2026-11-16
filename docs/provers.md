@@ -1,72 +1,95 @@
 # Provers
 
-The stateless proof signer (`eez-proof-signer`) lives in
-[eez-association/provers](https://github.com/eez-association/provers) under
-`stateless-ecdsa/`, pinned here as the `provers/` submodule. It runs reth v2.7.0
-(`fa9e76a`), revm 43 and the stateless fork
-(`eez-association/stateless@935f25a`) independently of the reth and EVM the
-node links. The node and the signer meet only at the `prove.v1` gRPC boundary,
-so the signer re-executes every window with its own EVM.
+Both ECDSA backends live in [eez-association/provers](https://github.com/eez-association/provers),
+in one `ecdsa/` workspace and lockfile, pinned here as the `provers/` submodule:
 
-The signer pipeline itself (`crates/eez-proof-signer`: gRPC service, window
-validation, settlement checks, attestation) stays here with the other protocol
-crates. Both backends plug into it: the stateless backend in provers, the
-stateful backend in `eez-follower`.
+- `eez-proof-signer` (package `eez-prover-stateless`) replays streamed witnesses.
+- `eez-prover-stateful` runs a revm follower and signs against its local database.
+- `eez-proof-signer` is also the shared library for admission, settlement checks,
+  streaming gRPC, public inputs and attestations. Both backends use it.
+- `eez-prover-evm` supplies execution to both backends, including the stateful
+  engine, payload builder, L1 deriver and checkpoint replay.
 
-## Crates provers uses
+The ordinary `eez-follower` binary stays here and uses `eez-evm`. Its library
+has no dependency on a prover. `eez_follower::run_with` accepts the caller's
+EVM, RPC transaction converter and a callback with the provider, chain spec, committer and task executor
+once historical synchronization and L1 anchoring finish. The stateful binary
+attaches its service through that callback and drains it during node shutdown.
 
-`provers/stateless-ecdsa` takes `eez-primitives`, `eez-protocol`,
-`eez-proof-signer`, `eez-payload-codec`, `eez-blob`, `eez-control-rpc`,
-`eez-prover` and `eez-prover-client` as git dependencies on one eez-rollup0
-commit. It compiles them against its own lockfile, so they follow two rules:
+```mermaid
+flowchart LR
+  subgraph rollup[eez-rollup0 workspace]
+    F[eez-follower binary] --> FL[eez-follower library]
+    F --> NE[eez-evm]
+    FL --> NC[eez-node-common / eez-deriver]
+    P[protocol and prover-client crates]
+  end
+  subgraph provers[provers/ecdsa workspace]
+    SF[eez-prover-stateful] --> PE[eez-prover-evm]
+    SL[eez-prover-stateless] --> PE
+    SF --> PS[eez-proof-signer library]
+    SL --> PS
+  end
+  SF -->|pinned Git dependency, default features off| FL
+  PS --> P
+```
 
-- **No git-pinned reth, EVM or stateless crate.** They may use crates.io crates
-  whose version range both workspaces accept (alloy, reth-core's
-  `reth-primitives-traits`/`reth-codecs`/`reth-rpc-traits`, `alloy-hardforks`).
-  Node-only types live in node crates (`eez-engine` holds the Engine API types).
-- **Requirements are floors both sides accept.** A shared crate inherits its
-  dependency requirements from the root `[workspace.dependencies]`, even when
-  provers builds it.
+## Independent execution versions
 
-`eez-primitives` keeps the revm `TxEnv` conversions for `EezTxEnvelope` behind
-its off-by-default `revm` feature. The orphan rule keeps them in the crate that
-owns the envelope. provers enables the feature; the node's EVM crate enables it
-only while it is itself revm-based. Cargo lists optional dependencies in every
-lockfile, so the root `Cargo.lock` names revm even when nothing builds it.
+The prover workspace pins reth v2.7.0 (`fa9e76a`), revm 43 and the stateless
+fork (`935f25a`). Its follower/support crates are Git dependencies on a specific
+**eez-rollup0 revision**. They inherit that revision's root manifest, including
+its reth requirements. A newer root checkout can therefore build evm2 while
+both provers retain evm1. The prover owns its reth patches and lockfile; there
+is one reth source per executable graph and no root-to-prover Cargo dependency.
 
-## Building the signer here
+Shared protocol crates (`eez-primitives`, `eez-protocol`, `eez-payload-codec`,
+`eez-blob`, `eez-control-rpc`, `eez-prover`, `eez-prover-client`) must remain free
+of git-pinned reth/EVM dependencies. `eez-primitives` exposes revm conversions
+through its optional `revm` feature. Their version requirements must be compatible
+with both workspaces even when their source is redirected to a newer checkout.
 
-`scripts/provers-cargo.sh` runs cargo on `provers/stateless-ecdsa` with those
-crates redirected to this checkout, so a change to them is built and tested
-with the signer in the same PR. CI, the e2e harness and the Docker
-`proof-signer` target build the signer this way.
+## Building and testing here
 
 ```bash
 git submodule update --init provers
-scripts/provers-cargo.sh build --target-dir target -p eez-prover-stateless --bin eez-proof-signer
+scripts/provers-cargo.sh build --target-dir target -p eez-prover-stateless -p eez-prover-stateful --bins
 scripts/provers-cargo.sh nextest run --target-dir target --workspace
 ```
 
-The redirect rewrites the signer's `Cargo.lock`, so these runs cannot use
-`--locked`; the script restores the lockfile on exit, and concurrent runs wait
-for each other. `--target-dir target`
-puts the binary in the root `target/<profile>/`, where the e2e harness looks
-for it. `EEZ_TEST_PROOF_SIGNER_BIN` overrides the path.
+The helper redirects only the protocol crates to this checkout. It keeps the
+reth-dependent follower closure at the prover's Git pin. It restores the prover
+lockfile on exit, so these redirected builds cannot use `--locked`.
+For changes to follower internals on a **compatible reth revision**, explicitly
+set `EEZ_PROVERS_FOLLOWER_SOURCE` to that checkout's absolute path. Do not set it
+to an evm2 checkout when testing the revm prover.
 
-## Keeping the two repositories in step
+The e2e harness locates both executables beside the test profile, or builds them
+through the helper. `EEZ_TEST_PROOF_SIGNER_BIN` and
+`EEZ_TEST_STATEFUL_PROVER_BIN` override their paths. Docker targets are
+`proof-signer` and `stateful-prover`. Kurtosis `prover_backend: stateful` uses
+the `stateful_prover_image` setting and runs `eez-prover-stateful node ...`.
 
-- A change to the shared crates lands here first, tested with the signer as
-  above. provers then moves its eez-rollup0 pin to that commit on `main`, and
-  this repository bumps the submodule when the signer itself changes.
-- A change to the EEZ execution rules (0x76 native transactions, the fee
-  collector, the block executor) lands in `crates/eez-evm` here and in provers'
-  `crates/eez-prover-evm`.
-- Both EVMs replay provers' golden fixtures
-  (`provers/stateless-ecdsa/testing/evm-golden/execution.json`) and must match
-  them exactly; `crates/eez-evm/tests/golden.rs` reads them through the
-  submodule. Only provers records them.
-- provers keeps copies of the `prove.v1` conformance vectors and replayer in
-  `crates/eez-control-rpc/conformance/` for its streaming RPC test. A change to
-  them is copied there.
-- `[patch]` is read only from the root of the workspace being built, so provers
-  carries its own reth patch.
+## Migrating an existing stateful signer
+
+Replace `eez-follower node ...` with `eez-prover-stateful node ...`, preserving
+the chain, datadir, L1 endpoints and `EEZ_STATEFUL_PROOF_SIGNER_*` settings.
+The signer address and key are required; the ordinary follower rejects them
+with a migration error. `EEZ_SEQUENCER_ADDRESS` is forbidden for proving.
+Peer-assisted historical synchronization remains supported; `EEZ_SYNC_L1_ONLY`
+is optional. L1 may be remote over RPC, with trace RPC and beacon access as
+required by the posted data. The prover still owns its local L2 database.
+
+## Updating both repositories
+
+Land shared follower changes here first. Pin a compatible root revision in the
+prover workspace, test it there, then update this repository's submodule pointer.
+If root has changed reth APIs, port shared follower fixes to the compatible
+revision before moving the prover pin; do not replace its execution stack just
+to consume a newer follower source revision.
+
+Execution-rule changes land in root `eez-evm` and prover `eez-prover-evm` together.
+Both replay `provers/ecdsa/testing/evm-golden/execution.json`; only the prover
+workspace records these fixtures. Refresh the prover's copies of the streaming
+conformance vectors when the wire contract changes. The EVM version is chosen
+at build time by each binary, with no runtime EVM selector.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs cargo on the stateless proof signer (provers/stateless-ecdsa) with its
-# eez-rollup0 crates taken from this checkout instead of the commit provers
+# Runs cargo on both ECDSA proof signers (provers/ecdsa) with their
+# protocol crates taken from this checkout instead of the commit provers
 # pins, so a change to a shared crate is built and tested with the signer here.
 #
 #   scripts/provers-cargo.sh build -p eez-prover-stateless --bin eez-proof-signer
@@ -11,7 +11,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-signer="$root/provers/stateless-ecdsa"
+signer="$root/provers/ecdsa"
 url="https://github.com/eez-association/eez-rollup0"
 
 if [[ ! -f "$signer/Cargo.toml" ]]; then
@@ -30,18 +30,10 @@ mkdir -p "$root/target"
 exec 9>"$root/target/.provers-cargo.lock"
 perl -MFcntl=:flock -e 'open(my $lock, ">&=", 9) or die "lock: $!\n"; flock($lock, LOCK_EX) or die "lock: $!\n"'
 
-# Every eez-rollup0 package in the signer's lockfile.
-crates=()
-while IFS= read -r crate; do
-    crates+=("$crate")
-done < <(awk -v src="source = \"git+$url?" '
-    index($0, "name = ") == 1 { name = $3; gsub(/"/, "", name) }
-    index($0, src) == 1 { print name }
-' "$signer/Cargo.lock")
-if [[ ${#crates[@]} -eq 0 ]]; then
-    echo "no eez-rollup0 packages in $signer/Cargo.lock" >&2
-    exit 1
-fi
+# Only protocol crates cross independently pinned execution stacks. Patching the
+# follower closure from an evm2 checkout would also change its owning workspace's
+# reth dependencies. Keep that closure at the provers repo's Git pin by default.
+crates=(eez-blob eez-control-rpc eez-payload-codec eez-primitives eez-protocol eez-prover eez-prover-client)
 patches=()
 for crate in "${crates[@]}"; do
     if [[ ! -f "$root/crates/$crate/Cargo.toml" ]]; then
@@ -50,6 +42,16 @@ for crate in "${crates[@]}"; do
     fi
     patches+=(--config "patch.\"$url\".$crate.path=\"$root/crates/$crate\"")
 done
+
+# For work on shared follower internals, explicitly supply a checkout compatible
+# with the prover reth pin. This does not select the EVM; the prover binary does.
+if [[ -n "${EEZ_PROVERS_FOLLOWER_SOURCE:-}" ]]; then
+    for crate in eez-deriver eez-driver eez-engine eez-follower eez-l1 eez-node-common eez-p2p eez-seq-sig; do
+        path="$EEZ_PROVERS_FOLLOWER_SOURCE/crates/$crate"
+        [[ -f "$path/Cargo.toml" ]] || { echo "missing $path/Cargo.toml" >&2; exit 1; }
+        patches+=(--config "patch.\"$url\".$crate.path=\"$path\"")
+    done
+fi
 
 saved="$(mktemp)"
 cp "$signer/Cargo.lock" "$saved"

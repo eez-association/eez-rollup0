@@ -66,7 +66,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     && cp "target/$BUILD_PROFILE/examples/genesis_state_root" /build/genesis_state_root \
     && cp "target/$BUILD_PROFILE/examples/genesis_block_hash" /build/genesis_block_hash
 
-# ── prover-builder: the stateless signer from the provers/ submodule ──
+# ── prover-builder: both signers from the provers/ submodule ──
 # A separate workspace with its own lockfile (reth v2.7.0 + revm), built against
 # this checkout's crates by scripts/provers-cargo.sh. Those crates inherit from
 # the root Cargo.toml, so the root manifest and crates/ are copied too.
@@ -75,13 +75,14 @@ ARG BUILD_PROFILE=release
 COPY Cargo.toml ./
 COPY crates ./crates
 COPY scripts/provers-cargo.sh ./scripts/provers-cargo.sh
-COPY provers/stateless-ecdsa ./provers/stateless-ecdsa
+COPY provers/ecdsa ./provers/ecdsa
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=eez-prover-target,target=/build/target,sharing=locked \
     bash scripts/provers-cargo.sh build --profile "$BUILD_PROFILE" --target-dir target \
-        -p eez-prover-stateless --bin eez-proof-signer \
-    && cp "target/$BUILD_PROFILE/eez-proof-signer" /build/eez-proof-signer
+        -p eez-prover-stateless -p eez-prover-stateful --bins \
+    && cp "target/$BUILD_PROFILE/eez-proof-signer" /build/eez-proof-signer \
+    && cp "target/$BUILD_PROFILE/eez-prover-stateful" /build/eez-prover-stateful
 
 FROM debian:bookworm-slim AS proof-signer
 RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd \
@@ -92,6 +93,17 @@ USER 65532:65532
 EXPOSE 50061/tcp
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/eez-proof-signer"]
+
+# Stateful prover owns its revm follower, database and gRPC server.
+FROM debian:bookworm-slim AS stateful-prover
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=prover-builder --chmod=0555 /build/eez-prover-stateful /usr/local/bin/eez-prover-stateful
+WORKDIR /app
+EXPOSE 50061/tcp
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/eez-prover-stateful"]
+CMD ["--help"]
 
 # ── runtime: slim image with just the binaries ──────────────────
 FROM debian:bookworm-slim AS runtime

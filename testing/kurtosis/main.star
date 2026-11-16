@@ -141,7 +141,7 @@ def run(plan, args):
                 "set -eu;",
                 "test -f /out/deployments.env;",
                 "set -a; . /out/deployments.env; set +a;",
-                "exec eez-follower node",
+                "exec eez-prover-stateful node",
                 "--chain=/out/l2-genesis.json",
                 "--datadir=$EEZ_L2_DATADIR",
                 "--log.stdout.format=json",
@@ -156,7 +156,7 @@ def run(plan, args):
         plan.add_service(
             name=prover_service,
             config=ServiceConfig(
-                image=eez.get("eez_node_image", "eez-node:dev"),
+                image=eez.get("stateful_prover_image", "eez-prover-stateful:dev"),
                 ports={
                     "grpc": PortSpec(
                         number=PROOF_SIGNER_GRPC_PORT,

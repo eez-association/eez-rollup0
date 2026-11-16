@@ -56,7 +56,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - name: Check out the stateless signer (provers/)
+      - name: Check out the provers (provers/)
         run: git submodule update --init provers
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # @stable
         with:
@@ -85,7 +85,9 @@ jobs:
           --test public_inputs_hash_vectors
           --test rolling_hash_vectors
           --no-fail-fast
-      - name: Stateless signer tests against this checkout's crates
+      - name: Check prover execution dependency isolation
+        run: scripts/provers-cargo.sh metadata --format-version 1 | python3 provers/ecdsa/scripts/check-execution-deps.py
+      - name: Prover tests against this checkout's protocol crates
         run: scripts/provers-cargo.sh nextest run --cargo-profile ci-e2e --target-dir target --workspace --no-fail-fast
       - name: Payload conformance vectors
         run: cargo nextest run --locked --cargo-profile ci-e2e -p eez-payload-codec --test conformance --no-fail-fast
@@ -142,7 +144,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - name: Check out the stateless signer (provers/)
+      - name: Check out the provers (provers/)
         run: git submodule update --init provers
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # @stable
         with:
@@ -176,16 +178,16 @@ jobs:
           scripts/provers-cargo.sh build \
             --profile ci-e2e \
             --target-dir target \
-            -p eez-prover-stateless \
-            --bin eez-proof-signer
+            -p eez-prover-stateless -p eez-prover-stateful --bins
       - name: Stage E2E runtime binaries
         run: |
           cp target/ci-e2e/eez-composer artifacts/e2e-build/
           cp target/ci-e2e/eez-follower artifacts/e2e-build/
           cp target/ci-e2e/eez-proof-signer artifacts/e2e-build/
+          cp target/ci-e2e/eez-prover-stateful artifacts/e2e-build/
           cp target/ci-e2e/examples/genesis_state_root artifacts/e2e-build/eez-genesis-state-root
           cp target/ci-e2e/examples/genesis_block_hash artifacts/e2e-build/eez-genesis-block-hash
-          strip artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash || true
+          strip artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-prover-stateful artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: e2e-build
@@ -200,6 +202,7 @@ jobs:
     timeout-minutes: 80
     env:
       EEZ_TEST_PROOF_SIGNER_BIN: ${{ github.workspace }}/artifacts/e2e-build/eez-proof-signer
+      EEZ_TEST_STATEFUL_PROVER_BIN: ${{ github.workspace }}/artifacts/e2e-build/eez-prover-stateful
       EEZ_TEST_LOG_DIR: ${{ github.workspace }}/artifacts/embedded-e2e/logs
       EEZ_TEST_DATADIR_DIR: ${{ github.workspace }}/artifacts/embedded-e2e/datadirs
     steps:
@@ -228,7 +231,7 @@ jobs:
           path: artifacts/e2e-build
       - name: Restore helper executable permissions
         run: |
-          chmod +x artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash
+          chmod +x artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-prover-stateful artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash
           echo "$GITHUB_WORKSPACE/artifacts/e2e-build" >> "$GITHUB_PATH"
       - name: Verify generated EEZL2 genesis artifacts
         run: scripts/update-eezl2-genesis.sh --check
@@ -285,6 +288,7 @@ jobs:
             filter: binary(=contract_post)
     env:
       EEZ_TEST_PROOF_SIGNER_BIN: ${{ github.workspace }}/artifacts/e2e-build/eez-proof-signer
+      EEZ_TEST_STATEFUL_PROVER_BIN: ${{ github.workspace }}/artifacts/e2e-build/eez-prover-stateful
       EEZ_TEST_LOG_DIR: ${{ github.workspace }}/artifacts/cross-chain-e2e/${{ matrix.suite.id }}/logs
       EEZ_TEST_DATADIR_DIR: ${{ github.workspace }}/artifacts/cross-chain-e2e/${{ matrix.suite.id }}/datadirs
     steps:
@@ -311,7 +315,7 @@ jobs:
           name: e2e-build
           path: artifacts/e2e-build
       - name: Restore signer executable permission
-        run: chmod +x artifacts/e2e-build/eez-proof-signer
+        run: chmod +x artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-prover-stateful
       - name: Integration tests (${{ matrix.suite.name }}, serial)
         timeout-minutes: 75
         run: |
@@ -342,6 +346,7 @@ jobs:
       KURTOSIS_ENCLAVE: eez-ci
       EEZ_NODE_IMAGE: eez-node:ci
       EEZ_PROOF_SIGNER_IMAGE: eez-proof-signer:ci
+      EEZ_STATEFUL_PROVER_IMAGE: eez-prover-stateful:ci
       EEZ_DEPLOY_IMAGE: eez-deploy:ci
       EEZ_CI_RESULT_DIR: ${{ github.workspace }}/artifacts/kurtosis-e2e
       EEZ_PREBUILT_BIN_DIR: ${{ github.workspace }}/artifacts/e2e-build
@@ -356,7 +361,7 @@ jobs:
           name: e2e-build
           path: artifacts/e2e-build
       - name: Restore runtime binary permissions
-        run: chmod +x artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash
+        run: chmod +x artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-prover-stateful artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash
       - name: Reclaim runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
@@ -386,4 +391,4 @@ jobs:
           retention-days: 7
       - name: Remove candidate images
         if: always()
-        run: docker image rm "$EEZ_NODE_IMAGE" "$EEZ_PROOF_SIGNER_IMAGE" "$EEZ_DEPLOY_IMAGE" || true
+        run: docker image rm "$EEZ_NODE_IMAGE" "$EEZ_PROOF_SIGNER_IMAGE" "$EEZ_STATEFUL_PROVER_IMAGE" "$EEZ_DEPLOY_IMAGE" || true
