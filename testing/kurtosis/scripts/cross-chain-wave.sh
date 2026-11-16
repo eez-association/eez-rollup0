@@ -20,7 +20,7 @@ export FOUNDRY_DISABLE_NIGHTLY_WARNING=1
 K="$(cd "$(dirname "$0")/.." && pwd)"
 REPO="$(cd "$K/../.." && pwd)"
 ENCLAVE="${KURTOSIS_ENCLAVE:-eez-ci}"
-LOG_DIR="${EEZ_WAVE_LOG_DIR:-$REPO/datadir/smoke-logs}"
+LOG_DIR="$REPO/datadir/smoke-logs"
 mkdir -p "$LOG_DIR"
 
 MODE="${EEZ_WAVE_MODE:-mixed}"
@@ -370,9 +370,6 @@ run_waves() {
             else OUT_HASHES+=("$hash"); OUT_NONCE=$((OUT_NONCE + 1)); fi
         fi
         TX_META+=("$hash|$side|$kind|$arg")
-        if [[ -n "${EEZ_WAVE_TX_MANIFEST:-}" && "$kind" != rev ]]; then
-            printf '%s|%s\n' "$hash" "$side" >>"$EEZ_WAVE_TX_MANIFEST"
-        fi
     }
 
     submit_pure_filler() {
@@ -385,9 +382,6 @@ run_waves() {
             hash=$(cast keccak "$raw") || return 1
             send_front "$L2" "$raw" "$hash" || return 1
             PURE_HASHES+=("$hash")
-            if [[ -n "${EEZ_WAVE_TX_MANIFEST:-}" ]]; then
-                printf '%s|pure\n' "$hash" >>"$EEZ_WAVE_TX_MANIFEST" || return 1
-            fi
             PURE_NONCE=$((PURE_NONCE + 1))
             sleep 1
         done
@@ -441,10 +435,10 @@ run_waves() {
     done
 
     # ── Wait for inclusion ─────────────────────────────────────────────
-    # Inbound receipts are on L1. Outbound and filler receipts are on L2.
+    # inbound → L1 receipts, outbound and filler → L2 receipts.
     local total=$(( ${#IN_HASHES[@]} + ${#OUT_HASHES[@]} + ${#PURE_HASHES[@]} ))
     echo
-    echo "==> waiting up to ${RECEIPT_WAIT_SECS}s for $total transaction inclusions"
+    echo "==> waiting up to ${RECEIPT_WAIT_SECS}s for $total cross-chain inclusions"
     local wait_end=$(( SECONDS + RECEIPT_WAIT_SECS )) confirmed evicted h last_line=""
     while (( SECONDS < wait_end )); do
         confirmed=0
@@ -460,18 +454,15 @@ run_waves() {
         sleep 5
     done
     if (( confirmed != total )); then
-        echo "    ✗ only $confirmed/$total transactions succeeded" >&2
+        echo "    ✗ only $confirmed/$total cross-chain transactions succeeded" >&2
         exit 1
     fi
-    local pure_height=0 receipt height
+    # The matched safe block must cover every filler block.
+    local pure_height=0 height
     for h in "${PURE_HASHES[@]:-}"; do
         [[ -n "$h" ]] || continue
-        receipt=$(receipt_json "$h" "$L2")
-        height=$(jq -er '.result.blockNumber' <<<"$receipt")
-        height=$(cast to-dec "$height")
-        if (( height > pure_height )); then
-            pure_height="$height"
-        fi
+        height=$(cast to-dec "$(cast receipt "$h" --json --rpc-url "$L2" | jq -r .blockNumber)")
+        (( height > pure_height )) && pure_height="$height"
     done
     # ── Confirmed view (only receipt-confirmed ops count) ──────────────
     local m mh mside mkind marg
@@ -620,7 +611,7 @@ run_waves() {
         if (( commitment_matched )); then
             echo "    ✓ L1 rollups($EEZ_ROLLUP_ID) commitment == L2 safe block hash at height $L2_SAFE"
         else
-            echo "    ✗ L2 safe checkpoint $L2_BLOCK_HASH at height $L2_SAFE did not converge with L1 commitment $L1_RECHECK through filler height $pure_height"; ok_all=0
+            echo "    ✗ L1 commitment $L1_RECHECK != L2 safe block hash $L2_BLOCK_HASH at height $L2_SAFE (filler height $pure_height)"; ok_all=0
         fi
         if (( L2_SAFE >= LAST_SETTLED )); then
             echo "    ✓ L2 safe head reached settled height: $L2_SAFE"

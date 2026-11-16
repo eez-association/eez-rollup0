@@ -22,7 +22,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -159,8 +159,6 @@ jobs:
         run: |
           mkdir -p artifacts/e2e-build
           cargo nextest archive --locked --cargo-profile ci-e2e -p eez-node-e2e --test e2e --test cross_chain --test chained_interstate --test durability --test partial_consumption --test resumption --test resumption_append --test native_system --test contract_post --archive-file artifacts/e2e-build/tests.tar.zst
-      - name: Blob Integration Tests
-        run: cargo nextest archive --locked --cargo-profile ci-e2e -p eez-node-e2e --features blob-e2e --test blob_settlement --archive-file artifacts/e2e-build/blob-tests.tar.zst
       - name: Build E2E runtime binaries
         run: |
           cargo build --locked \
@@ -334,14 +332,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - profile: calldata
-            name: Kurtosis E2E
+          - name: Kurtosis E2E
             enclave: eez-ci
             image_tag: ci
             result_dir: kurtosis-e2e
             runner: run-ci.sh
-          - profile: blob
-            name: Kurtosis Blob E2E
+          - name: Kurtosis Blob E2E
             enclave: eez-blob-ci
             image_tag: blob-ci
             result_dir: kurtosis-blob-e2e
@@ -353,8 +349,7 @@ jobs:
       EEZ_DEPLOY_IMAGE: eez-deploy:${{ matrix.image_tag }}
       EEZ_CI_RESULT_DIR: ${{ github.workspace }}/artifacts/${{ matrix.result_dir }}
       EEZ_PREBUILT_BIN_DIR: ${{ github.workspace }}/artifacts/e2e-build
-      EEZ_PRUNE_BUILD_CACHE: ${{ matrix.profile == 'calldata' && '1' || '0' }}
-      EEZ_BLOB_TEST_ARCHIVE: ${{ github.workspace }}/artifacts/e2e-build/blob-tests.tar.zst
+      EEZ_PRUNE_BUILD_CACHE: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -366,15 +361,6 @@ jobs:
           path: artifacts/e2e-build
       - name: Restore runtime binary permissions
         run: chmod +x artifacts/e2e-build/eez-composer artifacts/e2e-build/eez-follower artifacts/e2e-build/eez-proof-signer artifacts/e2e-build/eez-genesis-state-root artifacts/e2e-build/eez-genesis-block-hash
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # @stable
-        if: matrix.profile == 'blob'
-        with:
-          toolchain: 1.98.1
-      - name: Install nextest
-        if: matrix.profile == 'blob'
-        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2
-        with:
-          tool: nextest@0.9.137
       - name: Reclaim runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
