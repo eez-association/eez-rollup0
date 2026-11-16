@@ -6,6 +6,7 @@ members = [
     "crates/eez-control-rpc",
     "crates/eez-deriver",
     "crates/eez-driver",
+    "crates/eez-engine",
     "crates/eez-follower",
     "crates/eez-l1",
     "crates/eez-node",
@@ -15,7 +16,6 @@ members = [
     "crates/eez-payload-codec",
     "crates/eez-proof-signer",
     "crates/eez-prover-stateful",
-    "crates/eez-prover-stateless",
     "crates/eez-protocol",
     "crates/eez-primitives",
     "crates/eez-evm",
@@ -80,9 +80,9 @@ reth-rpc-traits = "0.8.1"
 alloy-consensus-any = { version = "=2.5.0", features = ["serde"] }
 alloy-serde = "=2.5.0"
 
-# reth — official v2.7.0 release. Pinned by `tag`, never `rev`: reth_gnosis,
-# gnosis-primitives and stateless use the tag too, and Cargo treats a tag and a
-# rev of the same commit as distinct sources (duplicate reth types).
+# reth — official v2.7.0 release. Pinned by `tag`, never `rev`: reth_gnosis and
+# gnosis-primitives use the tag too, and Cargo treats a tag and a rev of the same
+# commit as distinct sources (duplicate reth types).
 reth-chain-state                = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-chainspec                  = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-cli                        = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
@@ -131,11 +131,6 @@ reth-rpc = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-rpc-convert = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 reth-rpc-eth-types = { git = "https://github.com/paradigmxyz/reth", tag = "v2.7.0" }
 
-# Stateless execution on the same reth v2.7.0 as the node. Branch
-# feat/reth-v2.7-candidate-block-hashes: the reth-v2.7 trie port plus our
-# candidate block hashes and empty-prefix checkpoint, pending upstream merge.
-stateless-reth = { package = "stateless", git = "https://github.com/eez-association/stateless", rev = "935f25aa0c28c36c3c169e36e36b823206c5a856" }
-
 # reth_gnosis — Gnosis chain (chiado / gnosis mainnet) NodeBuilder.
 # Both pin reth `tag = "v2.7.0"` like our reth-* deps, so the inner types are
 # wire-compatible. Provides `GnosisNode`, `GnosisChainSpec`, chiado genesis preset.
@@ -160,11 +155,13 @@ alloy-consensus        = { version = "=2.5.0", default-features = false }
 alloy-contract         = { version = "2", default-features = false }
 alloy-eips             = { version = "=2.5.0", default-features = false }
 alloy-genesis          = { version = "=2.5.0", default-features = false }
+alloy-hardforks        = { version = "0.4", default-features = false }
 alloy-network          = { version = "2", default-features = false }
 alloy-primitives       = { version = "1", default-features = false }
 alloy-provider         = { version = "2", default-features = false, features = ["reqwest", "debug-api"] }
 alloy-rpc-client       = { version = "2", default-features = false }
 alloy-rlp              = { version = "0.3", features = ["derive"] }
+alloy-trie             = { version = "0.9", default-features = false }
 alloy-rpc-types-engine = { version = "2", default-features = false }
 alloy-rpc-types-eth    = { version = "2", default-features = false }
 alloy-rpc-types-trace  = { version = "=2.5.0", default-features = false }
@@ -190,6 +187,7 @@ eez-blob           = { path = "crates/eez-blob" }
 eez-composer       = { path = "crates/eez-composer" }
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }
+eez-engine         = { path = "crates/eez-engine" }
 eez-follower       = { path = "crates/eez-follower" }
 eez-l1             = { path = "crates/eez-l1" }
 eez-node           = { path = "crates/eez-node" }
@@ -199,14 +197,14 @@ eez-proof-signer   = { path = "crates/eez-proof-signer" }
 eez-protocol       = { path = "crates/eez-protocol" }
 eez-prover         = { path = "crates/eez-prover" }
 eez-prover-stateful  = { path = "crates/eez-prover-stateful" }
-eez-prover-stateless = { path = "crates/eez-prover-stateless" }
 eez-testkit        = { path = "crates/eez-testkit" }
 
 # Interim: reth main at the merge of paradigmxyz/reth#27622 (fa9e76a), via the
 # debjit-bw/reth fork because a patch cannot point back at its own source. Every
-# reth crate is redirected, including those reth_gnosis and stateless pull by
-# tag, so the graph keeps one reth source. Remove once a reth release carries
-# #27622; see docs/RETH-V2.7-MIGRATION.md.
+# reth crate is redirected, including those reth_gnosis pulls by tag, so the
+# graph keeps one reth source. Remove once a reth release carries #27622; see
+# docs/RETH-V2.7-MIGRATION.md. The signer (provers/stateless-ecdsa) carries the
+# same patch.
 [patch."https://github.com/paradigmxyz/reth"]
 reth                            = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }
 reth-basic-payload-builder      = { git = "https://github.com/debjit-bw/reth", rev = "fa9e76ab4fd69d8323c3bbbbe43470f64aa47cb7" }

@@ -1,7 +1,7 @@
 # Executed Rollup0 streaming RPC vectors
 
 These are recorded protobuf request/response payloads for the
-[`prove.v2` wire contract](../proto/prove_stream.proto), with a
+[`prove.v1` wire contract](../proto/prove.proto), with a
 [standalone replay client](../examples/replay_streaming.rs). Use them to check a
 streaming prover's responses against expected protocol behavior. The client
 connects to a running prover configured for the fixture and selected test profile.
@@ -39,12 +39,12 @@ profile**: a proof binds the transition to its selected parent but does not
 attest the parent's L1 acceptance.
 The L1 contract checks applicability when consuming it. They do not test the
 prover-owned L1 parent authentication described for blob-based profiles in the
-[streaming specification](../STREAMING_SPEC.md).
+[streaming specification](../SPEC.md).
 
 ## Server setup and replay
 
 Use the six-empty-block
-[`captured-devnet-window-84`](../../eez-prover-stateless/tests/fixtures/captured-devnet-window-84)
+[`captured-devnet-window-84`](https://github.com/eez-association/provers/tree/main/stateless-ecdsa/crates/eez-prover-stateless/tests/fixtures/captured-devnet-window-84)
 fixture. Configure a streaming server with its `chain-config.json`, rollup ID,
 proof system, vkey, attester and L2 system address from `oracle.json`. The signing
 key is the **public Anvil test key**
@@ -75,11 +75,12 @@ Stop any test servers and remove temporary chain data after use, keeping only
 the logs needed to explain results.
 
 To run all cases against isolated stateless signer processes, including each
-case's required limits and a cold cache, use the integration suite. It shares
-the standalone client's wire replayer and reads the same vector files:
+case's required limits and a cold cache, use the signer's integration suite in
+provers. It replays copies of this wire replayer and these vector files against
+a signer built from this checkout's crates:
 
 ```sh
-cargo test --locked -p eez-prover-stateless --test streaming_rpc
+scripts/provers-cargo.sh test -p eez-prover-stateless --test streaming_rpc
 ```
 
 ## Assertions and portability

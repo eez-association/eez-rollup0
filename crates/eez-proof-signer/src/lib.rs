@@ -17,7 +17,6 @@ pub mod cancel;
 pub mod service;
 mod settlement;
 pub mod validate;
-pub mod window;
 
 #[cfg(test)]
 mod testkit;
@@ -69,8 +68,7 @@ pub async fn serve(
     }
     let shutdown_service = svc.clone();
     let serve_result = tonic::transport::Server::builder()
-        .add_service(svc.clone().into_server())
-        .add_service(svc.into_streaming_server())
+        .add_service(svc.into_server())
         .serve_with_shutdown(listen_addr, shutdown)
         .await;
     shutdown_service.wait_until_idle().await;
@@ -85,13 +83,12 @@ fn log_server_config(
     expected_rollup_id: u64,
     attester: &Attester,
 ) {
-    let window_limits = limits.window_limits();
     info!(
         version = env!("CARGO_PKG_VERSION"),
         listen = %listen_addr,
-        max_request_blocks = window_limits.blocks,
-        max_request_bytes = window_limits.payload_bytes,
-        max_request_witness_items = window_limits.witness_items,
+        max_request_blocks = limits.max_blocks,
+        max_request_bytes = limits.max_payload_bytes,
+        max_request_witness_items = limits.max_witness_items,
         max_decoding_message_bytes = limits.max_decoding_message_bytes(),
         stream_idle_timeout_secs = limits.stream_idle_timeout().as_secs(),
         request_timeout_secs = limits.request_timeout().as_secs(),
