@@ -23,8 +23,18 @@ if [[ $# -lt 1 ]]; then
     exit 2
 fi
 
+# Each run rewrites the signer's Cargo.lock and restores it, so runs take turns.
+# The lock is held until this script and its cargo exit. perl's flock, because
+# flock(1) is not on macOS.
+mkdir -p "$root/target"
+exec 9>"$root/target/.provers-cargo.lock"
+perl -MFcntl=:flock -e 'open(my $lock, ">&=", 9) or die "lock: $!\n"; flock($lock, LOCK_EX) or die "lock: $!\n"'
+
 # Every eez-rollup0 package in the signer's lockfile.
-mapfile -t crates < <(awk -v src="source = \"git+$url?" '
+crates=()
+while IFS= read -r crate; do
+    crates+=("$crate")
+done < <(awk -v src="source = \"git+$url?" '
     index($0, "name = ") == 1 { name = $3; gsub(/"/, "", name) }
     index($0, src) == 1 { print name }
 ' "$signer/Cargo.lock")

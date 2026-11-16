@@ -48,7 +48,8 @@ scripts/provers-cargo.sh nextest run --target-dir target --workspace
 ```
 
 The redirect rewrites the signer's `Cargo.lock`, so these runs cannot use
-`--locked`; the script restores the lockfile on exit. `--target-dir target`
+`--locked`; the script restores the lockfile on exit, and concurrent runs wait
+for each other. `--target-dir target`
 puts the binary in the root `target/<profile>/`, where the e2e harness looks
 for it. `EEZ_TEST_PROOF_SIGNER_BIN` overrides the path.
 
