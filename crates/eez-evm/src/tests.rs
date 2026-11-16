@@ -17,6 +17,7 @@ use revm::{
     state::{AccountInfo, Bytecode},
 };
 
+mod accounting;
 mod fees;
 mod system_calls;
 
@@ -465,7 +466,7 @@ fn native_gasprice_is_zero_in_nested_calls_including_reimbursement_and_positive_
 }
 
 #[test]
-fn ordinary_transactions_still_pay_fees_and_outbound_eth_stays_at_the_system_address() {
+fn ordinary_transfers_pay_fees_and_preserve_donations_at_the_system_address() {
     let user = address!("1111111111111111111111111111111111111111");
     let balance = U256::from(1_000_000);
     let block = block(0, 1);

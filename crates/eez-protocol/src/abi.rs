@@ -159,24 +159,7 @@ pub const SCANNED_TOPICS: [alloy_primitives::B256; 5] = [
 ];
 
 /// Events whose ABI differs specifically on `EEZL2`.
-pub mod eez_l2_events {
-    use alloy_sol_types::sol;
-
-    sol! {
-        /// Emitted when a mutable call leaves an L2 through a proxy.
-        ///
-        /// `callGas` is the manager-entry gas value included in the call hash.
-        /// It is zero when the deployed manager has `USE_GAS_LEFT` disabled.
-        event CrossChainCallExecuted(
-            bytes32 indexed crossChainCallHash,
-            address indexed proxy,
-            address sourceAddress,
-            bytes callData,
-            uint256 value,
-            uint64 callGas
-        );
-    }
-}
+pub use eez_primitives::eez_l2_events;
 
 // The L2 ABI is a separate, leaner family: one rollup means entries do not
 // carry L1 state updates or destination routing.

@@ -18,6 +18,26 @@ pub const SYSTEM_ADDRESS: Address = address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 /// The L2 execution manager is a protocol predeploy.
 pub const EEZL2_ADDRESS: Address = address!("4200000000000000000000000000000000000007");
 
+/// Contract events shared by consensus accounting and settlement authorization.
+pub mod eez_l2_events {
+    use alloy_sol_types::sol;
+
+    sol! {
+        /// Emitted when a mutable call leaves an L2 through a proxy.
+        ///
+        /// `callGas` is the manager-entry gas value included in the call hash.
+        /// It is zero when the deployed manager has `USE_GAS_LEFT` disabled.
+        event CrossChainCallExecuted(
+            bytes32 indexed crossChainCallHash,
+            address indexed proxy,
+            address sourceAddress,
+            bytes callData,
+            uint256 value,
+            uint64 callGas
+        );
+    }
+}
+
 /// Canonical wire body: chain ID, nonce, destination, value, calldata.
 /// Signatures and an arbitrary sender are deliberately absent. Authorization is
 /// established by derivation; this type must never enter a public transaction pool.

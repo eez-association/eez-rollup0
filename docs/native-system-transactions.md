@@ -51,9 +51,39 @@ inbound value. Canonical reconstruction and proof validation bind that value to
 the authorized cross-chain entry.
 
 The system account has no genesis allocation, code, or initial nonce. Its first
-transaction starts at nonce zero and creates it naturally. Outbound ETH continues
-to accumulate at this address; subsequent deposits mint fresh value and do not
-spend that existing balance. RPC retains native receipt types, gas usage and a
+transaction starts at nonce zero and creates it naturally. A committed withdrawal
+moves its value to SYSTEM inside EEZL2, then the shared EVM wrapper burns exactly
+the sum of EEZL2's committed `CrossChainCallExecuted.value` events. Events from
+reverted frames disappear, including when an outer caller catches the revert.
+Neither existing balances nor ordinary/forced transfers to SYSTEM or EEZL2 are
+burned. The event ABI is shared with settlement authorization in `eez-primitives`;
+malformed events, overflow and insufficient funds fail execution rather than
+silently changing the burn. L1 simulations explicitly disable this L2 policy.
+
+For Rollup0's supported flat groups, each inbound native transaction has one
+successful delivery, and each outbound `[load, user]` pair has zero prefunding.
+Consequently supply changes by `+deposit` or `-withdrawal` at group completion;
+a failed execution contributes zero. Speculative execution only returns state:
+discarded candidates and failed groups cannot retain a mint or burn. Cross-chain
+destination failures are currently evicted during composition, not settled as
+failed deposit receipts. Nested cross-chain callbacks remain unsupported; this
+is not a general reconciliation rule for arbitrarily prefunded execution tables.
+
+`cargo test -p eez-node-e2e --test accounting -- --nocapture` audits live per-tx
+state differences against submitted deposit/withdrawal intents, reconciles them
+with RPC balances at each settled block, and compares total supply with genesis
+supply plus L1 escrow after every operation. It covers zero/one-wei deposits,
+repeated withdrawals, destination failures, ordinary reverted/caught withdrawals,
+and direct/forced protocol donations. The equality assumes the test genesis's
+fee collector and excludes deliberate EVM supply destruction such as a newly
+created contract selfdestructing to itself; mint/burn reconciliation does not
+change Ethereum's unrelated account-lifecycle rules.
+
+This changes consensus state roots for withdrawals and requires a fresh chain
+or a coordinated activation; it does not repair already accumulated historical
+withdrawal balances. No L1 or EEZL2 contract upgrade is needed.
+
+RPC retains native receipt types, gas usage and a
 zero effective gas price. Transaction JSON exposes the fixed `gas` budget,
 `gasPrice: "0x0"`, and zero `v/r/s` placeholders for Ethereum tooling such as
 Blockscout. These compatibility fields are absent from the wire transaction and

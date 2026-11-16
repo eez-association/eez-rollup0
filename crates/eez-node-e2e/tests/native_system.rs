@@ -179,8 +179,8 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
 
     for url in urls {
         ensure!(
-            l2_balance(url, system).await? == withdrawal,
-            "outbound ETH must remain at the system address on {url}"
+            l2_balance(url, system).await? == U256::ZERO,
+            "withdrawal value must be burned at the system address on {url}"
         );
         ensure!(
             rpc(url, "eth_getTransactionCount", json!([system, "latest"])).await? == "0x2",
@@ -196,7 +196,7 @@ async fn two_composers_two_keyless_followers() -> Result<()> {
         json!({
             "systemGenesisBalance": "0x0", "systemGenesisNonce": "0x0",
             "deposit": deposit, "withdrawal": withdrawal,
-            "finalSystemBalance": withdrawal, "finalSystemNonce": 2,
+            "finalSystemBalance": U256::ZERO, "finalSystemNonce": 2,
         })
     );
 

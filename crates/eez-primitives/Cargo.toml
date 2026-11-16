@@ -10,6 +10,7 @@ default = ["serde"]
 serde = []
 
 [dependencies]
+alloy-sol-types.workspace = true
 alloy-consensus = { workspace = true, features = ["serde", "k256"] }
 alloy-eips.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }

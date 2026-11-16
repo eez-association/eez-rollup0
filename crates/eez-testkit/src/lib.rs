@@ -5176,7 +5176,11 @@ async fn setup_cross_chain_inner(
         !env.iter().any(|(name, _)| *name == "EEZ_PROOF_SIGNER_KEY"),
         "remote composer environment must not contain the proof-signer key",
     );
-    let mut node_cfg = NodeConfig::default();
+    // Live accounting tests independently inspect transaction state differences.
+    let mut node_cfg = NodeConfig {
+        extra_args: vec!["--http.api".into(), "eth,net,web3,debug".into()],
+        ..Default::default()
+    };
     if builder_stub {
         overlay_seed(&mut node_cfg, &mut env);
     }

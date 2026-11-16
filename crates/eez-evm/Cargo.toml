@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+alloy-sol-types.workspace = true
 eez-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true

@@ -1,4 +1,4 @@
-//! Native deposit minting and fee collection around the Ethereum EVM.
+//! Exact native deposit/withdrawal accounting and fee collection around the Ethereum EVM.
 //!
 //! Delegates execution and inspector dispatch to Alloy 0.39.0's [`EthEvm`]:
 //! <https://github.com/alloy-rs/alloy-evm/blob/ba6f83b80aba8cf005175f4d776d8b90796c72d9/crates/evm/src/eth/mod.rs>.
@@ -8,6 +8,8 @@ use alloy_evm::{
     precompiles::PrecompilesMap,
 };
 use alloy_primitives::{Address, Bytes, TxKind, U256};
+use alloy_sol_types::SolEvent;
+use eez_primitives::eez_l2_events::CrossChainCallExecuted;
 use eez_primitives::{EEZL2_ADDRESS, SYSTEM_ADDRESS, SYSTEM_TX_GAS_LIMIT, SYSTEM_TX_TYPE};
 use revm::{
     Inspector,
@@ -25,6 +27,7 @@ use revm::{
 pub struct EezEvm<DB: Database, I> {
     ethereum: EthEvm<DB, I, PrecompilesMap>,
     fee_collector: Option<Address>,
+    l1_simulation: bool,
 }
 
 impl<DB: Database, I> std::fmt::Debug for EezEvm<DB, I> {
@@ -55,12 +58,78 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> Evm for EezEvm<DB, I> {
         self.ethereum.chain_id()
     }
 
+    fn transact_raw(&mut self, tx: TxEnv) -> Result<ResultAndState, Self::Error> {
+        let mut output = self.transact_funded(tx)?;
+        if !self.l1_simulation {
+            // EEZL2 transfers each withdrawal's value to SYSTEM before emitting
+            // this event. Revm discards logs from reverted frames (including a
+            // caught inner revert), so only committed withdrawals are burned.
+            // Ordinary and forced transfers to either protocol address survive.
+            let mut withdrawn = U256::ZERO;
+            for log in output.result.logs() {
+                if log.address == EEZL2_ADDRESS
+                    && log.data.topics().first() == Some(&CrossChainCallExecuted::SIGNATURE_HASH)
+                {
+                    let event =
+                        CrossChainCallExecuted::decode_log_validate(log).map_err(|err| {
+                            EVMError::Custom(format!("invalid withdrawal event: {err}"))
+                        })?;
+                    withdrawn = withdrawn
+                        .checked_add(event.data.value)
+                        .ok_or_else(|| EVMError::Custom("withdrawal value overflow".into()))?;
+                }
+            }
+            if !withdrawn.is_zero() {
+                let account = output
+                    .state
+                    .get_mut(&SYSTEM_ADDRESS)
+                    .ok_or_else(|| EVMError::Custom("withdrawal did not touch SYSTEM".into()))?;
+                account.info.balance =
+                    account.info.balance.checked_sub(withdrawn).ok_or_else(|| {
+                        EVMError::Custom("withdrawal exceeds SYSTEM balance".into())
+                    })?;
+                account.mark_touch();
+            }
+        }
+        Ok(output)
+    }
+
+    fn transact_system_call(
+        &mut self,
+        caller: Address,
+        contract: Address,
+        data: Bytes,
+    ) -> Result<ResultAndState, Self::Error> {
+        self.ethereum.transact_system_call(caller, contract, data)
+    }
+
+    fn finish(self) -> (DB, EvmEnv) {
+        self.ethereum.finish()
+    }
+
+    fn set_inspector_enabled(&mut self, enabled: bool) {
+        self.ethereum.set_inspector_enabled(enabled);
+    }
+
+    fn components(&self) -> (&DB, &I, &PrecompilesMap) {
+        self.ethereum.components()
+    }
+
+    fn components_mut(&mut self) -> (&mut DB, &mut I, &mut PrecompilesMap) {
+        self.ethereum.components_mut()
+    }
+}
+
+impl<DB: Database, I: Inspector<EthEvmContext<DB>>> EezEvm<DB, I> {
     /// Mint native value before Ethereum's validation and transfer, preserving
     /// existing system funds. Revm errors discard the mint; reverted or halted
     /// calls need the explicit rollback below. The native TxEnv supplies zero fees.
     /// `EthEvm::transact_raw` dispatches to `inspect_tx` when its inspector is enabled,
     /// so all paths below preserve the inspector installed by our factory.
-    fn transact_raw(&mut self, tx: TxEnv) -> Result<ResultAndState, Self::Error> {
+    fn transact_funded(&mut self, tx: TxEnv) -> Result<ResultAndState, EVMError<DB::Error>> {
+        if self.l1_simulation && tx.tx_type == SYSTEM_TX_TYPE {
+            return Err(EVMError::Custom("native transactions are L2-only".into()));
+        }
         if tx.tx_type != SYSTEM_TX_TYPE {
             let Some(collector) = self.fee_collector else {
                 return self.ethereum.transact_raw(tx);
@@ -155,42 +224,28 @@ impl<DB: Database, I: Inspector<EthEvmContext<DB>>> Evm for EezEvm<DB, I> {
         }
         Ok(output)
     }
-
-    fn transact_system_call(
-        &mut self,
-        caller: Address,
-        contract: Address,
-        data: Bytes,
-    ) -> Result<ResultAndState, Self::Error> {
-        self.ethereum.transact_system_call(caller, contract, data)
-    }
-
-    fn finish(self) -> (DB, EvmEnv) {
-        self.ethereum.finish()
-    }
-
-    fn set_inspector_enabled(&mut self, enabled: bool) {
-        self.ethereum.set_inspector_enabled(enabled);
-    }
-
-    fn components(&self) -> (&DB, &I, &PrecompilesMap) {
-        self.ethereum.components()
-    }
-
-    fn components_mut(&mut self) -> (&mut DB, &mut I, &mut PrecompilesMap) {
-        self.ethereum.components_mut()
-    }
 }
 
-/// Installs identical minting and fee routing for ordinary and inspected execution.
+/// Installs identical mint/burn accounting and fee routing for inspected execution.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EezEvmFactory {
     fee_collector: Option<Address>,
+    l1_simulation: bool,
 }
 
 impl EezEvmFactory {
+    pub(crate) const fn for_l1_simulation() -> Self {
+        Self {
+            fee_collector: None,
+            l1_simulation: true,
+        }
+    }
+
     pub const fn new(fee_collector: Option<Address>) -> Self {
-        Self { fee_collector }
+        Self {
+            fee_collector,
+            l1_simulation: false,
+        }
     }
 }
 
@@ -208,6 +263,7 @@ impl EvmFactory for EezEvmFactory {
         EezEvm {
             ethereum: EthEvmFactory::default().create_evm(db, input),
             fee_collector: self.fee_collector,
+            l1_simulation: self.l1_simulation,
         }
     }
 
@@ -220,6 +276,7 @@ impl EvmFactory for EezEvmFactory {
         EezEvm {
             ethereum: EthEvmFactory::default().create_evm_with_inspector(db, input, inspector),
             fee_collector: self.fee_collector,
+            l1_simulation: self.l1_simulation,
         }
     }
 }

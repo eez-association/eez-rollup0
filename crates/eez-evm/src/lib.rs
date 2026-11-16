@@ -136,12 +136,21 @@ impl<C: EthChainSpec> EezEvmConfig<C> {
     /// Construct the shared Rollup0 execution configuration.
     pub fn new(chain_spec: Arc<C>) -> Result<Self, AnyError> {
         let factory = EezEvmFactory::new(fee_collector(&chain_spec.genesis().config)?);
-        Ok(Self {
+        Ok(Self::with_factory(chain_spec, factory))
+    }
+
+    /// Ethereum/Gnosis source simulation must not apply L2 mint/burn policy.
+    pub fn for_l1_simulation(chain_spec: Arc<C>) -> Self {
+        Self::with_factory(chain_spec, EezEvmFactory::for_l1_simulation())
+    }
+
+    fn with_factory(chain_spec: Arc<C>, factory: EezEvmFactory) -> Self {
+        Self {
             ethereum: EthEvmConfig::new(chain_spec.clone()),
             executor: EezBlockExecutorFactory {
                 ethereum: EthBlockExecutorFactory::new(EezReceiptBuilder, chain_spec, factory),
             },
-        })
+        }
     }
 
     pub fn chain_spec(&self) -> &Arc<C> {
