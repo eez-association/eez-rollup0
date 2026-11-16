@@ -15,7 +15,8 @@ use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use eez_control_rpc::v1::{
     Begin as StreamBegin, Block as StreamBlock, ClientFrame, Finalize as StreamFinalize,
-    Resume as StreamResume, Rewind as StreamRewind, ServerFrame, client_frame,
+    Resume as StreamResume, Rewind as StreamRewind, ServerFrame,
+    SettlementInput as StreamSettlement, client_frame,
     prover_client::ProverClient as StreamingProverClient, server_frame,
 };
 use eez_control_rpc::v1::{
@@ -267,9 +268,12 @@ impl RemoteProver {
         signature: Vec<u8>,
     ) -> ProverResult<Bytes> {
         let hash = verify_attestation(&signature, &public_inputs_hash, self.inner.attester)?;
-        let expected = eez_protocol::public_inputs::public_inputs_hashes_with_context(
+        let hashes = eez_blob::versioned_hashes(&ctx.blobs)
+            .map_err(|error| ProverError::Backend(format!("request blobs: {error}")))?;
+        let expected = eez_protocol::public_inputs::public_inputs_hashes_with_blobs_and_context(
             &ctx.batch,
             ctx.verification_key.unwrap_or_else(|| self.vkey()),
+            &hashes,
             ctx.l1_context,
         )
         .map_err(|error| {
@@ -358,12 +362,7 @@ impl RemoteProver {
         rollup_id: u64,
         anchor: ProvingAnchor,
         blocks: &[BlockWitness],
-        finalize: Option<(
-            u64,
-            u64,
-            Vec<u8>,
-            Option<eez_protocol::l1_context::LiveSettlementContext>,
-        )>,
+        finalize: Option<(u64, u64, StreamSettlement)>,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>, ProverError> {
         // One deadline covers lock acquisition, connect, both stream directions and EOF.
         // Dropping the exchange releases its lock; a later Resume recovers accepted work.
@@ -384,10 +383,10 @@ impl RemoteProver {
                     blocks.last().map_or(anchor.number, |block| block.number),
                 )
             },
-            |(from, to, _, _)| (*from, *to),
+            |(from, to, _)| (*from, *to),
         );
         let finalize = finalize
-            .map(|(from_block, to_block, abi_calldata, context)| {
+            .map(|(from_block, to_block, settlement)| {
                 let terminal = blocks
                     .iter()
                     .find(|block| block.number == to_block)
@@ -398,16 +397,7 @@ impl RemoteProver {
                     from_block,
                     to_block,
                     terminal_hash: terminal.hash.to_vec(),
-                    settlement: Some(eez_control_rpc::v1::SettlementInput {
-                        abi_calldata,
-                        blobs: Vec::new(),
-                        posting_context: context.map(|context| eez_control_rpc::v1::L1PostingContext {
-                            parent_hash: context.parent_hash.to_vec(),
-                            target_timestamp: context.timestamp,
-                            // Rollup0 authenticates parent/time at L1 proof consumption.
-                            chain_id: 0, parent_number: 0,
-                        }),
-                    }),
+                    settlement: Some(settlement),
                 })
             })
             .transpose()?;
@@ -679,12 +669,24 @@ impl Prover for RemoteProver {
             batch: ctx.batch.clone(),
         }
         .abi_encode();
+        let settlement = StreamSettlement {
+            abi_calldata,
+            blobs: ctx.blobs.iter().map(|bytes| bytes.to_vec()).collect(),
+            posting_context: ctx
+                .l1_context
+                .map(|context| eez_control_rpc::v1::L1PostingContext {
+                    parent_hash: context.parent_hash.to_vec(),
+                    target_timestamp: context.timestamp,
+                    chain_id: 0,
+                    parent_number: 0,
+                }),
+        };
         match self
             .stream_exchange(
                 ctx.rollup_id,
                 ctx.anchor,
                 &ctx.blocks,
-                Some((ctx.from_block, ctx.to_block, abi_calldata, ctx.l1_context)),
+                Some((ctx.from_block, ctx.to_block, settlement)),
             )
             .await
         {
@@ -1012,7 +1014,7 @@ mod tests {
                     1,
                     test_anchor(),
                     std::slice::from_ref(&input),
-                    Some((11, 11, Vec::new(), None)),
+                    Some((11, 11, StreamSettlement::default())),
                 )
                 .await
                 .unwrap_err();
@@ -1471,6 +1473,7 @@ mod tests {
             blocks: vec![test_block(11, test_anchor().hash, 0x22)],
             batch: test_batch(),
             l1_context: None,
+            blobs: Vec::new(),
             verification_key: None,
         }
     }
@@ -1601,6 +1604,7 @@ mod tests {
                 batch: test_batch(),
                 blocks: vec![block_11.clone()],
                 l1_context: None,
+                blobs: Vec::new(),
                 verification_key: None,
             })
             .await
@@ -1628,6 +1632,7 @@ mod tests {
                 batch: test_batch(),
                 blocks: vec![block_11, block_12],
                 l1_context: None,
+                blobs: Vec::new(),
                 verification_key: None,
             })
             .await
@@ -1682,6 +1687,7 @@ mod tests {
                     blocks: vec![block],
                     batch: test_batch(),
                     l1_context: None,
+                    blobs: Vec::new(),
                     verification_key: None,
                 }),
             )
@@ -1791,6 +1797,7 @@ mod tests {
                 blocks: vec![first.clone(), second, third.clone()],
                 batch: test_batch(),
                 l1_context: None,
+                blobs: Vec::new(),
                 verification_key: None,
             })
             .await
@@ -1850,6 +1857,7 @@ mod tests {
                     blocks: vec![first, second],
                     batch: test_batch(),
                     l1_context: None,
+                    blobs: Vec::new(),
                     verification_key: None,
                 })
                 .await;
@@ -1908,6 +1916,7 @@ mod tests {
                             blocks: vec![test_block(11, anchor.hash, 0x99)],
                             batch: test_batch(),
                             l1_context: None,
+                            blobs: Vec::new(),
                             verification_key: None,
                         })
                         .await
@@ -1939,6 +1948,7 @@ mod tests {
                             },
                             batch: test_batch(),
                             l1_context: None,
+                            blobs: Vec::new(),
                             verification_key: None,
                         })
                         .await
@@ -1988,6 +1998,7 @@ mod tests {
                 batch: test_batch(),
                 blocks: vec![block_11, block_12],
                 l1_context: None,
+                blobs: Vec::new(),
                 verification_key: None,
             })
             .await

@@ -71,9 +71,11 @@ flowchart LR
 8. `da` parses the tagged RLP payload without attacker-sized list allocations,
    compares every retained transaction and authorized sidecar, uses
    `SystemTransactionReconstructor` for omitted system transactions, and
-   requires byte equality with the validated settling block.
+   requires byte equality with the validated settling block. It decodes the
+   submitted blobs, or `callData` when there are none, and only then returns
+   `VerifiedDa` with the blobs' versioned hashes.
 9. Only after every gate passes does `CheckedPublicInputProfile` construct
-   `RecomputedPublicInputsHash`. The complete job then wraps it as
+   `RecomputedPublicInputsHash` from `VerifiedDa`. The complete job then wraps it as
    `AttestablePublicInputsHash` and returns it directly to the session runtime
    for signing.
 

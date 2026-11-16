@@ -63,15 +63,20 @@ Each call whose post lists this rollup is checked against its own `BatchPosted`:
 
 1. the bytes decode as `postAndVerifyBatch`, else `Decode`;
 2. `rollupIdsWithProofSystems[].rollupId` equals `rollupIds`, else `Decode`;
-3. no `blobIndices`, with `blockNumber == 0` (timeless) or `uint64.max`
-   (the reference manager's live parent/time profile), else `Unsupported`;
-4. `batch_shared_public_input_with_context(batch, sender, context)` equals `sharedPublicInput`
+3. `blockNumber == 0` (timeless) or `uint64.max` (the reference manager's live
+   parent/time profile), else `Unsupported`; blob carriers additionally require
+   empty `callData` and valid `blobIndices`, else `Decode`;
+4. `batch_shared_public_input_with_blobs_and_context(batch, sender, hashes, context)` equals `sharedPublicInput`
    (`:753-762`), else `Decode`, or `Unsupported` when another listed rollup
    may bind `customData` the scan cannot reproduce for either selector. Timeless
    batches use no context and empty custom data. Live batches use the inclusion
    header's parent hash and timestamp to reproduce
    `abi.encode(uint256(timestamp), bytes32(parent_hash))`. The proof signer's
-   `public_inputs_hashes_with_context` uses the same composition, so the two cannot drift.
+   `public_inputs_hashes_with_blobs_and_context` uses the same composition, so the two cannot drift.
+
+For direct and contract posts, `blobIndices` selects the outer transaction's
+versioned hashes in batch order; unlisted blobs are ignored. Derivation fetches
+those blobs, checks their hashes and decodes the stream.
 
 The hash does not bind `immediateEntryCount`, `expectedRootPerRollup` or the
 proofs; the scan reads them from the exact bytes EEZ received.
@@ -108,14 +113,21 @@ must match its entry, else `Decode`: `callHash` and `queue` (`:1304-1320`),
 |---|---|---|
 | `Provider` | retryable | transport; a malformed `get_logs` answer; a trace failure other than `-32601`, including a post's transaction failing or missing |
 | `SourceIncomplete` | retryable | two hashes for one block; a transaction or block the endpoint does not serve yet |
+| `BeaconLagging` | retryable | blobs missing while the beacon does not serve the post's execution block, or has not finalized its slot |
+| `BlobUnavailable` | terminal | selected blobs missing at a finalized slot whose execution hash matches the post |
 | `Decode` | terminal | undecodable bytes; a `rollupIds` or commitment mismatch; a grammar, pairing, ownership or entry-match violation |
 | `Unsupported` | terminal | the shapes below; a multi-rollup commitment mismatch; a post not made by a selector `CALL` |
 | `TraceUnavailable` | terminal | `-32601` (no `debug` namespace) on a block that needs a trace |
 
 The watcher and the settlement observer retry a retryable error on their next
 poll. Boot reconcile retries with backoff, but gives up after
-`BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES` `Provider` errors. A terminal one panics
-the watcher (invariant 7), fails boot reconcile and fails the observed bundle.
+`BOOT_CATCH_UP_MAX_TRANSPORT_FAILURES` `Provider` errors, and an L1-only boot
+reads `SourceIncomplete` deep below the head as pruned history and exits;
+`BeaconLagging` is always waited out. A terminal one panics the watcher
+(invariant 7), fails boot reconcile and fails the observed bundle. Only
+derivation fetches blobs: `BlobUnavailable`, or a beacon misconfiguration
+(`EEZ_L1_BEACON_URL` unset, unparsable, or serving another chain), fails boot
+reconcile or stops the live deriver's critical task, shutting down the node.
 
 ## Operation
 
@@ -131,6 +143,22 @@ The signer binds no sender, so anyone can re-post a batch through a contract
 and force every node to trace that block, stalling it on a trace over the
 endpoint's limits.
 
+### Beacon node requirement
+
+Every node deriving blob posts needs `EEZ_L1_BEACON_URL`, including followers
+using the calldata profile. It must serve the same chain as `EEZ_L1_RPC_URL`
+and retain complete blobs for the whole replay range, which for old L1 takes a
+blob archive. After Fulu, use a supernode with full column custody or a service
+that reconstructs blobs
+([Beacon API](https://github.com/ethereum/beacon-APIs/blob/master/apis/beacon/blobs/blobs.yaml)).
+The Chiado Compose stack's Lighthouse serves `http://127.0.0.1:6152`; start it
+with `--supernode` for blob mode or use another complete-blob source.
+
+Any beacon `400` reads as not served, which is how a node without full column
+custody refuses blobs. `BlobUnavailable` shows the source lacks finalized blobs,
+not that they were pruned: repair or replace the source. The post is never
+skipped.
+
 ### Trace latency (measured)
 
 `debug_traceBlockByHash` (callTracer, withLog) against the node's embedded L1
@@ -145,7 +173,6 @@ A trace costs milliseconds against a 12 s slot.
 
 ## Unsupported shapes
 
-- **Blobs.** The scan reads no blob data; the composer never sets `blobIndices`.
 - **Other block selectors or custom-data profiles.** Only `blockNumber == 0`
   with empty custom data and `uint64.max` with the reference manager's inclusion
   parent/time encoding are supported. Other managers' `getCustomData` may read

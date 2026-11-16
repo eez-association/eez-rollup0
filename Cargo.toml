@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/eez-blob",
     "crates/eez-composer",
     "crates/eez-control-rpc",
     "crates/eez-deriver",
@@ -64,7 +65,7 @@ eez-control-rpc    = { path = "crates/eez-control-rpc" }
 eez-prover-client  = { path = "crates/eez-prover-client" }
 eez-seq-sig        = { path = "crates/eez-seq-sig" }
 eez-p2p            = { path = "crates/eez-p2p" }
-libp2p             = { version = "0.56", default-features = false, features = ["secp256k1", "gossipsub", "macros", "noise", "tcp", "tokio", "yamux"] }
+libp2p             = { version = "0.57", default-features = false, features = ["secp256k1", "gossipsub", "macros", "noise", "tcp", "tokio", "yamux"] }
 snap               = "1"
 sha2               = "0.10"
 
@@ -185,6 +186,7 @@ jsonrpsee              = { version = "0.26", features = ["server", "macros"] }
 # internal crates
 eez-evm = { path = "crates/eez-evm" }
 eez-primitives = { path = "crates/eez-primitives" }
+eez-blob           = { path = "crates/eez-blob" }
 eez-composer       = { path = "crates/eez-composer" }
 eez-deriver        = { path = "crates/eez-deriver" }
 eez-driver         = { path = "crates/eez-driver" }

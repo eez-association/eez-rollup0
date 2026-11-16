@@ -18,8 +18,8 @@
 //! - **Canonical public inputs.** [`public_inputs::public_inputs_hashes`] is the
 //!   reconstruction used by the proof signer; another encoding changes the
 //!   signed inputs. The supported profile requires one uniform verification
-//!   key, block number zero, no blobs, and no sender binding; other profiles are
-//!   rejected.
+//!   key, block number zero, and no sender binding; other profiles are
+//!   rejected. Blob batches add one derived hash per `blobIndex`.
 //! - **Settlement root.** Before signing, the proof signer checks
 //!   `RollupUpdate.newRoot` against the root reth produced for the block.
 //!
