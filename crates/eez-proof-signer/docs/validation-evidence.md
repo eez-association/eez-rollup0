@@ -10,7 +10,7 @@ the operator-configured chain rules and produces the commitments later used by
 settlement.
 
 This guide follows the witness-backed `eez-prover-stateless` implementation.
-The node-backed implementation produces the same `BackendWindowOutput` contract
+The node-backed implementation produces the same `ValidatedBlock` contract
 and is described in [`eez-prover-stateful`](../../eez-prover-stateful/README.md).
 
 ```mermaid
@@ -26,7 +26,7 @@ flowchart TB
     A --> BIND[Exact decode and bind claims]
     CHAIN --> BIND
     BIND --> RECOVER[Fork-aware signer recovery]
-    RECOVER --> PLAN[Local final-block checkpoint plan]
+    RECOVER --> PLAN[Local checkpoint plan]
     PLAN --> EXEC[Stateless and Reth re-execution]
     A --> EXEC
 
@@ -42,15 +42,15 @@ At startup, [`eez-prover-stateless/src/backend.rs`](../../eez-prover-stateless/s
 operator-configured Alloy `ChainConfig` or complete `Genesis` document once,
 then builds the Reth `ChainSpec` and EVM configuration shared by every request.
 
-## Per-request adapter stages
+## Per-block adapter stages
 
-For each admitted window, the adapter:
+For each admitted block, the adapter:
 
 1. Exact-decodes each consensus block RLP and binds its number, parent hash, and
    computed block hash to the Composer claims retained in `AdmittedBlock`.
 2. Recovers transaction signers with the fork-aware rules from that same chain
    specification.
-3. Derives every settling-block checkpoint position locally from the recovered
+3. Derives each potential Sync checkpoint position locally from the recovered
    transaction framing. The Composer cannot nominate or suppress positions.
 4. Establishes the validated, witness-backed pre-state root, executes the block
    with Stateless/Reth, applies post-execution consensus checks, and recomputes
@@ -58,9 +58,8 @@ For each admitted window, the adapter:
 5. Retains receipt statuses, system-sender flags, and outbound event candidates
    from that validated execution. Named but malformed outbound events remain as
    candidates with no decoded hash so later gates fail closed.
-6. Requires each returned pre-state root to equal the preceding block's
-   computed post-state root, so the window telescopes without relying on a
-   Composer root claim.
+6. Requires the validated pre-state root to equal the exact parent root:
+   the supplied anchor for the first block, then each checked predecessor.
 
 The Stateless output exposes both the validated pre-state root and the
 independently recomputed post-state root. The adapter telescopes against the
@@ -75,7 +74,6 @@ vector; it does not authorize an effect position.
 
 | Output | Contents |
 | --- | --- |
-| `BackendWindowOutput` | One checked `Arc<ValidatedBlock>` per replayed block, oldest first |
 | `BackendBlockOutput` | Execution hash, post-state root, receipt outcomes, selected checkpoints and settlement evidence, consumed inside the backend by `DecodedBlock::finish` |
 | `ValidatedBlock` | Identity-bound decoded block and exact RLP, actual pre/post-state roots, and structurally checked execution evidence; immutable after construction |
 | `SettlementBlockEvidence` | Fork-aware system-sender flags and ordered outbound receipt observations derived from that block's accepted execution |
@@ -83,9 +81,8 @@ vector; it does not authorize an effect position.
 Inside each backend, `DecodedBlock::finish` applies the common evidence checks
 from [`validate.rs`](../src/validate.rs): execution hash binding, exact receipt
 and sender coverage against the retained decoded transactions, outbound-event
-bounds/order, checkpoint bounds/order, and empty checkpoint selections for v1
-preceding blocks. A malformed success is an internal contract failure and never
-becomes a reusable checked block. In v2, the shared planner requests checkpoints
+bounds/order and checkpoint bounds/order. A malformed success is an internal contract failure and never
+becomes a reusable checked block. The shared planner requests checkpoints
 for blocks containing native system transactions and for empty blocks: every
 valid nonempty Sync has those transactions, while an empty Sync needs its
 anchor checkpoint. Nonempty ordinary blocks use regular execution without
@@ -113,8 +110,7 @@ second block representation. It:
 The window pre-block hash is not automatically a batch anchor. Settlement must
 still bind the leading submitted state update to it. `ValidatedWindow` is an
 architectural boundary, not another proof: construction is safe because the
-v1 admission/replay establishes the complete sequence, or the v2 backend
-validates each exact extension and the session owns append, rewind and range
+backend validates each exact extension and the session owns append, rewind and range
 selection. An async append checks that its captured epoch/parent is
 still current. Selection checks new range bounds and terminal identity, rather
 than re-verifying immutable block linkage. Settlement reads the already-decoded

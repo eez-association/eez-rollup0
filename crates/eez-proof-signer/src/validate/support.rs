@@ -11,7 +11,6 @@ use eez_protocol::abi::eez_l2_events::CrossChainCallExecuted;
 use eez_protocol::settlement::{is_system_tx, pair_end_positions};
 use reth_chainspec::{ChainSpec, EthereumHardforks as _};
 use reth_primitives_traits::RecoveredBlock;
-use tracing::debug;
 
 use super::{
     AdmittedBlock, BackendBlockOutput, CheckpointAt, DecodedOutboundEvent,
@@ -19,7 +18,6 @@ use super::{
     check_backend_block_output,
 };
 use crate::EEZL2_ADDRESS;
-use crate::cancel::CancellationToken;
 
 /// Positions at which settlement framing needs replay outputs.
 #[derive(Debug, PartialEq, Eq)]
@@ -34,7 +32,7 @@ impl CheckpointPlan {
         Self { positions }
     }
 
-    /// Derive Sync-candidate checkpoints and system-sender flags for either RPC version.
+    /// Derive Sync-candidate checkpoints and system-sender flags for each streamed block.
     /// A nonempty Sync contains native system transactions; an empty Sync needs
     /// its anchor checkpoint. Ordinary nonempty blocks need no checkpoints.
     pub fn for_block(
@@ -100,23 +98,6 @@ pub fn system_sender_flags(
         .collect()
 }
 
-/// Stop between non-interruptible block executions after request cancellation.
-pub fn check_cancellation(
-    cancellation: &CancellationToken,
-    validated_blocks: usize,
-    total_blocks: usize,
-) -> Result<(), ValidationError> {
-    if cancellation.is_cancelled() {
-        debug!(
-            validated_blocks,
-            total_blocks, "proof validation stopped after request cancellation",
-        );
-        Err(ValidationError::Cancelled)
-    } else {
-        Ok(())
-    }
-}
-
 /// Identity-bound input retained through execution, so finishing validation
 /// need not decode the submitted bytes or bind their identity a second time.
 #[derive(Debug, Clone)]
@@ -145,18 +126,11 @@ impl DecodedBlock {
         self,
         output: BackendBlockOutput,
         pre_state_root: B256,
-        allow_checkpoints: bool,
     ) -> Result<Arc<ValidatedBlock>, ValidationError> {
         let hash = self.block.hash();
         let decoded = self.block.into_block();
-        check_backend_block_output(
-            decoded.header.number,
-            hash,
-            &decoded,
-            &output,
-            allow_checkpoints,
-        )
-        .map_err(|error| ValidationError::InvalidBackendOutput(error.to_string()))?;
+        check_backend_block_output(decoded.header.number, hash, &decoded, &output)
+            .map_err(|error| ValidationError::InvalidBackendOutput(error.to_string()))?;
         Ok(Arc::new(ValidatedBlock {
             number: decoded.header.number,
             hash: output.computed_hash,
