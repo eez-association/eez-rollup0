@@ -19,7 +19,7 @@ public chain and rollup identity without a private key.
 
 Prefer environment injection of the attestation key from a secret manager over
 command-line flags, which may be visible in shell history or process listings.
-The checked-in [`.env.example`](../../eez-prover-stateless/.env.example) contains placeholders only.
+The checked-in [`.env.example`](https://github.com/eez-association/provers/blob/main/stateless-ecdsa/crates/eez-prover-stateless/.env.example) contains placeholders only.
 
 ## Network exposure
 

@@ -9,6 +9,10 @@ use alloy_primitives::{Address, B256, Bytes, Sealable, Sealed, TxKind, U256, add
 use alloy_rlp::{Decodable, Encodable};
 use reth_primitives_traits::InMemorySize;
 
+/// Ethereum's signed envelope: the same type as reth's `TransactionSigned`
+/// alias, named through alloy so this crate needs no reth git dependency.
+type TransactionSigned = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>;
+
 /// Reserved EIP-2718 type for EEZ's unsigned system transactions.
 pub const SYSTEM_TX_TYPE: u8 = 0x76;
 /// Protocol execution budget. Native transactions carry no configurable gas fields.
@@ -194,13 +198,13 @@ impl Transaction for SystemTransaction {
 #[envelope(tx_type_name = EezTxType)]
 pub enum EezTxEnvelope {
     #[envelope(flatten)]
-    Ethereum(reth_ethereum_primitives::TransactionSigned),
+    Ethereum(TransactionSigned),
     #[envelope(ty = 118)]
     System(Sealed<SystemTransaction>),
 }
 
-impl From<reth_ethereum_primitives::TransactionSigned> for EezTxEnvelope {
-    fn from(tx: reth_ethereum_primitives::TransactionSigned) -> Self {
+impl From<TransactionSigned> for EezTxEnvelope {
+    fn from(tx: TransactionSigned) -> Self {
         Self::Ethereum(tx)
     }
 }
@@ -297,6 +301,9 @@ impl reth_codecs::Compact for EezTxType {
     }
 }
 
+// revm conversions for the revm-based proof signer. The orphan rule keeps them
+// in the crate that owns `EezTxEnvelope`; the node's evm2 EVM does not use them.
+#[cfg(feature = "revm")]
 impl alloy_evm::FromRecoveredTx<EezTxEnvelope> for revm::context::TxEnv {
     /// Native calls use the protocol sender, fixed gas budget, and zero price.
     /// Keeping type `0x76` selects revm's Custom validation, bypassing Ethereum
@@ -320,13 +327,12 @@ impl alloy_evm::FromRecoveredTx<EezTxEnvelope> for revm::context::TxEnv {
     }
 }
 
+#[cfg(feature = "revm")]
 impl alloy_evm::FromTxWithEncoded<EezTxEnvelope> for revm::context::TxEnv {
     fn from_encoded_tx(tx: &EezTxEnvelope, sender: Address, _: Bytes) -> Self {
         <Self as alloy_evm::FromRecoveredTx<EezTxEnvelope>>::from_recovered_tx(tx, sender)
     }
 }
-
-pub mod engine;
 
 /// Public transaction gossip retains Ethereum's pooled envelope. Conversion from
 /// a block is fallible so reorg reinjection cannot put native system txs in a pool.
@@ -363,7 +369,11 @@ impl reth_rpc_traits::SignableTxRequest<EezTxEnvelope> for alloy_rpc_types_eth::
         self,
         signer: impl alloy_network::TxSigner<alloy_primitives::Signature> + Send,
     ) -> Result<EezTxEnvelope, reth_rpc_traits::SignTxRequestError> {
-        <Self as reth_rpc_traits::SignableTxRequest<reth_ethereum_primitives::TransactionSigned>>::try_build_and_sign(self, signer).await.map(EezTxEnvelope::Ethereum)
+        <Self as reth_rpc_traits::SignableTxRequest<TransactionSigned>>::try_build_and_sign(
+            self, signer,
+        )
+        .await
+        .map(EezTxEnvelope::Ethereum)
     }
 }
 
@@ -394,7 +404,7 @@ mod tests;
 
 impl<T> From<alloy_consensus::Signed<T>> for EezTxEnvelope
 where
-    reth_ethereum_primitives::TransactionSigned: From<alloy_consensus::Signed<T>>,
+    TransactionSigned: From<alloy_consensus::Signed<T>>,
 {
     fn from(tx: alloy_consensus::Signed<T>) -> Self {
         Self::Ethereum(tx.into())
