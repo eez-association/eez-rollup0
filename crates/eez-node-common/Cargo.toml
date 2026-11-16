@@ -51,7 +51,6 @@ reth-engine-local.workspace = true
 reth-rpc.workspace = true
 reth-rpc-convert.workspace = true
 reth-rpc-eth-types.workspace = true
-eez-evm.workspace = true
 eez-primitives.workspace = true
 eez-engine.workspace = true
 alloy-consensus.workspace = true

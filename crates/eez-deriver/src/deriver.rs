@@ -16,7 +16,6 @@ use alloy_primitives::{Address, B256, Bytes, TxHash};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_GAS_LIMIT, BlockCommitterHandle, DeriveOutcome};
 use eez_engine::EezEngineTypes;
-use eez_evm::EezEvmConfig;
 use eez_l1::{BatchRecord, L1CanonicalHead, L1Event, L1Reader, Post, PostId};
 use eez_primitives::EezTxEnvelope as TransactionSigned;
 use eez_primitives::SYSTEM_TX_TYPE;
@@ -104,21 +103,21 @@ fn choose_seed(floor: u64, end: u64, finalized: Option<u64>) -> u64 {
 
 /// L1-derived L2 consensus engine. Cheaply [`Clone`]able.
 #[derive(Clone)]
-pub struct Deriver<L2>
+pub struct Deriver<L2, Evm>
 where
     L2: BlockReader,
 {
-    inner: Arc<Inner<L2>>,
+    inner: Arc<Inner<L2, Evm>>,
 }
 
-struct Inner<L2>
+struct Inner<L2, Evm>
 where
     L2: BlockReader,
 {
     committer: BlockCommitterHandle<EezEngineTypes>,
     l2_provider: Arc<L2>,
     l1_reader: L1Reader,
-    evm_config: EezEvmConfig,
+    evm_config: Evm,
     /// Chainspec-aware deriver
     chain_spec: Arc<ChainSpec>,
     /// L2 block time in seconds — `execute_block` derives each block's
@@ -147,7 +146,7 @@ where
     refuse_txs: Option<RefuseTxs>,
 }
 
-impl<L2> std::fmt::Debug for Deriver<L2>
+impl<L2, Evm> std::fmt::Debug for Deriver<L2, Evm>
 where
     L2: BlockReader,
 {
@@ -164,8 +163,12 @@ where
     }
 }
 
-impl<L2> Deriver<L2>
+impl<L2, Evm> Deriver<L2, Evm>
 where
+    Evm: ConfigureEvm<
+            Primitives = eez_primitives::EezPrimitives,
+            NextBlockEnvCtx = NextBlockEnvAttributes,
+        > + 'static,
     L2: BlockReader<Header = alloy_consensus::Header>
         + StateProviderFactory
         + Send
@@ -196,6 +199,7 @@ where
         l2_provider: Arc<L2>,
         l1_reader: L1Reader,
         chain_spec: Arc<ChainSpec>,
+        evm_config: Evm,
         l2_block_time_secs: u64,
         deploy_block: u64,
         l1_head: Arc<L1CanonicalHead>,
@@ -203,8 +207,6 @@ where
         boot: DeriverBoot,
         refuse_txs: Option<RefuseTxs>,
     ) -> Self {
-        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec))
-            .expect("execution chain configuration was validated at startup");
         Self {
             inner: Arc::new(Inner {
                 committer,

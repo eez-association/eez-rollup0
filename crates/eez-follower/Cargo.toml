@@ -7,7 +7,24 @@ rust-version.workspace = true
 description            = "L1-derived eez Rollup-0 follower node."
 default-run            = "eez-follower"
 
+[features]
+default = ["node-evm"]
+node-evm = ["dep:eez-evm"]
+
+[[bin]]
+name = "eez-follower"
+path = "src/bin/eez-follower.rs"
+required-features = ["node-evm"]
+
 [dependencies]
+eez-evm = { workspace = true, optional = true }
+alloy-rpc-types-eth.workspace = true
+reth-db.workspace = true
+reth-node-api.workspace = true
+reth-provider.workspace = true
+reth-rpc-convert.workspace = true
+reth-rpc-eth-types.workspace = true
+reth-tasks.workspace = true
 eez-primitives.workspace = true
 eez-engine.workspace = true
 eez-deriver.workspace = true
@@ -16,7 +33,6 @@ eez-l1.workspace      = true
 eez-node-common = { workspace = true, features = ["l1-startup"] }
 eez-p2p.workspace     = true
 eez-protocol.workspace = true
-eez-prover-stateful.workspace = true
 eez-seq-sig.workspace = true
 
 alloy-consensus.workspace    = true

@@ -234,11 +234,11 @@ pub async fn wait_for_idle_engine(is_syncing: impl Fn() -> bool) {
 ///
 /// An L1 read that retrying can't fix, a local provider or engine failure, a
 /// datadir off L1's chain, or history L1 no longer serves in L1-only mode.
-pub async fn boot<P, L2>(
+pub async fn boot<P, L2, Evm>(
     mode: SyncMode,
     provider: &P,
     committer: &BlockCommitterHandle<EezEngineTypes>,
-    deriver: &Deriver<L2>,
+    deriver: &Deriver<L2, Evm>,
     l1_reader: &L1Reader,
     peer_count: impl Fn() -> usize,
     role: &'static str,
@@ -246,6 +246,10 @@ pub async fn boot<P, L2>(
 where
     P: BlockIdReader + HeaderProvider<Header = Header>,
     L2: BlockReader<Header = Header> + StateProviderFactory + Send + Sync + 'static,
+    Evm: reth_evm::ConfigureEvm<
+            Primitives = eez_primitives::EezPrimitives,
+            NextBlockEnvCtx = reth_evm::NextBlockEnvAttributes,
+        > + 'static,
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
     <L2 as ReceiptProvider>::Receipt: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
 {
@@ -412,14 +416,18 @@ where
 /// Runs the Deriver's boot catch-up, retrying while the L1 source catches up.
 /// `role` tags the events' `mode` field. Errs on exhausted L1 transport, an
 /// L1-only scan past pruned L1 history, or any error a retry can't fix.
-async fn boot_catch_up<L2>(
-    deriver: &Deriver<L2>,
+async fn boot_catch_up<L2, Evm>(
+    deriver: &Deriver<L2, Evm>,
     l1_reader: &L1Reader,
     mode: SyncMode,
     role: &'static str,
 ) -> eyre::Result<(u64, B256)>
 where
     L2: BlockReader<Header = Header> + StateProviderFactory + Send + Sync + 'static,
+    Evm: reth_evm::ConfigureEvm<
+            Primitives = eez_primitives::EezPrimitives,
+            NextBlockEnvCtx = reth_evm::NextBlockEnvAttributes,
+        > + 'static,
     <L2 as TransactionsProvider>::Transaction: Encodable2718,
     <L2 as ReceiptProvider>::Receipt: alloy_consensus::TxReceipt<Log = alloy_primitives::Log>,
 {

@@ -16,7 +16,7 @@ pub use boot::{SyncMode, boot, sync_mode_from_env, wait_for_idle_engine};
 mod discovery;
 pub use discovery::{EezNetworkBuilder, discover};
 mod node;
-pub use node::EezNode;
+pub use node::{EezNode, NodeEvm};
 mod rpc;
 pub use rpc::eez_add_ons;
 mod payload;

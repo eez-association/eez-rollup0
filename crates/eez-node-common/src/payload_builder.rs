@@ -10,7 +10,6 @@ use alloy_primitives::U256;
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::PayloadAttributes as EthPayloadAttributes;
 use eez_engine::EezBuiltPayload;
-use eez_evm::EezEvmConfig;
 use eez_primitives::{EezPrimitives, EezTxEnvelope};
 use reth_basic_payload_builder::{
     BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder, PayloadConfig,
@@ -44,7 +43,7 @@ type BestTransactionsIter<Tx> = Box<dyn BestTransactions<Item = Arc<ValidPoolTra
 
 /// Live L2 payload builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativePayloadBuilder<Pool, Client, EvmConfig = EezEvmConfig> {
+pub struct NativePayloadBuilder<Pool, Client, EvmConfig> {
     client: Client,
     pool: Pool,
     evm_config: EvmConfig,
