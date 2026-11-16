@@ -59,6 +59,7 @@ and signed hashes.
 - `info` records startup configuration without secrets and successful
   attestations.
 - `warn` records expected operational or composer-controlled refusals.
+- `error` records attestation signing failures with their internal cause.
 - `debug` adds session and operator-configured chain detail.
 - `trace` adds per-block validation summaries.
 

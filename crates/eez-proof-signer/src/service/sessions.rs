@@ -18,7 +18,7 @@ use tokio::time::timeout;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{Level, event, warn};
+use tracing::{Level, error, event, warn};
 
 use super::settlement_job::{SettlementInput, run_settlement};
 use super::{ProveSvc, ServiceLimits, ServiceState};
@@ -913,11 +913,19 @@ impl SessionRuntime {
             if cancellation.is_cancelled() {
                 return Err(Status::cancelled("ProveStream Finalize was cancelled"));
             }
-            let signature = self
-                .state
-                .attester
-                .sign(hash)
-                .map_err(|_| Status::internal("attestation signing failed"))?;
+            let signature = self.state.attester.sign(hash).map_err(|signing_error| {
+                error!(
+                    phase = "attestation",
+                    grpc_code = ?tonic::Code::Internal,
+                    session_id = %bound.id,
+                    validated_from_block = finalize.from_block,
+                    validated_to_block = finalize.to_block,
+                    attester = %self.state.attester.address(),
+                    error = %signing_error,
+                    "public-input hash signing failed",
+                );
+                Status::internal("attestation signing failed")
+            })?;
             session.anchor = anchor;
             session.blocks.drain(..start_index);
             session.proved_through = session.proved_through.max(finalize.to_block);

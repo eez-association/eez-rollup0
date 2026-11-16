@@ -108,7 +108,8 @@ verify_real_proof_path() {
     for failure in \
         'stream validation failed' \
         'session settlement rejected' \
-        'session finalization worker failed'
+        'session finalization worker failed' \
+        'public-input hash signing failed'
     do
         if grep -Fq "$failure" "$signer_log"; then
             echo "proof-signer log contains failure: $failure" >&2
