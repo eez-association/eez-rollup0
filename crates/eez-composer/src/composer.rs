@@ -1893,6 +1893,12 @@ where
             || rollup.l1_head.last_indexed().map(|tip| tip.post) != Some(l1_tip.post)
             || self.inner.committer.last_header().hash() != l2_head
         {
+            event!(
+                Level::INFO,
+                rollup_id,
+                sync_height,
+                "partial settlement snapshot recheck failed; retaining txs for retry",
+            );
             return; // Retain every tx for reorg recovery or a fresh disposition.
         }
         let (spent, culprit) = partial_disposition(&partial.txs, &nonces);
@@ -1938,9 +1944,9 @@ where
         dispose_recovered_txs(rollup_id, pool, sync_height, charged, &[], true);
     }
 
-    /// Each sender's nonce, read at fixed blocks so a reorg mid-read can't mix
-    /// in another fork's answer: L1 at the last block the Deriver confirmed, L2
-    /// at the committed head. `None` unless every sender was read.
+    /// Read each sender's source nonce at the supplied L1 and L2 block hashes.
+    /// The caller must revalidate these snapshots under the reconcile guard
+    /// before applying disposition. Returns `None` unless every sender was read.
     async fn source_nonces(
         &self,
         rollup_id: u64,
