@@ -109,6 +109,7 @@ impl L1CanonicalHead {
             .lock()
             .unwrap()
             .iter()
+            .rev()
             .any(|record| record.tx_hash == tx_hash)
     }
 

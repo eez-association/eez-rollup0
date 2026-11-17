@@ -31,9 +31,9 @@ use eez_driver::{
     SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
     witness::{ExecutionWitnessMode, block_witness},
 };
+use eez_engine::EezEngineTypes;
 use eez_evm::EezEvmConfig;
 use eez_l1::{BundleTarget, L1Error, L1Event, SendOutcome, Submitter};
-use eez_primitives::engine::EezEngineTypes;
 use eez_prover::{
     ActionableProverFailure, BlockWitness, ProverError, ProvingContext, RetryableProverError,
 };
@@ -1893,12 +1893,19 @@ where
             || rollup.l1_head.last_indexed().map(|tip| tip.post) != Some(l1_tip.post)
             || self.inner.committer.last_header().hash() != l2_head
         {
+            event!(
+                Level::INFO,
+                rollup_id,
+                sync_height,
+                "partial settlement snapshot recheck failed; retaining txs for retry",
+            );
             return; // Retain every tx for reorg recovery or a fresh disposition.
         }
         let (spent, culprit) = partial_disposition(&partial.txs, &nonces);
         // The cursor may cover a rival's batch. Nonces still decide what was
         // consumed, but only our own canonical post can justify a retry charge.
-        let culprit = culprit.filter(|_| rollup.l1_head.contains_l1_tx(partial.post_batch_hash));
+        let own_post = rollup.l1_head.contains_l1_tx(partial.post_batch_hash);
+        let culprit = culprit.filter(|_| own_post);
         // Only spent txs can be stranded by a reorg; the re-queued ones are the
         // pool's again.
         let stranded: Vec<crate::HeldTx> = partial
@@ -1927,6 +1934,7 @@ where
             event_name = "eez.composer.recovery.settled_partial",
             rollup_id,
             sync_height,
+            own_post,
             txs = partial.txs.len(),
             spent = spent.len(),
             culprit = ?culprit,
@@ -1941,9 +1949,9 @@ where
         dispose_recovered_txs(rollup_id, pool, sync_height, charged, &[], true);
     }
 
-    /// Each sender's nonce, read at fixed blocks so a reorg mid-read can't mix
-    /// in another fork's answer: L1 at the last block the Deriver confirmed, L2
-    /// at the committed head. `None` unless every sender was read.
+    /// Read each sender's source nonce at the supplied L1 and L2 block hashes.
+    /// The caller must revalidate these snapshots under the reconcile guard
+    /// before applying disposition. Returns `None` unless every sender was read.
     async fn source_nonces(
         &self,
         rollup_id: u64,
@@ -4739,11 +4747,11 @@ where
             rollup_id,
             from_block: from,
             to_block: sync_block_number,
-            anchor: Some(eez_prover::ProvingAnchor {
+            anchor: eez_prover::ProvingAnchor {
                 number: posted,
                 hash: pre_block_hash,
                 state_root: pre_state_root,
-            }),
+            },
             batch: batch.clone(),
             blocks: block_witnesses,
             l1_context,

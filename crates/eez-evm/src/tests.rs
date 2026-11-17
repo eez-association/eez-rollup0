@@ -228,7 +228,7 @@ fn l2_rejects_beacon_withdrawals_during_construction_import_and_engine_replay() 
             .contains("L2 blocks cannot contain beacon withdrawals")
     );
 
-    let payload: ExecutionData = eez_primitives::engine::EezBuiltPayload::new(
+    let payload: ExecutionData = eez_engine::EezBuiltPayload::new(
         Arc::new(sealed.try_recover().unwrap()),
         U256::ZERO,
         None,
@@ -567,8 +567,7 @@ fn l2_block_and_engine_replay_reject_blobs_but_l1_simulation_still_executes_them
         }
 
         let payload: ExecutionData =
-            eez_primitives::engine::EezBuiltPayload::new(Arc::new(block), U256::ZERO, None, None)
-                .into();
+            eez_engine::EezBuiltPayload::new(Arc::new(block), U256::ZERO, None, None).into();
         let (raw, convert) = config
             .tx_iterator_for_payload(&payload)
             .unwrap()

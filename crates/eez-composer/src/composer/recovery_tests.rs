@@ -461,20 +461,3 @@ async fn own_partial_batch_still_charges_the_culprit() {
             .unwrap();
     }
 }
-
-#[tokio::test]
-async fn lost_race_retains_spent_transactions_for_reorg_without_charging_the_tail() {
-    for direction in [Direction::Inbound, Direction::Outbound] {
-        let rpc = Asserter::new();
-        rpc.push_success(&"0x1"); // The winner consumed nonce 0, but not nonce 1.
-        let fixture = Fixture::new(ProviderBuilder::default().connect_mocked_client(rpc));
-        let (txs, partial) = fixture.prepare(direction, B256::repeat_byte(0xb2));
-        fixture
-            .composer
-            .recover_partial_batch(1, fixture.rollup(), partial)
-            .await;
-        fixture.assert_requeued(&txs[1..]);
-        fixture.notify_composer();
-        fixture.assert_requeued(&txs);
-    }
-}

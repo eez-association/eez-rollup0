@@ -890,7 +890,7 @@ async fn quorum_two_of_three_settles_with_an_unresponsive_attester() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn quorum_prover_rejects_a_foreign_rollup_identity() {
-    use eez_control_rpc::v2;
+    use eez_control_rpc::v1;
 
     let harness = Harness::with_attesters(&[ANVIL_ATTESTER_KEY, ANVIL_KEY_4], 2)
         .await
@@ -919,14 +919,14 @@ async fn quorum_prover_rejects_a_foreign_rollup_identity() {
         .await
         .unwrap()
         .unwrap();
-    let begin = v2::Begin {
+    let begin = v1::Begin {
         rollup_id: harness.dep.rollup_id,
         anchor_number: 0,
         anchor_hash: genesis.header.hash.to_vec(),
         anchor_state_root: genesis.header.state_root.to_vec(),
     };
     let mut client =
-        v2::prover_client::ProverClient::connect(harness.attester_endpoint(0).unwrap())
+        v1::prover_client::ProverClient::connect(harness.attester_endpoint(0).unwrap())
             .await
             .unwrap();
     for foreign in [false, true] {
@@ -934,9 +934,9 @@ async fn quorum_prover_rejects_a_foreign_rollup_identity() {
         if foreign {
             begin.rollup_id += 1;
         }
-        let frame = v2::ClientFrame {
+        let frame = v1::ClientFrame {
             request_id: 1,
-            kind: Some(v2::client_frame::Kind::Begin(begin)),
+            kind: Some(v1::client_frame::Kind::Begin(begin)),
             ..Default::default()
         };
         let (requests, receiver) = tokio::sync::mpsc::channel(1);
@@ -956,12 +956,12 @@ async fn quorum_prover_rejects_a_foreign_rollup_identity() {
             assert!(frame.session_id.is_empty());
             assert_eq!(frame.epoch, 0);
             assert_eq!(frame.request_id, 1);
-            let Some(v2::server_frame::Kind::Rejected(rejected)) = &frame.kind else {
+            let Some(v1::server_frame::Kind::Rejected(rejected)) = &frame.kind else {
                 panic!("a foreign rollup must be rejected before receiving a session: {frame:?}");
             };
             assert_eq!(rejected.code, tonic::Code::Unimplemented as i32);
         } else {
-            assert!(matches!(frame.kind, Some(v2::server_frame::Kind::Ready(_))));
+            assert!(matches!(frame.kind, Some(v1::server_frame::Kind::Ready(_))));
             assert_eq!(frame.session_id.len(), 32);
         }
         drop(requests);

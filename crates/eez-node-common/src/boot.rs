@@ -7,8 +7,8 @@ use alloy_eips::Encodable2718;
 use alloy_primitives::B256;
 use eez_deriver::{Deriver, DeriverBoot, DeriverError};
 use eez_driver::{BlockCommitterHandle, ForkchoiceOutcome};
+use eez_engine::EezEngineTypes;
 use eez_l1::{BatchRecord, FinalizedCommitment, L1Error, L1Reader, L1Result, PostId};
-use eez_primitives::engine::EezEngineTypes;
 use reth_primitives_traits::SealedHeader;
 use reth_provider::StateProviderFactory;
 use reth_storage_api::{

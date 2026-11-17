@@ -11,7 +11,7 @@ pub use config::Config;
 use std::sync::Arc;
 
 use eez_driver::BlockCommitterHandle;
-use eez_primitives::engine::EezEngineTypes;
+use eez_engine::EezEngineTypes;
 use eez_proof_signer::ServerConfig;
 use reth_chainspec::ChainSpec;
 use reth_storage_api::{BlockHashReader, BlockNumReader, HeaderProvider, StateProviderFactory};
@@ -46,8 +46,7 @@ where
         attester,
         limits,
     } = config;
-    let backend =
-        Backend::with_committer(provider, chain_spec, expected_l2_system_address, committer);
+    let backend = Backend::new(provider, chain_spec, expected_l2_system_address, committer);
     eez_proof_signer::serve(
         ServerConfig {
             listen_addr,
