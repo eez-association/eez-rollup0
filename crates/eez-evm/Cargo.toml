@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 eez-protocol.workspace = true
-eez-primitives.workspace = true
+eez-primitives = { workspace = true, features = ["revm"] }
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-genesis.workspace = true
@@ -24,6 +24,11 @@ serde_json.workspace = true
 
 [dev-dependencies]
 alloy-sol-types.workspace = true
+eez-engine.workspace = true
+# Golden fixture replay (tests/golden.rs).
+alloy-rlp.workspace = true
+alloy-trie = { workspace = true, features = ["ethereum"] }
+serde.workspace = true
 
 [lints]
 workspace = true

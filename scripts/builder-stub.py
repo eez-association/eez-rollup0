@@ -17,7 +17,8 @@ with `--order fifo` so a block keeps each bundle's transactions in order.
 Suitable for tests; not for production.
 
 Extra methods for tests: `eez_setBuilderMode` ("forward" | "drop"),
-`eez_setMining` (pause or resume the ticker) and `eez_mine` (mine one block).
+`eez_setMining` (pause or resume the ticker), `eez_mine` (mine one block) and
+`eez_setBundleAckDelay` (seconds each `eth_sendBundle` waits before answering).
 
 Usage:
     builder-stub.py --listen 127.0.0.1:9001 --upstream http://127.0.0.1:8545
@@ -77,6 +78,8 @@ class Builder:
     mining = True
     # Relay bundles to the upstream instead of mining them; no ticker.
     passthrough = False
+    # Seconds eth_sendBundle waits before answering, like a slow relay.
+    ack_delay = 0.0
     # Serialises every block the stub mines; Anvil mines nothing else.
     lock = threading.Lock()
     # Target block number -> queued bundle params, in arrival order.
@@ -239,6 +242,14 @@ class Builder:
             time.sleep(wait)
 
 
+def _is_builder_request(body):
+    """Identify methods whose behavior belongs to the local builder."""
+    method = body.get("method") if isinstance(body, dict) else None
+    return isinstance(method, str) and (
+        method == "eth_sendBundle" or method.startswith("eez_")
+    )
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
@@ -274,10 +285,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # Like evm_mine: now, or just after the tip if that is later.
                 Builder.mine_slot(max(latest_ts + 1, int(time.time())))
             return self._result(body, True)
+        if method == "eez_setBundleAckDelay":
+            Builder.ack_delay = float(params[0]) if params else 0.0
+            return self._result(body, Builder.ack_delay)
         if method == "eez_getRejectedTransactions":
             with Builder.lock:
                 return self._result(body, list(Builder.rejected))
         if method == "eth_sendBundle":
+            time.sleep(Builder.ack_delay)
             if Builder.passthrough and Builder.mode == "forward":
                 return None
             try:
@@ -293,7 +308,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(400)
             return
 
-        response = self._dispatch(body)
+        if isinstance(body, list) and any(_is_builder_request(item) for item in body):
+            self.send_error(400, "builder methods require a single request")
+            return
+
+        response = None if isinstance(body, list) else self._dispatch(body)
         if response is not None:
             resp = json.dumps(response).encode()
         else:

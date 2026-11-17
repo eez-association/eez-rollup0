@@ -55,6 +55,7 @@ impl Validator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::Header;
     use alloy_primitives::{B256, Bytes};
     use alloy_signer::SignerSync;
     use alloy_signer_local::PrivateKeySigner;
@@ -70,11 +71,20 @@ mod tests {
         PrivateKeySigner::from_slice(&[n; 32]).unwrap()
     }
 
-    fn msg(key: &PrivateKeySigner, epoch_ms: u64, counter: u64, hash: u8) -> Vec<u8> {
+    /// A signed head at height 1; `variant` picks one of several blocks at that height.
+    fn msg(key: &PrivateKeySigner, epoch_ms: u64, counter: u64, variant: u8) -> Vec<u8> {
+        let block = eez_primitives::Block {
+            header: Header {
+                number: 1,
+                state_root: B256::repeat_byte(variant),
+                ..Default::default()
+            },
+            body: Default::default(),
+        };
         let head = HeadClaim {
             rollup_id: 1,
             number: 1,
-            block_hash: B256::repeat_byte(hash),
+            block_hash: block.header.hash_slow(),
             parent_hash: B256::ZERO,
             epoch_ms,
             counter,
@@ -83,7 +93,7 @@ mod tests {
         let envelope = Envelope {
             head,
             signature: Bytes::from(sig.as_bytes().to_vec()),
-            block: None,
+            block: Bytes::from(alloy_rlp::encode(&block)),
         };
         wire::encode(&envelope).unwrap()
     }

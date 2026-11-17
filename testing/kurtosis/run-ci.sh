@@ -106,10 +106,9 @@ verify_real_proof_path() {
 
     local failure
     for failure in \
-        'Prove request rejected while reading window' \
-        'request pipeline rejected' \
-        'request pipeline invariant failed' \
-        'request pipeline worker failed' \
+        'stream validation failed' \
+        'session settlement rejected' \
+        'session finalization worker failed' \
         'public-input hash signing failed'
     do
         if grep -Fq "$failure" "$signer_log"; then

@@ -7,10 +7,12 @@ use alloy_sol_types::SolValue as _;
 use eez_protocol::EvmBatch;
 use eez_protocol::abi::ProofSystemBatchPerVerificationEntriesSol;
 use eez_protocol::entries::decode_postbatch;
-use eez_protocol::public_inputs::public_inputs_hashes_with_context;
+use eez_protocol::public_inputs::public_inputs_hashes_with_blobs_and_context;
 use thiserror::Error;
 
 use crate::attest::NonZeroProofSystemVkey;
+
+use super::da::VerifiedDa;
 
 #[derive(Debug, Error)]
 pub(crate) enum PostBatchDecodeError {
@@ -106,17 +108,20 @@ pub(crate) struct CheckedPublicInputProfile<'a> {
 }
 
 impl<'a> CheckedPublicInputProfile<'a> {
-    /// Validate the expected rollup and single-proof-system profile.
+    /// Validate the expected rollup and single-proof-system profile against the
+    /// submitted blobs; calldata settlement submits none. Runs before DA or KZG work.
     pub(crate) fn new(
         canonical_batch: &'a CanonicalPostBatch,
         expected_rollup_id: NonZeroU64,
         expected_proof_system: Address,
+        submitted_blob_count: usize,
         context: Option<eez_protocol::l1_context::LiveSettlementContext>,
     ) -> Result<Self, PublicInputError> {
         validate_public_input_structure(
             canonical_batch.as_batch(),
             expected_rollup_id,
             expected_proof_system,
+            submitted_blob_count,
         )?;
         if (canonical_batch.as_batch().blockNumber == u64::MAX) != context.is_some() {
             return Err(invalid_structure(
@@ -132,17 +137,20 @@ impl<'a> CheckedPublicInputProfile<'a> {
         })
     }
 
-    /// Compute the sole canonical hash from this profile-checked batch.
+    /// Compute the sole canonical hash from this profile-checked batch and its
+    /// verified DA.
     ///
-    /// This type does not prove that state, effects, or DA passed their gates;
-    /// the complete settlement job grants that stronger attestation boundary.
+    /// This type does not prove that state or effects passed their gates; the
+    /// complete settlement job grants that stronger attestation boundary.
     pub(crate) fn recompute_public_inputs_hash(
         &self,
         proof_system_vkey: NonZeroProofSystemVkey,
+        verified_da: &VerifiedDa,
     ) -> Result<RecomputedPublicInputsHash, PublicInputError> {
-        let hashes = public_inputs_hashes_with_context(
+        let hashes = public_inputs_hashes_with_blobs_and_context(
             self.canonical_batch.as_batch(),
             proof_system_vkey.get(),
+            verified_da.versioned_hashes(),
             self.context,
         )
         .map_err(|error| PublicInputError::Computation(error.to_string()))?;
@@ -175,9 +183,15 @@ pub(crate) fn recompute_public_input_hash(
     expected_proof_system: Address,
 ) -> Result<B256, PublicInputError> {
     let canonical = CanonicalPostBatch(batch.clone());
-    CheckedPublicInputProfile::new(&canonical, expected_rollup_id, expected_proof_system, None)?
-        .recompute_public_inputs_hash(proof_system_vkey)
-        .map(RecomputedPublicInputsHash::into_inner)
+    CheckedPublicInputProfile::new(
+        &canonical,
+        expected_rollup_id,
+        expected_proof_system,
+        0,
+        None,
+    )?
+    .recompute_public_inputs_hash(proof_system_vkey, &VerifiedDa::calldata_for_test())
+    .map(RecomputedPublicInputsHash::into_inner)
 }
 
 /// Validate every signer-specific structural rule before calling
@@ -187,6 +201,7 @@ fn validate_public_input_structure(
     batch: &EvmBatch,
     expected_rollup_id: NonZeroU64,
     expected_proof_system: Address,
+    submitted_blob_count: usize,
 ) -> Result<(), PublicInputError> {
     let [proof_system] = batch.proofSystems.as_slice() else {
         return Err(invalid_structure(format!(
@@ -270,10 +285,18 @@ fn validate_public_input_structure(
             batch.blockNumber
         )));
     }
-    if !batch.blobIndices.is_empty() {
+    let selected = (0..submitted_blob_count).map(alloy_primitives::U256::from);
+    if !batch.blobIndices.iter().copied().eq(selected) {
         return Err(invalid_structure(format!(
-            "blobIndices must be empty, got {}",
+            "blobIndices must select all {submitted_blob_count} submitted blobs in order, got {}",
             batch.blobIndices.len()
+        )));
+    }
+    // Blobs carry the whole DA payload; the calldata tail stays empty.
+    if submitted_blob_count > 0 && !batch.callData.is_empty() {
+        return Err(invalid_structure(format!(
+            "callData must be empty beside blobs, got {} bytes",
+            batch.callData.len()
         )));
     }
     if batch.bindMsgSenderInPublicInput {
@@ -282,7 +305,7 @@ fn validate_public_input_structure(
         ));
     }
     // `proofs` are verified on-chain but remain outside the signed preimage;
-    // `callData` is bound by both the DA gate and the recomputed hash.
+    // `callData` or blobs are bound by both the DA gate and the recomputed hash.
     Ok(())
 }
 

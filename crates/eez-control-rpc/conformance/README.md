@@ -1,7 +1,7 @@
 # Executed Rollup0 streaming RPC vectors
 
 These are recorded protobuf request/response payloads for the
-[`prove.v2` wire contract](../proto/prove_stream.proto), with a
+[`prove.v1` wire contract](../proto/prove.proto), with a
 [standalone replay client](../examples/replay_streaming.rs). Use them to check a
 streaming prover's responses against expected protocol behavior. The client
 connects to a running prover configured for the fixture and selected test profile.
@@ -17,7 +17,7 @@ more cases requiring explicit server limits. Together they contain 339 requests,
 | --- | --- |
 | Begin | Correct anchor; unsupported rollup; missing/31/33-byte hashes and roots; number overflow; invalid initial binding; repeated Begin. |
 | Block | Execution; duplicate at/before tip; missing data/witness; hash widths; zero/max/gapped numbers; contradictory parent/hash/RLP; invalid witness then valid retry; cache-parent binding. |
-| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; unsupported blobs/profile inputs; malformed Rollup0 posting-context fields rejected before range selection; valid retry. |
+| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; invalid blob carrier/profile inputs; malformed Rollup0 posting-context fields rejected before range selection; valid retry. |
 | Resume | Progress after half-close and Proof; live takeover; missing/malformed/retired session; nonzero initial epoch; stale transport cannot use the new epoch. |
 | Rewind | Tip, intermediate block and anchor; malformed/unknown/pruned ancestors; stale epoch; removed suffix cannot finalize; promoted anchor survives Resume. |
 | Cancel | Acknowledgement and EOF; retired session cannot resume; cross-stream cancellation denied; another Composer can finish. |
@@ -29,22 +29,27 @@ backend-specific cases. A minimal implementation can run `baseline-and-rejection
 alone. The full suite covers Rollup0's baseline and optional capabilities;
 session controls, shared caching, and concurrent sessions are not baseline
 requirements.
-Unsupported blobs and mismatched live context are negative tests of this profile,
-not requirements for a prover configured for another settlement profile.
+Blob submissions with calldata still populated are negative tests of blob carrier
+validation. Live parent/time posting context is supported. Blob proof success
+is covered by the stateless streaming integration tests, separately from these
+vectors.
 
-These vectors target Rollup0's calldata-only, timeless **conditional-proof
+These vectors target Rollup0's timeless **conditional-proof
 profile**: a proof binds the transition to its selected parent but does not
 attest the parent's L1 acceptance.
 The L1 contract checks applicability when consuming it. They do not test the
 prover-owned L1 parent authentication described for blob-based profiles in the
-[streaming specification](../STREAMING_SPEC.md).
+[streaming specification](../SPEC.md).
 
 ## Server setup and replay
 
 Use the six-empty-block
-[`captured-devnet-window-84`](../../eez-prover-stateless/tests/fixtures/captured-devnet-window-84)
+[`captured-devnet-window-84`](https://github.com/eez-association/provers/tree/main/stateless-ecdsa/crates/eez-prover-stateless/tests/fixtures/captured-devnet-window-84)
 fixture. Configure a streaming server with its `chain-config.json`, rollup ID,
-proof system, vkey and attester from `oracle.json`, and the current reserved L2 sender `0xfffffffffffffffffffffffffffffffffffffffe`. The historical oracle retains the original deployment address; its six empty blocks and proof bytes are unchanged. The signing
+proof system, vkey and attester from `oracle.json`, and the current reserved L2
+sender `0xfffffffffffffffffffffffffffffffffffffffe`. The historical oracle retains
+the original deployment address; its six empty blocks and proof bytes are
+unchanged. The signing
 key is the **public Anvil test key**
 `59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d`.
 Never use it outside an isolated test deployment.
@@ -73,11 +78,12 @@ Stop any test servers and remove temporary chain data after use, keeping only
 the logs needed to explain results.
 
 To run all cases against isolated stateless signer processes, including each
-case's required limits and a cold cache, use the integration suite. It shares
-the standalone client's wire replayer and reads the same vector files:
+case's required limits and a cold cache, use the signer's integration suite in
+provers. It replays copies of this wire replayer and these vector files against
+a signer built from this checkout's crates:
 
 ```sh
-cargo test --locked -p eez-prover-stateless --test streaming_rpc
+scripts/provers-cargo.sh test -p eez-prover-stateless --test streaming_rpc
 ```
 
 ## Assertions and portability
@@ -93,8 +99,7 @@ Status, authoritative cursor, binding, public-input hash, ordering and EOF remai
 assertions. Malformed posting context rejects with INVALID_ARGUMENT before
 session range selection: this includes the empty context in the invalid-range
 Finalize and nonzero Rollup0 chain-ID/parent-number fields. The original witness
-and proof oracles are unchanged. Each proof's signature must recover the
-configured attester over the
+and proof oracles are unchanged. Each proof's signature must recover the configured attester over the
 expected digest; a different valid ECDSA nonce is allowed. The saved deterministic
 signature is a reference, not a requirement for byte-identical ECDSA output.
 
@@ -120,9 +125,3 @@ anchor/history seeded separately. This suite does not cover nonempty Sync
 effects, actionable candidate-eviction details, L1 recovery, blob/RollupX positive
 conformance, or stress/deadline guarantees. Timing-dependent in-flight cancellation and
 backpressure belong in runtime tests, not schedule-dependent wire vectors.
-
-Context rejection vectors pin the applicable validation failures instead of
-blanket UNIMPLEMENTED: malformed Rollup0 posting context returns INVALID_ARGUMENT
-before range selection. With valid context, an unvalidated Finalize range returns
-FAILED_PRECONDITION. Both preserve the validated cursor. Nonempty blobs still
-return UNIMPLEMENTED.

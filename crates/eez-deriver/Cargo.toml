@@ -8,6 +8,7 @@ description            = "Consumes L1 events, decodes posted batches, drives the
 
 [dependencies]
 eez-primitives.workspace = true
+eez-engine.workspace = true
 eez-evm.workspace = true
 eez-driver.workspace        = true
 eez-protocol.workspace      = true

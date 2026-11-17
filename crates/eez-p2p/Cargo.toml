@@ -23,6 +23,7 @@ tracing.workspace          = true
 alloy-consensus.workspace        = true
 alloy-signer.workspace           = true
 alloy-signer-local.workspace     = true
+eez-primitives.workspace         = true
 reth-primitives-traits.workspace = true
 
 [lints]

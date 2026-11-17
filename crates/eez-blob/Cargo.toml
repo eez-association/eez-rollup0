@@ -1,0 +1,16 @@
+[package]
+name                   = "eez-blob"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "EIP-4844 carrier shared by the Composer, proof signer and L1 reader: KZG sidecars and versioned hashes."
+
+[dependencies]
+alloy-consensus = { workspace = true, features = ["kzg"] }
+alloy-eips = { workspace = true, features = ["kzg"] }
+alloy-primitives.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

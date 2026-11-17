@@ -1,6 +1,6 @@
 # eez-prover-stateful
 
-This crate is a node-backed implementation of the existing `prove.v1.Prover`
+This crate is a node-backed implementation of the `prove.v1.Prover/ProveStream`
 service. It is hosted by the L1-derived-only `eez-follower` process so it can read
 the follower's canonical L2 state directly.
 
@@ -10,24 +10,19 @@ attestation code. The comparison is therefore limited to execution evidence:
 
 | Stateless signer | Stateful signer |
 | --- | --- |
-| Replays each block from its streamed witness | Replays the complete range from local state at `from_block - 1` |
+| Replays each block from its streamed witness | Imports blocks through Reth and reuses local execution evidence |
 | Trust input is an operator-supplied chain document | Trust input is the follower's chain spec and canonical database |
 | Runs as a standalone daemon | Runs as a separately addressable gRPC service inside the follower process |
 
-For a request covering `m..=n`, the backend:
+`Begin` checks the exact L1-derived safe anchor. `Block` imports candidate
+execution through the follower's Reth engine and binds its retained block,
+receipts and parent state. Sync checkpoints are replayed and cached when
+needed; ordinary blocks reuse normal engine execution.
 
-1. returns `UNAVAILABLE` if the follower has not reached `m - 1`;
-2. rejects the request if its anchor or any already-local block conflicts with
-   the follower's canonical view;
-3. opens historical state at `m - 1` and replays every proposed block through
-   `n`, including intermediate and terminal Sync blocks;
-4. checks body/header consensus, receipt commitments, transaction checkpoints,
-   and every post-state root; and
-5. drops the in-memory overlay after the shared settlement pipeline signs or
-   rejects the request.
-
-The canonical node database is never changed, so success and failure require no
-rollback. If the anchor changes during replay, the RPC returns `ABORTED`.
+`Finalize` selects the checked terminal under the follower's reconciliation
+lock. Reth enforces safe/finalized ancestry, and a rejected or unavailable
+selection cannot produce a proof. Imported execution stays in Reth; sessions
+retain only references and supplemental evidence.
 
 ## Running
 
@@ -41,6 +36,6 @@ and `EEZ_L2_SYSTEM_ADDRESS` (the reserved native system address). Its attestatio
 secret uses a distinct name, `EEZ_STATEFUL_PROOF_SIGNER_KEY`, so enabling it does not put the
 node into Composer mode.
 
-The current `prove.v1` stream still requires execution witnesses for wire
-compatibility. They remain subject to admission quotas but this backend ignores
+The current `prove.v1` stream requires execution witnesses under the shared wire
+contract. They remain subject to admission quotas but this backend ignores
 their contents.

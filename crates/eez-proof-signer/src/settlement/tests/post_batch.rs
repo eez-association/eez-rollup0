@@ -1,14 +1,21 @@
 use super::*;
+use crate::settlement::CheckedPublicInputProfile;
 
-fn assert_structure_rejected(name: &str, batch: &EvmBatch) {
+fn profile(batch: &CanonicalPostBatch, submitted_blobs: usize) -> Result<(), PublicInputError> {
+    CheckedPublicInputProfile::new(
+        batch,
+        expected_rollup_id(),
+        EXPECTED_PROOF_SYSTEM,
+        submitted_blobs,
+        None,
+    )
+    .map(drop)
+}
+
+fn assert_structure_rejected(name: &str, batch: &CanonicalPostBatch, submitted_blobs: usize) {
     assert!(
         matches!(
-            recompute_public_input_hash(
-                batch,
-                test_proof_system_vkey(),
-                expected_rollup_id(),
-                EXPECTED_PROOF_SYSTEM,
-            ),
+            profile(batch, submitted_blobs),
             Err(PublicInputError::InvalidStructure(_))
         ),
         "{name} was accepted"
@@ -212,7 +219,7 @@ fn accepts_only_the_exact_leading_zero_proxy_run_as_immediate() {
     ] {
         let mut batch = valid.clone();
         batch.immediateEntryCount = count;
-        assert_structure_rejected(name, &batch);
+        assert_structure_rejected(name, &batch, 0);
     }
 }
 
@@ -288,11 +295,22 @@ fn rejects_every_public_input_structural_violation() {
     batch.blobIndices.push(U256::ZERO);
     cases.push(("blob index", batch));
 
-    let mut batch = valid;
+    let mut batch = valid.clone();
     batch.bindMsgSenderInPublicInput = true;
     cases.push(("bound sender", batch));
 
     for (name, batch) in &cases {
-        assert_structure_rejected(name, batch);
+        assert_structure_rejected(name, batch, 0);
     }
+
+    // Blobs carry the whole payload: indices select every submitted blob in
+    // order and callData stays empty.
+    let mut blobs = valid;
+    blobs.blobIndices = vec![U256::ZERO, U256::from(1)];
+    profile(&blobs, 2).unwrap();
+    let mut gap = blobs.clone();
+    gap.blobIndices[1] = U256::from(2);
+    assert_structure_rejected("blob index gap", &gap, 2);
+    blobs.callData = Bytes::from_static(b"tail");
+    assert_structure_rejected("callData beside blobs", &blobs, 2);
 }
