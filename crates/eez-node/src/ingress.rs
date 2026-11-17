@@ -128,6 +128,7 @@ async fn gate_and_hold(
         raw_tx: raw_tx.clone(),
         hash,
         attempts: 0,
+        excluded_slots: 0,
         max_fee_per_gas: envelope.max_fee_per_gas(),
         // Legacy/2930 have no tip field; gas_price is both cap and tip.
         priority_fee_per_gas: envelope

@@ -33,7 +33,7 @@ use eez_driver::{
 };
 use eez_engine::EezEngineTypes;
 use eez_evm::EezEvmConfig;
-use eez_l1::{BundleTarget, L1Error, L1Event, SendOutcome, Submitter};
+use eez_l1::{BundleTarget, DropReason, L1Error, L1Event, L1Result, SendOutcome, Submitter};
 use eez_prover::{
     ActionableProverFailure, BlockWitness, ProverError, ProvingContext, RetryableProverError,
 };
@@ -51,7 +51,7 @@ use crate::local::{
     BuildError, InboundL2TargetSession, L1SlotState, L1TargetSession, SyncCandidates,
     build::SyncBlockState, build_sync_block, sync_block_candidates,
 };
-use crate::optimistic::OptimisticallyIncluded;
+use crate::optimistic::{AttemptCharge, OptimisticallyIncluded};
 use crate::prover_retry::{
     actionable_held_tx, partition_retryable, validate_actionable_prover_failure,
 };
@@ -277,11 +277,9 @@ impl std::fmt::Debug for CrossChainWiring {
     }
 }
 
-/// Failed inclusion attempts before a held user_tx is evicted as probable
-/// poison. This covers funding deferrals, relay drops, and proof requests that
-/// still fail after their retry episode. After this many failures, the
-/// transaction and its nonce-dependent suffix are evicted so they cannot block
-/// the FIFO queue indefinitely.
+/// Settlement failures, funding deferrals and failed proof episodes allowed
+/// before a held user_tx is evicted as probable poison. Eviction also removes
+/// the nonce-dependent suffix so it cannot block the FIFO queue.
 ///
 /// Drain-time simulations are chained per chain in canonical order
 /// (`compose_crosschain` over the slot's L1 state and the Sync block under
@@ -290,6 +288,8 @@ impl std::fmt::Debug for CrossChainWiring {
 /// backstops is the residual: L1 state that moves between compose time and the
 /// bundle's inclusion block.
 pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
+/// Exclusion budget per held transaction (about two minutes of Gnosis slots).
+pub const MAX_EXCLUDED_SLOTS: u32 = 24;
 
 /// Stand-in for each proof when sizing before the attesters run. Sized for an
 /// ECDSA proof (65 B), the only kind the prover client accepts.
@@ -645,7 +645,7 @@ fn dispose_recovered_txs(
     sync_height: u64,
     txs: Vec<crate::HeldTx>,
     landed: &[alloy_primitives::TxHash],
-    charge_attempt: bool,
+    charge: AttemptCharge,
 ) {
     // Releasing or evicting a tx can come before reth re-adds it from the
     // dropped block, which would mine it as a plain L2 call.
@@ -670,16 +670,21 @@ fn dispose_recovered_txs(
         }
     }
     pool.release_in_flight_batch(&release);
-    let (re_pushed, settlement_evicted) = if charge_attempt {
-        let recovery =
-            recover_settlement_failure(pool, rollup_id, keep, SettlementFailureSource::Relay);
-        (recovery.requeued, recovery.evicted)
-    } else {
+    let (re_pushed, retry_evicted) = if charge == AttemptCharge::None {
         let re_pushed = keep.len();
         pool.push_front_batch(keep);
         (re_pushed, 0)
+    } else {
+        let recovery = recover_settlement_failure(
+            pool,
+            rollup_id,
+            keep,
+            SettlementFailureSource::Relay,
+            charge,
+        );
+        (recovery.requeued, recovery.evicted)
     };
-    dropped += settlement_evicted;
+    dropped += retry_evicted;
     if re_pushed > 0 || dropped > 0 {
         event!(
             name: "eez.composer.recovery.re_pushed",
@@ -717,36 +722,63 @@ fn partial_disposition(
     (spent.into_iter().map(|tx| tx.hash).collect(), culprit)
 }
 
-/// Count one failed settlement episode for every candidate, evict transactions
-/// that reach the bound, and cascade each eviction through its sender/direction
-/// nonce suffix. Survivors retain their attempt count and FIFO order.
+/// Charge each candidate's applicable retry budget and cascade each eviction
+/// through its sender/direction nonce suffix. Survivors retain FIFO order.
 fn recover_settlement_failure(
     pool: &HeldPool,
     rollup_id: u64,
     txs: Vec<HeldTx>,
     source: SettlementFailureSource,
+    charge: AttemptCharge,
 ) -> SettlementFailureOutcome {
+    debug_assert_ne!(charge, AttemptCharge::None);
     let mut retry = Vec::with_capacity(txs.len());
     let mut evicted = Vec::new();
     let mut evicted_chains: Vec<(Address, Direction, u64)> = Vec::new();
 
     for mut tx in txs {
-        tx.attempts = tx.attempts.saturating_add(1);
-        if tx.attempts >= MAX_BUNDLE_ATTEMPTS {
+        let exhausted = match charge {
+            AttemptCharge::Settlement => {
+                tx.attempts = tx.attempts.saturating_add(1);
+                tx.attempts >= MAX_BUNDLE_ATTEMPTS
+            }
+            AttemptCharge::Excluded => {
+                tx.excluded_slots = tx.excluded_slots.saturating_add(1);
+                tx.excluded_slots >= MAX_EXCLUDED_SLOTS
+            }
+            AttemptCharge::None => false,
+        };
+        if exhausted {
             evicted_chains.push((tx.sender, tx.direction, tx.nonce));
-            event!(
-                name: "eez.composer.recovery.poison_evicted",
-                Level::ERROR,
-                event_name = "eez.composer.recovery.poison_evicted",
-                rollup_id,
-                source = ?source,
-                tx_hash = %tx.hash,
-                sender = %tx.sender,
-                direction = ?tx.direction,
-                nonce = tx.nonce,
-                attempts = tx.attempts,
-                "potentially valid user_tx evicted after MAX_BUNDLE_ATTEMPTS failed settlement episodes to preserve chain liveness; repeated component disagreement requires investigation; resubmit required",
-            );
+            if charge == AttemptCharge::Settlement {
+                event!(
+                    name: "eez.composer.recovery.poison_evicted",
+                    Level::ERROR,
+                    event_name = "eez.composer.recovery.poison_evicted",
+                    rollup_id,
+                    source = ?source,
+                    tx_hash = %tx.hash,
+                    sender = %tx.sender,
+                    direction = ?tx.direction,
+                    nonce = tx.nonce,
+                    attempts = tx.attempts,
+                    "potentially valid user_tx evicted after MAX_BUNDLE_ATTEMPTS failed settlement episodes to preserve chain liveness; repeated component disagreement requires investigation; resubmit required",
+                );
+            } else {
+                event!(
+                    name: "eez.composer.recovery.exclusion_evicted",
+                    Level::ERROR,
+                    event_name = "eez.composer.recovery.exclusion_evicted",
+                    rollup_id,
+                    tx_hash = %tx.hash,
+                    sender = %tx.sender,
+                    direction = ?tx.direction,
+                    nonce = tx.nonce,
+                    attempts = tx.attempts,
+                    excluded_slots = tx.excluded_slots,
+                    "user_tx evicted after MAX_EXCLUDED_SLOTS excluded target slots; resubmit required",
+                );
+            }
             evicted.push(tx);
         } else {
             retry.push(tx);
@@ -820,7 +852,13 @@ fn recover_prover_failure(
             evicted: 0,
         };
     }
-    recover_settlement_failure(pool, rollup_id, txs, SettlementFailureSource::Prover)
+    recover_settlement_failure(
+        pool,
+        rollup_id,
+        txs,
+        SettlementFailureSource::Prover,
+        AttemptCharge::Settlement,
+    )
 }
 
 impl From<String> for PreparePostBatchError {
@@ -1856,9 +1894,9 @@ where
     /// height stays canonical, so only the tx disposition is owed.
     ///
     /// A tx is spent once its sender's nonce has moved past it. Spent txs are
-    /// released and the rest re-queue; the tx where L1 stopped, if known, alone
-    /// is charged an attempt, since the ones behind it did nothing wrong. If any
-    /// nonce cannot be read the batch waits for the next tick.
+    /// released and the rest re-queue. When our post is canonical, only the tx
+    /// where L1 stopped, if known, is charged. If any nonce cannot be read,
+    /// the batch waits for the next tick.
     async fn recover_partial_batch(
         &self,
         rollup_id: u64,
@@ -1945,8 +1983,22 @@ where
             .into_iter()
             .partition(|tx| culprit == Some(tx.hash));
         let pool = rollup.held_pool.as_ref();
-        dispose_recovered_txs(rollup_id, pool, sync_height, rest, &spent, false);
-        dispose_recovered_txs(rollup_id, pool, sync_height, charged, &[], true);
+        dispose_recovered_txs(
+            rollup_id,
+            pool,
+            sync_height,
+            rest,
+            &spent,
+            AttemptCharge::None,
+        );
+        dispose_recovered_txs(
+            rollup_id,
+            pool,
+            sync_height,
+            charged,
+            &[],
+            AttemptCharge::Settlement,
+        );
     }
 
     /// Read each sender's source nonce at the supplied L1 and L2 block hashes.
@@ -2142,9 +2194,7 @@ where
             sync_height,
             failed.txs,
             &landed,
-            // A drop the txs caused counts toward poison-eviction; a skipped L1
-            // slot or relay transport failure does not.
-            !failed.slot_skipped,
+            failed.charge,
         );
         outcome
     }
@@ -3636,6 +3686,7 @@ where
                         rollup_id,
                         survivors,
                         SettlementFailureSource::Prover,
+                        AttemptCharge::Settlement,
                     );
                     event!(
                         name: "eez.composer.prover.failure_recovered",
@@ -5028,22 +5079,24 @@ async fn observe_bundle_outcome(
     } else {
         // L1 ran nothing of this batch, so the height is unratified and the
         // reorg path is correct.
-        //
-        // slot_skipped = the drop was NOT attributable to the bundled txs →
-        // requeue without counting an attempt toward poison-eviction.
-        let slot_skipped = match &outcome {
-            // Never reached the relay, so it says nothing about the txs. A
-            // relay-side REJECTION is L1Error::Submission and still counts.
-            Err(L1Error::Provider(_)) => true,
-            // Pin unsatisfiable (block ts != pin, or unreadable), not the txs.
-            _ => match target {
-                BundleTarget::Exact { block, timestamp } => {
-                    submitter.block_timestamp(block).await.ok().flatten() != Some(timestamp)
-                }
-                BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => false,
-            },
-        };
-        optimistic.mark_failed(sync_height, post_batch_hash, slot_skipped);
+        optimistic.mark_failed(sync_height, post_batch_hash, failure_charge(&outcome));
+    }
+}
+
+/// Classify the outcome on the failed branch (no entries applied).
+fn failure_charge(outcome: &L1Result<SendOutcome>) -> AttemptCharge {
+    match outcome {
+        Ok(SendOutcome::Included { .. }) => AttemptCharge::Settlement,
+        Ok(SendOutcome::Dropped {
+            reason: DropReason::Excluded | DropReason::TargetPassed,
+            ..
+        })
+        | Err(L1Error::Submission(_)) => AttemptCharge::Excluded,
+        Ok(SendOutcome::Dropped {
+            reason: DropReason::SlotSkipped,
+            ..
+        })
+        | Err(_) => AttemptCharge::None,
     }
 }
 
@@ -5294,7 +5347,7 @@ mod tests {
 
         // L1 consumed the first two entries; the third never ran.
         let landed = [TxHash::repeat_byte(0xA1), TxHash::repeat_byte(0xA2)];
-        dispose_recovered_txs(1, &pool, 100, drained, &landed, false);
+        dispose_recovered_txs(1, &pool, 100, drained, &landed, AttemptCharge::None);
 
         let queued = pool.pop_all();
         assert_eq!(
@@ -5397,14 +5450,20 @@ mod tests {
             "an in-flight reservation must block the nonce before disposition",
         );
 
-        dispose_recovered_txs(1, &pool, 100, drained, &[TxHash::repeat_byte(0xB1)], false);
+        dispose_recovered_txs(
+            1,
+            &pool,
+            100,
+            drained,
+            &[TxHash::repeat_byte(0xB1)],
+            AttemptCharge::None,
+        );
         pool.push_contiguous(resubmission, 1)
             .expect("the nonce must be free once the burned tx releases its reservation");
         assert_eq!(pool.len(), 1);
     }
 
-    /// The eviction backstop still applies where the bundle genuinely failed and
-    /// we cannot tell whose fault it was.
+    /// An evicted tx stays refused when reth replays the dropped block's txs.
     #[test]
     fn a_charged_attempt_still_evicts_at_the_cap() {
         let pool = crate::HeldPool::new();
@@ -5414,7 +5473,7 @@ mod tests {
         pool.push_contiguous(tx, 1).unwrap();
         let drained = pool.pop_n(1);
 
-        dispose_recovered_txs(1, &pool, 100, drained, &[], true);
+        dispose_recovered_txs(1, &pool, 100, drained, &[], AttemptCharge::Settlement);
         assert_eq!(pool.len(), 0, "at MAX_BUNDLE_ATTEMPTS the tx is evicted");
         assert!(
             pool.holds(&TxHash::repeat_byte(0xD1)),
@@ -5427,6 +5486,7 @@ mod tests {
             raw_tx: Bytes::from(vec![hash_byte; 4]),
             hash: TxHash::repeat_byte(hash_byte),
             attempts: 0,
+            excluded_slots: 0,
             max_fee_per_gas: u128::from(hash_byte),
             priority_fee_per_gas: u128::from(hash_byte),
             sender,
@@ -5581,8 +5641,13 @@ mod tests {
         pool.push_contiguous(first.clone(), 0).unwrap();
         pool.push_contiguous(second.clone(), 0).unwrap();
 
-        let first_failure =
-            recover_settlement_failure(&pool, 1, pool.pop_all(), SettlementFailureSource::Prover);
+        let first_failure = recover_settlement_failure(
+            &pool,
+            1,
+            pool.pop_all(),
+            SettlementFailureSource::Prover,
+            AttemptCharge::Settlement,
+        );
         assert_eq!(
             first_failure,
             SettlementFailureOutcome {
@@ -5597,8 +5662,13 @@ mod tests {
         );
         assert!(after_first.iter().all(|tx| tx.attempts == 1));
 
-        let second_failure =
-            recover_settlement_failure(&pool, 1, after_first, SettlementFailureSource::Relay);
+        let second_failure = recover_settlement_failure(
+            &pool,
+            1,
+            after_first,
+            SettlementFailureSource::Relay,
+            AttemptCharge::Settlement,
+        );
         assert_eq!(
             second_failure,
             SettlementFailureOutcome {
@@ -5709,10 +5779,83 @@ mod tests {
 
     #[test]
     fn settlement_failure_limit_evicts_current_and_queued_nonce_suffix() {
+        assert_failure_limit_evicts_nonce_suffix(AttemptCharge::Settlement);
+    }
+
+    #[test]
+    fn failed_bundle_outcomes_select_the_retry_budget() {
+        let dropped = |reason| {
+            Ok(SendOutcome::Dropped {
+                tx_hash: TxHash::ZERO,
+                target_block: 100,
+                reason,
+            })
+        };
+        for (outcome, charge) in [
+            (
+                Ok(SendOutcome::Included {
+                    tx_hash: TxHash::ZERO,
+                    l1_block: 100,
+                    settlement: eez_l1::scan::Settlement::NONE,
+                }),
+                AttemptCharge::Settlement,
+            ),
+            (dropped(DropReason::SlotSkipped), AttemptCharge::None),
+            (dropped(DropReason::Excluded), AttemptCharge::Excluded),
+            (dropped(DropReason::TargetPassed), AttemptCharge::Excluded),
+            (
+                Err(L1Error::Provider("RPC unavailable".into())),
+                AttemptCharge::None,
+            ),
+            (
+                Err(L1Error::Submission("relay rejected bundle".into())),
+                AttemptCharge::Excluded,
+            ),
+            (
+                Err(L1Error::Decode("malformed settlement".into())),
+                AttemptCharge::None,
+            ),
+        ] {
+            assert_eq!(failure_charge(&outcome), charge, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn settlement_charge_preserves_exclusions_and_none_preserves_both_counters() {
+        let pool = HeldPool::new();
+        let mut tx = held(Address::repeat_byte(0xa), Direction::Inbound, 0, 1);
+        tx.excluded_slots = MAX_EXCLUDED_SLOTS - 1;
+        let hash = tx.hash;
+        dispose_recovered_txs(1, &pool, 100, vec![tx], &[], AttemptCharge::Settlement);
+        let queued = pool.pop_all();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            (queued[0].hash, queued[0].attempts, queued[0].excluded_slots),
+            (hash, 1, MAX_EXCLUDED_SLOTS - 1)
+        );
+        dispose_recovered_txs(1, &pool, 100, queued, &[], AttemptCharge::None);
+        let queued = pool.pop_all();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            (queued[0].hash, queued[0].attempts, queued[0].excluded_slots),
+            (hash, 1, MAX_EXCLUDED_SLOTS - 1)
+        );
+    }
+
+    #[test]
+    fn exclusion_bound_evicts_with_nonce_suffix() {
+        assert_failure_limit_evicts_nonce_suffix(AttemptCharge::Excluded);
+    }
+
+    fn assert_failure_limit_evicts_nonce_suffix(charge: AttemptCharge) {
         let pool = HeldPool::new();
         let sender = Address::repeat_byte(0xa);
         let mut root = held(sender, Direction::Inbound, 0, 1);
-        root.attempts = MAX_BUNDLE_ATTEMPTS - 1;
+        match charge {
+            AttemptCharge::Settlement => root.attempts = MAX_BUNDLE_ATTEMPTS - 1,
+            AttemptCharge::Excluded => root.excluded_slots = MAX_EXCLUDED_SLOTS - 1,
+            AttemptCharge::None => unreachable!(),
+        }
         let in_flight_suffix = held(sender, Direction::Inbound, 1, 2);
         let queued_suffix = held(sender, Direction::Inbound, 2, 3);
         let opposite_direction = held(sender, Direction::Outbound, 0, 4);
@@ -5725,7 +5868,7 @@ mod tests {
         pool.push_contiguous(independent.clone(), 0).unwrap();
 
         let recovery =
-            recover_settlement_failure(&pool, 1, failed, SettlementFailureSource::Prover);
+            recover_settlement_failure(&pool, 1, failed, SettlementFailureSource::Prover, charge);
         assert_eq!(
             recovery,
             SettlementFailureOutcome {

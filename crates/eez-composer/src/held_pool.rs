@@ -36,13 +36,10 @@ pub struct HeldTx {
     pub raw_tx: Bytes,
     /// Cached hash of the signed envelope, used for queued/in-flight dedupe.
     pub hash: TxHash,
-    /// Failed inclusion attempts so far. A funding deferral, proof rejection,
-    /// or bundle drop may otherwise retain a transaction indefinitely. Retry
-    /// handling increments this once per failed episode and EVICTS the tx (loud
-    /// ERROR, user resubmits) at
-    /// [`MAX_BUNDLE_ATTEMPTS`](crate::composer::MAX_BUNDLE_ATTEMPTS),
-    /// so one candidate set cannot fail every postBatch forever.
+    /// Charged settlement failures, prover failures and funding deferrals.
     pub attempts: u32,
+    /// Bundle exclusions and relay rejections, tracked separately from settlement failures.
+    pub excluded_slots: u32,
     /// Recovered L1 sender. Together with `nonce`, lets the pool and
     /// the eviction path keep each sender's nonce chain CONTIGUOUS:
     /// ingress rejects out-of-sequence submissions, and evicting a tx
@@ -425,6 +422,7 @@ mod tests {
             raw_tx: Bytes::from(vec![byte; 32]),
             hash: TxHash::from(B256::repeat_byte(byte)),
             attempts: 0,
+            excluded_slots: 0,
             max_fee_per_gas: u128::from(byte),
             priority_fee_per_gas: u128::from(byte),
             sender: Address::repeat_byte(byte),
@@ -465,6 +463,7 @@ mod tests {
                             raw_tx: Bytes::from(hash.as_slice().to_vec()),
                             hash,
                             attempts: 0,
+                            excluded_slots: 0,
                             max_fee_per_gas: 1_000,
                             priority_fee_per_gas: 100,
                             sender,
@@ -610,6 +609,7 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            excluded_slots: 0,
             max_fee_per_gas: u128::from(h),
             priority_fee_per_gas: u128::from(h),
             sender,
@@ -651,6 +651,7 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            excluded_slots: 0,
             max_fee_per_gas: u128::from(h),
             priority_fee_per_gas: u128::from(h),
             sender,
@@ -699,6 +700,7 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            excluded_slots: 0,
             max_fee_per_gas: u128::from(h),
             priority_fee_per_gas: u128::from(h),
             sender,
@@ -735,6 +737,7 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            excluded_slots: 0,
             max_fee_per_gas: u128::from(h),
             priority_fee_per_gas: u128::from(h),
             sender,
@@ -774,6 +777,7 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            excluded_slots: 0,
             max_fee_per_gas: u128::from(h),
             priority_fee_per_gas: u128::from(h),
             sender,
@@ -802,6 +806,7 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            excluded_slots: 0,
             max_fee_per_gas: u128::from(h),
             priority_fee_per_gas: u128::from(h),
             sender,
@@ -844,6 +849,7 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            excluded_slots: 0,
             max_fee_per_gas: u128::from(h),
             priority_fee_per_gas: u128::from(h),
             sender,
@@ -893,6 +899,7 @@ mod tests {
             raw_tx: Bytes::from(vec![h; 4]),
             hash: TxHash::from(B256::repeat_byte(h)),
             attempts: 0,
+            excluded_slots: 0,
             max_fee_per_gas: u128::from(h),
             priority_fee_per_gas: u128::from(h),
             sender,

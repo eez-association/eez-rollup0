@@ -53,6 +53,17 @@ pub enum BundleTarget {
     Exact { block: u64, timestamp: u64 },
 }
 
+/// Why a bundle did not land in its target block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /// The pinned block was built at the expected timestamp without this bundle.
+    Excluded,
+    /// A different timestamp filled the pinned height.
+    SlotSkipped,
+    /// The chain head passed the target without inclusion.
+    TargetPassed,
+}
+
 /// One bundle attempt's outcome. `Dropped` is the expected miss path —
 /// caller rebuilds on the next tick.
 #[derive(Debug, Clone)]
@@ -67,6 +78,7 @@ pub enum SendOutcome {
     Dropped {
         tx_hash: TxHash,
         target_block: u64,
+        reason: DropReason,
     },
 }
 
@@ -248,17 +260,6 @@ impl Submitter {
             .map_err(|e| L1Error::Provider(format!("get_transaction_receipt: {e}")))?
             .is_some())
     }
-
-    /// Timestamp of an L1 block on the target chain, or `None` if absent.
-    /// Distinguishes a skipped-slot drop from a genuine exclusion.
-    pub async fn block_timestamp(&self, number: u64) -> L1Result<Option<u64>> {
-        let provider = self.inner.build_target_provider();
-        Ok(provider
-            .get_block_by_number(BlockNumberOrTag::Number(number))
-            .await
-            .map_err(|e| L1Error::Provider(format!("get_block_by_number({number}): {e}")))?
-            .map(|b| b.header.timestamp))
-    }
 }
 
 impl Inner {
@@ -307,8 +308,13 @@ impl Inner {
             Ok(()) => {
                 // Relay path: the builder honors the min/max timestamp pin, so
                 // an Exact target's `pin_timestamp` unlocks the early verdict.
-                self.observe(post_batch_hash, target_block, pin_timestamp)
-                    .await
+                self.observe(
+                    &self.build_target_provider(),
+                    post_batch_hash,
+                    target_block,
+                    pin_timestamp,
+                )
+                .await
             }
             Err(L1Error::BundleRpcUnsupported)
                 if raw_txs.first().is_some_and(|raw| raw.first() == Some(&3)) =>
@@ -368,7 +374,13 @@ impl Inner {
                 }
                 // No bundle API, no timestamp pin: these txs can genuinely land
                 // in a later block, so the conservative rule is the only one.
-                self.observe(post_batch_hash, target_block, None).await
+                self.observe(
+                    &self.build_target_provider(),
+                    post_batch_hash,
+                    target_block,
+                    None,
+                )
+                .await
             }
             Err(other) => Err(other),
         }
@@ -384,6 +396,7 @@ impl Inner {
     /// bundle the relay accepted — those get the early verdict below.
     async fn observe(
         &self,
+        target_provider: &impl Provider,
         tx_hash: TxHash,
         target_block: u64,
         pin_timestamp: Option<u64>,
@@ -404,7 +417,6 @@ impl Inner {
         // `pinned` buys a slot without weakening that: min == max timestamp
         // leaves one satisfiable height, so the block there decides it.
         let start = tokio::time::Instant::now();
-        let target_provider = self.build_target_provider();
         let mut slow_logged = false;
         let mut settlement_read_warned: Option<tokio::time::Instant> = None;
         loop {
@@ -424,7 +436,7 @@ impl Inner {
                             && log.topic0() == Some(&BatchPosted::SIGNATURE_HASH)
                     });
                     match self
-                        .observe_settlement(&target_provider, l1_block, tx_hash, posted)
+                        .observe_settlement(target_provider, l1_block, tx_hash, posted)
                         .await
                     {
                         Ok(settlement) => {
@@ -458,20 +470,16 @@ impl Inner {
                 Ok(None) => {
                     let verdict = match pin_timestamp {
                         Some(pin_ts) => {
-                            pinned_slot_check(&target_provider, target_block, tx_hash, pin_ts).await
+                            pinned_slot_check(target_provider, target_block, tx_hash, pin_ts).await
                         }
                         None => PinnedVerdict::Pending,
                     };
                     match verdict {
                         PinnedVerdict::Excluded => {
-                            return Ok(dropped(
-                                tx_hash,
-                                target_block,
-                                "pinned slot built without inclusion",
-                            ));
+                            return Ok(dropped(tx_hash, target_block, DropReason::Excluded));
                         }
                         PinnedVerdict::SlotSkipped => {
-                            return Ok(dropped(tx_hash, target_block, "pinned slot skipped"));
+                            return Ok(dropped(tx_hash, target_block, DropReason::SlotSkipped));
                         }
                         // Our tx IS in the pinned block; only the receipt read
                         // trails it. Poll on, skipping the head rule.
@@ -481,7 +489,7 @@ impl Inner {
                                 return Ok(dropped(
                                     tx_hash,
                                     target_block,
-                                    "target block passed without inclusion",
+                                    DropReason::TargetPassed,
                                 ));
                             }
                             Ok(_) => {}
@@ -680,19 +688,26 @@ async fn pinned_slot_check<P: Provider>(
     }
 }
 
-fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutcome {
+fn dropped(tx_hash: TxHash, target_block: u64, reason: DropReason) -> SendOutcome {
+    let detail = match reason {
+        DropReason::Excluded => "pinned slot built without inclusion",
+        DropReason::SlotSkipped => "pinned slot skipped",
+        DropReason::TargetPassed => "target block passed without inclusion",
+    };
     event!(
         name: "eez.submitter.bundle.dropped",
         Level::WARN,
         event_name = "eez.submitter.bundle.dropped",
         target_block,
         tx_hash = %tx_hash,
-        reason,
+        reason = detail,
+        drop_reason = ?reason,
         "bundle dropped; composer will retry on next tick",
     );
     SendOutcome::Dropped {
         tx_hash,
         target_block,
+        reason,
     }
 }
 
@@ -724,6 +739,60 @@ mod tests {
     use alloy_primitives::{Address, B256, TxHash};
 
     const PIN: u64 = 1_700_000_012;
+
+    #[tokio::test]
+    async fn observe_returns_the_reason_for_each_drop_path() {
+        use super::{DropReason, SendOutcome, Submitter, SubmitterConfig};
+        use crate::L1ReaderConfig;
+        use alloy_provider::{ProviderBuilder, mock::Asserter};
+        use alloy_rpc_types_eth::{Block, Transaction};
+        use alloy_signer_local::PrivateKeySigner;
+
+        const TARGET: u64 = 10;
+        let url = "http://127.0.0.1:1".parse::<url::Url>().unwrap();
+        let submitter = Submitter::new(SubmitterConfig {
+            builder_rpc_url: url.clone(),
+            target_rpc_url: None,
+            reader: L1ReaderConfig {
+                rpc_url: url.clone(),
+                trace_rpc_url: url,
+                eez: Address::ZERO,
+                rollup_id: 1,
+                deploy_block: 0,
+                beacon_url: None,
+            },
+            poster: PrivateKeySigner::from_bytes(&B256::repeat_byte(1)).unwrap(),
+        });
+        for (pin, timestamp, expected) in [
+            (Some(PIN), Some(PIN), DropReason::Excluded),
+            (Some(PIN), Some(PIN + 5), DropReason::SlotSkipped),
+            (None, None, DropReason::TargetPassed),
+            (Some(PIN), None, DropReason::TargetPassed),
+        ] {
+            let rpc = Asserter::new();
+            rpc.push_success(&serde_json::Value::Null); // receipt
+            if let Some(timestamp) = timestamp {
+                let mut block = Block::<Transaction>::default();
+                block.header.inner.timestamp = timestamp;
+                rpc.push_success(&block);
+            } else {
+                if pin.is_some() {
+                    rpc.push_success(&serde_json::Value::Null); // pinned height unavailable
+                }
+                rpc.push_success(&"0xb"); // head passed TARGET
+            }
+            let provider = ProviderBuilder::default().connect_mocked_client(rpc);
+            let outcome = submitter
+                .inner
+                .observe(&provider, TxHash::ZERO, TARGET, pin)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, SendOutcome::Dropped { tx_hash: TxHash::ZERO, target_block: TARGET, reason } if reason == expected),
+                "{outcome:?}"
+            );
+        }
+    }
 
     /// The postBatch at index 0 is never whitelisted: if it reverts nothing
     /// settled, so letting the user_txs land would deliver calls with no state.
