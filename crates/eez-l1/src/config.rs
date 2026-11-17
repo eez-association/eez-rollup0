@@ -15,6 +15,7 @@ use crate::error::{L1Error, L1Result};
 
 const ENV_RPC_URL: &str = "EEZ_L1_RPC_URL";
 const ENV_TRACE_RPC_URL: &str = "EEZ_L1_TRACE_RPC_URL";
+const ENV_BEACON_URL: &str = "EEZ_L1_BEACON_URL";
 const ENV_BUILDER_RPC_URL: &str = "EEZ_L1_BUILDER_RPC_URL";
 const ENV_TARGET_RPC_URL: &str = "EEZ_L1_TARGET_RPC_URL";
 const ENV_POSTER_KEY: &str = "EEZ_L1_POSTER_KEY";
@@ -38,6 +39,8 @@ pub struct L1ReaderConfig {
     /// L1 block where `EEZ` was deployed. Lower bound for historical batch
     /// scans and boot-time source-readiness checks.
     pub deploy_block: u64,
+    /// Beacon REST endpoint, required for blob DA.
+    pub beacon_url: Option<Url>,
 }
 
 impl std::fmt::Debug for L1ReaderConfig {
@@ -61,12 +64,26 @@ impl L1ReaderConfig {
     /// malformed value.
     pub fn from_env() -> L1Result<Self> {
         let rpc_url = parse_url(ENV_RPC_URL)?;
+        let beacon_url = env::var(ENV_BEACON_URL)
+            .ok()
+            .filter(|url| !url.trim().is_empty())
+            .map(|url| {
+                Url::parse(url.trim())
+                    .map_err(|error| L1Error::Config(format!("{ENV_BEACON_URL}: {error}")))
+            })
+            .transpose()?;
+        if blob_da_enabled()? && beacon_url.is_none() {
+            return Err(L1Error::Config(format!(
+                "{ENV_BEACON_URL} is required for blob DA"
+            )));
+        }
         Ok(Self {
             trace_rpc_url: trace_rpc_url(&rpc_url)?,
             rpc_url,
             eez: parse_address(ENV_EEZ_ADDRESS)?,
             rollup_id: parse_u64(ENV_ROLLUP_ID)?,
             deploy_block: parse_u64(ENV_REGISTRY_DEPLOY_BLOCK)?,
+            beacon_url,
         })
     }
 }
@@ -171,6 +188,25 @@ fn parse_u64(name: &str) -> L1Result<u64> {
     require(name)?
         .parse::<u64>()
         .map_err(|e| L1Error::Config(format!("{name}: {e}")))
+}
+
+/// Whether the optional blob DA profile is selected.
+///
+/// # Errors
+///
+/// [`L1Error::Config`] for an unknown settlement profile.
+pub fn blob_da_enabled() -> L1Result<bool> {
+    match env::var("EEZ_SETTLEMENT_PROFILE") {
+        Err(env::VarError::NotPresent) => Ok(false),
+        Ok(value) => match value.trim() {
+            "" | "calldata" => Ok(false),
+            "blob" => Ok(true),
+            other => Err(L1Error::Config(format!(
+                "invalid EEZ_SETTLEMENT_PROFILE {other:?}"
+            ))),
+        },
+        Err(error) => Err(L1Error::Config(format!("EEZ_SETTLEMENT_PROFILE: {error}"))),
+    }
 }
 
 #[cfg(test)]

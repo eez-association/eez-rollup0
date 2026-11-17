@@ -1,10 +1,9 @@
 //! Test-support stub backend shared with the service tests.
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, mpsc};
+use std::sync::Mutex;
 
 use reth_primitives_traits::SignerRecoverable as _;
-use tokio::sync::oneshot;
 
 use super::*;
 
@@ -53,19 +52,12 @@ impl BackendBlockOutput {
     }
 }
 
-/// Raw canned output deliberately kept outside production's checked backend API.
-#[derive(Debug)]
-pub(crate) struct TestBackendWindowOutput {
-    pub blocks: Vec<BackendBlockOutput>,
-}
-
 /// Synthetic test metadata need not match the header (many fixtures use a
 /// byte-grid identity). Evidence still crosses the production shape checker.
 pub(crate) fn check_test_output(
     admitted: &AdmittedBlock,
     output: BackendBlockOutput,
     pre_state_root: B256,
-    allow_checkpoints: bool,
 ) -> Result<Arc<ValidatedBlock>, ValidationError> {
     let decoded = alloy_rlp::decode_exact::<EthereumBlock>(admitted.rlp()).map_err(|error| {
         ValidationError::InvalidBackendOutput(format!(
@@ -78,7 +70,6 @@ pub(crate) fn check_test_output(
         admitted.claimed_hash,
         &decoded,
         &output,
-        allow_checkpoints,
     )
     .map_err(|error| ValidationError::InvalidBackendOutput(error.to_string()))?;
     Ok(Arc::new(ValidatedBlock {
@@ -95,53 +86,17 @@ pub(crate) fn check_test_output(
     }))
 }
 
-#[derive(Debug)]
-enum StubAction {
-    Respond(Result<TestBackendWindowOutput, String>),
-    Block {
-        started: oneshot::Sender<()>,
-        release: mpsc::Receiver<()>,
-        response: Result<TestBackendWindowOutput, String>,
-    },
-    Panic,
+#[derive(Debug, Default)]
+struct StubState {
+    responses: VecDeque<Result<Vec<BackendBlockOutput>, String>>,
+    pending: VecDeque<BackendBlockOutput>,
 }
 
-/// Canned per-call actions, served in order; a call past the end fails loudly.
+/// Canned execution facts, deliberately independent of execution correctness.
 #[derive(Debug)]
 pub(crate) struct StubBackend {
-    actions: Mutex<VecDeque<StubAction>>,
+    state: Mutex<StubState>,
     expected_l2_system_address: alloy_primitives::Address,
-}
-
-impl StubBackend {
-    fn next_response(&self) -> Result<TestBackendWindowOutput, ValidationError> {
-        let action = self.actions.lock().unwrap().pop_front().ok_or_else(|| {
-            ValidationError::InternalInvariant(
-                "stub validator ran out of canned actions".to_owned(),
-            )
-        })?;
-        let response = match action {
-            StubAction::Respond(response) => response,
-            StubAction::Block {
-                started,
-                release,
-                response,
-            } => {
-                let _ = started.send(());
-                release.recv().map_err(|_| {
-                    ValidationError::InternalInvariant(
-                        "blocking stub release sender was dropped".to_owned(),
-                    )
-                })?;
-                response
-            }
-            StubAction::Panic => panic!("stub validator panicked"),
-        };
-        match response {
-            Ok(output) => Ok(output),
-            Err(reason) => Err(ValidationError::Rejected(reason)),
-        }
-    }
 }
 
 #[async_trait::async_trait]
@@ -149,116 +104,105 @@ impl ValidationBackend for StubBackend {
     fn label(&self) -> &'static str {
         "stub"
     }
-
     fn chain_id(&self) -> u64 {
         1
     }
-
     fn expected_l2_system_address(&self) -> alloy_primitives::Address {
         self.expected_l2_system_address
     }
-
-    fn validate_blocks(
-        &self,
-        blocks: &[AdmittedBlock],
-        _witnesses: &mut [ExecutionWitness],
-        cancellation: &CancellationToken,
-    ) -> Result<BackendWindowOutput, ValidationError> {
-        if cancellation.is_cancelled() {
-            return Err(ValidationError::Cancelled);
-        }
-        let output = self.next_response()?;
-        if output.blocks.len() != blocks.len() {
-            return Err(ValidationError::InvalidBackendOutput(format!(
-                "backend returned {} blocks for {} admitted blocks",
-                output.blocks.len(),
-                blocks.len()
-            )));
-        }
-        let checked = blocks
-            .iter()
-            .zip(output.blocks)
-            .enumerate()
-            .map(|(index, (admitted, output))| {
-                check_test_output(admitted, output, B256::ZERO, index + 1 == blocks.len())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(BackendWindowOutput { blocks: checked })
+    fn validate_anchor(&self, _anchor: BlockAnchor) -> Result<(), ValidationError> {
+        Ok(())
     }
-
+    async fn validate_next(
+        &self,
+        parent: BlockAnchor,
+        block: &AdmittedBlock,
+        _witness: ExecutionWitness,
+        _timeout: Duration,
+    ) -> Result<(Arc<ValidatedBlock>, bool), ValidationError> {
+        block.check_parent(parent)?;
+        let output = {
+            let mut state = self.state.lock().unwrap();
+            if state.pending.is_empty() {
+                let output = state
+                    .responses
+                    .pop_front()
+                    .ok_or_else(|| {
+                        ValidationError::InvalidBackendOutput("missing canned block output".into())
+                    })?
+                    .map_err(ValidationError::Rejected)?;
+                state.pending = output.into();
+            }
+            state.pending.pop_front().ok_or_else(|| {
+                ValidationError::InvalidBackendOutput("empty canned output".into())
+            })?
+        };
+        Ok((check_test_output(block, output, parent.state_root)?, false))
+    }
     fn remaining_test_actions(&self) -> Option<usize> {
-        Some(self.actions.lock().unwrap().len())
+        let state = self.state.lock().unwrap();
+        Some(state.responses.len() + usize::from(!state.pending.is_empty()))
     }
 }
 
 impl StubBackend {
-    /// A stub backend serving `responses` in order.
-    pub(crate) fn new(responses: Vec<Result<TestBackendWindowOutput, String>>) -> Self {
+    pub(crate) fn new(responses: Vec<Result<Vec<BackendBlockOutput>, String>>) -> Self {
         Self {
-            actions: Mutex::new(responses.into_iter().map(StubAction::Respond).collect()),
+            state: Mutex::new(StubState {
+                responses: responses.into(),
+                ..Default::default()
+            }),
             expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
         }
     }
-
-    /// A one-shot stub with caller-supplied settlement evidence for each block.
     pub(crate) fn with_settlement_evidence(
-        mut output: TestBackendWindowOutput,
+        mut output: Vec<BackendBlockOutput>,
         evidence: Vec<SettlementBlockEvidence>,
     ) -> Self {
-        assert_eq!(
-            output.blocks.len(),
-            evidence.len(),
-            "test settlement evidence must cover every backend block output",
-        );
-        for (block, settlement_evidence) in output.blocks.iter_mut().zip(evidence) {
-            block.settlement_evidence = settlement_evidence;
+        assert_eq!(output.len(), evidence.len());
+        for (block, evidence) in output.iter_mut().zip(evidence) {
+            block.settlement_evidence = evidence;
         }
         Self::new(vec![Ok(output)])
     }
-
-    /// A stub that blocks one validation until `release` is signalled.
-    pub(crate) fn blocking(
-        response: Result<TestBackendWindowOutput, String>,
-    ) -> (Self, oneshot::Receiver<()>, mpsc::Sender<()>) {
-        let (started_tx, started_rx) = oneshot::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let backend = Self {
-            actions: Mutex::new(
-                [StubAction::Block {
-                    started: started_tx,
-                    release: release_rx,
-                    response,
-                }]
-                .into(),
-            ),
-            expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
-        };
-        (backend, started_rx, release_tx)
-    }
-
-    /// A stub whose next validation panics.
-    pub(crate) fn panicking() -> Self {
-        Self {
-            actions: Mutex::new([StubAction::Panic].into()),
-            expected_l2_system_address: crate::testkit::TEST_SYSTEM_ADDRESS,
-        }
-    }
-
-    /// Exercise the shared v1 adapter with a synthetic admitted window.
+    /// Apply the production evidence checker to canned outputs for pure shape tests.
     pub(crate) fn validate(
         &self,
         blocks: &[AdmittedBlock],
     ) -> Result<ValidatedWindow, ValidationError> {
         if blocks.is_empty() {
             return Err(ValidationError::Rejected(
-                "refusing to validate an empty window".to_owned(),
+                "refusing to validate an empty window".into(),
             ));
         }
-        validate_window(
-            self,
-            AdmittedBlocks::for_test(blocks.to_vec()),
-            &CancellationToken::default(),
-        )
+        let output = self
+            .state
+            .lock()
+            .unwrap()
+            .responses
+            .pop_front()
+            .ok_or_else(|| {
+                ValidationError::InternalInvariant(
+                    "stub validator ran out of canned actions".into(),
+                )
+            })?
+            .map_err(ValidationError::Rejected)?;
+        if output.len() != blocks.len() {
+            return Err(ValidationError::InvalidBackendOutput(
+                "backend block count does not match admitted window".into(),
+            ));
+        }
+        let mut checked = blocks
+            .iter()
+            .zip(output)
+            .map(|(block, output)| check_test_output(block, output, B256::ZERO))
+            .collect::<Result<Vec<_>, _>>()?;
+        let terminal = checked.pop().unwrap();
+        Ok(ValidatedWindow::from_validated_prefix(
+            blocks[0].claimed_parent_hash,
+            checked,
+            terminal,
+        ))
     }
 }
 
@@ -267,29 +211,26 @@ impl StubBackend {
 /// Valid block RLP receives one successful status per transaction. Malformed
 /// RLP receives an empty status list rather than a fabricated count; the test
 /// backend rejects such a block when it constructs checked evidence.
-pub(crate) fn backend_output_for(blocks: &[AdmittedBlock]) -> TestBackendWindowOutput {
-    TestBackendWindowOutput {
-        blocks: blocks
-            .iter()
-            .enumerate()
-            .map(|(index, block)| {
-                let decoded_transaction_count =
-                    alloy_rlp::decode_exact::<EthereumBlock>(block.rlp())
-                        .map(|block| block.body.transactions.len())
-                        .unwrap_or_default();
-                let transaction_state_checkpoints = (index + 1 == blocks.len()
-                    && decoded_transaction_count == 0)
-                    .then(|| crate::testkit::pre_execution_checkpoint(block.claimed_hash))
-                    .into_iter()
-                    .collect();
-                BackendBlockOutput {
-                    computed_hash: block.claimed_hash,
-                    receipt_successes: vec![true; decoded_transaction_count],
-                    transaction_state_checkpoints,
-                    post_state_root: B256::ZERO,
-                    settlement_evidence: SettlementBlockEvidence::from_rlp_for_test(&block.rlp),
-                }
-            })
-            .collect(),
-    }
+pub(crate) fn backend_output_for(blocks: &[AdmittedBlock]) -> Vec<BackendBlockOutput> {
+    blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            let decoded_transaction_count = alloy_rlp::decode_exact::<EthereumBlock>(block.rlp())
+                .map(|block| block.body.transactions.len())
+                .unwrap_or_default();
+            let transaction_state_checkpoints = (index + 1 == blocks.len()
+                && decoded_transaction_count == 0)
+                .then(|| crate::testkit::pre_execution_checkpoint(block.claimed_hash))
+                .into_iter()
+                .collect();
+            BackendBlockOutput {
+                computed_hash: block.claimed_hash,
+                receipt_successes: vec![true; decoded_transaction_count],
+                transaction_state_checkpoints,
+                post_state_root: B256::ZERO,
+                settlement_evidence: SettlementBlockEvidence::from_rlp_for_test(&block.rlp),
+            }
+        })
+        .collect()
 }

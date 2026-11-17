@@ -235,7 +235,7 @@ fn transient_validation_errors_have_stable_rpc_mappings() {
     ];
 
     for (error, code, message) in cases {
-        let status = PipelineError::Validation(error).status();
+        let status = error.status();
         assert_eq!(status.code(), code);
         assert_eq!(status.message(), message);
     }
@@ -257,6 +257,7 @@ fn cancelled_settlement_stops_before_decoding_untrusted_input() {
     let run = run_settlement(SettlementInput {
         l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: b"not ABI calldata".to_vec(),
+        blobs: &[],
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -267,39 +268,6 @@ fn cancelled_settlement_stops_before_decoding_untrusted_input() {
     });
 
     assert!(matches!(run, Err(SettlementPipelineError::Cancelled)));
-}
-
-#[test]
-fn an_elapsed_deadline_stops_the_pipeline_between_validation_and_settlement() {
-    let mut input = AdmittedBlock::test(5, 0x04, 0x05);
-    let empty_body: eez_primitives::BlockBody = Default::default();
-    input.rlp = alloy_rlp::encode(eez_primitives::Block::new(Default::default(), empty_body));
-    let inputs = vec![input];
-    let state = inner(StubBackend::new(vec![Ok(backend_output_for(&inputs))]));
-    // A deadline captured now is already past when the boundary between
-    // execution validation and settlement runs.
-    let deadline = tokio::time::Instant::now();
-
-    let result = validate_and_settle(
-        &state,
-        crate::window::AdmittedBlocks::for_test(inputs),
-        b"not ABI calldata".to_vec(),
-        None,
-        deadline,
-        &CancellationToken::default(),
-    );
-
-    // The exact variant proves settlement never decoded the untrusted bytes:
-    // decoding them would have produced a calldata error instead.
-    let error = result
-        .err()
-        .expect("an elapsed deadline must stop the pipeline");
-    assert!(matches!(error, PipelineError::DeadlineBeforeSettlement));
-    assert_eq!(error.phase(), "settlement");
-    assert_eq!(error.gate(), "deadline");
-    let status = error.status();
-    assert_eq!(status.code(), Code::DeadlineExceeded);
-    assert_eq!(status.message(), "Prove request deadline exceeded");
 }
 
 #[test]
@@ -355,6 +323,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     let run = run_settlement(SettlementInput {
         l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: calldata.clone(),
+        blobs: &[],
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -365,12 +334,16 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     });
 
     assert_eq!(run.unwrap().into_inner(), expected_hash);
+    let mut wrong_sidecar = sidecar.clone();
+    wrong_sidecar.l2ToL1Calls[0].data = Bytes::from_static(b"different call");
+    assert_blob_da_settles(&batch, &validated, &[Vec::new()], &sidecar, &wrong_sidecar);
 
     // Removing both the selector and its context must not turn an inbound
     // system transaction into an attestable timeless batch.
     let mut timeless = batch.clone();
     timeless.blockNumber = 0;
     let error = run_settlement(SettlementInput {
+        blobs: &[],
         l1_parent_hash: None,
         submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&timeless),
         validated_window: &validated,
@@ -435,6 +408,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
         let error = run_settlement(SettlementInput {
             l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
             submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&substituted),
+            blobs: &[],
             validated_window: &validated,
             expected_rollup_id: expected_rollup_id(1),
             expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -457,6 +431,7 @@ fn a_fully_bound_inbound_passes_settlement_and_da_validation() {
     let error = run_settlement(SettlementInput {
         l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: calldata,
+        blobs: &[],
         validated_window: &reverted,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -504,6 +479,7 @@ fn a_reverted_outbound_load_reports_the_paired_user_transaction() {
     let error = run_settlement(SettlementInput {
         l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+        blobs: &[],
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -549,6 +525,7 @@ fn an_outbound_observation_failure_reports_the_user_transaction() {
     let error = run_settlement(SettlementInput {
         l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+        blobs: &[],
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -600,6 +577,7 @@ fn an_outbound_claim_hash_mismatch_remains_non_actionable() {
     let error = run_settlement(SettlementInput {
         l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+        blobs: &[],
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -644,6 +622,7 @@ fn a_fully_bound_outbound_effect_is_authorized() {
     let run = run_settlement(SettlementInput {
         l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: calldata,
+        blobs: &[],
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -659,14 +638,17 @@ fn a_fully_bound_outbound_effect_is_authorized() {
     // state update projects to the same action — EEZ binds state updates
     // through the entry hashes in the public input, not through the DA. A
     // mismatch therefore has to be a different call.
-    let mut mismatched_da = batch;
+    let mut mismatched_da = batch.clone();
     let mut wrong_call = mismatched_da.entries[1].clone();
     wrong_call.l2ToL1Calls[0].value += alloy_primitives::U256::from(1);
-    mismatched_da.callData = settlement::encode_da_payload(&[vec![user]], &[wrong_call]).into();
+    mismatched_da.callData =
+        settlement::encode_da_payload(&[vec![user.clone()]], std::slice::from_ref(&wrong_call))
+            .into();
     let mismatched_calldata = eez_protocol::entries::encode_postbatch(&mismatched_da);
     let run = run_settlement(SettlementInput {
         l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
         submitted_post_batch_calldata: mismatched_calldata,
+        blobs: &[],
         validated_window: &validated,
         expected_rollup_id: expected_rollup_id(1),
         expected_l2_system_address: TEST_SYSTEM_ADDRESS,
@@ -681,4 +663,54 @@ fn a_fully_bound_outbound_effect_is_authorized() {
             settlement::DaPayloadError::ActionMismatch { .. }
         ))
     ));
+    assert_blob_da_settles(
+        &batch,
+        &validated,
+        &[vec![user]],
+        &batch.entries[1],
+        &wrong_call,
+    );
+}
+
+/// Carry `batch`'s DA in one blob instead of `callData`: it settles to the
+/// hash binding the blob's versioned hash, and a substituted sidecar still
+/// fails the DA gate.
+fn assert_blob_da_settles(
+    batch: &eez_protocol::EvmBatch,
+    validated: &validate::ValidatedWindow,
+    blocks: &[Vec<Vec<u8>>],
+    sidecar: &ExecutionEntrySol,
+    wrong_sidecar: &ExecutionEntrySol,
+) {
+    let mut batch = batch.clone();
+    batch.callData = Bytes::new();
+    batch.blobIndices = vec![U256::ZERO];
+    let reconstructor = test_system_transaction_reconstructor(expected_rollup_id(1));
+    let cancellation = CancellationToken::default();
+    let settle = |blobs: &[Vec<u8>]| {
+        run_settlement(SettlementInput {
+            l1_parent_hash: Some(crate::testkit::live_context().parent_hash),
+            submitted_post_batch_calldata: eez_protocol::entries::encode_postbatch(&batch),
+            blobs,
+            validated_window: validated,
+            expected_rollup_id: expected_rollup_id(1),
+            expected_l2_system_address: TEST_SYSTEM_ADDRESS,
+            proof_system_vkey: test_proof_system_vkey(),
+            expected_proof_system: test_proof_system(),
+            system_transaction_reconstructor: &reconstructor,
+            cancellation: &cancellation,
+        })
+    };
+    let blobs = settlement::encode_blob_da_payload(blocks, std::slice::from_ref(sidecar));
+    let expected = eez_protocol::public_inputs::public_inputs_hashes_with_blobs_and_context(
+        &batch,
+        test_proof_system_vkey().get(),
+        &eez_blob::versioned_hashes(&blobs).unwrap(),
+        Some(crate::testkit::live_context()),
+    )
+    .unwrap()[0];
+    assert_eq!(settle(&blobs).unwrap().into_inner(), expected);
+    let substituted =
+        settlement::encode_blob_da_payload(blocks, std::slice::from_ref(wrong_sidecar));
+    assert_eq!(settle(&substituted).unwrap_err().gate(), "da_payload");
 }

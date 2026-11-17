@@ -37,9 +37,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use eez_control_rpc::{
     MAX_MESSAGE_BYTES, encode_prove_failure,
     v1::{
-        InboundFailure, ProveChunk, ProveFailure, ProveResponse, prove_chunk, prove_failure,
+        ClientFrame, InboundFailure, ProveFailure, Rejected, ServerFrame, client_frame,
+        prove_failure,
         prover_client::ProverClient,
         prover_server::{Prover, ProverServer},
+        server_frame,
     },
 };
 use eez_protocol::EEZL2_ADDRESS;
@@ -342,6 +344,16 @@ impl BundleStub {
         }
         Ok(())
     }
+
+    async fn set_ack_delay(&self, delay: Duration) -> Result<()> {
+        let provider = ProviderBuilder::new().connect_http(self.url.parse()?);
+        let _: f64 = provider
+            .client()
+            .request("eez_setBundleAckDelay", (delay.as_secs_f64(),))
+            .await
+            .context("set builder stub ack delay")?;
+        Ok(())
+    }
 }
 
 impl Drop for BundleStub {
@@ -394,15 +406,24 @@ fn proof_signer_binary() -> Result<PathBuf> {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow!("target profile directory is not valid UTF-8"))?;
-        let mut command = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-        command.current_dir(repo_root()).args([
-            "build",
-            "--locked",
-            "-p",
-            "eez-prover-stateless",
-            "--bin",
-            "eez-proof-signer",
-        ]);
+        // The signer builds from the provers/ submodule against this
+        // checkout's crates, into the workspace target directory. Cargo
+        // nests a configured target triple below it, so the binary lands
+        // next to this test executable.
+        let target_dir = cargo_target_directory()?;
+        let mut command = Command::new("bash");
+        command
+            .current_dir(repo_root())
+            .args([
+                "scripts/provers-cargo.sh",
+                "build",
+                "-p",
+                "eez-prover-stateless",
+                "--bin",
+                "eez-proof-signer",
+            ])
+            .arg("--target-dir")
+            .arg(target_dir);
         if profile != "debug" {
             command.args(["--profile", profile]);
         }
@@ -414,6 +435,25 @@ fn proof_signer_binary() -> Result<PathBuf> {
     path.is_file()
         .then_some(path)
         .ok_or_else(|| anyhow!("eez-proof-signer build completed without producing the binary"))
+}
+
+/// The workspace target directory as Cargo resolves it (`CARGO_TARGET_DIR`,
+/// `build.target-dir`), without any target triple.
+fn cargo_target_directory() -> Result<PathBuf> {
+    let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .current_dir(repo_root())
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .output()
+        .context("run cargo metadata")?;
+    if !output.status.success() {
+        bail!("cargo metadata failed with {}", output.status);
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse cargo metadata")?;
+    metadata["target_directory"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("cargo metadata has no target_directory"))
 }
 
 /// Configuration for one real `eez-proof-signer` process.
@@ -611,32 +651,24 @@ pub enum ProverMutation {
 }
 
 impl ProverMutation {
-    fn apply(self, chunks: &mut [ProveChunk]) -> Result<(), Status> {
-        match self {
-            Self::None => {}
-            Self::PostBatch => {
-                let calldata = chunks
-                    .iter_mut()
-                    .find_map(|chunk| match chunk.kind.as_mut() {
-                        Some(prove_chunk::Kind::Header(header)) => header
-                            .post_batch
-                            .as_mut()
-                            .map(|post_batch| &mut post_batch.abi_calldata),
-                        _ => None,
-                    })
-                    .ok_or_else(|| Status::internal("missing Prove header"))?;
+    fn apply(self, frame: &mut ClientFrame) -> Result<(), Status> {
+        match (self, frame.kind.as_mut()) {
+            (Self::PostBatch, Some(client_frame::Kind::Finalize(finalize))) => {
+                let calldata = &mut finalize
+                    .settlement
+                    .as_mut()
+                    .ok_or_else(|| Status::internal("missing settlement input"))?
+                    .abi_calldata;
                 let byte = calldata
                     .last_mut()
                     .ok_or_else(|| Status::internal("empty PostBatch calldata"))?;
                 *byte ^= 1;
             }
-            Self::Witness => {
-                let witness = chunks
-                    .iter_mut()
-                    .find_map(|chunk| match chunk.kind.as_mut() {
-                        Some(prove_chunk::Kind::Block(block)) => block.witness.as_mut(),
-                        _ => None,
-                    })
+            (Self::Witness, Some(client_frame::Kind::Block(block))) => {
+                let witness = block
+                    .data
+                    .as_mut()
+                    .and_then(|block| block.witness.as_mut())
                     .ok_or_else(|| Status::internal("missing block witness"))?;
                 if let Some(byte) = witness.state.iter_mut().find_map(|node| node.first_mut()) {
                     *byte ^= 1;
@@ -644,45 +676,40 @@ impl ProverMutation {
                     witness.state.push(vec![0xff]);
                 }
             }
-            Self::ResourceExhausted | Self::MismatchedActionable => {
-                let calldata = chunks
-                    .iter()
-                    .find_map(|chunk| match chunk.kind.as_ref() {
-                        Some(prove_chunk::Kind::Header(header)) => header
-                            .post_batch
-                            .as_ref()
-                            .map(|post_batch| post_batch.abi_calldata.as_slice()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| Status::internal("missing Prove header"))?;
+            (
+                Self::ResourceExhausted | Self::MismatchedActionable,
+                Some(client_frame::Kind::Finalize(finalize)),
+            ) => {
+                let calldata = &finalize
+                    .settlement
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("missing settlement input"))?
+                    .abi_calldata;
                 let batch = eez_protocol::entries::decode_postbatch(calldata)
                     .map_err(|error| Status::internal(format!("decode PostBatch: {error}")))?;
-                // Exercise the rejection only on effect-bearing batches, so
-                // anchor-only historical/minimal proofs remain healthy.
+                // Reject only effect-bearing batches so anchor-only recovery remains healthy.
                 if batch.entries.len() > 1 {
-                    return match self {
-                        Self::ResourceExhausted => Err(Status::resource_exhausted(
+                    if matches!(self, Self::ResourceExhausted) {
+                        return Err(Status::resource_exhausted(
                             "window validation resource quota exceeded",
+                        ));
+                    }
+                    let failure = ProveFailure {
+                        actionable_failure: Some(prove_failure::ActionableFailure::Inbound(
+                            InboundFailure {
+                                entry_index: u32::MAX,
+                                entry_hash: vec![0xff; 32],
+                            },
                         )),
-                        Self::MismatchedActionable => {
-                            let failure = ProveFailure {
-                                actionable_failure: Some(
-                                    prove_failure::ActionableFailure::Inbound(InboundFailure {
-                                        entry_index: u32::MAX,
-                                        entry_hash: vec![0xff; 32],
-                                    }),
-                                ),
-                            };
-                            Err(Status::with_details(
-                                tonic::Code::FailedPrecondition,
-                                "candidate identity does not match the request",
-                                encode_prove_failure(&failure).into(),
-                            ))
-                        }
-                        Self::None | Self::PostBatch | Self::Witness => unreachable!(),
                     };
+                    return Err(Status::with_details(
+                        tonic::Code::FailedPrecondition,
+                        "candidate identity does not match the request",
+                        encode_prove_failure(&failure).into(),
+                    ));
                 }
             }
+            _ => {}
         }
         Ok(())
     }
@@ -704,49 +731,105 @@ struct ProverProxyService {
 
 #[tonic::async_trait]
 impl Prover for ProverProxyService {
-    async fn prove(
-        &self,
-        request: Request<Streaming<ProveChunk>>,
-    ) -> Result<Response<ProveResponse>, Status> {
-        self.counters.attempts.fetch_add(1, Ordering::Relaxed);
-        let mut input = request.into_inner();
-        let mut chunks = Vec::new();
-        while let Some(chunk) = input.message().await? {
-            chunks.push(chunk);
-        }
-        if let Err(status) = self.mutation.apply(&mut chunks) {
-            if matches!(
-                status.code(),
-                tonic::Code::ResourceExhausted | tonic::Code::FailedPrecondition
-            ) {
-                self.counters.rejections.fetch_add(1, Ordering::Relaxed);
-            }
-            return Err(status);
-        }
+    type ProveStreamStream = tokio_stream::wrappers::ReceiverStream<Result<ServerFrame, Status>>;
 
+    async fn prove_stream(
+        &self,
+        request: Request<Streaming<ClientFrame>>,
+    ) -> Result<Response<Self::ProveStreamStream>, Status> {
+        self.counters.attempts.fetch_add(1, Ordering::Relaxed);
         let mut client = ProverClient::connect(self.upstream.clone())
             .await
             .map_err(|error| Status::unavailable(format!("connect upstream signer: {error}")))?
             .max_encoding_message_size(MAX_MESSAGE_BYTES)
             .max_decoding_message_size(MAX_MESSAGE_BYTES);
-        match client.prove(tokio_stream::iter(chunks)).await {
-            Ok(response) => {
-                self.counters.successes.fetch_add(1, Ordering::Relaxed);
-                Ok(response)
-            }
-            Err(status) => {
-                // Transport failures do not prove that the signer rejected the input.
-                if matches!(
-                    status.code(),
-                    tonic::Code::InvalidArgument
-                        | tonic::Code::FailedPrecondition
-                        | tonic::Code::ResourceExhausted
-                ) {
-                    self.counters.rejections.fetch_add(1, Ordering::Relaxed);
+        let (requests, receiver) = tokio::sync::mpsc::channel(8);
+        let mut upstream = client
+            .prove_stream(tokio_stream::wrappers::ReceiverStream::new(receiver))
+            .await?
+            .into_inner();
+        let (output, responses) = tokio::sync::mpsc::channel(8);
+        let mutation = self.mutation;
+        let counters = Arc::clone(&self.counters);
+        tokio::spawn(async move {
+            let forward = async {
+                let mut input = request.into_inner();
+                let mut cursor = (0, Vec::new());
+                // Forward one exchange at a time so injected rejections follow
+                // every earlier acknowledgement, even when the client pipelines.
+                while let Some(mut frame) = input.message().await? {
+                    let response = if let Err(status) = mutation.apply(&mut frame) {
+                        ServerFrame {
+                            session_id: frame.session_id,
+                            request_id: frame.request_id,
+                            epoch: frame.epoch,
+                            kind: Some(server_frame::Kind::Rejected(Rejected {
+                                code: i32::from(status.code()),
+                                message: status.message().to_owned(),
+                                details: status.details().to_vec(),
+                                validated_through: cursor.0,
+                                validated_hash: cursor.1.clone(),
+                            })),
+                        }
+                    } else {
+                        requests
+                            .send(frame)
+                            .await
+                            .map_err(|_| Status::unavailable("upstream request stream closed"))?;
+                        let Some(response) = upstream.message().await? else {
+                            break;
+                        };
+                        response
+                    };
+                    let terminal = match &response.kind {
+                        Some(server_frame::Kind::Ready(ready)) => {
+                            cursor = (ready.validated_through, ready.validated_hash.clone());
+                            false
+                        }
+                        Some(server_frame::Kind::Validated(validated)) => {
+                            cursor = (validated.number, validated.hash.clone());
+                            false
+                        }
+                        Some(server_frame::Kind::Proof(_)) => {
+                            counters.successes.fetch_add(1, Ordering::Relaxed);
+                            true
+                        }
+                        Some(server_frame::Kind::Rejected(rejection)) => {
+                            if matches!(
+                                tonic::Code::from_i32(rejection.code),
+                                tonic::Code::InvalidArgument
+                                    | tonic::Code::FailedPrecondition
+                                    | tonic::Code::ResourceExhausted
+                            ) {
+                                counters.rejections.fetch_add(1, Ordering::Relaxed);
+                            }
+                            false
+                        }
+                        Some(server_frame::Kind::Cancelled(_)) => true,
+                        None => false,
+                    };
+                    if output.send(Ok(response)).await.is_err() || terminal {
+                        break;
+                    }
                 }
-                Err(Status::new(status.code(), status.message().to_string()))
+                Ok::<_, Status>(())
+            };
+            tokio::select! {
+                () = output.closed() => {}
+                result = forward => {
+                    if let Err(status) = result {
+                        // A transport outage is not evidence of input rejection.
+                        if matches!(status.code(), tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition | tonic::Code::ResourceExhausted) {
+                            counters.rejections.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let _ = output.send(Err(status)).await;
+                    }
+                }
             }
-        }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            responses,
+        )))
     }
 }
 
@@ -814,7 +897,7 @@ pub struct Harness {
     pub dep: Deployment,
     // The owning tempdir must outlive every node and signer using this genesis.
     l2_genesis: (PathBuf, tempfile::TempDir),
-    // Each composer gets isolated state because the signer admits one request at a time.
+    // Keep the dedicated signers alive with the harness.
     provers: std::sync::Mutex<Vec<ProofSignerHandle>>,
     /// Where in `provers` the signers of [`Self::env_with_attesters`] start.
     quorum_start: std::sync::OnceLock<usize>,
@@ -4222,6 +4305,18 @@ impl CrossChainWorld {
                 "world has no builder stub; start it with setup_cross_chain_with_builder_stub",
             )?
             .set_mode(mode)
+            .await
+    }
+
+    /// Delay the relay stub's answer to each bundle, so the composer's verdict
+    /// on it lags the L1 block it targets.
+    pub async fn set_builder_ack_delay(&self, delay: Duration) -> Result<()> {
+        self.builder
+            .as_ref()
+            .context(
+                "world has no builder stub; start it with setup_cross_chain_with_builder_stub",
+            )?
+            .set_ack_delay(delay)
             .await
     }
 }

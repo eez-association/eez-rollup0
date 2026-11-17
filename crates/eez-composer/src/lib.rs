@@ -52,7 +52,7 @@ pub use attestation_quorum::{
     AttestationQuorum, DEFAULT_ATTESTATION_GRACE, Prevalidation, QuorumConfigError, QuorumMember,
 };
 #[doc(inline)]
-pub use composer::{Composer, ComposerConfigError, CrossChainExecCtx};
+pub use composer::{BlobPostingConfig, Composer, ComposerConfigError, CrossChainExecCtx};
 #[doc(inline)]
 pub use held_pool::{AdmissionError, HeldPool, HeldTx};
 #[doc(inline)]

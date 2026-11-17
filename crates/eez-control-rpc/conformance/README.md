@@ -1,7 +1,7 @@
 # Executed Rollup0 streaming RPC vectors
 
 These are recorded protobuf request/response payloads for the
-[`prove.v2` wire contract](../proto/prove_stream.proto), with a
+[`prove.v1` wire contract](../proto/prove.proto), with a
 [standalone replay client](../examples/replay_streaming.rs). Use them to check a
 streaming prover's responses against expected protocol behavior. The client
 connects to a running prover configured for the fixture and selected test profile.
@@ -17,7 +17,7 @@ more cases requiring explicit server limits. Together they contain 339 requests,
 | --- | --- |
 | Begin | Correct anchor; unsupported rollup; missing/31/33-byte hashes and roots; number overflow; invalid initial binding; repeated Begin. |
 | Block | Execution; duplicate at/before tip; missing data/witness; hash widths; zero/max/gapped numbers; contradictory parent/hash/RLP; invalid witness then valid retry; cache-parent binding. |
-| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; unsupported blob/context/profile inputs; valid retry. |
+| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; invalid blob carrier/unsupported context/profile inputs; valid retry. |
 | Resume | Progress after half-close and Proof; live takeover; missing/malformed/retired session; nonzero initial epoch; stale transport cannot use the new epoch. |
 | Rewind | Tip, intermediate block and anchor; malformed/unknown/pruned ancestors; stale epoch; removed suffix cannot finalize; promoted anchor survives Resume. |
 | Cancel | Acknowledgement and EOF; retired session cannot resume; cross-stream cancellation denied; another Composer can finish. |
@@ -29,20 +29,22 @@ backend-specific cases. A minimal implementation can run `baseline-and-rejection
 alone. The full suite covers Rollup0's baseline and optional capabilities;
 session controls, shared caching, and concurrent sessions are not baseline
 requirements.
-Unsupported blobs/context are negative tests of this calldata-only profile,
-not requirements for a prover configured for another settlement profile.
+Blob submissions with calldata still populated are negative tests of blob carrier
+validation. Live parent/time posting context is supported. Blob proof success
+is covered by the stateless streaming integration tests, separately from these
+vectors.
 
-These vectors target Rollup0's calldata-only, timeless **conditional-proof
+These vectors target Rollup0's timeless **conditional-proof
 profile**: a proof binds the transition to its selected parent but does not
 attest the parent's L1 acceptance.
 The L1 contract checks applicability when consuming it. They do not test the
 prover-owned L1 parent authentication described for blob-based profiles in the
-[streaming specification](../STREAMING_SPEC.md).
+[streaming specification](../SPEC.md).
 
 ## Server setup and replay
 
 Use the six-empty-block
-[`captured-devnet-window-84`](../../eez-prover-stateless/tests/fixtures/captured-devnet-window-84)
+[`captured-devnet-window-84`](https://github.com/eez-association/provers/tree/main/stateless-ecdsa/crates/eez-prover-stateless/tests/fixtures/captured-devnet-window-84)
 fixture. Configure a streaming server with its `chain-config.json`, rollup ID,
 proof system, vkey, attester and L2 system address from `oracle.json`. The signing
 key is the **public Anvil test key**
@@ -73,11 +75,12 @@ Stop any test servers and remove temporary chain data after use, keeping only
 the logs needed to explain results.
 
 To run all cases against isolated stateless signer processes, including each
-case's required limits and a cold cache, use the integration suite. It shares
-the standalone client's wire replayer and reads the same vector files:
+case's required limits and a cold cache, use the signer's integration suite in
+provers. It replays copies of this wire replayer and these vector files against
+a signer built from this checkout's crates:
 
 ```sh
-cargo test --locked -p eez-prover-stateless --test streaming_rpc
+scripts/provers-cargo.sh test -p eez-prover-stateless --test streaming_rpc
 ```
 
 ## Assertions and portability

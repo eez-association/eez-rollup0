@@ -12,8 +12,8 @@
 
 use alloy_primitives::Bytes;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT};
+use eez_engine::EezBuiltPayload;
 use eez_primitives::EezPrimitives;
-use eez_primitives::engine::EezBuiltPayload;
 use reth_ethereum_engine_primitives::EthPayloadAttributes;
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};

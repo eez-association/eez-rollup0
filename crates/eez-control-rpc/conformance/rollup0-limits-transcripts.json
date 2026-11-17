@@ -908,7 +908,7 @@
       ]
     }
   ],
-  "fixture": "crates/eez-prover-stateless/tests/fixtures/captured-devnet-window-84",
+  "fixture": "provers/stateless-ecdsa/crates/eez-prover-stateless/tests/fixtures/captured-devnet-window-84",
   "format": "eez-prove-v2-transcript-1",
   "normalization": "Map only server-issued session IDs and epochs to recorded placeholders; unmapped invalid IDs/epochs are literal. Ignore Rejected.message and Validated.reused. The replay tool verifies each Proof signature over the recorded digest against oracle.attester; valid ECDSA nonce differences are allowed. Other fields, response ordering, cursor and EOF are checked. Frames are protobuf payloads, without the gRPC compression/length prefix. Use a fresh signer for the stateless-cold-cache case. Limit cases require their listed server_args.",
   "oracle": {

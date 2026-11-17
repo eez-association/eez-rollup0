@@ -38,7 +38,10 @@
 
 mod container;
 
-pub use container::{Action, DecodedContainer, STREAM_VERSION, decode_container, encode_container};
+pub use container::{
+    Action, DecodedContainer, LOGICAL_BYTES_PER_BLOB, STREAM_VERSION, decode_blob_container,
+    decode_container, encode_blob_container, encode_container,
+};
 
 /// A raw EIP-2718 signed transaction, exactly as it enters the block's
 /// transaction trie. Opaque to this crate: the span never reserializes or
@@ -155,6 +158,27 @@ pub enum CodecError {
     /// A bracket followed a failed return, which terminates the manifest.
     #[error("an action bracket follows a failed return")]
     ActionAfterFailure,
+    /// A physical EIP-4844 blob did not have the required byte length.
+    #[error("blob {index} has length {actual}; expected {expected}")]
+    InvalidBlobLength {
+        /// Zero-based blob position.
+        index: usize,
+        /// Submitted byte length.
+        actual: usize,
+        /// Required EIP-4844 byte length.
+        expected: usize,
+    },
+    /// The high byte of a packed field element must be zero.
+    #[error("blob {blob_index} field element {field_index} has a nonzero high byte")]
+    NonCanonicalFieldElement {
+        /// Zero-based blob position.
+        blob_index: usize,
+        /// Zero-based field-element position.
+        field_index: usize,
+    },
+    /// A blob-backed stream does not end in CloseBlobStream and zero padding.
+    #[error("blob stream does not end in CloseBlobStream and zero padding")]
+    CloseBlobStreamMissing,
     /// A value did not fit the `uvarint32` domain on encode.
     #[error("{what} = {value} exceeds u32")]
     ValueTooLarge {
