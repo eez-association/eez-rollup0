@@ -55,6 +55,10 @@ tracing.workspace      = true
 
 [dev-dependencies]
 alloy-transport = { version = "2", default-features = false }
+jsonrpsee.workspace = true
+serde_json.workspace = true
+reth-engine-primitives.workspace = true
+reth-payload-builder.workspace = true
 # MockEthProvider: an in-memory StateProviderFactory for the prefix-state
 # equivalence test (no datadir, no engine API).
 reth-provider = { workspace = true, features = ["test-utils"] }
