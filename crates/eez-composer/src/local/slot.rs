@@ -18,19 +18,17 @@
 use std::sync::Arc;
 
 use alloy_consensus::Header;
-use alloy_primitives::{Address, Bytes, TxKind};
+use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::SolCall;
-use eez_evm::EezEvmConfig;
-use reth_evm::{ConfigureEvm, Evm as _};
+use eez_evm::{EezEvmConfig, EezEvmTypes};
+use evm2::{
+    EvmFeatures, Inspector, InspectorConfig, TxResultWithState,
+    evm::Cache,
+    interpreter::{Interpreter, Message, MessageKind, MessageResult},
+    registry::HandlerError,
+};
+use reth_evm::{ConfigureEvm, EvmEnvFor};
 use reth_primitives_traits::SealedHeader;
-use reth_revm::{database::StateProviderDatabase, db::State, db::bal::EvmDatabaseError};
-use reth_storage_api::errors::provider::ProviderError;
-use reth_storage_api::{EvmStateProviderAdapter, StateProvider, StateProviderBox};
-use revm::context::result::{EVMError, InvalidTransaction};
-use revm::context_interface::ContextTr;
-use revm::database::CacheState;
-use revm::interpreter::{CallInputs, CallOutcome, CallScheme};
-use revm::{DatabaseCommit, Inspector};
 
 use eez_protocol::abi::{
     authorizedProxiesCall, computeCrossChainProxyAddressCall, createCrossChainProxyCall,
@@ -45,8 +43,8 @@ use eez_protocol::{
 
 use super::build::{BuildError, ForkSnapshot, SyncBlockFork};
 use super::client::LocalChainClient;
-use super::reset_frame_caller_nonce;
 use super::session::{DIRECT_CALL_GAS_LIMIT, evm_err, provider_err};
+use super::sim::{SimState, disable_tx_gas_caps, reset_frame_caller_nonce, synthetic_call};
 
 /// The concrete local clients slot-scoped composition needs, alongside the
 /// type-erased `ChainClient` views on the wiring. `l1_entry` is the same
@@ -98,15 +96,13 @@ fn reject_manager_destination(target: Address, manager: Address) -> ExecutorResu
 /// Classify a `transact` failure. A database read failure is transient, and an
 /// insufficient target balance is state-dependent; other validation failures
 /// are properties of the transaction (`Evm` ⇒ poison).
-pub(super) fn transact_err(e: EVMError<EvmDatabaseError<ProviderError>>) -> ExecutorError {
+pub(super) fn transact_err(e: HandlerError) -> ExecutorError {
     match e {
-        EVMError::Database(db) => provider_err(db),
-        EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { fee, balance }) => {
-            ExecutorError::InsufficientFunds {
-                available: *balance,
-                required: *fee,
-            }
-        }
+        HandlerError::Database(db) => provider_err(db),
+        HandlerError::InsufficientFunds { fee, balance } => ExecutorError::InsufficientFunds {
+            available: balance,
+            required: fee,
+        },
         other => evm_err(other),
     }
 }
@@ -134,7 +130,7 @@ pub struct L1SlotState {
     /// L1 head at drain start; every fork opens its state here.
     pub anchor: SealedHeader<Header>,
     /// Effects committed by surviving transactions, seeded into each fork.
-    pub cache: CacheState,
+    pub cache: Cache,
 }
 
 impl L1SlotState {
@@ -160,7 +156,7 @@ impl L1SlotState {
         );
         Ok(Self {
             anchor,
-            cache: CacheState::default(),
+            cache: Cache::default(),
         })
     }
 
@@ -169,11 +165,8 @@ impl L1SlotState {
     fn open_state(
         &self,
         client: &LocalChainClient,
-        seed: CacheState,
-    ) -> ExecutorResult<(
-        State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>,
-        reth_evm::EvmEnvFor<EezEvmConfig>,
-    )> {
+        seed: Cache,
+    ) -> ExecutorResult<(SimState, EvmEnvFor<EezEvmConfig>)> {
         let provider = client.chain_provider();
         let state_prov = provider
             .provider
@@ -183,14 +176,7 @@ impl L1SlotState {
             .evm_config
             .evm_env(self.anchor.header())
             .map_err(evm_err)?;
-        let state = State::builder()
-            .with_database(StateProviderDatabase::new(
-                state_prov.into_evm_state_provider(),
-            ))
-            .with_cached_prestate(seed)
-            .with_bundle_update()
-            .build();
-        Ok((state, evm_env))
+        Ok((SimState::new(state_prov, seed), evm_env))
     }
 
     /// Open a fork of this state for an inbound SOURCE simulation: anchor
@@ -205,10 +191,7 @@ impl L1SlotState {
     pub fn fork_state(
         &self,
         client: &LocalChainClient,
-    ) -> ExecutorResult<(
-        State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>,
-        reth_evm::EvmEnvFor<EezEvmConfig>,
-    )> {
+    ) -> ExecutorResult<(SimState, EvmEnvFor<EezEvmConfig>)> {
         self.open_state(client, self.cache.clone())
     }
 }
@@ -221,15 +204,15 @@ impl L1SlotState {
 /// ## Checkpoint payload contract
 ///
 /// [`checkpoint`](TargetExecutionSession::checkpoint) returns a boxed
-/// [`CacheState`] and nothing else. The drain relies on that: it reclaims the
+/// [`Cache`] and nothing else. The drain relies on that: it reclaims the
 /// session through `CompositionBuilder::take_sessions`, calls `checkpoint()`,
-/// downcasts to `CacheState`, and commits it into `L1SlotState::cache` on
+/// downcasts to `Cache`, and commits it into `L1SlotState::cache` on
 /// survivor-accept. Changing the payload type breaks that hand-off.
 pub struct L1TargetSession {
     client: Arc<LocalChainClient>,
     evm_config: EezEvmConfig,
-    state: State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>,
-    evm_env: reth_evm::EvmEnvFor<EezEvmConfig>,
+    state: SimState,
+    evm_env: EvmEnvFor<EezEvmConfig>,
     manager: Address,
     chain_id: u64,
 }
@@ -256,13 +239,14 @@ impl L1TargetSession {
     /// opened, [`ExecutorError::Evm`] when env construction fails.
     pub fn new(state: &L1SlotState, client: Arc<LocalChainClient>) -> ExecutorResult<Self> {
         let (state, mut evm_env) = state.open_state(&client, state.cache.clone())?;
-        let chain_id = evm_env.cfg_env.chain_id;
+        let chain_id = evm_env.version.chain_id;
         // Synthetic frames carry no fee market and no EOA sender; the balance
         // check is deliberately left on so escrow value is real.
-        evm_env.cfg_env.disable_base_fee = true;
-        evm_env.cfg_env.disable_eip3607 = true;
-        evm_env.cfg_env.disable_nonce_check = true;
-        evm_env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
+        evm_env
+            .version
+            .features
+            .remove(EvmFeatures::BASE_FEE_CHECK | EvmFeatures::EIP3607 | EvmFeatures::NONCE_CHECK);
+        disable_tx_gas_caps(&mut evm_env);
 
         let evm_config = client.chain_provider().evm_config.clone();
         let manager = client.manager_address();
@@ -276,11 +260,11 @@ impl L1TargetSession {
         })
     }
 
-    /// Clamp a frame's gas to the anchor block's gas limit — revm rejects a
+    /// Clamp a frame's gas to the anchor block's gas limit — the EVM rejects a
     /// caller gas limit above it, and real L1 execution has no more either
     /// (chiado's block limit is well below `DIRECT_CALL_GAS_LIMIT`).
     fn frame_gas(&self, requested: u64) -> u64 {
-        requested.min(self.evm_env.block_env.gas_limit)
+        requested.min(self.evm_env.block.gas_limit.saturating_to())
     }
 
     /// Run one synthetic frame against the manager. `commit` keeps its writes
@@ -291,34 +275,33 @@ impl L1TargetSession {
         gas_limit: u64,
         commit: bool,
     ) -> ExecutorResult<Bytes> {
-        let tx_env = revm::context::TxEnv {
-            caller: Address::ZERO,
-            gas_limit: self.frame_gas(gas_limit),
-            kind: TxKind::Call(self.manager),
-            data: data.into(),
-            chain_id: Some(self.chain_id),
-            ..Default::default()
-        };
-        let result = {
-            let mut evm = self
-                .evm_config
-                .evm_with_env(&mut self.state, self.evm_env.clone());
-            evm.transact(tx_env).map_err(transact_err)?
-        };
-        if !result.result.is_success() {
+        let call = synthetic_call(
+            self.chain_id,
+            Address::ZERO,
+            self.manager,
+            data.into(),
+            U256::ZERO,
+            self.frame_gas(gas_limit),
+        );
+        let TxResultWithState {
+            result,
+            mut pending_state,
+            ..
+        } = self
+            .state
+            .transact(&self.evm_config, &self.evm_env, &call, None)
+            .map_err(transact_err)?;
+        if !result.is_success() {
             return Err(encoding_err(format!(
-                "manager frame reverted on {}: {:?}",
-                self.manager,
-                result.result.output()
+                "manager frame reverted on {}: {}",
+                self.manager, result.output
             )));
         }
-        let output = result.result.output().cloned().unwrap_or_default();
         if commit {
-            let mut changes = result.state;
-            reset_frame_caller_nonce(&mut changes, Address::ZERO);
-            self.state.commit(changes);
+            reset_frame_caller_nonce(&mut pending_state, Address::ZERO);
+            self.state.commit(&pending_state);
         }
-        Ok(output)
+        Ok(result.output)
     }
 
     /// Run a read-only manager frame and drop its state.
@@ -398,48 +381,41 @@ impl TargetExecutionSession for L1TargetSession {
             data: req.data.clone(),
         }
         .abi_encode();
-        let tx_env = revm::context::TxEnv {
-            caller: self.manager,
-            gas_limit: self.frame_gas(DIRECT_CALL_GAS_LIMIT),
-            kind: TxKind::Call(proxy),
-            data: calldata.into(),
-            value: req.value,
-            chain_id: Some(self.chain_id),
-            ..Default::default()
-        };
+        let call = synthetic_call(
+            self.chain_id,
+            self.manager,
+            proxy,
+            calldata.into(),
+            req.value,
+            self.frame_gas(DIRECT_CALL_GAS_LIMIT),
+        );
 
         // Inspected so a nested proxy call inside the target is recorded; the
         // accept-time shape gate turns it into a precise eviction. The
         // outermost frame is skipped: it targets an authorized proxy itself,
         // and intercepting it would re-dispatch the very frame that IS the
         // dispatch.
-        let inspector = SkipTopFrame::new(self.client.inspector_factory().build(dispatcher));
-        let (return_data, gas_used, success, mut changes, inspector_error) = {
-            let mut evm = self.evm_config.evm_with_env_and_inspector(
-                &mut self.state,
-                self.evm_env.clone(),
-                inspector,
-            );
-            let result = evm.transact(tx_env).map_err(transact_err)?;
-            let inspector_error = evm.inspector_mut().inner.take_error();
-            (
-                result.result.output().cloned().unwrap_or_default(),
-                result.result.tx_gas_used(),
-                result.result.is_success(),
-                result.state,
-                inspector_error,
-            )
-        };
+        let mut inspector = SkipTopFrame::new(self.client.inspector_factory().build(dispatcher));
+        let outcome =
+            self.state
+                .transact(&self.evm_config, &self.evm_env, &call, Some(&mut inspector));
+        let inspector_error = inspector.inner.take_error();
+        let TxResultWithState {
+            result,
+            mut pending_state,
+            ..
+        } = outcome.map_err(transact_err)?;
         if let Some(err) = inspector_error {
             return Err(err);
         }
+        let (gas_used, success) = (result.tx_gas_used(), result.is_success());
+        let return_data = result.output;
 
-        // A reverted frame's only state today is the caller's nonce bump, but
-        // committing it would tie the slot-shared state to whatever a future
-        // revm decides to return in `result.state` for a revert.
+        // A reverted frame's only state is the caller's nonce bump; keeping it
+        // would tie the slot-shared state to what the EVM reports for a revert.
         if success {
-            reset_frame_caller_nonce(&mut changes, self.manager);
-            self.state.commit(changes);
+            reset_frame_caller_nonce(&mut pending_state, self.manager);
+            self.state.commit(&pending_state);
         }
 
         tracing::debug!(
@@ -461,16 +437,14 @@ impl TargetExecutionSession for L1TargetSession {
     }
 
     fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot> {
-        // Cache-only is sound here: simulation reads state exclusively through
-        // the cache, and the bundle/transition state is never consulted.
-        Ok(Box::new(self.state.cache.clone()))
+        Ok(Box::new(self.state.cache().clone()))
     }
 
     fn rollback(&mut self, snapshot: SessionSnapshot) -> ExecutorResult<()> {
         let cache = snapshot
-            .downcast::<CacheState>()
+            .downcast::<Cache>()
             .map_err(|_e| encoding_err("L1TargetSession::rollback: snapshot type mismatch"))?;
-        self.state.cache = *cache;
+        self.state.set_cache(*cache);
         Ok(())
     }
 }
@@ -495,20 +469,33 @@ impl<I> SkipTopFrame<I> {
     }
 }
 
-impl<CTX, I: Inspector<CTX>> Inspector<CTX> for SkipTopFrame<I> {
-    fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
+impl<I: Inspector<EezEvmTypes>> Inspector<EezEvmTypes> for SkipTopFrame<I> {
+    fn inspector_config(&self) -> InspectorConfig {
+        self.inner.inspector_config()
+    }
+
+    fn call(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, EezEvmTypes>,
+        message: &mut Message<EezEvmTypes>,
+    ) -> Option<MessageResult<EezEvmTypes>> {
         let top = self.depth == 0;
         self.depth += 1;
         if top {
             return None;
         }
-        self.inner.call(context, inputs)
+        self.inner.call(interp, message)
     }
 
-    fn call_end(&mut self, context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
+    fn call_end(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, EezEvmTypes>,
+        message: &Message<EezEvmTypes>,
+        result: &mut MessageResult<EezEvmTypes>,
+    ) {
         self.depth = self.depth.saturating_sub(1);
         if self.depth > 0 {
-            self.inner.call_end(context, inputs, outcome);
+            self.inner.call_end(interp, message, result);
         }
     }
 }
@@ -751,26 +738,39 @@ impl ProbeInspector {
     }
 }
 
-impl<CTX: ContextTr> Inspector<CTX> for ProbeInspector {
-    fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
-        let matched = !inputs.is_static
-            && matches!(inputs.scheme, CallScheme::Call)
-            && inputs.caller == self.eezl2_address
-            && inputs
+impl Inspector<EezEvmTypes> for ProbeInspector {
+    fn inspector_config(&self) -> InspectorConfig {
+        InspectorConfig::without_steps()
+    }
+
+    fn call(
+        &mut self,
+        interp: &mut Interpreter<'_, '_, EezEvmTypes>,
+        message: &mut Message<EezEvmTypes>,
+    ) -> Option<MessageResult<EezEvmTypes>> {
+        let matched = !message.is_static()
+            && message.kind == MessageKind::Call
+            && message.caller == self.eezl2_address
+            && message
                 .input
-                .as_bytes(context)
+                .as_bytes(interp.memory())
                 .starts_with(&executeOnBehalfCall::SELECTOR);
         self.frames.push(matched);
         None
     }
 
-    fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
+    fn call_end(
+        &mut self,
+        _interp: &mut Interpreter<'_, '_, EezEvmTypes>,
+        _message: &Message<EezEvmTypes>,
+        result: &mut MessageResult<EezEvmTypes>,
+    ) {
         if self.frames.pop() != Some(true) {
             return;
         }
         self.captures.push(ProbeCapture {
-            success: outcome.result.is_ok(),
-            output: outcome.result.output.clone(),
+            success: result.is_success(),
+            output: result.output.clone(),
         });
     }
 }
@@ -778,7 +778,6 @@ impl<CTX: ContextTr> Inspector<CTX> for ProbeInspector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::U256;
 
     #[test]
     fn a_call_targeting_its_manager_is_poison() {
@@ -793,12 +792,10 @@ mod tests {
 
     #[test]
     fn lack_of_funds_is_classified_as_state_dependent() {
-        let error = transact_err(EVMError::Transaction(
-            InvalidTransaction::LackOfFundForMaxFee {
-                fee: Box::new(U256::from(10)),
-                balance: Box::new(U256::from(3)),
-            },
-        ));
+        let error = transact_err(HandlerError::InsufficientFunds {
+            fee: U256::from(10),
+            balance: U256::from(3),
+        });
 
         assert!(matches!(
             error,
