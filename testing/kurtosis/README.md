@@ -595,3 +595,13 @@ Kurtosis assigns different host ports automatically. Remember that
 - `scripts/verify-state-chaining.sh`: ordered same-Sync-block state-chaining regression.
 - `scripts/verify-fault-recovery.sh`: proof-signer outage, node restart, and exact safe-prefix replay.
 - `scripts/verify-ingress-admission.sh`: live L1 front nonce-gap rejection and contiguous recovery.
+
+### Blob settlement E2E
+
+`bash testing/kurtosis/run-blob-ci.sh` runs the blob lane in its own enclave
+(`eez-blob-ci`) with `blob-args.yaml`: Gnosis blob limits (target 1, max 2) and
+a Lighthouse supernode. It runs the shared wave, ingress, and fault-recovery
+suites, then checks that every `BatchPosted` settlement is a successful type-3
+blob transaction. A peerless `eez-l2-follower` must then derive the composer's
+safe block hash from L1 alone, which pins the decoded blocks, state root, and
+ancestry. Logs land in `artifacts/kurtosis-blob-e2e`.

@@ -198,8 +198,8 @@ fn compose_crosschain(
     entry_client: &crate::local::LocalChainClient,
     raw_tx: &[u8],
     sessions: SlotSessions,
-    source_state: &mut crate::local::build::DraftDb,
-    source_env: reth_evm::EvmEnvFor<EezEvmConfig>,
+    source_state: &mut crate::local::sim::SimState,
+    source_env: &reth_evm::EvmEnvFor<EezEvmConfig>,
 ) -> eez_protocol::ComposerResult<(eez_protocol::Composition, SlotSessions, u64)> {
     use eez_protocol::ChainClient as _;
     use eez_protocol::composition::Rollup;
@@ -1162,11 +1162,11 @@ fn append_and_execute(
 
 /// Take the L1 session's accumulated effects for commit into the slot's state.
 /// The payload shape is pinned by `L1TargetSession::checkpoint`: a boxed
-/// `CacheState` and nothing else.
+/// `Cache` and nothing else.
 fn take_l1_cache(
     sessions: &mut SlotSessions,
     l1_rollup_id: eez_protocol::RollupId,
-) -> Result<revm::database::CacheState, String> {
+) -> Result<evm2::evm::Cache, String> {
     let mut session = sessions
         .remove(&l1_rollup_id)
         .ok_or_else(|| format!("composition returned no session for L1 rollup {l1_rollup_id}"))?;
@@ -1174,9 +1174,9 @@ fn take_l1_cache(
         .checkpoint()
         .map_err(|e| format!("L1 session checkpoint: {e}"))?;
     snapshot
-        .downcast::<revm::database::CacheState>()
+        .downcast::<evm2::evm::Cache>()
         .map(|cache| *cache)
-        .map_err(|_e| "L1 session checkpoint payload is not a CacheState".to_owned())
+        .map_err(|_e| "L1 session checkpoint payload is not a Cache".to_owned())
 }
 
 /// Hex of the first 32 bytes of a revert/return payload, for event messages.
@@ -1917,12 +1917,46 @@ where
         partial: crate::optimistic::FailedBatch,
     ) {
         let sync_height = partial.sync_height;
-        // A guess would drop a tx that must return, or re-queue one whose nonce
-        // is gone and lose it on a later reorg.
-        let Some(nonces) = self.source_nonces(rollup_id, rollup, &partial.txs).await else {
+        let Some(l1_tip) = rollup.l1_head.last_indexed() else {
             return;
         };
+        let l2_head = self.inner.committer.last_header().hash();
+        // A guess would drop a tx that must return, or re-queue one whose nonce
+        // is gone and lose it on a later reorg.
+        let Some(nonces) = self
+            .source_nonces(
+                rollup_id,
+                rollup,
+                &partial.txs,
+                l1_tip.post.l1_block_hash,
+                l2_head,
+            )
+            .await
+        else {
+            return;
+        };
+        // Keep slow nonce RPCs outside the reconcile guard. Deriver changes
+        // the index and head under it, so validate the exact snapshots before
+        // claiming the ledger entry or mutating the pool. A height check alone
+        // misses a retreat followed by a same-height replacement.
+        let _guard = self.inner.committer.begin_reconcile().await;
+        if rollup.l1_head.cursor() < sync_height
+            || rollup.l1_head.last_indexed().map(|tip| tip.post) != Some(l1_tip.post)
+            || self.inner.committer.last_header().hash() != l2_head
+        {
+            event!(
+                Level::INFO,
+                rollup_id,
+                sync_height,
+                "partial settlement snapshot recheck failed; retaining txs for retry",
+            );
+            return; // Retain every tx for reorg recovery or a fresh disposition.
+        }
         let (spent, culprit) = partial_disposition(&partial.txs, &nonces);
+        // The cursor may cover a rival's batch. Nonces still decide what was
+        // consumed, but only our own canonical post can justify a retry charge.
+        let own_post = rollup.l1_head.contains_l1_tx(partial.post_batch_hash);
+        let culprit = culprit.filter(|_| own_post);
         // Only spent txs can be stranded by a reorg; the re-queued ones are the
         // pool's again.
         let stranded: Vec<crate::HeldTx> = partial
@@ -1951,6 +1985,7 @@ where
             event_name = "eez.composer.recovery.settled_partial",
             rollup_id,
             sync_height,
+            own_post,
             txs = partial.txs.len(),
             spent = spent.len(),
             culprit = ?culprit,
@@ -1965,17 +2000,17 @@ where
         dispose_recovered_txs(rollup_id, pool, sync_height, charged, &[], true);
     }
 
-    /// Each sender's nonce, read at fixed blocks so a reorg mid-read can't mix
-    /// in another fork's answer: L1 at the last block the Deriver confirmed, L2
-    /// at the committed head. `None` unless every sender was read.
+    /// Read each sender's source nonce at the supplied L1 and L2 block hashes.
+    /// The caller must revalidate these snapshots under the reconcile guard
+    /// before applying disposition. Returns `None` unless every sender was read.
     async fn source_nonces(
         &self,
         rollup_id: u64,
         rollup: &RollupState<L2>,
         txs: &[HeldTx],
+        l1_block: B256,
+        head: B256,
     ) -> Option<HashMap<(Address, Direction), u64>> {
-        let l1_block = rollup.l1_head.last_indexed()?.post.l1_block_hash;
-        let head = self.inner.committer.last_header().hash();
         let mut nonces = match rollup.l2_provider.state_by_block_hash(head) {
             Ok(state) => outbound_source_nonces_for_drain(state.as_ref(), rollup_id, txs),
             Err(error) => {
@@ -4110,7 +4145,6 @@ impl CrossChainDrain {
             };
             let sessions = seed_session(cc.entry_rollup_id, l1_exec);
             let (state, env) = l2_fork.state_and_env();
-            let env = env.clone();
             let sim = compose_crosschain(
                 cc,
                 eez_protocol::RollupId(rollup_id),
@@ -4587,7 +4621,7 @@ impl CrossChainDrain {
                 held.raw_tx.as_ref(),
                 sessions,
                 &mut l1_fork,
-                l1_env,
+                &l1_env,
             );
             match sim {
                 Ok((composition, _sessions, _probe_gas)) => {
@@ -4792,7 +4826,7 @@ impl CrossChainDrain {
                     self.sync_txs.extend(deliveries);
                     // The source fork carries the L1 user tx's committed writes;
                     // later inbound sims must observe them (design §4 step 6).
-                    self.l1_state.cache = l1_fork.cache;
+                    self.l1_state.cache = l1_fork.into_cache();
 
                     let target_count = target_entries.len();
                     self.pending_in.extend(target_entries);
@@ -5090,6 +5124,9 @@ async fn sign_post_batch_tx(
         raw: Bytes::from(buf),
     })
 }
+
+#[cfg(test)]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
