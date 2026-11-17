@@ -1792,17 +1792,18 @@ where
         // the optimistic ledger, and observes L1 settlement in the background.
         // Inbound source transactions execute through the L1 bundle; outbound
         // source transactions execute as user halves of L2 Sync pairs.
-        match self
-            .compose_cross_chain_batch(
-                &self.inner.cross_chain,
-                rollup_id,
-                drained.clone(),
-                parent_header,
-                timestamp,
-                rollup.config.fee_recipient,
-                bundle_target,
-            )
-            .await
+        // Boxed: the drain holds two live execution contexts, so its future is
+        // past the inline-size budget.
+        match Box::pin(self.compose_cross_chain_batch(
+            &self.inner.cross_chain,
+            rollup_id,
+            drained.clone(),
+            parent_header,
+            timestamp,
+            rollup.config.fee_recipient,
+            bundle_target,
+        ))
+        .await
         {
             Ok(Some(built)) => {
                 event!(
