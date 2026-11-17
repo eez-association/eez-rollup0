@@ -12,8 +12,8 @@
 //! 3. The inspector answers the call with that response so the source
 //!    transaction's control flow continues.
 //!
-//! Errors surfaced by dispatch are stashed locally so the caller can consult
-//! them after the EVM pass without unwinding the EVM.
+//! Dispatch errors and failed registry reads are stashed locally so the caller
+//! can consult them after the EVM pass without unwinding the EVM.
 //!
 //! # Why live EVM state
 //!
@@ -42,26 +42,15 @@ use eez_protocol::{ProxyInfo, decode_proxy_value, proxy_mapping_key};
 ///
 /// The read is untracked: it sees the transaction's writes but neither loads
 /// nor warms the slot, so the inspected transaction's gas is unchanged.
-/// Returns `None` for unregistered proxies and for DB errors; the caller
-/// treats both as "not a proxy."
+/// Returns `None` for an unregistered address.
 fn lookup_authorized_proxy_live(
     state: &mut State<'_>,
     lookup: &ProxyLookupConfig,
     addr: Address,
-) -> Option<ProxyInfo> {
+) -> DbResult<Option<ProxyInfo>> {
     let key = proxy_mapping_key(addr, lookup.authorized_proxies_slot);
-    match state.storage_slot_untracked(&lookup.contract_address, &key.into()) {
-        Ok(value) => decode_proxy_value(value),
-        Err(error) => {
-            tracing::warn!(
-                contract = %lookup.contract_address,
-                proxy = %addr,
-                %error,
-                "proxy lookup: DB error reading authorizedProxies slot; treating as not-a-proxy",
-            );
-            None
-        }
-    }
+    let value = state.storage_slot_untracked(&lookup.contract_address, &key.into())?;
+    Ok(decode_proxy_value(value))
 }
 
 /// This rollup's live state as a cache: the accepted state plus the current
@@ -312,12 +301,20 @@ impl Inspector<EezEvmTypes> for SessionInspector<'_> {
             "inspector: CALL"
         );
 
-        let Some(info) =
-            lookup_authorized_proxy_live(state, &self.proxy_lookup, message.destination)
-        else {
-            tracing::trace!(addr = %message.destination, "inspector: not a proxy");
-            return None;
-        };
+        let info =
+            match lookup_authorized_proxy_live(state, &self.proxy_lookup, message.destination) {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    tracing::trace!(addr = %message.destination, "inspector: not a proxy");
+                    return None;
+                }
+                // An unread registry must abort the slot, not pass the call through
+                // unrecorded: that leaves `EmptyCalls`, which evicts the tx.
+                Err(error) => {
+                    self.record_error(provider_error(error));
+                    return Some(self.answer(message, InstrStop::Revert, Bytes::new()));
+                }
+            };
 
         let req = eez_protocol::ExecutionRequest {
             call_mode: CallMode::Mutable,
@@ -394,13 +391,24 @@ impl Inspector<EezEvmTypes> for SessionInspector<'_> {
 #[cfg(test)]
 mod tests {
     //! [`lookup_authorized_proxy_live`] reads the live state (transaction
-    //! overlay, then the database), not a pre-tx snapshot.
+    //! overlay, then the database), not a pre-tx snapshot, and a failed read
+    //! aborts composition.
+
+    use std::{collections::HashMap, sync::Arc};
 
     use super::*;
-    use alloy_primitives::{U256, address};
+    use crate::local::sim::{disable_checks, synthetic_call};
+    use crate::new_overlay_channel;
+    use alloy_consensus::Header;
+    use alloy_primitives::{B256, U256, address};
+    use eez_evm::EezEvmConfig;
     use eez_protocol::{EEZ_AUTHORIZED_PROXIES_SLOT, EEZL2_AUTHORIZED_PROXIES_SLOT};
-    use evm2::evm::InMemoryDB;
+    use evm2::bytecode::Bytecode;
+    use evm2::evm::{AccountInfo, Db, InMemoryDB};
+    use reth_chainspec::ChainSpecBuilder;
+    use reth_evm::{BlockExecutorFactory, ConfigureEvm};
 
+    const CALLER: Address = address!("0x4444444444444444444444444444444444444444");
     const CONTRACT: Address = address!("0x1111111111111111111111111111111111111111");
     const PROXY_ADDR: Address = address!("0x2222222222222222222222222222222222222222");
     const DESTINATION_ADDR: Address = address!("0x3333333333333333333333333333333333333333");
@@ -432,17 +440,85 @@ mod tests {
         State::new(db)
     }
 
-    fn assert_registered(info: Option<ProxyInfo>) {
-        let info = info.expect("proxy is registered");
+    fn assert_registered(info: DbResult<Option<ProxyInfo>>) {
+        let info = info.expect("readable").expect("proxy is registered");
         assert_eq!(info.original_address, DESTINATION_ADDR);
         assert_eq!(info.original_rollup_id, RollupId(TARGET_ROLLUP));
+    }
+
+    /// An empty database whose reads of `CONTRACT`'s storage fail.
+    struct RegistryUnreadable;
+
+    impl evm2::evm::Database for RegistryUnreadable {
+        type Error = std::io::Error;
+
+        fn get_account(&mut self, _: &Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(None)
+        }
+
+        fn get_code_by_hash(&mut self, _: &B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+
+        fn get_storage(&mut self, address: &Address, _: &Word) -> Result<Word, Self::Error> {
+            if *address == CONTRACT {
+                return Err(std::io::Error::other("registry unreadable"));
+            }
+            Ok(Word::ZERO)
+        }
+
+        fn get_block_hash(&mut self, _: &Word) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    /// A failed registry read aborts composition as a provider error (the slot
+    /// retries) instead of letting the call run unrecorded (the tx is evicted).
+    #[test]
+    fn unreadable_registry_is_a_provider_error() {
+        let config = EezEvmConfig::new(Arc::new(
+            ChainSpecBuilder::mainnet().cancun_activated().build(),
+        ))
+        .expect("config");
+        let mut env = config
+            .evm_env(&Header {
+                excess_blob_gas: Some(0),
+                ..Default::default()
+            })
+            .expect("env");
+        disable_checks(&mut env);
+        let tx = synthetic_call(1, CALLER, PROXY_ADDR, Bytes::new(), U256::ZERO, 100_000);
+        let mut builder = CompositionBuilder::new(RollupId(0), HashMap::new());
+        let factory = SessionInspectorFactory::new(
+            lookup(EEZ_AUTHORIZED_PROXIES_SLOT),
+            RollupId(1),
+            new_overlay_channel(),
+        );
+        let mut inspector = factory.build(&mut builder);
+
+        let mut evm = config
+            .block_executor_factory()
+            .evm_with_env(Db::new(RegistryUnreadable), env);
+        let _ = evm
+            .transact_with_inspector(&tx, &mut inspector)
+            .expect("the EVM never reads the registry itself")
+            .discard();
+
+        assert!(matches!(
+            inspector.take_error(),
+            Some(ExecutorError::Provider(_))
+        ));
     }
 
     #[test]
     fn unregistered_address_returns_none() {
         let mut state = State::new(InMemoryDB::default());
         let lookup = lookup(EEZ_AUTHORIZED_PROXIES_SLOT);
-        assert!(lookup_authorized_proxy_live(&mut state, &lookup, PROXY_ADDR).is_none());
+        assert!(
+            lookup_authorized_proxy_live(&mut state, &lookup, PROXY_ADDR)
+                .expect("readable")
+                .is_none()
+        );
     }
 
     #[test]
@@ -477,7 +553,9 @@ mod tests {
         assert_ne!(EEZ_AUTHORIZED_PROXIES_SLOT, wrong_slot);
         let mut state = registered_in_db(EEZ_AUTHORIZED_PROXIES_SLOT);
         assert!(
-            lookup_authorized_proxy_live(&mut state, &lookup(wrong_slot), PROXY_ADDR).is_none(),
+            lookup_authorized_proxy_live(&mut state, &lookup(wrong_slot), PROXY_ADDR)
+                .expect("readable")
+                .is_none(),
             "reading the wrong slot must miss, not decode garbage"
         );
     }
