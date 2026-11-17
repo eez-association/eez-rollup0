@@ -25,12 +25,15 @@ use alloy_primitives::{B256, Bytes, U256, keccak256};
 use alloy_rpc_types_debug::ExecutionWitness;
 use eez_primitives::{Block, EezPrimitives};
 use eez_prover::BlockWitness;
-use reth_evm::{ConfigureEvm, execute::Executor};
+use evm2::block::bundle_state::{AccountStatus, BundleAccount};
+use evm2::evm::{CacheDB, Db};
+use reth_evm::{
+    BundleState, ConfigureEvm, database::StateProviderDatabase, execute::Executor,
+    witness::ExecutionWitnessRecord,
+};
 use reth_primitives_traits::RecoveredBlock;
-use reth_revm::State;
-use reth_revm::{database::StateProviderDatabase, witness::ExecutionWitnessRecord};
 use reth_storage_api::{
-    HashedPostStateProvider, HeaderProvider, StateProvider, StateProviderFactory,
+    AccountReader, HashedPostStateProvider, HeaderProvider, StateProvider, StateProviderFactory,
 };
 use reth_trie::{HashedPostState, HashedStorage};
 use std::collections::HashSet;
@@ -107,31 +110,28 @@ where
         "block_execution_witness: re-executing block on parent state",
     );
 
-    // 1. Re-execute the exact canonical block on the parent state. The
-    //    executor builds its own `State` over the parent provider; reads
-    //    warm its cache → that cache is the exact access set.
-    let mut executor = evm_config.batch_executor(StateProviderDatabase::new(
+    // 1. Re-execute the exact canonical block on the parent state, as reth's
+    //    `debug_executionWitness` does. Every read falls through to and is
+    //    cached in `db` → that cache is the exact access set. Committing the
+    //    block's changes leaves post-state values in it.
+    let mut db = CacheDB::new(Db::new(StateProviderDatabase::new(
         provider
             .state_by_block_hash(parent_hash)?
             .into_evm_state_provider(),
-    ));
-    executor.execute_one(block)?;
-    let state = executor.into_state();
+    )));
+    let output = evm_config.executor(&mut db).execute(block)?;
+    let codes = ExecutionWitnessRecord::commit_execution(&mut db, &output.state);
 
-    // 2. Record the access set (cheap: cache walk, no trie). Re-open the parent
-    //    provider (the first was consumed by the executor).
+    // 2. Record the access set (cheap: cache walk, no trie).
     let state_provider = provider.state_by_block_hash(parent_hash)?;
-    let accesses = witness_access_state(&state, state_provider.as_ref())?;
+    let accesses = witness_access_state(&db, state_provider.as_ref())?;
     let (account_removal_state, removal_accounts) = touched_account_removal_state(&accesses);
     let (storage_removal_state, removal_slots) = touched_storage_removal_state(&accesses)?;
 
     // 3. One batched trie pass against the parent → trie nodes + headers.
-    let mut witness = ExecutionWitnessRecord::new(&state).into_execution_witness(
-        state_provider.as_ref(),
-        provider,
-        block_number,
-        mode,
-    )?;
+    let mut witness = ExecutionWitnessRecord::new(&db)
+        .with_canonical_codes(codes)
+        .into_execution_witness(state_provider.as_ref(), provider, block_number, mode)?;
     let endpoint_state_nodes = witness.state.len();
 
     // 4. EEZ-specific augmentation: two removals-first witness passes emit the
@@ -179,28 +179,45 @@ where
 }
 
 /// The executed block's access set, as `ExecutionWitnessRecord` collects it
-/// internally (reth keeps that private): every cached account and slot, plus
-/// the parent provider's zero-expansion of destroyed accounts' storage. Bundle
-/// values override cached ones.
+/// internally (reth keeps that private): every cached account and slot at its
+/// post-state value, plus the parent provider's zero-expansion of storage the
+/// block wiped.
 fn witness_access_state<DB>(
-    state: &State<DB>,
-    provider: &(impl HashedPostStateProvider + ?Sized),
+    db: &CacheDB<DB>,
+    provider: &(impl HashedPostStateProvider + AccountReader + ?Sized),
 ) -> eyre::Result<HashedPostState> {
     let mut accesses = HashedPostState::default();
-    for (address, account) in &state.cache.accounts {
+    let mut wiped = BundleState::default();
+    for (address, account) in &db.cache.accounts {
         let hashed_address = keccak256(address);
-        accesses.accounts.insert(
-            hashed_address,
-            account.account.as_ref().map(|a| (&a.info).into()),
-        );
+        accesses
+            .accounts
+            .insert(hashed_address, account.as_ref().map(Into::into));
         let storage = accesses.storages.entry(hashed_address).or_default();
-        if let Some(account) = &account.account {
-            for (slot, value) in &account.storage {
+        if let Some(cached) = db.cache.storage.get(address) {
+            for (slot, value) in &cached.slots {
                 storage.storage.insert(keccak256(B256::from(*slot)), *value);
+            }
+            if cached.wiped {
+                wiped.state.insert(
+                    *address,
+                    BundleAccount::new(
+                        provider.basic_account(address)?.map(Into::into),
+                        account.clone(),
+                        Default::default(),
+                        if account.is_some() {
+                            AccountStatus::DestroyedChanged
+                        } else {
+                            AccountStatus::Destroyed
+                        },
+                    ),
+                );
             }
         }
     }
-    accesses.extend(provider.hashed_post_state(&state.bundle_state)?);
+    if !wiped.is_empty() {
+        accesses.extend(provider.hashed_post_state(&wiped)?);
+    }
     Ok(accesses)
 }
 
