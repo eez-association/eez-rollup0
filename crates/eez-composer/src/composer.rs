@@ -1902,6 +1902,10 @@ where
             return; // Retain every tx for reorg recovery or a fresh disposition.
         }
         let (spent, culprit) = partial_disposition(&partial.txs, &nonces);
+        // The cursor may cover a rival's batch. Nonces still decide what was
+        // consumed, but only our own canonical post can justify a retry charge.
+        let own_post = rollup.l1_head.contains_l1_tx(partial.post_batch_hash);
+        let culprit = culprit.filter(|_| own_post);
         // Only spent txs can be stranded by a reorg; the re-queued ones are the
         // pool's again.
         let stranded: Vec<crate::HeldTx> = partial
@@ -1930,6 +1934,7 @@ where
             event_name = "eez.composer.recovery.settled_partial",
             rollup_id,
             sync_height,
+            own_post,
             txs = partial.txs.len(),
             spent = spent.len(),
             culprit = ?culprit,
