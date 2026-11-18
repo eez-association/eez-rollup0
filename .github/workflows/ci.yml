@@ -86,9 +86,13 @@ jobs:
           --test rolling_hash_vectors
           --no-fail-fast
       - name: Check prover execution dependency isolation
-        run: scripts/provers-cargo.sh metadata --format-version 1 | python3 provers/ecdsa/scripts/check-execution-deps.py
+        run: |
+          scripts/provers-cargo.sh metadata --format-version 1 | python3 provers/scripts/check-execution-deps.py stateless
+          scripts/provers-cargo.sh --stateful metadata --format-version 1 | python3 provers/scripts/check-execution-deps.py stateful
       - name: Prover tests against this checkout's protocol crates
-        run: scripts/provers-cargo.sh nextest run --cargo-profile ci-e2e --target-dir target --workspace --no-fail-fast
+        run: |
+          scripts/provers-cargo.sh nextest run --cargo-profile ci-e2e --target-dir target --workspace --no-fail-fast
+          scripts/provers-cargo.sh --stateful nextest run --cargo-profile ci-e2e --target-dir target --workspace --no-fail-fast
       - name: Payload conformance vectors
         run: cargo nextest run --locked --cargo-profile ci-e2e -p eez-payload-codec --test conformance --no-fail-fast
       - name: EVM golden fixtures (node EVM, fixtures from provers/)
@@ -178,7 +182,11 @@ jobs:
           scripts/provers-cargo.sh build \
             --profile ci-e2e \
             --target-dir target \
-            -p eez-prover-stateless -p eez-prover-stateful --bins
+            -p eez-prover-stateless --bins
+          scripts/provers-cargo.sh --stateful build \
+            --profile ci-e2e \
+            --target-dir target \
+            -p eez-prover-stateful --bins
       - name: Stage E2E runtime binaries
         run: |
           cp target/ci-e2e/eez-composer artifacts/e2e-build/

@@ -414,14 +414,12 @@ fn prover_binary(package: &str, binary: &str, override_env: &str) -> Result<Path
         let mut command = Command::new("bash");
         command
             .current_dir(repo_root())
-            .args([
-                "scripts/provers-cargo.sh",
-                "build",
-                "-p",
-                package,
-                "--bin",
-                binary,
-            ])
+            .arg("scripts/provers-cargo.sh");
+        if package == "eez-prover-stateful" {
+            command.arg("--stateful");
+        }
+        command
+            .args(["build", "-p", package, "--bin", binary])
             .arg("--target-dir")
             .arg(target_dir)
             .env("CARGO_INCREMENTAL", "0");
