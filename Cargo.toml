@@ -14,6 +14,7 @@ members = [
     "crates/eez-node-e2e",
     "crates/eez-p2p",
     "crates/eez-payload-codec",
+    "crates/eez-proof-signer",
     "crates/eez-protocol",
     "crates/eez-primitives",
     "crates/eez-evm",
@@ -191,6 +192,7 @@ eez-l1             = { path = "crates/eez-l1" }
 eez-node           = { path = "crates/eez-node" }
 eez-node-common    = { path = "crates/eez-node-common" }
 eez-payload-codec  = { path = "crates/eez-payload-codec" }
+eez-proof-signer   = { path = "crates/eez-proof-signer" }
 eez-protocol       = { path = "crates/eez-protocol" }
 eez-prover         = { path = "crates/eez-prover" }
 eez-testkit        = { path = "crates/eez-testkit" }
@@ -200,8 +202,8 @@ eez-testkit        = { path = "crates/eez-testkit" }
 #
 # evm2: reth-core 275ce4c declares evm2 f93318f and reth/reth_gnosis declare
 # 66687c1; this unifies them on one source. debjit-bw/evm2@5885d6b is 66687c1
-# plus `#[derive(Clone)]` on `BlockState` (alloy-rs/evm2#1078). Preserve the
-# existing node pin as stateful proving moves to its revm workspace. Return to reth's own patch
+# plus `#[derive(Clone)]` on `BlockState` (alloy-rs/evm2#1078), which the
+# stateful prover's mid-block checkpoints need. Return to reth's own patch
 # (`DaniPopes/evm2`, evm2's pre-transfer URL) once a reth release carries an
 # evm2 rev with that change. `evm2-macros` is listed because reth_gnosis uses it.
 [patch."https://github.com/alloy-rs/evm2"]
@@ -212,7 +214,7 @@ evm2-macros     = { git = "https://github.com/debjit-bw/evm2", rev = "5885d6bc0a
 
 # reth v2.11.0 depends on unreleased reth-core. The workspace keeps the crates.io
 # floors ("0.8.1") so the shared crates also resolve in the signer's workspace
-# (provers/ecdsa, crates.io 0.8.1).
+# (provers/stateless-ecdsa, crates.io 0.8.1).
 [patch.crates-io]
 reth-codecs            = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
 reth-codecs-derive     = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }

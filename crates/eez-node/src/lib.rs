@@ -476,11 +476,8 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     // Before launch: the L2 pool refuses the cross-chain txs this pool holds.
     let held_pool = Arc::new(HeldPool::new());
     let held = Arc::clone(&held_pool);
-    let node_evm = eez_evm::EezEvmConfig::new(builder.config().chain.clone())?;
     let handle = builder
         .node(EezNode {
-            evm: node_evm,
-            tx_env_converter: eez_evm::EezTxEnvConverter,
             held: Some(HeldTxs(Arc::new(move |hash| held.holds(hash)))),
         })
         .extend_rpc_modules(move |ctx| {
@@ -880,7 +877,6 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         Arc::new(provider.clone()),
         submitter.reader(),
         chain_spec,
-        handle.node.evm_config.clone(),
         l2_block_time_secs,
         deploy_block,
         Arc::clone(&l1_head),

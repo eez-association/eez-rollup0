@@ -3,7 +3,7 @@
 The node runs reth v2.11.0, whose EVM is evm2. The proof signer keeps revm 43
 in eez-association/provers (the `provers/` submodule, see `docs/provers.md`)
 and re-executes every window, so the two EVMs check each other. Both replay the
-golden fixtures in `provers/ecdsa/testing/evm-golden/` and must match
+golden fixtures in `provers/stateless-ecdsa/testing/evm-golden/` and must match
 them exactly.
 
 ## The EEZ EVM (`crates/eez-evm`)

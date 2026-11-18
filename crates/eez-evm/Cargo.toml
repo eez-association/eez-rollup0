@@ -6,8 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-reth-rpc-convert.workspace = true
-alloy-rpc-types-eth.workspace = true
 eez-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-eips.workspace = true

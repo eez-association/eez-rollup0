@@ -1,0 +1,844 @@
+//! Shared fixtures and the in-process tonic `ProveStream` harness for the service
+//! test submodules.
+
+mod attestation;
+mod golden;
+mod pipeline;
+mod runtime;
+
+use alloy_consensus::{SignableTransaction as _, Transaction as _};
+use alloy_primitives::{B256, Bytes, Signature, U256, address, b256, keccak256};
+use alloy_sol_types::SolValue as _;
+use eez_control_rpc::v1::prover_client::ProverClient;
+use eez_control_rpc::v1::{
+    Begin, Block, BlockWitness, ClientFrame, ExecutionWitness, Finalize, Proof, ServerFrame,
+    SettlementInput as WireSettlementInput, client_frame, prove_failure, server_frame,
+};
+use eez_protocol::abi::{ExecutionEntrySol, L2ToL1CallSol, RollupUpdateSol};
+use reth_primitives_traits::BlockBody as _;
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Code, Status};
+
+use super::settlement_job::{SettlementInput, SettlementPipelineError, run_settlement};
+use super::*;
+use crate::cancel::CancellationToken;
+use crate::testkit::{
+    TEST_SYSTEM_ADDRESS, checkpoint, empty_prefix_candidate, pre_execution_checkpoint,
+    system_transaction_context, test_proof_system_vkey,
+};
+use crate::validate::AdmittedBlock;
+use crate::validate::testing::{StubBackend, backend_output_for};
+
+fn nz(value: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).unwrap()
+}
+
+fn expected_rollup_id(value: u64) -> NonZeroU64 {
+    NonZeroU64::new(value).unwrap()
+}
+
+fn test_proof_system() -> Address {
+    address!("00000000000000000000000000000000000000aa")
+}
+
+fn test_attester() -> crate::attest::Attester {
+    test_attester_for(test_proof_system_vkey(), test_proof_system())
+}
+
+fn test_attester_for(
+    proof_system_vkey: crate::attest::NonZeroProofSystemVkey,
+    proof_system: Address,
+) -> crate::attest::Attester {
+    // Anvil account #1. Test-only and intentionally public.
+    let private_key = b256!("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
+    crate::attest::Attester::new(
+        private_key,
+        proof_system_vkey,
+        proof_system,
+        TEST_SYSTEM_ADDRESS,
+    )
+    .unwrap()
+}
+
+fn test_system_transaction_reconstructor(
+    rollup_id: NonZeroU64,
+) -> settlement::SystemTransactionReconstructor {
+    settlement::SystemTransactionReconstructor::new(1, rollup_id)
+}
+
+#[test]
+fn service_state_rejects_an_attester_bound_to_another_system_identity() {
+    let attester = crate::attest::Attester::new(
+        b256!("59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"),
+        test_proof_system_vkey(),
+        test_proof_system(),
+        Address::repeat_byte(0xbb),
+    )
+    .unwrap();
+
+    let error = ServiceState::new(
+        StubBackend::new(Vec::new()),
+        expected_rollup_id(1),
+        attester,
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "attester and native system transactions use different L2 system addresses"
+    );
+}
+
+fn anchor_batch() -> eez_protocol::EvmBatch {
+    anchor_batch_for(1)
+}
+
+/// Hash `block_chunk` gives block `number`: it seals blocks so that block `n`
+/// has hash `repeat_byte(n)` and parent `repeat_byte(n - 1)`.
+fn block_hash_of(number: u64) -> B256 {
+    B256::repeat_byte(u8::try_from(number).expect("fixture block numbers are small"))
+}
+
+/// The commitment endpoints of a `block_chunk` window over `from..=to`:
+/// the parent of `from`, the parent of `to`, and the hash of `to`.
+fn window_endpoints(from: u64, to: u64) -> (B256, B256, B256) {
+    (
+        block_hash_of(from - 1),
+        block_hash_of(to - 1),
+        block_hash_of(to),
+    )
+}
+
+/// An anchor-only batch whose commitment chain matches the blocks
+/// `block_chunk` produces for `from..=to`: the parent of `from` through to the
+/// hash of `to`.
+fn anchor_batch_spanning(from: u64, to: u64) -> eez_protocol::EvmBatch {
+    anchor_batch_spanning_for(1, from, to)
+}
+
+fn anchor_batch_spanning_for(rollup_id: u64, from: u64, to: u64) -> eez_protocol::EvmBatch {
+    let mut batch = anchor_batch_for(rollup_id);
+    batch.entries[0].rollupUpdates[0].currentRoot = block_hash_of(from - 1);
+    batch.entries[0].rollupUpdates[0].newRoot = block_hash_of(to);
+    eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
+    batch
+}
+
+/// The candidate block sealed over a transaction prefix that stops short of the
+/// settling block. It closes no window, so it is deliberately unrelated to the
+/// hashes `block_chunk` seals.
+fn interior_candidate() -> B256 {
+    B256::repeat_byte(0xc5)
+}
+
+fn anchor_batch_for(rollup_id: u64) -> eez_protocol::EvmBatch {
+    let mut batch = eez_protocol::EvmBatch {
+        blockNumber: u64::MAX,
+        ..Default::default()
+    };
+    batch.entries.push(ExecutionEntrySol {
+        rollupUpdates: vec![RollupUpdateSol {
+            rollupId: rollup_id,
+            currentRoot: B256::ZERO,
+            newRoot: B256::ZERO,
+            etherDelta: alloy_primitives::aliases::I192::ZERO,
+        }],
+        proxyEntryHash: B256::ZERO,
+        destinationRollupId: rollup_id,
+        l2ToL1Calls: Vec::new(),
+        expectedL1ToL2Calls: Vec::new(),
+        success: true,
+        returnData: Bytes::new(),
+        rollingHash: B256::ZERO,
+    });
+    batch.immediateEntryCount = U256::from(1);
+    batch.proofSystems = vec![test_proof_system()];
+    batch.rollupIdsWithProofSystems = vec![eez_protocol::abi::RollupIdWithProofSystemsSol {
+        rollupId: rollup_id,
+        proofSystemIndexes: vec![0],
+    }];
+    eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
+    batch
+}
+
+/// An anchor plus one outbound effect, chained over the window's block hashes:
+/// the anchor claims the settling block's empty prefix and the effect closes the
+/// window.
+fn outbound_batch(window_pre: B256, window_post: B256) -> eez_protocol::EvmBatch {
+    let mut batch = anchor_batch();
+    let anchor = &mut batch.entries[0];
+    anchor.rollupUpdates[0].currentRoot = window_pre;
+    anchor.rollupUpdates[0].newRoot = empty_prefix_candidate();
+
+    let mut effect = anchor.clone();
+    effect.rollupUpdates[0].currentRoot = empty_prefix_candidate();
+    effect.rollupUpdates[0].newRoot = window_post;
+    effect.l2ToL1Calls.push(l2_to_l1_call());
+    batch.entries.push(effect);
+    batch.immediateEntryCount = U256::from(2);
+    eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
+    batch
+}
+
+fn l2_to_l1_call() -> L2ToL1CallSol {
+    L2ToL1CallSol {
+        revertNextNCalls: 0,
+        isStatic: false,
+        gas: 0,
+        sourceAddress: Address::ZERO,
+        sourceRollupId: 1,
+        targetAddress: Address::ZERO,
+        value: U256::ZERO,
+        data: Bytes::new(),
+    }
+}
+
+/// Canonical one-pair Sync block and the batch that commits to it.
+fn canonical_outbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256) {
+    outbound_case(U256::ZERO)
+}
+
+fn outbound_case(value: U256) -> (eez_protocol::EvmBatch, Vec<u8>, Vec<u8>, B256) {
+    let (window_pre, _settling_pre, window_post) = window_endpoints(5, 5);
+    let mut batch = outbound_batch(window_pre, window_post);
+    batch.entries[1].l2ToL1Calls[0].value = value;
+    batch.entries[1].rollupUpdates[0].etherDelta = -eez_protocol::abi::u256_to_i192(value).unwrap();
+    eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
+    let call = &batch.entries[1].l2ToL1Calls[0];
+    let call_hash = eez_protocol::l2_outbound_call_hash(
+        eez_protocol::CallHashInput {
+            call_mode: eez_protocol::CallMode::Mutable,
+            source_address: call.sourceAddress,
+            source_rollup_id: eez_protocol::RollupId(1),
+            target_address: call.targetAddress,
+            target_rollup_id: eez_protocol::RollupId::MAINNET,
+            value: call.value,
+            data: &call.data,
+        },
+        0,
+    );
+    let user_body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
+        transactions: vec![non_system_transaction()],
+        ..Default::default()
+    };
+    let user = user_body.encoded_2718_transactions_iter().next().unwrap();
+    let mut sidecar = batch.entries[1].clone();
+    sidecar.rollupUpdates.clear();
+    sidecar.rollingHash = B256::ZERO;
+    let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
+        &[(sidecar.clone(), Bytes::from(user.clone()))],
+        &[],
+        &system_transaction_context(),
+        0,
+    )
+    .unwrap();
+    let transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
+        .into_iter()
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
+        transactions,
+        ..Default::default()
+    };
+    let block = eez_primitives::Block::new(crate::testkit::block_header(), body);
+    batch.callData =
+        settlement::encode_da_payload(&[vec![user.clone()]], &[sidecar.clone()]).into();
+    (batch, alloy_rlp::encode(block), user, call_hash)
+}
+
+fn outbound_backend_output() -> Vec<validate::BackendBlockOutput> {
+    let inputs = [AdmittedBlock::test(5, 0x04, 0x05)];
+    let mut backend_output = backend_output_for(&inputs);
+    backend_output[0].set_transaction_results_for_test(vec![true, true]);
+    // The pair ends on the block's last transaction, so its candidate is the
+    // settling block itself.
+    backend_output[0].transaction_state_checkpoints = vec![
+        pre_execution_checkpoint(empty_prefix_candidate()),
+        checkpoint(1, block_hash_of(5)),
+    ];
+    backend_output[0]
+        .settlement_evidence
+        .set_system_sender_flags_for_test(vec![true, false]);
+    backend_output
+}
+
+fn outbound_evidence(call_hash: B256) -> validate::SettlementBlockEvidence {
+    validate::SettlementBlockEvidence::for_test(
+        vec![true, false],
+        vec![validate::OutboundEventObservation::decoded_for_test(
+            1, 0, call_hash, 0,
+        )],
+    )
+}
+
+fn mixed_outbound_inbound_case() -> (eez_protocol::EvmBatch, Vec<u8>, B256) {
+    let (mut batch, _outbound_block, user, outbound_call_hash) = canonical_outbound_case();
+    let value = U256::from(9);
+    let (_unused_nonce_zero_tx, inbound_call_hash, return_data, inbound_sidecar) =
+        strict_inbound_transaction(value);
+
+    // The outbound effect no longer ends the block, so it closes on the
+    // candidate sealed at its own transaction and the inbound effect takes over
+    // the window's closing hash.
+    let (_, _, window_post) = window_endpoints(5, 5);
+    batch.entries[1].rollupUpdates[0].newRoot = interior_candidate();
+    let mut inbound_entry = batch.entries[0].clone();
+    inbound_entry.rollupUpdates[0].currentRoot = interior_candidate();
+    inbound_entry.rollupUpdates[0].newRoot = window_post;
+    inbound_entry.rollupUpdates[0].etherDelta = eez_protocol::abi::u256_to_i192(value).unwrap();
+    inbound_entry.proxyEntryHash = inbound_call_hash;
+    inbound_entry.returnData = return_data;
+    batch.entries.push(inbound_entry);
+    eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch).unwrap();
+
+    let mut outbound_sidecar = batch.entries[1].clone();
+    outbound_sidecar.rollupUpdates.clear();
+    outbound_sidecar.rollingHash = B256::ZERO;
+    let pairs = eez_protocol::system_tx::build_cross_chain_sync_pairs(
+        &[(outbound_sidecar.clone(), Bytes::from(user.clone()))],
+        std::slice::from_ref(&inbound_sidecar),
+        &system_transaction_context(),
+        0,
+    )
+    .unwrap();
+    let transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
+        .into_iter()
+        .map(|raw| {
+            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+                raw.as_ref(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
+        transactions,
+        ..Default::default()
+    };
+    let block = eez_primitives::Block::new(crate::testkit::block_header(), body);
+    batch.callData = settlement::encode_da_payload(
+        &[vec![user]],
+        &[outbound_sidecar.clone(), inbound_sidecar.clone()],
+    )
+    .into();
+
+    (batch, alloy_rlp::encode(block), outbound_call_hash)
+}
+
+fn mixed_backend_output() -> Vec<validate::BackendBlockOutput> {
+    let inputs = [AdmittedBlock::test(5, 0x04, 0x05)];
+    let mut backend_output = backend_output_for(&inputs);
+    backend_output[0].set_transaction_results_for_test(vec![true, true, true]);
+    backend_output[0].transaction_state_checkpoints = vec![
+        pre_execution_checkpoint(empty_prefix_candidate()),
+        checkpoint(1, interior_candidate()),
+        checkpoint(2, block_hash_of(5)),
+    ];
+    backend_output
+}
+
+fn mixed_evidence(outbound_call_hash: B256) -> validate::SettlementBlockEvidence {
+    validate::SettlementBlockEvidence::for_test(
+        vec![true, false, true],
+        vec![validate::OutboundEventObservation::decoded_for_test(
+            1,
+            0,
+            outbound_call_hash,
+            0,
+        )],
+    )
+}
+
+fn single_block_settlement_window(batch: eez_protocol::EvmBatch, block_rlp: Vec<u8>) -> TestWindow {
+    let mut block = block_chunk(5, 0x04, 0x05);
+    block.rlp = block_rlp;
+    let mut window = TestWindow::new(5, 5, vec![block]);
+    replace_post_batch(&mut window, public_input_post_batch_for(batch));
+    window
+}
+
+struct TestWindow {
+    rollup_id: u64,
+    from_block: u64,
+    to_block: u64,
+    settlement: WireSettlementInput,
+    blocks: Vec<BlockWitness>,
+}
+
+impl TestWindow {
+    fn new(from_block: u64, to_block: u64, blocks: Vec<BlockWitness>) -> Self {
+        Self {
+            rollup_id: 1,
+            from_block,
+            to_block,
+            settlement: public_input_post_batch_for_empty_blocks(
+                anchor_batch_spanning(from_block, to_block),
+                blocks.len(),
+            ),
+            blocks,
+        }
+    }
+}
+
+fn public_input_post_batch_for(batch: eez_protocol::EvmBatch) -> WireSettlementInput {
+    WireSettlementInput {
+        posting_context: (batch.blockNumber == u64::MAX).then(|| {
+            let context = crate::testkit::live_context();
+            eez_control_rpc::v1::L1PostingContext {
+                parent_hash: context.parent_hash.to_vec(),
+                target_timestamp: context.timestamp,
+                ..Default::default()
+            }
+        }),
+        abi_calldata: eez_protocol::entries::encode_postbatch(&batch),
+        ..WireSettlementInput::default()
+    }
+}
+
+fn public_input_post_batch_for_empty_blocks(
+    mut batch: eez_protocol::EvmBatch,
+    block_count: usize,
+) -> WireSettlementInput {
+    // A span covers at least one block, so a zero-block window (an inverted
+    // range fixture) has no encodable payload — an empty one stands in, and is
+    // itself invalid, which is what such a fixture wants.
+    batch.callData = if block_count == 0 {
+        alloy_primitives::Bytes::new()
+    } else {
+        let rollup_id = batch
+            .rollupIdsWithProofSystems
+            .first()
+            .map_or(1, |r| r.rollupId);
+        settlement::encode_da_payload_for(rollup_id, &vec![Vec::new(); block_count], &[]).into()
+    };
+    public_input_post_batch_for(batch)
+}
+
+fn recompute_test_public_inputs_hash(batch: &eez_protocol::EvmBatch) -> B256 {
+    settlement::CheckedPublicInputProfile::new(
+        &settlement::CanonicalPostBatch::from_decoded_for_test(batch.clone()),
+        expected_rollup_id(1),
+        test_proof_system(),
+        0,
+        (batch.blockNumber == u64::MAX).then(crate::testkit::live_context),
+    )
+    .unwrap()
+    .recompute_public_inputs_hash(
+        test_proof_system_vkey(),
+        &settlement::VerifiedDa::calldata_for_test(),
+    )
+    .unwrap()
+    .into_inner()
+}
+
+#[track_caller]
+fn assert_attestation(response: &Proof, expected_hash: B256, expected_signer: Address) {
+    assert_eq!(response.public_inputs_hash, expected_hash.as_slice());
+    assert_eq!(response.proof.len(), 65);
+    let signature = Signature::try_from(response.proof.as_slice()).unwrap();
+    assert_eq!(
+        signature
+            .recover_address_from_prehash(&expected_hash)
+            .unwrap(),
+        expected_signer
+    );
+}
+
+fn replace_post_batch(window: &mut TestWindow, settlement: WireSettlementInput) {
+    window.settlement = settlement;
+}
+
+fn da_payload_for_window(window: &TestWindow) -> Vec<u8> {
+    let blocks = window
+        .blocks
+        .iter()
+        .map(|block| {
+            let block = alloy_rlp::decode_exact::<eez_primitives::Block>(&block.rlp).unwrap();
+            block.body.encoded_2718_transactions_iter().collect()
+        })
+        .collect::<Vec<_>>();
+    settlement::encode_da_payload(&blocks, &[])
+}
+
+fn replace_batch_bound_to_window(window: &mut TestWindow, mut batch: eez_protocol::EvmBatch) {
+    batch.callData = da_payload_for_window(window).into();
+    replace_post_batch(window, public_input_post_batch_for(batch));
+}
+
+fn block_chunk(number: u64, parent: u8, hash: u8) -> BlockWitness {
+    BlockWitness {
+        number,
+        hash: vec![hash; 32],
+        parent_hash: vec![parent; 32],
+        rlp: alloy_rlp::encode(eez_primitives::Block::new(
+            crate::testkit::block_header(),
+            eez_primitives::BlockBody::default(),
+        )),
+        witness: Some(ExecutionWitness {
+            state: vec![vec![number as u8]],
+            ..Default::default()
+        }),
+    }
+}
+
+/// A chained happy-path fixture covering blocks 5, 6, and 7.
+fn happy_window() -> TestWindow {
+    TestWindow::new(
+        5,
+        7,
+        vec![
+            block_chunk(5, 0x04, 0x05),
+            block_chunk(6, 0x05, 0x06),
+            block_chunk(7, 0x06, 0x07),
+        ],
+    )
+}
+
+type TestTransaction = eez_primitives::EezTxEnvelope;
+
+fn single_non_system_transaction_window() -> TestWindow {
+    single_transaction_window(non_system_transaction())
+}
+
+fn non_system_transaction() -> TestTransaction {
+    alloy_consensus::TxLegacy::default()
+        .into_signed(alloy_primitives::Signature::test_signature())
+        .into()
+}
+
+fn single_system_transaction_window() -> TestWindow {
+    single_transaction_window(system_transaction())
+}
+
+fn system_transaction() -> TestTransaction {
+    <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+        &hex::decode(crate::testkit::SYSTEM_TX).unwrap(),
+    )
+    .unwrap()
+}
+
+fn strict_inbound_transaction(value: U256) -> (TestTransaction, B256, Bytes, ExecutionEntrySol) {
+    let target = alloy_primitives::address!("00000000000000000000000000000000000000aa");
+    let source = alloy_primitives::address!("00000000000000000000000000000000000000bb");
+    let data = Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]);
+    let return_data = Bytes::from_static(&[0x01, 0x02]);
+    let entry =
+        eez_protocol::entries::build_l2_incoming_entry(eez_protocol::entries::IncomingEntry {
+            target,
+            source,
+            value,
+            data: data.clone(),
+            source_rollup_id: eez_protocol::RollupId(0),
+            l2_rollup_id: eez_protocol::RollupId(1),
+            return_data: return_data.clone(),
+            success: true,
+        })
+        .unwrap();
+    let call_hash = entry.proxyEntryHash;
+    let sidecar = ExecutionEntrySol {
+        rollupUpdates: Vec::new(),
+        proxyEntryHash: call_hash,
+        l2ToL1Calls: vec![L2ToL1CallSol {
+            revertNextNCalls: 0,
+            isStatic: false,
+            gas: 0,
+            sourceAddress: source,
+            sourceRollupId: 0,
+            targetAddress: target,
+            value,
+            data,
+        }],
+        expectedL1ToL2Calls: Vec::new(),
+        rollingHash: entry.rollingHash,
+        destinationRollupId: 1,
+        success: true,
+        returnData: return_data.clone(),
+    };
+    let input = eez_protocol::entries::encode_execute_incoming(entry);
+    let context = system_transaction_context();
+    let inbound = eez_protocol::entries::InboundSidecar::try_from(&sidecar).unwrap();
+    let raw = eez_protocol::system_tx::build_inbound_system_txs(
+        std::slice::from_ref(&inbound),
+        &context,
+        0,
+    )
+    .unwrap()
+    .remove(0);
+    let transaction: TestTransaction =
+        <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+            raw.as_ref(),
+        )
+        .unwrap();
+    assert_eq!(transaction.input(), input.as_slice());
+    (transaction, call_hash, return_data, sidecar)
+}
+
+fn single_transaction_window(transaction: TestTransaction) -> TestWindow {
+    TestWindow::new(
+        5,
+        5,
+        vec![transaction_block_chunk(5, 0x04, 0x05, transaction)],
+    )
+}
+
+fn two_block_transaction_window(first: TestTransaction, settling: TestTransaction) -> TestWindow {
+    TestWindow::new(
+        5,
+        6,
+        vec![
+            transaction_block_chunk(5, 0x04, 0x05, first),
+            transaction_block_chunk(6, 0x05, 0x06, settling),
+        ],
+    )
+}
+
+fn transaction_block_chunk(
+    number: u64,
+    parent: u8,
+    hash: u8,
+    transaction: TestTransaction,
+) -> BlockWitness {
+    transactions_block_chunk(number, parent, hash, vec![transaction])
+}
+
+fn transactions_block_chunk(
+    number: u64,
+    parent: u8,
+    hash: u8,
+    transactions: Vec<TestTransaction>,
+) -> BlockWitness {
+    let body: eez_primitives::BlockBody = alloy_consensus::BlockBody {
+        transactions,
+        ..Default::default()
+    };
+    let consensus_block = eez_primitives::Block::new(crate::testkit::block_header(), body);
+    let mut chunk = block_chunk(number, parent, hash);
+    chunk.rlp = alloy_rlp::encode(consensus_block);
+    chunk
+}
+
+/// The admitted-block shape of [`happy_window`], for stub backend-output construction.
+fn happy_block_inputs() -> Vec<AdmittedBlock> {
+    [(5u64, 0x04u8, 0x05u8), (6, 0x05, 0x06), (7, 0x06, 0x07)]
+        .into_iter()
+        .map(|(number, parent_hash, hash)| AdmittedBlock::test(number, parent_hash, hash))
+        .collect()
+}
+
+fn limits() -> ServiceLimits {
+    limits_with(
+        16,
+        1024 * 1024,
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+    )
+}
+
+fn limits_with(
+    max_blocks: usize,
+    max_bytes: usize,
+    idle_timeout: Duration,
+    request_timeout: Duration,
+) -> ServiceLimits {
+    ServiceLimits::new(ServiceLimitsParams {
+        max_window_blocks: nz(max_blocks),
+        max_window_bytes: nz(max_bytes),
+        max_window_witness_items: nz(1024),
+        stream_idle_timeout: idle_timeout,
+        request_timeout,
+    })
+    .unwrap()
+}
+
+/// One in-process server with shared client setup and drop-triggered shutdown.
+pub(super) struct TestServer {
+    pub(super) endpoint: String,
+    _shutdown: oneshot::Sender<()>,
+}
+
+impl TestServer {
+    async fn new(state: Arc<ServiceState>) -> Self {
+        Self::with_limits(state, limits()).await
+    }
+
+    async fn with_limits(state: Arc<ServiceState>, limits: ServiceLimits) -> Self {
+        Self::with_service(ProveSvc::new(state, limits)).await
+    }
+
+    pub(super) async fn with_service(svc: ProveSvc) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(svc.into_server())
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = shutdown_rx.await;
+                    },
+                )
+                .await
+                .expect("test Prove server failed");
+        });
+        Self {
+            endpoint: format!("http://{addr}"),
+            _shutdown: shutdown,
+        }
+    }
+
+    pub(super) async fn client(&self) -> ProverClient<tonic::transport::Channel> {
+        ProverClient::connect(self.endpoint.clone())
+            .await
+            .unwrap()
+            .max_encoding_message_size(eez_control_rpc::MAX_MESSAGE_BYTES)
+    }
+
+    async fn exchange(&self, window: TestWindow) -> Result<Proof, Status> {
+        let first = window.blocks.first().expect("fixture has a block");
+        let terminal_hash = window.blocks.last().unwrap().hash.clone();
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(ClientFrame {
+                request_id: 1,
+                kind: Some(client_frame::Kind::Begin(Begin {
+                    rollup_id: window.rollup_id,
+                    anchor_number: window.from_block - 1,
+                    anchor_hash: first.parent_hash.clone(),
+                    anchor_state_root: vec![0; 32],
+                })),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut responses = self
+            .client()
+            .await
+            .prove_stream(ReceiverStream::new(receiver))
+            .await?
+            .into_inner();
+        let ready = responses.message().await?.expect("Begin response");
+        let binding = (ready.session_id.clone(), ready.epoch);
+        require_success(ready)?;
+        let mut request_id = 1;
+        for block in window.blocks {
+            request_id += 1;
+            sender
+                .send(ClientFrame {
+                    session_id: binding.0.clone(),
+                    epoch: binding.1,
+                    request_id,
+                    kind: Some(client_frame::Kind::Block(Block { data: Some(block) })),
+                })
+                .await
+                .unwrap();
+            let response = responses.message().await?.expect("Block response");
+            assert_eq!(response.request_id, request_id);
+            assert!(matches!(
+                require_success(response)?,
+                server_frame::Kind::Validated(_)
+            ));
+        }
+        sender
+            .send(ClientFrame {
+                session_id: binding.0,
+                epoch: binding.1,
+                request_id: request_id + 1,
+                kind: Some(client_frame::Kind::Finalize(Finalize {
+                    from_block: window.from_block,
+                    to_block: window.to_block,
+                    terminal_hash,
+                    settlement: Some(window.settlement),
+                })),
+            })
+            .await
+            .unwrap();
+        let response = responses.message().await?.expect("Finalize response");
+        let server_frame::Kind::Proof(proof) = require_success(response)? else {
+            panic!("expected proof")
+        };
+        assert!(responses.message().await?.is_none());
+        Ok(proof)
+    }
+
+    async fn prove(&self, window: TestWindow) -> Status {
+        self.exchange(window)
+            .await
+            .expect_err("request must be rejected")
+    }
+
+    async fn attest(&self, window: TestWindow) -> Proof {
+        self.exchange(window)
+            .await
+            .expect("valid window must be attested")
+    }
+}
+
+fn one_accepting_validator() -> Arc<ServiceState> {
+    inner(StubBackend::new(vec![Ok(backend_output_for(
+        &happy_block_inputs(),
+    ))]))
+}
+
+fn one_accepting_single_block_validator() -> Arc<ServiceState> {
+    inner(StubBackend::new(vec![Ok(backend_output_for(&[
+        AdmittedBlock::test(5, 0x04, 0x05),
+    ]))]))
+}
+
+fn single_block_validator_with_execution_evidence(
+    receipt_successes: Vec<bool>,
+    system_sender_flags: Vec<bool>,
+) -> Arc<ServiceState> {
+    let mut backend_output = backend_output_for(&[AdmittedBlock::test(5, 0x04, 0x05)]);
+    backend_output[0].set_transaction_results_for_test(receipt_successes);
+    backend_output[0]
+        .settlement_evidence
+        .set_system_sender_flags_for_test(system_sender_flags);
+    inner(StubBackend::new(vec![Ok(backend_output)]))
+}
+
+fn two_block_validator_with_execution_evidence(
+    first_receipt_successes: Vec<bool>,
+    first_system_sender_flags: Vec<bool>,
+    settling_receipt_successes: Vec<bool>,
+    settling_system_sender_flags: Vec<bool>,
+) -> Arc<ServiceState> {
+    let mut backend_output = backend_output_for(&[
+        AdmittedBlock::test(5, 0x04, 0x05),
+        AdmittedBlock::test(6, 0x05, 0x06),
+    ]);
+    backend_output[0].set_transaction_results_for_test(first_receipt_successes);
+    backend_output[0]
+        .settlement_evidence
+        .set_system_sender_flags_for_test(first_system_sender_flags);
+    backend_output[1].set_transaction_results_for_test(settling_receipt_successes);
+    backend_output[1]
+        .settlement_evidence
+        .set_system_sender_flags_for_test(settling_system_sender_flags);
+    inner(StubBackend::new(vec![Ok(backend_output)]))
+}
+
+fn inner(validator: StubBackend) -> Arc<ServiceState> {
+    inner_with_rollup(validator, expected_rollup_id(1))
+}
+
+fn inner_with_rollup(validator: StubBackend, expected_rollup_id: NonZeroU64) -> Arc<ServiceState> {
+    Arc::new(ServiceState::new(validator, expected_rollup_id, test_attester()).unwrap())
+}
+
+fn require_success(response: ServerFrame) -> Result<server_frame::Kind, Status> {
+    match response.kind.expect("response kind") {
+        server_frame::Kind::Rejected(rejected) => Err(Status::with_details(
+            Code::from_i32(rejected.code),
+            rejected.message,
+            rejected.details.into(),
+        )),
+        kind => Ok(kind),
+    }
+}

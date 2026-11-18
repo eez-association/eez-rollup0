@@ -1,20 +1,19 @@
 //! Shared L2 node configuration. L1 nodes retain their upstream Ethereum/Gnosis types.
 //!
 //! Component wiring adapted from reth's Ethereum node at the pinned revision:
-//! <https://github.com/paradigmxyz/reth/blob/v2.11.0/crates/ethereum/node/src/node.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/node/src/node.rs>.
 //! Engine validation delegates to:
-//! <https://github.com/paradigmxyz/reth/blob/v2.11.0/crates/ethereum/node/src/engine.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/node/src/engine.rs>.
 
 use crate::{EezNetworkBuilder, EezPayloadBuilder, EezPoolBuilder, HeldTxs};
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes};
-use alloy_rpc_types_eth::TransactionRequest;
 use eez_engine::EezEngineTypes;
+use eez_evm::EezEvmConfig;
 use eez_primitives::{Block, EezPrimitives, EezTxEnvelope};
 use reth_chainspec::ChainSpec;
 use reth_engine_primitives::{EngineApiValidator, PayloadValidator};
 use reth_ethereum_consensus::EthBeaconConsensus;
 use reth_ethereum_payload_builder::EthereumExecutionPayloadValidator;
-use reth_evm::{ConfigureEngineEvm, NextBlockEnvAttributes};
 use reth_node_api::{
     AddOnsContext, FullNodeComponents, FullNodeTypes, NodeTypes, PayloadAttributesBuilder,
 };
@@ -31,47 +30,22 @@ use reth_payload_primitives::{
 };
 use reth_primitives_traits::SealedBlock;
 use reth_provider::EthStorage;
-use reth_rpc_convert::{EthTxEnvError, transaction::TxEnvConverter};
 use std::{future::ready, sync::Arc};
 
-/// Execution selected by the binary and shared by import, payloads and derivation.
-pub trait NodeEvm:
-    ConfigureEngineEvm<
-        ExecutionData,
-        Primitives = EezPrimitives,
-        NextBlockEnvCtx = NextBlockEnvAttributes,
-    > + 'static
-{
-}
-impl<T> NodeEvm for T where
-    T: ConfigureEngineEvm<
-            ExecutionData,
-            Primitives = EezPrimitives,
-            NextBlockEnvCtx = NextBlockEnvAttributes,
-        > + 'static
-{
-}
-
 /// The L2 node. A composer's pool also refuses the cross-chain txs it holds.
-#[derive(Debug, Clone)]
-pub struct EezNode<Evm, TxEnv = ()> {
-    pub tx_env_converter: TxEnv,
-    pub evm: Evm,
+#[derive(Debug, Default, Clone)]
+pub struct EezNode {
     pub held: Option<HeldTxs>,
 }
 
-impl<Evm: NodeEvm, TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default>
-    NodeTypes for EezNode<Evm, TxEnv>
-{
+impl NodeTypes for EezNode {
     type Primitives = EezPrimitives;
     type ChainSpec = ChainSpec;
     type Storage = EthStorage<EezTxEnvelope>;
     type Payload = EezEngineTypes;
 }
 
-impl<Evm: NodeEvm, TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default>
-    EezNode<Evm, TxEnv>
-{
+impl EezNode {
     pub fn components<N: FullNodeTypes<Types = Self>>(
         &self,
     ) -> ComponentsBuilder<
@@ -79,7 +53,7 @@ impl<Evm: NodeEvm, TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxE
         EezPoolBuilder,
         BasicPayloadServiceBuilder<EezPayloadBuilder>,
         EezNetworkBuilder,
-        EezExecutorBuilder<Evm>,
+        EezExecutorBuilder,
         EezConsensusBuilder,
     > {
         ComponentsBuilder::default()
@@ -88,21 +62,14 @@ impl<Evm: NodeEvm, TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxE
                 eez_primitives::SYSTEM_ADDRESS,
                 self.held.clone(),
             ))
-            .executor(EezExecutorBuilder(self.evm.clone()))
+            .executor(EezExecutorBuilder)
             .payload(BasicPayloadServiceBuilder::new(EezPayloadBuilder::default()))
             .network(EezNetworkBuilder)
             .consensus(EezConsensusBuilder)
     }
 }
 
-impl<
-    Evm: NodeEvm,
-    TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default,
-    N: FullNodeComponents<Types = Self>,
-> DebugNode<N> for EezNode<Evm, TxEnv>
-where
-    reth_rpc_eth_types::EthApiError: reth_rpc_eth_types::error::FromEvmError<Evm>,
-{
+impl<N: FullNodeComponents<Types = Self>> DebugNode<N> for EezNode {
     type RpcBlock = alloy_rpc_types_eth::Block<alloy_rpc_types_eth::Transaction<EezTxEnvelope>>;
 
     fn rpc_to_primitive_block(block: Self::RpcBlock) -> Block {
@@ -119,15 +86,10 @@ where
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct EezExecutorBuilder<Evm>(Evm);
+pub struct EezExecutorBuilder;
 
-impl<
-    Evm: NodeEvm,
-    TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default,
-    N: FullNodeTypes<Types = EezNode<Evm, TxEnv>>,
-> ExecutorBuilder<N> for EezExecutorBuilder<Evm>
-{
-    type EVM = Evm;
+impl<N: FullNodeTypes<Types = EezNode>> ExecutorBuilder<N> for EezExecutorBuilder {
+    type EVM = EezEvmConfig;
 
     fn build_evm(self, ctx: &BuilderContext<N>) -> impl Future<Output = eyre::Result<Self::EVM>> {
         // EezEvmFactory has no JIT backend; refuse `--jit` rather than ignore it.
@@ -136,19 +98,14 @@ impl<
                 "--jit is not supported: the L2 EVM (EezEvmFactory) has no JIT backend"
             )));
         }
-        ready(Ok(self.0))
+        ready(EezEvmConfig::new(ctx.chain_spec()).map_err(Into::into))
     }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct EezConsensusBuilder;
 
-impl<
-    Evm: NodeEvm,
-    TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default,
-    N: FullNodeTypes<Types = EezNode<Evm, TxEnv>>,
-> ConsensusBuilder<N> for EezConsensusBuilder
-{
+impl<N: FullNodeTypes<Types = EezNode>> ConsensusBuilder<N> for EezConsensusBuilder {
     type Consensus = Arc<EthBeaconConsensus<ChainSpec>>;
 
     fn build_consensus(
@@ -208,11 +165,8 @@ impl EngineApiValidator<EezEngineTypes> for EezEngineValidator {
 #[derive(Debug, Default, Clone)]
 pub struct EezEngineValidatorBuilder;
 
-impl<
-    Evm: NodeEvm,
-    TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default,
-    N: FullNodeComponents<Types = EezNode<Evm, TxEnv>>,
-> PayloadValidatorBuilder<N> for EezEngineValidatorBuilder
+impl<N: FullNodeComponents<Types = EezNode>> PayloadValidatorBuilder<N>
+    for EezEngineValidatorBuilder
 {
     type Validator = EezEngineValidator;
 
@@ -224,25 +178,18 @@ impl<
     }
 }
 
-impl<
-    Evm: NodeEvm,
-    TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default,
-    N: FullNodeTypes<Types = Self>,
-> reth_node_builder::Node<N> for EezNode<Evm, TxEnv>
-where
-    reth_rpc_eth_types::EthApiError: reth_rpc_eth_types::error::FromEvmError<Evm>,
-{
+impl<N: FullNodeTypes<Types = Self>> reth_node_builder::Node<N> for EezNode {
     type ComponentsBuilder = ComponentsBuilder<
         N,
         EezPoolBuilder,
         BasicPayloadServiceBuilder<EezPayloadBuilder>,
         EezNetworkBuilder,
-        EezExecutorBuilder<Evm>,
+        EezExecutorBuilder,
         EezConsensusBuilder,
     >;
     type AddOns = reth_node_builder::rpc::RpcAddOns<
         reth_node_builder::NodeAdapter<N>,
-        crate::rpc::EezEthApiBuilder<TxEnv>,
+        crate::rpc::EezEthApiBuilder,
         EezEngineValidatorBuilder,
     >;
 
@@ -251,6 +198,6 @@ where
     }
 
     fn add_ons(&self) -> Self::AddOns {
-        crate::rpc::eez_add_ons(self.tx_env_converter.clone())
+        crate::rpc::eez_add_ons()
     }
 }

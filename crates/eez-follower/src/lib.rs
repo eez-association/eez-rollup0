@@ -5,11 +5,10 @@ mod unsafe_head;
 use std::{env, str::FromStr, sync::Arc};
 
 use alloy_primitives::Address;
-use alloy_rpc_types_eth::TransactionRequest;
 use eez_deriver::Deriver;
 use eez_driver::{BlockCommitterHandle, RollupTiming};
 use eez_l1::{L1CanonicalHead, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
-use eez_node_common::{EezNode, NodeEvm};
+use eez_node_common::EezNode;
 use eez_node_common::{
     L2NodeBuilder, boot, node_cli, sync_mode_from_env, wait_for_idle_engine, wait_for_l1_ready,
     warn_on_deprecated_env,
@@ -17,7 +16,6 @@ use eez_node_common::{
 use eez_seq_sig::HeadDomain;
 use reth_chainspec::EthChainSpec as _;
 use reth_network::{BlockDownloaderProvider as _, NetworkInfo as _, PeersInfo as _};
-use reth_rpc_convert::{EthTxEnvError, transaction::TxEnvConverter};
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
@@ -58,72 +56,46 @@ pub struct FollowerArgs {
 ///
 /// Returns an error when configuration is invalid or either reth or the L1
 /// bootstrap fails.
-#[cfg(feature = "node-evm")]
 pub fn run() -> eyre::Result<()> {
-    run_with(|chain_spec, _args| {
+    run_with(|_args| {
         eyre::ensure!(
             env::var_os("EEZ_STATEFUL_PROOF_SIGNER_ADDR").is_none()
                 && env::var_os("EEZ_STATEFUL_PROOF_SIGNER_KEY").is_none(),
             "stateful signing moved to the eez-prover-stateful binary in eez-association/provers",
         );
-        Ok((
-            eez_evm::EezEvmConfig::new(chain_spec)?,
-            eez_evm::EezTxEnvConverter,
-            |_| Ok(()),
-        ))
+        Ok(|_| Ok(()))
     })
 }
 
-/// The follower's database, using the same node types as its execution engine.
-pub type FollowerProvider<Evm, TxEnv = ()> = reth_provider::providers::BlockchainProvider<
-    reth_node_api::NodeTypesWithDBAdapter<EezNode<Evm, TxEnv>, reth_db::DatabaseEnv>,
->;
-
 /// Handles available after historical synchronization and L1 anchoring complete.
-/// Services should use the task executor to join the node's shutdown lifecycle.
 #[derive(Debug)]
-pub struct FollowerContext<
-    Evm: NodeEvm,
-    TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default = (),
-> {
-    pub provider: FollowerProvider<Evm, TxEnv>,
+pub struct FollowerContext {
+    pub provider: reth_provider::providers::BlockchainProvider<
+        reth_node_api::NodeTypesWithDBAdapter<EezNode, reth_db::DatabaseEnv>,
+    >,
     pub chain_spec: Arc<reth_chainspec::ChainSpec>,
     pub committer: BlockCommitterHandle<eez_engine::EezEngineTypes>,
     pub task_executor: reth_tasks::TaskExecutor,
 }
 
-/// Launch shared follower code with execution and a service chosen by the binary.
-/// `init` validates role-specific arguments before launching node services; its
-/// returned callback runs once the follower has bootstrapped from L1 or peers.
-pub fn run_with<Evm, TxEnv, Init, OnReady>(init: Init) -> eyre::Result<()>
+/// Run the default follower and attach a service after synchronization.
+/// `init` validates the caller's configuration before any node services start.
+pub fn run_with<Init, OnReady>(init: Init) -> eyre::Result<()>
 where
-    Evm: NodeEvm,
-    TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default,
-    reth_rpc_eth_types::EthApiError: reth_rpc_eth_types::error::FromEvmError<Evm>,
-    Init: FnOnce(Arc<reth_chainspec::ChainSpec>, &FollowerArgs) -> eyre::Result<(Evm, TxEnv, OnReady)>
-        + Send
-        + 'static,
-    OnReady: FnOnce(FollowerContext<Evm, TxEnv>) -> eyre::Result<()> + Send + 'static,
+    Init: FnOnce(&FollowerArgs) -> eyre::Result<OnReady> + Send + 'static,
+    OnReady: FnOnce(FollowerContext) -> eyre::Result<()> + Send + 'static,
 {
     node_cli::<FollowerArgs>()?.run(move |builder, args| async move {
-        let (evm, tx_env_converter, on_ready) = init(builder.config().chain.clone(), &args)?;
-        launch(builder, args, evm, tx_env_converter, on_ready).await
+        let on_ready = init(&args)?;
+        launch(builder, args, on_ready).await
     })
 }
 
-async fn launch<Evm, TxEnv, OnReady>(
+async fn launch(
     builder: L2NodeBuilder,
     ext: FollowerArgs,
-    evm: Evm,
-    tx_env_converter: TxEnv,
-    on_ready: OnReady,
-) -> eyre::Result<()>
-where
-    Evm: NodeEvm,
-    TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default,
-    reth_rpc_eth_types::EthApiError: reth_rpc_eth_types::error::FromEvmError<Evm>,
-    OnReady: FnOnce(FollowerContext<Evm, TxEnv>) -> eyre::Result<()> + Send + 'static,
-{
+    on_ready: impl FnOnce(FollowerContext) -> eyre::Result<()> + Send + 'static,
+) -> eyre::Result<()> {
     event!(
         name: "eez.node.launching",
         Level::INFO,
@@ -145,11 +117,7 @@ where
     let system_address = eez_primitives::SYSTEM_ADDRESS;
 
     let handle = builder
-        .node(EezNode {
-            evm,
-            tx_env_converter,
-            held: None,
-        })
+        .node(EezNode::default())
         .launch_with_debug_capabilities()
         .await?;
 
@@ -196,7 +164,6 @@ where
         Arc::new(provider.clone()),
         l1_reader.clone(),
         chain_spec,
-        handle.node.evm_config.clone(),
         timing.l2_block_time().as_secs(),
         deploy_block,
         Arc::clone(&l1_head),

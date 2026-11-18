@@ -1,5 +1,5 @@
 //! Golden execution fixtures, read from the provers/ submodule
-//! (`ecdsa/testing/evm-golden/execution.json`).
+//! (`stateless-ecdsa/testing/evm-golden/execution.json`).
 //!
 //! Each scenario is a genesis plus a chain of blocks, recorded with the
 //! post-state root, receipts root, logs bloom and gas used of every block (or
@@ -51,7 +51,7 @@ struct Outcome {
 
 fn fixtures_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../provers/ecdsa/testing/evm-golden/execution.json")
+        .join("../../provers/stateless-ecdsa/testing/evm-golden/execution.json")
 }
 
 #[test]

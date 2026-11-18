@@ -44,7 +44,7 @@ prover-owned L1 parent authentication described for blob-based profiles in the
 ## Server setup and replay
 
 Use the six-empty-block
-[`captured-devnet-window-84`](https://github.com/eez-association/provers/tree/main/ecdsa/crates/eez-prover-stateless/tests/fixtures/captured-devnet-window-84)
+[`captured-devnet-window-84`](https://github.com/eez-association/provers/tree/main/stateless-ecdsa/crates/eez-prover-stateless/tests/fixtures/captured-devnet-window-84)
 fixture. Configure a streaming server with its `chain-config.json`, rollup ID,
 proof system, vkey, attester and L2 system address from `oracle.json`. The signing
 key is the **public Anvil test key**

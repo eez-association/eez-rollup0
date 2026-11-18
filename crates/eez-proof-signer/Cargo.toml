@@ -1,0 +1,52 @@
+[package]
+name                   = "eez-proof-signer"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Shared EEZ proof-signer gRPC, settlement-validation, and attestation pipeline."
+
+[features]
+test-utils = []
+
+[dependencies]
+eez-primitives.workspace = true
+# The `prove.v1` wire this daemon serves.
+eez-control-rpc.workspace = true
+# Canonical `postAndVerifyBatch` ABI types and codec.
+eez-protocol.workspace = true
+eez-payload-codec.workspace = true
+eez-blob.workspace = true
+
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-primitives = { workspace = true, features = ["k256"] }
+alloy-rlp.workspace = true
+alloy-rpc-types-debug.workspace = true
+alloy-sol-types.workspace = true
+
+alloy-hardforks.workspace = true
+reth-primitives-traits.workspace = true
+
+eyre.workspace = true
+async-trait.workspace = true
+prost.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+tonic-prost.workspace = true
+# Recorded calldata fixture decoding.
+hex.workspace = true
+serde_json.workspace = true
+# Client-side of the in-process Prove round-trip tests.
+eez-prover.workspace = true
+eez-prover-client.workspace = true
+tokio-stream = { workspace = true, features = ["net"] }
+
+[lints]
+workspace = true

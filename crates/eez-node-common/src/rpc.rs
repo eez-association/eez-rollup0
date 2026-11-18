@@ -5,12 +5,16 @@
 //! Receipt/log conversion adapted from `EthReceiptConverter`:
 //! <https://github.com/paradigmxyz/reth/blob/v2.11.0/crates/rpc/rpc-eth-types/src/receipt.rs>.
 
-use crate::node::{EezEngineValidatorBuilder, EezNode, NodeEvm};
+use crate::node::{EezEngineValidatorBuilder, EezNode};
+use alloy_consensus::transaction::Recovered;
 use alloy_consensus::{Receipt as RpcReceipt, TxReceipt};
 use alloy_consensus_any::AnyReceiptEnvelope;
 use alloy_rpc_types_eth::{Header, Log, Transaction, TransactionReceipt, TransactionRequest};
+use eez_evm::{EezEvmConfig, EezEvmTx};
 use eez_primitives::{EezTxEnvelope, Receipt};
+use evm2::ethereum::RecoveredTxEnvelope;
 use reth_chainspec::{ChainSpec, ChainSpecProvider};
+use reth_evm::{EvmEnvFor, TxEnvFor};
 use reth_node_api::FullNodeComponents;
 use reth_node_builder::rpc::{
     BasicEngineApiBuilder, BasicEngineValidatorBuilder, EthApiBuilder, EthApiCtx, Identity,
@@ -18,7 +22,9 @@ use reth_node_builder::rpc::{
 };
 use reth_primitives_traits::TransactionMeta;
 use reth_rpc::EthApi;
-use reth_rpc_convert::{EthTxEnvError, RpcConverter, RpcTypes, transaction::TxEnvConverter};
+use reth_rpc_convert::{
+    EthTxEnvError, RpcConverter, RpcTypes, TryIntoTxEnv, transaction::TxEnvConverter,
+};
 use reth_rpc_eth_types::receipt::EthReceiptConverter;
 use std::future::ready;
 
@@ -34,27 +40,46 @@ impl RpcTypes for EezRpcTypes {
 }
 
 type ReceiptBuilder = fn(Receipt, usize, TransactionMeta) -> AnyReceiptEnvelope<Log>;
-type Converter<Evm, TxEnv> = RpcConverter<
+type Converter = RpcConverter<
     EezRpcTypes,
-    Evm,
+    EezEvmConfig,
     EthReceiptConverter<ChainSpec, ReceiptBuilder>,
     (),
     (),
     (),
     (),
-    TxEnv,
+    EezTxEnvConverter,
 >;
 
-#[derive(Debug, Default)]
-pub struct EezEthApiBuilder<TxEnv>(TxEnv);
+/// Builds call and estimate environments from RPC requests. Requests are always
+/// Ethereum transactions; native `0x76` transactions never come from RPC.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EezTxEnvConverter;
 
-impl<Evm: NodeEvm, TxEnv, N: FullNodeComponents<Types = EezNode<Evm, TxEnv>, Evm = Evm>>
-    EthApiBuilder<N> for EezEthApiBuilder<TxEnv>
-where
-    TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default,
-    reth_rpc_eth_types::EthApiError: reth_rpc_eth_types::error::FromEvmError<Evm>,
+impl TxEnvConverter<TransactionRequest, EezEvmConfig> for EezTxEnvConverter {
+    type Error = EthTxEnvError;
+
+    fn convert_tx_env(
+        &self,
+        tx_req: TransactionRequest,
+        evm_env: &EvmEnvFor<EezEvmConfig>,
+    ) -> Result<TxEnvFor<EezEvmConfig>, Self::Error> {
+        let tx: RecoveredTxEnvelope = tx_req.try_into_tx_env(evm_env)?;
+        let signer = tx.signer();
+        Ok(Recovered::new_unchecked(
+            EezEvmTx::Ethereum(tx.into_inner()),
+            signer,
+        ))
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct EezEthApiBuilder;
+
+impl<N: FullNodeComponents<Types = EezNode, Evm = EezEvmConfig>> EthApiBuilder<N>
+    for EezEthApiBuilder
 {
-    type EthApi = EthApi<RpcNodeCoreFor<N>, Converter<Evm, TxEnv>>;
+    type EthApi = EthApi<RpcNodeCoreFor<N>, Converter>;
 
     fn build_eth_api(
         self,
@@ -64,9 +89,7 @@ where
             .with_builder(build_receipt as ReceiptBuilder);
         ready(Ok(ctx
             .eth_api_builder()
-            .map_converter(|_| {
-                RpcConverter::<EezRpcTypes, Evm, _>::new(receipts).with_tx_env_converter(self.0)
-            })
+            .map_converter(|_| RpcConverter::new(receipts).with_tx_env_converter(EezTxEnvConverter))
             .build()))
     }
 }
@@ -106,19 +129,10 @@ fn build_receipt(
     }
 }
 
-pub fn eez_add_ons<
-    Evm: NodeEvm,
-    TxEnv,
-    N: FullNodeComponents<Types = EezNode<Evm, TxEnv>, Evm = Evm>,
->(
-    tx_env_converter: TxEnv,
-) -> RpcAddOns<N, EezEthApiBuilder<TxEnv>, EezEngineValidatorBuilder>
-where
-    TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default,
-    reth_rpc_eth_types::EthApiError: reth_rpc_eth_types::error::FromEvmError<Evm>,
-{
+pub fn eez_add_ons<N: FullNodeComponents<Types = EezNode, Evm = EezEvmConfig>>()
+-> RpcAddOns<N, EezEthApiBuilder, EezEngineValidatorBuilder> {
     RpcAddOns::new(
-        EezEthApiBuilder(tx_env_converter),
+        EezEthApiBuilder,
         EezEngineValidatorBuilder,
         BasicEngineApiBuilder::default(),
         BasicEngineValidatorBuilder::default(),

@@ -31,8 +31,6 @@ use reth_primitives_traits::{
 use reth_storage_errors::any::AnyError;
 use std::{borrow::Cow, fmt, sync::Arc};
 
-mod rpc;
-pub use rpc::EezTxEnvConverter;
 mod block;
 mod evm;
 pub use block::{EezBlockExecutor, EezBlockExecutorFactory};
