@@ -13,11 +13,11 @@ payload builder skips blobs without storing or fetching sidecars, and block/Engi
 replay rejects them before execution, including stateless proof validation.
 Engine API blob bundles remain present but empty. L1 still supports blobs.
 
-Native wire transactions have no fee or gas-limit fields. Their execution environment
-preserves type `0x76`, which revm recognizes as Custom, and supplies a zero gas
-price. This skips Ethereum-specific fee validation while ordinary fee accounting
-charges zero even with a positive block base fee. Nonce and chain-ID validation
-remain enabled. The implicit protocol budget is `SYSTEM_TX_GAS_LIMIT` (2,000,000);
+Native wire transactions have no fee or gas-limit fields. The EEZ EVM runs type
+`0x76` through its own handler with a zero gas price. This skips Ethereum-specific
+fee validation while ordinary fee accounting charges zero even with a positive
+block base fee. Nonce and chain-ID validation remain enabled. The implicit
+protocol budget is `SYSTEM_TX_GAS_LIMIT` (2,000,000);
 execution is metered and actual gas usage counts toward receipts and the block
 limit. The full budget must fit the remaining block gas before execution.
 
@@ -41,9 +41,9 @@ native and paid transactions. These are representative behavior tests with
 stand-in contracts, not a compatibility audit of third-party applications.
 
 An inbound transaction mints exactly its `value` before the ordinary EVM call,
-independently of any existing system balance. The shared `eez-evm` wrapper journals
-this credit, delegates execution to Ethereum's EVM, and removes the credit if the
-outer call reverts or halts. Such failures still advance the nonce and consume
+independently of any existing system balance. The native handler in `eez-evm`
+credits it before the call and restores the pre-mint balance if the outer call
+reverts or halts. Such failures still advance the nonce and consume
 gas; invalid transactions commit nothing. Nested call failures retain the normal
 contract/EVM semantics. Unlike OP deposits, an outer failure does not retain the
 mint. No separate `mint` field is needed because this protocol mints the attached
