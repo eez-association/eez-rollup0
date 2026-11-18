@@ -4,19 +4,17 @@
 //! calls within one source transaction. It drives a direct call to the
 //! destination contract with the proxy address as `msg.sender`
 //! (CREATE2-derived).
-//!
-//! Also hosts the reth helper [`disable_checks`].
 
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, U256};
 use alloy_sol_types::SolCall;
 
 use crate::{OverlayChannelHandle, SessionInspector, SessionInspectorFactory};
-use eez_evm::EezEvmConfig;
-use reth_evm::{ConfigureEvm, Evm as _};
-use reth_revm::{database::StateProviderDatabase, db::State};
-use reth_storage_api::{EvmStateProviderAdapter, StateProvider, StateProviderBox};
-use revm::DatabaseCommit;
-use revm::database::CacheState;
+use eez_evm::{EezEvmConfig, EezEvmTypes};
+use evm2::{
+    Inspector, TxResultWithState,
+    evm::{Cache, InMemoryDB},
+};
+use reth_evm::{ConfigureEvm, EvmEnvFor};
 
 use eez_protocol::{
     CallMode, CompositionBuilder, ExecutionOutcome, ExecutionRequest, ExecutorError,
@@ -24,12 +22,15 @@ use eez_protocol::{
 };
 
 use super::provider::ChainProvider;
-use super::reset_frame_caller_nonce;
+use super::sim::{SimState, disable_checks, reset_frame_caller_nonce, synthetic_call};
 use super::slot::transact_err;
 
 /// Gas cap for simulated direct target calls; exhaustion is returned as an
 /// unsuccessful execution outcome.
 pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
+
+/// Gas cap for the manager's `computeCrossChainProxyAddress` view call.
+const PROXY_ADDRESS_GAS_LIMIT: u64 = 1_000_000;
 
 /// Stateful target-chain execution session.
 ///
@@ -46,8 +47,8 @@ pub(super) const DIRECT_CALL_GAS_LIMIT: u64 = 30_000_000;
 /// the full `executeIncomingCrossChainCall` path.
 pub struct LocalExecutionSession {
     evm_config: EezEvmConfig,
-    state: State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>,
-    evm_env: reth_evm::EvmEnvFor<EezEvmConfig>,
+    state: SimState,
+    evm_env: EvmEnvFor<EezEvmConfig>,
     chain_id: u64,
     manager_address: Address,
     /// Optional factory for inspecting nested proxy calls. `None` disables
@@ -75,8 +76,8 @@ impl LocalExecutionSession {
     /// call inspection.
     ///
     /// `cache` preloads in-flight state captured before a nested dispatch;
-    /// `None` opens a fresh revm state. `overlay_channel` publishes cumulative
-    /// state after execution so a suspended inspector can apply the diff.
+    /// `None` opens the latest state as is. `overlay_channel` receives the
+    /// writes of every execution so a suspended inspector can replay them.
     ///
     /// # Errors
     ///
@@ -87,7 +88,7 @@ impl LocalExecutionSession {
         provider: &ChainProvider,
         manager_address: Address,
         inspector_factory: Option<SessionInspectorFactory>,
-        cache: Option<CacheState>,
+        cache: Option<Cache>,
         overlay_channel: OverlayChannelHandle,
     ) -> ExecutorResult<Self> {
         let num = provider.headers.best_block_number().map_err(provider_err)?;
@@ -107,15 +108,10 @@ impl LocalExecutionSession {
         let state_prov = provider.provider.latest().map_err(provider_err)?;
 
         let mut evm_env = provider.evm_config.evm_env(&header).map_err(evm_err)?;
-        let chain_id = evm_env.cfg_env.chain_id;
+        let chain_id = evm_env.version.chain_id;
         disable_checks(&mut evm_env);
 
-        let db = StateProviderDatabase::new(state_prov.into_evm_state_provider());
-        let mut builder = State::builder().with_database(db).with_bundle_update();
-        if let Some(cache) = cache {
-            builder = builder.with_cached_prestate(cache);
-        }
-        let state = builder.build();
+        let state = SimState::new(state_prov, cache.unwrap_or_default());
 
         tracing::debug!(
             block = num,
@@ -148,32 +144,27 @@ impl LocalExecutionSession {
             originalRollupId: source_rollup.0,
         }
         .abi_encode();
+        let call = synthetic_call(
+            self.chain_id,
+            Address::ZERO,
+            self.manager_address,
+            calldata.into(),
+            U256::ZERO,
+            PROXY_ADDRESS_GAS_LIMIT,
+        );
 
-        let tx_env = revm::context::TxEnv {
-            caller: Address::ZERO,
-            gas_limit: 1_000_000,
-            kind: alloy_primitives::TxKind::Call(self.manager_address),
-            data: calldata.into(),
-            chain_id: Some(self.chain_id),
-            ..Default::default()
-        };
-
-        let result = {
-            let mut evm = self
-                .evm_config
-                .evm_with_env(&mut self.state, self.evm_env.clone());
-            evm.transact(tx_env).map_err(transact_err)?
-        };
-        let output = match result.result {
-            revm::context::result::ExecutionResult::Success { output, .. } => output.into_data(),
-            other => {
-                return Err(ExecutorError::Unavailable(format!(
-                    "computeCrossChainProxyAddress reverted on manager {}: {other:?}",
-                    self.manager_address
-                )));
-            }
-        };
-        computeCrossChainProxyAddressCall::abi_decode_returns(&output).map_err(|error| {
+        let result = self
+            .state
+            .transact(&self.evm_config, &self.evm_env, &call, None)
+            .map_err(transact_err)?
+            .result;
+        if !result.is_success() {
+            return Err(ExecutorError::Unavailable(format!(
+                "computeCrossChainProxyAddress reverted on manager {}: {:?} {}",
+                self.manager_address, result.stop, result.output
+            )));
+        }
+        computeCrossChainProxyAddressCall::abi_decode_returns(&result.output).map_err(|error| {
             ExecutorError::Unavailable(format!(
                 "manager {} returned malformed computeCrossChainProxyAddress output: {error}",
                 self.manager_address
@@ -181,137 +172,76 @@ impl LocalExecutionSession {
         })
     }
 
-    /// Uninspected direct-call path. Executes the call and restores the
-    /// simulated proxy caller's nonce before committing the result.
-    fn execute_internal(
-        &mut self,
-        destination: &Address,
-        calldata: &Bytes,
-        value: &U256,
-        source_address: &Address,
-        source_rollup: RollupId,
-    ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
-        let tx_env =
-            self.build_tx_env(destination, calldata, value, source_address, source_rollup)?;
-        let caller = tx_env.caller;
-        let (return_data, gas_used, success, mut changes) = {
-            let mut evm = self
-                .evm_config
-                .evm_with_env(&mut self.state, self.evm_env.clone());
-            let result = evm.transact(tx_env).map_err(transact_err)?;
-            (
-                result.result.output().cloned().unwrap_or_default(),
-                result.result.tx_gas_used(),
-                result.result.is_success(),
-                result.state,
-            )
-        };
-        reset_frame_caller_nonce(&mut changes, caller);
-        Ok(self.commit_and_finish(return_data, gas_used, success, changes))
-    }
-
-    /// Inspected direct-call path. Runs the target-chain tx under the
-    /// supplied [`SessionInspector`] so proxy CALLs detected
-    /// during execution dispatch through the composition builder.
+    /// Run the direct call from the source's proxy address, inspected when the
+    /// session has an inspector factory, then commit it with the proxy's nonce
+    /// restored and publish its writes on the overlay channel.
     ///
-    /// The session takes the inspector by value because reth owns it for the
-    /// EVM pass. The caller reads `take_error` before returning the outcome.
-    fn execute_internal_with_inspector(
+    /// The caller reads the inspector's error before returning the outcome.
+    fn execute_call(
         &mut self,
-        inspector: SessionInspector<'_>,
-        destination: &Address,
-        calldata: &Bytes,
-        value: &U256,
-        source_address: &Address,
-        source_rollup: RollupId,
-    ) -> ExecutorResult<eez_protocol::ExecutionOutcome> {
-        let tx_env =
-            self.build_tx_env(destination, calldata, value, source_address, source_rollup)?;
-        let caller = tx_env.caller;
-        let (return_data, gas_used, success, mut changes, inspector_error) = {
-            let mut evm = self.evm_config.evm_with_env_and_inspector(
-                &mut self.state,
-                self.evm_env.clone(),
-                inspector,
-            );
-            let result = evm.transact(tx_env).map_err(transact_err)?;
-            let inspector_error = evm.inspector_mut().take_error();
-            (
-                result.result.output().cloned().unwrap_or_default(),
-                result.result.tx_gas_used(),
-                result.result.is_success(),
-                result.state,
-                inspector_error,
-            )
-        };
-        if let Some(err) = inspector_error {
-            return Err(err);
+        req: &ExecutionRequest,
+        dispatcher: &mut CompositionBuilder,
+    ) -> ExecutorResult<ExecutionOutcome> {
+        let caller = self.compute_proxy_address(req.source_address, req.source_rollup_id)?;
+
+        tracing::trace!(
+            dest = %req.target_address,
+            proxy_caller = %caller,
+            source_addr = %req.source_address,
+            source_rollup = %req.source_rollup_id,
+            value = %req.value,
+            calldata_len = req.data.len(),
+            "executing direct call on target chain");
+
+        let call = synthetic_call(
+            self.chain_id,
+            caller,
+            req.target_address,
+            req.data.clone(),
+            req.value,
+            DIRECT_CALL_GAS_LIMIT,
+        );
+        let mut inspector = self
+            .inspector_factory
+            .as_ref()
+            .map(|factory| factory.build(dispatcher));
+        let outcome = self.state.transact(
+            &self.evm_config,
+            &self.evm_env,
+            &call,
+            inspector
+                .as_mut()
+                .map(|inspector| inspector as &mut dyn Inspector<EezEvmTypes>),
+        );
+        let inspector_error = inspector.as_mut().and_then(SessionInspector::take_error);
+        let TxResultWithState {
+            result,
+            mut pending_state,
+            ..
+        } = outcome.map_err(transact_err)?;
+        if let Some(error) = inspector_error {
+            return Err(error);
         }
-        reset_frame_caller_nonce(&mut changes, caller);
-        Ok(self.commit_and_finish(return_data, gas_used, success, changes))
-    }
+        reset_frame_caller_nonce(&mut pending_state, caller);
+        self.state.commit(&pending_state);
 
-    /// Commit the revm bundle, publish the overlay cache, and return the
-    /// execution outcome.
-    fn commit_and_finish(
-        &mut self,
-        return_data: Bytes,
-        gas_used: u64,
-        success: bool,
-        changes: revm::primitives::map::AddressHashMap<revm::state::Account>,
-    ) -> eez_protocol::ExecutionOutcome {
-        self.state.commit(changes);
-
-        // Publish the cumulative post-execute cache. An inspector waiting on
-        // the same channel can pop and apply it after nested dispatch; the
-        // stack preserves LIFO order for recursive re-entry.
-        self.overlay_channel
-            .push_post_cache(self.state.cache.clone());
+        // Publish this execution's writes. An inspector suspended in a dispatch
+        // that re-entered this rollup replays them on its own state.
+        let mut writes = InMemoryDB::default();
+        writes.commit_pending(&pending_state);
+        self.overlay_channel.push_writes(writes.cache);
 
         tracing::debug!(
-            success = success,
-            gas = gas_used,
-            return_len = return_data.len(),
+            success = result.is_success(),
+            gas = result.tx_gas_used(),
+            return_len = result.output.len(),
             "target call completed"
         );
 
-        eez_protocol::ExecutionOutcome::Resolved {
-            return_data: return_data.to_vec(),
-            gas_used,
-            success,
-        }
-    }
-
-    /// Build the `TxEnv` for a direct call on the target chain. Shared
-    /// between inspected and uninspected paths so the revm input shape
-    /// is identical regardless of inspection policy.
-    fn build_tx_env(
-        &mut self,
-        destination: &Address,
-        calldata: &Bytes,
-        value: &U256,
-        source_address: &Address,
-        source_rollup: RollupId,
-    ) -> ExecutorResult<revm::context::TxEnv> {
-        let caller = self.compute_proxy_address(*source_address, source_rollup)?;
-
-        tracing::trace!(
-            dest = %destination,
-            proxy_caller = %caller,
-            source_addr = %source_address,
-            %source_rollup,
-            value = %value,
-            calldata_len = calldata.len(),
-            "executing direct call on target chain");
-
-        Ok(revm::context::TxEnv {
-            caller,
-            gas_limit: DIRECT_CALL_GAS_LIMIT,
-            kind: alloy_primitives::TxKind::Call(*destination),
-            data: calldata.clone(),
-            value: *value,
-            chain_id: Some(self.chain_id),
-            ..Default::default()
+        Ok(ExecutionOutcome::Resolved {
+            return_data: result.output.to_vec(),
+            gas_used: result.tx_gas_used(),
+            success: result.is_success(),
         })
     }
 }
@@ -327,33 +257,12 @@ impl TargetExecutionSession for LocalExecutionSession {
                 "static target execution is not implemented".to_owned(),
             ));
         }
-        let outcome = if let Some(factory) = self.inspector_factory.clone() {
-            let inspector = factory.build(dispatcher);
-            self.execute_internal_with_inspector(
-                inspector,
-                &req.target_address,
-                &req.data,
-                &req.value,
-                &req.source_address,
-                req.source_rollup_id,
-            )?
-        } else {
-            let _ = dispatcher;
-            self.execute_internal(
-                &req.target_address,
-                &req.data,
-                &req.value,
-                &req.source_address,
-                req.source_rollup_id,
-            )?
-        };
-
-        Ok(outcome)
+        self.execute_call(&req, dispatcher)
     }
 
     fn checkpoint(&mut self) -> ExecutorResult<eez_protocol::SessionSnapshot> {
-        // The snapshot restores no session state: the revm cache and bundle
-        // are not captured (full-snapshot rollback is planned separately).
+        // The snapshot restores no session state: the simulation cache is
+        // not captured (full-snapshot rollback is planned separately).
         // Annulled-call safety rests on batch materialization rejecting
         // revert spans, so a composition with rolled-back calls never emits
         // entries.
@@ -368,15 +277,6 @@ impl TargetExecutionSession for LocalExecutionSession {
         })?;
         Ok(())
     }
-}
-
-pub(super) fn disable_checks(env: &mut reth_evm::EvmEnvFor<EezEvmConfig>) {
-    env.cfg_env.disable_base_fee = true;
-    env.cfg_env.disable_balance_check = true;
-    env.cfg_env.disable_nonce_check = true;
-    env.cfg_env.disable_eip3607 = true;
-    env.cfg_env.disable_block_gas_limit = true;
-    env.cfg_env.tx_gas_limit_cap = Some(u64::MAX);
 }
 
 pub(super) fn provider_err(
