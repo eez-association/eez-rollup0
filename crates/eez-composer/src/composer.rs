@@ -406,6 +406,9 @@ struct PostBatchGasBudget {
     projected: u64,
     /// `None` when the batch carries its DA in calldata.
     blob: Option<BlobBytes>,
+    /// Attestation gas for the configured attesters, priced into every
+    /// postBatch projection.
+    attestation: u64,
 }
 
 /// Blob stream bytes: the post's capacity, the bytes reserved so far, and
@@ -421,12 +424,19 @@ impl PostBatchGasBudget {
     /// A budget for a batch that may carry a proof from each of
     /// `proof_systems` attesters.
     fn new(max_gas: u64, proof_systems: u64) -> Self {
+        let attestation = attestation_gas(proof_systems);
         Self {
             cap: max_gas.saturating_sub(POSTBATCH_DRAIN_MARGIN),
-            projected: projected_postbatch_gas(1, 0, 0)
-                .saturating_add(attestation_gas(proof_systems)),
+            projected: projected_postbatch_gas(1, 0, 0).saturating_add(attestation),
             blob: None,
+            attestation,
         }
+    }
+
+    /// The cost of `cost` as a postBatch of its own, for the cut event.
+    fn standalone_cost(&self, cost: TxL1Gas) -> u64 {
+        projected_postbatch_gas(cost.entries, cost.calldata_gas, cost.target_gas)
+            .saturating_add(self.attestation)
     }
 
     /// L1 gas one accepted tx adds. Its DA copies cost calldata gas only when
@@ -551,6 +561,16 @@ const fn gas_limit_violation(declared: u64, cap: Option<u64>) -> Option<(u64, u6
 struct BlockGasCut {
     gas_used: u64,
     declared: u64,
+}
+
+/// The Sync slot a batch is built for: the block it extends, its timestamp and
+/// fee recipient, and the L1 block its bundle targets.
+#[derive(Debug, Clone, Copy)]
+struct SlotTarget<'a> {
+    parent_header: &'a reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
+    timestamp: u64,
+    fee_recipient: Address,
+    bundle_target: BundleTarget,
 }
 
 /// The budget that ran out first and ended the drain.
@@ -1714,16 +1734,14 @@ where
         // Catchup: structural-only — skip the drain, emit a minimal postBatch
         // (cross-chain stays pooled for the next Steady slot).
         if matches!(mode, SyncSlotMode::Catchup) {
+            let slot = SlotTarget {
+                parent_header: &parent_header,
+                timestamp,
+                fee_recipient: suggested_fee_recipient,
+                bundle_target, // catch-up → NextBlock (unpinned)
+            };
             return self
-                .dispatch_minimal_postbatch(
-                    &cc.exec_ctx,
-                    rollup_id,
-                    rollup,
-                    &parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target, // catch-up → NextBlock (unpinned)
-                )
+                .dispatch_minimal_postbatch(&cc.exec_ctx, rollup_id, rollup, slot)
                 .await
                 .unwrap_or_else(|err| {
                     event!(
@@ -1754,15 +1772,11 @@ where
         let Some(rollup) = self.inner.rollups.get(&rollup_id) else {
             return;
         };
-        let cursor = rollup.l1_head.cursor();
-        if let Some(partial) = rollup.optimistic.partial_to_dispose(cursor) {
-            self.recover_partial_batch(rollup_id, rollup, partial).await;
-        }
-        if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
-            // Deliberately ignored: a tick owes no block, and the Sequencer
-            // re-reads the head right after this hook returns.
-            let _ = self.recover_failed_batch(rollup_id, rollup, failed).await;
-        }
+        // Deliberately ignored: a tick owes no block, and the Sequencer
+        // re-reads the head right after this hook returns.
+        let _ = self
+            .recover_batches(rollup_id, rollup, rollup.l1_head.cursor())
+            .await;
     }
 }
 
@@ -1831,10 +1845,12 @@ where
             &self.inner.cross_chain,
             rollup_id,
             drained.clone(),
-            parent_header,
-            timestamp,
-            rollup.config.fee_recipient,
-            bundle_target,
+            SlotTarget {
+                parent_header,
+                timestamp,
+                fee_recipient: rollup.config.fee_recipient,
+                bundle_target,
+            },
         ))
         .await
         {
@@ -1868,8 +1884,7 @@ where
     }
 
     /// Release the in-flight transactions of batches the cursor has confirmed,
-    /// dispose of a partially settled batch, then recover a failed one.
-    /// `Some` when a failed batch was recovered, with whether the head moved.
+    /// then run [`Self::recover_batches`].
     async fn reconcile_slot_batches(
         &self,
         rollup_id: u64,
@@ -1882,8 +1897,18 @@ where
                 .held_pool
                 .release_in_flight_batch(&newly_cursor_confirmed);
         }
+        self.recover_batches(rollup_id, rollup, cursor).await
+    }
 
-        // ── Slot-context failure recovery ────────────────────────────
+    /// Dispose of a partially settled batch, then recover a failed one.
+    /// `Some` when a failed batch was recovered, with whether the head moved.
+    async fn recover_batches(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        cursor: u64,
+    ) -> Option<RecoveryOutcome> {
+        // ── Failure recovery (Sync slot or per-tick hook) ────────────
         // The observer task only RECORDS verdicts; the destructive
         // recovery happens here, serialized with the Sequencer's own
         // commits (the slot loop is sequential — no commit can race
@@ -2278,11 +2303,14 @@ where
         cc: &CrossChainWiring,
         rollup_id: u64,
         drained: Vec<HeldTx>,
-        parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
-        timestamp: u64,
-        suggested_fee_recipient: Address,
-        bundle_target: BundleTarget,
+        slot: SlotTarget<'_>,
     ) -> Result<Option<SyncSlotBlock>, String> {
+        let SlotTarget {
+            parent_header,
+            timestamp,
+            fee_recipient: suggested_fee_recipient,
+            bundle_target,
+        } = slot;
         let ctx = cc.exec_ctx.as_ref();
         // Read the base SYSTEM_ADDRESS nonce from parent state. The canonical
         // builder allocates outbound-load nonces before inbound-delivery nonces.
@@ -2328,15 +2356,7 @@ where
         // to minimal.
         if drained.is_empty() {
             return self
-                .dispatch_minimal_postbatch(
-                    ctx,
-                    rollup_id,
-                    rollup,
-                    parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                )
+                .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                 .await;
         }
 
@@ -2470,15 +2490,7 @@ where
                 );
                 pool.push_front_batch(drained);
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
         };
@@ -2497,7 +2509,6 @@ where
         let mut drain = CrossChainDrain {
             rollup_id,
             nonce,
-            attesters: self.inner.emission.attesters,
             l1_state,
             draft,
             sync_txs: Vec::new(),
@@ -2548,18 +2559,8 @@ where
         }
         // Boxed: the drain holds two live execution contexts, so its future is
         // past the inline-size budget.
-        Box::pin(self.finish_cross_chain_batch(
-            cc,
-            rollup,
-            parent_header,
-            timestamp,
-            suggested_fee_recipient,
-            bundle_target,
-            &stf_cfg,
-            stale.len(),
-            drain,
-        ))
-        .await
+        Box::pin(self.finish_cross_chain_batch(cc, rollup, slot, &stf_cfg, stale.len(), drain))
+            .await
     }
 
     /// Settle the drain: run the budget-cut and poison dispositions, re-queue
@@ -2570,14 +2571,17 @@ where
         &self,
         cc: &CrossChainWiring,
         rollup: &RollupState<L2>,
-        parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
-        timestamp: u64,
-        suggested_fee_recipient: Address,
-        bundle_target: BundleTarget,
+        slot: SlotTarget<'_>,
         stf_cfg: &eez_protocol::system_tx::SystemTxContext,
         evicted_stale: usize,
         mut drain: CrossChainDrain,
     ) -> Result<Option<SyncSlotBlock>, String> {
+        let SlotTarget {
+            parent_header,
+            timestamp,
+            fee_recipient: suggested_fee_recipient,
+            bundle_target,
+        } = slot;
         let ctx = cc.exec_ctx.as_ref();
         let pool = rollup.held_pool.as_ref();
         drain.handle_budget_cut();
@@ -2648,15 +2652,7 @@ where
                 requeue.extend(rest);
                 requeue_unprocessed(pool, rollup_id, &poison_gaps, requeue);
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
         };
@@ -2678,15 +2674,7 @@ where
                 "no held tx survived the drain (stale, deterministic failure, temporarily underfunded, or over the gas budget); emitting minimal postBatch",
             );
             return self
-                .dispatch_minimal_postbatch(
-                    ctx,
-                    rollup_id,
-                    rollup,
-                    parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                )
+                .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                 .await;
         }
 
@@ -2716,15 +2704,7 @@ where
                 );
                 pool.push_front_batch(survivors);
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
         };
@@ -2753,15 +2733,7 @@ where
             );
             pool.push_front_batch(survivors);
             return self
-                .dispatch_minimal_postbatch(
-                    ctx,
-                    rollup_id,
-                    rollup,
-                    parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                )
+                .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                 .await;
         }
 
@@ -2787,15 +2759,7 @@ where
                 );
                 pool.push_front_batch(survivors);
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
         };
@@ -2813,15 +2777,7 @@ where
             );
             pool.push_front_batch(survivors);
             return self
-                .dispatch_minimal_postbatch(
-                    ctx,
-                    rollup_id,
-                    rollup,
-                    parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                )
+                .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                 .await;
         }
         // Per-effect intermediate L2 roots: the prover requires each entry's
@@ -2846,15 +2802,7 @@ where
                 );
                 pool.push_front_batch(survivors);
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
         };
@@ -2927,15 +2875,7 @@ where
                         "opaque prover failure recovered with bounded transaction eviction",
                     );
                     return self
-                        .dispatch_minimal_postbatch(
-                            ctx,
-                            rollup_id,
-                            rollup,
-                            parent_header,
-                            timestamp,
-                            suggested_fee_recipient,
-                            bundle_target,
-                        )
+                        .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                         .await;
                 };
 
@@ -2988,16 +2928,8 @@ where
                 // The recursive call owns `retry`; retain this level's exact
                 // set so a pre-classification error can requeue it locally.
                 let retry_after_error = retry.clone();
-                let recomposed = Box::pin(self.compose_cross_chain_batch(
-                    cc,
-                    rollup_id,
-                    retry,
-                    parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                ))
-                .await;
+                let recomposed =
+                    Box::pin(self.compose_cross_chain_batch(cc, rollup_id, retry, slot)).await;
                 return match recomposed {
                     Ok(result) => Ok(result),
                     Err(error) => {
@@ -3015,10 +2947,7 @@ where
                                 ctx,
                                 rollup_id,
                                 rollup,
-                                parent_header,
-                                timestamp,
-                                suggested_fee_recipient,
-                                bundle_target,
+                                slot,
                             )
                             .await
                             .unwrap_or_else(|fallback_error| {
@@ -3068,15 +2997,7 @@ where
                     "prover failure recovered",
                 );
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
             Err(PreparePostBatchError::Build(error)) => {
@@ -3089,15 +3010,7 @@ where
                 );
                 pool.push_front_batch(survivors);
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
         };
@@ -3169,11 +3082,14 @@ where
         ctx: &CrossChainExecCtx,
         rollup_id: u64,
         rollup: &RollupState<L2>,
-        parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
-        timestamp: u64,
-        suggested_fee_recipient: Address,
-        bundle_target: BundleTarget,
+        slot: SlotTarget<'_>,
     ) -> Result<Option<SyncSlotBlock>, String> {
+        let SlotTarget {
+            parent_header,
+            timestamp,
+            fee_recipient: suggested_fee_recipient,
+            bundle_target,
+        } = slot;
         let empty_built = match build_sync_block(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
@@ -3660,19 +3576,13 @@ where
         // The L1-confirmed cursor block anchors the batch: its hash is the
         // leading immediate entry's `currentRoot` and `posted + 1` starts the
         // covered range.
-        let posted = self
-            .inner
-            .rollups
-            .get(&rollup_id)
-            .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
-            .l1_head
-            .cursor();
+        let rollup =
+            self.inner.rollups.get(&rollup_id).ok_or_else(|| {
+                format!("unknown rollup_id {rollup_id} in prepare_post_batch_raw")
+            })?;
+        let posted = rollup.l1_head.cursor();
         let (pre_block_hash, pre_state_root): (B256, B256) = {
-            let h = self
-                .inner
-                .rollups
-                .get(&rollup_id)
-                .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
+            let h = rollup
                 .l2_provider
                 .sealed_header(posted)
                 .map_err(|e| format!("sealed_header({posted}): {e}"))?
@@ -3708,10 +3618,6 @@ where
         // provider index for the newest block. The Sync-block DA carries
         // outbound user transactions; its system transactions are reconstructed
         // by the deriver from the postBatch entries.
-        let rollup =
-            self.inner.rollups.get(&rollup_id).ok_or_else(|| {
-                format!("unknown rollup_id {rollup_id} in prepare_post_batch_raw")
-            })?;
         // Reuse the SAME cursor read that anchored the leading
         // immediate's currentRoot above — a second read could race the
         // Deriver's cursor advance and desync the callData range from
@@ -3946,8 +3852,6 @@ struct CrossChainDrain {
     rollup_id: u64,
     /// Base SYSTEM_ADDRESS nonce read from the parent state.
     nonce: u64,
-    /// Configured attester count, priced into every postBatch gas projection.
-    attesters: u64,
     l1_state: L1SlotState,
     draft: SyncBlockState,
     /// The Sync block's txs in canonical order, exactly as accepted: the
@@ -4080,7 +3984,7 @@ impl CrossChainDrain {
         reopen: impl Fn(&[Bytes]) -> Result<SyncBlockState, BuildError>,
         outbounds: Vec<(usize, HeldTx)>,
     ) {
-        let (rollup_id, nonce, attesters) = (self.rollup_id, self.nonce, self.attesters);
+        let (rollup_id, nonce) = (self.rollup_id, self.nonce);
         let local = &cc.local;
         let ctx = cc.exec_ctx.as_ref();
         // ── PHASE 1 — OUTBOUND (L2→L1) ───────────────────────────────
@@ -4335,12 +4239,7 @@ impl CrossChainDrain {
                     if !candidate_budget.try_accept(cost) {
                         self.end = DrainEnd::Cut {
                             cut: BudgetCut::PostBatchGas {
-                                rejected_cost: projected_postbatch_gas(
-                                    cost.entries,
-                                    cost.calldata_gas,
-                                    cost.target_gas,
-                                )
-                                .saturating_add(attestation_gas(attesters)),
+                                rejected_cost: candidate_budget.standalone_cost(cost),
                             },
                             rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
                         };
@@ -4545,7 +4444,7 @@ impl CrossChainDrain {
         reopen: impl Fn(&[Bytes]) -> Result<SyncBlockState, BuildError>,
         inbounds: Vec<(usize, HeldTx)>,
     ) {
-        let (rollup_id, nonce, attesters) = (self.rollup_id, self.nonce, self.attesters);
+        let (rollup_id, nonce) = (self.rollup_id, self.nonce);
         let local = &cc.local;
         // ── PHASE 2 — INBOUND (L1→L2) ────────────────────────────────
         // Source-sim runs the L1 user tx on a fork of the state; the L2 side
@@ -4741,12 +4640,7 @@ impl CrossChainDrain {
                     if !candidate_budget.try_accept(cost) {
                         self.end = DrainEnd::Cut {
                             cut: BudgetCut::PostBatchGas {
-                                rejected_cost: projected_postbatch_gas(
-                                    cost.entries,
-                                    cost.calldata_gas,
-                                    cost.target_gas,
-                                )
-                                .saturating_add(attestation_gas(attesters)),
+                                rejected_cost: candidate_budget.standalone_cost(cost),
                             },
                             rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
                         };
