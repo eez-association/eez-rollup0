@@ -480,28 +480,48 @@ async fn own_partial_batch_still_charges_the_culprit() {
 
 #[tokio::test]
 async fn excluded_failure_before_rival_is_indexed_does_not_evict() {
-    let fixture = Fixture::new(ProviderBuilder::default().connect_mocked_client(Asserter::new()));
-    let mut expected = fixture.prepare_pending(Direction::Outbound);
-    let rollup = fixture.rollup();
-    assert_eq!(rollup.l1_head.cursor(), 9);
-    rollup
-        .optimistic
-        .mark_failed(10, BATCH, AttemptCharge::Excluded);
-    let failed = rollup.optimistic.take_failed_for_recovery(9).unwrap();
+    for direction in [Direction::Inbound, Direction::Outbound] {
+        let fixture =
+            Fixture::new(ProviderBuilder::default().connect_mocked_client(Asserter::new()));
+        let mut expected = fixture.prepare_pending(direction);
+        let rollup = fixture.rollup();
+        assert_eq!(rollup.l1_head.cursor(), 9);
 
-    // Exercise disposition directly: rollback receipt checks use a separate
-    // HTTP client that is outside the fixture's mocked provider.
-    dispose_recovered_txs(
-        1,
-        &rollup.held_pool,
-        failed.sync_height,
-        failed.txs,
-        &[],
-        failed.charge,
-    );
-    for tx in &mut expected[..2] {
-        tx.excluded_slots = 1;
+        // The rival's bundle won the target block, so the relay excluded ours.
+        let charge = failure_charge(&Ok(SendOutcome::Dropped {
+            tx_hash: BATCH,
+            target_block: 101,
+            reason: DropReason::Excluded,
+        }));
+        assert_eq!(charge, AttemptCharge::Excluded);
+        rollup.optimistic.mark_failed(10, BATCH, charge);
+        let failed = rollup.optimistic.take_failed_for_recovery(9).unwrap();
+
+        // Exercise disposition directly: rollback receipt checks use a separate
+        // HTTP client that is outside the fixture's mocked provider.
+        dispose_recovered_txs(
+            1,
+            &rollup.held_pool,
+            failed.sync_height,
+            failed.txs,
+            &[],
+            failed.charge,
+        );
+
+        // The rival's batch is indexed only after our failure was recovered. It
+        // must not reach partial disposition and charge a culprit.
+        rollup
+            .l1_head
+            .append(record(101, 10, B256::repeat_byte(0xb2)));
+        assert!(rollup.optimistic.resolve_below_cursor(10).is_empty());
+        assert!(rollup.optimistic.partial_to_dispose(10).is_none());
+        assert!(rollup.optimistic.take_failed_for_recovery(9).is_none());
+
+        // tx0 was one strike from MAX_BUNDLE_ATTEMPTS; only the batched txs
+        // pay an exclusion, and the queued suffix is untouched.
+        for tx in &mut expected[..2] {
+            tx.excluded_slots = 1;
+        }
+        fixture.assert_requeued(&expected);
     }
-    fixture.assert_requeued(&expected);
-    assert!(rollup.optimistic.take_failed_for_recovery(9).is_none());
 }

@@ -5842,6 +5842,24 @@ mod tests {
     }
 
     #[test]
+    fn excluded_drops_do_not_use_the_settlement_bound() {
+        let pool = HeldPool::new();
+        let mut tx = held(Address::repeat_byte(0xa), Direction::Inbound, 0, 1);
+        tx.attempts = MAX_BUNDLE_ATTEMPTS - 1;
+        let hash = tx.hash;
+        let mut queued = vec![tx];
+        for exclusions in 1..=3 {
+            dispose_recovered_txs(1, &pool, 100, queued, &[], AttemptCharge::Excluded);
+            queued = pool.pop_all();
+            assert_eq!(queued.len(), 1, "exclusion {exclusions} evicted the tx");
+            assert_eq!(
+                (queued[0].hash, queued[0].attempts, queued[0].excluded_slots),
+                (hash, MAX_BUNDLE_ATTEMPTS - 1, exclusions)
+            );
+        }
+    }
+
+    #[test]
     fn exclusion_bound_evicts_with_nonce_suffix() {
         assert_failure_limit_evicts_nonce_suffix(AttemptCharge::Excluded);
     }
