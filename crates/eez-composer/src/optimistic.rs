@@ -33,20 +33,22 @@ use reth_primitives_traits::SealedHeader;
 
 use crate::held_pool::HeldTx;
 
-/// A failed entry extracted for slot-context recovery.
+/// Which retry budget a failed bundle consumes during rollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttemptCharge {
+    /// Re-queue without charging either counter.
+    #[default]
+    None,
+    /// The bundle missed its target or the relay rejected it.
+    Excluded,
+    /// Count against the settlement attempt limit, also used for prover failures.
+    Settlement,
+}
+
+/// An optimistic batch awaiting rollback or partial settlement disposition.
 ///
-/// "Failed" here always means the bundle did not land (postBatch had no
-/// receipt by its target L1 block). Under strict all-or-nothing bundles
-/// a reverting tx is excluded → the whole bundle drops, so the outcome
-/// can't distinguish "relay bad luck" from "a tx would revert" — both
-/// look like a drop. Poison is therefore caught earlier, at compose
-/// time (a tx whose chained simulation deterministically fails is
-/// evicted before it can ever enter a bundle); a drop that reaches
-/// recovery is treated as bad luck and re-queued, with
-/// [`MAX_BUNDLE_ATTEMPTS`](crate::composer::MAX_BUNDLE_ATTEMPTS) as a
-/// backstop for poison the compose-time sim view missed. The same bound covers
-/// proof failures and compose-time funding deferrals, so one counter follows a
-/// transaction across every bounded retry path.
+/// A builder may omit a bundle because it lost selection or because a bundled
+/// tx would revert. The observer sees an exclusion in either case.
 #[derive(Debug)]
 pub struct FailedBatch {
     /// L2 height of the optimistically-committed Sync block.
@@ -61,9 +63,8 @@ pub struct FailedBatch {
     pub block: alloy_primitives::B256,
     /// The user txs whose effects the block carried.
     pub txs: Vec<HeldTx>,
-    /// Drop not attributable to the txs (skipped L1 slot, relay transport
-    /// failure) — recovery re-queues without counting toward poison-eviction.
-    pub slot_skipped: bool,
+    /// Charge to apply if this batch is rolled back.
+    pub charge: AttemptCharge,
 }
 
 /// Resolution state of one optimistically-committed Sync block's batch.
@@ -100,8 +101,7 @@ struct InFlight {
     /// Settled first, while cursor confirmation owns the held pool's
     /// one-time in-flight cleanup.
     cursor_confirmed: bool,
-    /// Set by `mark_failed` when the drop wasn't the bundled txs' fault.
-    slot_skipped: bool,
+    charge: AttemptCharge,
 }
 
 /// Ledger of in-flight and settled-but-unfinalized optimistic batches.
@@ -141,7 +141,7 @@ impl OptimisticallyIncluded {
                 block,
                 resolution: Resolution::Pending,
                 cursor_confirmed: false,
-                slot_skipped: false,
+                charge: AttemptCharge::None,
             },
         );
     }
@@ -213,8 +213,8 @@ impl OptimisticallyIncluded {
             // in that window must still find every tx here to recover. The full
             // set is right then, since the reorg also undoes their spent nonces.
             txs: entry.txs.clone(),
-            // A partial settlement is not a drop: the entries that ran, ran.
-            slot_skipped: false,
+            // Charge only the culprit identified during partial disposition.
+            charge: AttemptCharge::None,
         })
     }
 
@@ -264,15 +264,15 @@ impl OptimisticallyIncluded {
     /// context via [`Self::take_failed_for_recovery`] — the observer
     /// task never mutates chain state. No-op if the entry is already
     /// Settled (cursor confirmation wins) or gone. See
-    /// [`FailedBatch::slot_skipped`] for the flag.
-    pub fn mark_failed(&self, sync_height: u64, post_batch_hash: TxHash, slot_skipped: bool) {
+    /// [`FailedBatch::charge`] for the rollback charge.
+    pub fn mark_failed(&self, sync_height: u64, post_batch_hash: TxHash, charge: AttemptCharge) {
         let mut map = self.by_sync_height.lock().unwrap();
         if let Some(entry) = map.get_mut(&sync_height)
             && entry.post_batch_hash == post_batch_hash
             && entry.resolution == Resolution::Pending
         {
             entry.resolution = Resolution::Failed;
-            entry.slot_skipped = slot_skipped;
+            entry.charge = charge;
         }
     }
 
@@ -296,7 +296,7 @@ impl OptimisticallyIncluded {
             parent: entry.parent,
             block: entry.block,
             txs: entry.txs,
-            slot_skipped: entry.slot_skipped,
+            charge: entry.charge,
         })
     }
 
@@ -312,7 +312,7 @@ impl OptimisticallyIncluded {
                 block: batch.block,
                 resolution: Resolution::Failed,
                 cursor_confirmed: false,
-                slot_skipped: batch.slot_skipped,
+                charge: batch.charge,
             },
         );
     }
@@ -380,6 +380,7 @@ mod tests {
             raw_tx: raw,
             hash,
             attempts: 0,
+            excluded_slots: 0,
             max_fee_per_gas: u128::from(tag),
             priority_fee_per_gas: u128::from(tag),
             sender: alloy_primitives::Address::repeat_byte(tag),
@@ -529,7 +530,12 @@ mod tests {
                     2 => {
                         if let Some(height) = blocking {
                             let batch = ledger.by_sync_height.lock().unwrap()[&height].post_batch_hash;
-                            ledger.mark_failed(height, batch, flag);
+                            let charge = if flag {
+                                AttemptCharge::Excluded
+                            } else {
+                                AttemptCharge::None
+                            };
+                            ledger.mark_failed(height, batch, charge);
                         }
                     }
                     3 => {
@@ -612,7 +618,7 @@ mod tests {
         assert_eq!(swept.sync_height, 10);
         assert_eq!(swept.txs.len(), 2);
         assert!(
-            !swept.slot_skipped,
+            swept.charge == AttemptCharge::None,
             "a partial settlement is not a drop: the entries that ran, ran",
         );
         assert!(
@@ -677,14 +683,14 @@ mod tests {
         pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
         pool.begin(10, pb_hash(0xb), hdr(), B256::ZERO, vec![tx(2)]);
 
-        pool.mark_failed(10, pb_hash(0xa), false);
+        pool.mark_failed(10, pb_hash(0xa), AttemptCharge::None);
         pool.mark_settled(10, pb_hash(0xa));
         pool.mark_settled_partial(10, pb_hash(0xa));
         assert!(pool.take_failed_for_recovery(0).is_none());
         assert!(pool.partial_to_dispose(10).is_none());
 
         // Still Pending, so the new bundle's own verdict applies.
-        pool.mark_failed(10, pb_hash(0xb), false);
+        pool.mark_failed(10, pb_hash(0xb), AttemptCharge::None);
         let failed = pool
             .take_failed_for_recovery(0)
             .expect("the new batch's verdict");
@@ -712,7 +718,7 @@ mod tests {
     fn failed_recovery_extracts_once_and_unblocks() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1), tx(2)]);
-        pool.mark_failed(10, pb_hash(0xa), false);
+        pool.mark_failed(10, pb_hash(0xa), AttemptCharge::None);
         // Failed entry still blocks until recovered.
         assert_eq!(pool.blocking_height(0), Some(10));
         let batch = pool.take_failed_for_recovery(0).expect("failed entry");
@@ -727,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn reinserted_failure_preserves_nonce_reservations() {
+    fn reinserted_failure_preserves_charge_and_nonce_reservations() {
         let held_pool = crate::HeldPool::new();
         let original = tx(1);
         held_pool.push_contiguous(original.clone(), 1).unwrap();
@@ -735,8 +741,9 @@ mod tests {
 
         let optimistic = OptimisticallyIncluded::new();
         optimistic.begin(10, pb_hash(0xa), hdr(), B256::ZERO, reserved);
-        optimistic.mark_failed(10, pb_hash(0xa), false);
+        optimistic.mark_failed(10, pb_hash(0xa), AttemptCharge::Excluded);
         let failed = optimistic.take_failed_for_recovery(0).unwrap();
+        assert_eq!(failed.charge, AttemptCharge::Excluded);
         optimistic.reinsert_failed(failed);
 
         let mut replacement = original;
@@ -744,30 +751,25 @@ mod tests {
         replacement.raw_tx = alloy_primitives::Bytes::from(vec![0xff; 4]);
         assert!(held_pool.push_contiguous(replacement, 1).is_err());
         assert_eq!(optimistic.blocking_height(0), Some(10));
-    }
-
-    #[test]
-    fn failed_recovery_propagates_slot_skipped() {
-        let pool = OptimisticallyIncluded::new();
-        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1), tx(2)]);
-        // A skipped-slot drop isn't the tx's fault; the flag must reach
-        // recovery so the caller requeues without poison-eviction.
-        pool.mark_failed(10, pb_hash(0xa), true);
-        let batch = pool.take_failed_for_recovery(0).expect("failed entry");
-        assert!(batch.slot_skipped);
-        assert_eq!(batch.txs.len(), 2);
+        assert_eq!(
+            optimistic.take_failed_for_recovery(0).unwrap().charge,
+            AttemptCharge::Excluded,
+        );
     }
 
     #[test]
     fn cursor_resolution_overrides_false_failure() {
         let pool = OptimisticallyIncluded::new();
         pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
-        pool.mark_failed(10, pb_hash(0xa), false);
+        pool.mark_failed(10, pb_hash(0xa), AttemptCharge::Excluded);
         // Deriver confirmed the batch — the false-negative verdict is overridden,
         // and nonces, not the verdict, decide what happens to its txs.
         assert!(pool.resolve_below_cursor(10).is_empty());
         assert!(pool.take_failed_for_recovery(0).is_none());
-        assert!(pool.partial_to_dispose(10).is_some());
+        assert_eq!(
+            pool.partial_to_dispose(10).unwrap().charge,
+            AttemptCharge::None
+        );
         assert_eq!(pool.blocking_height(10), None);
     }
 
