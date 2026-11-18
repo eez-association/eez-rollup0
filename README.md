@@ -88,7 +88,7 @@ EEZ_DEPLOY_SKIP_SIMULATION=1 make deploy-protocol
 ```
 
 This deploys EEZ + ECDSAProofSystem + the rollup manager, registers the
-rollup, deploys the L1 bridge contracts, and writes **`deployments.env`**
+rollup, deploys an initialized L1 reference ETH bridge, and writes **`deployments.env`**
 (registry, proof system, rollup id, deploy block, bridge, and EEZL2 addresses).
 The deploy uses reserved native system address `0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076`,
 generates its canonical EEZL2 genesis without allocating the system account, and
@@ -133,9 +133,7 @@ by name, the EEZ L1 and L2 chain IDs, and the running composer version:
   "eezContracts": {
     "eezRegistryAddress": "0x…",
     "eezRollupManagerAddress": "0x…",
-    "eezL1BridgeSender": "0x…",
-    "eezL2Address": "0x4200000000000000000000000000000000000007",
-    "eezL2BridgeReceiver": "0x…"
+    "eezL2Address": "0x4200000000000000000000000000000000000007"
   },
   "supportedNetworks": {
     "eezL1": 10200,
@@ -207,6 +205,39 @@ cargo run -p eez-follower -- node \
   --chain "$EEZ_L2_GENESIS_PATH" \
   --datadir "$EEZ_L2_DATADIR"
 ```
+
+## Reference ETH bridge
+
+Protocol deployment writes `EEZ_L1_BRIDGE_ADDRESS` to `deployments.env`.
+After L2 is producing blocks, deploy its counterpart with:
+
+```bash
+EEZ_L2_RPC_URL=http://localhost:18688 make deploy-bridge-l2
+```
+
+The deployment key must be funded on L2; `EEZ_L2_DEPLOY_KEY` overrides the
+normal deployment key. The command records `EEZ_L2_BRIDGE_ADDRESS` and reuses
+an existing bridge only when its manager and rollup ID match the deployment.
+Both bridges use the protocol's constructor-initialized deployment, so no
+CREATE2 factory or separate initialization transaction is needed.
+
+Call `bridgeEther(uint64,address)` with value on the source bridge, using the
+L1 cross-chain front for deposits and the L2 cross-chain front for withdrawals.
+The destination rollup ID is `EEZ_ROLLUP_ID` for deposits and `0` for withdrawals.
+The destination is the recipient, not a bridge receiver predeploy. The existing
+Kurtosis waves retain their direct-proxy transfers. The separate
+`testing/kurtosis/scripts/verify-bridge-round-trip.sh` check deposits through the L1 bridge,
+waits for the deposit to be safe, then withdraws the same amount through the L2
+bridge back to the sender. It checks gas-adjusted balances, escrow restoration,
+and matching block hashes and balances on an independent L1-only follower.
+The follower runs in the node image using Docker host networking on Linux.
+
+These are the protocol's test-only reference bridges. This integration covers
+ETH; it does not configure or validate ERC20 bridging between different bridge
+addresses. Removing the old `0x4200…0008` sink changes genesis: existing devnets
+need a fresh protocol deployment and fresh L2 data. It cannot recover funds
+already sent to the old sink.
+
 
 ## Build, test, teardown
 
