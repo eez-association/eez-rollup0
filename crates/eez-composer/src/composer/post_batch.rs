@@ -370,7 +370,7 @@ pub(super) async fn encode_da<'a>(
 
 /// Projected `postAndVerifyBatch` gas of the batch sized with a worst-case
 /// proof from each of `proof_count` attesters, and that call's byte length.
-pub(super) fn project_postbatch_gas(
+pub(super) fn postbatch_gas_with_floor(
     batch: &eez_protocol::EvmBatch,
     proof_count: usize,
     outbound_target_gas: u64,

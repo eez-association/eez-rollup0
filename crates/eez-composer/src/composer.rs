@@ -66,7 +66,7 @@ use blob::{
 };
 use post_batch::{
     apply_attestations, attestation_error, batch_range, build_da_payload, build_settlement_batch,
-    encode_da, project_postbatch_gas,
+    encode_da, postbatch_gas_with_floor,
 };
 
 fn bundle_targets_for_slot(
@@ -553,6 +553,37 @@ struct BlockGasCut {
     declared: u64,
 }
 
+/// The budget that ran out first and ended the drain.
+#[derive(Debug, Clone, Copy)]
+enum BudgetCut {
+    /// The postBatch gas budget; the refused tx's projected cost, for the cut
+    /// event.
+    PostBatchGas { rejected_cost: u64 },
+    /// The L2 block's gas, not the postBatch's.
+    BlockGas(BlockGasCut),
+    /// The blob byte budget.
+    Blob,
+}
+
+/// How the cross-chain drain ended. The first refusal or failure ends it, so
+/// at most one of a cut or a transient abort can happen.
+enum DrainEnd {
+    /// No cut or transient abort ended the drain early.
+    Complete,
+    /// A budget cut: `rest` is the tx that did not fit plus everything after
+    /// it, owed back to the pool unpenalized.
+    Cut {
+        cut: BudgetCut,
+        rest: Vec<(usize, HeldTx)>,
+    },
+    /// A transient failure aborts the slot: `rest` is the failing tx plus the
+    /// unprocessed remainder of both phases, re-queued with the survivors.
+    Transient {
+        error: String,
+        rest: Vec<(usize, HeldTx)>,
+    },
+}
+
 /// Emission bounds, resolved once at construction. `timing` is here for its
 /// `k()` — the grid the historical chunk boundary snaps to.
 #[derive(Debug, Clone, Copy)]
@@ -562,6 +593,8 @@ struct EmissionLimits {
     max_blocks: u64,
     /// Gas limit every postBatch is signed with, and the cap the drain uses.
     max_gas: u64,
+    /// Cap on held transactions attempted in one bundle.
+    max_user_txs: usize,
     /// Configured attesters: a batch may carry a proof from each.
     attesters: u64,
 }
@@ -578,6 +611,9 @@ impl EmissionLimits {
         let k = u64::from(timing.k());
         let requested_blocks = read_var("EEZ_MAX_BLOCKS_PER_BATCH");
         let requested_gas = read_var("EEZ_MAX_POSTBATCH_GAS");
+        let max_user_txs = read_var("EEZ_MAX_USER_TXS_PER_BUNDLE")
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(50);
         let max_blocks = grid_aligned_cap(requested_blocks.unwrap_or(MAX_BLOCKS_PER_BATCH), k);
         let max_gas = clamp_max_postbatch_gas(
             requested_gas.unwrap_or(DEFAULT_MAX_POSTBATCH_GAS),
@@ -589,6 +625,7 @@ impl EmissionLimits {
             Level::INFO,
             max_blocks,
             max_gas,
+            max_user_txs,
             k,
             requested_blocks = ?requested_blocks,
             requested_gas = ?requested_gas,
@@ -598,6 +635,7 @@ impl EmissionLimits {
             timing,
             max_blocks,
             max_gas,
+            max_user_txs,
             attesters,
         }
     }
@@ -1757,12 +1795,7 @@ where
         // Caps how many held transactions one bundle attempts and therefore how
         // many an atomic-relay drop re-queues. L1 block gas remains the hard
         // protocol constraint, so deployments may need a lower cap.
-        let max_user_txs = std::env::var("EEZ_MAX_USER_TXS_PER_BUNDLE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(50);
-        let drained = pool.pop_n(max_user_txs);
+        let drained = pool.pop_n(self.inner.emission.max_user_txs);
         // When the pool is empty, do not return early. This slot attempts a
         // minimal postBatch whose leading immediate entry advances L1's stored
         // root to the empty Sync block's final state root. Without it, L1's view
@@ -2074,7 +2107,7 @@ where
         // cross-chain effects; empty (minimal-path) blocks are
         // L1-independent and need no rollback.
         if !failed.txs.is_empty() {
-            let _guard = committer.begin_reconcile().await;
+            let guard = committer.begin_reconcile().await;
             // Cursor re-check UNDER the lock: the Deriver may have
             // canonicalized this very batch from L1 between the
             // observer's verdict and this slot (a false-failure
@@ -2124,7 +2157,7 @@ where
             // L2 txs. Head elsewhere → nothing to substitute.
             if replaces || head.hash() == failed.parent.hash() {
                 outcome = self
-                    .replace_failed_sync_block(rollup_id, rollup, &failed)
+                    .replace_failed_sync_block(rollup_id, rollup, &failed, &guard)
                     .await;
             }
             // The failed block stays canonical until a sibling replaces it, so keep
@@ -2147,13 +2180,13 @@ where
         outcome
     }
 
-    /// Commit an empty sibling in place of the failed Sync block. Called while
-    /// the caller holds the reconcile guard.
+    /// Commit an empty sibling in place of the failed Sync block.
     async fn replace_failed_sync_block(
         &self,
         rollup_id: u64,
         rollup: &RollupState<L2>,
         failed: &crate::optimistic::FailedBatch,
+        _reconcile: &tokio::sync::OwnedMutexGuard<()>,
     ) -> RecoveryOutcome {
         let sync_height = failed.sync_height;
         let committer = &self.inner.committer;
@@ -2480,7 +2513,6 @@ where
             poison_gaps: Vec::new(),
             funding_deferred: Vec::new(),
             funding_gaps: Vec::new(),
-            transient: None,
             budget: PostBatchGasBudget {
                 blob,
                 ..PostBatchGasBudget::new(
@@ -2488,10 +2520,7 @@ where
                     self.inner.emission.attesters,
                 )
             },
-            deferred: Vec::new(),
-            rejected_cost: None,
-            block_gas_cut: None,
-            blob_budget_cut: false,
+            end: DrainEnd::Complete,
         };
 
         // Canonical block order is all outbound pairs then all inbound
@@ -2506,18 +2535,16 @@ where
             .partition(|(_, held)| held.direction == Direction::Outbound);
 
         drain
-            .compose_outbound(
-                cc,
-                &stf_cfg,
-                outbound_gas_limit_cap,
-                &reopen,
-                outbounds,
-                &mut inbounds,
-            )
+            .compose_outbound(cc, &stf_cfg, outbound_gas_limit_cap, &reopen, outbounds)
             .await;
-        // An outbound abort already moved the inbounds into its re-queue set.
-        if drain.transient.is_none() {
-            drain.compose_inbound(cc, &stf_cfg, inbound_gas_limit_cap, reopen, inbounds);
+        // An outbound abort or cut moves the inbounds into its re-queue set.
+        match &mut drain.end {
+            DrainEnd::Cut { rest, .. } | DrainEnd::Transient { rest, .. } => {
+                rest.append(&mut inbounds);
+            }
+            DrainEnd::Complete => {
+                drain.compose_inbound(cc, &stf_cfg, inbound_gas_limit_cap, reopen, inbounds);
+            }
         }
         // Boxed: the drain holds two live execution contexts, so its future is
         // past the inline-size budget.
@@ -2553,7 +2580,6 @@ where
     ) -> Result<Option<SyncSlotBlock>, String> {
         let ctx = cc.exec_ctx.as_ref();
         let pool = rollup.held_pool.as_ref();
-        let deferred_was_empty = drain.deferred.is_empty();
         drain.handle_budget_cut();
         let CrossChainDrain {
             rollup_id,
@@ -2569,8 +2595,7 @@ where
             poison,
             poison_gaps,
             mut funding_deferred,
-            transient,
-            deferred,
+            end,
             ..
         } = drain;
 
@@ -2604,39 +2629,37 @@ where
             }
         }
 
-        // ── Transient abort: re-queue survivors + remainder, minimal. ──
-        // A cut empties the inbound queue, so phase 2 can't also fail here.
-        // Asserted so a future edit can't double-push the survivors.
-        debug_assert!(
-            transient.is_none() || deferred_was_empty,
-            "budget cut and transient abort are mutually exclusive"
-        );
-        if let Some((err, rest)) = transient {
-            event!(
-                name: "eez.composer.phase2.transient",
-                Level::WARN,
-                rollup_id,
-                error = %err,
-                survivors = survivors.len(),
-                "transient compose failure; re-queueing and degrading to minimal postBatch this slot",
-            );
-            // Both phases contribute; the pool is owed its own FIFO order.
-            let mut requeue = funding_deferred;
-            requeue.extend(survivors);
-            requeue.extend(rest);
-            requeue_unprocessed(pool, rollup_id, &poison_gaps, requeue);
-            return self
-                .dispatch_minimal_postbatch(
-                    ctx,
+        let deferred = match end {
+            DrainEnd::Complete => Vec::new(),
+            DrainEnd::Cut { rest, .. } => rest,
+            // ── Transient abort: re-queue survivors + remainder, minimal. ──
+            DrainEnd::Transient { error, rest } => {
+                event!(
+                    name: "eez.composer.phase2.transient",
+                    Level::WARN,
                     rollup_id,
-                    rollup,
-                    parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                )
-                .await;
-        }
+                    error = %error,
+                    survivors = survivors.len(),
+                    "transient compose failure; re-queueing and degrading to minimal postBatch this slot",
+                );
+                // Both phases contribute; the pool is owed its own FIFO order.
+                let mut requeue = funding_deferred;
+                requeue.extend(survivors);
+                requeue.extend(rest);
+                requeue_unprocessed(pool, rollup_id, &poison_gaps, requeue);
+                return self
+                    .dispatch_minimal_postbatch(
+                        ctx,
+                        rollup_id,
+                        rollup,
+                        parent_header,
+                        timestamp,
+                        suggested_fee_recipient,
+                        bundle_target,
+                    )
+                    .await;
+            }
+        };
 
         funding_deferred.extend(deferred);
         if !funding_deferred.is_empty() {
@@ -3721,7 +3744,7 @@ where
         // Priced on the encoded candidate before witnesses and proving; `Ok(None)`
         // is over-budget, not an error, and the caller chooses what to do.
         let ceiling = self.inner.emission.max_gas;
-        let (projected_gas, calldata_bytes) = project_postbatch_gas(
+        let (projected_gas, calldata_bytes) = postbatch_gas_with_floor(
             &batch,
             self.inner.quorum.len(),
             outbound_target_gas,
@@ -3965,22 +3988,11 @@ struct CrossChainDrain {
     /// still settle and change the balance for the next slot.
     funding_deferred: Vec<(usize, HeldTx)>,
     funding_gaps: Vec<(Address, Direction, u64)>,
-    /// On a transient failure we abort the slot; this holds the error
-    /// string + the txs still needing re-queue (the failing tx + the
-    /// unprocessed remainder of both phases; survivors are added below).
-    transient: Option<(String, Vec<(usize, HeldTx)>)>,
     /// Gas and bytes, not the tx cap, bound this bundle; overflow stays
     /// held for later slots.
     budget: PostBatchGasBudget,
-    /// Set by a budget cut: the tx that did not fit plus everything after it,
-    /// owed back to the pool unpenalized.
-    deferred: Vec<(usize, HeldTx)>,
-    /// Cost of the tx that tripped the budget, for the cut event.
-    rejected_cost: Option<u64>,
-    /// Set instead when it was the L2 block's gas, not the postBatch's, that
-    /// ran out. The cuts are mutually exclusive: the first refusal ends the drain.
-    block_gas_cut: Option<BlockGasCut>,
-    blob_budget_cut: bool,
+    /// Set by the cut or transient abort that ended the drain, if any.
+    end: DrainEnd,
 }
 
 impl CrossChainDrain {
@@ -3991,19 +4003,23 @@ impl CrossChainDrain {
         // ── Budget cut: settle what fits, keep the rest held. ─────────
         // Normal under load. Before the poison sweep, so an eviction here rides
         // the same nonce cascade.
-        if !self.deferred.is_empty() {
-            let deferred_count = self.deferred.len();
+        if let DrainEnd::Cut { cut, rest } = &mut self.end {
+            let deferred_count = rest.len();
             let accepted_count = self.survivors.len();
             // A block-gas cut needs gas on the block, which needs an accepted tx,
             // so the eviction branch below can only ever be an L1-budget cut.
             debug_assert!(
-                accepted_count > 0 || self.block_gas_cut.is_none(),
+                accepted_count > 0 || !matches!(cut, BudgetCut::BlockGas(_)),
                 "a block-gas cut cannot happen with nothing accepted"
             );
-            if accepted_count == 0 && !self.blob_budget_cut {
+            let rejected_cost = match cut {
+                BudgetCut::PostBatchGas { rejected_cost } => *rejected_cost,
+                BudgetCut::BlockGas(_) | BudgetCut::Blob => 0,
+            };
+            if accepted_count == 0 && !matches!(cut, BudgetCut::Blob) {
                 // It lost against the whole budget, so no slot is roomier and
                 // re-queueing would block the FIFO forever. It sits first.
-                let (_, head) = self.deferred.remove(0);
+                let (_, head) = rest.remove(0);
                 event!(
                     name: "eez.composer.sync_slot.gas_budget_cut",
                     Level::WARN,
@@ -4011,13 +4027,13 @@ impl CrossChainDrain {
                     accepted_count,
                     deferred_count,
                     projected_gas = self.budget.projected,
-                    rejected_cost = self.rejected_cost.unwrap_or(0),
+                    rejected_cost,
                     budget = self.budget.cap,
                     tx_hash = %head.hash,
                     "the first held tx alone exceeds the postBatch gas budget; it can never settle — evicting it (resubmit a cheaper call)",
                 );
                 push_poison_root(&mut self.poison, &mut self.poison_gaps, head);
-            } else if self.blob_budget_cut {
+            } else if matches!(cut, BudgetCut::Blob) {
                 event!(
                     name: "eez.composer.sync_slot.blob_budget_cut",
                     Level::INFO,
@@ -4027,7 +4043,7 @@ impl CrossChainDrain {
                     blob = ?self.budget.blob,
                     "blob byte budget reached; remaining held transactions stay queued",
                 );
-            } else if let Some(BlockGasCut { gas_used, declared }) = self.block_gas_cut {
+            } else if let BudgetCut::BlockGas(BlockGasCut { gas_used, declared }) = *cut {
                 event!(
                     name: "eez.composer.sync_slot.block_gas_cut",
                     Level::INFO,
@@ -4047,7 +4063,7 @@ impl CrossChainDrain {
                     accepted_count,
                     deferred_count,
                     projected_gas = self.budget.projected,
-                    rejected_cost = self.rejected_cost.unwrap_or(0),
+                    rejected_cost,
                     budget = self.budget.cap,
                     "postBatch gas budget reached; {{deferred_count}} held tx(s) stay queued for a later Sync slot",
                 );
@@ -4055,9 +4071,7 @@ impl CrossChainDrain {
         }
     }
 
-    /// Phase 1: compose the outbound (L2→L1) transactions onto the drain. A
-    /// budget cut or transient abort also moves the not-yet-composed
-    /// `inbounds` into its re-queue set, leaving `inbounds` empty.
+    /// Phase 1: compose the outbound (L2→L1) transactions onto the drain.
     async fn compose_outbound(
         &mut self,
         cc: &CrossChainWiring,
@@ -4065,7 +4079,6 @@ impl CrossChainDrain {
         outbound_gas_limit_cap: Option<u64>,
         reopen: impl Fn(&[Bytes]) -> Result<SyncBlockState, BuildError>,
         outbounds: Vec<(usize, HeldTx)>,
-        inbounds: &mut Vec<(usize, HeldTx)>,
     ) {
         let (rollup_id, nonce, attesters) = (self.rollup_id, self.nonce, self.attesters);
         let local = &cc.local;
@@ -4137,10 +4150,10 @@ impl CrossChainDrain {
             let (l1_exec, mut l2_fork) = match contexts {
                 Ok(contexts) => contexts,
                 Err(e) => {
-                    self.transient = Some((
-                        format!("outbound execution contexts tx#{idx}: {e}"),
-                        abort_rest(Some((idx, held)), &mut out_iter, std::mem::take(inbounds)),
-                    ));
+                    self.end = DrainEnd::Transient {
+                        error: format!("outbound execution contexts tx#{idx}: {e}"),
+                        rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                    };
                     break;
                 }
             };
@@ -4256,15 +4269,13 @@ impl CrossChainDrain {
                     match block_gas_fit(self.draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
                         BlockGasFit::Accept => {}
                         BlockGasFit::Defer => {
-                            self.block_gas_cut = Some(BlockGasCut {
-                                gas_used: self.draft.gas_used(),
-                                declared,
-                            });
-                            self.deferred = abort_rest(
-                                Some((idx, held)),
-                                &mut out_iter,
-                                std::mem::take(inbounds),
-                            );
+                            self.end = DrainEnd::Cut {
+                                cut: BudgetCut::BlockGas(BlockGasCut {
+                                    gas_used: self.draft.gas_used(),
+                                    declared,
+                                }),
+                                rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                            };
                             break;
                         }
                         BlockGasFit::Unfittable => {
@@ -4299,23 +4310,17 @@ impl CrossChainDrain {
                             continue;
                         }
                         Ok(BlockGasFit::Defer) => {
-                            self.blob_budget_cut = true;
-                            self.deferred = abort_rest(
-                                Some((idx, held)),
-                                &mut out_iter,
-                                std::mem::take(inbounds),
-                            );
+                            self.end = DrainEnd::Cut {
+                                cut: BudgetCut::Blob,
+                                rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                            };
                             break;
                         }
                         Err(error) => {
-                            self.transient = Some((
+                            self.end = DrainEnd::Transient {
                                 error,
-                                abort_rest(
-                                    Some((idx, held)),
-                                    &mut out_iter,
-                                    std::mem::take(inbounds),
-                                ),
-                            ));
+                                rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                            };
                             break;
                         }
                     }
@@ -4328,16 +4333,17 @@ impl CrossChainDrain {
                         target_gas,
                     );
                     if !candidate_budget.try_accept(cost) {
-                        self.rejected_cost = Some(
-                            projected_postbatch_gas(
-                                cost.entries,
-                                cost.calldata_gas,
-                                cost.target_gas,
-                            )
-                            .saturating_add(attestation_gas(attesters)),
-                        );
-                        self.deferred =
-                            abort_rest(Some((idx, held)), &mut out_iter, std::mem::take(inbounds));
+                        self.end = DrainEnd::Cut {
+                            cut: BudgetCut::PostBatchGas {
+                                rejected_cost: projected_postbatch_gas(
+                                    cost.entries,
+                                    cost.calldata_gas,
+                                    cost.target_gas,
+                                )
+                                .saturating_add(attestation_gas(attesters)),
+                            },
+                            rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                        };
                         break;
                     }
                     // ── ACCEPT ───────────────────────────────────────
@@ -4373,14 +4379,10 @@ impl CrossChainDrain {
                             // A backing-store failure says nothing about the tx —
                             // abort the slot instead of evicting a valid pair.
                             if matches!(&why, BuildError::Provider(_)) {
-                                self.transient = Some((
-                                    format!("outbound append tx#{idx} at {at}: {why}"),
-                                    abort_rest(
-                                        Some((idx, held)),
-                                        &mut out_iter,
-                                        std::mem::take(inbounds),
-                                    ),
-                                ));
+                                self.end = DrainEnd::Transient {
+                                    error: format!("outbound append tx#{idx} at {at}: {why}"),
+                                    rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                                };
                                 break;
                             }
                             event!(
@@ -4399,10 +4401,12 @@ impl CrossChainDrain {
                             self.draft = match reopen(&self.sync_txs) {
                                 Ok(rebuilt) => rebuilt,
                                 Err(e) => {
-                                    self.transient = Some((
-                                        format!("Sync block prefix rebuild after tx#{idx}: {e}"),
-                                        abort_rest(None, &mut out_iter, std::mem::take(inbounds)),
-                                    ));
+                                    self.end = DrainEnd::Transient {
+                                        error: format!(
+                                            "Sync block prefix rebuild after tx#{idx}: {e}"
+                                        ),
+                                        rest: abort_rest(None, &mut out_iter, Vec::new()),
+                                    };
                                     break;
                                 }
                             };
@@ -4434,10 +4438,10 @@ impl CrossChainDrain {
                         self.draft = match reopen(&self.sync_txs) {
                             Ok(rebuilt) => rebuilt,
                             Err(e) => {
-                                self.transient = Some((
-                                    format!("Sync block prefix rebuild after tx#{idx}: {e}"),
-                                    abort_rest(None, &mut out_iter, std::mem::take(inbounds)),
-                                ));
+                                self.end = DrainEnd::Transient {
+                                    error: format!("Sync block prefix rebuild after tx#{idx}: {e}"),
+                                    rest: abort_rest(None, &mut out_iter, Vec::new()),
+                                };
                                 break;
                             }
                         };
@@ -4465,14 +4469,10 @@ impl CrossChainDrain {
                                 error = %e,
                                 "the L1 execution session did not come back from the composition; the slot's L1 state can no longer chain — degrading",
                             );
-                            self.transient = Some((
-                                format!("L1 session hand-off tx#{idx}: {e}"),
-                                abort_rest(
-                                    Some((idx, held)),
-                                    &mut out_iter,
-                                    std::mem::take(inbounds),
-                                ),
-                            ));
+                            self.end = DrainEnd::Transient {
+                                error: format!("L1 session hand-off tx#{idx}: {e}"),
+                                rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                            };
                             break;
                         }
                     }
@@ -4525,10 +4525,10 @@ impl CrossChainDrain {
                     push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
                 }
                 Err(e) => {
-                    self.transient = Some((
-                        format!("compose_crosschain outbound tx#{idx}: {e}"),
-                        abort_rest(Some((idx, held)), &mut out_iter, std::mem::take(inbounds)),
-                    ));
+                    self.end = DrainEnd::Transient {
+                        error: format!("compose_crosschain outbound tx#{idx}: {e}"),
+                        rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                    };
                     break;
                 }
             }
@@ -4552,7 +4552,7 @@ impl CrossChainDrain {
         // probes the canonical delivery on a fork of the block and reads the
         // claim off the real `EEZL2 → proxy` frame. On accept the delivery
         // extends the block and the source fork's writes become the state.
-        // A phase-1 abort already collected these txs into the re-queue set.
+        // Skipped after a phase-1 abort or cut; the caller re-queues these txs.
         let mut in_iter = inbounds.into_iter();
         while let Some((idx, held)) = in_iter.next() {
             if let Some(gap_at) = poison_gap_for(&self.poison_gaps, &held) {
@@ -4607,10 +4607,10 @@ impl CrossChainDrain {
             let (probe, (mut l1_fork, l1_env)) = match contexts {
                 Ok(contexts) => contexts,
                 Err(e) => {
-                    self.transient = Some((
-                        format!("inbound execution contexts tx#{idx}: {e}"),
-                        abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
-                    ));
+                    self.end = DrainEnd::Transient {
+                        error: format!("inbound execution contexts tx#{idx}: {e}"),
+                        rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                    };
                     break;
                 }
             };
@@ -4675,11 +4675,13 @@ impl CrossChainDrain {
                     match block_gas_fit(self.draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
                         BlockGasFit::Accept => {}
                         BlockGasFit::Defer => {
-                            self.block_gas_cut = Some(BlockGasCut {
-                                gas_used: self.draft.gas_used(),
-                                declared,
-                            });
-                            self.deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
+                            self.end = DrainEnd::Cut {
+                                cut: BudgetCut::BlockGas(BlockGasCut {
+                                    gas_used: self.draft.gas_used(),
+                                    declared,
+                                }),
+                                rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                            };
                             break;
                         }
                         BlockGasFit::Unfittable => {
@@ -4714,15 +4716,17 @@ impl CrossChainDrain {
                             continue;
                         }
                         Ok(BlockGasFit::Defer) => {
-                            self.blob_budget_cut = true;
-                            self.deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
+                            self.end = DrainEnd::Cut {
+                                cut: BudgetCut::Blob,
+                                rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                            };
                             break;
                         }
                         Err(error) => {
-                            self.transient = Some((
+                            self.end = DrainEnd::Transient {
                                 error,
-                                abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
-                            ));
+                                rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                            };
                             break;
                         }
                     }
@@ -4735,15 +4739,17 @@ impl CrossChainDrain {
                         0,
                     );
                     if !candidate_budget.try_accept(cost) {
-                        self.rejected_cost = Some(
-                            projected_postbatch_gas(
-                                cost.entries,
-                                cost.calldata_gas,
-                                cost.target_gas,
-                            )
-                            .saturating_add(attestation_gas(attesters)),
-                        );
-                        self.deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
+                        self.end = DrainEnd::Cut {
+                            cut: BudgetCut::PostBatchGas {
+                                rejected_cost: projected_postbatch_gas(
+                                    cost.entries,
+                                    cost.calldata_gas,
+                                    cost.target_gas,
+                                )
+                                .saturating_add(attestation_gas(attesters)),
+                            },
+                            rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                        };
                         break;
                     }
                     // ── ACCEPT ───────────────────────────────────────
@@ -4794,10 +4800,10 @@ impl CrossChainDrain {
                         // A backing-store failure says nothing about the tx —
                         // abort the slot instead of evicting a valid delivery.
                         if matches!(&why, BuildError::Provider(_)) {
-                            self.transient = Some((
-                                format!("inbound append tx#{idx} at {at}: {why}"),
-                                abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
-                            ));
+                            self.end = DrainEnd::Transient {
+                                error: format!("inbound append tx#{idx} at {at}: {why}"),
+                                rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                            };
                             break;
                         }
                         event!(
@@ -4814,10 +4820,10 @@ impl CrossChainDrain {
                         self.draft = match reopen(&self.sync_txs) {
                             Ok(rebuilt) => rebuilt,
                             Err(e) => {
-                                self.transient = Some((
-                                    format!("Sync block prefix rebuild after tx#{idx}: {e}"),
-                                    abort_rest(None, &mut in_iter, Vec::new()),
-                                ));
+                                self.end = DrainEnd::Transient {
+                                    error: format!("Sync block prefix rebuild after tx#{idx}: {e}"),
+                                    rest: abort_rest(None, &mut in_iter, Vec::new()),
+                                };
                                 break;
                             }
                         };
@@ -4860,10 +4866,10 @@ impl CrossChainDrain {
                 Err(e) => {
                     // Transient (provider / transport / unavailable) —
                     // abort the slot, re-queue this tx + the remainder.
-                    self.transient = Some((
-                        format!("compose_crosschain inbound tx#{idx}: {e}"),
-                        abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
-                    ));
+                    self.end = DrainEnd::Transient {
+                        error: format!("compose_crosschain inbound tx#{idx}: {e}"),
+                        rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                    };
                     break;
                 }
             }
