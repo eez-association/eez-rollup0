@@ -82,8 +82,13 @@ required by the posted data. The prover still owns its local L2 database.
 
 ## Updating both repositories
 
-Land shared follower changes here first. Pin a compatible root revision in the
-prover workspace, test it there, then update this repository's submodule pointer.
+Publish shared follower changes here first and keep the compatible commit
+reachable. Pin that revision in the prover workspace, test and merge the prover
+changes, then land this repository's submodule update. For the initial migration,
+the API commit can be published on the root PR branch before that PR merges.
+Preserve it with a merge commit or a lasting compatibility ref; a squash of the
+evm2 integration is not a compatible replacement for the prover's revm source pin.
+If the prover PR is squashed, update the root gitlink to its resulting merge SHA.
 If root has changed reth APIs, port shared follower fixes to the compatible
 revision before moving the prover pin; do not replace its execution stack just
 to consume a newer follower source revision.

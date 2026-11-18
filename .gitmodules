@@ -7,5 +7,5 @@
 [submodule "provers"]
 	path = provers
 	url = https://github.com/eez-association/provers.git
-	# The gitlink pins the stateless proof signer (stateless-ecdsa/). Upgrade
+	# The gitlink pins both ECDSA proof signers (ecdsa/). Upgrade
 	# it the same way as eez-core-protocol.

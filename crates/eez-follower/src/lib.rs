@@ -66,7 +66,11 @@ pub fn run() -> eyre::Result<()> {
                 && env::var_os("EEZ_STATEFUL_PROOF_SIGNER_KEY").is_none(),
             "stateful signing moved to the eez-prover-stateful binary in eez-association/provers",
         );
-        Ok((eez_evm::EezEvmConfig::new(chain_spec)?, (), |_| Ok(())))
+        Ok((
+            eez_evm::EezEvmConfig::new(chain_spec)?,
+            eez_evm::EezTxEnvConverter,
+            |_| Ok(()),
+        ))
     })
 }
 
@@ -243,7 +247,7 @@ where
         let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_BUFFER);
         let overlay = eez_p2p::Overlay::new(
             cfg,
-            eez_p2p::keypair(&network.secret_key().secret_bytes())?,
+            eez_p2p::keypair(&network.secret_key().to_secret_bytes())?,
             eez_p2p::Validator::new(head_domain, sequencer_address),
             eez_node_common::discover(network.clone()),
         )?;

@@ -16,32 +16,22 @@ use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT};
 use eez_engine::EezEngineTypes;
-use eez_evm::{EezEvmConfig, ensure_supported_transaction};
+use eez_evm::{EezEvmConfig, EezEvmTx, EezEvmTypes, ensure_supported_transaction};
 use eez_primitives::{Block, EezTxEnvelope as TransactionSigned};
+use evm2::{Inspector, TxResult, evm::Cache, registry::HandlerError};
 use reth_chainspec::EthereumHardforks;
 use reth_evm::{
-    ConfigureEvm, Evm as _, EvmEnvFor, InspectorFor, NextBlockEnvAttributes, execute::BlockBuilder,
+    ConfigureEvm, Evm as _, EvmEnvFor, NextBlockEnvAttributes, database::StateProviderDatabase,
+    execute::BlockBuilder,
 };
 use reth_payload_primitives::PayloadTypes;
 use reth_primitives_traits::{Recovered, RecoveredBlock, SealedHeader, SignedTransaction};
-use reth_revm::database::StateProviderDatabase;
-use reth_storage_api::{
-    EvmStateProviderAdapter, StateProvider, StateProviderBox, StateProviderFactory,
-};
-use revm::database::{CacheState, State};
-use revm::inspector::NoOpInspector;
-use revm::{
-    DatabaseCommit,
-    context::result::{EVMError, ExecutionResult},
-};
+use reth_storage_api::{StateProvider, StateProviderFactory};
 use std::sync::Arc;
 use thiserror::Error;
 
 use super::provider::StateSnapshotProvider;
-
-/// The revm state a Sync block is built over: the parent state provider plus
-/// every change committed by the block's txs so far.
-pub type DraftDb = State<StateProviderDatabase<EvmStateProviderAdapter<StateProviderBox>>>;
+use super::sim::SimState;
 
 /// Errors raised by [`build_sync_block`].
 #[derive(Debug, Error)]
@@ -55,7 +45,7 @@ pub enum BuildError {
     /// Signer recovery failed for the held tx at `idx`.
     #[error("recover signer for tx #{idx}")]
     RecoverSigner { idx: usize },
-    /// Revm rejected the tx at execution time (gas, balance, …).
+    /// The EVM rejected the tx at execution time (gas, balance, …).
     #[error("execute tx #{idx}: {msg}")]
     ExecuteTx { idx: usize, msg: String },
     /// `reth-evm` block-builder primitive surfaced an error during
@@ -129,25 +119,17 @@ fn recover_tx(raw: &Bytes, idx: usize) -> Result<Recovered<TransactionSigned>, B
     SignedTransaction::try_into_recovered(tx).map_err(|_| BuildError::RecoverSigner { idx })
 }
 
-/// Open the revm state for a block built on `parent_hash`, optionally
-/// preloaded with an already-warmed cache.
-fn open_draft_db(
+/// Open the state of a block built on `parent_hash` with `cache` accepted
+/// over it.
+fn open_draft_state(
     provider: &dyn StateSnapshotProvider,
     parent_hash: B256,
-    cache: Option<CacheState>,
-) -> Result<DraftDb, BuildError> {
+    cache: Cache,
+) -> Result<SimState, BuildError> {
     let state_provider = provider
         .state_by_block_hash(parent_hash)
         .map_err(|e| BuildError::Provider(format!("state_by_block_hash({parent_hash}): {e}")))?;
-    let mut builder = State::builder()
-        .with_database(StateProviderDatabase::new(
-            state_provider.into_evm_state_provider(),
-        ))
-        .with_bundle_update();
-    if let Some(cache) = cache {
-        builder = builder.with_cached_prestate(cache);
-    }
-    Ok(builder.build())
+    Ok(SimState::new(state_provider, cache))
 }
 
 /// Build a Sync block on top of `parent`, executing `sync_txs` in order. The
@@ -178,16 +160,12 @@ where
     let state_provider = l2_provider
         .state_by_block_hash(parent_hash)
         .map_err(|e| BuildError::Provider(format!("state_by_block_hash({parent_hash}): {e}")))?;
-    let state_db = StateProviderDatabase::new(state_provider.as_ref().into_evm_state_provider());
-    let mut db = State::builder()
-        .with_database(state_db)
-        .with_bundle_update()
-        .build();
+    let db = StateProviderDatabase::new(state_provider.as_ref().into_evm_state_provider());
 
     let attributes = next_block_attributes(evm_config, timestamp, suggested_fee_recipient);
 
     let mut builder = evm_config
-        .builder_for_next_block(&mut db, parent, attributes)
+        .builder_for_next_block(db, parent, attributes)
         .map_err(|e| BuildError::Builder(format!("builder_for_next_block: {e}")))?;
 
     builder
@@ -227,7 +205,7 @@ where
 /// Outcome of one transaction executed on a live prefix state.
 ///
 /// A reverted tx is a successful *execution* with `success == false` — only a
-/// tx revm refuses outright (nonce, balance, decode) is a [`BuildError`].
+/// tx the EVM refuses outright (nonce, balance, decode) is a [`BuildError`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxOutcome {
     /// Receipt-level status: false for a revert or a halt.
@@ -242,50 +220,46 @@ pub struct TxOutcome {
     pub logs: Vec<alloy_primitives::Log>,
 }
 
-fn exec_outcome<H>(result: &ExecutionResult<H>) -> TxOutcome {
+fn exec_outcome(result: TxResult<EezEvmTypes>) -> TxOutcome {
     TxOutcome {
         success: result.is_success(),
         gas_used: result.tx_gas_used(),
-        output: result.output().cloned().unwrap_or_default(),
-        logs: result.logs().to_vec(),
+        output: result.output,
+        logs: result.logs,
     }
 }
 
 /// Execute one raw tx against `state` under `evm_env` and commit it — the
-/// per-tx half of `BlockBuilder::execute_transaction` (`alloy_evm`'s
-/// `EthBlockExecutor` transacts and commits the same way; the rest of its work
-/// is receipts and block-gas accounting, which carry no state).
+/// per-tx half of `BlockBuilder::execute_transaction` (the block executor
+/// transacts and commits the same way; the rest of its work is receipts and
+/// block-gas accounting, which carry no state).
 ///
 /// The caller tracks cumulative block gas off [`TxOutcome::gas_used`] — the
 /// same per-tx figure the block executor adds to its own total.
-///
-/// The uninspected path passes [`NoOpInspector`], the same inspector reth uses
-/// when a caller supplies none.
-fn execute_and_commit_inspected<I>(
+fn execute_and_commit(
     evm_config: &EezEvmConfig,
-    state: &mut DraftDb,
+    state: &mut SimState,
     evm_env: &EvmEnvFor<EezEvmConfig>,
     raw: &Bytes,
     idx: usize,
-    inspector: I,
-) -> Result<TxOutcome, BuildError>
-where
-    I: for<'db> InspectorFor<EezEvmConfig, &'db mut DraftDb>,
-{
-    let recovered = recover_tx(raw, idx)?;
-    let mut evm = evm_config.evm_with_env_and_inspector(state, evm_env.clone(), inspector);
+    inspector: Option<&mut dyn Inspector<EezEvmTypes>>,
+) -> Result<TxOutcome, BuildError> {
+    let tx = recover_tx(raw, idx)?.convert::<EezEvmTx>();
     // A database read failure is the store being unavailable, not the tx being
     // invalid: the two classes drive opposite recoveries in the drain.
-    let result = evm.transact(&recovered).map_err(|e| match e {
-        EVMError::Database(err) => BuildError::Provider(format!("execute tx #{idx}: {err}")),
-        other => BuildError::ExecuteTx {
-            idx,
-            msg: other.to_string(),
-        },
-    })?;
-    let outcome = exec_outcome(&result.result);
-    evm.db_mut().commit(result.state);
-    Ok(outcome)
+    let executed = state
+        .transact(evm_config, evm_env, &tx, inspector)
+        .map_err(|e| match e {
+            HandlerError::Database(err) => {
+                BuildError::Provider(format!("execute tx #{idx}: {err}"))
+            }
+            other => BuildError::ExecuteTx {
+                idx,
+                msg: other.to_string(),
+            },
+        })?;
+    state.commit(&executed.pending_state);
+    Ok(exec_outcome(executed.result))
 }
 
 /// Live, incrementally extended execution state of the Sync block under
@@ -302,7 +276,7 @@ pub struct SyncBlockState {
     evm_config: EezEvmConfig,
     parent_hash: B256,
     evm_env: EvmEnvFor<EezEvmConfig>,
-    state: DraftDb,
+    state: SimState,
     /// Number of txs applied — the next tx's block position.
     applied: usize,
     /// Cumulative gas of the applied txs, matching the block executor's own
@@ -324,7 +298,7 @@ impl SyncBlockState {
     /// Declared transaction-gas cap from this draft's next-block environment.
     #[must_use]
     pub(crate) fn declared_tx_gas_limit_cap(&self) -> Option<u64> {
-        eez_evm::declared_tx_gas_limit_cap(&self.evm_env.cfg_env)
+        eez_evm::declared_tx_gas_limit_cap(&self.evm_env.version)
     }
 
     /// Open the state of a Sync block on `parent` whose first `prefix_txs` have
@@ -342,19 +316,19 @@ impl SyncBlockState {
         prefix_txs: &[Bytes],
     ) -> Result<Self, BuildError> {
         let parent_hash = parent.hash();
-        let mut state = open_draft_db(provider.as_ref(), parent_hash, None)?;
+        let mut state = open_draft_state(provider.as_ref(), parent_hash, Cache::default())?;
         let attributes = next_block_attributes(evm_config, timestamp, suggested_fee_recipient);
         let evm_env = evm_config
             .next_evm_env(parent, &attributes)
             .map_err(|e| BuildError::Builder(format!("next_evm_env: {e}")))?;
 
-        // Drive the prefix through the real block builder, then drop it WITHOUT
-        // `finish`: that applies the pre-execution changes exactly once and
-        // leaves `state` at the mid-block point appended txs continue from.
+        // Drive the prefix through the real block builder, then take its state
+        // WITHOUT `finish`: that applies the pre-execution changes exactly once
+        // and leaves `state` at the mid-block point appended txs continue from.
         let mut gas_used: u64 = 0;
-        {
+        let cache = {
             let mut builder = evm_config
-                .builder_for_next_block(&mut state, parent, attributes)
+                .builder_for_next_block(state.database_mut(), parent, attributes)
                 .map_err(|e| BuildError::Builder(format!("builder_for_next_block: {e}")))?;
             builder
                 .apply_pre_execution_changes()
@@ -370,7 +344,9 @@ impl SyncBlockState {
                     })?;
                 gas_used = gas_used.saturating_add(gas.tx_gas_used());
             }
-        }
+            builder.evm_mut().take_state_cache()
+        };
+        state.merge(cache);
 
         Ok(Self {
             provider,
@@ -397,31 +373,31 @@ impl SyncBlockState {
     ///
     /// See [`BuildError`].
     pub fn execute_tx(&mut self, raw: &Bytes) -> Result<TxOutcome, BuildError> {
-        let outcome = execute_and_commit_inspected(
+        let outcome = execute_and_commit(
             &self.evm_config,
             &mut self.state,
             &self.evm_env,
             raw,
             self.applied,
-            NoOpInspector,
+            None,
         )?;
         self.applied += 1;
         self.gas_used = self.gas_used.saturating_add(outcome.gas_used);
         Ok(outcome)
     }
 
-    /// Open a throwaway fork of this state: a fresh revm state over the same
-    /// parent state provider, preloaded with a clone of this state's cache and
+    /// Open a throwaway fork of this state: a fresh state over the same parent
+    /// state provider, preloaded with a clone of this state's cache and
     /// running the same env. Nothing executed on the fork touches the block.
     ///
     /// # Errors
     ///
     /// See [`BuildError`].
     pub fn fork(&mut self) -> Result<SyncBlockFork, BuildError> {
-        let state = open_draft_db(
+        let state = open_draft_state(
             self.provider.as_ref(),
             self.parent_hash,
-            Some(self.state.cache.clone()),
+            self.state.cache().clone(),
         )?;
         Ok(SyncBlockFork {
             evm_config: self.evm_config.clone(),
@@ -437,7 +413,7 @@ impl SyncBlockState {
 /// rollback undoes; `applied` and `gas_used` ride along so both rewind too.
 #[derive(Debug)]
 pub struct ForkSnapshot {
-    cache: CacheState,
+    cache: Cache,
     applied: usize,
     gas_used: u64,
 }
@@ -448,7 +424,7 @@ pub struct ForkSnapshot {
 pub struct SyncBlockFork {
     evm_config: EezEvmConfig,
     evm_env: EvmEnvFor<EezEvmConfig>,
-    state: DraftDb,
+    state: SimState,
     applied: usize,
     gas_used: u64,
 }
@@ -469,13 +445,13 @@ impl SyncBlockFork {
     ///
     /// See [`BuildError`].
     pub fn execute_tx(&mut self, raw: &Bytes) -> Result<TxOutcome, BuildError> {
-        let outcome = execute_and_commit_inspected(
+        let outcome = execute_and_commit(
             &self.evm_config,
             &mut self.state,
             &self.evm_env,
             raw,
             self.applied,
-            NoOpInspector,
+            None,
         )?;
         self.applied += 1;
         self.gas_used = self.gas_used.saturating_add(outcome.gas_used);
@@ -488,21 +464,18 @@ impl SyncBlockFork {
     /// # Errors
     ///
     /// See [`BuildError`].
-    pub fn execute_tx_inspected<I>(
+    pub fn execute_tx_inspected(
         &mut self,
         raw: &Bytes,
-        inspector: I,
-    ) -> Result<TxOutcome, BuildError>
-    where
-        I: for<'db> InspectorFor<EezEvmConfig, &'db mut DraftDb>,
-    {
-        let outcome = execute_and_commit_inspected(
+        inspector: &mut dyn Inspector<EezEvmTypes>,
+    ) -> Result<TxOutcome, BuildError> {
+        let outcome = execute_and_commit(
             &self.evm_config,
             &mut self.state,
             &self.evm_env,
             raw,
             self.applied,
-            inspector,
+            Some(inspector),
         )?;
         self.applied += 1;
         self.gas_used = self.gas_used.saturating_add(outcome.gas_used);
@@ -512,7 +485,7 @@ impl SyncBlockFork {
     /// Restore point for composition rollback.
     pub fn snapshot(&self) -> ForkSnapshot {
         ForkSnapshot {
-            cache: self.state.cache.clone(),
+            cache: self.state.cache().clone(),
             applied: self.applied,
             gas_used: self.gas_used,
         }
@@ -520,14 +493,14 @@ impl SyncBlockFork {
 
     /// Roll back to a [`Self::snapshot`].
     pub fn restore(&mut self, snapshot: ForkSnapshot) {
-        self.state.cache = snapshot.cache;
+        self.state.set_cache(snapshot.cache);
         self.applied = snapshot.applied;
         self.gas_used = snapshot.gas_used;
     }
 
     /// Raw state + env, for callers that drive their own EVM (a source
     /// simulation threading its inspector through this fork).
-    pub fn state_and_env(&mut self) -> (&mut DraftDb, &EvmEnvFor<EezEvmConfig>) {
+    pub fn state_and_env(&mut self) -> (&mut SimState, &EvmEnvFor<EezEvmConfig>) {
         (&mut self.state, &self.evm_env)
     }
 }
@@ -918,7 +891,7 @@ mod tests {
         assert_eq!(first, second, "restore must rewind the probe's effects");
         assert!(!first.success);
 
-        // Non-vacuous: without the rewind the nonce is spent and revm rejects
+        // Non-vacuous: without the rewind the nonce is spent and the EVM rejects
         // the replay outright.
         assert!(
             fork.execute_tx(&f.txs[2]).is_err(),

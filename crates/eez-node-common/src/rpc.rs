@@ -1,9 +1,9 @@
 //! Ethereum RPC methods with EEZ transaction and receipt response types.
 //!
 //! RPC wiring adapted from reth's Ethereum node at the pinned revision:
-//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/node/src/node.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.11.0/crates/ethereum/node/src/node.rs>.
 //! Receipt/log conversion adapted from `EthReceiptConverter`:
-//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/rpc/rpc-eth-types/src/receipt.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.11.0/crates/rpc/rpc-eth-types/src/receipt.rs>.
 
 use crate::node::{EezEngineValidatorBuilder, EezNode, NodeEvm};
 use alloy_consensus::{Receipt as RpcReceipt, TxReceipt};
@@ -14,7 +14,7 @@ use reth_chainspec::{ChainSpec, ChainSpecProvider};
 use reth_node_api::FullNodeComponents;
 use reth_node_builder::rpc::{
     BasicEngineApiBuilder, BasicEngineValidatorBuilder, EthApiBuilder, EthApiCtx, Identity,
-    RpcAddOns,
+    RpcAddOns, RpcNodeCoreFor,
 };
 use reth_primitives_traits::TransactionMeta;
 use reth_rpc::EthApi;
@@ -54,7 +54,7 @@ where
     TxEnv: TxEnvConverter<TransactionRequest, Evm, Error = EthTxEnvError> + Default,
     reth_rpc_eth_types::EthApiError: reth_rpc_eth_types::error::FromEvmError<Evm>,
 {
-    type EthApi = EthApi<N, Converter<Evm, TxEnv>>;
+    type EthApi = EthApi<RpcNodeCoreFor<N>, Converter<Evm, TxEnv>>;
 
     fn build_eth_api(
         self,

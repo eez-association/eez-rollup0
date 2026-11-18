@@ -480,7 +480,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     let handle = builder
         .node(EezNode {
             evm: node_evm,
-            tx_env_converter: (),
+            tx_env_converter: eez_evm::EezTxEnvConverter,
             held: Some(HeldTxs(Arc::new(move |hash| held.holds(hash)))),
         })
         .extend_rpc_modules(move |ctx| {
@@ -936,7 +936,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         if let Some(cfg) = p2p_config {
             let overlay = eez_p2p::Overlay::new(
                 cfg,
-                eez_p2p::keypair(&network.secret_key().secret_bytes())?,
+                eez_p2p::keypair(&network.secret_key().to_secret_bytes())?,
                 eez_p2p::Validator::new(domain, key.address()),
                 eez_node_common::discover(network),
             )?;

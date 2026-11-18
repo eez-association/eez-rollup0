@@ -30,6 +30,12 @@ def run(plan, args):
     if prover_backend not in ["stateless", "stateful"]:
         fail("eez.prover_backend must be 'stateless' or 'stateful'")
 
+    settlement_profile = eez.get("settlement_profile", "calldata")
+    if settlement_profile not in ["calldata", "blob"]:
+        fail("eez.settlement_profile must be 'calldata' or 'blob'")
+    if settlement_profile == "blob" and prover_backend != "stateless":
+        fail("the blob E2E lane requires the stateless proof signer")
+
     poster_key = eez.get("poster_key", "")
     proof_signer_key = eez.get("proof_signer_key", "")
     recovery_address = eez.get("recovery_address", "")
@@ -245,6 +251,38 @@ def run(plan, args):
             "--ipcdisable --disable-discovery",
         ]
     )
+
+    if settlement_profile == "blob":
+        eez_env["EEZ_SETTLEMENT_PROFILE"] = "blob"
+        eez_env["EEZ_L1_BEACON_URL"] = participants[0].cl_context.beacon_http_url
+        eez_env["EEZ_L1_MAX_FEE_PER_BLOB_GAS"] = str(eez.get("max_fee_per_blob_gas", 1000000000))
+
+        # Peerless L2 verifier: every block must be rebuilt from canonical L1 data.
+        follower_env = {k: eez_env[k] for k in [
+            "EEZ_L1_CHAIN_ID", "EEZ_L1_BEACON_URL", "EEZ_L1_BLOCK_TIME_MS",
+            "EEZ_L2_BLOCK_TIME_MS", "EEZ_PROOF_TIME_MS", "EEZ_SUBMISSION_SLACK_MS",
+            "EEZ_L2_DATADIR", "EEZ_L2_HTTP_PORT", "EEZ_L2_AUTH_PORT", "EEZ_L2_P2P_PORT",
+            "EEZL2_ADDRESS", "EEZ_SYNC_L1_ONLY",
+        ]}
+        follower_env["EEZ_L1_RPC_URL"] = l1_el.rpc_http_url
+        plan.add_service(
+            name="eez-l2-follower",
+            config=ServiceConfig(
+                image=eez.get("eez_node_image", "eez-node:dev"),
+                ports={
+                    "l2-rpc": PortSpec(
+                        number=L2_RPC_PORT,
+                        transport_protocol="TCP",
+                        application_protocol="http",
+                    ),
+                },
+                files={"/out": deploy.files_artifacts[0]},
+                env_vars=follower_env,
+                entrypoint=["/bin/sh", "-c"],
+                cmd=[node_cmd.replace("eez-composer", "eez-follower") +
+                     " --max-outbound-peers=0 --max-inbound-peers=0"],
+            ),
+        )
 
     # Follower beacon drives eez-node's embedded reth over the engine API.
     plan.add_service(

@@ -1,9 +1,9 @@
 //! Shared L2 node configuration. L1 nodes retain their upstream Ethereum/Gnosis types.
 //!
 //! Component wiring adapted from reth's Ethereum node at the pinned revision:
-//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/node/src/node.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.11.0/crates/ethereum/node/src/node.rs>.
 //! Engine validation delegates to:
-//! <https://github.com/paradigmxyz/reth/blob/v2.7.0/crates/ethereum/node/src/engine.rs>.
+//! <https://github.com/paradigmxyz/reth/blob/v2.11.0/crates/ethereum/node/src/engine.rs>.
 
 use crate::{EezNetworkBuilder, EezPayloadBuilder, EezPoolBuilder, HeldTxs};
 use alloy_rpc_types_engine::{ExecutionData, PayloadAttributes};

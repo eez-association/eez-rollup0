@@ -14,13 +14,14 @@ use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_primitives::{Address, B256, Bloom, Bytes, KECCAK256_EMPTY, U256, keccak256, logs_bloom};
 use eez_evm::EezEvmConfig;
 use eez_primitives::Block;
+use evm2::{
+    bytecode::Bytecode,
+    evm::{AccountInfo, InMemoryDB},
+};
 use reth_chainspec::ChainSpec;
+use reth_evm::BundleState;
 use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::SealedBlock;
-use revm::{
-    database::{BundleState, InMemoryDB},
-    state::{AccountInfo, Bytecode},
-};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,7 +115,7 @@ fn database(state: &BTreeMap<Address, GenesisAccount>) -> InMemoryDB {
     for (address, account) in state {
         let code = account.code.clone().map(Bytecode::new_raw);
         db.insert_account_info(
-            *address,
+            address,
             AccountInfo {
                 balance: account.balance,
                 nonce: account.nonce.unwrap_or_default(),
@@ -125,11 +126,10 @@ fn database(state: &BTreeMap<Address, GenesisAccount>) -> InMemoryDB {
         );
         for (slot, value) in account.storage.iter().flatten() {
             db.insert_account_storage(
-                *address,
-                U256::from_be_bytes(slot.0),
-                U256::from_be_bytes(value.0),
-            )
-            .unwrap();
+                address,
+                &U256::from_be_bytes(slot.0),
+                &U256::from_be_bytes(value.0),
+            );
         }
     }
     db
