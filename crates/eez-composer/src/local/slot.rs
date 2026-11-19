@@ -588,8 +588,7 @@ impl InboundL2TargetSession {
                 ))
             },
         )?;
-        tx.at_position(eez_driver::BUILDER_GAS_LIMIT, self.fork.gas_used())
-            .map_err(encoding_err)
+        self.fork.materialize(&tx).map_err(encoding_err)
     }
 }
 
@@ -627,13 +626,6 @@ impl TargetExecutionSession for InboundL2TargetSession {
         let captured = match inspector.captures.as_slice() {
             [one] => one.clone(),
             [] => {
-                if eez_primitives::system_tx_gas_limit(
-                    eez_driver::BUILDER_GAS_LIMIT,
-                    self.fork.gas_used(),
-                ) < eez_primitives::SYSTEM_TX_GAS_CAP
-                {
-                    return Err(ExecutorError::Capacity);
-                }
                 return Err(encoding_err(format!(
                     "inbound probe never reached the EEZL2→proxy frame for {} \
                      (entry hash or table mismatch); probe success={} output={}",
@@ -650,14 +642,6 @@ impl TargetExecutionSession for InboundL2TargetSession {
             }
         };
 
-        if !captured.success
-            && eez_primitives::system_tx_gas_limit(
-                eez_driver::BUILDER_GAS_LIMIT,
-                self.fork.gas_used(),
-            ) < eez_primitives::SYSTEM_TX_GAS_CAP
-        {
-            return Err(ExecutorError::Capacity);
-        }
         if !captured.success {
             return Err(encoding_err(format!(
                 "inbound target {} reverted during delivery; reverting targets \
@@ -673,14 +657,7 @@ impl TargetExecutionSession for InboundL2TargetSession {
         let final_entry = self.inbound_sidecar_for_call(&req, captured.output.clone())?;
         let final_tx = self.delivery_tx(&final_entry)?;
         let real = self.fork.execute_tx(&final_tx).map_err(fork_err)?;
-        if !real.success
-            && eez_primitives::system_tx_gas_limit(
-                eez_driver::BUILDER_GAS_LIMIT,
-                self.fork.gas_used().saturating_sub(real.gas_used),
-            ) < eez_primitives::SYSTEM_TX_GAS_CAP
-        {
-            return Err(ExecutorError::Capacity);
-        }
+
         if !real.success {
             return Err(encoding_err(format!(
                 "canonical delivery for {} reverted on the block prefix at \

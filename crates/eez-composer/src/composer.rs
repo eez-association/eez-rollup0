@@ -860,7 +860,8 @@ fn clamp_max_postbatch_gas(requested: u64, attesters: u64) -> u64 {
 /// evicted before it can enter — and perpetually drop — a bundle.
 /// `false` = STATE-DEPENDENT OR TRANSIENT, which a retry may clear. The drain
 /// handles insufficient funds separately; other non-poison errors abort the
-/// slot and re-queue.
+/// slot and re-queue. Capacity is deferred before this classification when an
+/// accepted prefix exists; in an empty block it means the group cannot fit.
 fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
     use eez_protocol::{ComposerError, ExecutorError};
     match err {
@@ -872,7 +873,6 @@ fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
         ComposerError::Executor(ee) => !matches!(
             ee,
             ExecutorError::Unavailable(_)
-                | ExecutorError::Capacity
                 | ExecutorError::Provider(_)
                 | ExecutorError::Missing(_)
                 | ExecutorError::InsufficientFunds { .. }
@@ -1137,20 +1137,12 @@ fn append_and_execute(
 ) -> Result<Vec<alloy_primitives::Log>, (usize, BuildError)> {
     let mut logs = Vec::new();
     for (at, plan) in txs.iter().enumerate() {
-        let tx = plan
-            .at_position(BUILDER_GAS_LIMIT, prefix.gas_used())
+        let tx = prefix
+            .materialize(plan)
             .map_err(|msg| (at, BuildError::ExecuteTx { idx: at, msg }))?;
         match prefix.execute_tx(&tx) {
             Ok(outcome) if outcome.success => logs.extend(outcome.logs),
             Ok(outcome) => {
-                if matches!(plan, eez_protocol::system_tx::PlannedTransaction::Native(_))
-                    && eez_primitives::system_tx_gas_limit(
-                        BUILDER_GAS_LIMIT,
-                        prefix.gas_used().saturating_sub(outcome.gas_used),
-                    ) < eez_primitives::SYSTEM_TX_GAS_CAP
-                {
-                    return Err((at, BuildError::Capacity));
-                }
                 return Err((
                     at,
                     BuildError::ExecuteTx {
@@ -2282,29 +2274,6 @@ where
                 })
             }
         };
-        let mut source_nonces = inbound_source_nonces_for_drain(
-            ctx,
-            rollup_id,
-            &drained,
-            alloy_eips::BlockId::latest(),
-        )
-        .await;
-        source_nonces.extend(outbound_source_nonces);
-        let (drained, stale) = partition_stale(drained, &source_nonces);
-        for tx in &stale {
-            event!(
-                name: "eez.composer.cc_compose.stale_nonce_evicted",
-                Level::WARN,
-                rollup_id,
-                tx_hash = %tx.hash,
-                sender = %tx.sender,
-                nonce = tx.nonce,
-                direction = ?tx.direction,
-                "held tx nonce is below its canonical source-chain nonce; evicting stale tx",
-            );
-        }
-        pool.release_in_flight_batch(&stale);
-
         // ── Slot execution contexts (design §2) ──────────────────────
         // One L1 state pinned at the anchor and one live Sync-block prefix,
         // both advanced only by accepted transactions. Failing to open either
@@ -2349,9 +2318,14 @@ where
                         .declared_tx_gas_limit_cap_at(state.anchor.header()),
                 }
                 .map_err(|error| format!("resolve L1 transaction gas cap: {error}"))?;
-                Ok((state, draft, cap))
+                let live_source = eez_protocol::native_source::SourceEntry::new(
+                    ctx.l2_chain_id,
+                    state.anchor.hash(),
+                    0,
+                )?;
+                Ok((state, draft, cap, live_source))
             });
-        let (mut l1_state, mut draft, inbound_gas_limit_cap) = match slot_ctx {
+        let (mut l1_state, mut draft, inbound_gas_limit_cap, live_source) = match slot_ctx {
             Ok(contexts) => contexts,
             Err(e) => {
                 event!(
@@ -2376,6 +2350,29 @@ where
                     .await;
             }
         };
+        let mut source_nonces = inbound_source_nonces_for_drain(
+            ctx,
+            rollup_id,
+            &drained,
+            alloy_eips::BlockId::latest(),
+        )
+        .await;
+        source_nonces.extend(outbound_source_nonces);
+        let (drained, stale) = partition_stale(drained, &source_nonces);
+        for tx in &stale {
+            event!(
+                name: "eez.composer.cc_compose.stale_nonce_evicted",
+                Level::WARN,
+                rollup_id,
+                tx_hash = %tx.hash,
+                sender = %tx.sender,
+                nonce = tx.nonce,
+                direction = ?tx.direction,
+                "held tx nonce is below its canonical source-chain nonce; evicting stale tx",
+            );
+        }
+        pool.release_in_flight_batch(&stale);
+
         // The draft's EVM rules govern outbound envelopes.
         let outbound_gas_limit_cap = draft.declared_tx_gas_limit_cap();
         event!(
@@ -2392,14 +2389,6 @@ where
         // list the prefix is rebuilt from and the keystone assert compares the
         // canonical rebuild against.
         let mut sync_txs: Vec<Bytes> = Vec::new();
-        // Fixed source-hash inputs for this Sync candidate: the L2 chain and
-        // intended L1 parent. `live_source.with_index(group_index)` combines these
-        // with each group's original ordinal to derive its system tx sourceHash.
-        let live_source = eez_protocol::native_source::SourceEntry::new(
-            ctx.l2_chain_id,
-            l1_state.anchor.hash(),
-            0,
-        )?;
         // One ordinal per complete native group in the original candidate.
         let mut system_txs_appended: u64 = 0;
 
@@ -3434,8 +3423,9 @@ where
         // Past the drain the pool's order is all that matters again.
         let survivors: Vec<HeldTx> = restore_pool_order(survivors);
 
-        // Reconstruct and execute the canonical plans independently of the
-        // accepted byte list. A mismatch aborts posting and requeues survivors.
+        // Reconstruct canonical plans independently of the accepted byte list,
+        // using the actual preceding gas recorded by the draft. A mismatch
+        // aborts posting and requeues survivors without re-executing the block.
         let (pairs, canonical) = match eez_protocol::system_tx::build_cross_chain_sync_pairs(
             &pending_out,
             &pending_in,
@@ -3443,14 +3433,8 @@ where
             live_source,
         )
         .and_then(|pairs| {
-            let mut check = reopen(&[]).map_err(|e| e.to_string())?;
-            let mut bytes = Vec::new();
-            append_and_execute(
-                &mut check,
-                &eez_protocol::system_tx::interleave_sync_block_txs(&pairs),
-                &mut bytes,
-            )
-            .map_err(|(at, e)| format!("canonical reconstruction at {at}: {e}"))?;
+            let bytes = draft
+                .materialize_prefix(&eez_protocol::system_tx::interleave_sync_block_txs(&pairs))?;
             Ok((pairs, bytes))
         }) {
             Ok(p) => p,
@@ -5220,6 +5204,9 @@ async fn sign_post_batch_tx(
 mod recovery_tests;
 
 #[cfg(test)]
+mod native_gas_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::attestation_quorum::MAX_ATTESTERS;
@@ -6327,13 +6314,12 @@ mod tests {
     /// second must be refused before `build_sync_block` hard-errors on it.
     #[test]
     fn block_gas_fit_refuses_the_second_fat_outbound_pair() {
-        // Live shapes: 30M block, 2M `loadExecutionTable`, a user tx declaring
-        // 16.7M and burning 13.3M of it.
-        const LOAD: u64 = 2_000_000;
+        // The early gate checks the signed user's declared gas. The actual
+        // load is metered before the user is admitted by append_and_execute.
         const USER_DECLARED: u64 = 16_700_000;
         const USER_BURNED: u64 = 13_300_000;
         const LOAD_BURNED: u64 = 100_000;
-        let pair = LOAD + USER_DECLARED;
+        let pair = USER_DECLARED;
 
         // Pair 1 fits an empty block.
         assert_eq!(
@@ -6387,9 +6373,8 @@ mod tests {
     fn eip_7825_user_cap_is_independent_of_sync_block_fit() {
         // An invalid user limit can still fit in the aggregate Sync-block budget.
         const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
-        const SYSTEM_TX_GAS_CAP: u64 = 2_000_000;
         let invalid_user_limit = EIP_7825_TX_GAS_LIMIT + 1;
-        let pair_limit = SYSTEM_TX_GAS_CAP + invalid_user_limit;
+        let pair_limit = invalid_user_limit;
 
         assert_eq!(
             block_gas_fit(0, pair_limit, BUILDER_GAS_LIMIT),
