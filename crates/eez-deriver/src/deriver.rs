@@ -945,6 +945,14 @@ where
         header_inputs: &BlockHeaderInputs,
     ) -> DeriverResult<DeriveOutcome> {
         let (payload, header) = self.execute_block(parent_block_number, raw_txs, header_inputs)?;
+        self.commit_replayed_block(payload, header).await
+    }
+
+    async fn commit_replayed_block(
+        &self,
+        payload: ExecutionData,
+        header: SealedHeader<alloy_consensus::Header>,
+    ) -> DeriverResult<DeriveOutcome> {
         // feed_witness=false: follower / L1-reconcile re-derive — the producer
         // already fed this block to the prover witness capture; don't double-feed.
         Ok(self
@@ -1753,9 +1761,10 @@ where
                 // `CrossChainCallExecuted` events, observable only after replay.
                 gate_outbound = outbound_paired.iter().map(|(e, _)| e.clone()).collect();
 
-                let all_pairs = if original_outbound_len + original_inbound_len == 0 {
-                    Vec::new()
-                } else {
+                let mut pairs = Vec::new();
+                if !settlement.applied().is_empty()
+                    && original_outbound_len + original_inbound_len != 0
+                {
                     let context = l1_context.ok_or_else(|| DeriverError::LocalDiverged {
                         l2_block: from_block,
                         detail: Some("native derivation requires authenticated L1 context".into()),
@@ -1765,38 +1774,22 @@ where
                         context.parent_hash,
                         0,
                     )
-                    .map_err(DeriverError::L2Provider)?;
-                    let all_outbound = outbound
-                        .iter()
-                        .cloned()
-                        .zip(sync_user_txs.iter().cloned())
-                        .collect::<Vec<_>>();
-                    eez_protocol::system_tx::build_cross_chain_sync_pairs(
-                        &all_outbound,
+                    .map_err(|error| {
+                        DeriverError::L2Provider(format!(
+                            "postBatch({tx_hash}) native source: {error}"
+                        ))
+                    })?;
+                    pairs = build_applied_sync_pairs(
+                        settlement,
+                        &outbound,
                         &inbound,
+                        &sync_user_txs,
                         cfg,
                         source,
                     )
-                    .map_err(DeriverError::L2Provider)?
-                };
-                let mut pairs = Vec::new();
-                for applied in settlement.applied() {
-                    let index = match applied.role {
-                        eez_l1::EntryRole::Outbound { ordinal } => ordinal,
-                        eez_l1::EntryRole::Inbound { ordinal } => original_outbound_len + ordinal,
-                        _ => continue,
-                    };
-                    pairs.push(
-                        all_pairs
-                            .get(index)
-                            .ok_or_else(|| DeriverError::LocalDiverged {
-                                l2_block: from_block,
-                                detail: Some(
-                                    "applied native ordinal is outside original candidate".into(),
-                                ),
-                            })?
-                            .clone(),
-                    );
+                    .map_err(|error| {
+                        DeriverError::L2Provider(format!("postBatch({tx_hash}): {error}"))
+                    })?;
                 }
                 let mut full = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
                 full.extend(
@@ -1869,6 +1862,7 @@ where
                 .map(Encodable2718::encoded_2718)
                 .collect();
             let current_hash = self.l2_hash_at(from_block)?;
+            let mut executed = None;
             let new_content = if settlement.final_state == Some(current_hash) {
                 Vec::new()
             } else {
@@ -1887,17 +1881,24 @@ where
                     })
                     .collect::<Vec<_>>();
                 plans.extend(sync_block_txs.clone().unwrap_or_default());
-                let (_, _, bytes) = self.execute_planned_block(
-                    from_block - 1,
-                    &plans,
-                    &BlockHeaderInputs::from_span(decoded, last_index)?,
-                )?;
+                let bytes = match ordinary_plan_bytes(&plans) {
+                    Some(bytes) => bytes,
+                    None => {
+                        let (payload, header, bytes) = self.execute_planned_block(
+                            from_block - 1,
+                            &plans,
+                            &BlockHeaderInputs::from_span(decoded, last_index)?,
+                        )?;
+                        executed = Some((payload, header));
+                        bytes
+                    }
+                };
                 bytes[existing_txs.len()..].to_vec()
             };
             // The block exists (`stale_boundary` above refused otherwise), so its
             // hash answers whether a previous pass already appended these entries.
             let replay_txs = resume_replay_txs(
-                self.l2_hash_at(from_block)?,
+                current_hash,
                 settlement.final_state,
                 &existing_txs,
                 &new_content,
@@ -1958,13 +1959,17 @@ where
                         "safe retreated to the parent for a same-height resumed replacement (finalized unchanged)",
                     );
                 }
-                let outcome = self
-                    .replay_block(
-                        from_block - 1,
-                        &block_txs,
-                        &BlockHeaderInputs::from_span(decoded, last_index)?,
-                    )
-                    .await?;
+                let outcome = match executed {
+                    Some((payload, header)) => self.commit_replayed_block(payload, header).await?,
+                    None => {
+                        self.replay_block(
+                            from_block - 1,
+                            &block_txs,
+                            &BlockHeaderInputs::from_span(decoded, last_index)?,
+                        )
+                        .await?
+                    }
+                };
                 // No later block follows this one to make it canonical, so
                 // reading by number can still return the old block. Only an
                 // issue here; a forward replay is extended by the next commit.
@@ -2005,15 +2010,20 @@ where
                 // The Sync block's full tx list (system + outbound-user, interleaved,
                 // plus trailing non-cc user txs) was pre-built above; every other
                 // block is its user txs verbatim.
+                let mut executed = None;
                 let block_txs: Vec<Vec<u8>> = match (is_sync_block, sync_block_txs.as_ref()) {
-                    (true, Some(full)) => {
-                        self.execute_planned_block(
-                            l2_block - 1,
-                            full,
-                            &BlockHeaderInputs::from_span(decoded, i)?,
-                        )?
-                        .2
-                    }
+                    (true, Some(full)) => match ordinary_plan_bytes(full) {
+                        Some(bytes) => bytes,
+                        None => {
+                            let (payload, header, bytes) = self.execute_planned_block(
+                                l2_block - 1,
+                                full,
+                                &BlockHeaderInputs::from_span(decoded, i)?,
+                            )?;
+                            executed = Some((payload, header));
+                            bytes
+                        }
+                    },
                     _ => user_txs.to_vec(),
                 };
                 // Skip only identical blocks: a needless rewrite wedges reth.
@@ -2041,9 +2051,13 @@ where
                 if !should_replay {
                     continue;
                 }
-                let outcome = self
-                    .replay_block(l2_block - 1, &block_txs, &header_inputs)
-                    .await?;
+                let outcome = match executed {
+                    Some((payload, header)) => self.commit_replayed_block(payload, header).await?,
+                    None => {
+                        self.replay_block(l2_block - 1, &block_txs, &header_inputs)
+                            .await?
+                    }
+                };
                 if is_sync_block {
                     sync_block_hash = Some(outcome.block_hash);
                 }
@@ -2427,6 +2441,20 @@ fn range_already_derived(
     }
 }
 
+/// Ordinary plans already carry their exact bytes and need no execution to
+/// materialize. Native plans depend on the gas consumed by their prefix.
+fn ordinary_plan_bytes(
+    plans: &[eez_protocol::system_tx::PlannedTransaction],
+) -> Option<Vec<Vec<u8>>> {
+    plans
+        .iter()
+        .map(|plan| match plan {
+            eez_protocol::system_tx::PlannedTransaction::User(raw) => Some(raw.to_vec()),
+            eez_protocol::system_tx::PlannedTransaction::Native(_) => None,
+        })
+        .collect()
+}
+
 /// Transactions to replay a resumed batch's Sync block with, or `None` when
 /// local already holds L1's settled endpoint.
 ///
@@ -2435,10 +2463,9 @@ fn range_already_derived(
 /// pass already appended them. Comparing the local block's hash against L1's
 /// settled commitment settles that outright.
 ///
-/// The returned list drops any copy of `new_content` the existing block already
-/// ends with before appending: a block can carry this content and still hash
-/// differently (any header field differing is enough), and appending then would
-/// duplicate it.
+/// The caller has authenticated the existing block as the entry root before
+/// materializing new content. Append exactly the settled entries; coincidentally
+/// equal transaction bytes are not evidence that a transition already ran.
 fn resume_replay_txs(
     local_hash: B256,
     settled: Option<B256>,
@@ -2448,16 +2475,54 @@ fn resume_replay_txs(
     if settled == Some(local_hash) {
         return None;
     }
-    let base = if new_content.is_empty() {
-        existing_txs
-    } else {
-        existing_txs
-            .strip_suffix(new_content)
-            .unwrap_or(existing_txs)
-    };
-    let mut txs = base.to_vec();
+    let mut txs = existing_txs.to_vec();
     txs.extend_from_slice(new_content);
     Some(txs)
+}
+
+fn build_applied_sync_pairs(
+    settlement: &eez_l1::Settlement,
+    outbound: &[eez_protocol::abi::ExecutionEntrySol],
+    inbound: &[eez_protocol::abi::ExecutionEntrySol],
+    users: &[Bytes],
+    cfg: &eez_protocol::system_tx::SystemTxContext,
+    source: eez_protocol::native_source::SourceEntry,
+) -> Result<Vec<eez_protocol::system_tx::SyncPair>, String> {
+    let mut pairs = Vec::new();
+    for applied in settlement.applied() {
+        let selected = match applied.role {
+            eez_l1::EntryRole::Outbound { ordinal } => {
+                let (entry, user) =
+                    outbound
+                        .get(ordinal)
+                        .zip(users.get(ordinal))
+                        .ok_or_else(|| {
+                            format!("applied outbound ordinal {ordinal} is outside the candidate")
+                        })?;
+                eez_protocol::system_tx::build_outbound_pair(
+                    entry,
+                    user,
+                    cfg,
+                    source.with_index(ordinal as u64),
+                )
+            }
+            eez_l1::EntryRole::Inbound { ordinal } => {
+                let entry = inbound.get(ordinal).ok_or_else(|| {
+                    format!("applied inbound ordinal {ordinal} is outside the candidate")
+                })?;
+                eez_protocol::system_tx::build_cross_chain_sync_pairs(
+                    &[],
+                    std::slice::from_ref(entry),
+                    cfg,
+                    source.with_index((outbound.len() + ordinal) as u64),
+                )
+            }
+            _ => continue,
+        }
+        .map_err(|error| format!("applied entry {}: {error}", applied.entry_index))?;
+        pairs.extend(selected);
+    }
+    Ok(pairs)
 }
 
 /// The DA slots L1 actually applied, addressed by role rather than by offset.
@@ -2621,10 +2686,10 @@ mod reconcile_decision_tests {
         );
     }
 
-    /// A block can already carry this content and still hash differently — any
-    /// header field differing is enough. Appending again would duplicate it.
+    /// The caller authenticated the existing entry root. Matching suffix bytes
+    /// do not authorize dropping another settled transition.
     #[test]
-    fn a_resumed_replay_never_duplicates_content_the_block_already_ends_with() {
+    fn a_resumed_replay_appends_even_when_entry_root_has_equal_suffix_bytes() {
         let new_content = [tx(3), tx(4)];
         let already_appended = [tx(1), tx(2), tx(3), tx(4)];
 
@@ -2635,8 +2700,8 @@ mod reconcile_decision_tests {
                 &already_appended,
                 &new_content
             ),
-            Some(vec![tx(1), tx(2), tx(3), tx(4)]),
-            "the suffix is rebuilt in place, not appended a second time"
+            Some(vec![tx(1), tx(2), tx(3), tx(4), tx(3), tx(4)]),
+            "only the settled root identifies an already-applied transition"
         );
     }
 
@@ -2694,6 +2759,83 @@ mod applied_selection_tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn lowering_skips_unapplied_shapes_and_keeps_original_source_ordinals() {
+        use alloy_eips::Decodable2718;
+        use eez_protocol::RollupId;
+        use eez_protocol::entries::{InboundSidecar, IncomingEntry};
+        let cfg = eez_protocol::system_tx::SystemTxContext {
+            eezl2_address: eez_primitives::EEZL2_ADDRESS,
+            l2_chain_id: 1,
+            this_rollup_id: 1,
+        };
+        let source =
+            eez_protocol::native_source::SourceEntry::new(1, B256::repeat_byte(0x99), 0).unwrap();
+        let good = InboundSidecar::new(IncomingEntry {
+            target: Address::repeat_byte(1),
+            source: Address::repeat_byte(2),
+            value: alloy_primitives::U256::ZERO,
+            data: Bytes::new(),
+            source_rollup_id: RollupId::MAINNET,
+            l2_rollup_id: RollupId(1),
+            return_data: Bytes::new(),
+            success: true,
+        })
+        .unwrap()
+        .as_abi_entry()
+        .clone();
+        let mut bad = good.clone();
+        bad.l2ToL1Calls[0].gas = 1;
+        let outbound = vec![bad.clone()];
+        let inbound = vec![bad.clone(), good, bad];
+        let selected = Settlement::new(
+            vec![AppliedEntry {
+                entry_index: 3,
+                role: EntryRole::Inbound { ordinal: 1 },
+            }],
+            None,
+            None,
+            false,
+        );
+        let pairs = super::build_applied_sync_pairs(
+            &selected,
+            &outbound,
+            &inbound,
+            &[user_tx(1)],
+            &cfg,
+            source,
+        )
+        .unwrap();
+        assert_eq!(pairs.len(), 1);
+        let raw = pairs[0].system_tx.at_position(30_000_000, 0).unwrap();
+        let eez_primitives::EezTxEnvelope::System(tx) =
+            eez_primitives::EezTxEnvelope::decode_2718_exact(&raw).unwrap()
+        else {
+            panic!("expected delivery")
+        };
+        assert_eq!(tx.source_hash, source.with_index(2).hash());
+        let bad_selected = Settlement::new(
+            vec![AppliedEntry {
+                entry_index: 4,
+                role: EntryRole::Inbound { ordinal: 2 },
+            }],
+            None,
+            None,
+            false,
+        );
+        let error = super::build_applied_sync_pairs(
+            &bad_selected,
+            &outbound,
+            &inbound,
+            &[user_tx(1)],
+            &cfg,
+            source,
+        )
+        .unwrap_err();
+        assert!(error.contains("applied entry 4"));
+        assert!(error.contains("explicit-gas"));
     }
 
     proptest! {
