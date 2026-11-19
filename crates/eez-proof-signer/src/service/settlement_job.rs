@@ -117,7 +117,8 @@ impl SettlementPipelineError {
                 settlement::BlockInspectionError::IntermediateSystemTransaction { .. }
                 | settlement::BlockInspectionError::IntermediateOutboundEvent { .. }
                 | settlement::BlockInspectionError::RevertedSystemTransaction { .. }
-                | settlement::BlockInspectionError::ReservedSystemSender { .. } => (
+                | settlement::BlockInspectionError::ReservedSystemSender { .. }
+                | settlement::BlockInspectionError::InvalidExecutionGroup(_) => (
                     tonic::Code::FailedPrecondition,
                     "settlement validation rejected",
                 ),

@@ -643,7 +643,15 @@ fn verify_reconstructed_sync_block(
                 .map_err(|reason| DaPayloadError::SystemTransactionReconstruction { reason })?,
         )
         .map_err(|reason| DaPayloadError::SystemTransactionReconstruction { reason })?;
-    let reconstructed = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
+    let plans = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
+    // Reject the layout before indexing positional gas evidence.
+    if plans.len() != validated_transactions.len() {
+        return Err(DaPayloadError::SyncBlockTransactionCount {
+            expected: plans.len(),
+            actual: validated_transactions.len(),
+        });
+    }
+    let reconstructed = plans
         .iter()
         .enumerate()
         .map(|(i, plan)| {
@@ -659,15 +667,6 @@ fn verify_reconstructed_sync_block(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // The canonical Sync layout contains exactly `2 * outbound + inbound`
-    // transactions. Reject a different terminal-block length before comparing
-    // transaction bytes.
-    if reconstructed.len() != validated_transactions.len() {
-        return Err(DaPayloadError::SyncBlockTransactionCount {
-            expected: reconstructed.len(),
-            actual: validated_transactions.len(),
-        });
-    }
     for (transaction_index, (validated_transaction, reconstructed_transaction)) in
         validated_transactions.iter().zip(reconstructed).enumerate()
     {

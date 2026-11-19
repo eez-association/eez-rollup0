@@ -510,7 +510,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     // (build_sync_block → reth-evm BlockBuilder). Same chain spec
     // the engine uses, so blocks produced here pass validation
     // when reth ingests them via newPayload.
-    let evm_config = eez_evm::EezEvmConfig::new(chain_spec.clone())?;
+    let evm_config = eez_evm::EezEvmConfig::new_l2(chain_spec.clone())?;
 
     use eez_composer::{GnosisL1Adapter, LocalChainClient};
     use eez_protocol::rollup_id::RollupId;

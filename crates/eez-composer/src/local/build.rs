@@ -583,8 +583,7 @@ pub struct SyncCandidates {
 ///
 /// # Errors
 ///
-/// See [`BuildError`]. A sync tx that fails to decode is treated as a non-system
-/// tx (pair-end), matching the prover's fail-safe flagging.
+/// See [`BuildError`]. Invalid envelopes and incomplete native groups are rejected.
 pub fn sync_block_candidates<P>(
     l2_provider: &P,
     evm_config: &EezEvmConfig,
@@ -608,19 +607,18 @@ where
         .map(|prefix| prefix.header.hash())
     };
     let anchor = candidate(&[])?;
-    // Per-tx system flags must match the proof signer's classification so
-    // pair-end positions agree on both sides.
-    let flags: Vec<bool> = sync_txs
+    let transactions = sync_txs
         .iter()
-        .map(|raw| {
-            let Ok(tx) = TransactionSigned::decode_2718(&mut raw.as_ref()) else {
-                return false;
-            };
-            eez_protocol::settlement::is_system_tx(&tx)
+        .enumerate()
+        .map(|(idx, raw)| {
+            TransactionSigned::decode_2718_exact(raw).map_err(|error| BuildError::DecodeTx {
+                idx,
+                msg: error.to_string(),
+            })
         })
-        .collect();
-
-    let per_effect = eez_protocol::settlement::pair_end_positions(&flags)
+        .collect::<Result<Vec<_>, _>>()?;
+    let per_effect = eez_protocol::settlement::pair_end_positions(&transactions)
+        .map_err(|error| BuildError::Builder(error.into()))?
         .into_iter()
         .map(|p| candidate(&sync_txs[..=p]))
         .collect::<Result<Vec<_>, _>>()?;
@@ -894,10 +892,9 @@ mod tests {
             !candidates.per_effect.contains(&candidates.anchor),
             "the empty prefix is distinct from every transaction prefix",
         );
-        assert_eq!(
-            candidates.per_effect.last().copied(),
-            Some(f.build(&f.txs).header.hash()),
-            "the last candidate is the full Sync block",
+        assert!(
+            candidates.per_effect.is_empty(),
+            "ordinary transactions without native loads create no effect checkpoints",
         );
     }
 

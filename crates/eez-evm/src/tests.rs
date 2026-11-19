@@ -26,6 +26,15 @@ fn config() -> EezEvmConfig {
 }
 
 #[test]
+fn l2_configuration_rejects_future_amsterdam_without_restricting_l1() {
+    let mut spec = ChainSpecBuilder::mainnet().cancun_activated().build();
+    spec.genesis.config.amsterdam_time = Some(u64::MAX);
+    let spec = Arc::new(spec);
+    assert!(EezEvmConfig::new(Arc::clone(&spec)).is_ok());
+    assert!(EezEvmConfig::new_l2(spec).is_err());
+}
+
+#[test]
 fn declared_cap_tracks_osaka_and_amsterdam_semantics() {
     use alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
 
@@ -51,7 +60,7 @@ fn block(_group: u64, chain_id: u64) -> reth_primitives_traits::RecoveredBlock<B
         gas_limit: SYSTEM_TX_GAS_CAP,
         to: EEZL2_ADDRESS,
         value: U256::from(13),
-        input: Bytes::from_static(&eez_protocol::entries::EXECUTE_INCOMING_SELECTOR),
+        input: Bytes::from_static(&eez_primitives::EXECUTE_INCOMING_SELECTOR),
     }
     .into();
     let block = Block::new(
@@ -104,7 +113,7 @@ fn native(group: u64, chain_id: u64, value: u64) -> Recovered<EezEvmTx> {
         gas_limit: SYSTEM_TX_GAS_CAP,
         to: EEZL2_ADDRESS,
         value: U256::from(value),
-        input: Bytes::from_static(&eez_protocol::entries::EXECUTE_INCOMING_SELECTOR),
+        input: Bytes::from_static(&eez_primitives::EXECUTE_INCOMING_SELECTOR),
     };
     Recovered::new_unchecked(EezEvmTx::System(tx), SYSTEM_ADDRESS)
 }
@@ -464,7 +473,7 @@ fn native_tx(gas_limit: u64, input: Bytes) -> EezTxEnvelope {
         to: EEZL2_ADDRESS,
         value: U256::from(13),
         input: [
-            eez_protocol::entries::EXECUTE_INCOMING_SELECTOR.as_slice(),
+            eez_primitives::EXECUTE_INCOMING_SELECTOR.as_slice(),
             input.as_ref(),
         ]
         .concat()
@@ -545,7 +554,6 @@ fn native_budget_is_the_remaining_block_gas_after_ordinary_transactions() {
 
 #[test]
 fn outbound_group_preserves_inventory_and_requires_paired_user() {
-    use alloy_sol_types::SolCall as _;
     for (code, user_succeeds) in [
         (bytes!("4760005500"), true),
         // The native selector succeeds; the empty-data ordinary call reverts.
@@ -581,7 +589,7 @@ fn outbound_group_preserves_inventory_and_requires_paired_user() {
                 gas_limit: SYSTEM_TX_GAS_CAP,
                 to: EEZL2_ADDRESS,
                 value: U256::ZERO,
-                input: Bytes::from_static(&eez_protocol::abi::loadExecutionTableCall::SELECTOR),
+                input: Bytes::from_static(&eez_primitives::LOAD_EXECUTION_TABLE_SELECTOR),
             }
             .into(),
             user,
@@ -616,6 +624,10 @@ fn outbound_group_preserves_inventory_and_requires_paired_user() {
             .executor(db)
             .execute_one(&SealedBlock::seal_slow(body).try_recover().unwrap())
             .unwrap_err();
+        assert!(matches!(
+            error,
+            reth_evm::BlockExecutionError::Validation(_)
+        ));
         assert!(error.to_string().contains("block ends inside an outbound"));
     }
 }
@@ -743,7 +755,6 @@ fn native_nonce_is_unchanged_during_execution_and_mint_rolls_back() {
 
 #[test]
 fn discarded_native_execution_preserves_group_cursor_and_gas_position() {
-    use alloy_sol_types::SolCall;
     use reth_evm::{BlockExecutor, CommitChanges};
 
     for conditional in [false, true] {
@@ -761,7 +772,7 @@ fn discarded_native_execution_preserves_group_cursor_and_gas_position() {
             gas_limit: 100_000,
             to: EEZL2_ADDRESS,
             value: U256::ZERO,
-            input: Bytes::from_static(&eez_protocol::abi::loadExecutionTableCall::SELECTOR),
+            input: Bytes::from_static(&eez_primitives::LOAD_EXECUTION_TABLE_SELECTOR),
         }
         .into();
         let load = Recovered::new_unchecked(load, SYSTEM_ADDRESS);
@@ -799,6 +810,10 @@ fn discarded_native_execution_preserves_group_cursor_and_gas_position() {
         let error = executor
             .execute_transaction_without_commit(delivery)
             .unwrap_err();
+        assert!(matches!(
+            error,
+            reth_evm::BlockExecutionError::Validation(_)
+        ));
         assert!(error.to_string().contains("must be followed immediately"));
         assert!(
             executor

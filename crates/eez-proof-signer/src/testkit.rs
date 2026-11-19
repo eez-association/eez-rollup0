@@ -12,8 +12,8 @@ use alloy_primitives::{Address, B256, address};
 pub(crate) const TEST_SYSTEM_ADDRESS: Address =
     address!("fffffffffffffffffffffffffffffffffffffffe");
 
-/// Native system envelope with empty calldata, for framing tests.
-pub(crate) const SYSTEM_TX: &str = "45f83e01a0111111111111111111111111111111111111111111111111111111111111111184010000009442000000000000000000000000000000000000078080";
+/// Native table-load envelope with selector-only calldata, for framing tests.
+pub(crate) const SYSTEM_TX: &str = "45f84201a0111111111111111111111111111111111111111111111111111111111111111184010000009442000000000000000000000000000000000000078084bf2eebd3";
 
 /// Canonical context for reconstructing system transactions in tests; tests
 /// that need a noncanonical variant mutate one field of a fresh copy.

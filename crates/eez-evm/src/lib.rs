@@ -152,6 +152,13 @@ impl<C: EthChainSpec> EezEvmConfig<C> {
         })
     }
 
+    /// Construct an L2 configuration, refusing unsupported fork schedules.
+    pub fn new_l2(chain_spec: Arc<C>) -> Result<Self, AnyError> {
+        eez_primitives::ensure_supported_l2_forks(&chain_spec.genesis().config)
+            .map_err(|error| AnyError::new(std::io::Error::other(error)))?;
+        Self::new(chain_spec)
+    }
+
     pub fn chain_spec(&self) -> &Arc<C> {
         self.ethereum.chain_spec()
     }

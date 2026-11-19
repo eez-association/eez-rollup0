@@ -6,7 +6,7 @@ use crate::native_source::SourceEntry;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_sol_types::SolCall;
-use eez_primitives::{EEZL2_ADDRESS, EezTxEnvelope, SystemTransaction};
+use eez_primitives::{EEZL2_ADDRESS, SystemTransaction};
 
 use crate::RollupId;
 use crate::abi::{ExecutionEntrySol, L2ExecutionEntrySol, loadExecutionTableCall};
@@ -15,67 +15,7 @@ use crate::entries::{
     encode_execute_incoming,
 };
 
-/// The transaction body determines boundaries; request metadata never does.
-/// Native loads and their immediately following ordinary transaction form one
-/// group, regardless of receipt status. Inbound deliveries are one-transaction
-/// groups. Unpaired ordinary transactions do not end a group.
-/// Keep this cursor with the executed prefix and restore it with speculative
-/// state. A proposed transition takes effect only when its transaction commits.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ExecutionGroupState {
-    awaiting_user: bool,
-}
-
-impl ExecutionGroupState {
-    /// Propose the next cursor and whether this transaction completes a group.
-    /// This classifies already decoded envelopes, not source/effect authority.
-    pub fn after(self, tx: &EezTxEnvelope) -> Result<(Self, bool), &'static str> {
-        match tx {
-            EezTxEnvelope::Ethereum(_) => Ok(self.after_ordinary()),
-            EezTxEnvelope::System(_) if self.awaiting_user => {
-                Err("native table load must be followed immediately by its user transaction")
-            }
-            EezTxEnvelope::System(native) if native.to == EEZL2_ADDRESS => {
-                if native.input.starts_with(&loadExecutionTableCall::SELECTOR) {
-                    Ok((
-                        Self {
-                            awaiting_user: true,
-                        },
-                        false,
-                    ))
-                } else if native
-                    .input
-                    .starts_with(&crate::entries::EXECUTE_INCOMING_SELECTOR)
-                {
-                    Ok((Self::default(), true))
-                } else {
-                    Err("unsupported native group selector")
-                }
-            }
-            EezTxEnvelope::System(_) => Err("unsupported native group destination"),
-        }
-    }
-
-    /// The ordinary branch, also used for unsigned advisory executions. It
-    /// neither validates a signature nor authorizes the paired origin identity.
-    pub const fn after_ordinary(self) -> (Self, bool) {
-        (
-            Self {
-                awaiting_user: false,
-            },
-            self.awaiting_user,
-        )
-    }
-
-    /// A published block or effect checkpoint cannot end after an unpaired load.
-    pub fn ensure_complete(self) -> Result<(), &'static str> {
-        if self.awaiting_user {
-            Err("block ends inside an outbound load/user group")
-        } else {
-            Ok(())
-        }
-    }
-}
+pub use eez_primitives::ExecutionGroupState;
 
 /// Public reconstruction inputs shared by Composer, Deriver, and proof validation.
 #[derive(Clone, Debug)]

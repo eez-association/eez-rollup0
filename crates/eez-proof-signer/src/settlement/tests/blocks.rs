@@ -5,8 +5,8 @@ fn derives_system_flags_and_effect_candidates_from_exact_block_rlp() {
     let rlp = block_rlp(vec![
         transaction(SYSTEM_TX),
         transaction(USER_INBOUND_SELECTOR_TX),
-        transaction(SYSTEM_TX),
-        transaction(SYSTEM_TX),
+        target_system_inbound_transaction(),
+        target_system_inbound_transaction(),
     ]);
 
     let facts = inspect_settling_block(&rlp, &[true; 4], expected_rollup_id()).unwrap();
@@ -32,14 +32,14 @@ fn validated_settling_block_uses_backend_recovered_sender_facts() {
     let facts = inspect_validated_settling_block(&block, expected_rollup_id()).unwrap();
 
     assert_eq!(facts.system_sender_flags(), [true, false, false]);
-    assert_eq!(facts.effect_candidate_positions(), [1, 2]);
+    assert_eq!(facts.effect_candidate_positions(), [1]);
     assert!(facts.inbound_candidates().is_empty());
     assert_eq!(facts.outbound_event_candidates(), [observation]);
 }
 
 #[test]
 fn native_transactions_are_system_transactions() {
-    let rlp = block_rlp(vec![transaction(SYSTEM_TX)]);
+    let rlp = block_rlp(vec![target_system_inbound_transaction()]);
 
     let facts = inspect_settling_block(&rlp, &[true], expected_rollup_id()).unwrap();
 
@@ -57,7 +57,7 @@ fn signature_recovery_failures_are_not_system_transactions() {
     let facts = inspect_settling_block(&rlp, &[false], expected_rollup_id()).unwrap();
 
     assert_eq!(facts.system_sender_flags(), [false]);
-    assert_eq!(facts.effect_candidate_positions(), [0]);
+    assert!(facts.effect_candidate_positions().is_empty());
 }
 
 #[test]
@@ -153,7 +153,7 @@ fn settling_inbound_candidates_are_retained_independently_of_effect_candidates()
     let facts = inspect_settling_block(&rlp, &[true, true], expected_rollup_id()).unwrap();
 
     assert_eq!(facts.system_sender_flags(), [true, false]);
-    assert_eq!(facts.effect_candidate_positions(), [1]);
+    assert_eq!(facts.effect_candidate_positions(), [0]);
     assert_eq!(facts.inbound_candidates().len(), 1);
     assert_eq!(facts.inbound_candidates()[0].transaction_index, 0);
     assert!(facts.inbound_candidates()[0].inspection.is_ok());
@@ -359,17 +359,19 @@ fn inbound_binding_rejects_a_candidate_hidden_inside_an_outbound_pair() {
         &[ClaimedEntryShape::Outbound],
     );
 
-    let effect_prefix = verify_effect_prefix(
-        &batch,
-        pre_settling,
-        &[checkpoint(1, effect_root)],
-        &settling,
-    )
-    .unwrap();
     assert_eq!(
-        verify_inbound_effect_entries(&effect_prefix).err(),
-        Some(InboundEffectError::UnexpectedCandidate {
+        verify_effect_prefix(
+            &batch,
+            pre_settling,
+            &[checkpoint(0, effect_root)],
+            &settling,
+        )
+        .err(),
+        Some(EffectPrefixError::EffectKindMismatch {
+            entry_index: 1,
             transaction_index: 0,
+            claimed: ClaimedEntryShape::Outbound,
+            observed: ObservedEffectKind::Inbound,
         })
     );
 }

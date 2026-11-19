@@ -63,7 +63,7 @@ impl<P> Backend<P> {
         expected_l2_system_address: Address,
         committer: BlockCommitterHandle<EezEngineTypes>,
     ) -> Self {
-        let evm_config = EezEvmConfig::new(Arc::clone(&chain_spec))
+        let evm_config = EezEvmConfig::new_l2(Arc::clone(&chain_spec))
             .expect("execution chain configuration was validated at startup");
         Self {
             provider,
@@ -328,7 +328,7 @@ where
                 })?;
 
             let (checkpoint_plan, sender_flags) =
-                CheckpointPlan::for_block(&block, self.expected_l2_system_address);
+                CheckpointPlan::for_block(&block, self.expected_l2_system_address)?;
             let cached_checkpoints = self.checkpoints.lock().unwrap().get(&block.hash()).cloned();
             let (receipt_successes, observed_outbound_events, checkpoints) =
                 if checkpoint_plan.positions().is_empty() || cached_checkpoints.is_some() {

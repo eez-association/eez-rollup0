@@ -9,6 +9,24 @@ use alloy_primitives::{Address, B256, Bytes, Sealable, Sealed, TxKind, U256, add
 use alloy_rlp::{Decodable, Encodable};
 use reth_primitives_traits::InMemorySize;
 
+mod groups;
+pub use groups::{
+    EXECUTE_INCOMING_SELECTOR, ExecutionGroupState, LOAD_EXECUTION_TABLE_SELECTOR,
+    execution_group_end_positions,
+};
+
+/// Receipt gas defines native budgets and prefix commitments. EIP-8037 changes
+/// block gas accounting, so L2 deployments must not schedule it yet. L1
+/// simulation does not use this restriction.
+pub fn ensure_supported_l2_forks(config: &alloy_genesis::ChainConfig) -> Result<(), &'static str> {
+    if config.amsterdam_time.is_some() || config.bogota_time.is_some() {
+        return Err(
+            "L2 execution forks after Osaka are unsupported: native budgets require receipt gas accounting",
+        );
+    }
+    Ok(())
+}
+
 /// Ethereum's signed envelope: the same type as reth's `TransactionSigned`
 /// alias, named through alloy so this crate needs no reth git dependency.
 type TransactionSigned = alloy_consensus::EthereumTxEnvelope<alloy_consensus::TxEip4844>;

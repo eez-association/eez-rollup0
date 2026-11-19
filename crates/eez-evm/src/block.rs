@@ -6,7 +6,7 @@
 
 use alloy_consensus::Transaction;
 use alloy_eip7928::{BlockAccessIndex, BlockAccessList};
-use eez_protocol::system_tx::ExecutionGroupState;
+use eez_primitives::ExecutionGroupState;
 use evm2::block::BlockTransactionResult;
 use evm2::{
     SpecId,
@@ -200,7 +200,7 @@ impl<'a> BlockExecutor for EezBlockExecutor<'a> {
         let (group_state, _) = self
             .group_state
             .after(recovered.tx())
-            .map_err(BlockExecutionError::msg)?;
+            .map_err(BlockValidationError::msg)?;
         if let EezTxEnvelope::System(native) = recovered.tx() {
             let expected = eez_primitives::system_tx_gas_limit(
                 self.ethereum.evm().block().gas_limit.to(),
@@ -237,7 +237,7 @@ impl<'a> BlockExecutor for EezBlockExecutor<'a> {
     ) -> Result<(BlockExecutionOutput<Receipt>, Option<BlockAccessList>), BlockExecutionError> {
         self.group_state
             .ensure_complete()
-            .map_err(BlockExecutionError::msg)?;
+            .map_err(BlockValidationError::msg)?;
         self.ethereum.finish_with_block_access_list()
     }
 
@@ -246,7 +246,7 @@ impl<'a> BlockExecutor for EezBlockExecutor<'a> {
     ) -> Result<(BlockExecutionOutput<Receipt>, Option<Bal>), BlockExecutionError> {
         self.group_state
             .ensure_complete()
-            .map_err(BlockExecutionError::msg)?;
+            .map_err(BlockValidationError::msg)?;
         self.ethereum.finish_with_prepared_block_access_list()
     }
 }

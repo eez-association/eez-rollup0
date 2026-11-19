@@ -112,7 +112,7 @@ fn cached_engine(
     let hash = block.header.hash_slow();
     let input = admitted_block(block.clone());
     let recovered = decode_match_and_recover_signers(&input, &chain_spec).unwrap();
-    let (plan, _) = CheckpointPlan::for_block(&recovered, SYSTEM_ADDRESS);
+    let (plan, _) = CheckpointPlan::for_block(&recovered, SYSTEM_ADDRESS).unwrap();
     assert_eq!(!plan.positions().is_empty(), with_checkpoints);
     let provider = MockEthProvider::<EezPrimitives>::new();
     provider.add_header(anchor.hash, parent.clone());

@@ -193,3 +193,79 @@ fn native_rpc_rejects_forged_ethereum_placeholders() {
         );
     }
 }
+
+#[test]
+fn l2_forks_reject_amsterdam_even_when_scheduled_in_the_future() {
+    for time in [0, u64::MAX] {
+        for config in [
+            alloy_genesis::ChainConfig {
+                amsterdam_time: Some(time),
+                ..Default::default()
+            },
+            alloy_genesis::ChainConfig {
+                bogota_time: Some(time),
+                ..Default::default()
+            },
+        ] {
+            assert!(ensure_supported_l2_forks(&config).is_err());
+        }
+    }
+    assert!(
+        ensure_supported_l2_forks(&alloy_genesis::ChainConfig {
+            osaka_time: Some(0),
+            ..Default::default()
+        })
+        .is_ok()
+    );
+}
+
+#[test]
+fn group_endpoints_follow_delivery_and_load_selectors() {
+    let ordinary: EezTxEnvelope = TxLegacy::default()
+        .into_signed(Signature::new(U256::from(1), U256::from(1), false))
+        .into();
+    let native = |selector| {
+        SystemTransaction {
+            chain_id: 1,
+            source_hash: B256::repeat_byte(1),
+            gas_limit: SYSTEM_TX_GAS_CAP,
+            to: EEZL2_ADDRESS,
+            value: U256::ZERO,
+            input: Bytes::copy_from_slice(selector),
+        }
+        .into()
+    };
+    for (kinds, expected) in [
+        ("", vec![]),
+        ("UU", vec![]),
+        ("I", vec![0]),
+        ("IU", vec![0]),
+        ("LU", vec![1]),
+        ("LUIUI", vec![1, 2, 4]),
+        ("ULU", vec![2]),
+    ] {
+        let txs = kinds
+            .bytes()
+            .map(|kind| match kind {
+                b'I' => native(&EXECUTE_INCOMING_SELECTOR),
+                b'L' => native(&LOAD_EXECUTION_TABLE_SELECTOR),
+                _ => ordinary.clone(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            execution_group_end_positions(&txs).unwrap(),
+            expected,
+            "{kinds}"
+        );
+    }
+    for txs in [
+        vec![native(&LOAD_EXECUTION_TABLE_SELECTOR)],
+        vec![
+            native(&LOAD_EXECUTION_TABLE_SELECTOR),
+            native(&EXECUTE_INCOMING_SELECTOR),
+        ],
+        vec![native(&[0; 4])],
+    ] {
+        assert!(execution_group_end_positions(&txs).is_err());
+    }
+}
