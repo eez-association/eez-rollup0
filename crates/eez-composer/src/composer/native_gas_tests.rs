@@ -1,7 +1,8 @@
 use super::*;
 use alloy_consensus::{SignableTransaction, TxLegacy};
+use alloy_eips::Decodable2718;
 use alloy_network::TxSignerSync;
-use alloy_primitives::{TxKind, bytes};
+use alloy_primitives::{Sealable, TxKind, bytes};
 use alloy_signer_local::PrivateKeySigner;
 use eez_protocol::system_tx::{PlannedTransaction, SystemTxContext};
 use reth_chainspec::ChainSpecBuilder;
@@ -239,4 +240,130 @@ fn canonical_materialization_uses_recorded_execution_gas() {
     let mut changed = plans.clone();
     changed.swap(0, 1);
     assert_ne!(draft.materialize_prefix(&changed).unwrap(), encoded);
+}
+
+#[test]
+fn inbound_probe_under_clamp_commits_only_the_canonical_delivery() {
+    use eez_protocol::{
+        CallMode, CompositionBuilder, ExecutionRequest, RollupId, TargetExecutionSession,
+    };
+
+    let genesis: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../genesis.json")).unwrap();
+    let code = genesis["alloc"][eez_primitives::EEZL2_ADDRESS.to_string()]["code"]
+        .as_str()
+        .unwrap()
+        .parse::<Bytes>()
+        .unwrap();
+    let (provider, config, parent, signer, burner) = fixture(code);
+    let target = Address::repeat_byte(0x23);
+    // Increment storage[0] and return it. A committed probe would double count.
+    provider.add_account(
+        target,
+        ExtendedAccount::new(0, U256::ZERO).with_bytecode(bytes!("5f54600101805f555f5260205ff3")),
+    );
+    let mut draft = SyncBlockState::open(
+        Arc::new(provider),
+        &config,
+        &parent,
+        1012,
+        Address::ZERO,
+        &[signed(&signer, 0, burner, 14_500_000)],
+    )
+    .unwrap();
+    assert!(BUILDER_GAS_LIMIT - draft.gas_used() < eez_primitives::SYSTEM_TX_GAS_CAP);
+    let mut session = crate::local::InboundL2TargetSession::new(
+        draft.fork().unwrap(),
+        SystemTxContext {
+            eezl2_address: eez_primitives::EEZL2_ADDRESS,
+            l2_chain_id: 1,
+            this_rollup_id: 1,
+        },
+        eez_protocol::native_source::SourceEntry::new(1, B256::repeat_byte(1), 0).unwrap(),
+    );
+    let request = ExecutionRequest {
+        call_mode: CallMode::Mutable,
+        target_address: target,
+        data: Bytes::new(),
+        value: U256::ZERO,
+        source_address: Address::repeat_byte(0x34),
+        source_rollup_id: RollupId::MAINNET,
+    };
+    let mut dispatcher = CompositionBuilder::new(RollupId::MAINNET, Default::default());
+    for expected in [1u64, 2] {
+        let outcome = session.execute(request.clone(), &mut dispatcher).unwrap();
+        assert!(outcome.is_success());
+        assert_eq!(
+            outcome.return_data().unwrap(),
+            U256::from(expected).to_be_bytes::<32>()
+        );
+    }
+}
+
+#[test]
+fn native_intrinsic_gas_exceeding_clamped_budget_is_capacity_without_commit() {
+    use eez_evm::EezEvmTx;
+    use reth_primitives_traits::Recovered;
+
+    let (provider, config, parent, signer, burner) = fixture(bytes!("00"));
+    let mut draft = SyncBlockState::open(
+        Arc::new(provider),
+        &config,
+        &parent,
+        1012,
+        Address::ZERO,
+        &[signed(&signer, 0, burner, BUILDER_GAS_LIMIT)],
+    )
+    .unwrap();
+    let gas_before = draft.gas_used();
+    let raw = delivery()
+        .at_position(BUILDER_GAS_LIMIT, gas_before)
+        .unwrap();
+    let eez_primitives::EezTxEnvelope::System(native) =
+        eez_primitives::EezTxEnvelope::decode_2718(&mut raw.as_ref()).unwrap()
+    else {
+        panic!("expected native envelope")
+    };
+    let mut native = native.into_inner();
+    // The STOP fixture accepts any input at the full cap. Only intrinsic gas
+    // prevents this same transaction from running at its clamped position.
+    let mut input = native.input.to_vec();
+    input.extend(vec![0xff; 40_000]);
+    native.input = input.into();
+    assert!(native.gas_limit < 21_000 + 16 * 40_000);
+    let mut fork = draft.fork().unwrap();
+    let (state, env) = fork.state_and_env();
+    let tx = Recovered::new_unchecked(
+        EezEvmTx::System(native.clone()),
+        eez_primitives::SYSTEM_ADDRESS,
+    );
+    assert!(matches!(
+        state.transact(&config, env, &tx, None),
+        Err(evm2::registry::HandlerError::IntrinsicGasTooLow { .. })
+    ));
+    let mut full = native.clone();
+    full.gas_limit = eez_primitives::SYSTEM_TX_GAS_CAP;
+    assert!(
+        state
+            .transact(
+                &config,
+                env,
+                &Recovered::new_unchecked(EezEvmTx::System(full), eez_primitives::SYSTEM_ADDRESS),
+                None
+            )
+            .unwrap()
+            .result
+            .is_success()
+    );
+    let raw: Bytes = eez_primitives::EezTxEnvelope::System(native.seal_slow())
+        .encoded_2718()
+        .into();
+    assert!(matches!(draft.execute_tx(&raw), Err(BuildError::Capacity)));
+    assert_eq!(draft.gas_used(), gas_before);
+    assert!(
+        draft
+            .execute_tx(&signed(&signer, 1, Address::repeat_byte(0x99), 21_000))
+            .unwrap()
+            .success
+    );
 }
