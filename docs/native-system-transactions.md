@@ -14,7 +14,7 @@ sourceHash = keccak256(abi.encode(
 ))
 ```
 
-The domain is a dynamic ABI string, not packed bytes or a prehashed string. Indices start at zero in the full original Sync candidate: all outbound `[load, user]` pairs, then inbound deliveries. A pair counts once. Foreign entries that produce no L2 transaction do not consume an index. Derivation constructs this complete mapping before selecting the entries L1 applied; resumption preserves original indices and materializes gas against the retained execution prefix.
+The domain is a dynamic ABI string, not packed bytes or a prehashed string. Indices start at zero in the full original Sync candidate: all outbound `[load, user]` pairs, then inbound deliveries. A pair counts once. Foreign entries that produce no L2 transaction do not consume an index. Derivation counts all source positions but lowers only the entries L1 applied; resumption preserves original indices and materializes gas against the retained execution prefix.
 
 A source hash identifies an execution position, not the contents of the transaction and not authorization by itself. Competing candidates for the same position can share a source hash while differing in transaction hash. The same candidate can also be retransmitted. Exactly one accepted state-root chain determines what executed. There is no global source-hash database or native nonce replay guard inside the EVM.
 
@@ -30,7 +30,9 @@ Rollup0's signer produces conditional proofs: it does not query L1 to authentica
 
 ## Execution and accounting
 
-Each native envelope encodes exactly `min(16_777_216, blockGasLimit - precedingCumulativeGasUsed)`. Builders resolve it after executing the preceding prefix; consensus execution and signer reconstruction check it. Only actual gas usage counts against the block. A budget below intrinsic gas invalidates the transaction. Under a nearly full block, composition defers a group that needs more room rather than permanently evicting it.
+Each native envelope encodes exactly `min(16_777_216, blockGasLimit - precedingCumulativeGasUsed)`. Builders resolve it after executing the preceding prefix; consensus execution and signer reconstruction check it. Only actual gas usage counts against the block. A budget below intrinsic gas invalidates the transaction. When a native budget is below the cap, composition compares its result and pending state with an uncommitted full-cap execution. A difference defers the group when the block already contains accepted groups; a group that cannot fit an empty block is evicted. A revert that also occurs at the full cap remains a permanent execution failure. This admission safeguard does not change the encoded gas rule.
+
+L2 configurations scheduling Amsterdam or later execution forks are rejected until native position gas and receipt/header gas accounting support those forks. L1 observation is unaffected.
 
 Native `GASPRICE` is zero, including nested calls. Native calls retain chain-ID validation and execution metering, but neither validate nor increment the system account nonce. The nonce stays unchanged during execution as well as afterward. Ordinary users, including the user transaction in an outbound pair, retain normal nonces and fee rules. RPC exposes zero nonce/signature/fee placeholders; they are not wire fields or authorization.
 

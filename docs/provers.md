@@ -58,7 +58,7 @@ for it. `EEZ_TEST_PROOF_SIGNER_BIN` overrides the path.
 - A change to the shared crates lands here first, tested with the signer as
   above. provers then moves its eez-rollup0 pin to that commit on `main`, and
   this repository bumps the submodule when the signer itself changes.
-- A change to the EEZ execution rules (0x76 native transactions, the fee
+- A change to the EEZ execution rules (0x45 native transactions, the fee
   collector, the block executor) lands in `crates/eez-evm` here and in provers'
   `crates/eez-prover-evm`.
 - Both EVMs replay provers' golden fixtures
