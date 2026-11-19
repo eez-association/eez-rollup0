@@ -30,6 +30,8 @@ Rollup0's signer produces conditional proofs: it does not query L1 to authentica
 
 ## Execution and accounting
 
+Checkpoints mark complete cross-chain effect groups: the user transaction in an outbound `[load, user]` pair, or the native transaction in an inbound `[delivery]` group. Adjacent ordinary transactions do not move those boundaries. A non-empty Sync block containing only ordinary transactions is fully executed and validated but has no cross-chain effect checkpoints; an empty Sync block retains its anchor checkpoint. Current settlement produces native groups, so ordinary-only Sync blocks are not produced by that path. Sharing the group rules makes Composer and settlement agree with the signer's existing ordinary-only behavior.
+
 Each native envelope encodes exactly `min(16_777_216, blockGasLimit - precedingCumulativeGasUsed)`. Builders resolve it after executing the preceding prefix; consensus execution and signer reconstruction check it. Only actual gas usage counts against the block. A budget below intrinsic gas invalidates the transaction. When a native budget is below the cap, composition compares its result and pending state with an uncommitted full-cap execution. A difference defers the group when the block already contains accepted groups; a group that cannot fit an empty block is evicted. A revert that also occurs at the full cap remains a permanent execution failure. This admission safeguard does not change the encoded gas rule.
 
 L2 configurations scheduling Amsterdam or later execution forks are rejected until native position gas and receipt/header gas accounting support those forks. L1 observation is unaffected.
