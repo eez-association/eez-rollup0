@@ -68,6 +68,13 @@ pub enum SendOutcome {
         tx_hash: TxHash,
         target_block: u64,
     },
+    /// The post landed, but reading how it settled failed for good. Not a
+    /// failure: the Deriver's cursor resolves the batch.
+    IncludedUnread {
+        tx_hash: TxHash,
+        l1_block: u64,
+        error: String,
+    },
 }
 
 /// Whether a bundled user_tx may revert without failing the bundle, so L1
@@ -423,21 +430,13 @@ impl Inner {
                         log.address() == self.reader.eez()
                             && log.topic0() == Some(&BatchPosted::SIGNATURE_HASH)
                     });
-                    match self
+                    let read = self
                         .observe_settlement(&target_provider, l1_block, tx_hash, posted)
-                        .await
-                    {
-                        Ok(settlement) => {
-                            return Ok(SendOutcome::Included {
-                                tx_hash,
-                                l1_block,
-                                settlement,
-                            });
-                        }
-                        // The receipt proves it landed, and a failed read says
-                        // nothing about how it settled, so keep reading. If a
-                        // reorg removes the block, the receipt goes with it.
-                        Err(err) if !err.is_terminal() => {
+                        .await;
+                    match included_outcome(tx_hash, l1_block, read) {
+                        Ok(outcome) => return Ok(outcome),
+                        // If a reorg removes the block, the receipt goes with it.
+                        Err(err) => {
                             if settlement_read_warned
                                 .is_none_or(|at| at.elapsed() >= SETTLEMENT_READ_WARN_EVERY)
                             {
@@ -452,7 +451,6 @@ impl Inner {
                                 );
                             }
                         }
-                        Err(err) => return Err(err),
                     }
                 }
                 Ok(None) => {
@@ -696,6 +694,29 @@ fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutc
     }
 }
 
+/// The outcome of a post whose receipt exists, or the retryable error to read
+/// again on. The receipt proves the post landed, so no failed read makes it a
+/// failure: a read that cannot succeed leaves the settlement unread.
+fn included_outcome(
+    tx_hash: TxHash,
+    l1_block: u64,
+    read: L1Result<crate::scan::Settlement>,
+) -> L1Result<SendOutcome> {
+    match read {
+        Ok(settlement) => Ok(SendOutcome::Included {
+            tx_hash,
+            l1_block,
+            settlement,
+        }),
+        Err(err) if !err.is_terminal() => Err(err),
+        Err(err) => Ok(SendOutcome::IncludedUnread {
+            tx_hash,
+            l1_block,
+            error: err.to_string(),
+        }),
+    }
+}
+
 /// Our tx posts directly, and the scan rejects a direct tx with two posts, so
 /// at most one post carries our hash.
 fn settlement_of_our_post(
@@ -718,7 +739,10 @@ fn settlement_of_our_post(
 
 #[cfg(test)]
 mod tests {
-    use super::{PinnedVerdict, pinned_verdict, reverting_whitelist, settlement_of_our_post};
+    use super::{
+        PinnedVerdict, SendOutcome, included_outcome, pinned_verdict, reverting_whitelist,
+        settlement_of_our_post,
+    };
     use crate::error::L1Error;
     use crate::scan::{Post, PostId, Settlement};
     use alloy_primitives::{Address, B256, TxHash};
@@ -786,6 +810,30 @@ mod tests {
         ] {
             assert_eq!(pinned_verdict(block, PIN), want, "{case}");
         }
+    }
+
+    /// A landed post never fails on a settlement read: a terminal read leaves
+    /// it unread, and a retryable one reads again.
+    #[test]
+    fn settlement_read_failure_after_inclusion_is_not_a_failure() {
+        let tx = TxHash::repeat_byte(0x0A);
+        let terminal = L1Error::TraceUnavailable {
+            block: 7,
+            detail: "no debug namespace".into(),
+        };
+        assert!(matches!(
+            included_outcome(tx, 7, Err(terminal)),
+            Ok(SendOutcome::IncludedUnread { l1_block: 7, .. })
+        ));
+        let retryable = L1Error::Provider("timeout".into());
+        assert!(matches!(
+            included_outcome(tx, 7, Err(retryable)),
+            Err(L1Error::Provider(_))
+        ));
+        assert!(matches!(
+            included_outcome(tx, 7, Ok(Settlement::NONE)),
+            Ok(SendOutcome::Included { l1_block: 7, .. })
+        ));
     }
 
     /// The post under our hash settles, and none is a lagging scan only when

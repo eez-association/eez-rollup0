@@ -4818,6 +4818,25 @@ async fn observe_bundle_outcome(
     target: BundleTarget,
 ) {
     let outcome = submitter.send_bundle(&bundle, target).await;
+    if let Ok(SendOutcome::IncludedUnread {
+        tx_hash,
+        l1_block,
+        error,
+    }) = &outcome
+    {
+        // The post landed, so it is not a failure; the cursor resolves it.
+        event!(
+            name: "eez.composer.bundle.verdict_unread",
+            Level::ERROR,
+            rollup_id,
+            sync_height,
+            tx_hash = %tx_hash,
+            l1_block,
+            error = %error,
+            "postBatch landed but its settlement is unreadable; leaving the batch pending for the cursor",
+        );
+        return;
+    }
     // How far L1 got with this batch, attributed to our own postBatch tx.
     let settlement = match &outcome {
         Ok(SendOutcome::Included { settlement, .. }) => Some(settlement),
