@@ -2,14 +2,20 @@
 //!
 //! - [`timing`]: [`RollupTiming`], the per-rollup timing config, and the
 //!   per-trigger Live / Future / Sync split.
+//! - [`clock`]: the injected [`Clock`] that every slot-time read goes through.
+//! - [`deadline`]: the lateness check and the proof-start cutoff.
 //! - [`scheduler`]: [`SlotKind`] and [`SlotEvent`], the protocol between the
 //!   scheduler and the Sequencer.
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+pub mod clock;
+pub mod deadline;
 pub mod scheduler;
 pub mod timing;
 
+#[doc(inline)]
+pub use clock::{Clock, SharedClock, SystemClock, TokioClock};
 #[doc(inline)]
 pub use scheduler::{SlotEvent, SlotKind};
 #[doc(inline)]

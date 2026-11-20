@@ -37,6 +37,7 @@ use eez_l1::{BundleTarget, L1Error, L1Event, SendOutcome, Submitter};
 use eez_prover::{
     ActionableProverFailure, BlockWitness, ProverError, ProvingContext, RetryableProverError,
 };
+use eez_timing::SharedClock;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
 use reth_storage_api::{
     BlockReader, BlockSource, StateProvider, StateProviderFactory, TransactionsProvider,
@@ -1315,6 +1316,8 @@ struct Inner<L2: BlockReader> {
     /// the emission decision, the boundary math, and the span guard in
     /// `prepare_post_batch_raw` can never disagree about the cap mid-run.
     emission: EmissionLimits,
+    /// Wall clock for the proof-start cutoff.
+    clock: SharedClock,
 }
 
 impl<L2: BlockReader> std::fmt::Debug for Composer<L2> {
@@ -1346,6 +1349,7 @@ where
         committer: BlockCommitterHandle<EezEngineTypes>,
         witness_source: Option<Arc<dyn eez_prover::ProvingWitnessSource>>,
         timing: RollupTiming,
+        clock: SharedClock,
     ) -> Result<Self, ComposerConfigError> {
         let submitter = cross_chain.exec_ctx.submitter.clone();
         let submitter_poster = submitter.poster_address();
@@ -1363,6 +1367,7 @@ where
                 committer,
                 witness_source,
                 emission,
+                clock,
             }),
         })
     }
@@ -3711,7 +3716,12 @@ where
             verification_key: None,
         };
         let attestations = round
-            .attest(&proving_ctx, self.inner.emission.timing, bundle_target)
+            .attest(
+                &proving_ctx,
+                self.inner.emission.timing,
+                bundle_target,
+                self.inner.clock.as_ref(),
+            )
             .await
             .map_err(|error| attestation_error(rollup_id, error, &batch, sync_block))?;
         apply_attestations(&mut batch, rollup_id, attestations);

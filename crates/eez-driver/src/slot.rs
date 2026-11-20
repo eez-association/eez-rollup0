@@ -22,7 +22,7 @@
 //! channel.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use alloy_consensus::Header;
 use alloy_rpc_types_engine::ExecutionData;
@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::{Level, event};
 
-use eez_timing::{RollupTiming, SlotEvent};
+use eez_timing::{RollupTiming, SharedClock, SlotEvent};
 
 /// Pre-built Sync block produced by a [`SyncSlotComposer`] — ready to
 /// commit via [`BlockCommitterHandle::commit_derived`].
@@ -151,12 +151,15 @@ struct PendingSyncSlot {
 /// full channel just means the Sequencer is busy and the next tick
 /// re-nudges, which beats blocking the armed trigger behind queued ticks.
 ///
+/// Every wall-clock read goes through `clock`.
+///
 /// Exits when the source closes or the receiver is dropped.
 #[must_use]
 pub fn spawn_l1_anchored(
     mut source: eez_l1::L1HeadStream,
     timing: RollupTiming,
     l2_genesis_timestamp: u64,
+    clock: SharedClock,
 ) -> mpsc::Receiver<SlotEvent> {
     let (tx, rx) = mpsc::channel(8);
     tokio::spawn(async move {
@@ -184,7 +187,7 @@ pub fn spawn_l1_anchored(
                 // fractional phase, firing the trigger ~0.8s late and
                 // eating the send-lead before the slot.
                 let trigger_at_ms = p.trigger_at.saturating_mul(1_000);
-                Duration::from_millis(trigger_at_ms.saturating_sub(now_unix_millis()))
+                Duration::from_millis(trigger_at_ms.saturating_sub(clock.now_unix_ms()))
             });
 
             tokio::select! {
@@ -276,16 +279,4 @@ pub fn spawn_l1_anchored(
         }
     });
     rx
-}
-
-/// Wall-clock unix time in milliseconds — the defer-on-lateness check
-/// needs sub-second precision.
-pub(crate) fn now_unix_millis() -> u64 {
-    u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX)
 }

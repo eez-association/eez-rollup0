@@ -8,6 +8,10 @@ description            = "Slot timing for an EEZ rollup: timing config, deadline
 
 [dependencies]
 thiserror.workspace = true
+tokio = { version = "1", default-features = false, features = ["time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

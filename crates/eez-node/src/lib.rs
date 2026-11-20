@@ -23,7 +23,7 @@ use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
 use eez_deriver::Deriver;
 use eez_driver::{
     BlockCommitterHandle, DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, RollupTiming,
-    Sequencer, SyncSlotComposerHandle, spawn_l1_anchored,
+    Sequencer, SharedClock, SyncSlotComposerHandle, SystemClock, spawn_l1_anchored,
 };
 use eez_engine::EezEngineTypes;
 use eez_l1::{
@@ -501,6 +501,8 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     let l1_head = Arc::new(L1CanonicalHead::default());
 
     let timing = RollupTiming::from_env()?;
+    // The one wall clock behind every slot-time read.
+    let clock: SharedClock = Arc::new(SystemClock);
 
     // Env reads come first so a bad L1 env fails at startup, not after a backfill.
     let submitter_config = SubmitterConfig::from_env()?;
@@ -836,6 +838,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             block_committer.clone(),
             witness_source,
             timing,
+            Arc::clone(&clock),
         )?;
         let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
@@ -843,12 +846,14 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             L1HeadStream::from_watcher(&l1_watcher),
             timing,
             l2_genesis_timestamp,
+            Arc::clone(&clock),
         );
         let sequencer = Sequencer::composer(
             attributes,
             block_committer.clone(),
             schedule_rx,
             timing,
+            clock,
             rollup_id,
             sync_slot_handle,
             depth,

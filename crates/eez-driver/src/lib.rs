@@ -15,8 +15,8 @@
 //! - [`slot`] — [`spawn_l1_anchored`] and the Sync-slot composer hook.
 //! - [`Sequencer`] consumes [`SlotEvent`]s, builds payload attributes,
 //!   drives reth's engine, tracks head.
-//! - [`RollupTiming`], [`SlotComposition`], [`SlotKind`] and [`SlotEvent`]
-//!   live in `eez-timing` and are re-exported here.
+//! - [`RollupTiming`], [`SlotComposition`], [`SlotKind`], [`SlotEvent`] and
+//!   the injected [`Clock`] live in `eez-timing` and are re-exported here.
 //!
 //! L1-anchored scheduling consumes an [`eez_l1::L1HeadStream`] through
 //! [`spawn_l1_anchored`]; higher-level composition remains in `eez-composer`.
@@ -40,8 +40,8 @@ pub mod witness;
 pub use block_committer::{BlockCommitterHandle, CommitOutcome, DeriveOutcome, ForkchoiceOutcome};
 #[doc(inline)]
 pub use eez_timing::{
-    MAX_BLOCKS_PER_BATCH, MAX_BLOCKS_PER_CATCHUP, RollupTiming, SlotComposition, SlotEvent,
-    SlotKind,
+    Clock, MAX_BLOCKS_PER_BATCH, MAX_BLOCKS_PER_CATCHUP, RollupTiming, SharedClock,
+    SlotComposition, SlotEvent, SlotKind, SystemClock, TokioClock,
 };
 #[doc(inline)]
 pub use error::{DriverError, DriverResult};

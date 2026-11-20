@@ -3491,6 +3491,7 @@ dependencies = [
  "eez-primitives",
  "eez-protocol",
  "eez-prover",
+ "eez-timing",
  "evm2",
  "futures-util",
  "gnosis-primitives",
@@ -4045,6 +4046,7 @@ name = "eez-timing"
 version = "0.1.0"
 dependencies = [
  "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

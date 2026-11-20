@@ -41,7 +41,8 @@ use tokio::sync::mpsc;
 use crate::block_committer::BlockCommitterHandle;
 use crate::error::{DriverError, DriverResult};
 use crate::slot::{SyncSlotComposerHandle, SyncSlotMode};
-use eez_timing::{RollupTiming, SlotComposition, SlotEvent, SlotKind};
+use eez_timing::deadline::misses_l1_slot;
+use eez_timing::{RollupTiming, SharedClock, SlotComposition, SlotEvent, SlotKind};
 
 /// How often the sequencer re-publishes the current forkchoice state.
 ///
@@ -152,6 +153,8 @@ where
     /// compute per-trigger Live/Future/Sync block composition and per-
     /// block timestamps.
     timing: RollupTiming,
+    /// Wall clock for the defer-on-lateness check.
+    clock: SharedClock,
     rollup_id: u64,
     composer: SyncSlotComposerHandle,
     max_speculative_depth: u64,
@@ -201,6 +204,7 @@ where
         committer: BlockCommitterHandle<T>,
         schedule_rx: mpsc::Receiver<SlotEvent>,
         timing: RollupTiming,
+        clock: SharedClock,
         rollup_id: u64,
         composer: SyncSlotComposerHandle,
         max_speculative_depth: u64,
@@ -211,6 +215,7 @@ where
             schedule_rx,
             committer,
             timing,
+            clock,
             rollup_id,
             composer,
             max_speculative_depth,
@@ -322,14 +327,7 @@ where
     /// the immediate next L1 slot. Steady state has headroom; fires only on
     /// a late trigger, where the slot is deferred.
     fn sync_block_misses_l1_slot(&self, sync_slot_timestamp: u64) -> bool {
-        let proof_ms = u64::try_from(self.timing.proof_time().as_millis()).unwrap_or(u64::MAX);
-        let slack_ms =
-            u64::try_from(self.timing.submission_slack().as_millis()).unwrap_or(u64::MAX);
-        let ready_ms = crate::slot::now_unix_millis().saturating_add(proof_ms);
-        let deadline_ms = sync_slot_timestamp
-            .saturating_mul(1_000)
-            .saturating_sub(slack_ms);
-        ready_ms > deadline_ms
+        misses_l1_slot(self.timing, self.clock.now_unix_ms(), sync_slot_timestamp)
     }
 
     /// One skip self-heals next trigger; a run of them means production is
