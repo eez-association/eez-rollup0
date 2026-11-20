@@ -27,7 +27,7 @@ ethereum_package:
     mev_builder_subsidy: 1
 
 eez:
-  # `stateful` runs the proof service inside an L1-derived eez-follower so
+  # `stateful` runs the proof service inside eez-prover-stateful with an L1-derived follower so
   # Reth owns unsafe block/state storage; the default remains `stateless`.
   prover_backend: stateless
   # Blockscout adds eight services (frontend, backend, verifier, and database
@@ -36,6 +36,7 @@ eez:
 
   eez_node_image: eez-node:ci
   proof_signer_image: eez-proof-signer:ci
+  stateful_prover_image: eez-prover-stateful:ci
   deploy_image: eez-deploy:ci
   follower_image: sigp/lighthouse:v8.1.2
   blockscout_postgres_image: postgres:alpine

@@ -15,7 +15,6 @@ members = [
     "crates/eez-p2p",
     "crates/eez-payload-codec",
     "crates/eez-proof-signer",
-    "crates/eez-prover-stateful",
     "crates/eez-protocol",
     "crates/eez-primitives",
     "crates/eez-evm",
@@ -196,7 +195,6 @@ eez-payload-codec  = { path = "crates/eez-payload-codec" }
 eez-proof-signer   = { path = "crates/eez-proof-signer" }
 eez-protocol       = { path = "crates/eez-protocol" }
 eez-prover         = { path = "crates/eez-prover" }
-eez-prover-stateful  = { path = "crates/eez-prover-stateful" }
 eez-testkit        = { path = "crates/eez-testkit" }
 
 # Patches do not propagate from git dependencies, so these mirror reth v2.11.0's

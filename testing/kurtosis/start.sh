@@ -39,6 +39,7 @@ yv() { grep -E "^[[:space:]]*$1:" "$ARGS_FILE" | head -1 \
 
 NODE_IMAGE="$(yv eez_node_image)";                NODE_IMAGE="${NODE_IMAGE:-eez-node:dev}"
 PROOF_SIGNER_IMAGE="$(yv proof_signer_image)";    PROOF_SIGNER_IMAGE="${PROOF_SIGNER_IMAGE:-eez-proof-signer:dev}"
+STATEFUL_PROVER_IMAGE="$(yv stateful_prover_image || true)"; STATEFUL_PROVER_IMAGE="${STATEFUL_PROVER_IMAGE:-eez-prover-stateful:dev}"
 DEPLOY_IMAGE="$(yv deploy_image)";                DEPLOY_IMAGE="${DEPLOY_IMAGE:-eez-deploy:dev}"
 PREBUILT_BIN_DIR="${EEZ_PREBUILT_BIN_DIR:-}"
 
@@ -90,7 +91,8 @@ if [[ -n "$PREBUILT_BIN_DIR" ]]; then
         eez-follower \
         eez-genesis-state-root \
         eez-genesis-block-hash \
-        eez-proof-signer
+        eez-proof-signer \
+        eez-prover-stateful
     do
         if [[ ! -x "$PREBUILT_BIN_DIR/$binary" ]]; then
             echo "prebuilt binary is missing or not executable: $PREBUILT_BIN_DIR/$binary" >&2
@@ -127,6 +129,16 @@ if [[ "${EEZ_SKIP_PROOF_SIGNER_BUILD:-0}" != "1" ]]; then
     fi
 else
     echo "==> reusing $PROOF_SIGNER_IMAGE (EEZ_SKIP_PROOF_SIGNER_BUILD=1)"
+fi
+
+if [[ "$(yv prover_backend || true)" == "stateful" && "${EEZ_SKIP_PROOF_SIGNER_BUILD:-0}" != "1" ]]; then
+    if [[ -n "$PREBUILT_BIN_DIR" ]]; then
+        docker build -f "$HERE/Dockerfile.prebuilt" --target stateful-prover \
+            -t "$STATEFUL_PROVER_IMAGE" "$PREBUILT_BIN_DIR"
+    else
+        docker_release_build signer -f "$REPO/Dockerfile" --target stateful-prover \
+            -t "$STATEFUL_PROVER_IMAGE" "$REPO"
+    fi
 fi
 
 if [[ "${EEZ_SKIP_DEPLOY_BUILD:-0}" != "1" ]]; then

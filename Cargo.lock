@@ -508,7 +508,7 @@ dependencies = [
  "futures",
  "futures-utils-wasm",
  "http",
- "lru 0.18.5",
+ "lru",
  "parking_lot",
  "pin-project",
  "reqwest 0.13.4",
@@ -3645,16 +3645,19 @@ dependencies = [
  "eez-p2p",
  "eez-primitives",
  "eez-protocol",
- "eez-prover-stateful",
  "eez-seq-sig",
  "eyre",
  "reth-chainspec",
  "reth-consensus-common",
+ "reth-db",
  "reth-network",
  "reth-network-p2p",
+ "reth-node-api",
  "reth-payload-primitives",
  "reth-primitives-traits",
+ "reth-provider",
  "reth-storage-api",
+ "reth-tasks",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -3979,43 +3982,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tracing",
-]
-
-[[package]]
-name = "eez-prover-stateful"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-rpc-types-debug",
- "alloy-rpc-types-engine",
- "async-trait",
- "eez-composer",
- "eez-driver",
- "eez-engine",
- "eez-evm",
- "eez-primitives",
- "eez-proof-signer",
- "evm2",
- "eyre",
- "lru 0.16.4",
- "reth-chain-state",
- "reth-chainspec",
- "reth-consensus",
- "reth-engine-primitives",
- "reth-ethereum-consensus",
- "reth-evm",
- "reth-execution-types",
- "reth-payload-builder",
- "reth-payload-primitives",
- "reth-primitives-traits",
- "reth-provider",
- "reth-storage-api",
- "reth-trie-common",
- "tokio",
  "tracing",
 ]
 
@@ -6874,15 +6840,6 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.16.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
-dependencies = [
- "hashbrown 0.16.1",
-]
-
-[[package]]
-name = "lru"
 version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
@@ -8709,7 +8666,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "itertools 0.14.0",
  "kasuari",
- "lru 0.18.5",
+ "lru",
  "palette",
  "serde",
  "strum 0.28.0",
