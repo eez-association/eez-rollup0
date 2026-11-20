@@ -1048,6 +1048,14 @@ where
                         skipped,
                         "L1 event stream lagged; resyncing from L1",
                     );
+                    // A skipped Reorg above the index tail moves no cursor, so
+                    // recheck the unsafe seeds, with sequencing held until it passes.
+                    if let Err(err) = self.mark_missed_reorg().await {
+                        stop_if_fatal(&err);
+                        if matches!(&err, DeriverError::CommitterClosed) {
+                            return;
+                        }
+                    }
                     if !self.try_recover().await {
                         return;
                     }
@@ -1062,6 +1070,15 @@ where
                 }
             }
         }
+    }
+
+    /// Block sequencing and flag the unsafe suffix for a seed recheck, which the
+    /// next [`Self::retry_l1_reorg`] runs.
+    async fn mark_missed_reorg(&self) -> DeriverResult<()> {
+        let _guard = self.inner.committer.begin_reconcile().await;
+        self.inner.committer.begin_l1_reorg().await?;
+        self.inner.reseed_pending.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Post-failure recovery via [`Self::catch_up`]. Returns `false` only
