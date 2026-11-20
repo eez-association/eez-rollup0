@@ -93,7 +93,8 @@ rollup, deploys the L1 bridge contracts, and writes **`deployments.env`**
 The deploy uses reserved native system address `0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076`,
 generates its canonical EEZL2 genesis without allocating the system account, and
 registers that exact state root. System transactions require no private key. It also writes the
-L2 **`datadir/genesis.json`** whose timestamp is pinned to the deploy block. The
+L2 **`datadir/genesis.json`**, pinned one L1 slot after a finalized L1 reference
+block whose `prevRandao` it copies (`EEZ_L1_REFERENCE`, see `.env.example`). The
 container loads `deployments.env` automatically; `.env.chiado`'s
 `FRESH_GENESIS` points at that genesis (default `./datadir/genesis.json`), so
 **deploy must run before `up`** — there is no separate genesis-creation step.
