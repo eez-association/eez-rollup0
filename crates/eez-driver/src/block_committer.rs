@@ -901,16 +901,137 @@ fn classify_advance_head_response(res: &ForkchoiceUpdated) -> DriverResult<Forkc
 mod tests {
     use super::*;
     use alloy_consensus::Header;
+    use alloy_rpc_types_engine::PayloadId;
     use reth_engine_primitives::BeaconEngineMessage;
     use reth_ethereum_engine_primitives::EthEngineTypes;
     use reth_ethereum_primitives::BlockBody;
     use reth_primitives_traits::SealedBlock;
+
+    use crate::test_engine::{self, EngineCall, TestEngine};
 
     fn sealed(number: u64) -> SealedHeader {
         SealedHeader::seal_slow(Header {
             number,
             ..Default::default()
         })
+    }
+
+    type Witness = mpsc::UnboundedReceiver<B256>;
+    type Payload = <EthEngineTypes as PayloadTypes>::ExecutionData;
+
+    /// A committer on the mock engine that feeds witnesses to the returned receiver.
+    fn fed_committer(
+        head: &SealedHeader,
+    ) -> (TestEngine, BlockCommitterHandle<EthEngineTypes>, Witness) {
+        let (engine, to_engine, payload_builder) = TestEngine::spawn(head);
+        let (witness_tx, witness_rx) = mpsc::unbounded_channel();
+        let committer = BlockCommitterHandle::spawn(
+            head.clone(),
+            head.clone(),
+            head.hash(),
+            to_engine,
+            payload_builder,
+            Some(witness_tx),
+        );
+        (engine, committer, witness_rx)
+    }
+
+    /// Every block hash fed to the witness channel so far.
+    fn fed(witness: &mut Witness) -> Vec<B256> {
+        std::iter::from_fn(|| witness.try_recv().ok()).collect()
+    }
+
+    /// An empty child of `parent` and its engine payload.
+    fn child(parent: &SealedHeader) -> (SealedHeader, Payload) {
+        let header = SealedHeader::seal_slow(Header {
+            parent_hash: parent.hash(),
+            number: parent.number + 1,
+            timestamp: parent.timestamp + 2,
+            ..Default::default()
+        });
+        let block = SealedBlock::<reth_ethereum_primitives::Block>::from_sealed_parts(
+            header.clone(),
+            BlockBody::default(),
+        );
+        (
+            header,
+            <EthEngineTypes as PayloadTypes>::block_to_payload(block, None),
+        )
+    }
+
+    #[tokio::test]
+    async fn sequence_is_build_import_adopt() {
+        let genesis = test_engine::genesis();
+        let (engine, committer, mut witness) = fed_committer(&genesis);
+
+        let block = committer
+            .commit_sequenced(genesis.hash(), test_engine::attrs(1_002))
+            .await
+            .unwrap()
+            .header;
+        assert_eq!(block.parent_hash, genesis.hash());
+        assert_eq!(
+            engine.calls(),
+            vec![
+                EngineCall::Fcu {
+                    head: genesis.hash(),
+                    with_attrs: true
+                },
+                EngineCall::Resolve {
+                    id: PayloadId::new(1_u64.to_be_bytes())
+                },
+                EngineCall::NewPayload { hash: block.hash() },
+                EngineCall::Fcu {
+                    head: block.hash(),
+                    with_attrs: false
+                },
+            ]
+        );
+        assert_eq!(committer.last_header().hash(), block.hash());
+        assert_eq!(fed(&mut witness), vec![block.hash()]);
+    }
+
+    #[tokio::test]
+    async fn derive_is_import_then_adopt() {
+        let genesis = test_engine::genesis();
+        let (engine, committer, mut witness) = fed_committer(&genesis);
+        let (produced, produced_payload) = child(&genesis);
+        let (replayed, replayed_payload) = child(&produced);
+
+        for (block, payload, feed_witness) in [
+            (&produced, produced_payload, true),
+            (&replayed, replayed_payload, false),
+        ] {
+            let outcome = committer
+                .commit_derived(payload, block.clone(), feed_witness)
+                .await
+                .unwrap();
+            assert_eq!(
+                (outcome.block_hash, outcome.block_number),
+                (block.hash(), block.number)
+            );
+            assert_eq!(committer.last_header().hash(), block.hash());
+        }
+        assert_eq!(
+            engine.calls(),
+            vec![
+                EngineCall::NewPayload {
+                    hash: produced.hash()
+                },
+                EngineCall::Fcu {
+                    head: produced.hash(),
+                    with_attrs: false
+                },
+                EngineCall::NewPayload {
+                    hash: replayed.hash()
+                },
+                EngineCall::Fcu {
+                    head: replayed.hash(),
+                    with_attrs: false
+                },
+            ]
+        );
+        assert_eq!(fed(&mut witness), vec![produced.hash()]);
     }
 
     #[tokio::test]

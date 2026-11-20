@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use alloy_consensus::Header;
-use alloy_primitives::{B256, U256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_rpc_types_engine::{PayloadId, PayloadStatus, PayloadStatusEnum};
 use reth_engine_primitives::{BeaconEngineMessage, ConsensusEngineHandle, OnForkChoiceUpdated};
 use reth_ethereum_engine_primitives::{EthBuiltPayload, EthEngineTypes, EthPayloadAttributes};
@@ -238,32 +238,32 @@ fn invalid() -> PayloadStatus {
     })
 }
 
+/// A genesis header at timestamp 1000.
+pub(crate) fn genesis() -> SealedHeader {
+    SealedHeader::seal_slow(Header {
+        timestamp: 1_000,
+        gas_limit: 30_000_000,
+        ..Default::default()
+    })
+}
+
+/// Payload attributes with only the timestamp set.
+pub(crate) fn attrs(timestamp: u64) -> EthPayloadAttributes {
+    EthPayloadAttributes {
+        timestamp,
+        prev_randao: B256::ZERO,
+        suggested_fee_recipient: Address::ZERO,
+        withdrawals: None,
+        parent_beacon_block_root: None,
+        slot_number: None,
+        target_gas_limit: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::Address;
-
     use super::*;
     use crate::DriverError;
-
-    fn genesis() -> SealedHeader {
-        SealedHeader::seal_slow(Header {
-            timestamp: 1_000,
-            gas_limit: 30_000_000,
-            ..Default::default()
-        })
-    }
-
-    fn attrs(timestamp: u64) -> EthPayloadAttributes {
-        EthPayloadAttributes {
-            timestamp,
-            prev_randao: B256::ZERO,
-            suggested_fee_recipient: Address::ZERO,
-            withdrawals: None,
-            parent_beacon_block_root: None,
-            slot_number: None,
-            target_gas_limit: None,
-        }
-    }
 
     #[tokio::test]
     async fn sequenced_commit_builds_a_child_and_logs_every_call() {
