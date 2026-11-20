@@ -39,6 +39,11 @@ tokio.workspace   = true
 tracing.workspace = true
 
 [dev-dependencies]
+jsonrpsee.workspace = true
+reth-engine-primitives.workspace = true
+reth-payload-builder.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }
+serde_json.workspace = true
 proptest = "1"
 # tests build event logs; the lib itself no longer decodes ABI
 alloy-sol-types.workspace = true

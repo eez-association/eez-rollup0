@@ -139,6 +139,53 @@ compute_genesis_state_root() {
     fi
 }
 
+# ── L1 genesis reference ────────────────────────────────────────────
+# The genesis reference is a finalized L1 block R. L2 genesis starts one L1
+# slot after it, so R is P(T_genesis), the latest L1 block before the genesis
+# Sync timestamp: its prevRandao seeds the genesis header and the first
+# interval, and R is already final, so nothing waits for finality.
+# EEZ_L1_REFERENCE=genesis uses L1 block zero instead, for a fresh private
+# devnet with no finalized block yet. Picked before the first broadcast so a
+# failure here deploys nothing.
+case "${EEZ_L1_REFERENCE:-finalized}" in
+    finalized) REFERENCE_BLOCK=finalized ;;
+    genesis) REFERENCE_BLOCK=0 ;;
+    *)
+        echo "deploy: EEZ_L1_REFERENCE must be 'finalized' or 'genesis'" >&2
+        exit 1
+        ;;
+esac
+case "$(cast chain-id --rpc-url "$EEZ_L1_RPC_URL")" in
+    1) : "${EEZ_L1_BLOCK_TIME_MS:=12000}" ;;
+    10200) : "${EEZ_L1_BLOCK_TIME_MS:=5000}" ;;
+esac
+[[ "${EEZ_L1_BLOCK_TIME_MS:-}" =~ ^[1-9][0-9]*000$ ]] || {
+    echo "deploy: EEZ_L1_BLOCK_TIME_MS must be set to the L1 slot time in whole seconds" >&2
+    exit 1
+}
+REFERENCE="$(cast block "$REFERENCE_BLOCK" --rpc-url "$EEZ_L1_RPC_URL" --json)" || {
+    echo "deploy: L1 serves no '$REFERENCE_BLOCK' block for the genesis reference" >&2
+    exit 1
+}
+REFERENCE_NUMBER="$(jq -er '.number' <<<"$REFERENCE")" \
+    && REFERENCE_TS="$(jq -er '.timestamp' <<<"$REFERENCE")" \
+    && REFERENCE_HASH="$(jq -er '.hash' <<<"$REFERENCE")" \
+    && REFERENCE_RANDAO="$(jq -er '.mixHash' <<<"$REFERENCE")" \
+    && [[ "$REFERENCE_NUMBER" =~ ^0x[0-9a-fA-F]+$ && "$REFERENCE_TS" =~ ^0x[0-9a-fA-F]+$ \
+        && "$REFERENCE_HASH" =~ ^0x[0-9a-fA-F]{64}$ && "$REFERENCE_RANDAO" =~ ^0x[0-9a-fA-F]{64}$ ]] || {
+    echo "deploy: L1 '$REFERENCE_BLOCK' block has a missing or malformed number, timestamp, hash or mixHash" >&2
+    exit 1
+}
+REFERENCE_NUMBER="$(( REFERENCE_NUMBER ))"
+REFERENCE_TS="$(( REFERENCE_TS ))"
+# The Sequencer backfills every L2 slot from genesis to now, so an old
+# reference (block zero of a public chain, or stalled finality) is refused.
+(( $(date +%s) - REFERENCE_TS <= 86400 )) || {
+    echo "deploy: L1 reference block #$REFERENCE_NUMBER is more than a day old" >&2
+    exit 1
+}
+GENESIS_TS_HEX="$(printf '0x%x' $(( REFERENCE_TS + EEZ_L1_BLOCK_TIME_MS / 1000 )))"
+
 # ── 1/5 DeployEEZ ────────────────────────────────────────────────────
 echo "[1/5] DeployEEZ"
 run_forge "DeployEEZ" forge script script/DeployEEZ.s.sol:DeployEEZ \
@@ -203,23 +250,22 @@ fi
 echo "      stateRoot  = $EEZ_INITIAL_STATE_ROOT"
 echo "      runtimeHash= $EEZ_L2_EEZL2_CODE_HASH"
 
-# ── L2 genesis with deploy-aligned timestamp ────────────────────────
+# ── L2 genesis pinned to the L1 reference ───────────────────────────
 # Reth's `--chain dev` prebaked genesis has timestamp = June 2023.
 # The Sequencer's greedy backfill loop produces blocks at
 # `parent.timestamp + 2s` until wall-clock — from a 2023 genesis
 # that's ~47M blocks of pure timestamp catch-up to reach 2026.
-# Useless work. We write a per-deploy genesis with timestamp set to
-# the L1 block observed after deploying the EEZ registry, so catch-up
-# only bridges deployment time to now. Timestamp and fork activation do not
-# change the genesis state root, but verify that explicitly before publishing.
-DEPLOY_BLOCK_TS_HEX="$(cast block "$EEZ_REGISTRY_DEPLOY_BLOCK" --rpc-url "$EEZ_L1_RPC_URL" --json | jq -r '.timestamp')"
-[[ -n "$DEPLOY_BLOCK_TS_HEX" && "$DEPLOY_BLOCK_TS_HEX" != "null" ]] || {
-    echo "deploy: failed to capture L1 block timestamp for $EEZ_REGISTRY_DEPLOY_BLOCK" >&2
-    exit 1
-}
+# Useless work. We write a per-deploy genesis one L1 slot after the recent
+# reference picked above, copying its prevRandao, so catch-up only bridges
+# that block to now. Its number and hash go to deployments.env: the stateless
+# signer rejects unknown genesis `config` fields. Timestamp, mixHash and fork
+# activation do not change the genesis state root, but verify that explicitly
+# before publishing.
 GENESIS_TIMESTAMP_TMP="$(mktemp "${GENESIS_OUT}.tmp.XXXXXX")"
-jq --arg timestamp "$DEPLOY_BLOCK_TS_HEX" --arg fee_recipient "$EEZ_L2_FEE_RECIPIENT" '
+jq --arg timestamp "$GENESIS_TS_HEX" --arg fee_recipient "$EEZ_L2_FEE_RECIPIENT" \
+    --arg mix_hash "$REFERENCE_RANDAO" '
     .timestamp = $timestamp
+    | .mixHash = $mix_hash
     | .config.feeCollector = $fee_recipient
     | .config += {
         homesteadBlock: 0,
@@ -249,12 +295,13 @@ mv "$GENESIS_TIMESTAMP_TMP" "$GENESIS_OUT"
 
 FINAL_STATE_ROOT="$(compute_genesis_state_root "$GENESIS_OUT")"
 if [[ "${FINAL_STATE_ROOT,,}" != "${EEZ_INITIAL_STATE_ROOT,,}" ]]; then
-    echo "deploy: the timestamp pin changed the genesis state root" >&2
+    echo "deploy: the genesis pin changed the genesis state root" >&2
     echo "rendered:  $EEZ_INITIAL_STATE_ROOT" >&2
     echo "finalized: $FINAL_STATE_ROOT" >&2
     exit 1
 fi
-echo "      genesis.ts = $DEPLOY_BLOCK_TS_HEX ($(printf %d $DEPLOY_BLOCK_TS_HEX))"
+echo "      genesis.ts = $GENESIS_TS_HEX ($(printf %d "$GENESIS_TS_HEX"))"
+echo "      l1Reference= #$REFERENCE_NUMBER $REFERENCE_HASH (prevRandao $REFERENCE_RANDAO)"
 
 # The rollup is registered by its genesis BLOCK HASH, which — unlike the state
 # root — commits the timestamp and fork activations rewritten just above. So it
@@ -312,6 +359,9 @@ EEZ_ROLLUP_ID=$EEZ_ROLLUP_ID
 EEZ_INITIAL_STATE_ROOT=$EEZ_INITIAL_STATE_ROOT
 # The value actually registered on L1: the finalized genesis block hash.
 EEZ_INITIAL_BLOCK_HASH=$EEZ_INITIAL_BLOCK_HASH
+# The finalized L1 block whose prevRandao the L2 genesis copies.
+EEZ_GENESIS_L1_REFERENCE_NUMBER=$REFERENCE_NUMBER
+EEZ_GENESIS_L1_REFERENCE_HASH=$REFERENCE_HASH
 EEZ_L2_GENESIS_PATH=$GENESIS_OUT
 EEZ_L2_GENESIS_PROFILE_PATH=$GENESIS_PROFILE_OUT
 # Also used by the composer for priority fees; base fees are fixed in genesis.
