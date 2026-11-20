@@ -272,6 +272,8 @@ struct BundleStub {
 pub enum BuilderStubMode {
     Forward,
     Drop,
+    /// Queue the bundle like `Forward`, then close without answering.
+    AckLost,
 }
 
 impl BuilderStubMode {
@@ -279,6 +281,7 @@ impl BuilderStubMode {
         match self {
             Self::Forward => "forward",
             Self::Drop => "drop",
+            Self::AckLost => "ack-lost",
         }
     }
 }

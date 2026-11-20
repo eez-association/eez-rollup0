@@ -16,7 +16,9 @@ revert is left out and the block is built without it. Anvil must also run
 with `--order fifo` so a block keeps each bundle's transactions in order.
 Suitable for tests; not for production.
 
-Extra methods for tests: `eez_setBuilderMode` ("forward" | "drop"),
+Extra methods for tests: `eez_setBuilderMode` ("forward" | "drop" | "ack-lost";
+"ack-lost" queues each bundle like "forward" but closes the connection without
+answering),
 `eez_setMining` (pause or resume the ticker), `eez_mine` (mine one block) and
 `eez_setBundleAckDelay` (seconds each `eth_sendBundle` waits before answering).
 
@@ -112,7 +114,7 @@ class Builder:
                 _log(
                     f"bundle for block {target} arrived after block {number}; not included"
                 )
-            elif cls.mode == "forward":
+            elif cls.mode in ("forward", "ack-lost"):
                 cls.pending.setdefault(target, []).append(params)
         digest = hashlib.sha256(json.dumps(txs).encode()).hexdigest()
         return {"bundleHash": "0x" + digest}
@@ -242,6 +244,10 @@ class Builder:
             time.sleep(wait)
 
 
+# The request took effect but gets no answer, like a reply lost in transit.
+_NO_REPLY = object()
+
+
 def _is_builder_request(body):
     """Identify methods whose behavior belongs to the local builder."""
     method = body.get("method") if isinstance(body, dict) else None
@@ -269,7 +275,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         params = body.get("params", [])
         if method == "eez_setBuilderMode":
             mode = params[0] if params else None
-            if mode not in ("forward", "drop"):
+            if mode not in ("forward", "drop", "ack-lost"):
                 return self._error(body, "invalid builder stub mode")
             with Builder.lock:
                 Builder.mode = mode
@@ -293,13 +299,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._result(body, list(Builder.rejected))
         if method == "eth_sendBundle":
             time.sleep(Builder.ack_delay)
-            if Builder.passthrough and Builder.mode == "forward":
-                return None
+            lose_reply = Builder.mode == "ack-lost"
+            if Builder.passthrough and Builder.mode != "drop":
+                if not lose_reply:
+                    return None
+                self._forward(body)
+                return _NO_REPLY
             try:
-                return self._result(body, Builder.queue(params[0]))
+                response = self._result(body, Builder.queue(params[0]))
             except (IndexError, KeyError, TypeError, ValueError, RuntimeError) as error:
                 return self._error(body, str(error))
+            return _NO_REPLY if lose_reply else response
         return None
+
+    def _forward(self, body):
+        # The stub is the harness's only Anvil gateway. Serialising
+        # forwarded calls keeps snapshot rollback from losing a request
+        # that arrived while a candidate block was being built.
+        with Builder.lock:
+            return urllib.request.urlopen(
+                urllib.request.Request(
+                    Builder.upstream,
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"},
+                ),
+                timeout=10,
+            ).read()
 
     def do_POST(self):
         try:
@@ -313,21 +338,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         response = None if isinstance(body, list) else self._dispatch(body)
+        if response is _NO_REPLY:
+            # HTTP/1.0: the connection closes with nothing written.
+            return
         if response is not None:
             resp = json.dumps(response).encode()
         else:
-            # The stub is the harness's only Anvil gateway. Serialising
-            # forwarded calls keeps snapshot rollback from losing a request
-            # that arrived while a candidate block was being built.
-            with Builder.lock:
-                resp = urllib.request.urlopen(
-                    urllib.request.Request(
-                        Builder.upstream,
-                        data=json.dumps(body).encode(),
-                        headers={"Content-Type": "application/json"},
-                    ),
-                    timeout=10,
-                ).read()
+            resp = self._forward(body)
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(resp)))
