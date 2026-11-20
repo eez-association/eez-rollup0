@@ -24,10 +24,11 @@
 use std::sync::Arc;
 
 use alloy_consensus::Header;
+use alloy_primitives::B256;
 use alloy_rpc_types_engine::ExecutionData;
 use async_trait::async_trait;
 use reth_primitives_traits::SealedHeader;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::{Level, event};
 
@@ -43,6 +44,29 @@ pub struct SyncSlotBlock {
     pub payload: ExecutionData,
     /// Sealed header of the new block (head-mirror update on commit).
     pub header: SealedHeader<Header>,
+    /// Sends the block's bundle once the block is committed. `None` when the
+    /// block has no bundle.
+    pub release: Option<CommitRelease>,
+}
+
+/// Releases a Sync block's bundle once the block is committed. Dropping it
+/// withholds the bundle.
+#[derive(Debug)]
+pub struct CommitRelease(oneshot::Sender<B256>);
+
+impl CommitRelease {
+    /// A release and the receiver the bundle's sender waits on.
+    #[must_use]
+    pub fn new() -> (Self, oneshot::Receiver<B256>) {
+        let (tx, rx) = oneshot::channel();
+        (Self(tx), rx)
+    }
+
+    /// The block `hash` is committed, so its bundle may be sent.
+    pub fn committed(self, hash: B256) {
+        // A sender that is gone has nothing left to send.
+        let _ = self.0.send(hash);
+    }
 }
 
 /// Parent context the Sequencer supplies to a [`SyncSlotComposer`].
@@ -237,7 +261,6 @@ pub fn spawn_l1_anchored(
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::B256;
     use eez_l1::{L1Event, L1HeadStream};
     use eez_timing::{Clock, TokioClock};
     use tokio::sync::broadcast;

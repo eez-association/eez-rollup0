@@ -3076,6 +3076,7 @@ where
         Ok(Some(SyncSlotBlock {
             payload: built.payload,
             header: built.header,
+            release: None,
         }))
     }
 
@@ -3185,6 +3186,7 @@ where
                 return Ok(Some(SyncSlotBlock {
                     payload: empty_built.payload,
                     header: empty_built.header,
+                    release: None,
                 }));
             }
         };
@@ -3222,6 +3224,7 @@ where
         Ok(Some(SyncSlotBlock {
             payload: empty_built.payload,
             header: empty_built.header,
+            release: None,
         }))
     }
 
@@ -3244,6 +3247,7 @@ where
             Ok(built) => Some(SyncSlotBlock {
                 payload: built.payload,
                 header: built.header,
+                release: None,
             }),
             Err(err) => {
                 event!(
