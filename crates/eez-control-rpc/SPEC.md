@@ -2,7 +2,7 @@
 
 The Rollup0 runtime implements this contract for calldata and blob settlement, with
 timeless ordinary-only batches and parent/time-bound live cross-chain batches.
-System transactions require the live profile; the prover enforces this before
+Native `0x45` transactions require the live profile; the prover enforces this before
 signing. See the [settlement policy and rationale](../eez-proof-signer/SPEC.md#7-canonical-batch-and-public-input-profile).
 [prove.proto](proto/prove.proto) is the canonical schema, served as
 `prove.v1.Prover/ProveStream`. This is the only supported prover RPC.

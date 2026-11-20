@@ -258,6 +258,8 @@ impl OutboundEventObservation {
 /// receives only immutable views.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettlementBlockEvidence {
+    /// Cumulative receipt gas from the independently validated execution.
+    pub cumulative_gas_used: Vec<u64>,
     /// Whether each transaction's fork-aware recovered signer is the reserved
     /// system address, in exact block order.
     pub system_sender_flags: Vec<bool>,
@@ -283,6 +285,7 @@ impl SettlementBlockEvidence {
         observed_outbound_events: Vec<OutboundEventObservation>,
     ) -> Self {
         Self {
+            cumulative_gas_used: vec![0; system_sender_flags.len()],
             system_sender_flags,
             observed_outbound_events,
         }
@@ -291,6 +294,7 @@ impl SettlementBlockEvidence {
     /// Replace recovered sender evidence in tests that exercise rejection paths.
     #[cfg(test)]
     pub(crate) fn set_system_sender_flags_for_test(&mut self, flags: Vec<bool>) {
+        self.cumulative_gas_used = vec![0; flags.len()];
         self.system_sender_flags = flags;
     }
 }
@@ -321,6 +325,7 @@ impl ValidatedBlock {
             + self.decoded.size()
             + self.receipt_successes.capacity()
             + self.transaction_state_checkpoints.capacity() * std::mem::size_of::<StateCheckpoint>()
+            + self.settlement_evidence.cumulative_gas_used.capacity() * std::mem::size_of::<u64>()
             + self.settlement_evidence.system_sender_flags.capacity()
             + self.settlement_evidence.observed_outbound_events.capacity()
                 * std::mem::size_of::<OutboundEventObservation>()
@@ -586,6 +591,23 @@ fn check_backend_block_output(
         transaction_count,
     );
     let settlement_evidence = &output.settlement_evidence;
+    eyre::ensure!(
+        settlement_evidence.cumulative_gas_used.len() == transaction_count,
+        "receipt gas coverage differs from transaction count"
+    );
+    eyre::ensure!(
+        settlement_evidence
+            .cumulative_gas_used
+            .windows(2)
+            .all(|p| p[0] <= p[1])
+            && settlement_evidence
+                .cumulative_gas_used
+                .last()
+                .copied()
+                .unwrap_or(0)
+                == decoded.header.gas_used,
+        "receipt cumulative gas does not match the validated header"
+    );
     eyre::ensure!(
         settlement_evidence.system_sender_flags.len() == transaction_count,
         "system-sender flags for block {} cover {} transactions, expected {}",

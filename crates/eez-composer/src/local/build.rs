@@ -11,6 +11,7 @@
 //! session, so a claim read off it is the value the committed block produces.
 
 use alloy_consensus::Header;
+use alloy_consensus::Transaction as _;
 use alloy_eips::Decodable2718;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
@@ -18,6 +19,7 @@ use eez_driver::{BUILDER_EXTRA_DATA, BUILDER_GAS_LIMIT};
 use eez_engine::EezEngineTypes;
 use eez_evm::{EezEvmConfig, EezEvmTx, EezEvmTypes, ensure_supported_transaction};
 use eez_primitives::{Block, EezTxEnvelope as TransactionSigned};
+use eez_protocol::system_tx::ExecutionGroupState;
 use evm2::{Inspector, TxResult, evm::Cache, registry::HandlerError};
 use reth_chainspec::EthereumHardforks;
 use reth_evm::{
@@ -36,6 +38,9 @@ use super::sim::SimState;
 /// Errors raised by [`build_sync_block`].
 #[derive(Debug, Error)]
 pub enum BuildError {
+    /// The current prefix leaves too little gas; retry the group in a fresh block.
+    #[error("insufficient remaining block gas")]
+    Capacity,
     /// Provider lookup (state, header) failed.
     #[error("provider: {0}")]
     Provider(String),
@@ -242,23 +247,73 @@ fn execute_and_commit(
     evm_env: &EvmEnvFor<EezEvmConfig>,
     raw: &Bytes,
     idx: usize,
+    gas_used: u64,
+    group: &mut ExecutionGroupState,
     inspector: Option<&mut dyn Inspector<EezEvmTypes>>,
 ) -> Result<TxOutcome, BuildError> {
-    let tx = recover_tx(raw, idx)?.convert::<EezEvmTx>();
-    // A database read failure is the store being unavailable, not the tx being
-    // invalid: the two classes drive opposite recoveries in the drain.
-    let executed = state
-        .transact(evm_config, evm_env, &tx, inspector)
-        .map_err(|e| match e {
-            HandlerError::Database(err) => {
-                BuildError::Provider(format!("execute tx #{idx}: {err}"))
-            }
-            other => BuildError::ExecuteTx {
-                idx,
-                msg: other.to_string(),
-            },
+    let recovered = recover_tx(raw, idx)?;
+    let (next_group, _) = group
+        .after(recovered.inner())
+        .map_err(|msg| BuildError::ExecuteTx {
+            idx,
+            msg: msg.into(),
         })?;
+    let remaining = evm_env.block.gas_limit.to::<u64>().saturating_sub(gas_used);
+    let is_native = matches!(recovered.inner(), TransactionSigned::System(_));
+    if is_native
+        && recovered.gas_limit()
+            != eez_primitives::system_tx_gas_limit(evm_env.block.gas_limit.to(), gas_used)
+    {
+        return Err(BuildError::ExecuteTx {
+            idx,
+            msg: "native gas does not match execution position".into(),
+        });
+    }
+    if recovered.gas_limit() > remaining {
+        return Err(BuildError::Capacity);
+    }
+    // A reduced native budget must preserve execution at the full cap. A
+    // successful outer call can still catch an inner out-of-gas failure or
+    // branch on GAS, so status alone cannot establish that the group fits.
+    let tx = recovered.convert::<EezEvmTx>();
+    let reference = if is_native && tx.gas_limit() < eez_primitives::SYSTEM_TX_GAS_CAP {
+        let EezEvmTx::System(mut native) = tx.inner().clone() else {
+            unreachable!("native envelope converted to an ordinary transaction")
+        };
+        native.gas_limit = eez_primitives::SYSTEM_TX_GAS_CAP;
+        let reference = Recovered::new_unchecked(EezEvmTx::System(native), tx.signer());
+        Some(
+            state
+                .transact(evm_config, evm_env, &reference, None)
+                .map_err(|error| match error {
+                    HandlerError::Database(error) => BuildError::Provider(error.to_string()),
+                    other => BuildError::ExecuteTx {
+                        idx,
+                        msg: other.to_string(),
+                    },
+                })?,
+        )
+    } else {
+        None
+    };
+    let executed = match state.transact(evm_config, evm_env, &tx, inspector) {
+        Err(HandlerError::Database(error)) => return Err(BuildError::Provider(error.to_string())),
+        Err(_) if reference.is_some() => return Err(BuildError::Capacity),
+        Err(error) => {
+            return Err(BuildError::ExecuteTx {
+                idx,
+                msg: error.to_string(),
+            });
+        }
+        Ok(executed) => executed,
+    };
+    if reference.is_some_and(|reference| {
+        reference.result != executed.result || reference.pending_state != executed.pending_state
+    }) {
+        return Err(BuildError::Capacity);
+    }
     state.commit(&executed.pending_state);
+    *group = next_group;
     Ok(exec_outcome(executed.result))
 }
 
@@ -281,7 +336,8 @@ pub struct SyncBlockState {
     applied: usize,
     /// Cumulative gas of the applied txs, matching the block executor's own
     /// total: the drain needs it to stop before the block overflows.
-    gas_used: u64,
+    cumulative_gas_used: Vec<u64>,
+    group: ExecutionGroupState,
 }
 
 impl std::fmt::Debug for SyncBlockState {
@@ -289,7 +345,7 @@ impl std::fmt::Debug for SyncBlockState {
         f.debug_struct("SyncBlockState")
             .field("parent_hash", &self.parent_hash)
             .field("applied", &self.applied)
-            .field("gas_used", &self.gas_used)
+            .field("gas_used", &self.gas_used())
             .finish_non_exhaustive()
     }
 }
@@ -325,7 +381,8 @@ impl SyncBlockState {
         // Drive the prefix through the real block builder, then take its state
         // WITHOUT `finish`: that applies the pre-execution changes exactly once
         // and leaves `state` at the mid-block point appended txs continue from.
-        let mut gas_used: u64 = 0;
+        let mut cumulative_gas_used: Vec<u64> = Vec::with_capacity(prefix_txs.len());
+        let mut group = ExecutionGroupState::default();
         let cache = {
             let mut builder = evm_config
                 .builder_for_next_block(state.database_mut(), parent, attributes)
@@ -336,13 +393,29 @@ impl SyncBlockState {
             for (idx, raw) in prefix_txs.iter().enumerate() {
                 // The builder's own per-tx figure, so a reopened prefix reports
                 // the gas the block it rebuilds actually holds.
-                let gas = builder
-                    .execute_transaction(recover_tx(raw, idx)?)
-                    .map_err(|e| BuildError::ExecuteTx {
+                let recovered = recover_tx(raw, idx)?;
+                let next_group = group
+                    .after(recovered.inner())
+                    .map_err(|msg| BuildError::ExecuteTx {
                         idx,
-                        msg: e.to_string(),
-                    })?;
-                gas_used = gas_used.saturating_add(gas.tx_gas_used());
+                        msg: msg.into(),
+                    })?
+                    .0;
+                let gas =
+                    builder
+                        .execute_transaction(recovered)
+                        .map_err(|e| BuildError::ExecuteTx {
+                            idx,
+                            msg: e.to_string(),
+                        })?;
+                cumulative_gas_used.push(
+                    cumulative_gas_used
+                        .last()
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(gas.tx_gas_used()),
+                );
+                group = next_group;
             }
             builder.evm_mut().take_state_cache()
         };
@@ -355,15 +428,51 @@ impl SyncBlockState {
             evm_env,
             state,
             applied: prefix_txs.len(),
-            gas_used,
+            cumulative_gas_used,
+            group,
         })
     }
 
     /// Gas the applied txs have used, the same total the block builder holds.
     /// The block's remaining room is measured against it.
     #[must_use]
-    pub const fn gas_used(&self) -> u64 {
-        self.gas_used
+    pub fn gas_used(&self) -> u64 {
+        self.cumulative_gas_used.last().copied().unwrap_or(0)
+    }
+
+    /// Materialize a local plan using this draft's execution environment.
+    pub fn materialize(
+        &self,
+        plan: &eez_protocol::system_tx::PlannedTransaction,
+    ) -> Result<Bytes, String> {
+        plan.at_position(self.evm_env.block.gas_limit.to(), self.gas_used())
+    }
+
+    /// Independently reconstruct accepted transaction bytes from actual prefix gas.
+    /// A refused group may have partially extended the draft; only the accepted
+    /// plans are reconstructed, using the gas preceding their original positions.
+    pub fn materialize_prefix(
+        &self,
+        plans: &[eez_protocol::system_tx::PlannedTransaction],
+    ) -> Result<Vec<Bytes>, String> {
+        if plans.len() > self.applied {
+            return Err("canonical plans exceed the executed prefix".into());
+        }
+        plans
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| {
+                let prior = if index == 0 {
+                    0
+                } else {
+                    *self
+                        .cumulative_gas_used
+                        .get(index - 1)
+                        .ok_or("canonical plans exceed the executed prefix")?
+                };
+                plan.at_position(self.evm_env.block.gas_limit.to(), prior)
+            })
+            .collect()
     }
 
     /// Execute one raw EIP-2718 tx with full real-STF semantics and commit it,
@@ -373,16 +482,20 @@ impl SyncBlockState {
     ///
     /// See [`BuildError`].
     pub fn execute_tx(&mut self, raw: &Bytes) -> Result<TxOutcome, BuildError> {
+        let gas_used = self.gas_used();
         let outcome = execute_and_commit(
             &self.evm_config,
             &mut self.state,
             &self.evm_env,
             raw,
             self.applied,
+            gas_used,
+            &mut self.group,
             None,
         )?;
         self.applied += 1;
-        self.gas_used = self.gas_used.saturating_add(outcome.gas_used);
+        self.cumulative_gas_used
+            .push(gas_used.saturating_add(outcome.gas_used));
         Ok(outcome)
     }
 
@@ -404,7 +517,8 @@ impl SyncBlockState {
             evm_env: self.evm_env.clone(),
             state,
             applied: self.applied,
-            gas_used: self.gas_used,
+            gas_used: self.gas_used(),
+            group: self.group,
         })
     }
 }
@@ -416,6 +530,7 @@ pub struct ForkSnapshot {
     cache: Cache,
     applied: usize,
     gas_used: u64,
+    group: ExecutionGroupState,
 }
 
 /// A throwaway copy of a [`SyncBlockState`] for simulation: probes and source
@@ -427,6 +542,7 @@ pub struct SyncBlockFork {
     state: SimState,
     applied: usize,
     gas_used: u64,
+    group: ExecutionGroupState,
 }
 
 impl std::fmt::Debug for SyncBlockFork {
@@ -439,6 +555,14 @@ impl std::fmt::Debug for SyncBlockFork {
 }
 
 impl SyncBlockFork {
+    /// Materialize a native delivery using this fork's execution environment.
+    pub fn materialize(
+        &self,
+        plan: &eez_protocol::system_tx::NativeTransactionPlan,
+    ) -> Result<Bytes, String> {
+        plan.at_position(self.evm_env.block.gas_limit.to(), self.gas_used)
+    }
+
     /// Execute one raw EIP-2718 tx on the fork and commit it there.
     ///
     /// # Errors
@@ -451,6 +575,8 @@ impl SyncBlockFork {
             &self.evm_env,
             raw,
             self.applied,
+            self.gas_used,
+            &mut self.group,
             None,
         )?;
         self.applied += 1;
@@ -475,6 +601,8 @@ impl SyncBlockFork {
             &self.evm_env,
             raw,
             self.applied,
+            self.gas_used,
+            &mut self.group,
             Some(inspector),
         )?;
         self.applied += 1;
@@ -488,6 +616,7 @@ impl SyncBlockFork {
             cache: self.state.cache().clone(),
             applied: self.applied,
             gas_used: self.gas_used,
+            group: self.group,
         }
     }
 
@@ -496,6 +625,7 @@ impl SyncBlockFork {
         self.state.set_cache(snapshot.cache);
         self.applied = snapshot.applied;
         self.gas_used = snapshot.gas_used;
+        self.group = snapshot.group;
     }
 
     /// Raw state + env, for callers that drive their own EVM (a source
@@ -528,8 +658,7 @@ pub struct SyncCandidates {
 ///
 /// # Errors
 ///
-/// See [`BuildError`]. A sync tx that fails to decode is treated as a non-system
-/// tx (pair-end), matching the prover's fail-safe flagging.
+/// See [`BuildError`]. Invalid envelopes and incomplete native groups are rejected.
 pub fn sync_block_candidates<P>(
     l2_provider: &P,
     evm_config: &EezEvmConfig,
@@ -553,19 +682,18 @@ where
         .map(|prefix| prefix.header.hash())
     };
     let anchor = candidate(&[])?;
-    // Per-tx system flags must match the proof signer's classification so
-    // pair-end positions agree on both sides.
-    let flags: Vec<bool> = sync_txs
+    let transactions = sync_txs
         .iter()
-        .map(|raw| {
-            let Ok(tx) = TransactionSigned::decode_2718(&mut raw.as_ref()) else {
-                return false;
-            };
-            eez_protocol::settlement::is_system_tx(&tx)
+        .enumerate()
+        .map(|(idx, raw)| {
+            TransactionSigned::decode_2718_exact(raw).map_err(|error| BuildError::DecodeTx {
+                idx,
+                msg: error.to_string(),
+            })
         })
-        .collect();
-
-    let per_effect = eez_protocol::settlement::pair_end_positions(&flags)
+        .collect::<Result<Vec<_>, _>>()?;
+    let per_effect = eez_protocol::settlement::pair_end_positions(&transactions)
+        .map_err(|error| BuildError::Builder(error.into()))?
         .into_iter()
         .map(|p| candidate(&sync_txs[..=p]))
         .collect::<Result<Vec<_>, _>>()?;
@@ -839,10 +967,9 @@ mod tests {
             !candidates.per_effect.contains(&candidates.anchor),
             "the empty prefix is distinct from every transaction prefix",
         );
-        assert_eq!(
-            candidates.per_effect.last().copied(),
-            Some(f.build(&f.txs).header.hash()),
-            "the last candidate is the full Sync block",
+        assert!(
+            candidates.per_effect.is_empty(),
+            "ordinary transactions without native loads create no effect checkpoints",
         );
     }
 

@@ -510,7 +510,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     // (build_sync_block → reth-evm BlockBuilder). Same chain spec
     // the engine uses, so blocks produced here pass validation
     // when reth ingests them via newPayload.
-    let evm_config = eez_evm::EezEvmConfig::new(chain_spec.clone())?;
+    let evm_config = eez_evm::EezEvmConfig::new_l2(chain_spec.clone())?;
 
     use eez_composer::{GnosisL1Adapter, LocalChainClient};
     use eez_protocol::rollup_id::RollupId;
@@ -860,11 +860,11 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     if let Some(cap) = l2_entry_client
         .current_declared_tx_gas_limit_cap()
         .map_err(|error| eyre::eyre!("resolve active L2 declared gas cap: {error}"))?
-        && eez_primitives::SYSTEM_TX_GAS_LIMIT > cap
+        && eez_primitives::SYSTEM_TX_GAS_CAP > cap
     {
         return Err(eyre::eyre!(
             "L2 system transaction gas limit {} exceeds the active transaction gas limit cap {cap}",
-            eez_primitives::SYSTEM_TX_GAS_LIMIT,
+            eez_primitives::SYSTEM_TX_GAS_CAP,
         ));
     }
 

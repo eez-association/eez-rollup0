@@ -345,7 +345,7 @@ fn da_payload_binds_inbound_sidecars_and_complete_reconstructed_transactions() {
         .map(|encoded| ExecutionEntrySol::abi_decode(encoded).unwrap())
         .collect::<Vec<_>>();
     let sidecars = entries.clone();
-    let transactions = build_inbound_transactions(&entries, &system_transaction_context(), 11);
+    let transactions = build_inbound_transactions(&entries, &system_transaction_context(), 0);
     let (intermediate_rlp, intermediate_transactions) =
         block_and_payload_transactions(vec![transaction(CREATE_TX)]);
     let (settling_rlp, raw_transactions) = block_and_payload_transactions(transactions.clone());
@@ -442,7 +442,7 @@ fn da_payload_binds_inbound_sidecars_and_complete_reconstructed_transactions() {
 
     let mut noncanonical_context = system_transaction_context();
     noncanonical_context.l2_chain_id += 1;
-    let noncanonical_transactions = build_inbound_transactions(&entries, &noncanonical_context, 11);
+    let noncanonical_transactions = build_inbound_transactions(&entries, &noncanonical_context, 0);
     let mut mutated_second_transaction = transactions;
     mutated_second_transaction[1] = noncanonical_transactions[1].clone();
     let wrong_block = block_rlp(mutated_second_transaction);
@@ -487,10 +487,13 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
         &[(sidecar.clone(), Bytes::from(user.clone()))],
         &[],
         &system_transaction_context(),
-        11,
+        crate::testkit::native_source(0),
     )
     .unwrap();
-    let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
+    let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
+        .into_iter()
+        .map(|plan| plan.at_position(30_000_000, 0).unwrap())
+        .collect::<Vec<_>>();
     let transactions = raw_transactions
         .iter()
         .map(|raw| {
@@ -518,6 +521,38 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
     };
 
     assert_eq!(verify(&payload, [(41, settling_rlp.as_slice())]), Ok(()));
+
+    // Exact reconstruction rejects a forged source, including replaying ordinal
+    // 1 at ordinal 0, even when execution/effects/DA are otherwise unchanged.
+    for source_hash in [
+        B256::ZERO,
+        crate::testkit::native_source(1).hash(),
+        B256::repeat_byte(0x98),
+    ] {
+        let TransactionSigned::System(native) =
+            <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(
+                &raw_transactions[0],
+            )
+            .unwrap()
+        else {
+            panic!("native load")
+        };
+        let mut native = native.into_inner();
+        native.source_hash = source_hash;
+        let mut tampered = raw_transactions
+            .iter()
+            .map(|raw| {
+                <TransactionSigned as alloy_eips::Decodable2718>::decode_2718_exact(raw).unwrap()
+            })
+            .collect::<Vec<_>>();
+        tampered[0] = native.into();
+        assert_eq!(
+            verify(&payload, [(41, block_rlp(tampered).as_slice())]),
+            Err(DaPayloadError::SyncBlockTransactionMismatch {
+                transaction_index: 0
+            })
+        );
+    }
 
     let missing_sidecar = encode_da_payload(&[vec![user.clone()]], &[]);
     assert_eq!(
@@ -588,10 +623,13 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
         &[(sidecar.clone(), Bytes::from(user))],
         &[],
         &noncanonical_context,
-        11,
+        crate::testkit::native_source(0),
     )
     .unwrap();
     let wrong_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&wrong_pairs)
+        .into_iter()
+        .map(|plan| plan.at_position(30_000_000, 0).unwrap())
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|raw| {
             <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
@@ -610,7 +648,7 @@ fn da_payload_binds_outbound_sidecars_users_and_system_loads() {
 }
 
 #[test]
-fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
+fn da_payload_binds_multiple_outbound_pairs_and_source_ordinal_progression() {
     let mut batch = effect_batch(
         &[B256::ZERO; 4],
         &[ClaimedEntryShape::Outbound, ClaimedEntryShape::Outbound],
@@ -652,15 +690,25 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
         &outbound_inputs,
         &[],
         &system_transaction_context(),
-        11,
+        crate::testkit::native_source(0),
     )
     .unwrap();
-    let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
+    let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
+        .into_iter()
+        .map(|plan| plan.at_position(30_000_000, 0).unwrap())
+        .collect::<Vec<_>>();
     let first_load: TransactionSigned =
         alloy_rlp::decode_exact(raw_transactions[0].as_ref()).unwrap();
     let second_load: TransactionSigned =
         alloy_rlp::decode_exact(raw_transactions[2].as_ref()).unwrap();
-    assert_eq!((first_load.nonce(), second_load.nonce()), (11, 12));
+    assert_eq!((first_load.nonce(), second_load.nonce()), (0, 0));
+    let (TransactionSigned::System(first), TransactionSigned::System(second)) =
+        (first_load, second_load)
+    else {
+        panic!("native loads")
+    };
+    assert_eq!(first.source_hash, crate::testkit::native_source(0).hash());
+    assert_eq!(second.source_hash, crate::testkit::native_source(1).hash());
     let settling_rlp = block_rlp(
         raw_transactions
             .iter()
@@ -719,10 +767,13 @@ fn da_payload_binds_multiple_outbound_pairs_and_system_nonce_progression() {
         &outbound_inputs,
         &[],
         &noncanonical_context,
-        11,
+        crate::testkit::native_source(0),
     )
     .unwrap();
-    let wrong_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&wrong_pairs);
+    let wrong_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&wrong_pairs)
+        .into_iter()
+        .map(|plan| plan.at_position(30_000_000, 0).unwrap())
+        .collect::<Vec<_>>();
     let mut mutated_second_load = raw_transactions;
     mutated_second_load[2] = wrong_transactions[2].clone();
     let wrong_block = block_rlp(
@@ -791,10 +842,13 @@ fn da_payload_binds_the_complete_mixed_sync_sequence_and_sidecar_order() {
         &[(outbound_sidecar.clone(), Bytes::from(user.clone()))],
         std::slice::from_ref(&inbound_sidecar),
         &system_transaction_context(),
-        11,
+        crate::testkit::native_source(0),
     )
     .unwrap();
-    let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
+    let raw_transactions = eez_protocol::system_tx::interleave_sync_block_txs(&pairs)
+        .into_iter()
+        .map(|plan| plan.at_position(30_000_000, 0).unwrap())
+        .collect::<Vec<_>>();
     let transactions = raw_transactions
         .iter()
         .map(|raw| {

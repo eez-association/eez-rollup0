@@ -72,10 +72,11 @@ fn cached_engine(
         "sync" => vec![
             SystemTransaction {
                 chain_id: 1,
-                nonce: 0,
+                source_hash: B256::repeat_byte(0x11),
+                gas_limit: eez_primitives::SYSTEM_TX_GAS_CAP,
                 to: EEZL2_ADDRESS,
                 value: U256::ZERO,
-                input: Bytes::new(),
+                input: Bytes::from_static(&[0xc3, 0xfb, 0x5f, 0x3d]),
             }
             .into(),
         ],
@@ -111,7 +112,7 @@ fn cached_engine(
     let hash = block.header.hash_slow();
     let input = admitted_block(block.clone());
     let recovered = decode_match_and_recover_signers(&input, &chain_spec).unwrap();
-    let (plan, _) = CheckpointPlan::for_block(&recovered, SYSTEM_ADDRESS);
+    let (plan, _) = CheckpointPlan::for_block(&recovered, SYSTEM_ADDRESS).unwrap();
     assert_eq!(!plan.positions().is_empty(), with_checkpoints);
     let provider = MockEthProvider::<EezPrimitives>::new();
     provider.add_header(anchor.hash, parent.clone());
@@ -678,10 +679,11 @@ fn native_deposits_execute_with_and_without_checkpoints() {
             transactions: vec![
                 SystemTransaction {
                     chain_id: 1,
-                    nonce: 0,
+                    source_hash: B256::repeat_byte(0x11),
+                    gas_limit: eez_primitives::SYSTEM_TX_GAS_CAP,
                     to: EEZL2_ADDRESS,
                     value: U256::from(13),
-                    input: Bytes::new(),
+                    input: Bytes::from_static(&[0xc3, 0xfb, 0x5f, 0x3d]),
                 }
                 .into(),
             ],
@@ -717,25 +719,22 @@ fn native_deposits_execute_with_and_without_checkpoints() {
             result.receipts[0].tx_type,
             eez_primitives::EezTxType::System
         );
-        let system = replay
-            .bundle
-            .state
-            .get(&SYSTEM_ADDRESS)
-            .unwrap()
-            .info
-            .as_ref()
-            .unwrap();
-        assert_eq!(system.nonce, 1);
-        assert_eq!(system.balance, U256::ZERO);
-        let recipient = replay
-            .bundle
-            .state
-            .get(&EEZL2_ADDRESS)
-            .unwrap()
-            .info
-            .as_ref()
-            .unwrap();
-        assert_eq!(recipient.balance, U256::from(13));
+        // The native sender stays empty; the successful deposit remains at its recipient.
+        for (address, balance) in [
+            (SYSTEM_ADDRESS, U256::ZERO),
+            (EEZL2_ADDRESS, U256::from(13)),
+        ] {
+            let account = replay
+                .bundle
+                .state
+                .get(&address)
+                .and_then(|account| account.info.as_ref());
+            assert_eq!(account.map_or(0, |account| account.nonce), 0);
+            assert_eq!(
+                account.map_or(U256::ZERO, |account| account.balance),
+                balance
+            );
+        }
     }
 }
 
