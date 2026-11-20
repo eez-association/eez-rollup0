@@ -2,13 +2,11 @@
 //! `eth_sendBundle`. Read-only canonical-chain scans live in
 //! [`L1Reader`].
 //!
-//! `eth_sendBundle` pins inclusion to one L1 block. If the bundle
-//! isn't in that block we report [`SendOutcome::Dropped`] and the
-//! Composer rebuilds on the next tick with a fresh target + nonce.
-//! Real Flashbots-style relays don't consume the nonce on miss; nor does
-//! the anvil-side `scripts/builder-stub.py` (it mines bundles
-//! atomically), and the cursor-race guard + `pending` nonce read keep
-//! both paths correct.
+//! `eth_sendBundle` pins inclusion to one L1 block. Only L1 decides the
+//! outcome: the post is in a block, or the chain passed its target
+//! without it ([`SendOutcome::Dropped`]). The relay's answer is reported
+//! as a [`RelayAck`] and never decides it, because a lost reply says
+//! nothing about whether the relay took the bundle.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +24,8 @@ use crate::l1_reader::L1Reader;
 
 /// Wall-clock cap on the target-block + inclusion check.
 const TARGET_WAIT_BUDGET: Duration = Duration::from_secs(30);
+/// Reads of the `NextBlock` target before giving up without sending.
+const TARGET_READ_ATTEMPTS: u32 = 3;
 /// How often a settlement read that keeps failing is logged again.
 const SETTLEMENT_READ_WARN_EVERY: Duration = Duration::from_mins(1);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -53,7 +53,46 @@ pub enum BundleTarget {
     Exact { block: u64, timestamp: u64 },
 }
 
-/// One bundle attempt's outcome. `Dropped` is the expected miss path —
+/// What the relay answered to a bundle. It decides nothing about the outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayAck {
+    /// The relay accepted the bundle.
+    Accepted,
+    /// The relay answered with an error.
+    Rejected(String),
+    /// No answer arrived, so the relay may have taken the bundle.
+    Unreachable(String),
+}
+
+/// Why L1 shows the bundle did not land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /// Another timestamp filled the pinned height, so the pin cannot match.
+    PinnedSlotSkipped,
+    /// The pinned slot was built without the bundle.
+    PinnedSlotExcluded,
+    /// The chain passed the target block without the post.
+    TargetPassed,
+}
+
+impl DropReason {
+    const fn describe(self) -> &'static str {
+        match self {
+            Self::PinnedSlotSkipped => "pinned slot skipped",
+            Self::PinnedSlotExcluded => "pinned slot built without inclusion",
+            Self::TargetPassed => "target block passed without inclusion",
+        }
+    }
+}
+
+/// One sent bundle: what the relay answered and what L1 did.
+#[derive(Debug, Clone)]
+pub struct SendReport {
+    pub ack: RelayAck,
+    pub outcome: SendOutcome,
+}
+
+/// What L1 did with one bundle. `Dropped` is the expected miss path —
 /// caller rebuilds on the next tick.
 #[derive(Debug, Clone)]
 pub enum SendOutcome {
@@ -67,6 +106,7 @@ pub enum SendOutcome {
     Dropped {
         tx_hash: TxHash,
         target_block: u64,
+        reason: DropReason,
     },
     /// The post landed, but reading how it settled failed for good. Not a
     /// failure: the Deriver's cursor resolves the batch.
@@ -136,12 +176,10 @@ impl Submitter {
             inner: Arc::new(Inner {
                 config,
                 reader,
-                // Bounded timeout so a hanging/unreachable builder relay cannot
-                // stall the one-in-flight gate forever: a timed-out `eth_sendBundle`
-                // returns Err, which `observe_bundle_outcome` treats as a drop →
-                // the gate reopens and the next slot retries. `Client::new()` has
-                // NO timeout, so a relay that accepts the TCP connection but never
-                // responds freezes posting permanently (cursor stuck at 0).
+                // Bounded timeout so a relay that never answers cannot stall
+                // the send: the bundle is then `Unreachable` and L1 decides,
+                // by the target block at the latest. `Client::new()` has NO
+                // timeout.
                 http: reqwest::Client::builder()
                     .timeout(Duration::from_secs(30))
                     .build()
@@ -171,19 +209,21 @@ impl Submitter {
     /// `eth_sendBundle` POST. Flashbots ordering: the bundle lands in
     /// `target_block` as one atomic insert or is dropped — no subset.
     ///
-    /// Observation is best-effort: only `raw_txs[0]` (the postBatch) is
-    /// checked for inclusion; if it's in, the bundle either succeeded or
-    /// a proposer broke atomicity (their bug, not ours).
+    /// Once sent, the bundle is observed until L1 decides, whatever the
+    /// relay answered. Only `raw_txs[0]` (the postBatch) is checked for
+    /// inclusion; if it's in, the bundle either succeeded or a proposer
+    /// broke atomicity (their bug, not ours).
     ///
     /// # Errors
     ///
-    /// - [`L1Error::Provider`] on RPC failure (block fetch, log fetch).
-    /// - [`L1Error::Submission`] if the relay rejects the bundle.
+    /// Only when nothing was sent: an empty or undecodable bundle, an
+    /// unreadable `NextBlock` target, or a blob post to a relay without
+    /// `eth_sendBundle`.
     pub async fn send_bundle(
         &self,
         raw_txs: &[alloy_primitives::Bytes],
         target: BundleTarget,
-    ) -> L1Result<SendOutcome> {
+    ) -> L1Result<SendReport> {
         fail::fail_point!("submitter::send::start", |_| Err(L1Error::Submission(
             "injected failpoint: submitter::send::start".into()
         )));
@@ -201,14 +241,7 @@ impl Submitter {
         };
         let target_block = match target {
             BundleTarget::Exact { block, .. } | BundleTarget::ExactBlock { block } => block,
-            BundleTarget::NextBlock => {
-                let target_provider = self.inner.build_target_provider();
-                target_provider
-                    .get_block_number()
-                    .await
-                    .map_err(|e| L1Error::Provider(format!("get_block_number: {e}")))?
-                    + NEXT_BLOCK_SLACK
-            }
+            BundleTarget::NextBlock => self.inner.next_block_target().await?,
         };
         let post_batch_hash = eez_blob::post_batch_tx_hash(&raw_txs[0]).map_err(|e| {
             L1Error::Submission(format!("send_bundle: decode postBatch envelope: {e}"))
@@ -283,9 +316,25 @@ impl Inner {
             .connect_http(url)
     }
 
+    /// `latest + NEXT_BLOCK_SLACK` from the target provider, read a few times.
+    async fn next_block_target(&self) -> L1Result<u64> {
+        let provider = self.build_target_provider();
+        let mut attempt = 1;
+        loop {
+            match provider.get_block_number().await {
+                Ok(head) => return Ok(head + NEXT_BLOCK_SLACK),
+                Err(e) if attempt >= TARGET_READ_ATTEMPTS => {
+                    return Err(L1Error::Provider(format!("get_block_number: {e}")));
+                }
+                Err(_) => attempt += 1,
+            }
+            tokio::time::sleep(TARGET_POLL_INTERVAL).await;
+        }
+    }
+
     /// Submit `raw_txs` (postBatch first) and observe the outcome. Try
     /// the relay's `eth_sendBundle`; if it's a plain execution RPC
-    /// ([`L1Error::BundleRpcUnsupported`]), degrade to ordered mempool
+    /// (JSON-RPC `-32601`), degrade to ordered mempool
     /// submission — on dev reth / anvil that lands every tx in the next
     /// block, postBatch first by priority-fee, minus the all-or-nothing
     /// guarantee (irrelevant without a competing builder).
@@ -296,7 +345,7 @@ impl Inner {
         post_batch_hash: TxHash,
         target_block: u64,
         pin_timestamp: Option<u64>,
-    ) -> L1Result<SendOutcome> {
+    ) -> L1Result<SendReport> {
         let hexes: Vec<String> = raw_txs
             .iter()
             .map(|t| hex::encode_prefixed(t.as_ref()))
@@ -311,13 +360,25 @@ impl Inner {
         )
         .await
         {
-            Ok(()) => {
+            PostReply::Ack(ack) => {
+                if ack != RelayAck::Accepted {
+                    event!(
+                        name: "eez.submitter.bundle.not_accepted",
+                        Level::WARN,
+                        tx_hash = %post_batch_hash,
+                        target_block,
+                        ack = ?ack,
+                        "relay did not accept the bundle; L1 decides its outcome",
+                    );
+                }
                 // Relay path: the builder honors the min/max timestamp pin, so
                 // an Exact target's `pin_timestamp` unlocks the early verdict.
-                self.observe(post_batch_hash, target_block, pin_timestamp)
-                    .await
+                let outcome = self
+                    .observe(post_batch_hash, target_block, pin_timestamp)
+                    .await;
+                Ok(SendReport { ack, outcome })
             }
-            Err(L1Error::BundleRpcUnsupported)
+            PostReply::Unsupported
                 if raw_txs.first().is_some_and(|raw| raw.first() == Some(&3)) =>
             {
                 Err(L1Error::Submission(
@@ -325,7 +386,7 @@ impl Inner {
                         .into(),
                 ))
             }
-            Err(L1Error::BundleRpcUnsupported) => {
+            PostReply::Unsupported => {
                 // A multi-tx bundle needs its order kept: the deferred entries
                 // chain, so a reordered user tx finds no entry and reverts.
                 if raw_txs.len() > 1 {
@@ -348,6 +409,7 @@ impl Inner {
                     );
                 }
                 let target_provider = self.build_target_provider();
+                let mut ack = RelayAck::Accepted;
                 for (idx, raw) in raw_txs.iter().enumerate() {
                     if let Err(err) = alloy_provider::Provider::send_raw_transaction(
                         &target_provider,
@@ -355,14 +417,26 @@ impl Inner {
                     )
                     .await
                     {
-                        // postBatch rejection is fatal for the slot;
-                        // a rejected user_tx (stale nonce after a
-                        // re-push) is logged and skipped — the rest of
-                        // the submission stands on its own.
+                        // A failed postBatch send stops the user_txs, which
+                        // would run without their entries; L1 still decides
+                        // whether the postBatch landed. A rejected user_tx
+                        // (stale nonce after a re-push) is logged and skipped.
                         if idx == 0 {
-                            return Err(L1Error::Submission(format!(
-                                "mempool fallback: postBatch rejected: {err}"
-                            )));
+                            let detail = format!("mempool fallback: postBatch send: {err}");
+                            ack = if err.is_error_resp() {
+                                RelayAck::Rejected(detail)
+                            } else {
+                                RelayAck::Unreachable(detail)
+                            };
+                            event!(
+                                name: "eez.submitter.bundle.not_accepted",
+                                Level::WARN,
+                                tx_hash = %post_batch_hash,
+                                target_block,
+                                ack = ?ack,
+                                "mempool did not accept the postBatch; L1 decides its outcome",
+                            );
+                            break;
                         }
                         event!(
                             name: "eez.submitter.mempool.user_tx_rejected",
@@ -375,9 +449,9 @@ impl Inner {
                 }
                 // No bundle API, no timestamp pin: these txs can genuinely land
                 // in a later block, so the conservative rule is the only one.
-                self.observe(post_batch_hash, target_block, None).await
+                let outcome = self.observe(post_batch_hash, target_block, None).await;
+                Ok(SendReport { ack, outcome })
             }
-            Err(other) => Err(other),
         }
     }
 
@@ -394,7 +468,7 @@ impl Inner {
         tx_hash: TxHash,
         target_block: u64,
         pin_timestamp: Option<u64>,
-    ) -> L1Result<SendOutcome> {
+    ) -> SendOutcome {
         // Failure must mean PROVABLY DEAD, not merely slow. A bundle is
         // pinned to `target_block` — included in order there or never —
         // so death = the chain passed the target (head > target) without
@@ -419,10 +493,16 @@ impl Inner {
             // failure verdict — while polling, the ledger stays Pending
             // and the composer's gate stays closed.
             match target_provider.get_transaction_receipt(tx_hash).await {
+                // A receipt without a block number is read again, like a failed read.
+                Ok(Some(receipt)) if receipt.block_number.is_none() => event!(
+                    name: "eez.submitter.observe.receipt_read_failed",
+                    Level::WARN,
+                    tx_hash = %tx_hash,
+                    error = "receipt present but block_number missing",
+                    "receipt read failed during bundle observation; retrying",
+                ),
                 Ok(Some(receipt)) => {
-                    let l1_block = receipt.block_number.ok_or_else(|| {
-                        L1Error::Provider("receipt present but block_number missing".into())
-                    })?;
+                    let l1_block = receipt.block_number.unwrap_or_default();
                     // The receipt's own logs say whether a batch was posted: a
                     // call that succeeds can still post nothing, e.g. before
                     // the contract exists.
@@ -434,7 +514,7 @@ impl Inner {
                         .observe_settlement(&target_provider, l1_block, tx_hash, posted)
                         .await;
                     match included_outcome(tx_hash, l1_block, read) {
-                        Ok(outcome) => return Ok(outcome),
+                        Ok(outcome) => return outcome,
                         // If a reorg removes the block, the receipt goes with it.
                         Err(err) => {
                             if settlement_read_warned
@@ -462,25 +542,17 @@ impl Inner {
                     };
                     match verdict {
                         PinnedVerdict::Excluded => {
-                            return Ok(dropped(
-                                tx_hash,
-                                target_block,
-                                "pinned slot built without inclusion",
-                            ));
+                            return dropped(tx_hash, target_block, DropReason::PinnedSlotExcluded);
                         }
                         PinnedVerdict::SlotSkipped => {
-                            return Ok(dropped(tx_hash, target_block, "pinned slot skipped"));
+                            return dropped(tx_hash, target_block, DropReason::PinnedSlotSkipped);
                         }
                         // Our tx IS in the pinned block; only the receipt read
                         // trails it. Poll on, skipping the head rule.
                         PinnedVerdict::Included => {}
                         PinnedVerdict::Pending => match target_provider.get_block_number().await {
                             Ok(head) if head > target_block => {
-                                return Ok(dropped(
-                                    tx_hash,
-                                    target_block,
-                                    "target block passed without inclusion",
-                                ));
+                                return dropped(tx_hash, target_block, DropReason::TargetPassed);
                             }
                             Ok(_) => {}
                             Err(err) => event!(
@@ -541,28 +613,30 @@ impl Inner {
     }
 }
 
+/// The relay's answer to one `eth_sendBundle` POST.
+#[derive(Debug, PartialEq, Eq)]
+enum PostReply {
+    Ack(RelayAck),
+    /// JSON-RPC `-32601`: a plain execution RPC with no bundle API.
+    Unsupported,
+}
+
 /// POST a multi-tx bundle to a Flashbots-style `eth_sendBundle` relay.
-/// Returns `Ok(())` if the relay returns a successful JSON-RPC reply
-/// (any non-error `result` — most relays use `{"result": {"bundleHash":
-/// "0x..."}}`, the chiado builder returns `{"result": null}`). Errors
-/// surface relay-side rejections as [`L1Error::Submission`].
+/// Any non-error `result` is `Accepted` (most relays use `{"result":
+/// {"bundleHash": "0x..."}}`, the chiado builder returns `{"result":
+/// null}`). A non-2xx status or a JSON-RPC error is `Rejected`. A failed
+/// send or an undecodable reply is `Unreachable`.
 ///
 /// `target_block` is encoded as `0x{hex}` in the bundle params. Caller
 /// is responsible for picking a not-yet-proposed block — the relay
 /// silently drops bundles aimed at already-built blocks.
-///
-/// # Errors
-///
-/// - [`L1Error::Provider`] on transport (DNS, TCP, JSON decode) failure.
-/// - [`L1Error::Submission`] when the relay HTTP status is non-2xx OR
-///   the JSON body carries an `error` field.
 async fn post_bundle(
     http: &reqwest::Client,
     builder_rpc_url: &str,
     raw_tx_hexes: &[&str],
     target_block: u64,
     pin_timestamp: Option<u64>,
-) -> L1Result<()> {
+) -> PostReply {
     // Any revert OUTSIDE `revertingTxHashes` fails the bundle; whitelisting the
     // user_txs lets one revert while the postBatch lands, so L1 settles partially.
     let reverting = reverting_whitelist(raw_tx_hexes, partial_consumption_enabled());
@@ -585,17 +659,22 @@ async fn post_bundle(
         "jsonrpc": "2.0", "id": 1, "method": "eth_sendBundle",
         "params": [bundle_params],
     });
-    let resp: serde_json::Value = http
-        .post(builder_rpc_url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| L1Error::Provider(format!("eth_sendBundle POST: {e}")))?
-        .error_for_status()
-        .map_err(|e| L1Error::Submission(format!("eth_sendBundle HTTP: {e}")))?
-        .json()
-        .await
-        .map_err(|e| L1Error::Provider(format!("eth_sendBundle decode: {e}")))?;
+    let reply = match http.post(builder_rpc_url).json(&body).send().await {
+        Ok(reply) => reply,
+        Err(e) => {
+            return PostReply::Ack(RelayAck::Unreachable(format!("eth_sendBundle POST: {e}")));
+        }
+    };
+    let reply = match reply.error_for_status() {
+        Ok(reply) => reply,
+        Err(e) => return PostReply::Ack(RelayAck::Rejected(format!("eth_sendBundle HTTP: {e}"))),
+    };
+    let resp: serde_json::Value = match reply.json().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            return PostReply::Ack(RelayAck::Unreachable(format!("eth_sendBundle decode: {e}")));
+        }
+    };
     event!(
         name: "eez.submitter.bundle.sent",
         Level::INFO,
@@ -609,11 +688,11 @@ async fn post_bundle(
         // plain execution RPC (dev reth, anvil) with no bundle API.
         // Typed so `send_bundle` can degrade to mempool submission.
         if err.get("code").and_then(serde_json::Value::as_i64) == Some(-32601) {
-            return Err(L1Error::BundleRpcUnsupported);
+            return PostReply::Unsupported;
         }
-        return Err(L1Error::Submission(format!("eth_sendBundle: {err}")));
+        return PostReply::Ack(RelayAck::Rejected(format!("eth_sendBundle: {err}")));
     }
-    Ok(())
+    PostReply::Ack(RelayAck::Accepted)
 }
 
 /// Verdict for a relay-submitted, timestamp-pinned bundle, read off the
@@ -678,19 +757,20 @@ async fn pinned_slot_check<P: Provider>(
     }
 }
 
-fn dropped(tx_hash: TxHash, target_block: u64, reason: &'static str) -> SendOutcome {
+fn dropped(tx_hash: TxHash, target_block: u64, reason: DropReason) -> SendOutcome {
     event!(
         name: "eez.submitter.bundle.dropped",
         Level::WARN,
         event_name = "eez.submitter.bundle.dropped",
         target_block,
         tx_hash = %tx_hash,
-        reason,
+        reason = reason.describe(),
         "bundle dropped; composer will retry on next tick",
     );
     SendOutcome::Dropped {
         tx_hash,
         target_block,
+        reason,
     }
 }
 
@@ -740,8 +820,8 @@ fn settlement_of_our_post(
 #[cfg(test)]
 mod tests {
     use super::{
-        PinnedVerdict, SendOutcome, included_outcome, pinned_verdict, reverting_whitelist,
-        settlement_of_our_post,
+        PinnedVerdict, PostReply, RelayAck, SendOutcome, included_outcome, pinned_verdict,
+        post_bundle, reverting_whitelist, settlement_of_our_post,
     };
     use crate::error::L1Error;
     use crate::scan::{Post, PostId, Settlement};
@@ -809,6 +889,83 @@ mod tests {
             ),
         ] {
             assert_eq!(pinned_verdict(block, PIN), want, "{case}");
+        }
+    }
+
+    /// A relay that answers `status` with `body` to every request, or closes
+    /// the connection unanswered when `reply` is `None`.
+    async fn relay(reply: Option<(u16, &'static str)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                // Read the whole request so a close is not a reset mid-send.
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                while let Ok(read @ 1..) = socket.read(&mut chunk).await {
+                    request.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                if let Some((status, body)) = reply {
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn relay_ack_classifies_every_post_outcome() {
+        let accepted = r#"{"jsonrpc":"2.0","id":1,"result":{"bundleHash":"0x01"}}"#;
+        let error = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"no"}}"#;
+        let unsupported = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no"}}"#;
+        // A port that was bound and released refuses connections.
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+        let http = reqwest::Client::new();
+        for (case, url, want) in [
+            (
+                "200 + result",
+                relay(Some((200, accepted))).await,
+                "Accepted",
+            ),
+            ("200 + error", relay(Some((200, error))).await, "Rejected"),
+            (
+                "-32601",
+                relay(Some((200, unsupported))).await,
+                "Unsupported",
+            ),
+            ("502", relay(Some((502, ""))).await, "Rejected"),
+            ("closed unanswered", relay(None).await, "Unreachable"),
+            ("refused", refused, "Unreachable"),
+        ] {
+            let got = match post_bundle(&http, &url, &["0xaa"], 7, None).await {
+                PostReply::Ack(RelayAck::Accepted) => "Accepted",
+                PostReply::Ack(RelayAck::Rejected(_)) => "Rejected",
+                PostReply::Ack(RelayAck::Unreachable(_)) => "Unreachable",
+                PostReply::Unsupported => "Unsupported",
+            };
+            assert_eq!(got, want, "{case}");
         }
     }
 
