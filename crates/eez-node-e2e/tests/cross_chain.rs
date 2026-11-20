@@ -2164,7 +2164,6 @@ async fn failed_rich_bundle_keeps_live_l2_txs() {
 /// The relay queues the bundle but its reply is lost. L1 decides the outcome,
 /// so the batch settles and its block is never rolled back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "fails before A3: a lost relay reply is a transport error that fails the batch"]
 async fn relay_reply_lost_bundle_still_settles() {
     let w = setup_cross_chain_with_builder_stub().await.unwrap();
     let l1_rpc = w.l1_rpc();

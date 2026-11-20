@@ -35,8 +35,9 @@ use crate::held_pool::HeldTx;
 
 /// A failed entry extracted for slot-context recovery.
 ///
-/// "Failed" here always means the bundle did not land (postBatch had no
-/// receipt by its target L1 block). Under strict all-or-nothing bundles
+/// "Failed" here always means the bundle did not land: the postBatch had no
+/// receipt by its target L1 block, or it was never sent because its Sync
+/// block did not commit. Under strict all-or-nothing bundles
 /// a reverting tx is excluded → the whole bundle drops, so the outcome
 /// can't distinguish "relay bad luck" from "a tx would revert" — both
 /// look like a drop. Poison is therefore caught earlier, at compose
@@ -61,8 +62,9 @@ pub struct FailedBatch {
     pub block: alloy_primitives::B256,
     /// The user txs whose effects the block carried.
     pub txs: Vec<HeldTx>,
-    /// Drop not attributable to the txs (skipped L1 slot, relay transport
-    /// failure) — recovery re-queues without counting toward poison-eviction.
+    /// Drop not attributable to the txs (skipped L1 slot, unanswered relay,
+    /// bundle never sent) — recovery re-queues without counting toward
+    /// poison-eviction.
     pub slot_skipped: bool,
 }
 

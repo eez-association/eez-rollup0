@@ -27,8 +27,8 @@ use alloy_provider::Provider as _;
 use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use eez_driver::{
-    BUILDER_GAS_LIMIT, BlockCommitterHandle, MAX_BLOCKS_PER_BATCH, ParentContext, RollupTiming,
-    SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
+    BUILDER_GAS_LIMIT, BlockCommitterHandle, CommitRelease, MAX_BLOCKS_PER_BATCH, ParentContext,
+    RollupTiming, SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
     witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_engine::EezEngineTypes;
@@ -3056,7 +3056,7 @@ where
             entry_count = total_entries,
             evicted_poison = poison.len(),
             evicted_stale,
-            "rich bundle dispatched to background observer; committing Sync block optimistically",
+            "rich bundle staged; sent when the Sync block commits",
         );
         rollup.optimistic.begin(
             sync_height,
@@ -3065,6 +3065,7 @@ where
             built.header.hash(),
             survivors,
         );
+        let (release, released) = CommitRelease::new();
         self.spawn_bundle_observer(
             ctx,
             rollup_id,
@@ -3074,11 +3075,12 @@ where
             built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
+            Some(released),
         );
         Ok(Some(SyncSlotBlock {
             payload: built.payload,
             header: built.header,
-            release: None,
+            release: Some(release),
         }))
     }
 
@@ -3204,7 +3206,7 @@ where
             rollup_id,
             sync_height,
             post_batch_hash = %post_batch_hash,
-            "minimal postBatch dispatched to background observer (leading immediate only)",
+            "minimal postBatch staged (leading immediate only); sent when the Sync block commits",
         );
         rollup.optimistic.begin(
             sync_height,
@@ -3213,6 +3215,7 @@ where
             empty_built.header.hash(),
             Vec::new(),
         );
+        let (release, released) = CommitRelease::new();
         self.spawn_bundle_observer(
             ctx,
             rollup_id,
@@ -3222,11 +3225,12 @@ where
             empty_built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
+            Some(released),
         );
         Ok(Some(SyncSlotBlock {
             payload: empty_built.payload,
             header: empty_built.header,
-            release: None,
+            release: Some(release),
         }))
     }
 
@@ -3358,6 +3362,7 @@ where
             );
             // A past terminal cannot carry a timestamp pin, but the bundle can
             // still target the exact L1 slot that triggered this composition.
+            // Its terminal is committed, so it sends at once.
             self.spawn_bundle_observer(
                 ctx,
                 rollup_id,
@@ -3367,6 +3372,7 @@ where
                 boundary_header.hash(),
                 Arc::clone(&rollup.optimistic),
                 historical_target,
+                None,
             );
             return Ok(());
         }
@@ -3429,7 +3435,8 @@ where
     /// Spawn the background bundle-observer task. It owns the submission inputs
     /// and records only the verdict in the optimistic ledger; it holds neither
     /// the Composer nor the block committer, so chain recovery stays in slot
-    /// context through `recover_failed_batch`.
+    /// context through `recover_failed_batch`. With `released`, it sends only
+    /// once the Sync block commits.
     fn spawn_bundle_observer(
         &self,
         ctx: &CrossChainExecCtx,
@@ -3440,17 +3447,19 @@ where
         expected_final_root: B256,
         optimistic: Arc<OptimisticallyIncluded>,
         target: BundleTarget,
+        released: Option<tokio::sync::oneshot::Receiver<B256>>,
     ) {
-        let submitter = ctx.submitter.clone();
-        tokio::spawn(observe_bundle_outcome(
+        tokio::spawn(send_after_commit(
             rollup_id,
             sync_height,
             bundle,
             post_batch_hash,
             expected_final_root,
             optimistic,
-            submitter,
+            ctx.submitter.clone(),
             target,
+            released,
+            tokio::time::Instant::now(),
         ));
     }
 
@@ -4855,6 +4864,92 @@ async fn pin_mismatch(submitter: &Submitter, block: u64, pin: u64) -> bool {
     true
 }
 
+/// Send the bundle once its Sync block commits, then observe it. A bundle
+/// whose block is not committed is never sent, so nothing is charged.
+async fn send_after_commit(
+    rollup_id: u64,
+    sync_height: u64,
+    bundle: Vec<Bytes>,
+    post_batch_hash: alloy_primitives::TxHash,
+    expected_final_root: B256,
+    optimistic: Arc<OptimisticallyIncluded>,
+    submitter: Submitter,
+    target: BundleTarget,
+    released: Option<tokio::sync::oneshot::Receiver<B256>>,
+    staged: tokio::time::Instant,
+) {
+    if let Some(released) = released
+        && !await_commit(
+            rollup_id,
+            sync_height,
+            expected_final_root,
+            released,
+            staged,
+        )
+        .await
+    {
+        optimistic.mark_failed(sync_height, post_batch_hash, true);
+        return;
+    }
+    observe_bundle_outcome(
+        rollup_id,
+        sync_height,
+        bundle,
+        post_batch_hash,
+        expected_final_root,
+        optimistic,
+        submitter,
+        target,
+    )
+    .await;
+}
+
+/// Wait until the Sync block `expected` is committed. `false` withholds the
+/// bundle: the block was not committed, or another block was.
+async fn await_commit(
+    rollup_id: u64,
+    sync_height: u64,
+    expected: B256,
+    released: tokio::sync::oneshot::Receiver<B256>,
+    staged: tokio::time::Instant,
+) -> bool {
+    match released.await {
+        Ok(committed) if committed == expected => {
+            event!(
+                name: "eez.composer.bundle.released",
+                Level::INFO,
+                rollup_id,
+                sync_height,
+                commit_to_send_ms = u64::try_from(staged.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "Sync block committed; sending its bundle",
+            );
+            true
+        }
+        Ok(committed) => {
+            event!(
+                name: "eez.composer.bundle.withheld",
+                Level::ERROR,
+                rollup_id,
+                sync_height,
+                expected = %expected,
+                committed = %committed,
+                "a different block was committed for this bundle; withholding it",
+            );
+            false
+        }
+        Err(_) => {
+            event!(
+                name: "eez.composer.bundle.withheld",
+                Level::WARN,
+                rollup_id,
+                sync_height,
+                "Sync block was not committed; withholding its bundle",
+            );
+            false
+        }
+    }
+}
+
 /// Background bundle observer — verdict recording ONLY. Marks the ledger
 /// entry Settled or Failed; never mutates chain state. The destructive
 /// Recovery for failed entries runs at the next Sync slot through
@@ -5282,6 +5377,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A bundle whose Sync block never commits is never sent, and recovery
+    /// re-queues it without a charge.
+    #[tokio::test]
+    async fn withheld_bundle_is_never_sent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Every L1 read and the relay share this listener, which never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&connections);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::mem::forget(socket);
+            }
+        });
+        let reader = eez_l1::L1ReaderConfig {
+            rpc_url: url.parse().unwrap(),
+            trace_rpc_url: url.parse().unwrap(),
+            eez: Address::ZERO,
+            rollup_id: 1,
+            deploy_block: 0,
+            beacon_url: None,
+        };
+        let submitter = Submitter::new(eez_l1::SubmitterConfig {
+            builder_rpc_url: url.parse().unwrap(),
+            reader,
+            target_rpc_url: None,
+            poster: alloy_signer_local::PrivateKeySigner::random(),
+        });
+        let optimistic = Arc::new(OptimisticallyIncluded::new());
+        let block = B256::repeat_byte(7);
+        let post_batch = TxHash::repeat_byte(1);
+        let parent =
+            reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
+        optimistic.begin(6, post_batch, parent, block, Vec::new());
+
+        let (release, released) = CommitRelease::new();
+        drop(release);
+        let observer = send_after_commit(
+            1,
+            6,
+            vec![signed_user_tx(21_000)],
+            post_batch,
+            block,
+            Arc::clone(&optimistic),
+            submitter,
+            BundleTarget::Exact {
+                block: 9,
+                timestamp: 1,
+            },
+            Some(released),
+            tokio::time::Instant::now(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), observer)
+            .await
+            .expect("a withheld bundle must not wait on L1");
+
+        assert_eq!(connections.load(Ordering::SeqCst), 0);
+        let failed = optimistic.take_failed_for_recovery(0).unwrap();
+        assert!(failed.slot_skipped);
     }
 
     #[test]
