@@ -74,8 +74,8 @@ pub struct BuiltSyncBlock {
 
 /// The next-block attributes every Sync-block execution path shares.
 ///
-/// `prev_randao` is L1-derived (protocol §13.14); left zero here to match the
-/// Deriver's path. Hardfork-gated fields (parent_beacon_block_root,
+/// The caller supplies the L1-derived `prev_randao`.
+/// Hardfork-gated fields (parent_beacon_block_root,
 /// withdrawals) and `extra_data` / `gas_limit` mirror the Deriver's
 /// `execute_block` attrs so all three STF paths (sequencer pool, deriver
 /// replay, sync-slot composer) produce identical headers — otherwise
@@ -85,12 +85,13 @@ fn next_block_attributes(
     evm_config: &EezEvmConfig,
     timestamp: u64,
     suggested_fee_recipient: Address,
+    prev_randao: B256,
 ) -> NextBlockEnvAttributes {
     let chain_spec = evm_config.chain_spec();
     NextBlockEnvAttributes {
         timestamp,
         suggested_fee_recipient,
-        prev_randao: B256::ZERO,
+        prev_randao,
         gas_limit: BUILDER_GAS_LIMIT,
         parent_beacon_block_root: chain_spec
             .is_cancun_active_at_timestamp(timestamp)
@@ -151,6 +152,7 @@ pub fn build_sync_block<P>(
     parent: &SealedHeader<Header>,
     timestamp: u64,
     suggested_fee_recipient: Address,
+    prev_randao: B256,
     sync_txs: &[Bytes],
 ) -> Result<BuiltSyncBlock, BuildError>
 where
@@ -162,7 +164,8 @@ where
         .map_err(|e| BuildError::Provider(format!("state_by_block_hash({parent_hash}): {e}")))?;
     let db = StateProviderDatabase::new(state_provider.as_ref().into_evm_state_provider());
 
-    let attributes = next_block_attributes(evm_config, timestamp, suggested_fee_recipient);
+    let attributes =
+        next_block_attributes(evm_config, timestamp, suggested_fee_recipient, prev_randao);
 
     let mut builder = evm_config
         .builder_for_next_block(db, parent, attributes)
@@ -313,11 +316,13 @@ impl SyncBlockState {
         parent: &SealedHeader<Header>,
         timestamp: u64,
         suggested_fee_recipient: Address,
+        prev_randao: B256,
         prefix_txs: &[Bytes],
     ) -> Result<Self, BuildError> {
         let parent_hash = parent.hash();
         let mut state = open_draft_state(provider.as_ref(), parent_hash, Cache::default())?;
-        let attributes = next_block_attributes(evm_config, timestamp, suggested_fee_recipient);
+        let attributes =
+            next_block_attributes(evm_config, timestamp, suggested_fee_recipient, prev_randao);
         let evm_env = evm_config
             .next_evm_env(parent, &attributes)
             .map_err(|e| BuildError::Builder(format!("next_evm_env: {e}")))?;
@@ -536,6 +541,7 @@ pub fn sync_block_candidates<P>(
     parent: &SealedHeader<Header>,
     timestamp: u64,
     suggested_fee_recipient: Address,
+    prev_randao: B256,
     sync_txs: &[Bytes],
 ) -> Result<SyncCandidates, BuildError>
 where
@@ -548,6 +554,7 @@ where
             parent,
             timestamp,
             suggested_fee_recipient,
+            prev_randao,
             txs,
         )
         .map(|prefix| prefix.header.hash())
@@ -585,6 +592,7 @@ mod tests {
 
     const TIMESTAMP: u64 = 1_012;
     const FEE_RECIPIENT: Address = address!("0000000000000000000000000000000000000f00");
+    const PREV_RANDAO: B256 = B256::repeat_byte(0x5a);
     const BOB: Address = address!("000000000000000000000000000000000000b0b0");
     const STORE: Address = address!("00000000000000000000000000000000005107e0");
     const REVERTER: Address = address!("000000000000000000000000000000000000bad0");
@@ -682,6 +690,7 @@ mod tests {
                 &self.parent,
                 TIMESTAMP,
                 FEE_RECIPIENT,
+                PREV_RANDAO,
                 txs,
             )
             .expect("build sync block")
@@ -694,6 +703,7 @@ mod tests {
                 &self.parent,
                 TIMESTAMP,
                 FEE_RECIPIENT,
+                PREV_RANDAO,
                 prefix,
             )
             .expect("open prefix state")
@@ -733,6 +743,7 @@ mod tests {
                 &f.parent,
                 TIMESTAMP,
                 FEE_RECIPIENT,
+                PREV_RANDAO,
                 std::slice::from_ref(&raw),
             )
             .map(|_| ()),
@@ -742,6 +753,7 @@ mod tests {
                 &f.parent,
                 TIMESTAMP,
                 FEE_RECIPIENT,
+                PREV_RANDAO,
                 std::slice::from_ref(&raw),
             )
             .map(|_| ()),
@@ -819,6 +831,7 @@ mod tests {
             &f.parent,
             TIMESTAMP,
             FEE_RECIPIENT,
+            PREV_RANDAO,
             &f.txs,
         )
         .expect("candidates");

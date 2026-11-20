@@ -18,6 +18,7 @@
 
 use core::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
@@ -70,6 +71,9 @@ enum CommitCommand<T: PayloadTypes> {
     Sequence {
         attrs: EthPayloadAttributes,
         response: oneshot::Sender<DriverResult<CommitOutcome<T>>>,
+    },
+    Barrier {
+        response: oneshot::Sender<()>,
     },
     RefreshForkchoice {
         response: oneshot::Sender<DriverResult<()>>,
@@ -130,6 +134,8 @@ pub struct BlockCommitterHandle<T: PayloadTypes> {
     /// Held by Deriver across a whole batch reconcile; blocks
     /// `commit_sequenced` so sequencer ticks can't interleave
     reconcile_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Even revisions allow production. An odd revision means recovery is pending.
+    l1_revision: Arc<AtomicU64>,
 }
 
 impl<T: PayloadTypes> Clone for BlockCommitterHandle<T> {
@@ -138,6 +144,7 @@ impl<T: PayloadTypes> Clone for BlockCommitterHandle<T> {
             sender: self.sender.clone(),
             last_header: self.last_header.clone(),
             reconcile_lock: Arc::clone(&self.reconcile_lock),
+            l1_revision: Arc::clone(&self.l1_revision),
         }
     }
 }
@@ -186,6 +193,7 @@ where
             sender,
             last_header,
             reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
+            l1_revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -257,6 +265,45 @@ where
         Arc::clone(&self.reconcile_lock).lock_owned().await
     }
 
+    /// Capture the L1 revision before resolving a seed or starting composition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::StaleL1View`] while recovery is pending.
+    pub fn sequencing_revision(&self) -> DriverResult<u64> {
+        let revision = self.l1_revision.load(Ordering::Acquire);
+        if revision & 1 != 0 {
+            return Err(DriverError::StaleL1View);
+        }
+        Ok(revision)
+    }
+
+    /// Invalidate prepared blocks and wait for already-dispatched commits.
+    /// The caller holds the reconcile lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::CommitterClosed`] if the actor stopped.
+    pub async fn begin_l1_reorg(&self) -> DriverResult<()> {
+        let revision = self.l1_revision.load(Ordering::Relaxed);
+        self.l1_revision.store(revision | 1, Ordering::Release);
+        let (response, done) = oneshot::channel();
+        self.sender
+            .send(CommitCommand::Barrier { response })
+            .await
+            .map_err(|_| DriverError::CommitterClosed)?;
+        done.await.map_err(|_| DriverError::CommitterClosed)
+    }
+
+    /// Resume production after L1 reconciliation succeeds under the lock.
+    pub fn finish_l1_reorg(&self) {
+        let revision = self.l1_revision.load(Ordering::Relaxed);
+        if revision & 1 != 0 {
+            self.l1_revision
+                .store(revision.wrapping_add(1), Ordering::Release);
+        }
+    }
+
     /// Clone of the actor's current canonical head mirror. Reflects the
     /// latest head write of any command — no broadcast lag.
     #[must_use]
@@ -291,21 +338,28 @@ where
     /// # Errors
     ///
     /// - [`DriverError::StaleParent`] on snapshot mismatch.
+    /// - [`DriverError::StaleL1View`] if an L1 reorg began after `l1_revision`
+    ///   was captured, or its recovery is still pending.
     /// - Engine-API failures or `committer_closed`.
     pub async fn commit_sequenced(
         &self,
         parent_hash: B256,
         attrs: EthPayloadAttributes,
+        l1_revision: u64,
     ) -> DriverResult<CommitOutcome<T>> {
-        // The reconcile_lock guards ONLY the parent-hash snapshot check
-        // below — it stops the deriver advancing the head between the
-        // snapshot read and the engine dispatch. Holding it across
-        // `response_rx.await` (seconds, while the engine builds the
-        // payload) starves `begin_reconcile()` callers, and reth then
-        // evicts the issued id → "payload builder returned no payload
-        // for issued id".
+        let (response_tx, response_rx) = oneshot::channel();
         {
+            // The reconcile_lock guards the L1-revision and parent-hash checks
+            // below and the dispatch, so the deriver can neither advance the
+            // head nor start L1 reorg recovery in between, and a reorg barrier
+            // drains this commit. Holding it across `response_rx.await`
+            // (seconds, while the engine builds the payload) starves
+            // `begin_reconcile()` callers, and reth then evicts the issued id
+            // → "payload builder returned no payload for issued id".
             let _guard = self.reconcile_lock.lock().await;
+            if self.sequencing_revision()? != l1_revision {
+                return Err(DriverError::StaleL1View);
+            }
             let current_head = self.last_header.borrow().hash();
             if current_head != parent_hash {
                 return Err(DriverError::StaleParent {
@@ -313,15 +367,14 @@ where
                     actual: current_head,
                 });
             }
+            self.sender
+                .send(CommitCommand::Sequence {
+                    attrs,
+                    response: response_tx,
+                })
+                .await
+                .map_err(|_| DriverError::CommitterClosed)?;
         }
-        let (response_tx, response_rx) = oneshot::channel();
-        self.sender
-            .send(CommitCommand::Sequence {
-                attrs,
-                response: response_tx,
-            })
-            .await
-            .map_err(|_| DriverError::CommitterClosed)?;
         response_rx
             .await
             .map_err(|_| DriverError::CommitterClosed)?
@@ -564,6 +617,9 @@ where
                 CommitCommand::Sequence { attrs, response } => {
                     let result = self.process_sequence(attrs).await;
                     let _ = response.send(result);
+                }
+                CommitCommand::Barrier { response } => {
+                    let _ = response.send(());
                 }
                 CommitCommand::RefreshForkchoice { response } => {
                     let result = self.process_refresh_forkchoice().await;
@@ -911,6 +967,77 @@ mod tests {
             number,
             ..Default::default()
         })
+    }
+
+    #[tokio::test]
+    async fn l1_reorg_rejects_prepared_sequence_even_when_parent_is_unchanged() {
+        let parent = sealed(0);
+        let handle = BlockCommitterHandle::<EthEngineTypes>::spawn(
+            parent.clone(),
+            parent.clone(),
+            B256::ZERO,
+            ConsensusEngineHandle::new(mpsc::unbounded_channel().0),
+            PayloadBuilderHandle::new(mpsc::unbounded_channel().0),
+            None,
+        );
+        let revision = handle.sequencing_revision().unwrap();
+        let guard = handle.begin_reconcile().await;
+        handle.begin_l1_reorg().await.unwrap();
+        assert!(matches!(
+            handle.sequencing_revision(),
+            Err(DriverError::StaleL1View)
+        ));
+        handle.finish_l1_reorg();
+        drop(guard);
+        assert!(matches!(
+            handle
+                .commit_sequenced(parent.hash(), EthPayloadAttributes::default(), revision)
+                .await,
+            Err(DriverError::StaleL1View),
+        ));
+    }
+
+    #[tokio::test]
+    async fn l1_reorg_drains_dispatched_sequences_before_rechecking_the_head() {
+        let parent = sealed(0);
+        let (_head_tx, last_header) = watch::channel(parent.clone());
+        let (sender, mut commands) = mpsc::channel(2);
+        let handle = BlockCommitterHandle::<EthEngineTypes> {
+            sender,
+            last_header,
+            reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
+            l1_revision: Arc::new(AtomicU64::new(0)),
+        };
+        let sequence = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                handle
+                    .commit_sequenced(parent.hash(), EthPayloadAttributes::default(), 0)
+                    .await
+            })
+        };
+        let Some(CommitCommand::Sequence { response, .. }) = commands.recv().await else {
+            panic!("expected a dispatched sequence");
+        };
+        let guard = handle.begin_reconcile().await;
+        let mut reorg = std::pin::pin!(handle.begin_l1_reorg());
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(reorg.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        let Some(CommitCommand::Barrier { response: drained }) = commands.recv().await else {
+            panic!("expected a barrier behind the dispatched sequence");
+        };
+        response
+            .send(Ok(CommitOutcome { header: sealed(1) }))
+            .unwrap();
+        drained.send(()).unwrap();
+        reorg.await.unwrap();
+        assert_eq!(sequence.await.unwrap().unwrap().header.number, 1);
+        handle.finish_l1_reorg();
+        drop(guard);
     }
 
     #[tokio::test]

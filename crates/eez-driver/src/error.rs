@@ -38,6 +38,9 @@ pub enum DriverError {
     /// `RollupTiming` env loading or validation failed.
     #[error("RollupTiming misconfig: {0}")]
     TimingConfig(String),
+    /// L1 changed or is being reconciled while preparing a block.
+    #[error("L1 view changed or is being reconciled")]
+    StaleL1View,
     /// Sequencer's snapshotted `parent_hash` no longer matches `last_header`.
     #[error("stale parent on sequence: snapshot was {expected}, last_header is now {actual}")]
     StaleParent { expected: B256, actual: B256 },

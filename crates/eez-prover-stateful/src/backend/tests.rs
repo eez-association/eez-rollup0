@@ -626,8 +626,16 @@ fn empty_checkpoint_includes_eip_2935_and_matches_the_composer_anchor() {
 
     let checkpoint_root = B256::repeat_byte(3);
     provider.add_state_root(checkpoint_root);
-    let composer_block =
-        build_sync_block(&provider, &evm_config, &parent, 1, Address::ZERO, &[]).unwrap();
+    let composer_block = build_sync_block(
+        &provider,
+        &evm_config,
+        &parent,
+        1,
+        Address::ZERO,
+        B256::ZERO,
+        &[],
+    )
+    .unwrap();
 
     let checkpoint_provider = HistoryCheckpointProvider {
         inner: provider,

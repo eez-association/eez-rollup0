@@ -853,6 +853,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             sync_slot_handle,
             depth,
             Arc::clone(&l1_head),
+            submitter.reader(),
         );
         (sequencer, composer, deriver_system_tx_cfg)
     };
@@ -878,6 +879,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         submitter.reader(),
         chain_spec,
         l2_block_time_secs,
+        timing.l1_block_time().as_secs(),
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),

@@ -110,6 +110,8 @@ pub struct SyncSlotBlock {
     pub payload: ExecutionData,
     /// Sealed header of the new block (head-mirror update on commit).
     pub header: SealedHeader<Header>,
+    /// Releases bundle submission once the block is accepted. Dropping cancels it.
+    pub bundle_commit: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 /// Parent context the Sequencer supplies to a [`SyncSlotComposer`].
