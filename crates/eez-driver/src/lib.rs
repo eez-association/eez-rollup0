@@ -33,6 +33,8 @@ pub mod block_committer;
 pub mod error;
 pub mod sequencer;
 pub mod slot;
+#[cfg(test)]
+mod test_engine;
 #[cfg(feature = "witness")]
 pub mod witness;
 

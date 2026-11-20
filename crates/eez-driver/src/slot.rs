@@ -234,3 +234,65 @@ pub fn spawn_l1_anchored(
     });
     rx
 }
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::B256;
+    use eez_l1::{L1Event, L1HeadStream};
+    use eez_timing::{Clock, TokioClock};
+    use tokio::sync::broadcast;
+
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn anchored_shell_fires_sync_slot_at_trigger() {
+        // 12 s L1, 2 s L2, proof 4000, slack 1500: the trigger opens 6 s after the head.
+        let timing = RollupTiming::new(12_000, 2_000, 4_000, 1_500);
+        let genesis_ts = 1_700_000_000;
+        let head_ts = genesis_ts + 120;
+        // Start half a second after the head, so no Live tick lands on the trigger.
+        let start_ms = head_ts * 1_000 + 500;
+        let clock = Arc::new(TokioClock::starting_at(start_ms));
+
+        let (l1_tx, l1_rx) = broadcast::channel(4);
+        let mut rx = spawn_l1_anchored(
+            L1HeadStream::from_receiver(l1_rx),
+            timing,
+            genesis_ts,
+            clock.clone(),
+        );
+        l1_tx
+            .send(L1Event::NewHead {
+                block_number: 9,
+                block_hash: B256::ZERO,
+                timestamp: head_ts,
+            })
+            .unwrap();
+
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let event = rx.recv().await.unwrap();
+            seen.push((clock.now_unix_ms(), event));
+        }
+
+        let height = (head_ts + 12 - genesis_ts) / 2;
+        let tick = SlotEvent::LiveTick {
+            sync_slot_block_height: height,
+        };
+        let sync = SlotEvent::SyncSlot {
+            block_height: height,
+            timestamp: head_ts + 12,
+            l1_head: 9,
+        };
+        assert_eq!(
+            seen,
+            vec![
+                (start_ms + 2_000, tick),
+                (start_ms + 4_000, tick),
+                (head_ts * 1_000 + 6_000, sync),
+                (start_ms + 6_000, tick),
+                (start_ms + 8_000, tick),
+            ]
+        );
+    }
+}
