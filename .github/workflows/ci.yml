@@ -85,11 +85,11 @@ jobs:
           --test public_inputs_hash_vectors
           --test rolling_hash_vectors
           --no-fail-fast
-      - name: Check prover execution dependency isolation
+      - name: Check prover dependency sources and execution isolation
         run: |
-          scripts/provers-cargo.sh metadata --format-version 1 | python3 provers/scripts/check-execution-deps.py stateless
-          scripts/provers-cargo.sh --stateful metadata --format-version 1 | python3 provers/scripts/check-execution-deps.py stateful
-      - name: Prover tests against this checkout's protocol crates
+          scripts/provers-cargo.sh metadata --format-version 1 | python3 scripts/check-prover-deps.py stateless
+          scripts/provers-cargo.sh --stateful metadata --format-version 1 | python3 scripts/check-prover-deps.py stateful
+      - name: Prover tests against this checkout's crates
         run: |
           scripts/provers-cargo.sh nextest run --cargo-profile ci-e2e --target-dir target --workspace --no-fail-fast
           scripts/provers-cargo.sh --stateful nextest run --cargo-profile ci-e2e --target-dir target --workspace --no-fail-fast

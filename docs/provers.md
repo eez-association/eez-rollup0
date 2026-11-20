@@ -9,7 +9,8 @@ pinned here as the `provers/` submodule. Each has its own Cargo workspace and lo
 | `provers/stateful-ecdsa/` | `eez-prover-stateful` | Default follower and existing stateful backend using `eez-evm`, evm2 and reth 2.11 |
 
 The ordinary `eez-follower` library and binary stay in this repository. Stateful
-imports that library at a pinned Git revision. `eez_follower::run_with` validates
+imports that library from this checkout for integrated builds and from a pinned
+Git revision for standalone builds. `eez_follower::run_with` validates
 caller configuration before node startup and provides handles after historical
 synchronization and L1 anchoring. Stateful attaches its service there and drains
 it during node shutdown. The hook does not customize execution: both binaries
@@ -33,7 +34,7 @@ flowchart LR
   subgraph stateless[provers/stateless-ecdsa workspace]
     SL[eez-prover-stateless] --> PE[eez-prover-evm / revm]
   end
-  SF -->|pinned Git source| F
+  SF -->|checkout or standalone Git pin| F
   SF --> E
   SF --> PS
   SL --> PS
@@ -49,13 +50,19 @@ scripts/provers-cargo.sh nextest run --target-dir target --workspace
 scripts/provers-cargo.sh --stateful nextest run --target-dir target --workspace
 ```
 
-The helper redirects the shared signing and protocol crates to this checkout.
-Each workspace keeps its execution-dependent crates at its own Git pin, so a
-later reth upgrade in root does not force either prover to upgrade. The helper
-restores the selected lockfile on exit; redirected builds cannot use `--locked`.
-For standalone builds, run Cargo inside the selected prover directory with
-`--locked`. Updating follower code used by stateful requires advancing its root
-Git pin and matching reth/evm2 dependencies in `stateful-ecdsa/Cargo.toml`.
+The helper redirects every `eez-rollup0` package in the selected prover's
+lockfile to this checkout. Stateful therefore builds and tests the current
+follower and EVM, while stateless keeps its own execution stack in `provers/`.
+CI checks both the source of root packages and execution dependency isolation.
+Root's Docker builds and the e2e harness use the same helper. The helper restores
+the selected lockfile on exit; redirected builds cannot use `--locked`.
+
+For reproducible standalone builds, run Cargo inside the selected prover
+directory with `--locked`; all root dependencies then use its pinned Git revision.
+When root upgrades reth or evm2, stateful's direct dependencies and patches in
+`stateful-ecdsa/Cargo.toml` must remain compatible with the current follower.
+Integration CI should expose any required prover update. Advance stateful's root
+Git pin to carry follower changes into standalone builds as well.
 
 The e2e harness locates both executables beside the test profile or builds them
 through the helper. `EEZ_TEST_PROOF_SIGNER_BIN` and

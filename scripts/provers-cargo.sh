@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Runs cargo on one ECDSA prover workspace with its shared signing and
-# protocol crates taken from this checkout instead of the commit provers
-# pins, so a change to a shared crate is built and tested with the signer here.
+# Runs cargo on one ECDSA prover workspace with all its eez-rollup0 crates
+# taken from this checkout instead of the commit provers pins. Stateful uses
+# this checkout's follower and EVM; stateless keeps its own execution stack.
 #
 #   scripts/provers-cargo.sh build -p eez-prover-stateless --bin eez-proof-signer
 #   scripts/provers-cargo.sh --stateful nextest run --workspace
@@ -34,10 +34,19 @@ mkdir -p "$root/target"
 exec 9>"$root/target/.provers-cargo.lock"
 perl -MFcntl=:flock -e 'open(my $lock, ">&=", 9) or die "lock: $!\n"; flock($lock, LOCK_EX) or die "lock: $!\n"'
 
-# Only execution-independent crates cross workspace boundaries. Keep each
-# prover's follower/EVM closure at its own Git pin, including when root later
-# changes reth versions. The signing library is shared by both backends.
-crates=(eez-blob eez-control-rpc eez-payload-codec eez-primitives eez-proof-signer eez-protocol eez-prover eez-prover-client)
+# Every eez-rollup0 package in the selected prover's lockfile, including the
+# stateful follower/EVM closure. Standalone builds retain their Git pins.
+crates=()
+while IFS= read -r crate; do
+    crates+=("$crate")
+done < <(awk -v src="source = \"git+$url?" '
+    index($0, "name = ") == 1 { name = $3; gsub(/"/, "", name) }
+    index($0, src) == 1 { print name }
+' "$signer/Cargo.lock")
+if [[ ${#crates[@]} -eq 0 ]]; then
+    echo "no eez-rollup0 packages in $signer/Cargo.lock" >&2
+    exit 1
+fi
 patches=()
 for crate in "${crates[@]}"; do
     if [[ ! -f "$root/crates/$crate/Cargo.toml" ]]; then

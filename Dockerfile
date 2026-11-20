@@ -66,8 +66,8 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry,sharin
     && cp "target/$BUILD_PROFILE/examples/genesis_state_root" /build/genesis_state_root \
     && cp "target/$BUILD_PROFILE/examples/genesis_block_hash" /build/genesis_block_hash
 
-# Each prover keeps its own execution dependencies and lockfile. The helper
-# redirects only the shared signing/protocol crates to this checkout.
+# Each prover keeps its own workspace and lockfile. The helper redirects all
+# eez-rollup0 crates, including stateful's follower and EVM, to this checkout.
 FROM chef AS prover-base
 ARG BUILD_PROFILE=release
 COPY Cargo.toml ./
