@@ -22,7 +22,6 @@
 //! channel.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use alloy_consensus::Header;
 use alloy_rpc_types_engine::ExecutionData;
@@ -32,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use tracing::{Level, event};
 
-use eez_timing::{RollupTiming, SharedClock, SlotEvent};
+use eez_timing::{RollupTiming, SharedClock, SlotEvent, SlotScheduler};
 
 /// Pre-built Sync block produced by a [`SyncSlotComposer`] — ready to
 /// commit via [`BlockCommitterHandle::commit_derived`].
@@ -112,27 +111,11 @@ pub trait SyncSlotComposer: Send + Sync + 'static {
 /// Cheap clone-able handle for a [`SyncSlotComposer`].
 pub type SyncSlotComposerHandle = Arc<dyn SyncSlotComposer>;
 
-/// Sync-slot trigger armed by an L1 head, waiting for its
-/// proof-window-open instant.
-#[derive(Debug, Clone, Copy)]
-struct PendingSyncSlot {
-    /// Wall-clock unix second at which to fire
-    /// (`L1.timestamp + proof_window_open`).
-    trigger_at: u64,
-    /// L2 block height the Sync block will land at.
-    block_height: u64,
-    /// Wall-clock unix timestamp the Sync block will advertise.
-    timestamp: u64,
-    /// L1 block of the anchoring head; carried into [`SlotEvent::SyncSlot`].
-    l1_head: u64,
-    /// L1 block timestamp of the anchoring head (logging only).
-    l1_timestamp: u64,
-}
-
 /// Spawn the L1-anchored scheduler. Returns the receiver side of the
 /// channel.
 ///
-/// On each L1 head from `source`:
+/// A tokio shell over [`SlotScheduler`], which holds every decision. On
+/// each L1 head from `source`:
 ///
 /// 1. Compute the deterministic sync-slot block height + timestamp
 ///    from `(l2_genesis_timestamp, L1.timestamp, L1_block_time,
@@ -163,32 +146,21 @@ pub fn spawn_l1_anchored(
 ) -> mpsc::Receiver<SlotEvent> {
     let (tx, rx) = mpsc::channel(8);
     tokio::spawn(async move {
+        let mut scheduler = SlotScheduler::new(timing, l2_genesis_timestamp);
         let mut ticker = interval_at(
             Instant::now() + timing.l2_block_time(),
             timing.l2_block_time(),
         );
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-        // Latest anchor-computed sync-slot height. None until the
-        // first L1 head; LiveTicks are suppressed until then.
-        let mut latest_sync_height: Option<u64> = None;
-        // Armed sync-slot trigger. None while idle between fire and
-        // the next L1 head.
-        let mut pending: Option<PendingSyncSlot> = None;
-
         loop {
-            // Remaining wait for the armed trigger, recomputed from unix
-            // time each iteration so re-creating the sleep when another
-            // select branch wins doesn't stretch the deadline. ZERO when
-            // disarmed — the branch is disabled, the future never polled.
-            let trigger_wait = pending.map_or(Duration::ZERO, |p| {
-                // Align the wake to the `trigger_at` instant in ms. A
-                // whole-second sleep wakes N seconds after the loop's
-                // fractional phase, firing the trigger ~0.8s late and
-                // eating the send-lead before the slot.
-                let trigger_at_ms = p.trigger_at.saturating_mul(1_000);
-                Duration::from_millis(trigger_at_ms.saturating_sub(clock.now_unix_ms()))
-            });
+            // Remaining wait for the armed trigger, recomputed from the
+            // clock each iteration so re-creating the sleep when another
+            // select branch wins doesn't stretch the deadline. The wait is
+            // aligned to the trigger's millisecond: a whole-second sleep
+            // wakes ~0.8s late and eats the send-lead before the slot.
+            // `None` while disarmed — the branch is disabled.
+            let trigger_wait = scheduler.wait(clock.now_unix_ms());
 
             tokio::select! {
                 maybe_head = source.next_head() => {
@@ -201,12 +173,8 @@ pub fn spawn_l1_anchored(
                         return;
                     };
 
-                    let trigger_at = head.timestamp + timing.proof_window_open().as_secs();
-                    let sync_slot_timestamp = head.timestamp + timing.l1_block_time().as_secs();
-                    let block_height = sync_slot_timestamp.saturating_sub(l2_genesis_timestamp)
-                        / timing.l2_block_time().as_secs();
-
-                    if let Some(stale) = pending {
+                    let stale = scheduler.on_l1_head(head.block_number, head.timestamp);
+                    if let (Some(stale), Some(armed)) = (stale, scheduler.armed()) {
                         // Only reachable when heads arrive faster than
                         // proof_window_open apart — a watcher catch-up
                         // burst. The newest anchor wins; the Sequencer's
@@ -215,24 +183,16 @@ pub fn spawn_l1_anchored(
                             name: "eez.slot.l1_anchored.trigger_superseded",
                             Level::WARN,
                             stale_block_height = stale.block_height,
-                            block_height,
+                            block_height = armed.block_height,
                             l1_head = head.block_number,
                             "L1 head arrived before armed sync-slot trigger fired; superseding with newest anchor",
                         );
                     }
-                    latest_sync_height = Some(block_height);
-                    pending = Some(PendingSyncSlot {
-                        trigger_at,
-                        block_height,
-                        timestamp: sync_slot_timestamp,
-                        l1_head: head.block_number,
-                        l1_timestamp: head.timestamp,
-                    });
                 }
-                () = tokio::time::sleep(trigger_wait), if pending.is_some() => {
-                    let fired = pending
-                        .take()
-                        .expect("branch enabled only while pending.is_some()");
+                () = tokio::time::sleep(trigger_wait.unwrap_or_default()), if trigger_wait.is_some() => {
+                    let fired = scheduler
+                        .fire()
+                        .expect("branch enabled only while a trigger is armed");
                     event!(
                         name: "eez.slot.l1_anchored.trigger",
                         Level::DEBUG,
@@ -242,23 +202,17 @@ pub fn spawn_l1_anchored(
                         block_height = fired.block_height,
                         "sync-slot trigger firing",
                     );
-                    if tx
-                        .send(SlotEvent::SyncSlot {
-                            block_height: fired.block_height,
-                            timestamp: fired.timestamp,
-                            l1_head: fired.l1_head,
-                        })
-                        .await
-                        .is_err()
-                    {
+                    if tx.send(fired.event()).await.is_err() {
                         return; // Sequencer dropped the receiver; exit cleanly.
                     }
                 }
                 _ = ticker.tick() => {
-                    let Some(sync_slot_block_height) = latest_sync_height else {
+                    let Some(tick @ SlotEvent::LiveTick { sync_slot_block_height }) =
+                        scheduler.live_tick()
+                    else {
                         continue; // No anchor yet; ticks must not outrun it.
                     };
-                    match tx.try_send(SlotEvent::LiveTick { sync_slot_block_height }) {
+                    match tx.try_send(tick) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             // Sequencer is mid-burst; the next tick
