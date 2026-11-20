@@ -3571,6 +3571,7 @@ dependencies = [
  "eez-l1",
  "eez-primitives",
  "eez-prover",
+ "eez-timing",
  "evm2",
  "eyre",
  "reth-chainspec",
@@ -4037,6 +4038,13 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+]
+
+[[package]]
+name = "eez-timing"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
 ]
 
 [[package]]

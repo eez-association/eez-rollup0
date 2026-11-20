@@ -22,6 +22,7 @@ members = [
     "crates/eez-prover-client",
     "crates/eez-seq-sig",
     "crates/eez-testkit",
+    "crates/eez-timing",
 ]
 
 [workspace.package]
@@ -196,6 +197,7 @@ eez-proof-signer   = { path = "crates/eez-proof-signer" }
 eez-protocol       = { path = "crates/eez-protocol" }
 eez-prover         = { path = "crates/eez-prover" }
 eez-testkit        = { path = "crates/eez-testkit" }
+eez-timing         = { path = "crates/eez-timing" }
 
 # Patches do not propagate from git dependencies, so these mirror reth v2.11.0's
 # own (reth Cargo.toml [patch]). A patch cannot point back at its own source.

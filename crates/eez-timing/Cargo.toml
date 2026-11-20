@@ -1,0 +1,13 @@
+[package]
+name                   = "eez-timing"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+rust-version.workspace = true
+description            = "Slot timing for an EEZ rollup: timing config, deadlines and the L1-anchored scheduler core. No reth dependency."
+
+[dependencies]
+thiserror.workspace = true
+
+[lints]
+workspace = true

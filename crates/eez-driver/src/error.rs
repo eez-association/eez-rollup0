@@ -42,3 +42,9 @@ pub enum DriverError {
     #[error("stale parent on sequence: snapshot was {expected}, last_header is now {actual}")]
     StaleParent { expected: B256, actual: B256 },
 }
+
+impl From<eez_timing::TimingError> for DriverError {
+    fn from(err: eez_timing::TimingError) -> Self {
+        Self::TimingConfig(err.0)
+    }
+}

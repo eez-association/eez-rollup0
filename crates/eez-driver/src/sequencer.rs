@@ -40,8 +40,8 @@ use tokio::sync::mpsc;
 
 use crate::block_committer::BlockCommitterHandle;
 use crate::error::{DriverError, DriverResult};
-use crate::slot::{SlotEvent, SlotKind, SyncSlotComposerHandle, SyncSlotMode};
-use crate::timing::{RollupTiming, SlotComposition};
+use crate::slot::{SyncSlotComposerHandle, SyncSlotMode};
+use eez_timing::{RollupTiming, SlotComposition, SlotEvent, SlotKind};
 
 /// How often the sequencer re-publishes the current forkchoice state.
 ///
