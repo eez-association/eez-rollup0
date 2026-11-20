@@ -54,6 +54,22 @@ impl<T: PayloadTypes> fmt::Debug for CommitOutcome<T> {
     }
 }
 
+/// A block the engine built on the committer's head, not yet imported or adopted.
+pub struct BuiltBlock<T: PayloadTypes> {
+    /// Header of the built block.
+    pub header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+    /// The same block as an engine payload, ready for `newPayload`.
+    pub payload: T::ExecutionData,
+}
+
+impl<T: PayloadTypes> fmt::Debug for BuiltBlock<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BuiltBlock")
+            .field("header", &self.header)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Follower unsafe-head forkchoice result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkchoiceOutcome {
@@ -291,7 +307,9 @@ where
     /// # Errors
     ///
     /// - [`DriverError::StaleParent`] on snapshot mismatch.
-    /// - Engine-API failures or `committer_closed`.
+    /// - [`DriverError::EngineNotReady`] when reth answers SYNCING or ACCEPTED
+    ///   to `newPayload`, or SYNCING to the head FCU; the head stays.
+    /// - Other engine-API failures or `committer_closed`.
     pub async fn commit_sequenced(
         &self,
         parent_hash: B256,
@@ -765,7 +783,58 @@ where
     ) -> DriverResult<DeriveOutcome> {
         let block_hash = payload.block_hash();
         let block_number = payload.block_number();
+        self.import(payload).await?;
+        self.adopt(header, feed_witness).await?;
+        Ok(DeriveOutcome {
+            block_hash,
+            block_number,
+        })
+    }
 
+    async fn process_sequence(
+        &mut self,
+        attrs: EthPayloadAttributes,
+    ) -> DriverResult<CommitOutcome<T>> {
+        let BuiltBlock { header, payload } = self.build_on_head(attrs).await?;
+        self.import(payload).await?;
+        // A produced block always feeds the prover.
+        self.adopt(header.clone(), true).await?;
+        Ok(CommitOutcome { header })
+    }
+
+    /// Builds a block on the head through reth's payload service. Moves
+    /// nothing: the FCU names the current head.
+    async fn build_on_head(&self, attrs: EthPayloadAttributes) -> DriverResult<BuiltBlock<T>> {
+        let state = ForkchoiceState {
+            head_block_hash: self.head_tx.borrow().hash(),
+            safe_block_hash: self.safe_header.hash(),
+            finalized_block_hash: self.finalized_hash,
+        };
+        let fcu = self
+            .to_engine
+            .fork_choice_updated(state, Some(attrs))
+            .await
+            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
+        if !fcu.is_valid() {
+            return Err(DriverError::InvalidForkchoice(format!("{fcu:?}")));
+        }
+        let payload_id = fcu.payload_id.ok_or(DriverError::PayloadMissing)?;
+
+        let built = self
+            .payload_builder
+            .resolve_kind(payload_id, PayloadKind::WaitForPending)
+            .await
+            .ok_or(DriverError::PayloadMissing)?
+            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
+        Ok(BuiltBlock {
+            header: built.block().sealed_header().clone(),
+            payload: T::block_to_payload(built.block().clone(), None),
+        })
+    }
+
+    /// `newPayload` with no forkchoice update. SYNCING or ACCEPTED means
+    /// reth has not validated the block yet.
+    async fn import(&self, payload: <T as PayloadTypes>::ExecutionData) -> DriverResult<()> {
         let np = self
             .to_engine
             .new_payload(payload)
@@ -780,10 +849,18 @@ where
         if !np.is_valid() {
             return Err(DriverError::InvalidPayload(format!("{np:?}")));
         }
+        Ok(())
+    }
 
-        // Advance reth's canonical head to the derived block. Safe /
-        // finalized stay put; `advance_safe_finalized` is the only
-        // thing that moves them.
+    /// Makes an imported block the head: head FCU, then the head mirror.
+    /// Safe and finalized stay put. `feed_witness` is set only by the
+    /// producer, so a re-derived block never feeds the prover twice.
+    async fn adopt(
+        &mut self,
+        header: SealedHeaderFor<<T::BuiltPayload as BuiltPayload>::Primitives>,
+        feed_witness: bool,
+    ) -> DriverResult<()> {
+        let block_hash = header.hash();
         let mut state = self.forkchoice_state();
         state.head_block_hash = block_hash;
         let fcu = self
@@ -798,84 +875,12 @@ where
             return Err(DriverError::InvalidForkchoice(format!("{fcu:?}")));
         }
         self.set_head(header);
-
-        // Prover-feed (prover-chain P1): a PRODUCED Sync/settling block reaches
-        // canonicalization via this path (commit_one_prebuilt → commit_derived),
-        // not process_sequence. Emit ONLY when the caller is the producer
-        // (`feed_witness`) — a follower / L1-reconcile re-derive passes
-        // `feed_witness=false` so the prover isn't double-fed the same block.
-        // The block is already canonical (the FCU above), so the witness task's
+        // The block is canonical now, so the witness task's
         // `recovered_block(hash)` resolves on the first try.
         if feed_witness {
             self.feed_witness(block_hash);
         }
-
-        Ok(DeriveOutcome {
-            block_hash,
-            block_number,
-        })
-    }
-
-    async fn process_sequence(
-        &mut self,
-        attrs: EthPayloadAttributes,
-    ) -> DriverResult<CommitOutcome<T>> {
-        let head_block_hash = self.head_tx.borrow().hash();
-        let state = ForkchoiceState {
-            head_block_hash,
-            safe_block_hash: self.safe_header.hash(),
-            finalized_block_hash: self.finalized_hash,
-        };
-        let fcu = self
-            .to_engine
-            .fork_choice_updated(state, Some(attrs))
-            .await
-            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
-        if !fcu.is_valid() {
-            return Err(DriverError::InvalidForkchoice(format!("{fcu:?}")));
-        }
-        let payload_id = fcu.payload_id.ok_or(DriverError::PayloadMissing)?;
-
-        let payload = self
-            .payload_builder
-            .resolve_kind(payload_id, PayloadKind::WaitForPending)
-            .await
-            .ok_or(DriverError::PayloadMissing)?
-            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
-
-        let header: SealedHeader<_> = payload.block().sealed_header().clone();
-        let exec_payload = T::block_to_payload(payload.block().clone(), None);
-
-        let np = self
-            .to_engine
-            .new_payload(exec_payload)
-            .await
-            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
-        if !np.is_valid() {
-            return Err(DriverError::InvalidPayload(format!("{np:?}")));
-        }
-
-        // Canonicalize the just-built block immediately (head-FCU, mirroring
-        // process_derive) so it is queryable BEFORE we emit to the prover feed.
-        // Without this the block is only `new_payload`'d here and becomes canonical
-        // at the NEXT slot's opening FCU, so a `recovered_block(hash)` in the
-        // witness task would transiently miss it.
-        let mut state = self.forkchoice_state();
-        state.head_block_hash = header.hash();
-        let fcu = self
-            .to_engine
-            .fork_choice_updated(state, None)
-            .await
-            .map_err(|e| DriverError::EngineRpc(e.to_string()))?;
-        if !fcu.is_valid() {
-            return Err(DriverError::InvalidForkchoice(format!("{fcu:?}")));
-        }
-
-        self.set_head(header.clone());
-        // Prover-feed trigger (prover-chain P1): the block is now canonical, so
-        // the witness task's `recovered_block(hash)` resolves on the first try.
-        self.feed_witness(header.hash());
-        Ok(CommitOutcome { header })
+        Ok(())
     }
 }
 
@@ -907,7 +912,7 @@ mod tests {
     use reth_ethereum_primitives::BlockBody;
     use reth_primitives_traits::SealedBlock;
 
-    use crate::test_engine::{self, EngineCall, TestEngine};
+    use crate::test_engine::{self, EngineCall, MockStatus, TestEngine};
 
     fn sealed(number: u64) -> SealedHeader {
         SealedHeader::seal_slow(Header {
@@ -1032,6 +1037,31 @@ mod tests {
             ]
         );
         assert_eq!(fed(&mut witness), vec![produced.hash()]);
+    }
+
+    #[tokio::test]
+    async fn sequence_syncing_is_engine_not_ready() {
+        let genesis = test_engine::genesis();
+        let (engine, committer, mut witness) = fed_committer(&genesis);
+
+        engine.queue_new_payload(MockStatus::Syncing);
+        let on_import = committer
+            .commit_sequenced(genesis.hash(), test_engine::attrs(1_002))
+            .await;
+        // The build FCU passes; the head FCU answers SYNCING.
+        engine.queue_fcu(MockStatus::Valid);
+        engine.queue_fcu(MockStatus::Syncing);
+        let on_adopt = committer
+            .commit_sequenced(genesis.hash(), test_engine::attrs(1_002))
+            .await;
+        for result in [on_import, on_adopt] {
+            assert!(
+                matches!(result, Err(DriverError::EngineNotReady(_))),
+                "{result:?}"
+            );
+        }
+        assert_eq!(committer.last_header().hash(), genesis.hash());
+        assert!(fed(&mut witness).is_empty());
     }
 
     #[tokio::test]
