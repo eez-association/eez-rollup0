@@ -56,11 +56,11 @@ type PayloadFuture =
 
 /// Shared state of the two mocks.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct TestEngine {
+pub(crate) struct MockEngine {
     state: Arc<Mutex<State>>,
 }
 
-impl TestEngine {
+impl MockEngine {
     /// Spawns both mocks on the current runtime. Payload jobs can build on `head`.
     pub(crate) fn spawn(
         head: &SealedHeader,
@@ -70,7 +70,7 @@ impl TestEngine {
         PayloadBuilderHandle<EthEngineTypes>,
     ) {
         let engine = Self::default();
-        engine.know(head);
+        engine.add_header(head);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel();
         let (service_tx, service_rx) = mpsc::unbounded_channel();
         tokio::spawn(engine.clone().run_engine(engine_rx));
@@ -97,7 +97,7 @@ impl TestEngine {
     }
 
     /// Lets payload jobs build on `header`.
-    pub(crate) fn know(&self, header: &SealedHeader) {
+    pub(crate) fn add_header(&self, header: &SealedHeader) {
         self.lock()
             .headers
             .insert(header.hash(), header.header().clone());
@@ -268,7 +268,7 @@ mod tests {
     #[tokio::test]
     async fn sequenced_commit_builds_a_child_and_logs_every_call() {
         let genesis = genesis();
-        let (engine, committer) = TestEngine::committer(&genesis);
+        let (engine, committer) = MockEngine::committer(&genesis);
 
         let outcome = committer
             .commit_sequenced(genesis.hash(), attrs(1_002))
@@ -300,7 +300,7 @@ mod tests {
     #[tokio::test]
     async fn queued_statuses_answer_one_call_each() {
         let genesis = genesis();
-        let (engine, committer) = TestEngine::committer(&genesis);
+        let (engine, committer) = MockEngine::committer(&genesis);
 
         engine.queue_new_payload(MockStatus::Invalid);
         let err = committer

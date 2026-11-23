@@ -174,7 +174,7 @@ pub fn spawn_l1_anchored(
                     };
 
                     let stale = scheduler.on_l1_head(head.block_number, head.timestamp);
-                    if let (Some(stale), Some(armed)) = (stale, scheduler.armed()) {
+                    if let (Some(stale), Some(armed)) = (stale, scheduler.pending()) {
                         // Only reachable when heads arrive faster than
                         // proof_window_open apart — a watcher catch-up
                         // burst. The newest anchor wins; the Sequencer's
@@ -245,7 +245,7 @@ mod tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn anchored_shell_fires_sync_slot_at_trigger() {
+    async fn spawn_l1_anchored_sends_each_event_on_time() {
         // 12 s L1, 2 s L2, proof 4000, slack 1500: the trigger opens 6 s after the head.
         let timing = RollupTiming::new(12_000, 2_000, 4_000, 1_500);
         let genesis_ts = 1_700_000_000;

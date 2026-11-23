@@ -692,7 +692,7 @@ mod tests {
 
     use super::*;
     use crate::slot::{ParentContext, SyncSlotBlock, SyncSlotComposer};
-    use crate::test_engine::{EngineCall, TestEngine};
+    use crate::test_engine::{EngineCall, MockEngine};
 
     /// 12 s L1, 2 s L2, proof 4000, slack 1500: live 3, future 2, K 6.
     const TIMING: RollupTiming = RollupTiming::new(12_000, 2_000, 4_000, 1_500);
@@ -704,10 +704,10 @@ mod tests {
     /// The trigger instant, `proof_window_open` after the anchor head.
     const TRIGGER_MS: u64 = (GENESIS_TS + 6) * 1_000;
     /// The last instant at which the bundle still makes the L1 slot.
-    const DEADLINE_MS: u64 = SYNC_TS * 1_000 - 1_500 - 4_000;
+    const CUTOFF_MS: u64 = SYNC_TS * 1_000 - 1_500 - 4_000;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct Compose {
+    struct ComposeCall {
         parent: u64,
         timestamp: u64,
         target: Option<u64>,
@@ -720,8 +720,8 @@ mod tests {
     /// commits the Sync block through the engine.
     #[derive(Debug)]
     struct RecordingComposer {
-        engine: TestEngine,
-        calls: Mutex<Vec<Compose>>,
+        engine: MockEngine,
+        calls: Mutex<Vec<ComposeCall>>,
     }
 
     #[async_trait]
@@ -734,7 +734,7 @@ mod tests {
             target_l1_block: Option<u64>,
             mode: SyncSlotMode,
         ) -> Option<SyncSlotBlock> {
-            self.calls.lock().unwrap().push(Compose {
+            self.calls.lock().unwrap().push(ComposeCall {
                 parent: parent.header.number(),
                 timestamp,
                 target: target_l1_block,
@@ -746,7 +746,7 @@ mod tests {
     }
 
     struct Fixture {
-        engine: TestEngine,
+        engine: MockEngine,
         composer: Arc<RecordingComposer>,
         sequencer: Sequencer<EthEngineTypes, ChainSpec>,
     }
@@ -758,7 +758,7 @@ mod tests {
                 gas_limit: 30_000_000,
                 ..Default::default()
             });
-            let (engine, committer) = TestEngine::committer(&genesis);
+            let (engine, committer) = MockEngine::committer(&genesis);
             let composer = Arc::new(RecordingComposer {
                 engine: engine.clone(),
                 calls: Mutex::default(),
@@ -794,7 +794,7 @@ mod tests {
                 .unwrap();
         }
 
-        fn composes(&self) -> Vec<Compose> {
+        fn compose_calls(&self) -> Vec<ComposeCall> {
             self.composer.calls.lock().unwrap().clone()
         }
 
@@ -842,8 +842,8 @@ mod tests {
         }
         // 3 Live + 2 Future, then the steady compose, then the Sync commit.
         assert_eq!(
-            f.composes(),
-            vec![Compose {
+            f.compose_calls(),
+            vec![ComposeCall {
                 parent: 5,
                 timestamp: SYNC_TS,
                 target: Some(L1_HEAD + 1),
@@ -859,22 +859,22 @@ mod tests {
     async fn late_trigger_composes_empty_sync_block() {
         // On time at the deadline; one millisecond later the slot is deferred.
         let mut on_time = Fixture::new(
-            DEADLINE_MS,
+            CUTOFF_MS,
             DEFAULT_MAX_SPECULATIVE_DEPTH,
             L1CanonicalHead::default(),
         );
         on_time.sync_slot(SYNC_TS).await;
-        assert_eq!(on_time.composes()[0].mode, SyncSlotMode::Steady);
+        assert_eq!(on_time.compose_calls()[0].mode, SyncSlotMode::Steady);
 
         let mut late = Fixture::new(
-            DEADLINE_MS + 1,
+            CUTOFF_MS + 1,
             DEFAULT_MAX_SPECULATIVE_DEPTH,
             L1CanonicalHead::default(),
         );
         late.sync_slot(SYNC_TS).await;
         assert_eq!(
-            late.composes(),
-            vec![Compose {
+            late.compose_calls(),
+            vec![ComposeCall {
                 parent: 5,
                 timestamp: SYNC_TS,
                 target: None,
@@ -895,7 +895,7 @@ mod tests {
         // One second off the grid: parent + L2 lands on SYNC_TS, not SYNC_TS + 1.
         f.sync_slot(SYNC_TS + 1).await;
 
-        assert!(f.composes().is_empty());
+        assert!(f.compose_calls().is_empty());
         assert_eq!(f.sequencer.off_grid_skips, 1);
         assert_eq!(f.commits(), 5);
         assert_eq!(f.head(), 5);
@@ -920,6 +920,6 @@ mod tests {
         // the second Future block and the Sync block.
         assert_eq!(f.commits(), 4);
         assert_eq!(f.head(), 4);
-        assert!(f.composes().is_empty());
+        assert!(f.compose_calls().is_empty());
     }
 }

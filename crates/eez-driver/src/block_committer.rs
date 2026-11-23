@@ -912,7 +912,7 @@ mod tests {
     use reth_ethereum_primitives::BlockBody;
     use reth_primitives_traits::SealedBlock;
 
-    use crate::test_engine::{self, EngineCall, MockStatus, TestEngine};
+    use crate::test_engine::{self, EngineCall, MockEngine, MockStatus};
 
     fn sealed(number: u64) -> SealedHeader {
         SealedHeader::seal_slow(Header {
@@ -921,14 +921,18 @@ mod tests {
         })
     }
 
-    type Witness = mpsc::UnboundedReceiver<B256>;
+    type WitnessFeed = mpsc::UnboundedReceiver<B256>;
     type Payload = <EthEngineTypes as PayloadTypes>::ExecutionData;
 
     /// A committer on the mock engine that feeds witnesses to the returned receiver.
     fn fed_committer(
         head: &SealedHeader,
-    ) -> (TestEngine, BlockCommitterHandle<EthEngineTypes>, Witness) {
-        let (engine, to_engine, payload_builder) = TestEngine::spawn(head);
+    ) -> (
+        MockEngine,
+        BlockCommitterHandle<EthEngineTypes>,
+        WitnessFeed,
+    ) {
+        let (engine, to_engine, payload_builder) = MockEngine::spawn(head);
         let (witness_tx, witness_rx) = mpsc::unbounded_channel();
         let committer = BlockCommitterHandle::spawn(
             head.clone(),
@@ -942,7 +946,7 @@ mod tests {
     }
 
     /// Every block hash fed to the witness channel so far.
-    fn fed(witness: &mut Witness) -> Vec<B256> {
+    fn fed(witness: &mut WitnessFeed) -> Vec<B256> {
         std::iter::from_fn(|| witness.try_recv().ok()).collect()
     }
 

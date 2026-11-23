@@ -80,7 +80,7 @@ pub enum SlotEvent {
 /// A Sync-slot trigger armed by an L1 head, waiting for its
 /// proof-window-open instant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ArmedTrigger {
+pub struct SyncSlotTrigger {
     /// Unix millisecond at which to fire:
     /// `(L1.timestamp + proof_window_open)·1000`.
     pub trigger_at_ms: u64,
@@ -94,7 +94,7 @@ pub struct ArmedTrigger {
     pub l1_timestamp: u64,
 }
 
-impl ArmedTrigger {
+impl SyncSlotTrigger {
     /// The [`SlotEvent::SyncSlot`] this trigger sends when it fires.
     #[must_use]
     pub const fn event(&self) -> SlotEvent {
@@ -119,7 +119,7 @@ pub struct SlotScheduler {
     /// Latest anchor-computed Sync height; `None` until the first head.
     latest_sync_height: Option<u64>,
     /// Armed trigger; `None` between a fire and the next head.
-    pending: Option<ArmedTrigger>,
+    pending: Option<SyncSlotTrigger>,
 }
 
 impl SlotScheduler {
@@ -139,7 +139,7 @@ impl SlotScheduler {
     ///
     /// The Sync height is `(timestamp + L1_block_time − genesis) / L2_block_time`,
     /// the same on every node with the same genesis.
-    pub fn on_l1_head(&mut self, number: u64, timestamp: u64) -> Option<ArmedTrigger> {
+    pub fn on_l1_head(&mut self, number: u64, timestamp: u64) -> Option<SyncSlotTrigger> {
         let trigger_at_ms = timestamp
             .saturating_add(self.timing.proof_window_open().as_secs())
             .saturating_mul(1_000);
@@ -147,7 +147,7 @@ impl SlotScheduler {
         let block_height = sync_slot_timestamp.saturating_sub(self.l2_genesis_timestamp)
             / self.timing.l2_block_time().as_secs();
         self.latest_sync_height = Some(block_height);
-        self.pending.replace(ArmedTrigger {
+        self.pending.replace(SyncSlotTrigger {
             trigger_at_ms,
             block_height,
             timestamp: sync_slot_timestamp,
@@ -158,7 +158,7 @@ impl SlotScheduler {
 
     /// The armed trigger, if any.
     #[must_use]
-    pub const fn armed(&self) -> Option<ArmedTrigger> {
+    pub const fn pending(&self) -> Option<SyncSlotTrigger> {
         self.pending
     }
 
@@ -171,8 +171,8 @@ impl SlotScheduler {
     }
 
     /// Disarm and return the armed trigger. The caller sends its
-    /// [`ArmedTrigger::event`].
-    pub const fn fire(&mut self) -> Option<ArmedTrigger> {
+    /// [`SyncSlotTrigger::event`].
+    pub const fn fire(&mut self) -> Option<SyncSlotTrigger> {
         self.pending.take()
     }
 
@@ -198,12 +198,12 @@ mod tests {
     const GENESIS: u64 = 1_700_000_000;
 
     #[test]
-    fn scheduler_arms_at_proof_window_open() {
+    fn scheduler_triggers_at_proof_window_open() {
         let mut s = SlotScheduler::new(mainnet(), GENESIS);
         let head_ts = GENESIS + 120;
         assert_eq!(s.on_l1_head(42, head_ts), None);
 
-        let armed = s.armed().unwrap();
+        let armed = s.pending().unwrap();
         assert_eq!(armed.trigger_at_ms, (head_ts + 6) * 1_000);
         assert_eq!(armed.timestamp, head_ts + 12);
         assert_eq!(armed.block_height, 66);
@@ -219,14 +219,14 @@ mod tests {
     }
 
     #[test]
-    fn newer_head_supersedes_armed_trigger() {
+    fn newer_head_supersedes_pending_trigger() {
         let mut s = SlotScheduler::new(mainnet(), GENESIS);
         s.on_l1_head(1, GENESIS);
-        let first = s.armed().unwrap();
+        let first = s.pending().unwrap();
 
         let stale = s.on_l1_head(2, GENESIS + 12);
         assert_eq!(stale, Some(first));
-        let second = s.armed().unwrap();
+        let second = s.pending().unwrap();
         assert_eq!(second.l1_head, 2);
         assert_eq!(second.block_height, first.block_height + 6);
         assert_eq!(
@@ -254,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn fired_trigger_disarms() {
+    fn fire_clears_the_pending_trigger() {
         let mut s = SlotScheduler::new(mainnet(), GENESIS);
         s.on_l1_head(7, GENESIS);
         let fired = s.fire().unwrap();
@@ -266,7 +266,7 @@ mod tests {
                 l1_head: 7,
             }
         );
-        assert_eq!(s.armed(), None);
+        assert_eq!(s.pending(), None);
         assert_eq!(s.wait(0), None);
         assert_eq!(s.fire(), None);
         // Live ticks keep the fired anchor's height until the next head.
@@ -279,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_matches_old_formula() {
+    fn scheduler_matches_the_closed_form() {
         let timings = [
             mainnet(),
             RollupTiming::new(5_000, 1_000, 200, 1_700),
@@ -300,7 +300,7 @@ mod tests {
             // Mostly after genesis, sometimes before it (the height saturates at 0).
             let head_ts = (genesis + next(100_000_000)).saturating_sub(next(50));
 
-            // The expressions the scheduler replaced, copied.
+            // The closed-form expressions.
             let trigger_at = head_ts + timing.proof_window_open().as_secs();
             let sync_slot_timestamp = head_ts + timing.l1_block_time().as_secs();
             let block_height =
@@ -308,7 +308,7 @@ mod tests {
 
             let mut s = SlotScheduler::new(timing, genesis);
             s.on_l1_head(i, head_ts);
-            let armed = s.armed().unwrap();
+            let armed = s.pending().unwrap();
             assert_eq!(armed.trigger_at_ms, trigger_at.saturating_mul(1_000));
             assert_eq!(armed.timestamp, sync_slot_timestamp);
             assert_eq!(armed.block_height, block_height);

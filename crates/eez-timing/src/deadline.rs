@@ -37,7 +37,7 @@ mod tests {
     const SYNC_TS: u64 = 1_700_000_012;
 
     #[test]
-    fn lateness_boundary() {
+    fn one_ms_late_misses_the_slot() {
         // proof 4000, slack 1500: the deadline is SYNC_TS·1000 − 1500.
         let t = RollupTiming::new(12_000, 2_000, 4_000, 1_500);
         let last_on_time = SYNC_TS * 1_000 - 1_500 - 4_000;
@@ -46,7 +46,7 @@ mod tests {
     }
 
     #[test]
-    fn cutoff_boundary() {
+    fn cutoff_is_the_last_on_time_start() {
         let t = RollupTiming::new(12_000, 2_000, 4_000, 1_500);
         let cutoff = proof_start_cutoff_ms(t, SYNC_TS);
         assert_eq!(cutoff, SYNC_TS * 1_000 - 1_500 - 4_000);

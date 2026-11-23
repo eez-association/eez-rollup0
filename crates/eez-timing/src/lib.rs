@@ -18,7 +18,7 @@ pub mod timing;
 #[doc(inline)]
 pub use clock::{Clock, SharedClock, SystemClock, TokioClock};
 #[doc(inline)]
-pub use scheduler::{ArmedTrigger, SlotEvent, SlotKind, SlotScheduler};
+pub use scheduler::{SlotEvent, SlotKind, SlotScheduler, SyncSlotTrigger};
 #[doc(inline)]
 pub use timing::{
     MAX_BLOCKS_PER_BATCH, MAX_BLOCKS_PER_CATCHUP, RollupTiming, SlotComposition, TimingError,
