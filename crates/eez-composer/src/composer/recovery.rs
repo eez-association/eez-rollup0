@@ -14,7 +14,7 @@ use reth_storage_api::{BlockReader, StateProviderFactory, TransactionsProvider};
 use tokio::sync::broadcast;
 use tracing::{Level, event};
 
-use super::compose::{
+use super::nonces::{
     inbound_source_nonces_for_drain, outbound_source_nonces_for_drain, partition_stale,
 };
 use super::{Composer, Inner};

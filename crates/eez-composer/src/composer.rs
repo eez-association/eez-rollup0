@@ -44,6 +44,7 @@ mod batcher;
 mod blob;
 mod budget;
 mod compose;
+mod nonces;
 mod post_batch;
 mod recovery;
 use batcher::{EmissionLimits, SlotTarget, bundle_targets_for_slot, ensure_submission_identity};
