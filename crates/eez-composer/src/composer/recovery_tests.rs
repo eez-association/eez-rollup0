@@ -5,6 +5,7 @@ use super::*;
 use alloy_consensus::Header;
 use alloy_provider::{ProviderBuilder, RootProvider, mock::Asserter};
 use eez_l1::{BatchRecord, L1CanonicalHead, L1ReaderConfig, SubmitterConfig, scan::PostId};
+use eez_prover::ProvingContext;
 use reth_chainspec::ChainSpecBuilder;
 use reth_engine_primitives::{BeaconEngineMessage, ConsensusEngineHandle, OnForkChoiceUpdated};
 use reth_payload_builder::PayloadBuilderHandle;
