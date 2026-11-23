@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Runs cargo on the stateless proof signer (provers/stateless-ecdsa) with its
-# eez-rollup0 crates taken from this checkout instead of the commit provers
-# pins, so a change to a shared crate is built and tested with the signer here.
+# Runs cargo on one ECDSA prover workspace with all its eez-rollup0 crates
+# taken from this checkout instead of the commit provers pins. Stateful uses
+# this checkout's follower and EVM; stateless keeps its own execution stack.
 #
 #   scripts/provers-cargo.sh build -p eez-prover-stateless --bin eez-proof-signer
-#   scripts/provers-cargo.sh nextest run --workspace
+#   scripts/provers-cargo.sh --stateful nextest run --workspace
 #
 # The patches rewrite the signer's Cargo.lock, so `--locked` cannot be used;
 # the lockfile is restored on exit.
@@ -12,6 +12,10 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 signer="$root/provers/stateless-ecdsa"
+if [[ ${1:-} == --stateful ]]; then
+    signer="$root/provers/stateful-ecdsa"
+    shift
+fi
 url="https://github.com/eez-association/eez-rollup0"
 
 if [[ ! -f "$signer/Cargo.toml" ]]; then
@@ -19,7 +23,7 @@ if [[ ! -f "$signer/Cargo.toml" ]]; then
     exit 1
 fi
 if [[ $# -lt 1 ]]; then
-    echo "usage: $0 <cargo subcommand> [args...]" >&2
+    echo "usage: $0 [--stateful] <cargo subcommand> [args...]" >&2
     exit 2
 fi
 
@@ -30,7 +34,8 @@ mkdir -p "$root/target"
 exec 9>"$root/target/.provers-cargo.lock"
 perl -MFcntl=:flock -e 'open(my $lock, ">&=", 9) or die "lock: $!\n"; flock($lock, LOCK_EX) or die "lock: $!\n"'
 
-# Every eez-rollup0 package in the signer's lockfile.
+# Every eez-rollup0 package in the selected prover's lockfile, including the
+# stateful follower/EVM closure. Standalone builds retain their Git pins.
 crates=()
 while IFS= read -r crate; do
     crates+=("$crate")

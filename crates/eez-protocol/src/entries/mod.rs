@@ -588,8 +588,7 @@ pub fn encode_execute_incoming(entry: L2ExecutionEntrySol) -> Vec<u8> {
 }
 
 /// Selector for `executeIncomingCrossChainCall`.
-pub const EXECUTE_INCOMING_SELECTOR: [u8; 4] =
-    crate::abi::executeIncomingCrossChainCallCall::SELECTOR;
+pub use eez_primitives::EXECUTE_INCOMING_SELECTOR;
 
 /// Decode the supported incoming call's return data.
 #[must_use]

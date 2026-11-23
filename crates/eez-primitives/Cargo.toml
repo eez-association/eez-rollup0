@@ -12,6 +12,7 @@ serde = []
 revm = ["dep:revm", "dep:alloy-evm"]
 
 [dependencies]
+alloy-genesis.workspace = true
 alloy-consensus = { workspace = true, features = ["serde", "k256"] }
 alloy-eips.workspace = true
 alloy-primitives = { workspace = true, features = ["serde"] }

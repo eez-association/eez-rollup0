@@ -15,6 +15,7 @@ rm -f "$RESULT_DIR/result.json"
 
 ARGS_TEMPLATE="${KURTOSIS_ARGS_FILE:-$HERE/ci-args.yaml}"
 export EEZ_NODE_IMAGE="${EEZ_NODE_IMAGE:-eez-node:ci-${GITHUB_SHA:-local}}"
+export EEZ_STATEFUL_PROVER_IMAGE="${EEZ_STATEFUL_PROVER_IMAGE:-eez-prover-stateful:ci-${GITHUB_SHA:-local}}"
 export EEZ_PROOF_SIGNER_IMAGE="${EEZ_PROOF_SIGNER_IMAGE:-eez-proof-signer:ci-${GITHUB_SHA:-local}}"
 export EEZ_DEPLOY_IMAGE="${EEZ_DEPLOY_IMAGE:-eez-deploy:ci-${GITHUB_SHA:-local}}"
 ROOT_COMMIT=unknown
@@ -146,6 +147,7 @@ ROOT_COMMIT="$(git -C "$REPO" rev-parse HEAD)"
 PROTOCOL_COMMIT="$(git -C "$REPO/eez-core-protocol" rev-parse HEAD)"
 sed \
     -e "s|^[[:space:]]*eez_node_image:.*|  eez_node_image: $EEZ_NODE_IMAGE|" \
+    -e "s|^[[:space:]]*stateful_prover_image:.*|  stateful_prover_image: $EEZ_STATEFUL_PROVER_IMAGE|" \
     -e "s|^[[:space:]]*proof_signer_image:.*|  proof_signer_image: $EEZ_PROOF_SIGNER_IMAGE|" \
     -e "s|^[[:space:]]*deploy_image:.*|  deploy_image: $EEZ_DEPLOY_IMAGE|" \
     -e "s|^[[:space:]]*enable_explorers:.*|  enable_explorers: false|" \

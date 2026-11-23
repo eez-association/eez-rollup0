@@ -28,6 +28,7 @@ pub(super) const RESERVED_SYSTEM_TRANSACTION_TYPE: u8 = eez_primitives::SYSTEM_T
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SettlingBlockObservations {
     system_sender_flags: Vec<bool>,
+    effect_candidate_positions: Vec<usize>,
     /// Every system-to-EEZL2 transaction carrying the inbound selector, in
     /// block order. Invalid observations remain candidates through positional
     /// binding and fail during inbound authorization rather than disappearing.
@@ -54,10 +55,10 @@ impl SettlingBlockObservations {
         &self.outbound_event_candidates
     }
 
-    /// Derive candidate effect boundaries from the ordered system-sender flags.
+    /// Return native-group boundaries derived from the decoded transactions.
     /// Semantic gates validate the corresponding inbound or outbound effects.
     pub(super) fn effect_candidate_positions(&self) -> Vec<usize> {
-        framed_effect_candidate_positions(&self.system_sender_flags)
+        self.effect_candidate_positions.clone()
     }
 
     /// Construct explicit observations for focused settlement tests.
@@ -67,8 +68,17 @@ impl SettlingBlockObservations {
         inbound_candidates: Vec<InboundCandidate>,
         outbound_event_candidates: Vec<OutboundEventObservation>,
     ) -> Self {
+        // Canned observations explicitly model legacy test layouts; production
+        // boundaries always come from decoded envelopes below.
+        let effect_candidate_positions = (0..system_sender_flags.len())
+            .filter(|&index| {
+                !system_sender_flags[index]
+                    || system_sender_flags.get(index + 1).copied().unwrap_or(true)
+            })
+            .collect();
         Self {
             system_sender_flags,
+            effect_candidate_positions,
             inbound_candidates,
             outbound_event_candidates,
         }
@@ -91,6 +101,8 @@ impl SettlingBlockObservations {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub(crate) enum BlockInspectionError {
+    #[error("invalid native execution group: {0}")]
+    InvalidExecutionGroup(&'static str),
     #[cfg(test)]
     #[error("block {block_number} RLP does not decode exactly: {reason}")]
     InvalidRlp { block_number: u64, reason: String },
@@ -249,6 +261,8 @@ fn inspect_decoded_settling_block(
     // The checked-block boundary guarantees the retained flags and receipts
     // cover every settling transaction just inspected.
     Ok(SettlingBlockObservations {
+        effect_candidate_positions: framed_effect_candidate_positions(transactions)
+            .map_err(BlockInspectionError::InvalidExecutionGroup)?,
         system_sender_flags: settlement_evidence.system_sender_flags().to_vec(),
         inbound_candidates,
         outbound_event_candidates: settlement_evidence.observed_outbound_events().to_vec(),

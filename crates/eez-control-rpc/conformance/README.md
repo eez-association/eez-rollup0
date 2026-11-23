@@ -17,7 +17,7 @@ more cases requiring explicit server limits. Together they contain 339 requests,
 | --- | --- |
 | Begin | Correct anchor; unsupported rollup; missing/31/33-byte hashes and roots; number overflow; invalid initial binding; repeated Begin. |
 | Block | Execution; duplicate at/before tip; missing data/witness; hash widths; zero/max/gapped numbers; contradictory parent/hash/RLP; invalid witness then valid retry; cache-parent binding. |
-| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; invalid blob carrier/unsupported context/profile inputs; valid retry. |
+| Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; invalid blob carrier/profile inputs; malformed Rollup0 posting-context fields rejected before range selection; valid retry. |
 | Resume | Progress after half-close and Proof; live takeover; missing/malformed/retired session; nonzero initial epoch; stale transport cannot use the new epoch. |
 | Rewind | Tip, intermediate block and anchor; malformed/unknown/pruned ancestors; stale epoch; removed suffix cannot finalize; promoted anchor survives Resume. |
 | Cancel | Acknowledgement and EOF; retired session cannot resume; cross-stream cancellation denied; another Composer can finish. |
@@ -46,7 +46,10 @@ prover-owned L1 parent authentication described for blob-based profiles in the
 Use the six-empty-block
 [`captured-devnet-window-84`](https://github.com/eez-association/provers/tree/main/stateless-ecdsa/crates/eez-prover-stateless/tests/fixtures/captured-devnet-window-84)
 fixture. Configure a streaming server with its `chain-config.json`, rollup ID,
-proof system, vkey, attester and L2 system address from `oracle.json`. The signing
+proof system, vkey and attester from `oracle.json`, and the current reserved L2
+sender `0xfffffffffffffffffffffffffffffffffffffffe`. The historical oracle retains
+the original deployment address; its six empty blocks and proof bytes are
+unchanged. The signing
 key is the **public Anvil test key**
 `59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d`.
 Never use it outside an isolated test deployment.

@@ -2160,3 +2160,116 @@ async fn failed_rich_bundle_keeps_live_l2_txs() {
     );
     w.node.assert_no_divergence_failure_logs();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_capacity_in_empty_sync_block_is_evicted_and_nonce_released() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let l2 = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+    let artifact: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(eez_testkit::repo_root().join("contracts/out/GasBurner.sol/GasBurner.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let creation: Bytes = artifact["bytecode"]["object"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let deployment = sign_and_send(
+        &l2_rpc,
+        TARGET_DEPLOYER,
+        w.l2_chain_id,
+        onchain_nonce(&l2_rpc, TARGET_DEPLOYER).await.unwrap(),
+        None,
+        U256::ZERO,
+        creation.to_vec(),
+        2_000_000,
+    )
+    .await
+    .unwrap();
+    let receipt = wait_for(SETTLE_TIMEOUT, || async {
+        Ok(l2.get_transaction_receipt(deployment).await?)
+    })
+    .await
+    .unwrap();
+    assert!(receipt.status());
+    let target = receipt.contract_address.unwrap();
+    let proxy = eez_testkit::create_cross_chain_proxy(
+        &l1_rpc,
+        w.cfg.deployer_key,
+        w.cfg.eez_address,
+        target,
+        w.cfg.rollup_id,
+    )
+    .await
+    .unwrap();
+    let wrapper = eez_testkit::deploy_setter_wrapper(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, proxy)
+        .await
+        .unwrap();
+    let nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+    let cursor = w.node.signal_cursor().unwrap();
+    // Each delivery fits the 2^24 cap; two cannot fit the 30M Sync block.
+    // This is the only held tx, so Capacity occurs with no accepted groups.
+    let rejected = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(wrapper),
+        U256::ZERO,
+        ISetterWrapper::setSameValueTwiceCall {
+            v: U256::from(15_200_000),
+        }
+        .abi_encode(),
+        1_200_000,
+    )
+    .await
+    .unwrap();
+    wait_for_poison_eviction(&w, cursor, rejected, "Inbound", "empty-block capacity").await;
+    let hash = rejected.to_string();
+    let logs = w.node.log_lines_matching(&[hash.as_str()], usize::MAX);
+    assert!(
+        logs.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
+                record["fields"]["error"].as_str()
+                    == Some("executor: insufficient remaining L2 block gas")
+            })
+        }),
+        "must evict for Capacity, not an unrelated multicall or execution error: {logs}"
+    );
+    assert_eq!(onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap(), nonce);
+    assert_eq!(
+        l2.get_storage_at(target, U256::ZERO).await.unwrap(),
+        U256::ZERO
+    );
+
+    let replacement = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(wrapper),
+        U256::ZERO,
+        ISetterWrapper::setViaProxyCall {
+            v: U256::from(15_200_000),
+        }
+        .abi_encode(),
+        1_200_000,
+    )
+    .await
+    .expect("eviction must release the held nonce reservation");
+    assert_all_transactions_succeeded(&w, &l1_rpc, &[replacement], "capacity replacement").await;
+    wait_for(SETTLE_TIMEOUT, || async {
+        Ok((l2.get_storage_at(target, U256::ZERO).await? == U256::from(1)).then_some(()))
+    })
+    .await
+    .expect("one full-cap delivery must settle after rejecting the pair");
+    assert_eq!(receipt_ok(&l1_rpc, rejected).await.unwrap(), None);
+    assert_eq!(
+        completed_proxy_calls(&l1_rpc, wrapper).await.unwrap(),
+        U256::from(1)
+    );
+    w.node.assert_no_process_death();
+}
