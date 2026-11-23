@@ -155,6 +155,9 @@ where
     refuse_txs: Option<RefuseTxs>,
     /// An unsafe `prev_randao` check an L1 reorg owes; retried each L1 head.
     reseed_pending: AtomicBool,
+    /// Whether a catch-up has checked the unsafe `prev_randao`s since boot. A
+    /// reorg while the node was down leaves no event to request the check.
+    boot_reseed_done: AtomicBool,
     /// L2 cursor whose retreat still needs to finish.
     retreat_pending: std::sync::Mutex<Option<u64>>,
 }
@@ -234,6 +237,7 @@ where
                 boot,
                 refuse_txs,
                 reseed_pending: AtomicBool::new(false),
+                boot_reseed_done: AtomicBool::new(false),
                 retreat_pending: std::sync::Mutex::new(None),
             }),
         }
@@ -467,7 +471,7 @@ where
             self.retreat_l2_to_cursor(cursor).await?;
             self.inner.committer.finish_l1_reorg();
         }
-        match anchor {
+        let end = match anchor {
             Some(anchor_l1_block) => self.sync_batches_inner(anchor_l1_block, cursor).await,
             // Peers mode seeds before catch-up and no reorg drops the floor, so
             // an empty index is a boot bug, never a cue to scan from deploy.
@@ -501,7 +505,13 @@ where
                 }
                 None => self.sync_batches_inner(self.inner.deploy_block, 0).await,
             },
+        }?;
+        // Runs once the L1-derived cursor is known, so only unsafe blocks are checked.
+        if !self.inner.boot_reseed_done.load(Ordering::Acquire) {
+            self.replace_reseeded_unsafe().await?;
+            self.inner.boot_reseed_done.store(true, Ordering::Release);
         }
+        Ok(end)
     }
 
     /// Phase 1 of [`Self::catch_up`]: walk the index tail backward,
@@ -1620,7 +1630,12 @@ where
     async fn replace_reseeded_unsafe(&self) -> DeriverResult<()> {
         // Stays set if a lookup fails, so the next L1 head retries.
         self.inner.reseed_pending.store(true, Ordering::Release);
-        let safe = self.inner.safe_l2_block.load(Ordering::Acquire);
+        // Boot may not have moved the safe mirror up to the cursor yet.
+        let safe = self
+            .inner
+            .safe_l2_block
+            .load(Ordering::Acquire)
+            .max(self.inner.l1_head.cursor());
         let head = self.inner.committer.last_header().number();
         for l2_block in safe + 1..=head {
             let header = self.l2_sealed_header_at(l2_block)?;

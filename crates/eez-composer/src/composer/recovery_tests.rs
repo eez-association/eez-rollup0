@@ -461,3 +461,25 @@ async fn own_partial_batch_still_charges_the_culprit() {
             .unwrap();
     }
 }
+
+/// An unavailable L1 seed skips the Sync slot instead of handing it to the
+/// mempool-fed fallback, which could fill it with transactions.
+#[tokio::test]
+async fn sync_slot_skips_when_l1_prev_randao_is_unavailable() {
+    // The submitter's L1 RPC is unreachable, so the seed lookup fails.
+    let fixture = Fixture::new(ProviderBuilder::default().connect_mocked_client(Asserter::new()));
+    for mode in [
+        SyncSlotMode::Steady,
+        SyncSlotMode::Catchup,
+        SyncSlotMode::Empty,
+    ] {
+        let outcome = fixture
+            .composer
+            .compose_sync_slot(1, ParentContext { header: header(10) }, 1_000, None, mode)
+            .await;
+        assert!(
+            matches!(outcome, SyncSlotOutcome::Skip),
+            "{mode:?}: {outcome:?}"
+        );
+    }
+}

@@ -68,6 +68,11 @@ impl Fixture {
             Ok(block)
         })
         .unwrap();
+        // Catch-up's scan: the head is block 10 and no batch was posted.
+        rpc.register_method("eth_blockNumber", |_, _, _| "0xa")
+            .unwrap();
+        rpc.register_method("eth_getLogs", |_, _, _| Vec::<serde_json::Value>::new())
+            .unwrap();
         let server = jsonrpsee::server::ServerBuilder::default()
             .build("127.0.0.1:0")
             .await
@@ -292,5 +297,31 @@ async fn lookup_rejects_a_seed_read_across_l1_forks() {
         reader.prev_randao_for(134, 12).await,
         Err(eez_l1::L1Error::SourceIncomplete { .. })
     ));
+    f.stop();
+}
+
+/// A restart after an L1 reorg leaves no reorg event and, with an unchanged
+/// settlement anchor and no new posts, no replay. Catch-up still rechecks the
+/// retained unsafe block's seed and replaces it.
+#[tokio::test]
+async fn restart_rechecks_a_retained_unsafe_block_with_no_new_posts() {
+    let f = Fixture::new(false, OLD_SEED, true).await;
+    f.l1_head.append(BatchRecord {
+        post: PostId {
+            l1_block: 10,
+            l1_block_hash: B256::repeat_byte(0xbb),
+            log_index: 0,
+        },
+        tx_hash: B256::repeat_byte(0xdd),
+        last_l2_block: 0,
+    });
+
+    f.deriver.catch_up().await.unwrap();
+    assert_eq!(f.l1_head.cursor(), 0);
+    let replacement = f.committer.last_header();
+    assert_eq!(replacement.number, f.head.number);
+    assert_eq!(replacement.mix_hash, SEED);
+    assert_ne!(replacement.hash(), f.head.hash());
+    assert!(!f.deriver.inner.reseed_pending.load(Ordering::Acquire));
     f.stop();
 }

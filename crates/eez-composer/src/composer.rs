@@ -28,7 +28,7 @@ use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use eez_driver::{
     BUILDER_GAS_LIMIT, BlockCommitterHandle, MAX_BLOCKS_PER_BATCH, ParentContext, RollupTiming,
-    SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
+    SyncSlotBlock, SyncSlotComposer, SyncSlotMode, SyncSlotOutcome,
     witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_engine::EezEngineTypes;
@@ -1599,8 +1599,9 @@ where
 {
     /// Drain `rollup_id`'s cross-chain `HeldPool`, compose its transactions,
     /// and hand the resulting Sync block back for the Sequencer to commit.
-    /// Returns `None` (→ vanilla pool-driven Sync commit) when cross-chain
-    /// composition is unavailable or cannot produce a block this slot.
+    /// Returns `Fallback` (→ vanilla pool-driven Sync commit) when cross-chain
+    /// composition is unavailable or cannot produce a block this slot, and
+    /// `Skip` when the slot owes an empty block it cannot build.
     ///
     /// Each eligible transaction runs through cross-chain simulation. Inbound
     /// survivors execute through the L1 bundle; outbound survivors execute in
@@ -1612,7 +1613,7 @@ where
         timestamp: u64,
         target_l1_block: Option<u64>,
         mode: SyncSlotMode,
-    ) -> Option<SyncSlotBlock> {
+    ) -> SyncSlotOutcome {
         // Steady bundles pin both block and timestamp. Ordinary catch-up
         // markers remain next-available so an L1 reorg cannot strand them,
         // while cap-triggered historical chunks name the known next block
@@ -1628,7 +1629,7 @@ where
             mode = ?mode,
             "compose_sync_slot invoked",
         );
-        let rollup = self.inner.rollups.get(&rollup_id).or_else(|| {
+        let Some(rollup) = self.inner.rollups.get(&rollup_id) else {
             event!(
                 name: "eez.composer.sync_slot.unknown_rollup",
                 Level::ERROR,
@@ -1636,8 +1637,8 @@ where
                 known_rollups = ?self.inner.rollups.keys().collect::<Vec<_>>(),
                 "compose_sync_slot called for unknown rollup_id",
             );
-            None
-        })?;
+            return SyncSlotOutcome::Fallback;
+        };
         let cc = &self.inner.cross_chain;
         // Use the Sequencer-supplied parent header directly (it reflects
         // the just-committed block via `last_header`'s mirror); a
@@ -1664,7 +1665,7 @@ where
         // covers it. Recovery runs before the seed lookup so an L1 outage
         // cannot hold it back.
         if matches!(recovery, Some(RecoveryOutcome::HeadMoved)) {
-            return None;
+            return SyncSlotOutcome::Fallback;
         }
         let prev_randao = match self.prev_randao_at(timestamp).await {
             Ok(prev_randao) => prev_randao,
@@ -1675,15 +1676,15 @@ where
                     rollup_id,
                     timestamp,
                     error = %error,
-                    "L1 prevRandao unavailable; Sequencer's commit_one fallback takes over",
+                    "L1 prevRandao unavailable; skipping the Sync slot — next trigger retries",
                 );
-                return None;
+                return SyncSlotOutcome::Skip;
             }
         };
 
         if matches!(recovery, Some(RecoveryOutcome::HeadUnchanged)) {
             // An UNCHANGED head (reinsert / stale-verdict) still owes the slot a
-            // block, and returning None here would let the mempool-fed
+            // block, and returning Fallback here would let the mempool-fed
             // commit_one fallback mint a tx-bearing grid block.
             return self.build_empty_slot_block(rollup, &parent_header, timestamp, prev_randao);
         }
@@ -1764,19 +1765,23 @@ where
                 prev_randao,
                 bundle_target, // catch-up → NextBlock (unpinned)
             };
-            return self
+            return match self
                 .dispatch_minimal_postbatch(&cc.exec_ctx, rollup_id, rollup, slot)
                 .await
-                .unwrap_or_else(|err| {
+            {
+                Ok(Some(built)) => SyncSlotOutcome::Built(Box::new(built)),
+                Ok(None) => SyncSlotOutcome::Skip,
+                Err(err) => {
                     event!(
                         name: "eez.composer.catchup.minimal_failed",
                         Level::ERROR,
                         rollup_id,
                         error = %err,
-                        "catchup minimal postBatch failed; Sequencer commits empty Sync",
+                        "catchup minimal postBatch failed; skipping the Sync slot — next trigger retries",
                     );
-                    None
-                });
+                    SyncSlotOutcome::Skip
+                }
+            };
         }
 
         self.compose_steady_slot(
@@ -1789,6 +1794,9 @@ where
             cursor,
         )
         .await
+        .map_or(SyncSlotOutcome::Fallback, |built| {
+            SyncSlotOutcome::Built(Box::new(built))
+        })
     }
 
     /// Run recovery on every tick, not just Sync slots, so a mid-slot verdict
@@ -3171,7 +3179,7 @@ where
                     Level::ERROR,
                     rollup_id,
                     error = %err,
-                    "minimal Sync block build failed; Sequencer's commit_one fallback takes over",
+                    "minimal Sync block build failed; no Sync block composed",
                 );
                 return Ok(None);
             }
@@ -3293,7 +3301,7 @@ where
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         timestamp: u64,
         prev_randao: B256,
-    ) -> Option<SyncSlotBlock> {
+    ) -> SyncSlotOutcome {
         match build_sync_block(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
@@ -3303,19 +3311,19 @@ where
             prev_randao,
             &[],
         ) {
-            Ok(built) => Some(SyncSlotBlock {
+            Ok(built) => SyncSlotOutcome::Built(Box::new(SyncSlotBlock {
                 bundle_commit: None,
                 payload: built.payload,
                 header: built.header,
-            }),
+            })),
             Err(err) => {
                 event!(
                     name: "eez.composer.sync_slot.build_failed",
                     Level::ERROR,
                     error = %err,
-                    "empty Sync block build failed; Sequencer's commit_one fallback takes over",
+                    "empty Sync block build failed; skipping the Sync slot — next trigger retries",
                 );
-                None
+                SyncSlotOutcome::Skip
             }
         }
     }

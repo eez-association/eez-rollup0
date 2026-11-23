@@ -40,7 +40,9 @@ use tokio::sync::mpsc;
 
 use crate::block_committer::BlockCommitterHandle;
 use crate::error::{DriverError, DriverResult};
-use crate::slot::{SlotEvent, SlotKind, SyncSlotComposerHandle, SyncSlotMode};
+use crate::slot::{
+    SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposerHandle, SyncSlotMode, SyncSlotOutcome,
+};
 use crate::timing::{RollupTiming, SlotComposition};
 
 /// How often the sequencer re-publishes the current forkchoice state.
@@ -67,6 +69,24 @@ fn log_stale_parent(phase: &str) {
         phase,
         "deriver advanced the chain under this commit; bailing — next trigger rebuilds from fresh head",
     );
+}
+
+/// The composed block, `None` for the pool-driven fallback, or `Err` when the
+/// composer skipped the slot and nothing may be committed.
+fn sync_slot_block(outcome: SyncSlotOutcome, phase: &str) -> Result<Option<SyncSlotBlock>, ()> {
+    match outcome {
+        SyncSlotOutcome::Built(built) => Ok(Some(*built)),
+        SyncSlotOutcome::Fallback => Ok(None),
+        SyncSlotOutcome::Skip => {
+            event!(
+                name: "eez.sequencer.sync_slot.skipped",
+                Level::WARN,
+                phase,
+                "composer skipped the Sync slot; committing nothing — next trigger retries the height",
+            );
+            Err(())
+        }
+    }
 }
 
 /// Builds [`EthPayloadAttributes`] for the next block.
@@ -449,6 +469,9 @@ where
                         SyncSlotMode::Catchup,
                     )
                     .await;
+                let Ok(prebuilt) = sync_slot_block(prebuilt, "catchup.sync") else {
+                    return Ok(());
+                };
                 if let Some(built) = prebuilt {
                     if let Err(err) = self
                         .commit_one_prebuilt(SlotKind::Sync, built, l1_revision)
@@ -543,7 +566,7 @@ where
                     );
                     // Empty mode keeps this grid height batch-boundary-eligible
                     // (a tx-bearing block is not). If the empty build fails,
-                    // control falls through to the mempool-fed commit below.
+                    // the composer skips the slot.
                     let parent = crate::slot::ParentContext {
                         header: last_header.clone(),
                     };
@@ -571,6 +594,9 @@ where
                             SyncSlotMode::Steady,
                         )
                         .await
+                };
+                let Ok(prebuilt) = sync_slot_block(prebuilt, "slot.sync") else {
+                    return Ok(());
                 };
                 if let Some(built) = prebuilt {
                     match self
@@ -714,5 +740,21 @@ where
             "produced block {block_number} hash={block_hash} ts={timestamp} kind={kind}",
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a skip stops the Sync commit; a fallback still reaches the
+    /// pool-driven `commit_one`.
+    #[test]
+    fn skipped_sync_slot_commits_nothing() {
+        assert!(sync_slot_block(SyncSlotOutcome::Skip, "test").is_err());
+        assert!(matches!(
+            sync_slot_block(SyncSlotOutcome::Fallback, "test"),
+            Ok(None)
+        ));
     }
 }
