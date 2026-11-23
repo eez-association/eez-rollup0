@@ -700,9 +700,8 @@ mod tests {
     use reth_ethereum_engine_primitives::EthEngineTypes;
 
     use super::*;
-    use crate::slot::{CommitRelease, ParentContext, SyncSlotBlock, SyncSlotComposer};
+    use crate::slot::{BundleRelease, ParentContext, SyncSlotBlock, SyncSlotComposer};
     use crate::test_engine::{EngineCall, MockEngine, MockStatus};
-    use reth_ethereum_engine_primitives::EthEngineTypes as Engine;
     use tokio::sync::oneshot;
 
     /// 12 s L1, 2 s L2, proof 4000, slack 1500: live 3, future 2, K 6.
@@ -731,14 +730,14 @@ mod tests {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Prebuild {
         /// No block: the Sequencer commits the Sync block through the engine.
-        None,
+        NoBlock,
         /// A prebuilt child of the parent, with a bundle release.
         Child,
         /// A prebuilt child of a sibling of the parent.
         StaleChild,
     }
 
-    type Release = tokio::task::JoinHandle<Result<B256, oneshot::error::RecvError>>;
+    type ReleaseTask = tokio::task::JoinHandle<Result<B256, oneshot::error::RecvError>>;
 
     /// Records every compose call and returns the [`Prebuild`] block.
     #[derive(Debug)]
@@ -747,7 +746,7 @@ mod tests {
         calls: Mutex<Vec<ComposeCall>>,
         prebuild: Mutex<Prebuild>,
         /// Resolves when the prebuilt block's bundle is released or withheld.
-        release: Mutex<Option<Release>>,
+        release: Mutex<Option<ReleaseTask>>,
     }
 
     impl RecordingComposer {
@@ -763,7 +762,7 @@ mod tests {
             let block = reth_primitives_traits::SealedBlock::<
                 reth_ethereum_primitives::Block,
             >::from_sealed_parts(header.clone(), Default::default());
-            let (release, released) = CommitRelease::new();
+            let (release, released) = BundleRelease::new();
             let engine = self.engine.clone();
             *self.release.lock().unwrap() = Some(tokio::spawn(async move {
                 let hash = released.await?;
@@ -771,7 +770,7 @@ mod tests {
                 Ok(hash)
             }));
             SyncSlotBlock {
-                payload: <Engine as PayloadTypes>::block_to_payload(block, None),
+                payload: <EthEngineTypes as PayloadTypes>::block_to_payload(block, None),
                 header,
                 release: Some(release),
             }
@@ -806,7 +805,7 @@ mod tests {
                 engine_calls: self.engine.calls().len(),
             });
             match *self.prebuild.lock().unwrap() {
-                Prebuild::None => None,
+                Prebuild::NoBlock => None,
                 Prebuild::Child => Some(self.prebuilt(&parent.header, timestamp)),
                 Prebuild::StaleChild => {
                     let mut sibling = parent.header.clone_header();
@@ -834,7 +833,7 @@ mod tests {
             let composer = Arc::new(RecordingComposer {
                 engine: engine.clone(),
                 calls: Mutex::default(),
-                prebuild: Mutex::new(Prebuild::None),
+                prebuild: Mutex::new(Prebuild::NoBlock),
                 release: Mutex::default(),
             });
             let chain_spec = Arc::new(ChainSpecBuilder::mainnet().build());
@@ -1021,7 +1020,7 @@ mod tests {
                     head: hash,
                     with_attrs: false
                 },
-                EngineCall::Released { hash },
+                EngineCall::BundleReleased { hash },
             ]
         );
     }

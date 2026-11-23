@@ -8,7 +8,7 @@ L2, and L1 alone decides what happened to it.
 1. The composer builds the rich Sync block, signs the postBatch, records the batch in the
    optimistic ledger and spawns the bundle observer. The observer waits.
 2. The Sequencer commits the block (`commit_one_prebuilt`). On success it releases the bundle
-   (`SyncSlotBlock.release`, a `CommitRelease`).
+   (`SyncSlotBlock.release`, a `BundleRelease`).
 3. The observer sends the bundle and watches L1.
 
 If the commit fails, or another block commits at that height, the release is dropped and the
@@ -19,15 +19,14 @@ Historical chunks have no block to wait for and send at once.
 
 ## Outcome
 
-`Submitter::send_bundle` returns a `SendReport { ack, outcome }`. It returns an error only when
+`Submitter::send_bundle` returns a `SentBundle { reply, outcome }`. It returns an error only when
 nothing was sent.
 
-- `ack` is the relay's answer: `Accepted`, `Rejected` or `Unreachable` (no answer, so the relay may
-  have taken the bundle).
+- `reply` is the relay's answer: `Accepted`, `Rejected` or `Unanswered`.
 - `outcome` is what L1 shows: the post landed (`Included`), landed but its settlement could not be
   read (`IncludedUnread`), or the target passed without it (`Dropped`).
 
-`bundle_verdict` maps the report to a verdict from `outcome` alone:
+`bundle_verdict` maps the sent bundle to a verdict from `outcome` alone:
 
 | L1 shows | Verdict |
 |---|---|
@@ -38,17 +37,17 @@ nothing was sent.
 | target passed without the post | failed |
 
 The relay's answer only affects the charge. A failed batch charges its txs an attempt unless the
-relay was `Unreachable`, the pinned slot was skipped, or the target block's timestamp differs from
-the pin.
+relay reply was `Unanswered`, the pinned slot was skipped, or the target block's timestamp
+differs from the pin.
 
 ## Cost
 
 The send starts later by the time the commit takes. Log event `eez.composer.bundle.released`
-carries `commit_to_send_ms`.
+carries `commit_wait_ms`.
 
 ## Tests
 
 - `relay_reply_lost_bundle_still_settles` (`eez-node-e2e`, `cross_chain`): the builder stub takes
   the bundle and drops the reply (`ack-lost`); the batch still settles.
-- `bundle_verdict_ignores_the_relay_answer` and `withheld_bundle_is_never_sent` (`eez-composer`).
+- `relay_reply_only_waives_the_charge` and `withheld_bundle_is_never_sent` (`eez-composer`).
 - `stale_parent_withholds_the_bundle` (`eez-driver`).

@@ -5,7 +5,7 @@
 //! `eth_sendBundle` pins inclusion to one L1 block. Only L1 decides the
 //! outcome: the post is in a block, or the chain passed its target
 //! without it ([`SendOutcome::Dropped`]). The relay's answer is reported
-//! as a [`RelayAck`] and never decides it, because a lost reply says
+//! as a [`RelayReply`] and never decides it, because a lost reply says
 //! nothing about whether the relay took the bundle.
 
 use std::sync::Arc;
@@ -55,13 +55,13 @@ pub enum BundleTarget {
 
 /// What the relay answered to a bundle. It decides nothing about the outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RelayAck {
+pub enum RelayReply {
     /// The relay accepted the bundle.
     Accepted,
     /// The relay answered with an error.
     Rejected(String),
     /// No answer arrived, so the relay may have taken the bundle.
-    Unreachable(String),
+    Unanswered(String),
 }
 
 /// Why L1 shows the bundle did not land.
@@ -87,8 +87,8 @@ impl DropReason {
 
 /// One sent bundle: what the relay answered and what L1 did.
 #[derive(Debug, Clone)]
-pub struct SendReport {
-    pub ack: RelayAck,
+pub struct SentBundle {
+    pub reply: RelayReply,
     pub outcome: SendOutcome,
 }
 
@@ -177,7 +177,7 @@ impl Submitter {
                 config,
                 reader,
                 // Bounded timeout so a relay that never answers cannot stall
-                // the send: the bundle is then `Unreachable` and L1 decides,
+                // the send: the bundle is then `Unanswered` and L1 decides,
                 // by the target block at the latest. `Client::new()` has NO
                 // timeout.
                 http: reqwest::Client::builder()
@@ -223,7 +223,7 @@ impl Submitter {
         &self,
         raw_txs: &[alloy_primitives::Bytes],
         target: BundleTarget,
-    ) -> L1Result<SendReport> {
+    ) -> L1Result<SentBundle> {
         fail::fail_point!("submitter::send::start", |_| Err(L1Error::Submission(
             "injected failpoint: submitter::send::start".into()
         )));
@@ -345,7 +345,7 @@ impl Inner {
         post_batch_hash: TxHash,
         target_block: u64,
         pin_timestamp: Option<u64>,
-    ) -> L1Result<SendReport> {
+    ) -> L1Result<SentBundle> {
         let hexes: Vec<String> = raw_txs
             .iter()
             .map(|t| hex::encode_prefixed(t.as_ref()))
@@ -360,14 +360,14 @@ impl Inner {
         )
         .await
         {
-            PostReply::Ack(ack) => {
-                if ack != RelayAck::Accepted {
+            PostReply::Relay(reply) => {
+                if reply != RelayReply::Accepted {
                     event!(
                         name: "eez.submitter.bundle.not_accepted",
                         Level::WARN,
                         tx_hash = %post_batch_hash,
                         target_block,
-                        ack = ?ack,
+                        relay_reply = ?reply,
                         "relay did not accept the bundle; L1 decides its outcome",
                     );
                 }
@@ -376,7 +376,7 @@ impl Inner {
                 let outcome = self
                     .observe(post_batch_hash, target_block, pin_timestamp)
                     .await;
-                Ok(SendReport { ack, outcome })
+                Ok(SentBundle { reply, outcome })
             }
             PostReply::Unsupported
                 if raw_txs.first().is_some_and(|raw| raw.first() == Some(&3)) =>
@@ -409,7 +409,7 @@ impl Inner {
                     );
                 }
                 let target_provider = self.build_target_provider();
-                let mut ack = RelayAck::Accepted;
+                let mut reply = RelayReply::Accepted;
                 for (idx, raw) in raw_txs.iter().enumerate() {
                     if let Err(err) = alloy_provider::Provider::send_raw_transaction(
                         &target_provider,
@@ -423,17 +423,17 @@ impl Inner {
                         // (stale nonce after a re-push) is logged and skipped.
                         if idx == 0 {
                             let detail = format!("mempool fallback: postBatch send: {err}");
-                            ack = if err.is_error_resp() {
-                                RelayAck::Rejected(detail)
+                            reply = if err.is_error_resp() {
+                                RelayReply::Rejected(detail)
                             } else {
-                                RelayAck::Unreachable(detail)
+                                RelayReply::Unanswered(detail)
                             };
                             event!(
                                 name: "eez.submitter.bundle.not_accepted",
                                 Level::WARN,
                                 tx_hash = %post_batch_hash,
                                 target_block,
-                                ack = ?ack,
+                                relay_reply = ?reply,
                                 "mempool did not accept the postBatch; L1 decides its outcome",
                             );
                             break;
@@ -450,7 +450,7 @@ impl Inner {
                 // No bundle API, no timestamp pin: these txs can genuinely land
                 // in a later block, so the conservative rule is the only one.
                 let outcome = self.observe(post_batch_hash, target_block, None).await;
-                Ok(SendReport { ack, outcome })
+                Ok(SentBundle { reply, outcome })
             }
         }
     }
@@ -616,7 +616,7 @@ impl Inner {
 /// The relay's answer to one `eth_sendBundle` POST.
 #[derive(Debug, PartialEq, Eq)]
 enum PostReply {
-    Ack(RelayAck),
+    Relay(RelayReply),
     /// JSON-RPC `-32601`: a plain execution RPC with no bundle API.
     Unsupported,
 }
@@ -625,7 +625,7 @@ enum PostReply {
 /// Any non-error `result` is `Accepted` (most relays use `{"result":
 /// {"bundleHash": "0x..."}}`, the chiado builder returns `{"result":
 /// null}`). A non-2xx status or a JSON-RPC error is `Rejected`. A failed
-/// send or an undecodable reply is `Unreachable`.
+/// send or an undecodable reply is `Unanswered`.
 ///
 /// `target_block` is encoded as `0x{hex}` in the bundle params. Caller
 /// is responsible for picking a not-yet-proposed block — the relay
@@ -662,17 +662,21 @@ async fn post_bundle(
     let reply = match http.post(builder_rpc_url).json(&body).send().await {
         Ok(reply) => reply,
         Err(e) => {
-            return PostReply::Ack(RelayAck::Unreachable(format!("eth_sendBundle POST: {e}")));
+            return PostReply::Relay(RelayReply::Unanswered(format!("eth_sendBundle POST: {e}")));
         }
     };
     let reply = match reply.error_for_status() {
         Ok(reply) => reply,
-        Err(e) => return PostReply::Ack(RelayAck::Rejected(format!("eth_sendBundle HTTP: {e}"))),
+        Err(e) => {
+            return PostReply::Relay(RelayReply::Rejected(format!("eth_sendBundle HTTP: {e}")));
+        }
     };
     let resp: serde_json::Value = match reply.json().await {
         Ok(resp) => resp,
         Err(e) => {
-            return PostReply::Ack(RelayAck::Unreachable(format!("eth_sendBundle decode: {e}")));
+            return PostReply::Relay(RelayReply::Unanswered(format!(
+                "eth_sendBundle decode: {e}"
+            )));
         }
     };
     event!(
@@ -690,9 +694,9 @@ async fn post_bundle(
         if err.get("code").and_then(serde_json::Value::as_i64) == Some(-32601) {
             return PostReply::Unsupported;
         }
-        return PostReply::Ack(RelayAck::Rejected(format!("eth_sendBundle: {err}")));
+        return PostReply::Relay(RelayReply::Rejected(format!("eth_sendBundle: {err}")));
     }
-    PostReply::Ack(RelayAck::Accepted)
+    PostReply::Relay(RelayReply::Accepted)
 }
 
 /// Verdict for a relay-submitted, timestamp-pinned bundle, read off the
@@ -820,7 +824,7 @@ fn settlement_of_our_post(
 #[cfg(test)]
 mod tests {
     use super::{
-        PinnedVerdict, PostReply, RelayAck, SendOutcome, included_outcome, pinned_verdict,
+        PinnedVerdict, PostReply, RelayReply, SendOutcome, included_outcome, pinned_verdict,
         post_bundle, reverting_whitelist, settlement_of_our_post,
     };
     use crate::error::L1Error;
@@ -933,7 +937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_ack_classifies_every_post_outcome() {
+    async fn post_bundle_classifies_every_reply() {
         let accepted = r#"{"jsonrpc":"2.0","id":1,"result":{"bundleHash":"0x01"}}"#;
         let error = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"no"}}"#;
         let unsupported = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no"}}"#;
@@ -956,13 +960,13 @@ mod tests {
                 "Unsupported",
             ),
             ("502", relay(Some((502, ""))).await, "Rejected"),
-            ("closed unanswered", relay(None).await, "Unreachable"),
-            ("refused", refused, "Unreachable"),
+            ("closed unanswered", relay(None).await, "Unanswered"),
+            ("refused", refused, "Unanswered"),
         ] {
             let got = match post_bundle(&http, &url, &["0xaa"], 7, None).await {
-                PostReply::Ack(RelayAck::Accepted) => "Accepted",
-                PostReply::Ack(RelayAck::Rejected(_)) => "Rejected",
-                PostReply::Ack(RelayAck::Unreachable(_)) => "Unreachable",
+                PostReply::Relay(RelayReply::Accepted) => "Accepted",
+                PostReply::Relay(RelayReply::Rejected(_)) => "Rejected",
+                PostReply::Relay(RelayReply::Unanswered(_)) => "Unanswered",
                 PostReply::Unsupported => "Unsupported",
             };
             assert_eq!(got, want, "{case}");

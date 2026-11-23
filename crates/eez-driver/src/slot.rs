@@ -46,15 +46,15 @@ pub struct SyncSlotBlock {
     pub header: SealedHeader<Header>,
     /// Sends the block's bundle once the block is committed. `None` when the
     /// block has no bundle.
-    pub release: Option<CommitRelease>,
+    pub release: Option<BundleRelease>,
 }
 
 /// Releases a Sync block's bundle once the block is committed. Dropping it
 /// withholds the bundle.
 #[derive(Debug)]
-pub struct CommitRelease(oneshot::Sender<B256>);
+pub struct BundleRelease(oneshot::Sender<B256>);
 
-impl CommitRelease {
+impl BundleRelease {
     /// A release and the receiver the bundle's sender waits on.
     #[must_use]
     pub fn new() -> (Self, oneshot::Receiver<B256>) {

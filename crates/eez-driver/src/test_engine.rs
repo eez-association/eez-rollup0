@@ -30,7 +30,7 @@ pub(crate) enum EngineCall {
     /// Payload-service resolve of the job `id`.
     Resolve { id: PayloadId },
     /// A test saw the bundle of block `hash` released.
-    Released { hash: B256 },
+    BundleReleased { hash: B256 },
 }
 
 /// How the mock answers one FCU or `newPayload`.
@@ -112,7 +112,7 @@ impl MockEngine {
 
     /// Logs a bundle release in call order.
     pub(crate) fn note_release(&self, hash: B256) {
-        self.lock().log.push(EngineCall::Released { hash });
+        self.lock().log.push(EngineCall::BundleReleased { hash });
     }
 
     /// Answers the next FCU without a queued status with `status`.

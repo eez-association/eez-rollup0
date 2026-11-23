@@ -27,14 +27,14 @@ use alloy_provider::Provider as _;
 use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use eez_driver::{
-    BUILDER_GAS_LIMIT, BlockCommitterHandle, CommitRelease, MAX_BLOCKS_PER_BATCH, ParentContext,
+    BUILDER_GAS_LIMIT, BlockCommitterHandle, BundleRelease, MAX_BLOCKS_PER_BATCH, ParentContext,
     RollupTiming, SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
     witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_engine::EezEngineTypes;
 use eez_evm::EezEvmConfig;
 use eez_l1::{
-    BundleTarget, DropReason, L1Error, L1Event, RelayAck, SendOutcome, SendReport, Submitter,
+    BundleTarget, DropReason, L1Error, L1Event, RelayReply, SendOutcome, SentBundle, Submitter,
 };
 use eez_prover::{
     ActionableProverFailure, BlockWitness, ProverError, ProvingContext, RetryableProverError,
@@ -3065,7 +3065,7 @@ where
             built.header.hash(),
             survivors,
         );
-        let (release, released) = CommitRelease::new();
+        let (release, released) = BundleRelease::new();
         self.spawn_bundle_observer(
             ctx,
             rollup_id,
@@ -3215,7 +3215,7 @@ where
             empty_built.header.hash(),
             Vec::new(),
         );
-        let (release, released) = CommitRelease::new();
+        let (release, released) = BundleRelease::new();
         self.spawn_bundle_observer(
             ctx,
             rollup_id,
@@ -4810,13 +4810,13 @@ impl CrossChainDrain {
 
 /// What the observer records for one bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verdict {
+enum BundleVerdict {
     /// L1 reached the claimed endpoint.
     Settled,
     /// L1 kept part of the batch; the height stays canonical.
     SettledPartial,
-    /// L1 ran nothing of the batch. `charge` counts an attempt toward eviction.
-    Failed { charge: bool },
+    /// L1 ran nothing of the batch. `charge_attempt` counts an attempt toward eviction.
+    Failed { charge_attempt: bool },
     /// The post landed but its settlement is unread; the cursor decides.
     Unresolved,
 }
@@ -4824,25 +4824,33 @@ enum Verdict {
 /// The verdict L1's outcome gives. The relay's answer never decides it: an
 /// unanswered send only waives the charge, as do a skipped pinned slot and
 /// `pin_mismatch` (the target block's timestamp differs from the pin).
-fn bundle_verdict(report: &SendReport, expected_final_root: B256, pin_mismatch: bool) -> Verdict {
-    let charge = !(matches!(report.ack, RelayAck::Unreachable(_)) || pin_mismatch);
-    match &report.outcome {
+fn bundle_verdict(
+    sent: &SentBundle,
+    expected_final_root: B256,
+    pin_mismatch: bool,
+) -> BundleVerdict {
+    let charge_attempt = !(matches!(sent.reply, RelayReply::Unanswered(_)) || pin_mismatch);
+    match &sent.outcome {
         SendOutcome::Included { settlement, .. }
             if settlement.final_state == Some(expected_final_root) =>
         {
-            Verdict::Settled
+            BundleVerdict::Settled
         }
         // The anchor names a candidate at THIS height, so any applied entry keeps
         // the height canonical; only an empty settlement leaves it unratified.
         SendOutcome::Included { settlement, .. } if !settlement.is_empty() => {
-            Verdict::SettledPartial
+            BundleVerdict::SettledPartial
         }
         SendOutcome::Dropped {
             reason: DropReason::PinnedSlotSkipped,
             ..
-        } => Verdict::Failed { charge: false },
-        SendOutcome::Included { .. } | SendOutcome::Dropped { .. } => Verdict::Failed { charge },
-        SendOutcome::IncludedUnread { .. } => Verdict::Unresolved,
+        } => BundleVerdict::Failed {
+            charge_attempt: false,
+        },
+        SendOutcome::Included { .. } | SendOutcome::Dropped { .. } => {
+            BundleVerdict::Failed { charge_attempt }
+        }
+        SendOutcome::IncludedUnread { .. } => BundleVerdict::Unresolved,
     }
 }
 
@@ -4920,7 +4928,7 @@ async fn await_commit(
                 Level::INFO,
                 rollup_id,
                 sync_height,
-                commit_to_send_ms = u64::try_from(staged.elapsed().as_millis()).unwrap_or(u64::MAX),
+                commit_wait_ms = u64::try_from(staged.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "Sync block committed; sending its bundle",
             );
             true
@@ -4970,8 +4978,8 @@ async fn observe_bundle_outcome(
     submitter: Submitter,
     target: BundleTarget,
 ) {
-    let report = match submitter.send_bundle(&bundle, target).await {
-        Ok(report) => report,
+    let sent = match submitter.send_bundle(&bundle, target).await {
+        Ok(sent) => sent,
         Err(err) => {
             // Nothing reached the relay, so it says nothing about the txs.
             event!(
@@ -4986,35 +4994,43 @@ async fn observe_bundle_outcome(
             return;
         }
     };
-    let mut verdict = bundle_verdict(&report, expected_final_root, false);
+    let mut verdict = bundle_verdict(&sent, expected_final_root, false);
     // Only a charge can be waived, and only an Exact target carries a pin.
-    if let (Verdict::Failed { charge: true }, BundleTarget::Exact { block, timestamp }) =
-        (verdict, target)
+    if let (
+        BundleVerdict::Failed {
+            charge_attempt: true,
+        },
+        BundleTarget::Exact { block, timestamp },
+    ) = (verdict, target)
         && pin_mismatch(&submitter, block, timestamp).await
     {
-        verdict = bundle_verdict(&report, expected_final_root, true);
+        verdict = bundle_verdict(&sent, expected_final_root, true);
     }
-    log_bundle_verdict(rollup_id, sync_height, &report, verdict);
+    log_bundle_verdict(rollup_id, sync_height, &sent, verdict);
     match verdict {
-        Verdict::Settled => optimistic.mark_settled(sync_height, post_batch_hash),
+        BundleVerdict::Settled => optimistic.mark_settled(sync_height, post_batch_hash),
         // L1 kept part of the batch, so this height stays canonical and
         // recovery owes only the tail disposition — no rollback.
-        Verdict::SettledPartial => optimistic.mark_settled_partial(sync_height, post_batch_hash),
+        BundleVerdict::SettledPartial => {
+            optimistic.mark_settled_partial(sync_height, post_batch_hash)
+        }
         // L1 ran nothing of this batch, so the height is unratified and the
         // reorg path is correct.
-        Verdict::Failed { charge } => optimistic.mark_failed(sync_height, post_batch_hash, !charge),
+        BundleVerdict::Failed { charge_attempt } => {
+            optimistic.mark_failed(sync_height, post_batch_hash, !charge_attempt)
+        }
         // The post landed, so it is not a failure; the cursor resolves it.
-        Verdict::Unresolved => {}
+        BundleVerdict::Unresolved => {}
     }
 }
 
-fn log_bundle_verdict(rollup_id: u64, sync_height: u64, report: &SendReport, verdict: Verdict) {
-    let settled = verdict == Verdict::Settled;
-    let (ack, outcome) = (&report.ack, &report.outcome);
+fn log_bundle_verdict(rollup_id: u64, sync_height: u64, sent: &SentBundle, verdict: BundleVerdict) {
+    let settled = verdict == BundleVerdict::Settled;
+    let (reply, outcome) = (&sent.reply, &sent.outcome);
     match (verdict, outcome) {
         // Settled partially: the height stays canonical and the Deriver rebuilds the
         // block L1 named; only the unconsumed tail is owed a disposition.
-        (Verdict::SettledPartial, SendOutcome::Included { settlement, .. }) => event!(
+        (BundleVerdict::SettledPartial, SendOutcome::Included { settlement, .. }) => event!(
             name: "eez.composer.bundle.observed",
             Level::WARN,
             event_name = "eez.composer.bundle.observed",
@@ -5024,19 +5040,19 @@ fn log_bundle_verdict(rollup_id: u64, sync_height: u64, report: &SendReport, ver
             applied_any = true,
             applied = ?settlement.applied_indices(),
             outcome = ?outcome,
-            ack = ?ack,
+            relay_reply = ?reply,
             "postBatch settled partially; L1 kept part of this batch",
         ),
-        (Verdict::Unresolved, _) => event!(
-            name: "eez.composer.bundle.verdict_unread",
+        (BundleVerdict::Unresolved, _) => event!(
+            name: "eez.composer.bundle.unresolved",
             Level::ERROR,
             rollup_id,
             sync_height,
             outcome = ?outcome,
-            ack = ?ack,
+            relay_reply = ?reply,
             "postBatch landed but its settlement is unreadable; leaving the batch pending for the cursor",
         ),
-        (Verdict::Failed { .. }, SendOutcome::Included { .. }) => event!(
+        (BundleVerdict::Failed { .. }, SendOutcome::Included { .. }) => event!(
             name: "eez.composer.bundle.observed",
             Level::ERROR,
             event_name = "eez.composer.bundle.observed",
@@ -5044,7 +5060,7 @@ fn log_bundle_verdict(rollup_id: u64, sync_height: u64, report: &SendReport, ver
             sync_height,
             settled,
             outcome = ?outcome,
-            ack = ?ack,
+            relay_reply = ?reply,
             "postBatch was included without the expected state transition; possible Composer/prover/settlement-contract disagreement",
         ),
         (_, SendOutcome::Dropped { .. }) => event!(
@@ -5055,7 +5071,7 @@ fn log_bundle_verdict(rollup_id: u64, sync_height: u64, report: &SendReport, ver
             sync_height,
             settled,
             outcome = ?outcome,
-            ack = ?ack,
+            relay_reply = ?reply,
             "bundle was dropped before settlement; re-queueing transactions for recovery",
         ),
         _ => event!(
@@ -5066,7 +5082,7 @@ fn log_bundle_verdict(rollup_id: u64, sync_height: u64, report: &SendReport, ver
             sync_height,
             settled,
             outcome = ?outcome,
-            ack = ?ack,
+            relay_reply = ?reply,
             "bundle outcome observed",
         ),
     }
@@ -5276,7 +5292,7 @@ mod tests {
     /// Every relay answer, L1 outcome and pin reading. The verdict differs from
     /// a table where the relay's answer decides only in the rows listed.
     #[test]
-    fn bundle_verdict_ignores_the_relay_answer() {
+    fn relay_reply_only_waives_the_charge() {
         use eez_l1::scan::{AppliedEntry, EntryRole, Settlement};
         let root = B256::repeat_byte(0xaa);
         let applied = |final_state| {
@@ -5316,34 +5332,37 @@ mod tests {
                 },
             ),
         ];
-        let acks = [
-            RelayAck::Accepted,
-            RelayAck::Rejected(String::new()),
-            RelayAck::Unreachable(String::new()),
+        let replies = [
+            RelayReply::Accepted,
+            RelayReply::Rejected(String::new()),
+            RelayReply::Unanswered(String::new()),
         ];
         // The relay decides: one that did not accept fails the batch before
         // L1 is read, and so does an unread settlement.
-        let relay_decides =
-            |ack: &RelayAck, outcome: &SendOutcome, pin_mismatch: bool| match (ack, outcome) {
-                (RelayAck::Unreachable(_), _) => Verdict::Failed { charge: false },
-                (RelayAck::Rejected(_), _) | (_, SendOutcome::IncludedUnread { .. }) => {
-                    Verdict::Failed {
-                        charge: !pin_mismatch,
-                    }
+        let relay_decides = |reply: &RelayReply, outcome: &SendOutcome, pin_mismatch: bool| match (
+            reply, outcome,
+        ) {
+            (RelayReply::Unanswered(_), _) => BundleVerdict::Failed {
+                charge_attempt: false,
+            },
+            (RelayReply::Rejected(_), _) | (_, SendOutcome::IncludedUnread { .. }) => {
+                BundleVerdict::Failed {
+                    charge_attempt: !pin_mismatch,
                 }
-                (_, SendOutcome::Included { settlement, .. })
-                    if settlement.final_state == Some(root) =>
-                {
-                    Verdict::Settled
-                }
-                (_, SendOutcome::Included { settlement, .. }) if !settlement.is_empty() => {
-                    Verdict::SettledPartial
-                }
-                _ => Verdict::Failed {
-                    charge: !pin_mismatch,
-                },
-            };
-        for ack in &acks {
+            }
+            (_, SendOutcome::Included { settlement, .. })
+                if settlement.final_state == Some(root) =>
+            {
+                BundleVerdict::Settled
+            }
+            (_, SendOutcome::Included { settlement, .. }) if !settlement.is_empty() => {
+                BundleVerdict::SettledPartial
+            }
+            _ => BundleVerdict::Failed {
+                charge_attempt: !pin_mismatch,
+            },
+        };
+        for reply in &replies {
             for (case, outcome) in &outcomes {
                 for pin_mismatch in [false, true] {
                     // A skipped slot always mismatches its pin, an excluded one never.
@@ -5356,24 +5375,24 @@ mod tests {
                     {
                         continue;
                     }
-                    let report = SendReport {
-                        ack: ack.clone(),
+                    let sent = SentBundle {
+                        reply: reply.clone(),
                         outcome: outcome.clone(),
                     };
-                    let got = bundle_verdict(&report, root, pin_mismatch);
-                    let want = match (ack, *case) {
+                    let got = bundle_verdict(&sent, root, pin_mismatch);
+                    let want = match (reply, *case) {
                         // L1 decides, whatever the relay answered.
-                        (RelayAck::Rejected(_) | RelayAck::Unreachable(_), "settled") => {
-                            Verdict::Settled
+                        (RelayReply::Rejected(_) | RelayReply::Unanswered(_), "settled") => {
+                            BundleVerdict::Settled
                         }
-                        (RelayAck::Rejected(_) | RelayAck::Unreachable(_), "partial") => {
-                            Verdict::SettledPartial
+                        (RelayReply::Rejected(_) | RelayReply::Unanswered(_), "partial") => {
+                            BundleVerdict::SettledPartial
                         }
                         // A landed post is never a failure.
-                        (_, "unread") => Verdict::Unresolved,
-                        _ => relay_decides(ack, outcome, pin_mismatch),
+                        (_, "unread") => BundleVerdict::Unresolved,
+                        _ => relay_decides(reply, outcome, pin_mismatch),
                     };
-                    assert_eq!(got, want, "{ack:?} {case} pin_mismatch={pin_mismatch}");
+                    assert_eq!(got, want, "{reply:?} {case} pin_mismatch={pin_mismatch}");
                 }
             }
         }
@@ -5416,7 +5435,7 @@ mod tests {
             reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
         optimistic.begin(6, post_batch, parent, block, Vec::new());
 
-        let (release, released) = CommitRelease::new();
+        let (release, released) = BundleRelease::new();
         drop(release);
         let observer = send_after_commit(
             1,

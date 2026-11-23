@@ -41,4 +41,4 @@ pub use l1_watcher::{L1Event, L1Watcher, L1WatcherConfig};
 #[doc(inline)]
 pub use scan::{AppliedEntry, BatchLogChunks, EntryRole, Post, PostId, Settlement};
 #[doc(inline)]
-pub use submitter::{BundleTarget, DropReason, RelayAck, SendOutcome, SendReport, Submitter};
+pub use submitter::{BundleTarget, DropReason, RelayReply, SendOutcome, SentBundle, Submitter};
