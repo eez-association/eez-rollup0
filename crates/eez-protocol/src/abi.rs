@@ -312,12 +312,12 @@ mod selector_locks {
     fn l2_selectors_match_upstream() {
         assert_eq!(
             loadExecutionTableCall::SELECTOR,
-            [0xbf, 0x2e, 0xeb, 0xd3],
+            eez_primitives::LOAD_EXECUTION_TABLE_SELECTOR,
             "loadExecutionTable selector drifted from pinned protocol"
         );
         assert_eq!(
             executeIncomingCrossChainCallCall::SELECTOR,
-            [0xc3, 0xfb, 0x5f, 0x3d],
+            eez_primitives::EXECUTE_INCOMING_SELECTOR,
             "executeIncomingCrossChainCall selector drifted from pinned protocol"
         );
     }

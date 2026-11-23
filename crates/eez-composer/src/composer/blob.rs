@@ -1,5 +1,6 @@
 //! Composer blob posting: capacity, fee limits, and sidecar preparation.
 
+use alloy_primitives::Bytes;
 use reth_chainspec::{ChainSpec, EthChainSpec as _, EthereumHardforks as _};
 
 /// Fork schedule and fee cap for blob posting.
@@ -25,6 +26,74 @@ pub(super) fn blob_stream_len(
 pub(super) struct BlobCarrier {
     pub(super) sidecar: alloy_eips::eip7594::BlobTransactionSidecarVariant,
     pub(super) max_fee_per_blob_gas: u128,
+}
+
+/// Blobs of an encoded blob post, with the posting config and the target
+/// block's blob limit.
+pub(super) struct PhysicalBlobs<'a> {
+    pub(super) config: &'a BlobPostingConfig,
+    pub(super) blobs: Vec<Vec<u8>>,
+    pub(super) limit: ActiveBlobLimit,
+}
+
+/// A blob sidecar building on the blocking pool, with the blob fee it offers.
+pub(super) struct PendingSidecar {
+    task: tokio::task::JoinHandle<
+        Result<alloy_eips::eip7594::BlobTransactionSidecarVariant, eez_blob::TransportError>,
+    >,
+    max_fee_per_blob_gas: u128,
+}
+
+/// Read the blob fee and start building the sidecar; returns the blobs the
+/// attesters prove over and the pending sidecar. No blobs → calldata post.
+pub(super) async fn start_blob_sidecar(
+    l1_provider: &alloy_provider::RootProvider,
+    physical_blobs: Option<PhysicalBlobs<'_>>,
+) -> Result<(Vec<Bytes>, Option<PendingSidecar>), String> {
+    // The fee is re-read since it can rise after the slot's gate. Cell
+    // proofs are CPU-heavy, so the sidecar builds on the blocking pool
+    // while the witnesses build and the attesters prove.
+    match physical_blobs {
+        Some(PhysicalBlobs {
+            config,
+            blobs,
+            limit,
+        }) => {
+            let max_fee_per_blob_gas = blob_fee(l1_provider, config).await?;
+            let blobs: Vec<Bytes> = blobs.into_iter().map(Bytes::from).collect();
+            let sidecar_blobs = blobs.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                eez_blob::prepare_blob_sidecar(&sidecar_blobs, limit.sidecar_encoding)
+            });
+            Ok((
+                blobs,
+                Some(PendingSidecar {
+                    task,
+                    max_fee_per_blob_gas,
+                }),
+            ))
+        }
+        None => Ok((Vec::new(), None)),
+    }
+}
+
+/// Wait for the pending sidecar and wrap it as the post's blob carrier.
+pub(super) async fn finish_blob_carrier(
+    pending: Option<PendingSidecar>,
+) -> Result<Option<BlobCarrier>, String> {
+    match pending {
+        Some(PendingSidecar {
+            task,
+            max_fee_per_blob_gas,
+        }) => Ok(Some(BlobCarrier {
+            sidecar: task
+                .await
+                .map_err(|e| format!("blob sidecar task: {e}"))?
+                .map_err(|e| format!("prepare blob sidecar: {e}"))?,
+            max_fee_per_blob_gas,
+        })),
+        None => Ok(None),
+    }
 }
 
 /// The blob limit at the L1 block a batch targets: its pinned timestamp, else

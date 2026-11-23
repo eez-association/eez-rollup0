@@ -57,16 +57,21 @@ fn build_inbound_transactions(
         .iter()
         .map(|entry| eez_protocol::entries::InboundSidecar::try_from(entry).unwrap())
         .collect::<Vec<_>>();
-    eez_protocol::system_tx::build_inbound_system_txs(&sidecars, context, starting_nonce)
+    eez_protocol::system_tx::build_inbound_system_txs(
+        &sidecars,
+        context,
+        crate::testkit::native_source(starting_nonce),
+    )
+    .unwrap()
+    .into_iter()
+    .map(|plan| {
+        let raw = plan.at_position(30_000_000, 0).unwrap();
+        <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
+            raw.as_ref(),
+        )
         .unwrap()
-        .into_iter()
-        .map(|raw| {
-            <eez_primitives::EezTxEnvelope as alloy_eips::Decodable2718>::decode_2718_exact(
-                raw.as_ref(),
-            )
-            .unwrap()
-        })
-        .collect()
+    })
+    .collect()
 }
 
 fn verify_anchor_only_da_payload<'a>(
@@ -465,7 +470,7 @@ fn block_rlp(transactions: Vec<TransactionSigned>) -> Vec<u8> {
         transactions,
         ..Default::default()
     };
-    alloy_rlp::encode(EthereumBlock::new(Default::default(), body))
+    alloy_rlp::encode(EthereumBlock::new(crate::testkit::block_header(), body))
 }
 
 fn validated_block(number: u64, rlp: Vec<u8>, system_senders: Vec<bool>) -> ValidatedBlock {
@@ -482,7 +487,7 @@ fn block_and_payload_transactions(transactions: Vec<TransactionSigned>) -> (Vec<
         ..Default::default()
     };
     let payload_transactions = body.encoded_2718_transactions_iter().collect();
-    let block = EthereumBlock::new(Default::default(), body);
+    let block = EthereumBlock::new(crate::testkit::block_header(), body);
     (alloy_rlp::encode(block), payload_transactions)
 }
 

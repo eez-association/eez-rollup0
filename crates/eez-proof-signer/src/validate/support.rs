@@ -41,7 +41,7 @@ impl CheckpointPlan {
     pub fn for_block(
         block: &RecoveredBlock<Block>,
         expected_l2_system_address: Address,
-    ) -> (Self, Vec<bool>) {
+    ) -> Result<(Self, Vec<bool>), ValidationError> {
         let transaction_count = block.body().transactions.len();
         let mut system_sender_flags = Vec::with_capacity(transaction_count);
         let mut sync_system_transaction_flags = Vec::with_capacity(transaction_count);
@@ -56,12 +56,13 @@ impl CheckpointPlan {
             // system calls, holding no transactions. Effect boundaries follow.
             positions.push(CheckpointAt::PreExecution);
             positions.extend(
-                pair_end_positions(&sync_system_transaction_flags)
+                pair_end_positions(&block.body().transactions)
+                    .map_err(|error| ValidationError::Rejected(error.into()))?
                     .into_iter()
                     .map(CheckpointAt::Transaction),
             );
         }
-        (Self { positions }, system_sender_flags)
+        Ok((Self { positions }, system_sender_flags))
     }
 
     /// Positions selected for checkpoint root computation.

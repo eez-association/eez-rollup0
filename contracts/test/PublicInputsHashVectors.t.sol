@@ -43,6 +43,12 @@ contract PublicInputsHashVectorsTest is Test {
     bytes32 private constant ALL_DIMENSIONS_PUBLIC_INPUT =
         0x18742f97fac6fcd3ca33e57739399b92eb55a4cf3465327a9dd274199ef677ef;
 
+    function testNativeSourceIdentityVector() external pure {
+        bytes32 parent = 0x9999999999999999999999999999999999999999999999999999999999999999;
+        assertEq(keccak256(abi.encode("SOURCE_ENTRY_V1", uint256(1), parent, uint64(7))),
+            0x67fb5da1784078579c726c542563b4577c50fb90652c54566d49b9f170784d37);
+    }
+
     function testLiveContextBindsActualParentAndTimestamp() external {
         EEZ eez = new EEZ(address(0xDEAD));
         MockProofSystem proofSystem = new MockProofSystem();

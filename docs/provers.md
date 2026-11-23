@@ -89,8 +89,9 @@ published on the root PR branch before the root PR merges. Keep that commit
 reachable, or repin stateful to a compatible merged root revision if squashing.
 If the prover PR is squashed, update the root gitlink to its merge SHA.
 
-Execution-rule changes still need matching behavior in root `eez-evm` and
-stateless `eez-prover-evm`. Both replay
+Execution-rule changes, including `0x45` native transactions, need matching
+behavior in root `eez-evm` and stateless `eez-prover-evm`. Both replay
 `provers/stateless-ecdsa/testing/evm-golden/execution.json`; the stateless workspace
-owns the fixtures. Stateful uses root's EVM directly. Refresh stateless's copies
+owns the fixtures. Stateful uses root's EVM directly; carry any shared-signing
+API and receipt-evidence changes into its backend too. Refresh stateless's copies
 of streaming conformance vectors when the wire contract changes.
