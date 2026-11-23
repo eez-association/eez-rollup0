@@ -64,6 +64,13 @@ When root upgrades reth or evm2, stateful's direct dependencies and patches in
 Integration CI should expose any required prover update. Advance stateful's root
 Git pin to carry follower changes into standalone builds as well.
 
+Execution-rule changes, including `0x45` native transactions, need matching
+behavior in root `eez-evm` and stateless `eez-prover-evm`. Both replay
+`provers/stateless-ecdsa/testing/evm-golden/execution.json`; the stateless workspace
+owns the fixtures. Stateful uses root's EVM directly; carry any shared-signing
+API and receipt-evidence changes into its backend too. Refresh stateless's copies
+of streaming conformance vectors when the wire contract changes.
+
 The e2e harness locates both executables beside the test profile or builds them
 through the helper. `EEZ_TEST_PROOF_SIGNER_BIN` and
 `EEZ_TEST_STATEFUL_PROVER_BIN` override their paths. Docker targets are
@@ -79,19 +86,3 @@ them with a migration error. `EEZ_SEQUENCER_ADDRESS` is forbidden for proving.
 Peer-assisted historical synchronization remains supported; `EEZ_SYNC_L1_ONLY`
 is optional. L1 may be remote over RPC, with trace RPC and beacon access as
 required by the posted data. The prover still owns its local L2 database.
-
-## Updating both repositories
-
-Publish the follower API commit here first, then pin it in stateful's workspace.
-Merge the prover changes, update this repository's submodule to the resulting
-provers commit, and merge the root integration. The initial API commit can be
-published on the root PR branch before the root PR merges. Keep that commit
-reachable, or repin stateful to a compatible merged root revision if squashing.
-If the prover PR is squashed, update the root gitlink to its merge SHA.
-
-Execution-rule changes, including `0x45` native transactions, need matching
-behavior in root `eez-evm` and stateless `eez-prover-evm`. Both replay
-`provers/stateless-ecdsa/testing/evm-golden/execution.json`; the stateless workspace
-owns the fixtures. Stateful uses root's EVM directly; carry any shared-signing
-API and receipt-evidence changes into its backend too. Refresh stateless's copies
-of streaming conformance vectors when the wire contract changes.
