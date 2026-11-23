@@ -83,7 +83,7 @@ impl SystemTransaction {
             EEZL2_ADDRESS => SYSTEM_TX_GAS_CAP,
             _ => {
                 return Err(alloy_rlp::Error::Custom(
-                    "invalid system transaction destination or value",
+                    "invalid system transaction destination",
                 ));
             }
         };

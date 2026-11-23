@@ -276,24 +276,21 @@ Signer recovery alone is not execution validation.
 ### 6.2 Local checkpoint plan
 
 Ordinary blocks require regular execution, not transaction-state checkpoints.
-For each recovered transaction in a potential Sync block define:
+If a nonempty block has no native `0x45` transaction targeting `EEZL2_ADDRESS`,
+the checkpoint plan is empty, even when this is the terminal block. Otherwise
+the locally selected candidate positions are the complete execution-group
+endpoints returned by `execution_group_end_positions`:
 
-```text
-system[i] = type(tx[i]) == 0x45
-            && tx[i].to == EEZL2_ADDRESS
-```
+- a native `loadExecutionTable` transaction and its immediately following
+  ordinary user transaction form an outbound group, ending at the user;
+- a native `executeIncoming` delivery forms an inbound group, ending at itself;
+- ordinary transactions outside a load/user group add no checkpoint.
 
-If a nonempty block has no transaction satisfying `system[i]`, the checkpoint
-plan is empty, even when this is the terminal block. Otherwise the locally
-selected candidate positions are:
-
-```text
-C = { i | !system[i] || system[i + 1] || i is the last transaction }
-```
-
-An absent `system[i + 1]` at block end is treated as `true`. Thus an outbound
-`[system-load, user]` pair ends at the user transaction, while a standalone
-inbound system transaction ends at itself.
+Group boundaries are derived from transaction envelopes and native call
+selectors, regardless of receipt status. Unsupported native destinations or
+selectors, a load followed by another native transaction, and a block ending
+with an unpaired load MUST be rejected. For example, `[delivery, ordinary]`
+selects position `0`, while `[load, user, ordinary]` selects position `1`.
 
 The plan first requests the pre-execution position: the terminal sealed after
 its pre-block system calls and before transaction 0, which is the anchor's
