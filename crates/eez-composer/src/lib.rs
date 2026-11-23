@@ -39,6 +39,7 @@
 pub mod attestation_quorum;
 pub mod composer;
 pub mod held_pool;
+mod in_flight;
 pub mod ingress;
 pub mod inspector;
 pub mod local;

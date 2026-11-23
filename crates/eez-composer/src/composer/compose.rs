@@ -21,12 +21,12 @@ use super::budget::{
 use super::nonces::{
     inbound_source_nonces_for_drain, outbound_source_nonces_for_drain, partition_stale,
 };
-use super::recovery::{
+use super::{Composer, CrossChainWiring};
+use crate::held_pool::HeldTx;
+use crate::in_flight::{
     MAX_BUNDLE_ATTEMPTS, SettlementFailureSource, recover_prover_failure,
     recover_settlement_failure,
 };
-use super::{Composer, CrossChainWiring};
-use crate::held_pool::HeldTx;
 use crate::ingress::Direction;
 use crate::local::{
     BuildError, InboundL2TargetSession, L1SlotState, L1TargetSession,
