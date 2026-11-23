@@ -27,9 +27,6 @@ ignore = [
     "RUSTSEC-2026-0403",
     # The wasm32 allocator shim; we don't build for wasm32.
     "RUSTSEC-2026-0410",
-    # anyhow `Error::downcast_mut()` unsoundness. Transitive; we never
-    # downcast_mut an anyhow error.
-    "RUSTSEC-2026-0190",
     # hickory-proto NSEC3 unbounded loop and O(n^2) name-compression DoS.
     # Reached via reth's p2p DNS discovery, which we do not enable.
     "RUSTSEC-2026-0118",
