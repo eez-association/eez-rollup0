@@ -16,12 +16,13 @@ use reth_storage_api::{BlockReader, BlockSource, StateProviderFactory, Transacti
 use tracing::{Level, event};
 
 use super::blob::{BlobCarrier, blob_stream_len, finish_blob_carrier, start_blob_sidecar};
+use super::compose::BlockGasFit;
 use super::post_batch::{
     apply_attestations, attestation_error, batch_range, build_da_payload, build_settlement_batch,
     encode_da, postbatch_gas_with_floor,
 };
 use super::recovery::observe_bundle_outcome;
-use super::{BlockGasFit, Composer, ComposerConfigError, CrossChainExecCtx};
+use super::{Composer, ComposerConfigError, CrossChainExecCtx};
 use crate::attestation_quorum::assign_proof_systems;
 use crate::local::{SyncCandidates, build_sync_block};
 use crate::optimistic::OptimisticallyIncluded;

@@ -14,10 +14,10 @@ use reth_storage_api::{BlockReader, StateProviderFactory, TransactionsProvider};
 use tokio::sync::broadcast;
 use tracing::{Level, event};
 
-use super::{
-    Composer, Inner, inbound_source_nonces_for_drain, outbound_source_nonces_for_drain,
-    partition_stale,
+use super::compose::{
+    inbound_source_nonces_for_drain, outbound_source_nonces_for_drain, partition_stale,
 };
+use super::{Composer, Inner};
 use crate::held_pool::{HeldPool, HeldTx};
 use crate::ingress::Direction;
 use crate::local::build_sync_block;
