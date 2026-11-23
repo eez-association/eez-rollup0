@@ -103,6 +103,7 @@ fn permanent_native_revert_is_not_capacity_under_load() {
             &parent,
             1012,
             Address::ZERO,
+            B256::ZERO,
             prefix,
         )
         .unwrap()
@@ -134,6 +135,7 @@ fn native_packing_dependent_success_is_refused_without_commit() {
                 &parent,
                 1012,
                 Address::ZERO,
+                B256::ZERO,
                 prefix,
             )
             .unwrap()
@@ -178,6 +180,7 @@ fn user_fits_before_load_but_not_after() {
         &parent,
         1012,
         Address::ZERO,
+        B256::ZERO,
         &[signed(&signer, 0, burner, 14_500_000)],
     )
     .unwrap();
@@ -226,6 +229,7 @@ fn canonical_materialization_uses_recorded_execution_gas() {
         &parent,
         1012,
         Address::ZERO,
+        B256::ZERO,
         &[],
     )
     .unwrap();
@@ -268,6 +272,7 @@ fn inbound_probe_under_clamp_commits_only_the_canonical_delivery() {
         &parent,
         1012,
         Address::ZERO,
+        B256::ZERO,
         &[signed(&signer, 0, burner, 14_500_000)],
     )
     .unwrap();
@@ -312,6 +317,7 @@ fn native_intrinsic_gas_exceeding_clamped_budget_is_capacity_without_commit() {
         &parent,
         1012,
         Address::ZERO,
+        B256::ZERO,
         &[signed(&signer, 0, burner, BUILDER_GAS_LIMIT)],
     )
     .unwrap();

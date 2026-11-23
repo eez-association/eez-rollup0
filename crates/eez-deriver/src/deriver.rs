@@ -2001,11 +2001,8 @@ where
                 let bytes = match ordinary_plan_bytes(&plans) {
                     Some(bytes) => bytes,
                     None => {
-                        let (payload, header, bytes) = self.execute_planned_block(
-                            from_block - 1,
-                            &plans,
-                            &header_inputs,
-                        )?;
+                        let (payload, header, bytes) =
+                            self.execute_planned_block(from_block - 1, &plans, &header_inputs)?;
                         executed = Some((payload, header));
                         bytes
                     }
@@ -2135,11 +2132,8 @@ where
                     (true, Some(full)) => match ordinary_plan_bytes(full) {
                         Some(bytes) => bytes,
                         None => {
-                            let (payload, header, bytes) = self.execute_planned_block(
-                                l2_block - 1,
-                                full,
-                                &header_inputs,
-                            )?;
+                            let (payload, header, bytes) =
+                                self.execute_planned_block(l2_block - 1, full, &header_inputs)?;
                             executed = Some((payload, header));
                             bytes
                         }
