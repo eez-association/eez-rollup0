@@ -13,11 +13,12 @@ use reth_primitives_traits::AlloyBlockHeader;
 use reth_storage_api::{BlockReader, StateProvider, StateProviderFactory, TransactionsProvider};
 use tracing::{Level, event};
 
-use super::batcher::{
-    BlobBytes, Dispatched, PostBatchGasBudget, PreparePostBatchError, SignedPostBatch, SlotTarget,
-    Staged,
+use super::batcher::{Dispatched, PreparePostBatchError, SignedPostBatch, SlotTarget, Staged};
+use super::blob::target_blob_limit;
+use super::budget::{
+    BlobBytes, BlockGasFit, PostBatchGasBudget, blob_stream_len, block_gas_fit, declared_gas_limit,
+    gas_limit_violation,
 };
-use super::blob::{blob_stream_len, target_blob_limit};
 use super::recovery::{
     MAX_BUNDLE_ATTEMPTS, SettlementFailureSource, recover_prover_failure,
     recover_settlement_failure,
@@ -147,47 +148,6 @@ fn compose_crosschain(
     );
 
     Ok((composition, sessions, target_gas))
-}
-
-/// What the drain can do with a pair wanting `declared` gas on a Sync block
-/// that already holds `gas_used`, or with a tx against the batch's blob bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BlockGasFit {
-    /// Room in this block — accept.
-    Accept,
-    /// No room here, but an emptier block would take it: hold for a later slot.
-    Defer,
-    /// Over the whole block limit, so no slot can ever take it.
-    Unfittable,
-}
-
-/// Whether a pair fits the L2 Sync block. Sums DECLARED limits, which is what
-/// the builder refuses on; over-estimating only defers early, never overflows.
-const fn block_gas_fit(gas_used: u64, declared: u64, block_gas_limit: u64) -> BlockGasFit {
-    if gas_used.saturating_add(declared) <= block_gas_limit {
-        BlockGasFit::Accept
-    } else if declared > block_gas_limit {
-        BlockGasFit::Unfittable
-    } else {
-        BlockGasFit::Defer
-    }
-}
-
-/// Declared gas limit of a raw tx. An undecodable tx counts as the whole block
-/// so it is refused, never read as free space (`invariant 7`).
-fn declared_gas_limit(raw: &Bytes) -> u64 {
-    use alloy_consensus::Transaction as _;
-    use alloy_eips::eip2718::Decodable2718 as _;
-    reth_ethereum_primitives::TransactionSigned::decode_2718(&mut raw.as_ref())
-        .map_or(u64::MAX, |tx| tx.gas_limit())
-}
-
-/// The declared limit and active cap when an envelope can never fit.
-const fn gas_limit_violation(declared: u64, cap: Option<u64>) -> Option<(u64, u64)> {
-    match cap {
-        Some(cap) if declared > cap => Some((declared, cap)),
-        _ => None,
-    }
 }
 
 /// The refused pair's numbers, for the block-gas cut event.
@@ -2422,7 +2382,7 @@ mod native_gas_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::composer::tests::{held, signed_user_tx};
+    use crate::composer::tests::held;
     use crate::held_pool::HeldPool;
     use crate::prover_retry::validate_actionable_prover_failure;
     use alloy_primitives::TxHash;
@@ -2684,98 +2644,6 @@ mod tests {
                 TxHash::repeat_byte(6),
             ]
         );
-    }
-
-    /// Two outbound pairs near the EIP-7825 cap overflow a 30M block, so the
-    /// second must be refused before `build_sync_block` hard-errors on it.
-    #[test]
-    fn block_gas_fit_refuses_the_second_fat_outbound_pair() {
-        // The early gate checks the signed user's declared gas. The actual
-        // load is metered before the user is admitted by append_and_execute.
-        const USER_DECLARED: u64 = 16_700_000;
-        const USER_BURNED: u64 = 13_300_000;
-        const LOAD_BURNED: u64 = 100_000;
-        let pair = USER_DECLARED;
-
-        // Pair 1 fits an empty block.
-        assert_eq!(
-            block_gas_fit(0, pair, BUILDER_GAS_LIMIT),
-            BlockGasFit::Accept
-        );
-        // Pair 2 sees the burn of pair 1 and does not.
-        let after_one = LOAD_BURNED + USER_BURNED;
-        assert_eq!(
-            block_gas_fit(after_one, pair, BUILDER_GAS_LIMIT),
-            BlockGasFit::Defer,
-            "the second fat pair must be deferred, not built",
-        );
-        // Ground truth for the deferral: the builder itself would refuse pair 2's
-        // user tx, since its declared limit exceeds what the block has left.
-        assert!(USER_DECLARED > BUILDER_GAS_LIMIT - after_one - LOAD_BURNED);
-
-        // Exact boundary: equal fits, one over defers.
-        assert_eq!(
-            block_gas_fit(BUILDER_GAS_LIMIT - pair, pair, BUILDER_GAS_LIMIT),
-            BlockGasFit::Accept,
-        );
-        assert_eq!(
-            block_gas_fit(BUILDER_GAS_LIMIT - pair + 1, pair, BUILDER_GAS_LIMIT),
-            BlockGasFit::Defer,
-        );
-
-        // Head of line: a pair over the whole block is unfittable at any prefix,
-        // so it is evicted rather than deferred forever.
-        assert_eq!(
-            block_gas_fit(0, BUILDER_GAS_LIMIT + 1, BUILDER_GAS_LIMIT),
-            BlockGasFit::Unfittable,
-        );
-        assert_eq!(
-            block_gas_fit(after_one, BUILDER_GAS_LIMIT + 1, BUILDER_GAS_LIMIT),
-            BlockGasFit::Unfittable,
-        );
-        // An undecodable tx counts as the whole block, so it can never be
-        // mistaken for free space.
-        assert_eq!(
-            declared_gas_limit(&Bytes::from_static(b"not a tx")),
-            u64::MAX
-        );
-        assert_eq!(
-            block_gas_fit(0, u64::MAX, BUILDER_GAS_LIMIT),
-            BlockGasFit::Unfittable,
-        );
-    }
-
-    #[test]
-    fn eip_7825_user_cap_is_independent_of_sync_block_fit() {
-        // An invalid user limit can still fit in the aggregate Sync-block budget.
-        const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
-        let invalid_user_limit = EIP_7825_TX_GAS_LIMIT + 1;
-        let pair_limit = invalid_user_limit;
-
-        assert_eq!(
-            block_gas_fit(0, pair_limit, BUILDER_GAS_LIMIT),
-            BlockGasFit::Accept,
-            "block capacity alone must not be treated as user-transaction validity",
-        );
-        assert!(invalid_user_limit > EIP_7825_TX_GAS_LIMIT);
-        assert!(pair_limit < BUILDER_GAS_LIMIT);
-    }
-
-    #[test]
-    fn gas_limit_violation_uses_the_decoded_eip_7825_boundary_only_when_active() {
-        const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
-        let at_cap = declared_gas_limit(&signed_user_tx(EIP_7825_TX_GAS_LIMIT));
-        let over_cap = declared_gas_limit(&signed_user_tx(EIP_7825_TX_GAS_LIMIT + 1));
-
-        assert_eq!(
-            gas_limit_violation(at_cap, Some(EIP_7825_TX_GAS_LIMIT)),
-            None
-        );
-        assert_eq!(
-            gas_limit_violation(over_cap, Some(EIP_7825_TX_GAS_LIMIT)),
-            Some((EIP_7825_TX_GAS_LIMIT + 1, EIP_7825_TX_GAS_LIMIT)),
-        );
-        assert_eq!(gas_limit_violation(over_cap, None), None);
     }
 
     #[test]

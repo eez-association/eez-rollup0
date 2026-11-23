@@ -42,6 +42,7 @@ use crate::rollup::RollupState;
 
 mod batcher;
 mod blob;
+mod budget;
 mod compose;
 mod post_batch;
 mod recovery;

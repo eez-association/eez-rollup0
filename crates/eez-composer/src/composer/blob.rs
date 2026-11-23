@@ -10,18 +10,6 @@ pub struct BlobPostingConfig {
     pub max_fee_per_blob_gas: u128,
 }
 
-/// Bytes `blocks` and `actions` take in a blob stream, its closing
-/// CloseBlobStream byte included.
-pub(super) fn blob_stream_len(
-    rollup_id: u64,
-    blocks: &[eez_payload_codec::SpanBlock],
-    actions: &[eez_payload_codec::Action],
-) -> Result<usize, String> {
-    eez_payload_codec::encode_container(rollup_id, blocks, actions)
-        .map(|stream| stream.len().saturating_add(1))
-        .map_err(|e| format!("encode blob DA: {e}"))
-}
-
 /// Type-3 carrier of a blob post: its sidecar and blob-gas fee cap.
 pub(super) struct BlobCarrier {
     pub(super) sidecar: alloy_eips::eip7594::BlobTransactionSidecarVariant,
