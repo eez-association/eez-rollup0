@@ -6,16 +6,22 @@ L2, and L1 alone decides what happened to it.
 ## Order
 
 1. The composer builds the rich Sync block, signs the postBatch, records the batch in the
-   optimistic ledger and spawns the bundle observer. The observer waits.
+   optimistic ledger and spawns the bundle observer. It logs `eez.composer.bundle.staged`. The
+   observer waits.
 2. The Sequencer commits the block (`commit_one_prebuilt`). On success it releases the bundle
    (`SyncSlotBlock.release`, a `BundleRelease`).
-3. The observer sends the bundle and watches L1.
+3. The observer sends the bundle, logs `eez.composer.bundle.dispatched` and watches L1.
+
+A minimal postBatch takes the same steps and logs `eez.composer.phase1.bundle.staged` and
+`eez.composer.phase1.bundle.dispatched`.
 
 If the commit fails, or another block commits at that height, the release is dropped and the
-bundle is never sent. Recovery re-queues its txs without charging an attempt. No bundle is in
-flight for a block that is not in the chain.
+bundle is never sent: it logs `eez.composer.bundle.withheld`, never `dispatched`. Recovery
+re-queues its txs without charging an attempt. No bundle is in flight for a block that is not in
+the chain.
 
-Historical chunks have no block to wait for and send at once.
+Historical chunks have no block to wait for and send at once. Their one event is
+`eez.composer.emission.historical_chunk`.
 
 ## Outcome
 
@@ -42,8 +48,8 @@ differs from the pin.
 
 ## Cost
 
-The send starts later by the time the commit takes. Log event `eez.composer.bundle.released`
-carries `commit_wait_ms`.
+The send starts later by the time the commit takes. Both `dispatched` events carry
+`commit_wait_ms`.
 
 ## Tests
 

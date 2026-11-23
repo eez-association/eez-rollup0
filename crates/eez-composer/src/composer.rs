@@ -3046,9 +3046,9 @@ where
                 .map(|h| h.raw_tx.clone()),
         );
         event!(
-            name: "eez.composer.bundle.dispatched",
+            name: "eez.composer.bundle.staged",
             Level::INFO,
-            event_name = "eez.composer.bundle.dispatched",
+            event_name = "eez.composer.bundle.staged",
             rollup_id,
             sync_height,
             post_batch_hash = %post_batch_hash,
@@ -3075,7 +3075,14 @@ where
             built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
-            Some(released),
+            Some(Staged {
+                released,
+                dispatched: Dispatched::Rich {
+                    entry_count: total_entries,
+                    evicted_poison: poison.len(),
+                    evicted_stale,
+                },
+            }),
         );
         Ok(Some(SyncSlotBlock {
             payload: built.payload,
@@ -3200,9 +3207,9 @@ where
             hash: post_batch_hash,
         } = minimal_postbatch_raw;
         event!(
-            name: "eez.composer.phase1.bundle.dispatched",
+            name: "eez.composer.phase1.bundle.staged",
             Level::INFO,
-            event_name = "eez.composer.phase1.bundle.dispatched",
+            event_name = "eez.composer.phase1.bundle.staged",
             rollup_id,
             sync_height,
             post_batch_hash = %post_batch_hash,
@@ -3225,7 +3232,10 @@ where
             empty_built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
-            Some(released),
+            Some(Staged {
+                released,
+                dispatched: Dispatched::Minimal,
+            }),
         );
         Ok(Some(SyncSlotBlock {
             payload: empty_built.payload,
@@ -3435,8 +3445,8 @@ where
     /// Spawn the background bundle-observer task. It owns the submission inputs
     /// and records only the verdict in the optimistic ledger; it holds neither
     /// the Composer nor the block committer, so chain recovery stays in slot
-    /// context through `recover_failed_batch`. With `released`, it sends only
-    /// once the Sync block commits.
+    /// context through `recover_failed_batch`. A `staged` bundle is sent only
+    /// once its Sync block commits.
     fn spawn_bundle_observer(
         &self,
         ctx: &CrossChainExecCtx,
@@ -3447,7 +3457,7 @@ where
         expected_final_root: B256,
         optimistic: Arc<OptimisticallyIncluded>,
         target: BundleTarget,
-        released: Option<tokio::sync::oneshot::Receiver<B256>>,
+        staged: Option<Staged>,
     ) {
         tokio::spawn(send_after_commit(
             rollup_id,
@@ -3458,7 +3468,7 @@ where
             optimistic,
             ctx.submitter.clone(),
             target,
-            released,
+            staged,
             tokio::time::Instant::now(),
         ));
     }
@@ -4872,6 +4882,27 @@ async fn pin_mismatch(submitter: &Submitter, block: u64, pin: u64) -> bool {
     true
 }
 
+/// A bundle waiting for its Sync block to commit.
+struct Staged {
+    /// Receives the hash of the block committed at the Sync height.
+    released: tokio::sync::oneshot::Receiver<B256>,
+    /// The event the bundle logs when it is sent.
+    dispatched: Dispatched,
+}
+
+/// The `dispatched` event of a staged bundle, with the fields known at staging.
+#[derive(Debug, Clone, Copy)]
+enum Dispatched {
+    /// `eez.composer.bundle.dispatched`: a rich Sync block's bundle.
+    Rich {
+        entry_count: usize,
+        evicted_poison: usize,
+        evicted_stale: usize,
+    },
+    /// `eez.composer.phase1.bundle.dispatched`: a minimal postBatch.
+    Minimal,
+}
+
 /// Send the bundle once its Sync block commits, then observe it. A bundle
 /// whose block is not committed is never sent, so nothing is charged.
 async fn send_after_commit(
@@ -4883,22 +4914,36 @@ async fn send_after_commit(
     optimistic: Arc<OptimisticallyIncluded>,
     submitter: Submitter,
     target: BundleTarget,
-    released: Option<tokio::sync::oneshot::Receiver<B256>>,
-    staged: tokio::time::Instant,
+    staged: Option<Staged>,
+    staged_at: tokio::time::Instant,
 ) {
-    if let Some(released) = released
-        && !await_commit(
-            rollup_id,
-            sync_height,
-            expected_final_root,
+    let dispatched = match staged {
+        Some(Staged {
             released,
-            staged,
-        )
-        .await
-    {
-        optimistic.mark_failed(sync_height, post_batch_hash, true);
-        return;
-    }
+            dispatched,
+        }) => {
+            if !await_commit(rollup_id, sync_height, expected_final_root, released).await {
+                optimistic.mark_failed(sync_height, post_batch_hash, true);
+                return;
+            }
+            Some((dispatched, staged_at.elapsed()))
+        }
+        // A historical chunk is sent at once; `emit_historical_chunk` logged its one event.
+        None => None,
+    };
+    let tx_count = bundle.len();
+    let on_dispatch = move || {
+        if let Some((dispatched, commit_wait)) = dispatched {
+            log_dispatched(
+                rollup_id,
+                sync_height,
+                post_batch_hash,
+                tx_count,
+                dispatched,
+                commit_wait,
+            );
+        }
+    };
     observe_bundle_outcome(
         rollup_id,
         sync_height,
@@ -4908,8 +4953,51 @@ async fn send_after_commit(
         optimistic,
         submitter,
         target,
+        on_dispatch,
     )
     .await;
+}
+
+/// Log that a staged bundle goes out, `commit_wait` after it was staged.
+fn log_dispatched(
+    rollup_id: u64,
+    sync_height: u64,
+    post_batch_hash: alloy_primitives::TxHash,
+    tx_count: usize,
+    dispatched: Dispatched,
+    commit_wait: std::time::Duration,
+) {
+    let commit_wait_ms = u64::try_from(commit_wait.as_millis()).unwrap_or(u64::MAX);
+    match dispatched {
+        Dispatched::Rich {
+            entry_count,
+            evicted_poison,
+            evicted_stale,
+        } => event!(
+            name: "eez.composer.bundle.dispatched",
+            Level::INFO,
+            event_name = "eez.composer.bundle.dispatched",
+            rollup_id,
+            sync_height,
+            post_batch_hash = %post_batch_hash,
+            tx_count,
+            entry_count,
+            evicted_poison,
+            evicted_stale,
+            commit_wait_ms,
+            "Sync block committed; sending its rich bundle",
+        ),
+        Dispatched::Minimal => event!(
+            name: "eez.composer.phase1.bundle.dispatched",
+            Level::INFO,
+            event_name = "eez.composer.phase1.bundle.dispatched",
+            rollup_id,
+            sync_height,
+            post_batch_hash = %post_batch_hash,
+            commit_wait_ms,
+            "Sync block committed; sending its minimal postBatch",
+        ),
+    }
 }
 
 /// Wait until the Sync block `expected` is committed. `false` withholds the
@@ -4919,20 +5007,9 @@ async fn await_commit(
     sync_height: u64,
     expected: B256,
     released: tokio::sync::oneshot::Receiver<B256>,
-    staged: tokio::time::Instant,
 ) -> bool {
     match released.await {
-        Ok(committed) if committed == expected => {
-            event!(
-                name: "eez.composer.bundle.released",
-                Level::INFO,
-                rollup_id,
-                sync_height,
-                commit_wait_ms = u64::try_from(staged.elapsed().as_millis()).unwrap_or(u64::MAX),
-                "Sync block committed; sending its bundle",
-            );
-            true
-        }
+        Ok(committed) if committed == expected => true,
         Ok(committed) => {
             event!(
                 name: "eez.composer.bundle.withheld",
@@ -4966,6 +5043,7 @@ async fn await_commit(
 /// "Settled" requires an `L2ExecutionPerformed` in the inclusion block
 /// whose `newRoot` equals `expected_final_root` (the built Sync block's
 /// root) — the leading immediate advancing L1 partway doesn't count.
+/// `on_dispatch` runs when the bundle goes out.
 async fn observe_bundle_outcome(
     rollup_id: u64,
     sync_height: u64,
@@ -4977,8 +5055,9 @@ async fn observe_bundle_outcome(
     optimistic: Arc<OptimisticallyIncluded>,
     submitter: Submitter,
     target: BundleTarget,
+    on_dispatch: impl FnOnce(),
 ) {
-    let sent = match submitter.send_bundle(&bundle, target).await {
+    let sent = match submitter.send_bundle(&bundle, target, on_dispatch).await {
         Ok(sent) => sent,
         Err(err) => {
             // Nothing reached the relay, so it says nothing about the txs.
@@ -5449,7 +5528,10 @@ mod tests {
                 block: 9,
                 timestamp: 1,
             },
-            Some(released),
+            Some(Staged {
+                released,
+                dispatched: Dispatched::Minimal,
+            }),
             tokio::time::Instant::now(),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), observer)

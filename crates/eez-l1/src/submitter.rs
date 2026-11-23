@@ -214,6 +214,8 @@ impl Submitter {
     /// inclusion; if it's in, the bundle either succeeded or a proposer
     /// broke atomicity (their bug, not ours).
     ///
+    /// `on_dispatch` runs once, right before the bundle goes to the relay.
+    ///
     /// # Errors
     ///
     /// Only when nothing was sent: an empty or undecodable bundle, an
@@ -223,6 +225,7 @@ impl Submitter {
         &self,
         raw_txs: &[alloy_primitives::Bytes],
         target: BundleTarget,
+        on_dispatch: impl FnOnce(),
     ) -> L1Result<SentBundle> {
         fail::fail_point!("submitter::send::start", |_| Err(L1Error::Submission(
             "injected failpoint: submitter::send::start".into()
@@ -258,6 +261,7 @@ impl Submitter {
             tx_count = raw_txs.len(),
             "dispatching bundle to builder",
         );
+        on_dispatch();
         // One bundle, one target block. Atomic bundle semantics:
         // rbuilder either includes the whole bundle in `target_block`
         // in the specified order, or drops it. Relays without a bundle
