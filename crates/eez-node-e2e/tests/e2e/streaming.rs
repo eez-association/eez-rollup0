@@ -65,7 +65,7 @@ async fn shared_prover_reorg(stateful: bool) -> Result<()> {
             NodeHandle::start(
                 "shared-stateful-prover",
                 &NodeConfig {
-                    binary: NodeBinary::Follower,
+                    binary: NodeBinary::StatefulProver,
                     genesis_path: Some(harness.l2_genesis_path()),
                     ..Default::default()
                 },
@@ -259,7 +259,7 @@ async fn stateful_sessions_can_extend_and_finalize_an_unselected_branch() -> Res
     let prover = NodeHandle::start(
         "fork-prover",
         &NodeConfig {
-            binary: NodeBinary::Follower,
+            binary: NodeBinary::StatefulProver,
             genesis_path: Some(harness.l2_genesis_path()),
             ..Default::default()
         },
