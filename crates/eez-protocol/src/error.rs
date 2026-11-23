@@ -47,6 +47,9 @@ pub type ProtocolResult<T> = Result<T, ProtocolError>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ExecutorError {
+    /// The current L2 prefix lacks gas; retry this complete group on a fresh block.
+    #[error("insufficient remaining L2 block gas")]
+    Capacity,
     /// The target chain is not reachable or not configured for the
     /// requested operation.
     #[error("target chain unavailable: {0}")]

@@ -294,7 +294,8 @@ mod tests {
     fn non_canonical_block_is_rejected() {
         let tx = eez_primitives::EezTxEnvelope::from(eez_primitives::SystemTransaction {
             chain_id: 1337,
-            nonce: 0,
+            source_hash: B256::repeat_byte(0x11),
+            gas_limit: eez_primitives::SYSTEM_TX_GAS_CAP,
             to: eez_primitives::EEZL2_ADDRESS,
             value: U256::ZERO,
             input: Bytes::from_static(&[1, 2, 3]),

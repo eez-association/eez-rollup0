@@ -52,7 +52,7 @@ type Converter = RpcConverter<
 >;
 
 /// Builds call and estimate environments from RPC requests. Requests are always
-/// Ethereum transactions; native `0x76` transactions never come from RPC.
+/// Ethereum transactions; native `0x45` transactions never come from RPC.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EezTxEnvConverter;
 

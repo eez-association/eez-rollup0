@@ -9,11 +9,11 @@ them exactly.
 ## The EEZ EVM (`crates/eez-evm`)
 
 - `EezEvmTypes` is the evm2 type family. Its transaction is `EezEvmTx`:
-  `Ethereum(TxEnvelope)` or `System(SystemTransaction)` for type `0x76`. Each
+  `Ethereum(TxEnvelope)` or `System(SystemTransaction)` for type `0x45`. Each
   EVM carries the genesis `feeCollector`.
 - Ethereum transactions run evm2's handlers with `EezTxHooks`, which credit
   `min(base fee, gas price) × gas used` to the fee collector without warming
-  it. Type `0x76` runs the native handler (`evm.rs`, `mod native`); see
+  it. Type `0x45` runs the native handler (`evm.rs`, `mod native`); see
   `docs/native-system-transactions.md`.
 - The block executor is reth's `EthBlockExecutor` with its block hooks pinned to
   the Merge: no beacon roots, withdrawals or requests, and a nonzero parent

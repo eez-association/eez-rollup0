@@ -926,7 +926,8 @@ fn clamp_max_postbatch_gas(requested: u64, attesters: u64) -> u64 {
 /// evicted before it can enter — and perpetually drop — a bundle.
 /// `false` = STATE-DEPENDENT OR TRANSIENT, which a retry may clear. The drain
 /// handles insufficient funds separately; other non-poison errors abort the
-/// slot and re-queue.
+/// slot and re-queue. Capacity is deferred before this classification when an
+/// accepted prefix exists; in an empty block it means the group cannot fit.
 fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
     use eez_protocol::{ComposerError, ExecutorError};
     match err {
@@ -1197,11 +1198,15 @@ fn requeue_unprocessed(
 /// caller can check what a tx actually did against what it composed.
 fn append_and_execute(
     prefix: &mut SyncBlockState,
-    txs: &[Bytes],
+    txs: &[eez_protocol::system_tx::PlannedTransaction],
+    encoded: &mut Vec<Bytes>,
 ) -> Result<Vec<alloy_primitives::Log>, (usize, BuildError)> {
     let mut logs = Vec::new();
-    for (at, tx) in txs.iter().enumerate() {
-        match prefix.execute_tx(tx) {
+    for (at, plan) in txs.iter().enumerate() {
+        let tx = prefix
+            .materialize(plan)
+            .map_err(|msg| (at, BuildError::ExecuteTx { idx: at, msg }))?;
+        match prefix.execute_tx(&tx) {
             Ok(outcome) if outcome.success => logs.extend(outcome.logs),
             Ok(outcome) => {
                 return Err((
@@ -1214,6 +1219,7 @@ fn append_and_execute(
             }
             Err(e) => return Err((at, e)),
         }
+        encoded.push(tx);
     }
     Ok(logs)
 }
@@ -2312,8 +2318,8 @@ where
             bundle_target,
         } = slot;
         let ctx = cc.exec_ctx.as_ref();
-        // Read the base SYSTEM_ADDRESS nonce from parent state. The canonical
-        // builder allocates outbound-load nonces before inbound-delivery nonces.
+        // Ordinary source nonces remain parent-state inputs; native identity
+        // is derived from the pinned intended L1 parent below.
         let parent_hash = parent_header.hash();
         let rollup =
             self.inner.rollups.get(&rollup_id).ok_or_else(|| {
@@ -2324,14 +2330,6 @@ where
             .l2_provider
             .state_by_block_hash(parent_hash)
             .map_err(|e| format!("state_by_block_hash({parent_hash}): {e}"))?;
-        let system_address = eez_primitives::SYSTEM_ADDRESS;
-        // Base SYSTEM_ADDRESS nonce; the canonical builder advances it
-        // internally (outbound loads, then inbound deliveries) post-drain.
-        let nonce = state
-            .account_nonce(&system_address)
-            .map_err(|e| format!("account_nonce({system_address}): {e}"))?
-            .unwrap_or(0);
-
         let stf_cfg = eez_protocol::system_tx::SystemTxContext {
             eezl2_address: ctx.eezl2_address,
             l2_chain_id: ctx.l2_chain_id,
@@ -2408,29 +2406,6 @@ where
                 })
             }
         };
-        let mut source_nonces = inbound_source_nonces_for_drain(
-            ctx,
-            rollup_id,
-            &drained,
-            alloy_eips::BlockId::latest(),
-        )
-        .await;
-        source_nonces.extend(outbound_source_nonces);
-        let (drained, stale) = partition_stale(drained, &source_nonces);
-        for tx in &stale {
-            event!(
-                name: "eez.composer.cc_compose.stale_nonce_evicted",
-                Level::WARN,
-                rollup_id,
-                tx_hash = %tx.hash,
-                sender = %tx.sender,
-                nonce = tx.nonce,
-                direction = ?tx.direction,
-                "held tx nonce is below its canonical source-chain nonce; evicting stale tx",
-            );
-        }
-        pool.release_in_flight_batch(&stale);
-
         // ── Slot execution contexts (design §2) ──────────────────────
         // One L1 state pinned at the anchor and one live Sync-block prefix,
         // both advanced only by accepted transactions. Failing to open either
@@ -2475,9 +2450,14 @@ where
                         .declared_tx_gas_limit_cap_at(state.anchor.header()),
                 }
                 .map_err(|error| format!("resolve L1 transaction gas cap: {error}"))?;
-                Ok((state, draft, cap))
+                let live_source = eez_protocol::native_source::SourceEntry::new(
+                    ctx.l2_chain_id,
+                    state.anchor.hash(),
+                    0,
+                )?;
+                Ok((state, draft, cap, live_source))
             });
-        let (l1_state, draft, inbound_gas_limit_cap) = match slot_ctx {
+        let (l1_state, draft, inbound_gas_limit_cap, live_source) = match slot_ctx {
             Ok(contexts) => contexts,
             Err(e) => {
                 event!(
@@ -2494,6 +2474,29 @@ where
                     .await;
             }
         };
+        let mut source_nonces = inbound_source_nonces_for_drain(
+            ctx,
+            rollup_id,
+            &drained,
+            alloy_eips::BlockId::latest(),
+        )
+        .await;
+        source_nonces.extend(outbound_source_nonces);
+        let (drained, stale) = partition_stale(drained, &source_nonces);
+        for tx in &stale {
+            event!(
+                name: "eez.composer.cc_compose.stale_nonce_evicted",
+                Level::WARN,
+                rollup_id,
+                tx_hash = %tx.hash,
+                sender = %tx.sender,
+                nonce = tx.nonce,
+                direction = ?tx.direction,
+                "held tx nonce is below its canonical source-chain nonce; evicting stale tx",
+            );
+        }
+        pool.release_in_flight_batch(&stale);
+
         // The draft's EVM rules govern outbound envelopes.
         let outbound_gas_limit_cap = draft.declared_tx_gas_limit_cap();
         event!(
@@ -2508,7 +2511,7 @@ where
 
         let mut drain = CrossChainDrain {
             rollup_id,
-            nonce,
+            live_source,
             l1_state,
             draft,
             sync_txs: Vec::new(),
@@ -2587,8 +2590,9 @@ where
         drain.handle_budget_cut();
         let CrossChainDrain {
             rollup_id,
-            nonce,
+            live_source,
             l1_state,
+            draft,
             sync_txs,
             survivors,
             survivor_comps,
@@ -2681,18 +2685,20 @@ where
         // Past the drain the pool's order is all that matters again.
         let survivors: Vec<HeldTx> = restore_pool_order(survivors);
 
-        // ── Rebuild the Sync block's system txs via THE canonical builder —
-        // deriver-byte-identical two-phase SYSTEM_ADDRESS nonces (outbound loads
-        // N.., then inbound deliveries N+K..) + interleaved order
-        // [load,user,…,deliveries]. Handles inbound / outbound / mixed
-        // uniformly. A failure is systemic (signing / nonce overflow) →
-        // re-queue survivors, degrade to minimal.
-        let pairs = match eez_protocol::system_tx::build_cross_chain_sync_pairs(
+        // Reconstruct canonical plans independently of the accepted byte list,
+        // using the actual preceding gas recorded by the draft. A mismatch
+        // aborts posting and requeues survivors without re-executing the block.
+        let (pairs, canonical) = match eez_protocol::system_tx::build_cross_chain_sync_pairs(
             &pending_out,
             &pending_in,
             stf_cfg,
-            nonce,
-        ) {
+            live_source,
+        )
+        .and_then(|pairs| {
+            let bytes = draft
+                .materialize_prefix(&eez_protocol::system_tx::interleave_sync_block_txs(&pairs))?;
+            Ok((pairs, bytes))
+        }) {
             Ok(p) => p,
             Err(e) => {
                 event!(
@@ -2715,7 +2721,6 @@ where
         // reconstructs from the same entries. Inequality is a composer bug, not
         // an input condition, so it degrades the slot loudly instead of posting
         // a block nobody else can rebuild.
-        let canonical = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
         if canonical != sync_txs {
             let first_divergent = canonical
                 .iter()
@@ -3850,18 +3855,15 @@ fn ensure_batch_registry_native(
 struct CrossChainDrain {
     /// The rollup being drained.
     rollup_id: u64,
-    /// Base SYSTEM_ADDRESS nonce read from the parent state.
-    nonce: u64,
+    /// Native group identity anchored to the intended L1 parent.
+    live_source: eez_protocol::native_source::SourceEntry,
     l1_state: L1SlotState,
     draft: SyncBlockState,
     /// The Sync block's txs in canonical order, exactly as accepted: the
     /// list the prefix is rebuilt from and the keystone assert compares the
     /// canonical rebuild against.
     sync_txs: Vec<Bytes>,
-    /// SYSTEM_ADDRESS cursor: one nonce per appended system tx. Phase 1 runs
-    /// to completion first, so this counts outbound loads N..N+K-1 and then
-    /// inbound deliveries from N+K — `build_cross_chain_sync_pairs`' split,
-    /// by construction.
+    /// One ordinal per complete native group in the original candidate.
     system_txs_appended: u64,
     /// Drain indices ride along so a re-queue can restore pool order across
     /// the two direction phases.
@@ -3984,7 +3986,7 @@ impl CrossChainDrain {
         reopen: impl Fn(&[Bytes]) -> Result<SyncBlockState, BuildError>,
         outbounds: Vec<(usize, HeldTx)>,
     ) {
-        let (rollup_id, nonce) = (self.rollup_id, self.nonce);
+        let rollup_id = self.rollup_id;
         let local = &cc.local;
         let ctx = cc.exec_ctx.as_ref();
         // ── PHASE 1 — OUTBOUND (L2→L1) ───────────────────────────────
@@ -4168,8 +4170,9 @@ impl CrossChainDrain {
                     }
                     // `[load, user]` must fit the Sync block or `build_sync_block`
                     // hard-errors. Before the L1 budget, so a refusal costs nothing.
-                    let declared =
-                        eez_primitives::SYSTEM_TX_GAS_LIMIT.saturating_add(user_declared);
+                    // Native loads use the remaining budget. The append below
+                    // checks the user's declared limit after actual load gas.
+                    let declared = user_declared;
                     match block_gas_fit(self.draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
                         BlockGasFit::Accept => {}
                         BlockGasFit::Defer => {
@@ -4254,7 +4257,7 @@ impl CrossChainDrain {
                         &l1_entries[0],
                         &held.raw_tx,
                         stf_cfg,
-                        nonce + self.system_txs_appended,
+                        self.live_source.with_index(self.system_txs_appended),
                     ) {
                         Ok(pairs) => pairs,
                         Err(e) => {
@@ -4271,10 +4274,22 @@ impl CrossChainDrain {
                             continue;
                         }
                     };
-                    let pair_txs = eez_protocol::system_tx::interleave_sync_block_txs(&pairs_k);
-                    let pair_logs = match append_and_execute(&mut self.draft, &pair_txs) {
+                    let plans = eez_protocol::system_tx::interleave_sync_block_txs(&pairs_k);
+                    let mut pair_txs = Vec::new();
+                    let pair_logs = match append_and_execute(&mut self.draft, &plans, &mut pair_txs)
+                    {
                         Ok(logs) => logs,
                         Err((at, why)) => {
+                            if matches!(why, BuildError::Capacity) && !self.sync_txs.is_empty() {
+                                self.end = DrainEnd::Cut {
+                                    cut: BudgetCut::BlockGas(BlockGasCut {
+                                        gas_used: self.draft.gas_used(),
+                                        declared: user_declared,
+                                    }),
+                                    rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                                };
+                                break;
+                            }
                             // A backing-store failure says nothing about the tx —
                             // abort the slot instead of evicting a valid pair.
                             if matches!(&why, BuildError::Provider(_)) {
@@ -4444,7 +4459,7 @@ impl CrossChainDrain {
         reopen: impl Fn(&[Bytes]) -> Result<SyncBlockState, BuildError>,
         inbounds: Vec<(usize, HeldTx)>,
     ) {
-        let (rollup_id, nonce) = (self.rollup_id, self.nonce);
+        let rollup_id = self.rollup_id;
         let local = &cc.local;
         // ── PHASE 2 — INBOUND (L1→L2) ────────────────────────────────
         // Source-sim runs the L1 user tx on a fork of the state; the L2 side
@@ -4494,7 +4509,7 @@ impl CrossChainDrain {
                     InboundL2TargetSession::new(
                         fork,
                         stf_cfg.clone(),
-                        nonce + self.system_txs_appended,
+                        self.live_source.with_index(self.system_txs_appended),
                     )
                 })
                 .and_then(|probe| {
@@ -4567,38 +4582,6 @@ impl CrossChainDrain {
                         continue;
                     }
 
-                    // Same gate: one delivery tx per entry, each at the protocol gas budget.
-                    // Foreign entries never ship, so this over-counts at worst.
-                    let declared = eez_primitives::SYSTEM_TX_GAS_LIMIT
-                        .saturating_mul(target_entries.len() as u64);
-                    match block_gas_fit(self.draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
-                        BlockGasFit::Accept => {}
-                        BlockGasFit::Defer => {
-                            self.end = DrainEnd::Cut {
-                                cut: BudgetCut::BlockGas(BlockGasCut {
-                                    gas_used: self.draft.gas_used(),
-                                    declared,
-                                }),
-                                rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
-                            };
-                            break;
-                        }
-                        BlockGasFit::Unfittable => {
-                            event!(
-                                name: "eez.composer.cc_compose.block_gas_unfittable",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                declared,
-                                deliveries = target_entries.len(),
-                                block_gas_limit = BUILDER_GAS_LIMIT,
-                                "inbound deliveries declare more gas than a whole L2 block; no slot can ever take them — evicting (resubmit as separate calls)",
-                            );
-                            push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
-                            continue;
-                        }
-                    }
                     // Commit both projections only after the block append succeeds.
                     let mut candidate_budget = self.budget;
                     match candidate_budget.try_accept_da(rollup_id, &target_entries, None) {
@@ -4656,7 +4639,7 @@ impl CrossChainDrain {
                             eez_protocol::system_tx::build_inbound_system_txs(
                                 &inbound,
                                 stf_cfg,
-                                nonce + self.system_txs_appended,
+                                self.live_source.with_index(self.system_txs_appended),
                             )
                         }) {
                         Ok(deliveries) if deliveries.is_empty() && !target_entries.is_empty() => {
@@ -4690,7 +4673,24 @@ impl CrossChainDrain {
                     // The delivery re-runs the on-chain claim compare, so this
                     // append IS the verifier: a revert means the claims and the
                     // block disagree and the tx must go.
-                    if let Err((at, why)) = append_and_execute(&mut self.draft, &deliveries) {
+                    let plans = deliveries
+                        .into_iter()
+                        .map(eez_protocol::system_tx::PlannedTransaction::Native)
+                        .collect::<Vec<_>>();
+                    let mut deliveries = Vec::new();
+                    if let Err((at, why)) =
+                        append_and_execute(&mut self.draft, &plans, &mut deliveries)
+                    {
+                        if matches!(why, BuildError::Capacity) && !self.sync_txs.is_empty() {
+                            self.end = DrainEnd::Cut {
+                                cut: BudgetCut::BlockGas(BlockGasCut {
+                                    gas_used: self.draft.gas_used(),
+                                    declared: eez_primitives::SYSTEM_TX_GAS_CAP,
+                                }),
+                                rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                            };
+                            break;
+                        }
                         // A backing-store failure says nothing about the tx —
                         // abort the slot instead of evicting a valid delivery.
                         if matches!(&why, BuildError::Provider(_)) {
@@ -4742,6 +4742,18 @@ impl CrossChainDrain {
                     self.budget = candidate_budget;
                     self.survivor_comps.push((composition, held.hash));
                     self.survivors.push((idx, held));
+                }
+                Err(eez_protocol::ComposerError::Executor(
+                    eez_protocol::ExecutorError::Capacity,
+                )) if !self.sync_txs.is_empty() => {
+                    self.end = DrainEnd::Cut {
+                        cut: BudgetCut::BlockGas(BlockGasCut {
+                            gas_used: self.draft.gas_used(),
+                            declared: eez_primitives::SYSTEM_TX_GAS_CAP,
+                        }),
+                        rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                    };
+                    break;
                 }
                 Err(e) if sim_error_is_poison(&e) => {
                     event!(
@@ -5028,6 +5040,9 @@ async fn sign_post_batch_tx(
 
 #[cfg(test)]
 mod recovery_tests;
+
+#[cfg(test)]
+mod native_gas_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6137,13 +6152,12 @@ mod tests {
     /// second must be refused before `build_sync_block` hard-errors on it.
     #[test]
     fn block_gas_fit_refuses_the_second_fat_outbound_pair() {
-        // Live shapes: 30M block, 2M `loadExecutionTable`, a user tx declaring
-        // 16.7M and burning 13.3M of it.
-        const LOAD: u64 = 2_000_000;
+        // The early gate checks the signed user's declared gas. The actual
+        // load is metered before the user is admitted by append_and_execute.
         const USER_DECLARED: u64 = 16_700_000;
         const USER_BURNED: u64 = 13_300_000;
         const LOAD_BURNED: u64 = 100_000;
-        let pair = LOAD + USER_DECLARED;
+        let pair = USER_DECLARED;
 
         // Pair 1 fits an empty block.
         assert_eq!(
@@ -6197,9 +6211,8 @@ mod tests {
     fn eip_7825_user_cap_is_independent_of_sync_block_fit() {
         // An invalid user limit can still fit in the aggregate Sync-block budget.
         const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
-        const SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
         let invalid_user_limit = EIP_7825_TX_GAS_LIMIT + 1;
-        let pair_limit = SYSTEM_TX_GAS_LIMIT + invalid_user_limit;
+        let pair_limit = invalid_user_limit;
 
         assert_eq!(
             block_gas_fit(0, pair_limit, BUILDER_GAS_LIMIT),

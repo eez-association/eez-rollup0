@@ -125,8 +125,8 @@ if [[ ! "$system_address" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
     exit 1
 fi
 system_address="$(cast to-check-sum-address "$system_address")"
-if [[ "$(printf '%s' "$system_address" | tr '[:upper:]' '[:lower:]')" != "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076" ]]; then
-    echo "system address must be the reserved native address 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076" >&2
+if [[ "$(printf '%s' "$system_address" | tr '[:upper:]' '[:lower:]')" != "0xfffffffffffffffffffffffffffffffffffffffe" ]]; then
+    echo "system address must be the reserved native address 0xfffffffffffffffffffffffffffffffffffffffe" >&2
     exit 1
 fi
 
@@ -135,10 +135,12 @@ if [[ ! "$recovery_address" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
     exit 1
 fi
 recovery_address="$(cast to-check-sum-address "$recovery_address")"
-if [[ "$(printf '%s' "$recovery_address" | tr '[:upper:]' '[:lower:]')" == "0x0000000000000000000000000000000000000000" ]]; then
-    echo "recovery address must be non-zero" >&2
-    exit 1
-fi
+case "$(printf '%s' "$recovery_address" | tr '[:upper:]' '[:lower:]')" in
+    0x0000000000000000000000000000000000000000|0xfffffffffffffffffffffffffffffffffffffffe)
+        echo "recovery address must be non-zero and differ from the reserved L2 system address" >&2
+        exit 1
+        ;;
+esac
 
 forge_version="$(forge --version | sed -n 's/^forge Version: //p')"
 if [[ "$forge_version" != "$EXPECTED_FOUNDRY_VERSION" ]]; then
