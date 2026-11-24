@@ -1559,6 +1559,24 @@ where
         Ok(self.l2_sealed_header_at(l2_block)?.hash())
     }
 
+    /// Whether height `number` is on the local chain, by [`on_local_chain`].
+    fn is_local(&self, number: u64) -> bool {
+        on_local_chain(number, self.inner.committer.last_header().number())
+    }
+
+    /// The hash of the local chain's block `number`; `None` above its head.
+    fn local_hash(&self, number: u64) -> DeriverResult<Option<B256>> {
+        if !self.is_local(number) {
+            return Ok(None);
+        }
+        Ok(self
+            .inner
+            .l2_provider
+            .sealed_header(number)
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
+            .map(|header| header.hash()))
+    }
+
     /// Height of the canonical block with hash `commitment`, if we hold one.
     fn block_at(&self, commitment: B256) -> DeriverResult<Option<u64>> {
         let Some(number) = self
@@ -1978,11 +1996,7 @@ where
             }
         } else if range_already_derived(
             stale_boundary,
-            self.inner
-                .l2_provider
-                .sealed_header(from_block + last_index as u64)
-                .map_err(|e| DeriverError::L2Provider(e.to_string()))?
-                .map(|header| header.hash()),
+            self.local_hash(from_block + last_index as u64)?,
             settlement.final_state,
         ) {
             event!(
@@ -2029,13 +2043,13 @@ where
                 // Skip only identical blocks: a needless rewrite wedges reth.
                 // Txs alone do not identify one; the header inputs seal in too.
                 let header_inputs = BlockHeaderInputs::from_span(decoded, i)?;
-                let local_matches =
-                    local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
-                        && local_header_inputs_match(
-                            &self.inner.l2_provider,
-                            l2_block,
-                            &header_inputs,
-                        )?;
+                let local_matches = self.is_local(l2_block)
+                    && local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
+                    && local_header_inputs_match(
+                        &self.inner.l2_provider,
+                        l2_block,
+                        &header_inputs,
+                    )?;
                 let should_replay = suffix_replay.required(local_matches);
                 event!(
                     name: "eez.deriver.reconcile.block",
@@ -2340,6 +2354,13 @@ mod header_inputs_tests {
     }
 }
 
+/// Whether height `number` is on the local chain whose head is at `tip`. A
+/// block above the head is not, even where a read by number still returns
+/// one: a retreat leaves its blocks readable.
+const fn on_local_chain(number: u64, tip: u64) -> bool {
+    number <= tip
+}
+
 fn local_batch_boundary_matches<L2>(l2_provider: &Arc<L2>, from_block: u64) -> DeriverResult<bool>
 where
     L2: BlockReader<Header = alloy_consensus::Header>,
@@ -2625,11 +2646,26 @@ mod suffix_replay_tests {
 
 #[cfg(test)]
 mod reconcile_decision_tests {
-    use super::{range_already_derived, resume_replay_txs};
+    use super::{on_local_chain, range_already_derived, resume_replay_txs};
     use alloy_primitives::B256;
 
     fn tx(byte: u8) -> Vec<u8> {
         vec![byte]
+    }
+
+    /// After a retreat a read by number still returns the block that was at a
+    /// height above the new head; it is not part of the local chain, so a range
+    /// ending there is not derived yet, even when that block is the one L1
+    /// settled.
+    #[test]
+    fn a_block_above_the_head_is_not_local() {
+        let settled = B256::repeat_byte(0xAA);
+        // The block a read by number returns at 62, left behind by a retreat
+        // to 58, is the one L1 settled.
+        let terminal = on_local_chain(62, 58).then_some(settled);
+        assert_eq!(terminal, None);
+        assert!(!range_already_derived(false, terminal, Some(settled)));
+        assert!(on_local_chain(58, 58), "the head itself is local");
     }
 
     /// The terminal block's hash decides the whole range: a block hash contains
