@@ -94,38 +94,129 @@ fn delivery() -> PlannedTransaction {
 }
 
 #[test]
-fn permanent_native_revert_is_not_capacity_under_load() {
-    let (provider, config, parent, signer, burner) = fixture(bytes!("63deadbeef6000526004601cfd"));
-    let open = |prefix: &[Bytes]| {
-        SyncBlockState::open(
-            Arc::new(provider.clone()),
-            &config,
-            &parent,
-            1012,
-            Address::ZERO,
-            prefix,
-        )
-        .unwrap()
-    };
-    let plan = delivery();
-    let full = append_and_execute(&mut open(&[]), std::slice::from_ref(&plan), &mut Vec::new())
-        .unwrap_err();
-    assert!(matches!(full.1, BuildError::ExecuteTx { .. }));
-    let mut prefix = open(&[signed(&signer, 0, burner, 14_500_000)]);
-    assert!(prefix.gas_used() > 13_222_784);
-    let reduced = append_and_execute(&mut prefix, &[plan], &mut Vec::new()).unwrap_err();
-    assert!(matches!(reduced.1, BuildError::ExecuteTx { .. }));
+fn permanent_native_failure_is_not_capacity_under_load() {
+    use evm2::{evm::DynDatabase as _, interpreter::Word};
+
+    for (name, code, burns_budget) in [
+        ("revert", bytes!("63deadbeef6000526004601cfd"), false),
+        ("invalid", bytes!("fe"), true),
+        // Write storage before looping forever; the failed execution must roll it back.
+        ("out of gas", bytes!("60015f555b600456"), true),
+    ] {
+        let (provider, config, parent, signer, burner) = fixture(code);
+        let open = |prefix: &[Bytes]| {
+            SyncBlockState::open(
+                Arc::new(provider.clone()),
+                &config,
+                &parent,
+                1012,
+                Address::ZERO,
+                prefix,
+            )
+            .unwrap()
+        };
+        let plan = delivery();
+        let mut empty = open(&[]);
+        let full = append_and_execute(&mut empty, std::slice::from_ref(&plan), &mut Vec::new())
+            .unwrap_err();
+        assert!(
+            matches!(full.1, BuildError::ExecuteTx { .. }),
+            "{name}: {full:?}"
+        );
+        let mut prefix = open(&[signed(&signer, 0, burner, 14_500_000)]);
+        let gas_before = prefix.gas_used();
+        let remaining = BUILDER_GAS_LIMIT - gas_before;
+        assert!(remaining < eez_primitives::SYSTEM_TX_GAS_CAP);
+        let reduced = append_and_execute(&mut prefix, &[plan], &mut Vec::new()).unwrap_err();
+        assert!(
+            matches!(reduced.1, BuildError::ExecuteTx { .. }),
+            "{name}: {reduced:?}"
+        );
+        if burns_budget {
+            assert_eq!(
+                empty.gas_used(),
+                eez_primitives::SYSTEM_TX_GAS_CAP,
+                "{name}"
+            );
+            assert_eq!(prefix.gas_used() - gas_before, remaining, "{name}");
+        } else {
+            assert_eq!(empty.gas_used(), prefix.gas_used() - gas_before, "{name}");
+        }
+        let mut fork = prefix.fork().unwrap();
+        let (state, _) = fork.state_and_env();
+        assert_eq!(
+            state
+                .database_mut()
+                .get_storage(&eez_primitives::EEZL2_ADDRESS, &Word::ZERO)
+                .unwrap(),
+            Word::ZERO,
+            "{name}: neither failed run may leak storage",
+        );
+    }
+}
+
+#[test]
+fn native_budget_dependent_outcome_is_capacity_without_commit() {
+    for (name, code, full_success) in [
+        // Branch on whether GAS exceeds 16M: only the full-cap run stops.
+        (
+            "full success, reduced out of gas",
+            bytes!("62f424005a11600d575b6009565b00"),
+            true,
+        ),
+        // The full-cap run hits INVALID; the reduced run succeeds.
+        (
+            "full invalid, reduced success",
+            bytes!("62f424005a11600a57005bfe"),
+            false,
+        ),
+        // Both halt and consume their budgets, but with different stop reasons.
+        (
+            "full invalid, reduced stack underflow",
+            bytes!("62f424005a11600b5750005bfe"),
+            false,
+        ),
+        // Both revert, but their output contains the starting gas.
+        ("different revert output", bytes!("5a5f5260205ffd"), false),
+    ] {
+        let (provider, config, parent, signer, burner) = fixture(code);
+        let open = |prefix: &[Bytes]| {
+            SyncBlockState::open(
+                Arc::new(provider.clone()),
+                &config,
+                &parent,
+                1012,
+                Address::ZERO,
+                prefix,
+            )
+            .unwrap()
+        };
+        let plan = delivery();
+        let full = open(&[])
+            .execute_tx(&plan.at_position(BUILDER_GAS_LIMIT, 0).unwrap())
+            .unwrap();
+        assert_eq!(full.success, full_success, "{name}");
+        let mut busy = open(&[signed(&signer, 0, burner, 14_500_000)]);
+        let gas_before = busy.gas_used();
+        assert!(BUILDER_GAS_LIMIT - gas_before < 16_000_000);
+        let reduced = busy.execute_tx(&plan.at_position(BUILDER_GAS_LIMIT, gas_before).unwrap());
+        assert!(
+            matches!(reduced, Err(BuildError::Capacity)),
+            "{name}: {reduced:?}"
+        );
+        assert_eq!(busy.gas_used(), gas_before, "{name}");
+    }
 }
 
 #[test]
 fn native_packing_dependent_success_is_refused_without_commit() {
-    // One program returns GAS; the other stores it while returning identical
-    // output. Both succeed at either budget, so status alone misses the change.
-    for code in [
-        bytes!("5a5f5260205ff3"),
-        bytes!("36156009575a5f55005b5f545f5260205ff3"),
+    // GAS can change output, storage, or only gas spent. All three programs
+    // succeed at either budget, so status alone misses the change.
+    for (code, writes_storage) in [
+        (bytes!("5a5f5260205ff3"), false),
+        (bytes!("36156009575a5f55005b5f545f5260205ff3"), true),
+        (bytes!("5b6207a1205a1160005700"), false),
     ] {
-        let writes_storage = code.len() > 8;
         let (provider, config, parent, signer, burner) = fixture(code);
         let open = |prefix: &[Bytes]| {
             SyncBlockState::open(

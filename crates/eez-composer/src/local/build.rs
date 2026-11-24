@@ -307,7 +307,16 @@ fn execute_and_commit(
         }
         Ok(executed) => executed,
     };
-    if reference.is_some_and(|reference| {
+    if reference.is_some_and(|mut reference| {
+        // Equivalent failures must reach normal rejection even when a halt
+        // consumes the entire (different) budget in each run. Normalize only
+        // the reference's gas accounting; retain every other result/state check.
+        if !reference.result.is_success() && !executed.result.is_success() {
+            reference.result.total_gas_spent = executed.result.total_gas_spent;
+            reference.result.state_gas_spent = executed.result.state_gas_spent;
+            reference.result.refunded = executed.result.refunded;
+            reference.result.floor_gas = executed.result.floor_gas;
+        }
         reference.result != executed.result || reference.pending_state != executed.pending_state
     }) {
         return Err(BuildError::Capacity);
