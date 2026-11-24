@@ -8,6 +8,8 @@ test-group = "integration"
 
 [test-groups]
 integration = { max-threads = 1 }
+# eez-node-e2e under the `local` profile: at most this many slots at once.
+e2e-local = { max-threads = 4 }
 
 # CI retries for diagnostics, but a pass on retry is still a failure: a flaky
 # integration test must not make the branch green.
@@ -15,3 +17,18 @@ integration = { max-threads = 1 }
 inherits = "default"
 retries = 2
 flaky-result = "fail"
+
+# Local runs of eez-node-e2e several tests at a time, for a large machine:
+#   cargo nextest run -p eez-node-e2e --profile local --no-fail-fast
+# A test that runs two composer nodes at once takes two slots, any other one.
+[profile.local]
+
+[[profile.local.overrides]]
+filter = "package(eez-node-e2e) & kind(test) & (binary(native_system) | test(/^(based_mode_|happy_case_two_composers_|multi_composer_|two_composers_|streaming::)/))"
+threads-required = 2
+test-group = "e2e-local"
+
+[[profile.local.overrides]]
+filter = "package(eez-node-e2e) & kind(test)"
+threads-required = 1
+test-group = "e2e-local"
