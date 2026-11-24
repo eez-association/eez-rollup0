@@ -165,6 +165,7 @@ async fn launch(
         l1_reader.clone(),
         chain_spec,
         timing.l2_block_time().as_secs(),
+        timing.l1_block_time().as_secs(),
         deploy_block,
         Arc::clone(&l1_head),
         Some(system_tx_cfg),

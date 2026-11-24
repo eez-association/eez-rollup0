@@ -47,7 +47,7 @@ pub use sequencer::{DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, Sequenc
 #[doc(inline)]
 pub use slot::{
     ParentContext, SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle,
-    SyncSlotMode, spawn_l1_anchored,
+    SyncSlotMode, SyncSlotOutcome, spawn_l1_anchored,
 };
 #[doc(inline)]
 pub use timing::{MAX_BLOCKS_PER_BATCH, MAX_BLOCKS_PER_CATCHUP, RollupTiming, SlotComposition};

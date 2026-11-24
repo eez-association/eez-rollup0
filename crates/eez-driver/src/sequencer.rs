@@ -40,7 +40,9 @@ use tokio::sync::mpsc;
 
 use crate::block_committer::BlockCommitterHandle;
 use crate::error::{DriverError, DriverResult};
-use crate::slot::{SlotEvent, SlotKind, SyncSlotComposerHandle, SyncSlotMode};
+use crate::slot::{
+    SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposerHandle, SyncSlotMode, SyncSlotOutcome,
+};
 use crate::timing::{RollupTiming, SlotComposition};
 
 /// How often the sequencer re-publishes the current forkchoice state.
@@ -69,16 +71,32 @@ fn log_stale_parent(phase: &str) {
     );
 }
 
+/// The composed block, `None` for the pool-driven fallback, or `Err` when the
+/// composer skipped the slot and nothing may be committed.
+fn sync_slot_block(outcome: SyncSlotOutcome, phase: &str) -> Result<Option<SyncSlotBlock>, ()> {
+    match outcome {
+        SyncSlotOutcome::Built(built) => Ok(Some(*built)),
+        SyncSlotOutcome::Fallback => Ok(None),
+        SyncSlotOutcome::Skip => {
+            event!(
+                name: "eez.sequencer.sync_slot.skipped",
+                Level::WARN,
+                phase,
+                "composer skipped the Sync slot; committing nothing — next trigger retries the height",
+            );
+            Err(())
+        }
+    }
+}
+
 /// Builds [`EthPayloadAttributes`] for the next block.
 ///
 /// Stage 1 produces minimal valid attributes: a strictly-increasing timestamp
-/// honoring the caller's target, a placeholder `prev_randao`, a
+/// honoring the caller's target, the caller's L1-derived `prev_randao`, a
 /// caller-configured `suggested_fee_recipient`, and the post-Shanghai /
 /// post-Cancun fields filled in based on the chainspec.
 ///
-/// Stage 3 will replace the placeholder `prev_randao` with an L1-derived
-/// value per the protocol spec (§13.14). Stage 4 will add a hook for
-/// composer-supplied system transactions.
+/// Stage 4 will add a hook for composer-supplied system transactions.
 #[derive(Debug, Clone)]
 pub struct EthAttributesBuilder<ChainSpec> {
     chain_spec: Arc<ChainSpec>,
@@ -114,13 +132,12 @@ where
         &self,
         parent: &SealedHeader<ChainSpec::Header>,
         target_timestamp: u64,
+        prev_randao: B256,
     ) -> EthPayloadAttributes {
         let timestamp = core::cmp::max(parent.timestamp().saturating_add(1), target_timestamp);
         EthPayloadAttributes {
             timestamp,
-            // TODO(stage 3): derive from L1 per spec §13.14. Zeroed for
-            // stage 1 — no security depends on prev_randao yet.
-            prev_randao: B256::ZERO,
+            prev_randao,
             suggested_fee_recipient: self.suggested_fee_recipient,
             withdrawals: self
                 .chain_spec
@@ -156,6 +173,7 @@ where
     composer: SyncSlotComposerHandle,
     max_speculative_depth: u64,
     l1_head: Arc<eez_l1::L1CanonicalHead>,
+    l1_reader: eez_l1::L1Reader,
     /// Consecutive Sync blocks skipped for off-grid drift. A skip self-heals
     /// next trigger; a run of them is a stall and must be loud (invariant 7).
     off_grid_skips: u32,
@@ -205,6 +223,7 @@ where
         composer: SyncSlotComposerHandle,
         max_speculative_depth: u64,
         l1_head: Arc<eez_l1::L1CanonicalHead>,
+        l1_reader: eez_l1::L1Reader,
     ) -> Self {
         Self {
             attributes,
@@ -215,6 +234,7 @@ where
             composer,
             max_speculative_depth,
             l1_head,
+            l1_reader,
             off_grid_skips: 0,
         }
     }
@@ -236,6 +256,16 @@ where
                         break;
                     };
                     if let Err(err) = self.advance(event).await {
+                        // The Deriver is reconciling an L1 reorg; it resumes
+                        // production once the unsafe seeds are rechecked.
+                        if matches!(&err, DriverError::StaleL1View) {
+                            event!(
+                                name: "eez.sequencer.stale_l1_view",
+                                Level::DEBUG,
+                                "L1 reorg recovery pending; skipping this trigger",
+                            );
+                            continue;
+                        }
                         event!(
                             name: "eez.sequencer.advance.failed",
                             Level::ERROR,
@@ -426,6 +456,7 @@ where
                 let parent = crate::slot::ParentContext {
                     header: last_header.clone(),
                 };
+                let l1_revision = self.committer.sequencing_revision()?;
                 let prebuilt = composer
                     // Supply the immediate next L1 block for a cap-triggered
                     // historical chunk. The ordinary catch-up marker remains
@@ -438,8 +469,14 @@ where
                         SyncSlotMode::Catchup,
                     )
                     .await;
+                let Ok(prebuilt) = sync_slot_block(prebuilt, "catchup.sync") else {
+                    return Ok(());
+                };
                 if let Some(built) = prebuilt {
-                    if let Err(err) = self.commit_one_prebuilt(SlotKind::Sync, built).await {
+                    if let Err(err) = self
+                        .commit_one_prebuilt(SlotKind::Sync, built, l1_revision)
+                        .await
+                    {
                         if matches!(&err, DriverError::StaleParent { .. }) {
                             log_stale_parent("catchup.sync.prebuilt");
                             return Ok(());
@@ -517,6 +554,7 @@ where
                 // Check against expected_sync_ts — the ts the bundle is pinned
                 // to below — so an off-grid trigger already past its pin defers
                 // instead of composing a bundle that can't make its slot.
+                let l1_revision = self.committer.sequencing_revision()?;
                 let prebuilt = if self.sync_block_misses_l1_slot(expected_sync_ts) {
                     event!(
                         name: "eez.sequencer.sync_slot.deferred_late",
@@ -528,7 +566,7 @@ where
                     );
                     // Empty mode keeps this grid height batch-boundary-eligible
                     // (a tx-bearing block is not). If the empty build fails,
-                    // control falls through to the mempool-fed commit below.
+                    // the composer skips the slot.
                     let parent = crate::slot::ParentContext {
                         header: last_header.clone(),
                     };
@@ -557,8 +595,14 @@ where
                         )
                         .await
                 };
+                let Ok(prebuilt) = sync_slot_block(prebuilt, "slot.sync") else {
+                    return Ok(());
+                };
                 if let Some(built) = prebuilt {
-                    match self.commit_one_prebuilt(SlotKind::Sync, built).await {
+                    match self
+                        .commit_one_prebuilt(SlotKind::Sync, built, l1_revision)
+                        .await
+                    {
                         Ok(()) => {}
                         Err(err) if matches!(&err, DriverError::StaleParent { .. }) => {
                             log_stale_parent("slot.sync.prebuilt");
@@ -608,16 +652,22 @@ where
     /// Commit a pre-built Sync block (from the cross-chain composer)
     /// via `commit_derived` — same engine-API tail the Deriver uses
     /// for L1-derived blocks. Holds the reconcile lock so a sync-slot
-    /// commit can't race with a deriver-side reconcile.
+    /// commit can't race with a deriver-side reconcile, and rejects the
+    /// block with [`DriverError::StaleL1View`] if an L1 reorg began after
+    /// `l1_revision` was captured.
     async fn commit_one_prebuilt(
         &mut self,
         kind: SlotKind,
         built: crate::slot::SyncSlotBlock,
+        l1_revision: u64,
     ) -> DriverResult<()> {
         // `commit_derived` doesn't take the lock itself (only
         // `commit_sequenced` does, and the Deriver already holds it via
         // `begin_reconcile`), so hold it here too.
         let _reconcile_guard = self.committer.begin_reconcile().await;
+        if self.committer.sequencing_revision()? != l1_revision {
+            return Err(DriverError::StaleL1View);
+        }
         // Stale-parent check under the lock, like commit_sequenced: the
         // Deriver (or a failed-batch recovery) can move the head between
         // compose and commit, and a prebuilt block on a stale parent
@@ -639,6 +689,9 @@ where
             // prover witness-capture feed (the follower/deriver passes false).
             .commit_derived(built.payload, built.header, true)
             .await?;
+        if let Some(bundle_commit) = built.bundle_commit {
+            let _ = bundle_commit.send(());
+        }
 
         event!(
             name: "eez.sequencer.block.produced",
@@ -662,9 +715,18 @@ where
         let parent_hash = parent.hash();
         let parent_ts = parent.timestamp();
         let next_ts = parent_ts.saturating_add(self.timing.l2_block_time().as_secs());
-        let attrs = self.attributes.build(parent, next_ts);
+        let l1_revision = self.committer.sequencing_revision()?;
+        let prev_randao = self
+            .l1_reader
+            .prev_randao_for(next_ts, self.timing.l1_block_time().as_secs())
+            .await
+            .map_err(|e| DriverError::Provider(format!("L1 prevRandao at {next_ts}: {e}")))?;
+        let attrs = self.attributes.build(parent, next_ts, prev_randao);
         let timestamp = attrs.timestamp;
-        let outcome = self.committer.commit_sequenced(parent_hash, attrs).await?;
+        let outcome = self
+            .committer
+            .commit_sequenced(parent_hash, attrs, l1_revision)
+            .await?;
         let block_number = outcome.header.number();
         let block_hash = outcome.header.hash();
 
@@ -678,5 +740,21 @@ where
             "produced block {block_number} hash={block_hash} ts={timestamp} kind={kind}",
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only a skip stops the Sync commit; a fallback still reaches the
+    /// pool-driven `commit_one`.
+    #[test]
+    fn skipped_sync_slot_commits_nothing() {
+        assert!(sync_slot_block(SyncSlotOutcome::Skip, "test").is_err());
+        assert!(matches!(
+            sync_slot_block(SyncSlotOutcome::Fallback, "test"),
+            Ok(None)
+        ));
     }
 }

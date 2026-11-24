@@ -110,6 +110,20 @@ pub struct SyncSlotBlock {
     pub payload: ExecutionData,
     /// Sealed header of the new block (head-mirror update on commit).
     pub header: SealedHeader<Header>,
+    /// Releases bundle submission once the block is accepted. Dropping cancels it.
+    pub bundle_commit: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// What a [`SyncSlotComposer`] hands back for one Sync slot.
+#[derive(Debug)]
+pub enum SyncSlotOutcome {
+    /// Commit this block.
+    Built(Box<SyncSlotBlock>),
+    /// No composed block: the Sequencer commits a pool-driven Sync block.
+    Fallback,
+    /// Commit nothing; the next trigger retries the height. For a slot that
+    /// owes an empty block it cannot build.
+    Skip,
 }
 
 /// Parent context the Sequencer supplies to a [`SyncSlotComposer`].
@@ -147,7 +161,7 @@ pub enum SyncSlotMode {
 /// Called by the Sequencer before each Sync block. The production impl
 /// (`eez-composer::Composer`) drains its `HeldPool`, resolves each held
 /// tx into system txs, builds the Sync block in-process, and returns it.
-/// `None` = no content → the Sequencer does a pool-driven Sync commit.
+/// See [`SyncSlotOutcome`] for what else it may return.
 /// `mode` gates the drain (see [`SyncSlotMode`]). Lives here, not in
 /// `eez-composer`, to avoid a dependency cycle.
 #[async_trait]
@@ -166,7 +180,7 @@ pub trait SyncSlotComposer: Send + Sync + 'static {
         timestamp: u64,
         target_l1_block: Option<u64>,
         mode: SyncSlotMode,
-    ) -> Option<SyncSlotBlock>;
+    ) -> SyncSlotOutcome;
 
     /// Run pending failed-bundle recovery before this tick's commit. May move
     /// the head (reorg + substitution), so callers re-read it. Default: no-op.

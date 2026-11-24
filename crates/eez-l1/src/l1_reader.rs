@@ -12,6 +12,7 @@ use eez_protocol::abi::rollupsCall;
 use crate::blob_source::BeaconBlobSource;
 use crate::config::L1ReaderConfig;
 use crate::error::{L1Error, L1Result};
+use crate::prev_randao::{RandaoHeader, select_prev_randao};
 use crate::scan::{BatchLogChunks, Post, scan_next_batch_log_chunk};
 
 /// Read-only L1 client for historical batch scans and canonicality checks.
@@ -154,6 +155,61 @@ impl L1Reader {
             .await
             .map_err(|e| L1Error::Provider(format!("get_block_by_number({number}): {e}")))?
             .map(|b| b.header.hash))
+    }
+
+    /// Resolve the L1-derived `prev_randao` for an L2 timestamp.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] on RPC failure, plus the
+    /// [`select_prev_randao`](crate::prev_randao::select_prev_randao) errors.
+    pub async fn prev_randao_for(
+        &self,
+        l2_timestamp: u64,
+        l1_block_time_secs: u64,
+    ) -> L1Result<B256> {
+        let provider = self.build_provider();
+        let fetch = |tag: BlockNumberOrTag| {
+            let provider = &provider;
+            async move {
+                Ok(provider
+                    .get_block_by_number(tag)
+                    .await
+                    .map_err(|e| L1Error::Provider(format!("get_block_by_number({tag}): {e}")))?
+                    .map(|b| {
+                        (
+                            b.header.hash,
+                            RandaoHeader {
+                                number: b.header.number,
+                                timestamp: b.header.timestamp,
+                                prev_randao: b.header.mix_hash,
+                            },
+                        )
+                    }))
+            }
+        };
+        let (head_hash, latest) = fetch(BlockNumberOrTag::Latest)
+            .await?
+            .ok_or_else(|| L1Error::Provider("L1 source has no latest block".into()))?;
+        let seed = select_prev_randao(latest, l2_timestamp, l1_block_time_secs, |n| async move {
+            Ok(fetch(BlockNumberOrTag::Number(n))
+                .await?
+                .map(|(_, header)| header))
+        })
+        .await?;
+        // Normal head advancement preserves this block by number. If it was
+        // replaced, the search may have combined headers from different forks.
+        if fetch(BlockNumberOrTag::Number(latest.number))
+            .await?
+            .map(|(hash, _)| hash)
+            != Some(head_hash)
+        {
+            return Err(L1Error::SourceIncomplete {
+                block: latest.number,
+                detail: "L1 head changed forks while selecting prevRandao".into(),
+            });
+        }
+        Ok(seed)
     }
 
     /// Whether the source serves `block`'s header, logs, and tx bodies — the

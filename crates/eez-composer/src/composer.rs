@@ -28,7 +28,7 @@ use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use eez_driver::{
     BUILDER_GAS_LIMIT, BlockCommitterHandle, MAX_BLOCKS_PER_BATCH, ParentContext, RollupTiming,
-    SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
+    SyncSlotBlock, SyncSlotComposer, SyncSlotMode, SyncSlotOutcome,
     witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_engine::EezEngineTypes;
@@ -570,6 +570,7 @@ struct SlotTarget<'a> {
     parent_header: &'a reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
     timestamp: u64,
     fee_recipient: Address,
+    prev_randao: B256,
     bundle_target: BundleTarget,
 }
 
@@ -1598,8 +1599,9 @@ where
 {
     /// Drain `rollup_id`'s cross-chain `HeldPool`, compose its transactions,
     /// and hand the resulting Sync block back for the Sequencer to commit.
-    /// Returns `None` (→ vanilla pool-driven Sync commit) when cross-chain
-    /// composition is unavailable or cannot produce a block this slot.
+    /// Returns `Fallback` (→ vanilla pool-driven Sync commit) when cross-chain
+    /// composition is unavailable or cannot produce a block this slot, and
+    /// `Skip` when the slot owes an empty block it cannot build.
     ///
     /// Each eligible transaction runs through cross-chain simulation. Inbound
     /// survivors execute through the L1 bundle; outbound survivors execute in
@@ -1611,7 +1613,7 @@ where
         timestamp: u64,
         target_l1_block: Option<u64>,
         mode: SyncSlotMode,
-    ) -> Option<SyncSlotBlock> {
+    ) -> SyncSlotOutcome {
         // Steady bundles pin both block and timestamp. Ordinary catch-up
         // markers remain next-available so an L1 reorg cannot strand them,
         // while cap-triggered historical chunks name the known next block
@@ -1627,7 +1629,7 @@ where
             mode = ?mode,
             "compose_sync_slot invoked",
         );
-        let rollup = self.inner.rollups.get(&rollup_id).or_else(|| {
+        let Some(rollup) = self.inner.rollups.get(&rollup_id) else {
             event!(
                 name: "eez.composer.sync_slot.unknown_rollup",
                 Level::ERROR,
@@ -1635,8 +1637,8 @@ where
                 known_rollups = ?self.inner.rollups.keys().collect::<Vec<_>>(),
                 "compose_sync_slot called for unknown rollup_id",
             );
-            None
-        })?;
+            return SyncSlotOutcome::Fallback;
+        };
         let cc = &self.inner.cross_chain;
         // Use the Sequencer-supplied parent header directly (it reflects
         // the just-committed block via `last_header`'s mirror); a
@@ -1658,17 +1660,33 @@ where
         // While blocked the slot still gets its (empty) Sync block — L2
         // cadence is unconditional; the next postBatch covers it.
         let cursor = rollup.l1_head.cursor();
-        if let Some(outcome) = self.reconcile_slot_batches(rollup_id, rollup, cursor).await {
-            // A moved head makes this slot's parent stale — the Sequencer's bail
-            // covers it. An UNCHANGED head (reinsert / stale-verdict) still owes
-            // the slot a block, and returning None there would let the
-            // mempool-fed commit_one fallback mint a tx-bearing grid block.
-            return match outcome {
-                RecoveryOutcome::HeadUnchanged => {
-                    self.build_empty_slot_block(rollup, &parent_header, timestamp)
-                }
-                RecoveryOutcome::HeadMoved => None,
-            };
+        let recovery = self.reconcile_slot_batches(rollup_id, rollup, cursor).await;
+        // A moved head makes this slot's parent stale — the Sequencer's bail
+        // covers it. Recovery runs before the seed lookup so an L1 outage
+        // cannot hold it back.
+        if matches!(recovery, Some(RecoveryOutcome::HeadMoved)) {
+            return SyncSlotOutcome::Fallback;
+        }
+        let prev_randao = match self.prev_randao_at(timestamp).await {
+            Ok(prev_randao) => prev_randao,
+            Err(error) => {
+                event!(
+                    name: "eez.composer.sync_slot.prev_randao_unavailable",
+                    Level::WARN,
+                    rollup_id,
+                    timestamp,
+                    error = %error,
+                    "L1 prevRandao unavailable; skipping the Sync slot — next trigger retries",
+                );
+                return SyncSlotOutcome::Skip;
+            }
+        };
+
+        if matches!(recovery, Some(RecoveryOutcome::HeadUnchanged)) {
+            // An UNCHANGED head (reinsert / stale-verdict) still owes the slot a
+            // block, and returning Fallback here would let the mempool-fed
+            // commit_one fallback mint a tx-bearing grid block.
+            return self.build_empty_slot_block(rollup, &parent_header, timestamp, prev_randao);
         }
 
         let blocked = rollup.optimistic.blocking_height(cursor).is_some();
@@ -1683,7 +1701,7 @@ where
                 parent_number,
                 "previous postBatch unresolved; committing Sync block without emission this slot",
             );
-            return self.build_empty_slot_block(rollup, &parent_header, timestamp);
+            return self.build_empty_slot_block(rollup, &parent_header, timestamp, prev_randao);
         }
         // Over the fee cap no blob post can land, so nothing is composed until
         // the fee falls; held transactions wait uncharged.
@@ -1697,7 +1715,7 @@ where
                 error = %error,
                 "no landable blob fee; committing Sync block without emission this slot",
             );
-            return self.build_empty_slot_block(rollup, &parent_header, timestamp);
+            return self.build_empty_slot_block(rollup, &parent_header, timestamp, prev_randao);
         }
 
         // ── Bounded emission ─────────────────────────────────────────
@@ -1725,7 +1743,7 @@ where
                     "historical chunk emission failed; committing Sync block without emission — same bounded range retries next slot",
                 );
             }
-            return self.build_empty_slot_block(rollup, &parent_header, timestamp);
+            return self.build_empty_slot_block(rollup, &parent_header, timestamp, prev_randao);
         }
 
         // Deferred-late: the bundle missed its L1 slot, so suppress PINNED
@@ -1734,7 +1752,7 @@ where
         // remains valid; checking first would starve a chronically late node
         // (slow prover, relay latency) of settlement entirely.
         if matches!(mode, SyncSlotMode::Empty) {
-            return self.build_empty_slot_block(rollup, &parent_header, timestamp);
+            return self.build_empty_slot_block(rollup, &parent_header, timestamp, prev_randao);
         }
 
         // Catchup: structural-only — skip the drain, emit a minimal postBatch
@@ -1744,21 +1762,26 @@ where
                 parent_header: &parent_header,
                 timestamp,
                 fee_recipient: suggested_fee_recipient,
+                prev_randao,
                 bundle_target, // catch-up → NextBlock (unpinned)
             };
-            return self
+            return match self
                 .dispatch_minimal_postbatch(&cc.exec_ctx, rollup_id, rollup, slot)
                 .await
-                .unwrap_or_else(|err| {
+            {
+                Ok(Some(built)) => SyncSlotOutcome::Built(Box::new(built)),
+                Ok(None) => SyncSlotOutcome::Skip,
+                Err(err) => {
                     event!(
                         name: "eez.composer.catchup.minimal_failed",
                         Level::ERROR,
                         rollup_id,
                         error = %err,
-                        "catchup minimal postBatch failed; Sequencer commits empty Sync",
+                        "catchup minimal postBatch failed; skipping the Sync slot — next trigger retries",
                     );
-                    None
-                });
+                    SyncSlotOutcome::Skip
+                }
+            };
         }
 
         self.compose_steady_slot(
@@ -1766,10 +1789,14 @@ where
             rollup,
             &parent_header,
             timestamp,
+            prev_randao,
             bundle_target,
             cursor,
         )
         .await
+        .map_or(SyncSlotOutcome::Fallback, |built| {
+            SyncSlotOutcome::Built(Box::new(built))
+        })
     }
 
     /// Run recovery on every tick, not just Sync slots, so a mid-slot verdict
@@ -1806,6 +1833,7 @@ where
         rollup: &RollupState<L2>,
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         timestamp: u64,
+        prev_randao: B256,
         bundle_target: BundleTarget,
         cursor: u64,
     ) -> Option<SyncSlotBlock> {
@@ -1855,6 +1883,7 @@ where
                 parent_header,
                 timestamp,
                 fee_recipient: rollup.config.fee_recipient,
+                prev_randao,
                 bundle_target,
             },
         ))
@@ -2139,6 +2168,10 @@ where
         // L1-independent and need no rollback.
         if !failed.txs.is_empty() {
             let guard = committer.begin_reconcile().await;
+            if committer.sequencing_revision().is_err() {
+                rollup.optimistic.reinsert_failed(failed);
+                return RecoveryOutcome::HeadUnchanged;
+            }
             // Cursor re-check UNDER the lock: the Deriver may have
             // canonicalized this very batch from L1 between the
             // observer's verdict and this slot (a false-failure
@@ -2211,6 +2244,17 @@ where
         outcome
     }
 
+    async fn prev_randao_at(&self, timestamp: u64) -> Result<B256, L1Error> {
+        self.inner
+            .submitter
+            .reader()
+            .prev_randao_for(
+                timestamp,
+                self.inner.emission.timing.l1_block_time().as_secs(),
+            )
+            .await
+    }
+
     /// Commit an empty sibling in place of the failed Sync block.
     async fn replace_failed_sync_block(
         &self,
@@ -2225,12 +2269,27 @@ where
             .parent
             .timestamp()
             .saturating_add(self.inner.emission.timing.l2_block_time().as_secs());
+        let prev_randao = match self.prev_randao_at(timestamp).await {
+            Ok(prev_randao) => prev_randao,
+            Err(err) => {
+                event!(
+                    name: "eez.composer.recovery.substitute_failed",
+                    Level::ERROR,
+                    rollup_id,
+                    sync_height,
+                    error = %err,
+                    "empty-sibling prevRandao lookup failed",
+                );
+                return RecoveryOutcome::HeadUnchanged;
+            }
+        };
         match build_sync_block(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
             &failed.parent,
             timestamp,
             rollup.config.fee_recipient,
+            prev_randao,
             &[],
         ) {
             // feed_witness=true: a PRODUCED block — later historical
@@ -2315,6 +2374,7 @@ where
             parent_header,
             timestamp,
             fee_recipient: suggested_fee_recipient,
+            prev_randao,
             bundle_target,
         } = slot;
         let ctx = cc.exec_ctx.as_ref();
@@ -2424,6 +2484,7 @@ where
                 parent_header,
                 timestamp,
                 suggested_fee_recipient,
+                prev_randao,
                 txs,
             )
         };
@@ -2583,6 +2644,7 @@ where
             parent_header,
             timestamp,
             fee_recipient: suggested_fee_recipient,
+            prev_randao,
             bundle_target,
         } = slot;
         let ctx = cc.exec_ctx.as_ref();
@@ -2751,6 +2813,7 @@ where
             parent_header,
             timestamp,
             suggested_fee_recipient,
+            prev_randao,
             &sync_txs,
         ) {
             Ok(b) => b,
@@ -2794,6 +2857,7 @@ where
             parent_header,
             timestamp,
             suggested_fee_recipient,
+            prev_randao,
             &sync_txs,
         ) {
             Ok(r) => r,
@@ -3058,6 +3122,7 @@ where
             built.header.hash(),
             survivors,
         );
+        let (bundle_commit, committed) = tokio::sync::oneshot::channel();
         self.spawn_bundle_observer(
             ctx,
             rollup_id,
@@ -3067,8 +3132,10 @@ where
             built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
+            Some(committed),
         );
         Ok(Some(SyncSlotBlock {
+            bundle_commit: Some(bundle_commit),
             payload: built.payload,
             header: built.header,
         }))
@@ -3093,6 +3160,7 @@ where
             parent_header,
             timestamp,
             fee_recipient: suggested_fee_recipient,
+            prev_randao,
             bundle_target,
         } = slot;
         let empty_built = match build_sync_block(
@@ -3101,6 +3169,7 @@ where
             parent_header,
             timestamp,
             suggested_fee_recipient,
+            prev_randao,
             &[], // no system_txs — empty Sync block
         ) {
             Ok(built) => built,
@@ -3110,7 +3179,7 @@ where
                     Level::ERROR,
                     rollup_id,
                     error = %err,
-                    "minimal Sync block build failed; Sequencer's commit_one fallback takes over",
+                    "minimal Sync block build failed; no Sync block composed",
                 );
                 return Ok(None);
             }
@@ -3178,6 +3247,7 @@ where
                     "minimal postBatch prepare failed; committing Sync block without emission — L1 catches up next slot",
                 );
                 return Ok(Some(SyncSlotBlock {
+                    bundle_commit: None,
                     payload: empty_built.payload,
                     header: empty_built.header,
                 }));
@@ -3204,6 +3274,7 @@ where
             empty_built.header.hash(),
             Vec::new(),
         );
+        let (bundle_commit, committed) = tokio::sync::oneshot::channel();
         self.spawn_bundle_observer(
             ctx,
             rollup_id,
@@ -3213,8 +3284,10 @@ where
             empty_built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
+            Some(committed),
         );
         Ok(Some(SyncSlotBlock {
+            bundle_commit: Some(bundle_commit),
             payload: empty_built.payload,
             header: empty_built.header,
         }))
@@ -3227,27 +3300,30 @@ where
         rollup: &RollupState<L2>,
         parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
         timestamp: u64,
-    ) -> Option<SyncSlotBlock> {
+        prev_randao: B256,
+    ) -> SyncSlotOutcome {
         match build_sync_block(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
             parent_header,
             timestamp,
             rollup.config.fee_recipient,
+            prev_randao,
             &[],
         ) {
-            Ok(built) => Some(SyncSlotBlock {
+            Ok(built) => SyncSlotOutcome::Built(Box::new(SyncSlotBlock {
+                bundle_commit: None,
                 payload: built.payload,
                 header: built.header,
-            }),
+            })),
             Err(err) => {
                 event!(
                     name: "eez.composer.sync_slot.build_failed",
                     Level::ERROR,
                     error = %err,
-                    "empty Sync block build failed; Sequencer's commit_one fallback takes over",
+                    "empty Sync block build failed; skipping the Sync slot — next trigger retries",
                 );
-                None
+                SyncSlotOutcome::Skip
             }
         }
     }
@@ -3356,6 +3432,7 @@ where
                 boundary_header.hash(),
                 Arc::clone(&rollup.optimistic),
                 historical_target,
+                None,
             );
             return Ok(());
         }
@@ -3429,18 +3506,28 @@ where
         expected_final_root: B256,
         optimistic: Arc<OptimisticallyIncluded>,
         target: BundleTarget,
+        committed: Option<tokio::sync::oneshot::Receiver<()>>,
     ) {
         let submitter = ctx.submitter.clone();
-        tokio::spawn(observe_bundle_outcome(
-            rollup_id,
-            sync_height,
-            bundle,
-            post_batch_hash,
-            expected_final_root,
-            optimistic,
-            submitter,
-            target,
-        ));
+        tokio::spawn(async move {
+            if let Some(committed) = committed
+                && committed.await.is_err()
+            {
+                optimistic.mark_failed(sync_height, post_batch_hash, true);
+                return;
+            }
+            observe_bundle_outcome(
+                rollup_id,
+                sync_height,
+                bundle,
+                post_batch_hash,
+                expected_final_root,
+                optimistic,
+                submitter,
+                target,
+            )
+            .await;
+        });
     }
 
     /// Read committed DA from the parent's ancestry, including pending blocks.

@@ -99,6 +99,9 @@ def run(plan, args):
             "EEZ_L2_RECOVERY_ADDRESS": recovery_address,
             "EEZ_DEPLOYMENTS_FILE": "/out/deployments.env",
             "EEZ_GENESIS_OUT": "/out/l2-genesis.json",
+            # The private L1 has no finalized checkpoint yet; pin L1 block zero.
+            "EEZ_L1_REFERENCE": "genesis",
+            "EEZ_L1_BLOCK_TIME_MS": str(eez.get("l1_block_time_ms", 12000)),
         },
         run="mkdir -p /out && bash /repo/scripts/deploy.sh && cp -R /repo/contracts/broadcast /out/foundry-broadcast",
         store=[StoreSpec(src="/out", name="eez-deployments")],

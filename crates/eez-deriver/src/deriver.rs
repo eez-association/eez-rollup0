@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use alloy_eips::{Decodable2718, Encodable2718, Typed2718};
@@ -35,16 +35,22 @@ use crate::error::{DeriverError, DeriverResult, is_fatal};
 
 /// Per-block header inputs the composer chose, carried in the DA span. Read
 /// from the payload, not assumed — a constant diverges the moment the composer
-/// picks something else.
+/// picks something else. `prev_randao` is not in the span; it comes from
+/// canonical L1.
 #[derive(Debug, Clone)]
 pub struct BlockHeaderInputs {
     pub beneficiary: Address,
     pub extra_data: Bytes,
+    pub prev_randao: B256,
 }
 
 impl BlockHeaderInputs {
     /// The inputs the span carries for its `index`-th block.
-    fn from_span(span: &eez_payload_codec::DecodedSpan, index: usize) -> DeriverResult<Self> {
+    fn from_span(
+        span: &eez_payload_codec::DecodedSpan,
+        index: usize,
+        prev_randao: B256,
+    ) -> DeriverResult<Self> {
         let (Some(beneficiary), Some(extra_data)) =
             (span.beneficiaries.get(index), span.extra_data.get(index))
         else {
@@ -56,6 +62,7 @@ impl BlockHeaderInputs {
         Ok(Self {
             beneficiary: Address::from(*beneficiary),
             extra_data: Bytes::copy_from_slice(extra_data),
+            prev_randao,
         })
     }
 }
@@ -126,6 +133,8 @@ where
     /// block hashes for byte-identical txs/state (composer↔follower
     /// divergence).
     l2_block_time_secs: u64,
+    /// L1 slot duration used to derive `prev_randao`.
+    l1_block_time_secs: u64,
     deploy_block: u64,
     /// Shared canonical-head state — cursor + per-batch index +
     /// `finalized_l2`. The Deriver is the sole writer; the Composer
@@ -144,6 +153,13 @@ where
     boot: DeriverBoot,
     /// See [`Deriver::new`].
     refuse_txs: Option<RefuseTxs>,
+    /// An unsafe `prev_randao` check an L1 reorg owes; retried each L1 head.
+    reseed_pending: AtomicBool,
+    /// Whether a catch-up has checked the unsafe `prev_randao`s since boot. A
+    /// reorg while the node was down leaves no event to request the check.
+    boot_reseed_done: AtomicBool,
+    /// L2 cursor whose retreat still needs to finish.
+    retreat_pending: std::sync::Mutex<Option<u64>>,
 }
 
 impl<L2> std::fmt::Debug for Deriver<L2>
@@ -196,6 +212,7 @@ where
         l1_reader: L1Reader,
         chain_spec: Arc<ChainSpec>,
         l2_block_time_secs: u64,
+        l1_block_time_secs: u64,
         deploy_block: u64,
         l1_head: Arc<L1CanonicalHead>,
         system_tx_cfg: Option<eez_protocol::system_tx::SystemTxContext>,
@@ -212,12 +229,16 @@ where
                 evm_config,
                 chain_spec,
                 l2_block_time_secs,
+                l1_block_time_secs,
                 deploy_block,
                 l1_head,
                 safe_l2_block: AtomicU64::new(0),
                 system_tx_cfg,
                 boot,
                 refuse_txs,
+                reseed_pending: AtomicBool::new(false),
+                boot_reseed_done: AtomicBool::new(false),
+                retreat_pending: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -441,13 +462,16 @@ where
     /// tip when the range was empty (nothing below it can hold our events).
     async fn catch_up_inner(&self) -> DeriverResult<u64> {
         let _guard = self.inner.committer.begin_reconcile().await;
+        self.retry_l1_reorg().await?;
         let old_cursor = self.inner.l1_head.cursor();
         let anchor = self.revalidate_index_tail().await?;
         let cursor = self.inner.l1_head.cursor();
         if cursor < old_cursor {
+            self.inner.committer.begin_l1_reorg().await?;
             self.retreat_l2_to_cursor(cursor).await?;
+            self.inner.committer.finish_l1_reorg();
         }
-        match anchor {
+        let end = match anchor {
             Some(anchor_l1_block) => self.sync_batches_inner(anchor_l1_block, cursor).await,
             // Peers mode seeds before catch-up and no reorg drops the floor, so
             // an empty index is a boot bug, never a cue to scan from deploy.
@@ -481,7 +505,13 @@ where
                 }
                 None => self.sync_batches_inner(self.inner.deploy_block, 0).await,
             },
+        }?;
+        // Runs once the L1-derived cursor is known, so only unsafe blocks are checked.
+        if !self.inner.boot_reseed_done.load(Ordering::Acquire) {
+            self.replace_reseeded_unsafe().await?;
+            self.inner.boot_reseed_done.store(true, Ordering::Release);
         }
+        Ok(end)
     }
 
     /// Phase 1 of [`Self::catch_up`]: walk the index tail backward,
@@ -869,7 +899,7 @@ where
         let attributes = NextBlockEnvAttributes {
             timestamp,
             suggested_fee_recipient: header.beneficiary,
-            prev_randao: B256::ZERO,
+            prev_randao: header.prev_randao,
             gas_limit: BUILDER_GAS_LIMIT,
             parent_beacon_block_root: chain_spec
                 .is_cancun_active_at_timestamp(timestamp)
@@ -1064,6 +1094,14 @@ where
                         skipped,
                         "L1 event stream lagged; resyncing from L1",
                     );
+                    // A skipped Reorg above the index tail moves no cursor, so
+                    // recheck the unsafe seeds, with sequencing held until it passes.
+                    if let Err(err) = self.mark_missed_reorg().await {
+                        stop_if_fatal(&err);
+                        if matches!(&err, DeriverError::CommitterClosed) {
+                            return;
+                        }
+                    }
                     if !self.try_recover().await {
                         return;
                     }
@@ -1078,6 +1116,15 @@ where
                 }
             }
         }
+    }
+
+    /// Block sequencing and flag the unsafe suffix for a seed recheck, which the
+    /// next [`Self::retry_l1_reorg`] runs.
+    async fn mark_missed_reorg(&self) -> DeriverResult<()> {
+        let _guard = self.inner.committer.begin_reconcile().await;
+        self.inner.committer.begin_l1_reorg().await?;
+        self.inner.reseed_pending.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Post-failure recovery via [`Self::catch_up`]. Returns `false` only
@@ -1120,6 +1167,12 @@ where
     }
 
     async fn handle_event(&self, event: L1Event) -> DeriverResult<()> {
+        if !matches!(&event, L1Event::Reorg { .. })
+            && self.inner.committer.sequencing_revision().is_err()
+        {
+            let _guard = self.inner.committer.begin_reconcile().await;
+            self.retry_l1_reorg().await?;
+        }
         match event {
             L1Event::BatchPosted {
                 post,
@@ -1374,6 +1427,9 @@ where
         // ancestor; hash-tail auditing is reserved for missed reorgs.
         let _guard = self.inner.committer.begin_reconcile().await;
 
+        self.inner.committer.begin_l1_reorg().await?;
+        self.inner.reseed_pending.store(true, Ordering::Release);
+
         let old_cursor = self.inner.l1_head.cursor();
         let (new_cursor, _new_finalized, dropped) = self.retreat_index(common_ancestor_number)?;
         if new_cursor >= old_cursor {
@@ -1388,10 +1444,13 @@ where
                 dropped_batches = dropped,
                 "L1 reorg reported above indexed batches; no L2 retreat needed",
             );
-            return Ok(());
+            // The reorg can still replace the L1 block an unsafe interval
+            // copies its `prev_randao` from.
+            return self.retry_l1_reorg().await;
         }
 
         let new_safe_hash = self.retreat_l2_to_cursor(new_cursor).await?;
+        self.retry_l1_reorg().await?;
 
         event!(
             name: "eez.deriver.l1.reorg.retreated",
@@ -1422,10 +1481,24 @@ where
             })
     }
 
+    /// Complete a deferred retreat and recheck the unsafe suffix under the reconcile lock.
+    async fn retry_l1_reorg(&self) -> DeriverResult<()> {
+        let cursor = *self.inner.retreat_pending.lock().unwrap();
+        if let Some(cursor) = cursor {
+            self.retreat_l2_to_cursor(cursor).await?;
+        }
+        if self.inner.reseed_pending.load(Ordering::Acquire) {
+            self.replace_reseeded_unsafe().await?;
+        }
+        self.inner.committer.finish_l1_reorg();
+        Ok(())
+    }
+
     /// Retreat reth's safe/finalized anchors to the L1-derived cursor and drop
     /// the blocks above it. Caller holds the reconcile lock so the Sequencer
     /// can't extend the branch between the two forkchoice updates.
     async fn retreat_l2_to_cursor(&self, cursor: u64) -> DeriverResult<B256> {
+        *self.inner.retreat_pending.lock().unwrap() = Some(cursor);
         let safe_header = self.l2_sealed_header_at(cursor)?;
         let safe_hash = safe_header.hash();
         let finalized_hash = self.l2_hash_at(self.inner.l1_head.finalized_l2())?;
@@ -1436,7 +1509,11 @@ where
             .committer
             .advance_safe_finalized(safe_header.clone(), finalized_hash)
             .await?;
+        self.inner.safe_l2_block.store(cursor, Ordering::Release);
         if let Err(error) = self.replace_above(&safe_header).await {
+            if matches!(&error, DeriverError::L1Scan(_)) {
+                return Err(error);
+            }
             event!(
                 name: "eez.deriver.l1.reorg.replace_failed",
                 Level::WARN,
@@ -1446,7 +1523,7 @@ where
             );
             self.inner.committer.reorg_to(safe_header).await?;
         }
-        self.inner.safe_l2_block.store(cursor, Ordering::Release);
+        *self.inner.retreat_pending.lock().unwrap() = None;
         Ok(safe_hash)
     }
 
@@ -1458,13 +1535,18 @@ where
         cursor: &SealedHeader<alloy_consensus::Header>,
     ) -> DeriverResult<()> {
         let head = self.inner.committer.last_header().number();
-        let inputs = BlockHeaderInputs {
-            beneficiary: cursor.beneficiary(),
-            extra_data: Bytes::new(),
-        };
+        let l2_block_time = self.inner.l2_block_time_secs;
         // A block that already is the empty child of its parent stays:
         // committing it again would unwind to it silently, not reorg.
         for parent in cursor.number()..head {
+            let timestamp = cursor
+                .timestamp()
+                .saturating_add((parent + 1 - cursor.number()) * l2_block_time);
+            let inputs = BlockHeaderInputs {
+                beneficiary: cursor.beneficiary(),
+                extra_data: Bytes::new(),
+                prev_randao: self.prev_randao_at(timestamp).await?,
+            };
             let (payload, header) = self.execute_block(parent, &[], &inputs)?;
             if self.l2_hash_at(parent + 1)? != header.hash() {
                 self.refuse_cross_chain_txs(parent + 1..=head)?;
@@ -1540,6 +1622,47 @@ where
             "advanced L2 finalized head from L1 finality",
         );
         Ok(())
+    }
+
+    /// Drop the unsafe blocks from the first one whose `prev_randao` no longer
+    /// matches canonical L1. Safe blocks need no check: their batch descends
+    /// from the L1 blocks they copy from.
+    async fn replace_reseeded_unsafe(&self) -> DeriverResult<()> {
+        // Stays set if a lookup fails, so the next L1 head retries.
+        self.inner.reseed_pending.store(true, Ordering::Release);
+        // Boot may not have moved the safe mirror up to the cursor yet.
+        let safe = self
+            .inner
+            .safe_l2_block
+            .load(Ordering::Acquire)
+            .max(self.inner.l1_head.cursor());
+        let head = self.inner.committer.last_header().number();
+        for l2_block in safe + 1..=head {
+            let header = self.l2_sealed_header_at(l2_block)?;
+            if header.mix_hash != self.prev_randao_at(header.timestamp()).await? {
+                event!(
+                    name: "eez.deriver.l1.reorg.reseeded",
+                    Level::WARN,
+                    event_name = "eez.deriver.l1.reorg.reseeded",
+                    l2_block,
+                    head,
+                    "L1 reorg changed an unsafe block's prevRandao source; replacing from it",
+                );
+                self.replace_above(&self.l2_sealed_header_at(l2_block - 1)?)
+                    .await?;
+                break;
+            }
+        }
+        self.inner.reseed_pending.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    async fn prev_randao_at(&self, l2_timestamp: u64) -> DeriverResult<B256> {
+        self.inner
+            .l1_reader
+            .prev_randao_for(l2_timestamp, self.inner.l1_block_time_secs)
+            .await
+            .map_err(DeriverError::L1Scan)
     }
 
     fn l2_sealed_header_at(
@@ -1862,6 +1985,15 @@ where
                 .map(Encodable2718::encoded_2718)
                 .collect();
             let current_hash = self.l2_hash_at(from_block)?;
+            let timestamp = self
+                .l2_sealed_header_at(from_block - 1)?
+                .timestamp()
+                .saturating_add(self.inner.l2_block_time_secs);
+            let header_inputs = BlockHeaderInputs::from_span(
+                decoded,
+                last_index,
+                self.prev_randao_at(timestamp).await?,
+            )?;
             let mut executed = None;
             let new_content = if settlement.final_state == Some(current_hash) {
                 Vec::new()
@@ -1884,11 +2016,8 @@ where
                 let bytes = match ordinary_plan_bytes(&plans) {
                     Some(bytes) => bytes,
                     None => {
-                        let (payload, header, bytes) = self.execute_planned_block(
-                            from_block - 1,
-                            &plans,
-                            &BlockHeaderInputs::from_span(decoded, last_index)?,
-                        )?;
+                        let (payload, header, bytes) =
+                            self.execute_planned_block(from_block - 1, &plans, &header_inputs)?;
                         executed = Some((payload, header));
                         bytes
                     }
@@ -1962,12 +2091,8 @@ where
                 let outcome = match executed {
                     Some((payload, header)) => self.commit_replayed_block(payload, header).await?,
                     None => {
-                        self.replay_block(
-                            from_block - 1,
-                            &block_txs,
-                            &BlockHeaderInputs::from_span(decoded, last_index)?,
-                        )
-                        .await?
+                        self.replay_block(from_block - 1, &block_txs, &header_inputs)
+                            .await?
                     }
                 };
                 // No later block follows this one to make it canonical, so
@@ -1997,8 +2122,10 @@ where
         } else {
             let mut suffix_replay = SuffixReplay::new(stale_boundary);
             let mut tx_offset = 0usize;
+            let mut timestamp = self.l2_sealed_header_at(from_block - 1)?.timestamp();
             for (i, count) in decoded.block_tx_counts.iter().enumerate() {
                 let l2_block = from_block + i as u64;
+                timestamp = timestamp.saturating_add(self.inner.l2_block_time_secs);
                 let count_usize = *count as usize;
                 let user_txs = &decoded.transactions[tx_offset..tx_offset + count_usize];
                 tx_offset += count_usize;
@@ -2010,16 +2137,18 @@ where
                 // The Sync block's full tx list (system + outbound-user, interleaved,
                 // plus trailing non-cc user txs) was pre-built above; every other
                 // block is its user txs verbatim.
+                let header_inputs = BlockHeaderInputs::from_span(
+                    decoded,
+                    i,
+                    self.prev_randao_at(timestamp).await?,
+                )?;
                 let mut executed = None;
                 let block_txs: Vec<Vec<u8>> = match (is_sync_block, sync_block_txs.as_ref()) {
                     (true, Some(full)) => match ordinary_plan_bytes(full) {
                         Some(bytes) => bytes,
                         None => {
-                            let (payload, header, bytes) = self.execute_planned_block(
-                                l2_block - 1,
-                                full,
-                                &BlockHeaderInputs::from_span(decoded, i)?,
-                            )?;
+                            let (payload, header, bytes) =
+                                self.execute_planned_block(l2_block - 1, full, &header_inputs)?;
                             executed = Some((payload, header));
                             bytes
                         }
@@ -2028,7 +2157,6 @@ where
                 };
                 // Skip only identical blocks: a needless rewrite wedges reth.
                 // Txs alone do not identify one; the header inputs seal in too.
-                let header_inputs = BlockHeaderInputs::from_span(decoded, i)?;
                 let local_matches =
                     local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
                         && local_header_inputs_match(
@@ -2308,13 +2436,18 @@ where
 
 /// The comparison itself, split out so it is testable without a provider.
 fn header_inputs_match(header: &alloy_consensus::Header, expected: &BlockHeaderInputs) -> bool {
-    header.beneficiary == expected.beneficiary && header.extra_data == expected.extra_data
+    header.beneficiary == expected.beneficiary
+        && header.extra_data == expected.extra_data
+        && header.mix_hash == expected.prev_randao
 }
+
+#[cfg(test)]
+mod l1_reorg_tests;
 
 #[cfg(test)]
 mod header_inputs_tests {
     use super::{BlockHeaderInputs, header_inputs_match};
-    use alloy_primitives::{Address, Bytes};
+    use alloy_primitives::{Address, B256, Bytes};
 
     /// A block whose txs match but whose header inputs do not is a DIFFERENT
     /// block, and the skip paths are the only guard against treating it as one.
@@ -2323,10 +2456,12 @@ mod header_inputs_tests {
         let expected = BlockHeaderInputs {
             beneficiary: Address::with_last_byte(0xAA),
             extra_data: Bytes::from_static(b"eez"),
+            prev_randao: B256::with_last_byte(0xCC),
         };
         let mut header = alloy_consensus::Header {
             beneficiary: expected.beneficiary,
             extra_data: expected.extra_data.clone(),
+            mix_hash: expected.prev_randao,
             ..Default::default()
         };
         assert!(header_inputs_match(&header, &expected));
@@ -2337,6 +2472,10 @@ mod header_inputs_tests {
         header.beneficiary = expected.beneficiary;
         header.extra_data = Bytes::from_static(b"other");
         assert!(!header_inputs_match(&header, &expected), "extraData");
+
+        header.extra_data = expected.extra_data.clone();
+        header.mix_hash = B256::with_last_byte(0xDD);
+        assert!(!header_inputs_match(&header, &expected), "prevRandao");
     }
 }
 

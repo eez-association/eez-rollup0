@@ -23,6 +23,7 @@ pub mod l1_canonical_head;
 pub mod l1_head_stream;
 pub mod l1_reader;
 pub mod l1_watcher;
+pub mod prev_randao;
 pub mod scan;
 pub mod submitter;
 
