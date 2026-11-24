@@ -227,8 +227,9 @@ pub async fn wait_for_idle_engine(is_syncing: impl Fn() -> bool) {
 }
 
 /// Anchors the local chain in `mode` and runs the Deriver's boot catch-up;
-/// returns the L1 watcher's seed. Call once reth is idle, with the committer
-/// spawned after that ([`wait_for_idle_engine`]).
+/// returns the L1 watcher's seed. Either mode leaves finalized at least at the
+/// block L1's finalized state names, when L1 serves it. Call once reth is
+/// idle, with the committer spawned after that ([`wait_for_idle_engine`]).
 ///
 /// # Errors
 ///
@@ -272,7 +273,7 @@ where
                         name: "eez.node.sync.history_check_skipped",
                         Level::WARN,
                         %error,
-                        "L1's finalized root is unreadable; boot skips checking that the local chain holds it",
+                        "L1's finalized root is unreadable; boot skips checking that the local chain holds it and leaves finalized where reth has it",
                     );
                     None
                 }
@@ -281,7 +282,9 @@ where
                 }
             };
             let seed = boot_catch_up(deriver, l1_reader, mode, role).await?;
-            ensure_l1_history(provider, before)?;
+            if let Some(finalized) = finalized_root_height(provider, before)? {
+                deriver.restore_finalized(finalized).await?;
+            }
             Ok(seed)
         }
     }
@@ -503,8 +506,12 @@ where
     }
 }
 
-/// Checks that the local chain holds the finalized root an L1-only scan passed.
-fn ensure_l1_history<P>(provider: &P, before: Option<FinalizedCommitment>) -> eyre::Result<()>
+/// Height of the finalized root an L1-only scan passed, on the local canonical
+/// chain; `None` when L1 named no root. Errs when the local chain lacks it.
+fn finalized_root_height<P>(
+    provider: &P,
+    before: Option<FinalizedCommitment>,
+) -> eyre::Result<Option<u64>>
 where
     P: BlockNumReader,
 {
@@ -514,14 +521,14 @@ where
         ..
     }) = before
     else {
-        return Ok(());
+        return Ok(None);
     };
-    if canonical_number(provider, root)?.is_none() {
-        return Err(eyre::eyre!(
+    match canonical_number(provider, root)? {
+        Some(height) => Ok(Some(height)),
+        None => Err(eyre::eyre!(
             "L1 history incomplete: L1-only derivation passed L1 block {l1_block} but the local chain lacks its finalized root {root}"
-        ));
+        )),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -651,8 +658,10 @@ mod tests {
         }
     }
 
+    /// The height boot raises finalized to after an L1-only scan: only a root
+    /// on the local canonical chain names one.
     #[test]
-    fn ensure_l1_history_needs_the_root_canonical() {
+    fn finalized_root_height_needs_the_root_canonical() {
         let fork = |canonical| Fork {
             block: ROOT,
             number: 5,
@@ -660,9 +669,17 @@ mod tests {
         };
         let sibling = B256::repeat_byte(0x5b);
 
-        assert!(ensure_l1_history(&fork(sibling), None).is_ok());
-        assert!(ensure_l1_history(&fork(ROOT), Some(commitment(Some(ROOT)))).is_ok());
-        let err = ensure_l1_history(&fork(sibling), Some(commitment(Some(ROOT)))).unwrap_err();
+        assert_eq!(
+            finalized_root_height(&fork(ROOT), Some(commitment(Some(ROOT)))).unwrap(),
+            Some(5)
+        );
+        assert_eq!(finalized_root_height(&fork(sibling), None).unwrap(), None);
+        assert_eq!(
+            finalized_root_height(&fork(sibling), Some(commitment(None))).unwrap(),
+            None,
+            "an unregistered rollup names no root"
+        );
+        let err = finalized_root_height(&fork(sibling), Some(commitment(Some(ROOT)))).unwrap_err();
         assert!(err.to_string().contains("L1 history incomplete"), "{err}");
     }
 

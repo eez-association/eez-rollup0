@@ -250,11 +250,8 @@ async fn l1_only_restart_keeps_finalized() {
         })
         .await
         .expect("composer never finalized an L1-settled batch");
-        // reth writes the finalized number to disk only with the next block it saves.
-        let head = wait_for_latest_height(&node, 0, TIMEOUT).await.unwrap();
-        wait_for_latest_height(&node, head.number + 1, TIMEOUT)
-            .await
-            .expect("composer never saved a block after finalizing");
+        // Killed right after: reth saves its finalized number only with a later
+        // block, so the restarted node must not need it.
         let safe = tag_number(&rpc, BlockNumberOrTag::Safe)
             .await
             .unwrap()

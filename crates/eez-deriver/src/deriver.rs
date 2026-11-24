@@ -1506,40 +1506,65 @@ where
     }
 
     async fn on_l1_finalized(&self, l1_finalized_block: u64) -> DeriverResult<()> {
-        // Find highest batch with l1_block <= l1_finalized_block.
-        // That batch's last_l2_block is the new L2 finalized head.
-        let new_finalized = self
+        // The highest batch at or below L1's finalized block names the L2 one.
+        let target = self
             .inner
             .l1_head
             .highest_l2_at_or_below_l1(l1_finalized_block)
             .unwrap_or(0);
-        let old_finalized = self.inner.l1_head.finalized_l2();
-        if new_finalized <= old_finalized {
-            return Ok(());
+        if let Some(l2_finalized) = self.raise_finalized(target).await? {
+            event!(
+                name: "eez.deriver.finalized.advanced",
+                Level::INFO,
+                event_name = "eez.deriver.finalized.advanced",
+                l1_finalized_block,
+                l2_finalized,
+                "advanced L2 finalized head from L1 finality",
+            );
         }
-        // Bound by safe — finalized never exceeds safe.
-        let current_safe = self.inner.safe_l2_block.load(Ordering::Acquire);
-        let bounded = new_finalized.min(current_safe);
-        if bounded <= old_finalized {
-            return Ok(());
-        }
+        Ok(())
+    }
 
+    /// Boot in L1-only mode: raises finalized to `l2_block`, the local
+    /// canonical block whose hash L1's finalized state stores. reth saves its
+    /// own finalized number only with a later block, so after an unclean stop
+    /// it can come back lower, down to genesis.
+    ///
+    /// # Errors
+    ///
+    /// `l2_provider` (a header lookup failed) or a committer error.
+    pub async fn restore_finalized(&self, l2_block: u64) -> DeriverResult<()> {
+        let before = self.inner.l1_head.finalized_l2();
+        if let Some(l2_finalized) = self.raise_finalized(l2_block).await? {
+            event!(
+                name: "eez.deriver.finalized.restored",
+                Level::INFO,
+                before,
+                target = l2_block,
+                l2_finalized,
+                "raised L2 finalized at boot to the block L1's finalized state names",
+            );
+        }
+        Ok(())
+    }
+
+    /// Moves finalized up to `target`, never past safe and never down; returns
+    /// the new finalized block when it moved.
+    async fn raise_finalized(&self, target: u64) -> DeriverResult<Option<u64>> {
+        let current_safe = self.inner.safe_l2_block.load(Ordering::Acquire);
+        let Some(finalized) =
+            raised_finalized(self.inner.l1_head.finalized_l2(), target, current_safe)
+        else {
+            return Ok(None);
+        };
         let safe_header = self.l2_sealed_header_at(current_safe)?;
-        let finalized_hash = self.l2_hash_at(bounded)?;
+        let finalized_hash = self.l2_hash_at(finalized)?;
         self.inner
             .committer
             .advance_safe_finalized(safe_header, finalized_hash)
             .await?;
-        self.inner.l1_head.set_finalized_l2(bounded);
-        event!(
-            name: "eez.deriver.finalized.advanced",
-            Level::INFO,
-            event_name = "eez.deriver.finalized.advanced",
-            l1_finalized_block,
-            l2_finalized = bounded,
-            "advanced L2 finalized head from L1 finality",
-        );
-        Ok(())
+        self.inner.l1_head.set_finalized_l2(finalized);
+        Ok(Some(finalized))
     }
 
     fn l2_sealed_header_at(
@@ -2265,6 +2290,13 @@ const fn in_settleable_range(found: Option<u64>, low: u64, high: u64) -> Option<
         Some(block) if block >= low && block <= high => Some(block),
         _ => None,
     }
+}
+
+/// Finalized after a raise towards `target`: bounded by `safe`, and `None`
+/// unless that is above `old`.
+fn raised_finalized(old: u64, target: u64, safe: u64) -> Option<u64> {
+    let new = target.min(safe);
+    (new > old).then_some(new)
 }
 
 /// L2 heights a batch's settled part covers. A resumed batch reuses the Sync
@@ -3306,6 +3338,30 @@ mod cursor_guard_tests {
         // No settled endpoint reported: only `entry_state` can clear the guard.
         assert!(!cursor_root_accepted(OTHER, ENTRY, None));
         assert!(!cursor_root_accepted(FINAL, ENTRY, None));
+    }
+}
+
+#[cfg(test)]
+mod finalized_tests {
+    use super::raised_finalized;
+
+    #[test]
+    fn finalized_rises_to_the_target_but_never_past_safe_or_down() {
+        assert_eq!(
+            raised_finalized(0, 20, 54),
+            Some(20),
+            "restores a lost number"
+        );
+        assert_eq!(raised_finalized(12, 20, 54), Some(20));
+        assert_eq!(raised_finalized(0, 60, 54), Some(54), "bounded by safe");
+        assert_eq!(raised_finalized(20, 20, 54), None, "already there");
+        assert_eq!(raised_finalized(30, 20, 54), None, "never lowers");
+        assert_eq!(
+            raised_finalized(20, 60, 20),
+            None,
+            "safe holds it where it is"
+        );
+        assert_eq!(raised_finalized(0, 0, 54), None, "genesis is no raise");
     }
 }
 
