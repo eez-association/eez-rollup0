@@ -533,7 +533,9 @@ async fn intercept_send_raw(
     json: &Value,
 ) -> Option<Response<Full<HyperBytes>>> {
     let raw: Bytes = raw_hex.parse().ok()?;
-    let envelope = TxEnvelope::decode_2718(&mut raw.as_ref()).ok()?;
+    // Exact: held bytes are replayed verbatim and decoded exactly downstream, so
+    // trailing bytes fall through to the node's own decode error.
+    let envelope = TxEnvelope::decode_2718_exact(raw.as_ref()).ok()?;
     // A creation has no target, so it can never compose. Forwarding deploys it
     // on the source chain, which is what the sender wanted.
     if envelope.is_create() {
@@ -1474,6 +1476,50 @@ mod tests {
             bodies[0]
         );
         assert!(pool.pop_all().is_empty(), "a creation must not be held");
+
+        task.abort();
+    }
+
+    /// Bytes after a signed tx must reach the source chain's decoder, not the held pool.
+    #[tokio::test]
+    async fn trailing_bytes_are_forwarded_upstream_and_never_held() {
+        const UPSTREAM_REPLY: &str = "upstream-decides";
+
+        let (_, _, raw) = signed_eip1559(1, U256::ZERO, 21_000, 1);
+        let mut padded = raw.to_vec();
+        padded.push(0x00);
+        let padded = Bytes::from(padded);
+        let (upstream, seen) = stub_upstream(UPSTREAM_REPLY).await;
+        let pool = Arc::new(HeldPool::new());
+        let port = free_port();
+        // Empty asserter: the gate must not run a single lookup for padded bytes.
+        let provider = ProviderBuilder::default().connect_mocked_client(Asserter::new());
+
+        let task = tokio::spawn(run_test_front(
+            port,
+            upstream,
+            Direction::Outbound,
+            Arc::clone(&pool),
+            provider,
+            1,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ));
+        wait_for_front(port).await;
+
+        let response = send_raw(port, &padded, 10).await;
+        assert_eq!(response["result"], UPSTREAM_REPLY, "{response}");
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "padded tx must be forwarded once: {bodies:?}"
+        );
+        assert!(
+            bodies[0].contains(&alloy_primitives::hex::encode(&padded)),
+            "the padded bytes must be relayed verbatim: {}",
+            bodies[0]
+        );
+        assert!(pool.pop_all().is_empty(), "a padded tx must not be held");
 
         task.abort();
     }
