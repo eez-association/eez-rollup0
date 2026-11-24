@@ -1,13 +1,13 @@
 //! Signed-head unsafe-head follower.
 //!
 //! Safe and finalized are owned by the L1 deriver through
-//! `BlockCommitterHandle::advance_safe_finalized`. The p2p overlay hands over
-//! signed heads it has verified and de-duplicated. This task keeps the latest
-//! head of each signing source and moves the unsafe head to the
-//! highest-version candidate that descends from the L1-derived safe block. Missing ancestors come from
-//! devp2p peers; they are fetched in batches sized to the gap, checked against
-//! the requested hashes, and imported through the committer under the
-//! reconcile lock.
+//! `BlockCommitterHandle::advance_safe_finalized`. A head feed (the p2p
+//! overlay, or a caller's) hands over signed heads it has verified and
+//! de-duplicated. This task keeps the latest head of each signing source and
+//! moves the unsafe head to the highest-version candidate that descends from
+//! the L1-derived safe block. Missing ancestors come from a [`BlockSource`];
+//! they are fetched in batches sized to the gap, checked against the requested
+//! hashes, and imported through the committer under the reconcile lock.
 //!
 //! Descent from safe is enforced here, not by reth: the engine only requires
 //! safe/finalized to be *known*, so it would canonicalize a head whose
@@ -57,10 +57,14 @@ const FETCH_BATCH: u64 = 64;
 const PEER_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
-pub(crate) enum FollowerError {
+pub enum FollowerError {
     /// devp2p peer request failure, timeout or invalid body.
     #[error("peer error: {0}")]
     Peer(String),
+
+    /// Any other block source's failure: transport, decoding or linkage.
+    #[error("block source error: {0}")]
+    Source(String),
 
     /// No source served this block.
     #[error("block {0} not served")]
@@ -101,14 +105,14 @@ enum SafeCompat {
 }
 
 /// Serves blocks by hash, walking back through parent hashes.
-pub(crate) trait BlockSource {
+pub trait BlockSource {
     /// Up to `count` blocks, newest first, starting at `from`; each
     /// hash-checked and parent-linked. May return fewer; empty = not served.
-    async fn blocks_back(
+    fn blocks_back(
         &self,
         from: B256,
         count: u64,
-    ) -> Result<Vec<SealedBlock<Block>>, FollowerError>;
+    ) -> impl Future<Output = Result<Vec<SealedBlock<Block>>, FollowerError>> + Send;
 }
 
 /// Blocks from devp2p peers through reth's `FetchClient`.
@@ -125,7 +129,7 @@ impl<C> PeerBlocks<C> {
 
 impl<C> BlockSource for PeerBlocks<C>
 where
-    C: HeadersClient<Header = Header> + BodiesClient<Body = BlockBody>,
+    C: HeadersClient<Header = Header> + BodiesClient<Body = BlockBody> + Sync,
 {
     async fn blocks_back(
         &self,
@@ -202,13 +206,13 @@ pub(crate) struct Missing {
     pub blocks: Vec<SealedBlock<Block>>,
 }
 
-/// Follows signed heads from gossip and routes every engine call through the
+/// Follows verified signed heads and routes every engine call through the
 /// shared [`BlockCommitterHandle`].
 #[derive(Debug)]
-pub(crate) struct UnsafeHeadFollower<P, S> {
+pub struct UnsafeHeadFollower<P, S> {
     committer: BlockCommitterHandle<EezEngineTypes>,
-    /// Heads the p2p overlay verified and accepted.
-    gossip: mpsc::Receiver<VerifiedHead>,
+    /// Heads the feed verified against the sequencer's address and domain.
+    heads: mpsc::Receiver<VerifiedHead>,
     /// Serves missing ancestors.
     blocks: S,
     /// Local chain reader: resolves the current safe anchor and the
@@ -227,9 +231,9 @@ where
     P: HeaderProvider<Header = Header> + BlockIdReader,
     S: BlockSource,
 {
-    pub(crate) fn new(
+    pub fn new(
         committer: BlockCommitterHandle<EezEngineTypes>,
-        gossip: mpsc::Receiver<VerifiedHead>,
+        heads: mpsc::Receiver<VerifiedHead>,
         blocks: S,
         local: P,
         l1_head: Arc<L1CanonicalHead>,
@@ -237,7 +241,7 @@ where
     ) -> Self {
         Self {
             committer,
-            gossip,
+            heads,
             blocks,
             local,
             l1_head,
@@ -247,7 +251,7 @@ where
         }
     }
 
-    pub(crate) async fn run(mut self) {
+    pub async fn run(mut self) {
         let mut retry = tokio::time::interval(self.retry_interval);
         // A slow fetch must not queue a burst of catch-up retries.
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -255,11 +259,11 @@ where
         loop {
             let advanced = tokio::select! {
                 _ = retry.tick() => self.follow_best().await,
-                Some(head) = self.gossip.recv() => {
-                    // The overlay passes only heads newer than their source's latest.
+                Some(head) = self.heads.recv() => {
+                    // The feed passes only heads newer than their source's latest.
                     self.tracker.observe(head, now_ms());
                     // Take the whole burst first, so one fetch serves the newest head.
-                    while let Ok(head) = self.gossip.try_recv() {
+                    while let Ok(head) = self.heads.try_recv() {
                         self.tracker.observe(head, now_ms());
                     }
                     self.follow_best().await
