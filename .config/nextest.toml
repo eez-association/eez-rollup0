@@ -9,7 +9,7 @@ test-group = "integration"
 [test-groups]
 integration = { max-threads = 1 }
 # eez-node-e2e under the `local` profile: at most this many slots at once.
-e2e-local = { max-threads = 4 }
+e2e-local = { max-threads = 8 }
 
 # CI retries for diagnostics, but a pass on retry is still a failure: a flaky
 # integration test must not make the branch green.
