@@ -66,7 +66,7 @@ after Kurtosis has deployed the contracts and started the network services. It
 leaves the enclave running.
 
 CI may set `EEZ_PREBUILT_BIN_DIR` to a directory containing prebuilt
-`eez-composer`, `eez-follower`, `eez-proof-signer`, and
+`eez-composer`, `eez-follower`, `eez-proof-signer`, `eez-prover-stateful`, and
 `eez-genesis-state-root` and `eez-genesis-block-hash` binaries. In that mode
 `start.sh` builds thin runtime images from those binaries instead of compiling
 Rust inside Docker.

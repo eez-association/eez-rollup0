@@ -1,4 +1,4 @@
-//! The EEZ evm2 type family: Ethereum transaction handling plus native `0x76`
+//! The EEZ evm2 type family: Ethereum transaction handling plus native `0x45`
 //! deposits and genesis-configured fee collection.
 //!
 //! Ethereum transactions run evm2's standard handlers with [`EezTxHooks`], which
@@ -9,7 +9,7 @@ use alloy_consensus::{Transaction, Typed2718, transaction::Recovered};
 use alloy_eips::{eip2930::AccessList, eip7702::SignedAuthorization};
 use alloy_primitives::{Address, B256, Bytes, ChainId, TxKind, U256};
 use eez_primitives::{
-    EEZL2_ADDRESS, EezTxEnvelope, SYSTEM_ADDRESS, SYSTEM_TX_GAS_LIMIT, SYSTEM_TX_TYPE,
+    EEZL2_ADDRESS, EezTxEnvelope, SYSTEM_ADDRESS, SYSTEM_TX_GAS_CAP, SYSTEM_TX_TYPE,
     SystemTransaction,
 };
 use evm2::{
@@ -55,7 +55,7 @@ pub struct EezEvmExt {
 pub enum EezEvmTx {
     /// An Ethereum transaction.
     Ethereum(TxEnvelope),
-    /// A native system transaction (`0x76`). It keeps its fields so the handler
+    /// A native system transaction (`0x45`). It keeps its fields so the handler
     /// re-validates the protocol sender and target.
     System(SystemTransaction),
 }
@@ -105,7 +105,7 @@ impl reth_evm::FromRecoveredTx<TransactionSigned> for EezEvmTx {
 impl reth_evm::FromTxWithEncoded<TransactionSigned> for EezEvmTx {}
 
 impl reth_evm::TransactionEnvMut for EezEvmTx {
-    /// Native transactions have a protocol-fixed gas budget.
+    /// Native gas is fixed by the envelope and execution position.
     fn set_gas_limit(&mut self, gas_limit: u64) {
         if let Self::Ethereum(tx) = self {
             tx.set_gas_limit(gas_limit);
@@ -146,10 +146,7 @@ impl Transaction for EezEvmTx {
         delegate!(self, tx => tx.nonce())
     }
     fn gas_limit(&self) -> u64 {
-        match self {
-            Self::Ethereum(tx) => tx.gas_limit(),
-            Self::System(_) => SYSTEM_TX_GAS_LIMIT,
-        }
+        delegate!(self, tx => tx.gas_limit())
     }
     fn gas_price(&self) -> Option<u128> {
         delegate!(self, tx => tx.gas_price())
@@ -209,7 +206,7 @@ pub enum EezEvmError {
 impl fmt::Display for EezEvmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::InvalidNativeTransaction => "invalid native system caller or target",
+            Self::InvalidNativeTransaction => "invalid native system caller, target or gas budget",
             Self::NativeDepositOverflow => "native deposit balance overflow",
             Self::FeeCollectorOverflow => "fee collector balance overflow",
         })
@@ -224,6 +221,20 @@ impl std::error::Error for EezEvmError {}
 pub struct EezTxHooks;
 
 impl TxHandlerHooks<EezEvmTypes> for EezTxHooks {
+    fn before_execution(
+        host: &mut Evm<'_, EezEvmTypes>,
+        _envelope: &EezEvmTx,
+        caller: Address,
+        upfront_fee: U256,
+    ) -> HandlerResult<()> {
+        if caller == SYSTEM_ADDRESS {
+            return Err(HandlerError::external(
+                EezEvmError::InvalidNativeTransaction,
+            ));
+        }
+        eth::charge_upfront(host, caller, upfront_fee)
+    }
+
     /// After Ethereum's refund and beneficiary reward, credit
     /// `min(basefee, effective price) × gas used`. The minimum also covers
     /// simulations with base-fee checks off. Only from London, only with fee
@@ -318,17 +329,17 @@ pub fn eez_tx_registry(spec_id: SpecId) -> TxRegistry<EezEvmTypes, TxResult<EezE
     registry
 }
 
-/// The native `0x76` handler: Ethereum's legacy handler without gas-price
+/// The native `0x45` handler: Ethereum's legacy handler without gas-price
 /// validation or the upfront fee charge, around a minted deposit.
 ///
-/// The mint precedes the sender's balance check and the frame checkpoint, so a
+/// The mint precedes the frame checkpoint, so a
 /// failed call keeps it; the handler restores the pre-mint balance. Any
 /// validation error discards the whole transaction state, mint included.
 mod native {
     use super::{
-        EEZL2_ADDRESS, EezEvmError, EezEvmTypes, GasSettlement, GasTracker, HandlerError,
-        HandlerResult, SYSTEM_ADDRESS, SYSTEM_TX_GAS_LIMIT, SystemTransaction, TxEnvExt, TxKind,
-        TxRequest, TxResult, U256, default_settle_gas, eth,
+        EEZL2_ADDRESS, EezEvmError, EezEvmTypes, EvmFeatures, GasSettlement, GasTracker,
+        HandlerError, HandlerResult, SYSTEM_ADDRESS, SYSTEM_TX_GAS_CAP, SystemTransaction,
+        TxEnvExt, TxKind, TxRequest, TxResult, U256, default_settle_gas, eth,
     };
 
     pub(super) struct Prepared {
@@ -343,7 +354,7 @@ mod native {
     ) -> HandlerResult<Prepared> {
         let caller = req.tx.signer();
         let tx = req.tx.inner();
-        if caller != SYSTEM_ADDRESS || tx.to != EEZL2_ADDRESS {
+        if caller != SYSTEM_ADDRESS || tx.to != EEZL2_ADDRESS || tx.gas_limit > SYSTEM_TX_GAS_CAP {
             return Err(HandlerError::external(
                 EezEvmError::InvalidNativeTransaction,
             ));
@@ -351,14 +362,13 @@ mod native {
         let to = TxKind::Call(tx.to);
         let version = req.host.version();
         eth::validate_chain_id(version, Some(tx.chain_id), true)?;
-        eth::validate_tx_gas_limit_cap(version, SYSTEM_TX_GAS_LIMIT)?;
-        eth::validate_block_gas_limit(version, SYSTEM_TX_GAS_LIMIT, req.host.block().gas_limit)?;
-        eth::validate_nonce_not_overflow(tx.nonce)?;
+        eth::validate_tx_gas_limit_cap(version, tx.gas_limit)?;
+        eth::validate_block_gas_limit(version, tx.gas_limit, req.host.block().gas_limit)?;
         let (intrinsic, floor_gas) =
             eth::intrinsic_and_floor_gas(version, caller, to, &tx.input, 0, 0, tx.value);
-        eth::validate_intrinsic_gas(SYSTEM_TX_GAS_LIMIT, intrinsic, 0)?;
-        eth::validate_floor_gas(SYSTEM_TX_GAS_LIMIT, floor_gas)?;
-        eth::validate_execution_gas_limit_cap(version, SYSTEM_TX_GAS_LIMIT, intrinsic, floor_gas)?;
+        eth::validate_intrinsic_gas(tx.gas_limit, intrinsic, 0)?;
+        eth::validate_floor_gas(tx.gas_limit, floor_gas)?;
+        eth::validate_execution_gas_limit_cap(version, tx.gas_limit, intrinsic, floor_gas)?;
 
         let previous_balance = {
             let mut system = req.host.state_mut().account(&SYSTEM_ADDRESS)?;
@@ -371,8 +381,20 @@ mod native {
             }
             previous
         };
-        let sender_nonce =
-            eth::validate_sender_and_bump_nonce(req.host, caller, tx.nonce, tx.value)?;
+        // Identity comes from derivation. Preserve the sender's nonce throughout
+        // execution while retaining Ethereum's code check and sender warming.
+        let check_code = req.host.feature(EvmFeatures::EIP3607);
+        let sender_nonce = {
+            let mut sender = req.host.state_mut().account(&caller)?;
+            if check_code && !sender.is_empty_code_hash() {
+                let code = sender.load_code()?;
+                if !code.is_empty() && !code.is_eip7702() {
+                    return Err(HandlerError::RejectCallerWithCode);
+                }
+            }
+            sender.warm();
+            sender.nonce()
+        };
         eth::warm_base_accounts(req.host, to);
         Ok(Prepared {
             intrinsic,
@@ -395,7 +417,7 @@ mod native {
         let caller = req.tx.signer();
         let tx = req.tx.inner();
         let (execution_gas_limit, reservoir) =
-            eth::initial_gas_and_reservoir(req.host.version(), SYSTEM_TX_GAS_LIMIT, intrinsic, 0);
+            eth::initial_gas_and_reservoir(req.host.version(), tx.gas_limit, intrinsic, 0);
         *req.host.tx_env_mut() = TxEnvExt {
             origin: caller,
             gas_price: U256::ZERO,
@@ -432,7 +454,7 @@ mod native {
             GasSettlement {
                 caller,
                 gas_price: U256::ZERO,
-                gas_limit: SYSTEM_TX_GAS_LIMIT,
+                gas_limit: tx.gas_limit,
                 floor_gas,
                 initial_state_gas: 0,
                 state_refund: 0,

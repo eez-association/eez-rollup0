@@ -146,7 +146,7 @@ The CLI value takes precedence.
 | `--vkey` | `EEZ_VKEY` | none | Nonzero 32-byte proof-system vkey. |
 | `--signer-key` | `EEZ_PROOF_SIGNER_KEY` | none | Valid secp256k1 attestation private key. |
 | `--attester-address` | `EEZ_ATTESTER_ADDRESS` | none | MUST equal the address derived from `--signer-key`. |
-| `--l2-system-address` | `EEZ_L2_SYSTEM_ADDRESS` | none | Address embedded in EEZL2; MUST equal reserved native sender `0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076`. |
+| `--l2-system-address` | `EEZ_L2_SYSTEM_ADDRESS` | none | Address embedded in EEZL2; MUST equal reserved native sender `0xfffffffffffffffffffffffffffffffffffffffe`. |
 | `--proof-system` | `EEZ_PROOF_SYSTEM` | none | Nonzero expected proof-system contract address. |
 | `--max-request-blocks` | `EEZ_PROOF_SIGNER_MAX_REQUEST_BLOCKS` | `512` | Nonzero. |
 | `--max-request-bytes` | `EEZ_PROOF_SIGNER_MAX_REQUEST_BYTES` | `536870912` | Nonzero. |
@@ -191,7 +191,7 @@ reserved system-address, and fixed EEZL2-address checks as the stateless service
 The active deployment bindings are:
 
 ```text
-SYSTEM_ADDRESS = 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076
+SYSTEM_ADDRESS = 0xfffffffffffffffffffffffffffffffffffffffe
 EEZL2_ADDRESS  = 0x4200000000000000000000000000000000000007
 ```
 
@@ -276,24 +276,21 @@ Signer recovery alone is not execution validation.
 ### 6.2 Local checkpoint plan
 
 Ordinary blocks require regular execution, not transaction-state checkpoints.
-For each recovered transaction in a potential Sync block define:
+If a nonempty block has no native `0x45` transaction targeting `EEZL2_ADDRESS`,
+the checkpoint plan is empty, even when this is the terminal block. Otherwise
+the locally selected candidate positions are the complete execution-group
+endpoints returned by `execution_group_end_positions`:
 
-```text
-system[i] = type(tx[i]) == 0x76
-            && tx[i].to == EEZL2_ADDRESS
-```
+- a native `loadExecutionTable` transaction and its immediately following
+  ordinary user transaction form an outbound group, ending at the user;
+- a native `executeIncoming` delivery forms an inbound group, ending at itself;
+- ordinary transactions outside a load/user group add no checkpoint.
 
-If a nonempty block has no transaction satisfying `system[i]`, the checkpoint
-plan is empty, even when this is the terminal block. Otherwise the locally
-selected candidate positions are:
-
-```text
-C = { i | !system[i] || system[i + 1] || i is the last transaction }
-```
-
-An absent `system[i + 1]` at block end is treated as `true`. Thus an outbound
-`[system-load, user]` pair ends at the user transaction, while a standalone
-inbound system transaction ends at itself.
+Group boundaries are derived from transaction envelopes and native call
+selectors, regardless of receipt status. Unsupported native destinations or
+selectors, a load followed by another native transaction, and a block ending
+with an unpaired load MUST be rejected. For example, `[delivery, ordinary]`
+selects position `0`, while `[load, user, ordinary]` selects position `1`.
 
 The plan first requests the pre-execution position: the terminal sealed after
 its pre-block system calls and before transaction 0, which is the anchor's
@@ -646,16 +643,18 @@ transaction sequence and compare it byte for byte with the validated block.
 The reconstruction context is:
 
 ```text
-type         = 0x76 (unsigned native)
+type         = 0x45 (unsigned native)
 sender       = reserved EEZ_L2_SYSTEM_ADDRESS
 target       = EEZL2_ADDRESS
 chain id     = operator-configured L2 chain ID
 rollup id    = expected_rollup_id
-first nonce  = nonce of the first validated omitted system transaction
+source hash  = SOURCE_ENTRY_V1 over configured chain, intended L1 parent, full group ordinal
 ```
 
-Gas fields are not encoded: execution uses a fixed gas limit of `2_000_000`
-and a gas price of `0`.
+Each envelope encodes exactly `min(16_777_216, blockGasLimit - precedingCumulativeGasUsed)`.
+The cumulative gas comes from validated receipts. Gas price is zero; the RPC
+nonce placeholder is zero, the envelope has no nonce, and no account nonce
+transition occurs.
 
 The canonical order is:
 
@@ -668,7 +667,8 @@ The canonical order is:
  inbound delivery M-1]
 ```
 
-System nonces increase through that order. Outbound loads carry zero native
+Group ordinals increase through that order, once per outbound pair or inbound
+delivery. Outbound loads carry zero native
 value. Inbound deliveries carry their authorized inbound value. The reconstructed
 sequence length and every raw transaction byte MUST equal the validated
 terminal block.

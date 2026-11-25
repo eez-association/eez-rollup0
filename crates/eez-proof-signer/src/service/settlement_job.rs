@@ -117,7 +117,8 @@ impl SettlementPipelineError {
                 settlement::BlockInspectionError::IntermediateSystemTransaction { .. }
                 | settlement::BlockInspectionError::IntermediateOutboundEvent { .. }
                 | settlement::BlockInspectionError::RevertedSystemTransaction { .. }
-                | settlement::BlockInspectionError::ReservedSystemSender { .. } => (
+                | settlement::BlockInspectionError::ReservedSystemSender { .. }
+                | settlement::BlockInspectionError::InvalidExecutionGroup(_) => (
                     tonic::Code::FailedPrecondition,
                     "settlement validation rejected",
                 ),
@@ -317,6 +318,7 @@ pub(super) fn run_settlement(
         &authorized_inbound_effects,
         system_transaction_reconstructor,
         expected_rollup_id.get(),
+        l1_context,
     )?;
     let recomputed_public_inputs_hash = checked_public_input_profile
         .recompute_public_inputs_hash(proof_system_vkey, &verified_da)?;

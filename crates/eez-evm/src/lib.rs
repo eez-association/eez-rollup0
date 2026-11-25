@@ -1,7 +1,7 @@
 //! Adapts Ethereum execution to EEZ transaction and receipt types.
 //!
 //! reth's `EthEvmConfig` fixes its primitives to Ethereum types, which cannot
-//! represent native type `0x76`. This configuration selects `EezPrimitives` and
+//! represent native type `0x45`. This configuration selects `EezPrimitives` and
 //! the EEZ evm2 type family ([`EezEvmTypes`]), preserves the native receipt
 //! type, and decodes native transactions in Engine payloads. Ethereum
 //! environments, gas accounting and block assembly are reused. L2 block
@@ -103,7 +103,7 @@ impl ReceiptBuilder for EezReceiptBuilder {
     type Transaction = EezTxEnvelope;
     type Receipt = Receipt;
 
-    /// Preserve native type `0x76` in the receipt root; Ethereum's receipt builder
+    /// Preserve native type `0x45` in the receipt root; Ethereum's receipt builder
     /// only accepts its own type enum. Status, gas, and logs are unchanged.
     fn build_receipt<T: evm2::EvmTypes>(
         &self,
@@ -150,6 +150,13 @@ impl<C: EthChainSpec> EezEvmConfig<C> {
                 ),
             },
         })
+    }
+
+    /// Construct an L2 configuration, refusing unsupported fork schedules.
+    pub fn new_l2(chain_spec: Arc<C>) -> Result<Self, AnyError> {
+        eez_primitives::ensure_supported_l2_forks(&chain_spec.genesis().config)
+            .map_err(|error| AnyError::new(std::io::Error::other(error)))?;
+        Self::new(chain_spec)
     }
 
     pub fn chain_spec(&self) -> &Arc<C> {

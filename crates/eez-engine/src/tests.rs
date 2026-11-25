@@ -6,7 +6,8 @@ use eez_primitives::{EEZL2_ADDRESS, EezTxEnvelope, SystemTransaction};
 fn system() -> EezTxEnvelope {
     SystemTransaction {
         chain_id: 1,
-        nonce: 0,
+        source_hash: B256::repeat_byte(0x11),
+        gas_limit: eez_primitives::SYSTEM_TX_GAS_CAP,
         to: EEZL2_ADDRESS,
         value: U256::ZERO,
         input: Bytes::from_static(&[1, 2, 3, 4]),

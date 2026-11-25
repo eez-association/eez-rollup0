@@ -49,7 +49,8 @@ use crate::held_pool::{HeldPool, HeldTx};
 use crate::ingress::Direction;
 use crate::local::{
     BuildError, InboundL2TargetSession, L1SlotState, L1TargetSession, SyncCandidates,
-    build::SyncBlockState, build_sync_block, sync_block_candidates,
+    build::{SyncBlockState, truncated_hex},
+    build_sync_block, sync_block_candidates,
 };
 use crate::optimistic::OptimisticallyIncluded;
 use crate::prover_retry::{
@@ -58,8 +59,16 @@ use crate::prover_retry::{
 use crate::rollup::RollupState;
 
 mod blob;
+mod post_batch;
 pub use blob::BlobPostingConfig;
-use blob::{BlobCarrier, blob_fee, blob_stream_len, target_blob_limit};
+use blob::{
+    BlobCarrier, blob_fee, blob_stream_len, finish_blob_carrier, start_blob_sidecar,
+    target_blob_limit,
+};
+use post_batch::{
+    apply_attestations, attestation_error, batch_range, build_da_payload, build_settlement_batch,
+    encode_da, postbatch_gas_with_floor,
+};
 
 fn bundle_targets_for_slot(
     target_l1_block: Option<u64>,
@@ -398,6 +407,9 @@ struct PostBatchGasBudget {
     projected: u64,
     /// `None` when the batch carries its DA in calldata.
     blob: Option<BlobBytes>,
+    /// Attestation gas for the configured attesters, priced into every
+    /// postBatch projection.
+    attestation: u64,
 }
 
 /// Blob stream bytes: the post's capacity, the bytes reserved so far, and
@@ -413,12 +425,19 @@ impl PostBatchGasBudget {
     /// A budget for a batch that may carry a proof from each of
     /// `proof_systems` attesters.
     fn new(max_gas: u64, proof_systems: u64) -> Self {
+        let attestation = attestation_gas(proof_systems);
         Self {
             cap: max_gas.saturating_sub(POSTBATCH_DRAIN_MARGIN),
-            projected: projected_postbatch_gas(1, 0, 0)
-                .saturating_add(attestation_gas(proof_systems)),
+            projected: projected_postbatch_gas(1, 0, 0).saturating_add(attestation),
             blob: None,
+            attestation,
         }
+    }
+
+    /// The cost of `cost` as a postBatch of its own, for the cut event.
+    fn standalone_cost(&self, cost: TxL1Gas) -> u64 {
+        projected_postbatch_gas(cost.entries, cost.calldata_gas, cost.target_gas)
+            .saturating_add(self.attestation)
     }
 
     /// L1 gas one accepted tx adds. Its DA copies cost calldata gas only when
@@ -545,6 +564,47 @@ struct BlockGasCut {
     declared: u64,
 }
 
+/// The Sync slot a batch is built for: the block it extends, its timestamp and
+/// fee recipient, and the L1 block its bundle targets.
+#[derive(Debug, Clone, Copy)]
+struct SlotTarget<'a> {
+    parent_header: &'a reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
+    timestamp: u64,
+    fee_recipient: Address,
+    bundle_target: BundleTarget,
+}
+
+/// The budget that ran out first and ended the drain.
+#[derive(Debug, Clone, Copy)]
+enum BudgetCut {
+    /// The postBatch gas budget; the refused tx's projected cost, for the cut
+    /// event.
+    PostBatchGas { rejected_cost: u64 },
+    /// The L2 block's gas, not the postBatch's.
+    BlockGas(BlockGasCut),
+    /// The blob byte budget.
+    Blob,
+}
+
+/// How the cross-chain drain ended. The first refusal or failure ends it, so
+/// at most one of a cut or a transient abort can happen.
+enum DrainEnd {
+    /// No cut or transient abort ended the drain early.
+    Complete,
+    /// A budget cut: `rest` is the tx that did not fit plus everything after
+    /// it, owed back to the pool unpenalized.
+    Cut {
+        cut: BudgetCut,
+        rest: Vec<(usize, HeldTx)>,
+    },
+    /// A transient failure aborts the slot: `rest` is the failing tx plus the
+    /// unprocessed remainder of both phases, re-queued with the survivors.
+    Transient {
+        error: String,
+        rest: Vec<(usize, HeldTx)>,
+    },
+}
+
 /// Emission bounds, resolved once at construction. `timing` is here for its
 /// `k()` — the grid the historical chunk boundary snaps to.
 #[derive(Debug, Clone, Copy)]
@@ -554,6 +614,8 @@ struct EmissionLimits {
     max_blocks: u64,
     /// Gas limit every postBatch is signed with, and the cap the drain uses.
     max_gas: u64,
+    /// Cap on held transactions attempted in one bundle.
+    max_user_txs: usize,
     /// Configured attesters: a batch may carry a proof from each.
     attesters: u64,
 }
@@ -570,6 +632,9 @@ impl EmissionLimits {
         let k = u64::from(timing.k());
         let requested_blocks = read_var("EEZ_MAX_BLOCKS_PER_BATCH");
         let requested_gas = read_var("EEZ_MAX_POSTBATCH_GAS");
+        let max_user_txs = read_var("EEZ_MAX_USER_TXS_PER_BUNDLE")
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(50);
         let max_blocks = grid_aligned_cap(requested_blocks.unwrap_or(MAX_BLOCKS_PER_BATCH), k);
         let max_gas = clamp_max_postbatch_gas(
             requested_gas.unwrap_or(DEFAULT_MAX_POSTBATCH_GAS),
@@ -581,6 +646,7 @@ impl EmissionLimits {
             Level::INFO,
             max_blocks,
             max_gas,
+            max_user_txs,
             k,
             requested_blocks = ?requested_blocks,
             requested_gas = ?requested_gas,
@@ -590,6 +656,7 @@ impl EmissionLimits {
             timing,
             max_blocks,
             max_gas,
+            max_user_txs,
             attesters,
         }
     }
@@ -860,7 +927,8 @@ fn clamp_max_postbatch_gas(requested: u64, attesters: u64) -> u64 {
 /// evicted before it can enter — and perpetually drop — a bundle.
 /// `false` = STATE-DEPENDENT OR TRANSIENT, which a retry may clear. The drain
 /// handles insufficient funds separately; other non-poison errors abort the
-/// slot and re-queue.
+/// slot and re-queue. Capacity is deferred before this classification when an
+/// accepted prefix exists; in an empty block it means the group cannot fit.
 fn sim_error_is_poison(err: &eez_protocol::ComposerError) -> bool {
     use eez_protocol::{ComposerError, ExecutorError};
     match err {
@@ -1131,11 +1199,15 @@ fn requeue_unprocessed(
 /// caller can check what a tx actually did against what it composed.
 fn append_and_execute(
     prefix: &mut SyncBlockState,
-    txs: &[Bytes],
+    txs: &[eez_protocol::system_tx::PlannedTransaction],
+    encoded: &mut Vec<Bytes>,
 ) -> Result<Vec<alloy_primitives::Log>, (usize, BuildError)> {
     let mut logs = Vec::new();
-    for (at, tx) in txs.iter().enumerate() {
-        match prefix.execute_tx(tx) {
+    for (at, plan) in txs.iter().enumerate() {
+        let tx = prefix
+            .materialize(plan)
+            .map_err(|msg| (at, BuildError::ExecuteTx { idx: at, msg }))?;
+        match prefix.execute_tx(&tx) {
             Ok(outcome) if outcome.success => logs.extend(outcome.logs),
             Ok(outcome) => {
                 return Err((
@@ -1148,6 +1220,7 @@ fn append_and_execute(
             }
             Err(e) => return Err((at, e)),
         }
+        encoded.push(tx);
     }
     Ok(logs)
 }
@@ -1169,19 +1242,6 @@ fn take_l1_cache(
         .downcast::<evm2::evm::Cache>()
         .map(|cache| *cache)
         .map_err(|_e| "L1 session checkpoint payload is not a Cache".to_owned())
-}
-
-/// Hex of the first 32 bytes of a revert/return payload, for event messages.
-fn truncated_hex(data: &Bytes) -> String {
-    const MAX: usize = 32;
-    if data.len() <= MAX {
-        return alloy_primitives::hex::encode_prefixed(data);
-    }
-    format!(
-        "{}… ({} bytes)",
-        alloy_primitives::hex::encode_prefixed(&data[..MAX]),
-        data.len()
-    )
 }
 
 /// Composer umbrella. Cheaply [`Clone`]able (`Arc<Inner>`).
@@ -1418,76 +1478,7 @@ where
                 }
             }
             Ok(L1Event::Finalized { block_number, .. }) => {
-                // Settled batches at or below L1 finality can never be
-                // rolled out — but "Settled" is the observer's/cursor's
-                // belief. Finality audit backstop: before discarding
-                // each ledger entry, verify its postBatch receipt still
-                // exists on L1. A missing receipt means a reorg rolled
-                // the batch out and the L1Watcher missed it. The receipt checks
-                // are async while `on_l1_event` is synchronous, so the audit
-                // runs in a spawned task per rollup.
-                for (rollup_id, rollup) in &self.rollups {
-                    let Some(fin_l2) = rollup.l1_head.highest_l2_at_or_below_l1(*block_number)
-                    else {
-                        continue;
-                    };
-                    let finalized = rollup.optimistic.take_finalized(fin_l2);
-                    if finalized.is_empty() {
-                        continue;
-                    }
-                    let rollup_id = *rollup_id;
-                    let submitter = self.submitter.clone();
-                    let held_pool = rollup.held_pool.clone();
-                    tokio::spawn(async move {
-                        for (sync_height, post_batch_hash, txs) in finalized {
-                            match submitter.receipt_exists(post_batch_hash).await {
-                                Ok(true) => {
-                                    held_pool.release_in_flight_batch(&txs);
-                                    event!(
-                                        name: "eez.composer.finality_audit.ok",
-                                        Level::DEBUG,
-                                        rollup_id,
-                                        sync_height,
-                                        post_batch_hash = %post_batch_hash,
-                                        "finalized batch audited: postBatch receipt present; ledger entry dropped",
-                                    );
-                                }
-                                Ok(false) => {
-                                    // Detection + tx recovery only —
-                                    // repairing the L2 history is the
-                                    // Deriver's job.
-                                    event!(
-                                        name: "eez.composer.finality_audit.rolled_out",
-                                        Level::ERROR,
-                                        rollup_id,
-                                        sync_height,
-                                        post_batch_hash = %post_batch_hash,
-                                        tx_count = txs.len(),
-                                        "finalized batch has NO postBatch receipt on L1 — reorg rolled it out unobserved; re-queueing its user_txs (front)",
-                                    );
-                                    held_pool.push_front_batch(txs);
-                                }
-                                Err(err) => {
-                                    // Inconclusive: re-queueing txs that
-                                    // actually landed would burn nonces
-                                    // and poison the next bundle's simulation,
-                                    // so an inconclusive audit does not recover
-                                    // transactions speculatively.
-                                    event!(
-                                        name: "eez.composer.finality_audit.check_failed",
-                                        Level::ERROR,
-                                        rollup_id,
-                                        sync_height,
-                                        post_batch_hash = %post_batch_hash,
-                                        error = %err,
-                                        "finality-audit receipt lookup failed; ledger entry dropped UNAUDITED",
-                                    );
-                                    held_pool.release_in_flight_batch(&txs);
-                                }
-                            }
-                        }
-                    });
-                }
+                self.audit_finalized_batches(*block_number);
             }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1505,6 +1496,80 @@ where
                     "L1 event stream closed",
                 );
             }
+        }
+    }
+
+    /// Finality audit: check each rollup's settled batches at or below the
+    /// finalized L1 block before they are discarded.
+    fn audit_finalized_batches(&self, block_number: u64) {
+        // Settled batches at or below L1 finality can never be
+        // rolled out — but "Settled" is the observer's/cursor's
+        // belief. Finality audit backstop: before discarding
+        // each ledger entry, verify its postBatch receipt still
+        // exists on L1. A missing receipt means a reorg rolled
+        // the batch out and the L1Watcher missed it. The receipt checks
+        // are async while `on_l1_event` is synchronous, so the audit
+        // runs in a spawned task per rollup.
+        for (rollup_id, rollup) in &self.rollups {
+            let Some(fin_l2) = rollup.l1_head.highest_l2_at_or_below_l1(block_number) else {
+                continue;
+            };
+            let finalized = rollup.optimistic.take_finalized(fin_l2);
+            if finalized.is_empty() {
+                continue;
+            }
+            let rollup_id = *rollup_id;
+            let submitter = self.submitter.clone();
+            let held_pool = rollup.held_pool.clone();
+            tokio::spawn(async move {
+                for (sync_height, post_batch_hash, txs) in finalized {
+                    match submitter.receipt_exists(post_batch_hash).await {
+                        Ok(true) => {
+                            held_pool.release_in_flight_batch(&txs);
+                            event!(
+                                name: "eez.composer.finality_audit.ok",
+                                Level::DEBUG,
+                                rollup_id,
+                                sync_height,
+                                post_batch_hash = %post_batch_hash,
+                                "finalized batch audited: postBatch receipt present; ledger entry dropped",
+                            );
+                        }
+                        Ok(false) => {
+                            // Detection + tx recovery only —
+                            // repairing the L2 history is the
+                            // Deriver's job.
+                            event!(
+                                name: "eez.composer.finality_audit.rolled_out",
+                                Level::ERROR,
+                                rollup_id,
+                                sync_height,
+                                post_batch_hash = %post_batch_hash,
+                                tx_count = txs.len(),
+                                "finalized batch has NO postBatch receipt on L1 — reorg rolled it out unobserved; re-queueing its user_txs (front)",
+                            );
+                            held_pool.push_front_batch(txs);
+                        }
+                        Err(err) => {
+                            // Inconclusive: re-queueing txs that
+                            // actually landed would burn nonces
+                            // and poison the next bundle's simulation,
+                            // so an inconclusive audit does not recover
+                            // transactions speculatively.
+                            event!(
+                                name: "eez.composer.finality_audit.check_failed",
+                                Level::ERROR,
+                                rollup_id,
+                                sync_height,
+                                post_batch_hash = %post_batch_hash,
+                                error = %err,
+                                "finality-audit receipt lookup failed; ledger entry dropped UNAUDITED",
+                            );
+                            held_pool.release_in_flight_batch(&txs);
+                        }
+                    }
+                }
+            });
         }
     }
 }
@@ -1560,7 +1625,6 @@ where
             );
             None
         })?;
-        let pool = rollup.held_pool.as_ref();
         let cc = &self.inner.cross_chain;
         // Use the Sequencer-supplied parent header directly (it reflects
         // the just-committed block via `last_header`'s mirror); a
@@ -1582,30 +1646,12 @@ where
         // While blocked the slot still gets its (empty) Sync block — L2
         // cadence is unconditional; the next postBatch covers it.
         let cursor = rollup.l1_head.cursor();
-        let newly_cursor_confirmed = rollup.optimistic.resolve_below_cursor(cursor);
-        if !newly_cursor_confirmed.is_empty() {
-            pool.release_in_flight_batch(&newly_cursor_confirmed);
-        }
-
-        // ── Slot-context failure recovery ────────────────────────────
-        // The observer task only RECORDS verdicts; the destructive
-        // recovery happens here, serialized with the Sequencer's own
-        // commits (the slot loop is sequential — no commit can race
-        // this) and with the Deriver (reconcile lock). By now the
-        // failed Sync block has either committed (head ≥ height →
-        // reorg it out) or permanently didn't (stale-parent bail —
-        // nothing to roll back).
-        if let Some(partial) = rollup.optimistic.partial_to_dispose(cursor) {
-            // No rollback: the height is canonical, so this owes the slot
-            // nothing beyond the tx disposition and the slot proceeds normally.
-            self.recover_partial_batch(rollup_id, rollup, partial).await;
-        }
-        if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
+        if let Some(outcome) = self.reconcile_slot_batches(rollup_id, rollup, cursor).await {
             // A moved head makes this slot's parent stale — the Sequencer's bail
             // covers it. An UNCHANGED head (reinsert / stale-verdict) still owes
             // the slot a block, and returning None there would let the
             // mempool-fed commit_one fallback mint a tx-bearing grid block.
-            return match self.recover_failed_batch(rollup_id, rollup, failed).await {
+            return match outcome {
                 RecoveryOutcome::HeadUnchanged => {
                     self.build_empty_slot_block(rollup, &parent_header, timestamp)
                 }
@@ -1682,16 +1728,14 @@ where
         // Catchup: structural-only — skip the drain, emit a minimal postBatch
         // (cross-chain stays pooled for the next Steady slot).
         if matches!(mode, SyncSlotMode::Catchup) {
+            let slot = SlotTarget {
+                parent_header: &parent_header,
+                timestamp,
+                fee_recipient: suggested_fee_recipient,
+                bundle_target, // catch-up → NextBlock (unpinned)
+            };
             return self
-                .dispatch_minimal_postbatch(
-                    &cc.exec_ctx,
-                    rollup_id,
-                    rollup,
-                    &parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target, // catch-up → NextBlock (unpinned)
-                )
+                .dispatch_minimal_postbatch(&cc.exec_ctx, rollup_id, rollup, slot)
                 .await
                 .unwrap_or_else(|err| {
                     event!(
@@ -1705,16 +1749,61 @@ where
                 });
         }
 
+        self.compose_steady_slot(
+            rollup_id,
+            rollup,
+            &parent_header,
+            timestamp,
+            bundle_target,
+            cursor,
+        )
+        .await
+    }
+
+    /// Run recovery on every tick, not just Sync slots, so a mid-slot verdict
+    /// isn't held for K blocks. Idempotent: no Failed entry means no work.
+    async fn recover_failed(&self, rollup_id: u64) {
+        let Some(rollup) = self.inner.rollups.get(&rollup_id) else {
+            return;
+        };
+        // Deliberately ignored: a tick owes no block, and the Sequencer
+        // re-reads the head right after this hook returns.
+        let _ = self
+            .recover_batches(rollup_id, rollup, rollup.l1_head.cursor())
+            .await;
+    }
+}
+
+// Helper impl block for the cross-chain compose path. Lives outside
+// the trait impl so we can use generic bounds independently.
+impl<L2> Composer<L2>
+where
+    L2: BlockReader<Header = alloy_consensus::Header>
+        + StateProviderFactory
+        + Send
+        + Sync
+        + 'static,
+    <L2 as TransactionsProvider>::Transaction: Encodable2718,
+{
+    /// Steady Sync slot: drain the held pool and compose its transactions
+    /// into a rich Sync block, re-queueing the drain if composition fails
+    /// before classifying it.
+    async fn compose_steady_slot(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
+        timestamp: u64,
+        bundle_target: BundleTarget,
+        cursor: u64,
+    ) -> Option<SyncSlotBlock> {
+        let pool = rollup.held_pool.as_ref();
+        let parent_number = parent_header.number();
         let pool_len_before = pool.len();
         // Caps how many held transactions one bundle attempts and therefore how
         // many an atomic-relay drop re-queues. L1 block gas remains the hard
         // protocol constraint, so deployments may need a lower cap.
-        let max_user_txs = std::env::var("EEZ_MAX_USER_TXS_PER_BUNDLE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(50);
-        let drained = pool.pop_n(max_user_txs);
+        let drained = pool.pop_n(self.inner.emission.max_user_txs);
         // When the pool is empty, do not return early. This slot attempts a
         // minimal postBatch whose leading immediate entry advances L1's stored
         // root to the empty Sync block's final state root. Without it, L1's view
@@ -1747,13 +1836,15 @@ where
         // Boxed: the drain holds two live execution contexts, so its future is
         // past the inline-size budget.
         match Box::pin(self.compose_cross_chain_batch(
-            cc,
+            &self.inner.cross_chain,
             rollup_id,
             drained.clone(),
-            &parent_header,
-            timestamp,
-            suggested_fee_recipient,
-            bundle_target,
+            SlotTarget {
+                parent_header,
+                timestamp,
+                fee_recipient: rollup.config.fee_recipient,
+                bundle_target,
+            },
         ))
         .await
         {
@@ -1786,35 +1877,48 @@ where
         }
     }
 
-    /// Run recovery on every tick, not just Sync slots, so a mid-slot verdict
-    /// isn't held for K blocks. Idempotent: no Failed entry means no work.
-    async fn recover_failed(&self, rollup_id: u64) {
-        let Some(rollup) = self.inner.rollups.get(&rollup_id) else {
-            return;
-        };
-        let cursor = rollup.l1_head.cursor();
+    /// Release the in-flight transactions of batches the cursor has confirmed,
+    /// then run [`Self::recover_batches`].
+    async fn reconcile_slot_batches(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        cursor: u64,
+    ) -> Option<RecoveryOutcome> {
+        let newly_cursor_confirmed = rollup.optimistic.resolve_below_cursor(cursor);
+        if !newly_cursor_confirmed.is_empty() {
+            rollup
+                .held_pool
+                .release_in_flight_batch(&newly_cursor_confirmed);
+        }
+        self.recover_batches(rollup_id, rollup, cursor).await
+    }
+
+    /// Dispose of a partially settled batch, then recover a failed one.
+    /// `Some` when a failed batch was recovered, with whether the head moved.
+    async fn recover_batches(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        cursor: u64,
+    ) -> Option<RecoveryOutcome> {
+        // ── Failure recovery (Sync slot or per-tick hook) ────────────
+        // The observer task only RECORDS verdicts; the destructive
+        // recovery happens here, serialized with the Sequencer's own
+        // commits (the slot loop is sequential — no commit can race
+        // this) and with the Deriver (reconcile lock). By now the
+        // failed Sync block has either committed (head ≥ height →
+        // reorg it out) or permanently didn't (stale-parent bail —
+        // nothing to roll back).
         if let Some(partial) = rollup.optimistic.partial_to_dispose(cursor) {
+            // No rollback: the height is canonical, so this owes the slot
+            // nothing beyond the tx disposition and the slot proceeds normally.
             self.recover_partial_batch(rollup_id, rollup, partial).await;
         }
-        if let Some(failed) = rollup.optimistic.take_failed_for_recovery(cursor) {
-            // Deliberately ignored: a tick owes no block, and the Sequencer
-            // re-reads the head right after this hook returns.
-            let _ = self.recover_failed_batch(rollup_id, rollup, failed).await;
-        }
+        let failed = rollup.optimistic.take_failed_for_recovery(cursor)?;
+        Some(self.recover_failed_batch(rollup_id, rollup, failed).await)
     }
-}
 
-// Helper impl block for the cross-chain compose path. Lives outside
-// the trait impl so we can use generic bounds independently.
-impl<L2> Composer<L2>
-where
-    L2: BlockReader<Header = alloy_consensus::Header>
-        + StateProviderFactory
-        + Send
-        + Sync
-        + 'static,
-    <L2 as TransactionsProvider>::Transaction: Encodable2718,
-{
     /// How many L2 blocks L1 has yet to record. Flat is healthy; monotonic
     /// growth is what every settlement stall looks like.
     fn log_settlement_backlog(
@@ -2001,37 +2105,28 @@ where
         // Set when the sibling commit moves the head.
         let mut outcome = RecoveryOutcome::HeadUnchanged;
         let committer = &self.inner.committer;
-        let mut landed = Vec::new();
-        let mut receipt_error = None;
-        for tx in &failed.txs {
-            match self.inner.submitter.receipt_exists(tx.hash).await {
-                Ok(true) => landed.push(tx.hash),
-                Ok(false) => {}
-                Err(err) => {
-                    receipt_error = Some((tx.hash, err));
-                    break;
-                }
+        let landed = match self.recovered_tx_receipts(&failed.txs).await {
+            Ok(landed) => landed,
+            Err((tx_hash, err)) => {
+                event!(
+                    name: "eez.composer.recovery.receipt_check_failed",
+                    Level::WARN,
+                    rollup_id,
+                    sync_height,
+                    tx_hash = %tx_hash,
+                    error = %err,
+                    "user receipt lookup failed; retaining failed batch for retry",
+                );
+                rollup.optimistic.reinsert_failed(failed);
+                return RecoveryOutcome::HeadUnchanged;
             }
-        }
-        if let Some((tx_hash, err)) = receipt_error {
-            event!(
-                name: "eez.composer.recovery.receipt_check_failed",
-                Level::WARN,
-                rollup_id,
-                sync_height,
-                tx_hash = %tx_hash,
-                error = %err,
-                "user receipt lookup failed; retaining failed batch for retry",
-            );
-            rollup.optimistic.reinsert_failed(failed);
-            return RecoveryOutcome::HeadUnchanged;
-        }
+        };
         // Reorg only if the failed block (or descendants) actually
         // became canonical. Rich Sync blocks carry unsettled
         // cross-chain effects; empty (minimal-path) blocks are
         // L1-independent and need no rollback.
         if !failed.txs.is_empty() {
-            let _guard = committer.begin_reconcile().await;
+            let guard = committer.begin_reconcile().await;
             // Cursor re-check UNDER the lock: the Deriver may have
             // canonicalized this very batch from L1 between the
             // observer's verdict and this slot (a false-failure
@@ -2080,54 +2175,9 @@ where
             // canonical, the sibling is a reorg, so reth's pool takes back its pure
             // L2 txs. Head elsewhere → nothing to substitute.
             if replaces || head.hash() == failed.parent.hash() {
-                let timestamp = failed
-                    .parent
-                    .timestamp()
-                    .saturating_add(self.inner.emission.timing.l2_block_time().as_secs());
-                match build_sync_block(
-                    rollup.l2_provider.as_ref(),
-                    &self.inner.evm_config,
-                    &failed.parent,
-                    timestamp,
-                    rollup.config.fee_recipient,
-                    &[],
-                ) {
-                    // feed_witness=true: a PRODUCED block — later historical
-                    // chunks need its witness in the store.
-                    Ok(built) => match committer
-                        .commit_derived(built.payload, built.header, true)
-                        .await
-                    {
-                        Ok(_) => {
-                            outcome = RecoveryOutcome::HeadMoved;
-                            event!(
-                                name: "eez.composer.recovery.substituted",
-                                Level::WARN,
-                                event_name = "eez.composer.recovery.substituted",
-                                rollup_id,
-                                sync_height,
-                                timestamp,
-                                "failed Sync block substituted with its empty sibling",
-                            );
-                        }
-                        Err(err) => event!(
-                            name: "eez.composer.recovery.substitute_failed",
-                            Level::ERROR,
-                            rollup_id,
-                            sync_height,
-                            error = %err,
-                            "empty-sibling commit failed",
-                        ),
-                    },
-                    Err(err) => event!(
-                        name: "eez.composer.recovery.substitute_failed",
-                        Level::ERROR,
-                        rollup_id,
-                        sync_height,
-                        error = %err,
-                        "empty-sibling build failed",
-                    ),
-                }
+                outcome = self
+                    .replace_failed_sync_block(rollup_id, rollup, &failed, &guard)
+                    .await;
             }
             // The failed block stays canonical until a sibling replaces it, so keep
             // the entry Failed for the next slot. A rewind would lose the pure L2 txs.
@@ -2149,13 +2199,94 @@ where
         outcome
     }
 
+    /// Commit an empty sibling in place of the failed Sync block.
+    async fn replace_failed_sync_block(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        failed: &crate::optimistic::FailedBatch,
+        _reconcile: &tokio::sync::OwnedMutexGuard<()>,
+    ) -> RecoveryOutcome {
+        let sync_height = failed.sync_height;
+        let committer = &self.inner.committer;
+        let timestamp = failed
+            .parent
+            .timestamp()
+            .saturating_add(self.inner.emission.timing.l2_block_time().as_secs());
+        match build_sync_block(
+            rollup.l2_provider.as_ref(),
+            &self.inner.evm_config,
+            &failed.parent,
+            timestamp,
+            rollup.config.fee_recipient,
+            &[],
+        ) {
+            // feed_witness=true: a PRODUCED block — later historical
+            // chunks need its witness in the store.
+            Ok(built) => match committer
+                .commit_derived(built.payload, built.header, true)
+                .await
+            {
+                Ok(_) => {
+                    event!(
+                        name: "eez.composer.recovery.substituted",
+                        Level::WARN,
+                        event_name = "eez.composer.recovery.substituted",
+                        rollup_id,
+                        sync_height,
+                        timestamp,
+                        "failed Sync block substituted with its empty sibling",
+                    );
+                    return RecoveryOutcome::HeadMoved;
+                }
+                Err(err) => event!(
+                    name: "eez.composer.recovery.substitute_failed",
+                    Level::ERROR,
+                    rollup_id,
+                    sync_height,
+                    error = %err,
+                    "empty-sibling commit failed",
+                ),
+            },
+            Err(err) => event!(
+                name: "eez.composer.recovery.substitute_failed",
+                Level::ERROR,
+                rollup_id,
+                sync_height,
+                error = %err,
+                "empty-sibling build failed",
+            ),
+        }
+        RecoveryOutcome::HeadUnchanged
+    }
+
+    /// Hashes of the failed batch's transactions that landed on L1; the
+    /// first receipt lookup error, with its transaction, stops the scan.
+    async fn recovered_tx_receipts(&self, txs: &[HeldTx]) -> Result<Vec<B256>, (B256, L1Error)> {
+        let mut landed = Vec::new();
+        for tx in txs {
+            if self
+                .inner
+                .submitter
+                .receipt_exists(tx.hash)
+                .await
+                .map_err(|err| (tx.hash, err))?
+            {
+                landed.push(tx.hash);
+            }
+        }
+        Ok(landed)
+    }
+
     /// Compose the drained transactions in canonical order over the slot's
     /// chained execution contexts, build the Sync block, register optimistic
     /// state, spawn L1 submission observation, and return the block for
     /// immediate L2 commit.
     ///
     /// Cadence: `CompositionBuilder::finalize` runs once per drained tx (via
-    /// the phase arms below, each seeded with the slot's live sessions);
+    /// [`CrossChainDrain::compose_outbound`] and
+    /// [`CrossChainDrain::compose_inbound`], each seeded with the slot's live
+    /// sessions);
     /// [`Self::prepare_post_batch_raw`] runs once per slot, merging every
     /// survivor's `Composition`.
     ///
@@ -2166,14 +2297,17 @@ where
         cc: &CrossChainWiring,
         rollup_id: u64,
         drained: Vec<HeldTx>,
-        parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
-        timestamp: u64,
-        suggested_fee_recipient: Address,
-        bundle_target: BundleTarget,
+        slot: SlotTarget<'_>,
     ) -> Result<Option<SyncSlotBlock>, String> {
+        let SlotTarget {
+            parent_header,
+            timestamp,
+            fee_recipient: suggested_fee_recipient,
+            bundle_target,
+        } = slot;
         let ctx = cc.exec_ctx.as_ref();
-        // Read the base SYSTEM_ADDRESS nonce from parent state. The canonical
-        // builder allocates outbound-load nonces before inbound-delivery nonces.
+        // Ordinary source nonces remain parent-state inputs; native identity
+        // is derived from the pinned intended L1 parent below.
         let parent_hash = parent_header.hash();
         let rollup =
             self.inner.rollups.get(&rollup_id).ok_or_else(|| {
@@ -2184,14 +2318,6 @@ where
             .l2_provider
             .state_by_block_hash(parent_hash)
             .map_err(|e| format!("state_by_block_hash({parent_hash}): {e}"))?;
-        let system_address = eez_primitives::SYSTEM_ADDRESS;
-        // Base SYSTEM_ADDRESS nonce; the canonical builder advances it
-        // internally (outbound loads, then inbound deliveries) post-drain.
-        let nonce = state
-            .account_nonce(&system_address)
-            .map_err(|e| format!("account_nonce({system_address}): {e}"))?
-            .unwrap_or(0);
-
         let stf_cfg = eez_protocol::system_tx::SystemTxContext {
             eezl2_address: ctx.eezl2_address,
             l2_chain_id: ctx.l2_chain_id,
@@ -2216,15 +2342,7 @@ where
         // to minimal.
         if drained.is_empty() {
             return self
-                .dispatch_minimal_postbatch(
-                    ctx,
-                    rollup_id,
-                    rollup,
-                    parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                )
+                .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                 .await;
         }
 
@@ -2276,29 +2394,6 @@ where
                 })
             }
         };
-        let mut source_nonces = inbound_source_nonces_for_drain(
-            ctx,
-            rollup_id,
-            &drained,
-            alloy_eips::BlockId::latest(),
-        )
-        .await;
-        source_nonces.extend(outbound_source_nonces);
-        let (drained, stale) = partition_stale(drained, &source_nonces);
-        for tx in &stale {
-            event!(
-                name: "eez.composer.cc_compose.stale_nonce_evicted",
-                Level::WARN,
-                rollup_id,
-                tx_hash = %tx.hash,
-                sender = %tx.sender,
-                nonce = tx.nonce,
-                direction = ?tx.direction,
-                "held tx nonce is below its canonical source-chain nonce; evicting stale tx",
-            );
-        }
-        pool.release_in_flight_batch(&stale);
-
         // ── Slot execution contexts (design §2) ──────────────────────
         // One L1 state pinned at the anchor and one live Sync-block prefix,
         // both advanced only by accepted transactions. Failing to open either
@@ -2343,9 +2438,14 @@ where
                         .declared_tx_gas_limit_cap_at(state.anchor.header()),
                 }
                 .map_err(|error| format!("resolve L1 transaction gas cap: {error}"))?;
-                Ok((state, draft, cap))
+                let live_source = eez_protocol::native_source::SourceEntry::new(
+                    ctx.l2_chain_id,
+                    state.anchor.hash(),
+                    0,
+                )?;
+                Ok((state, draft, cap, live_source))
             });
-        let (mut l1_state, mut draft, inbound_gas_limit_cap) = match slot_ctx {
+        let (l1_state, draft, inbound_gas_limit_cap, live_source) = match slot_ctx {
             Ok(contexts) => contexts,
             Err(e) => {
                 event!(
@@ -2358,18 +2458,33 @@ where
                 );
                 pool.push_front_batch(drained);
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
         };
+        let mut source_nonces = inbound_source_nonces_for_drain(
+            ctx,
+            rollup_id,
+            &drained,
+            alloy_eips::BlockId::latest(),
+        )
+        .await;
+        source_nonces.extend(outbound_source_nonces);
+        let (drained, stale) = partition_stale(drained, &source_nonces);
+        for tx in &stale {
+            event!(
+                name: "eez.composer.cc_compose.stale_nonce_evicted",
+                Level::WARN,
+                rollup_id,
+                tx_hash = %tx.hash,
+                sender = %tx.sender,
+                nonce = tx.nonce,
+                direction = ?tx.direction,
+                "held tx nonce is below its canonical source-chain nonce; evicting stale tx",
+            );
+        }
+        pool.release_in_flight_batch(&stale);
+
         // The draft's EVM rules govern outbound envelopes.
         let outbound_gas_limit_cap = draft.declared_tx_gas_limit_cap();
         event!(
@@ -2382,65 +2497,33 @@ where
             "L1 state pinned and Sync block prefix opened for this slot",
         );
 
-        // The Sync block's txs in canonical order, exactly as accepted: the
-        // list the prefix is rebuilt from and the keystone assert compares the
-        // canonical rebuild against.
-        let mut sync_txs: Vec<Bytes> = Vec::new();
-        // SYSTEM_ADDRESS cursor: one nonce per appended system tx. Phase 1 runs
-        // to completion first, so this counts outbound loads N..N+K-1 and then
-        // inbound deliveries from N+K — `build_cross_chain_sync_pairs`' split,
-        // by construction.
-        let mut system_txs_appended: u64 = 0;
-
-        // Drain indices ride along so a re-queue can restore pool order across
-        // the two direction phases.
-        let mut survivors: Vec<(usize, HeldTx)> = Vec::with_capacity(drained.len());
-        // Inbound survivors' compositions (their `source.batch` = the L1
-        // deferred entries) feed `prepare_post_batch_raw`'s merge.
-        // Keep each inbound composition attached to its HeldTx. The same
-        // compositions feed batch assembly and actionable entry resolution.
-        let mut survivor_comps: Vec<(eez_protocol::Composition, B256)> =
-            Vec::with_capacity(drained.len());
-        // Staged for the post-drain canonical rebuild, which must reproduce
-        // `sync_txs` byte-for-byte. `pending_out` pairs an outbound settlement
-        // entry with its user tx; `pending_in` holds inbound target-side
-        // derivation entries; and `outbound_entries` holds settlement entries
-        // spliced into `postBatch`.
-        let mut pending_out: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)> = Vec::new();
-        let mut pending_in: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
-        let mut outbound_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = Vec::new();
-        // Probed gas of the accepted outbound target calls; they re-execute
-        // inside postAndVerifyBatch, so its gas limit must cover them.
-        let mut outbound_target_gas: u64 = 0;
-        // Escrow drawn down per outbound withdrawal (read once, lazily) so several
-        // in one slot can't collectively over-drain. `None` = not yet read.
-        let mut escrow_remaining: Option<U256> = None;
-        let mut poison: Vec<HeldTx> = Vec::new();
-        let mut poison_gaps: Vec<(Address, Direction, u64)> = Vec::new();
-        // A temporarily underfunded outbound root and its same-sender nonce
-        // suffix stay held, while unrelated outbounds and all inbounds may
-        // still settle and change the balance for the next slot.
-        let mut funding_deferred: Vec<(usize, HeldTx)> = Vec::new();
-        let mut funding_gaps: Vec<(Address, Direction, u64)> = Vec::new();
-        // On a transient failure we abort the slot; this holds the error
-        // string + the txs still needing re-queue (the failing tx + the
-        // unprocessed remainder of both phases; survivors are added below).
-        let mut transient: Option<(String, Vec<(usize, HeldTx)>)> = None;
-        // Gas and bytes, not the tx cap, bound this bundle; overflow stays
-        // held for later slots.
-        let mut budget = PostBatchGasBudget {
-            blob,
-            ..PostBatchGasBudget::new(self.inner.emission.max_gas, self.inner.emission.attesters)
+        let mut drain = CrossChainDrain {
+            rollup_id,
+            live_source,
+            l1_state,
+            draft,
+            sync_txs: Vec::new(),
+            system_txs_appended: 0,
+            survivors: Vec::with_capacity(drained.len()),
+            survivor_comps: Vec::with_capacity(drained.len()),
+            pending_out: Vec::new(),
+            pending_in: Vec::new(),
+            outbound_entries: Vec::new(),
+            outbound_target_gas: 0,
+            escrow_remaining: None,
+            poison: Vec::new(),
+            poison_gaps: Vec::new(),
+            funding_deferred: Vec::new(),
+            funding_gaps: Vec::new(),
+            budget: PostBatchGasBudget {
+                blob,
+                ..PostBatchGasBudget::new(
+                    self.inner.emission.max_gas,
+                    self.inner.emission.attesters,
+                )
+            },
+            end: DrainEnd::Complete,
         };
-        // Set by a budget cut: the tx that did not fit plus everything after it,
-        // owed back to the pool unpenalized.
-        let mut deferred: Vec<(usize, HeldTx)> = Vec::new();
-        // Cost of the tx that tripped the budget, for the cut event.
-        let mut rejected_cost: Option<u64> = None;
-        // Set instead when it was the L2 block's gas, not the postBatch's, that
-        // ran out. The cuts are mutually exclusive: the first refusal ends the drain.
-        let mut block_gas_cut: Option<BlockGasCut> = None;
-        let mut blob_budget_cut = false;
 
         // Canonical block order is all outbound pairs then all inbound
         // deliveries, and L1 splits the same way physically (postBatch
@@ -2453,867 +2536,64 @@ where
             .enumerate()
             .partition(|(_, held)| held.direction == Direction::Outbound);
 
-        // ── PHASE 1 — OUTBOUND (L2→L1) ───────────────────────────────
-        // Source-sim runs on a fork of the Sync block against the L2 ENTRY
-        // client (the L2 follower errors `Unavailable`); the L1 side executes
-        // real `_processL2ToL1Calls` frames on a fork of the state. On accept the
-        // canonical `[load, user]` pair extends the block and the L1 frames
-        // commit to the state.
-        let mut out_iter = outbounds.into_iter();
-        while let Some((idx, held)) = out_iter.next() {
-            if let Some(gap_at) = poison_gap_for(&poison_gaps, &held) {
-                event!(
-                    name: "eez.composer.cc_compose.poison_chain_evicted",
-                    Level::WARN,
-                    rollup_id,
-                    tx_idx = idx,
-                    tx_hash = %held.hash,
-                    sender = %held.sender,
-                    nonce = held.nonce,
-                    gap_at,
-                    "same-sender tx above an evicted poison nonce in the same drain; evicted (resubmit in order)",
-                );
-                poison.push(held);
-                continue;
+        drain
+            .compose_outbound(cc, &stf_cfg, outbound_gas_limit_cap, &reopen, outbounds)
+            .await;
+        // An outbound abort or cut moves the inbounds into its re-queue set.
+        match &mut drain.end {
+            DrainEnd::Cut { rest, .. } | DrainEnd::Transient { rest, .. } => {
+                rest.append(&mut inbounds);
             }
-            if let Some(gap_at) = poison_gap_for(&funding_gaps, &held) {
-                event!(
-                    name: "eez.composer.cc_compose.outbound_funding_chain_deferred",
-                    Level::INFO,
-                    rollup_id,
-                    tx_idx = idx,
-                    tx_hash = %held.hash,
-                    sender = %held.sender,
-                    nonce = held.nonce,
-                    gap_at,
-                    "same-sender tx above an underfunded outbound nonce; holding for a later slot",
-                );
-                funding_deferred.push((idx, held));
-                continue;
-            }
-
-            // Reject against the draft's cap before simulation can mark it poison.
-            let user_declared = declared_gas_limit(&held.raw_tx);
-            if let Some((declared, cap)) =
-                gas_limit_violation(user_declared, outbound_gas_limit_cap)
-            {
-                evict_gas_limit_violation(
-                    rollup_id,
-                    idx,
-                    held,
-                    declared,
-                    cap,
-                    &mut poison,
-                    &mut poison_gaps,
-                );
-                continue;
-            }
-
-            let contexts = L1TargetSession::new(&l1_state, local.l1_entry.clone())
-                .map_err(|e| format!("L1TargetSession::new: {e}"))
-                .and_then(|exec| {
-                    draft
-                        .fork()
-                        .map(|fork| (exec, fork))
-                        .map_err(|e| format!("SyncBlockState::fork: {e}"))
-                });
-            let (l1_exec, mut l2_fork) = match contexts {
-                Ok(contexts) => contexts,
-                Err(e) => {
-                    transient = Some((
-                        format!("outbound execution contexts tx#{idx}: {e}"),
-                        abort_rest(
-                            Some((idx, held)),
-                            &mut out_iter,
-                            std::mem::take(&mut inbounds),
-                        ),
-                    ));
-                    break;
-                }
-            };
-            let sessions = seed_session(cc.entry_rollup_id, l1_exec);
-            let (state, env) = l2_fork.state_and_env();
-            let sim = compose_crosschain(
-                cc,
-                eez_protocol::RollupId(rollup_id),
-                &local.l2_entry,
-                held.raw_tx.as_ref(),
-                sessions,
-                state,
-                env,
-            );
-            match sim {
-                Ok((composition, mut sessions, target_gas)) => {
-                    let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
-                        .targets
-                        .iter()
-                        .flat_map(|t| t.batch.entries.iter().cloned())
-                        .collect();
-                    if l1_entries.is_empty() {
-                        event!(
-                            name: "eez.composer.cc_compose.outbound_no_entries",
-                            Level::WARN,
-                            rollup_id,
-                            tx_idx = idx,
-                            tx_hash = %held.hash,
-                            "outbound tx produced no L1 settlement entry; evicting (resubmit required)",
-                        );
-                        push_poison_root(&mut poison, &mut poison_gaps, held);
-                        continue;
-                    }
-                    // `check_entry_shape` covers multiple calls within one entry;
-                    // this guard covers one transaction producing multiple
-                    // entries. Each entry would pair with the same nonce-bearing
-                    // raw transaction, causing the Sync block to include it more
-                    // than once and fail replay.
-                    if l1_entries.len() > 1 {
-                        event!(
-                            name: "eez.composer.cc_compose.outbound_multicall_unsupported",
-                            Level::WARN,
-                            event_name = "eez.composer.cc_compose.outbound_multicall_unsupported",
-                            rollup_id,
-                            tx_idx = idx,
-                            tx_hash = %held.hash,
-                            entries = l1_entries.len(),
-                            "outbound tx made multiple cross-chain calls; evicting because one source transaction cannot back multiple entries",
-                        );
-                        push_poison_root(&mut poison, &mut poison_gaps, held);
-                        continue;
-                    }
-                    // Defer a withdrawal that currently exceeds the rollup's L1
-                    // escrow; an inbound deposit may make it valid next slot.
-                    // "ether out" is the amount of Ether being withdrawn in this outbound settlement entry.
-                    // If missing, the entry is malformed and must be evicted.
-                    // Review once reentrancy is available
-                    let Some(need) = eez_protocol::entries::outbound_ether_out(&l1_entries[0])
-                    else {
-                        event!(name: "eez.composer.cc_compose.outbound_ether_out_missing", Level::WARN, rollup_id, tx_idx = idx, tx_hash = %held.hash, "outbound tx is missing ether out entry, likely malformed; evicting");
-                        push_poison_root(&mut poison, &mut poison_gaps, held);
-                        continue;
-                    };
-                    // Check here (cheap early eviction, before any append work);
-                    // the debit happens at accept below.
-                    if need > U256::ZERO {
-                        if escrow_remaining.is_none() {
-                            escrow_remaining =
-                                read_rollup_escrow(&ctx.l1_provider, ctx.eez_registry, rollup_id)
-                                    .await;
-                        }
-                        if let Some(avail) = escrow_remaining
-                            && need > avail
-                        {
-                            event!(
-                                name: "eez.composer.cc_compose.outbound_over_escrow",
-                                Level::INFO,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                need = %need,
-                                escrow = %avail,
-                                "outbound withdrawal exceeds current L1 rollup escrow; applying bounded funding retry to this sender's nonce chain",
-                            );
-                            let (held, exhausted) = advance_funding_retry(rollup_id, held);
-                            if exhausted {
-                                push_poison_root(&mut poison, &mut poison_gaps, held);
-                            } else {
-                                push_deferred_root(
-                                    &mut funding_deferred,
-                                    &mut funding_gaps,
-                                    idx,
-                                    held,
-                                );
-                            }
-                            continue;
-                        } else if escrow_remaining.is_none() {
-                            event!(
-                                name: "eez.composer.cc_compose.escrow_read_failed",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                need = %need,
-                                "escrow read returned None; over-escrow check skipped and withdrawal admitted (the bundle may revert on L1 if the rollup balance is insufficient)",
-                            );
-                        }
-                    }
-                    // `[load, user]` must fit the Sync block or `build_sync_block`
-                    // hard-errors. Before the L1 budget, so a refusal costs nothing.
-                    let declared =
-                        eez_primitives::SYSTEM_TX_GAS_LIMIT.saturating_add(user_declared);
-                    match block_gas_fit(draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
-                        BlockGasFit::Accept => {}
-                        BlockGasFit::Defer => {
-                            block_gas_cut = Some(BlockGasCut {
-                                gas_used: draft.gas_used(),
-                                declared,
-                            });
-                            deferred = abort_rest(
-                                Some((idx, held)),
-                                &mut out_iter,
-                                std::mem::take(&mut inbounds),
-                            );
-                            break;
-                        }
-                        BlockGasFit::Unfittable => {
-                            event!(
-                                name: "eez.composer.cc_compose.block_gas_unfittable",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                declared,
-                                block_gas_limit = BUILDER_GAS_LIMIT,
-                                "outbound [load, user] pair declares more gas than a whole L2 block; no slot can ever take it — evicting (resubmit with a lower gas limit)",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        }
-                    }
-                    // Commit both projections only after the block append succeeds.
-                    let mut candidate_budget = budget;
-                    match candidate_budget.try_accept_da(rollup_id, &l1_entries, Some(&held.raw_tx))
-                    {
-                        Ok(BlockGasFit::Accept) => {}
-                        Ok(BlockGasFit::Unfittable) => {
-                            event!(
-                                name: "eez.composer.cc_compose.blob_unfittable",
-                                Level::WARN,
-                                rollup_id,
-                                tx_hash = %held.hash,
-                                "held transaction alone exceeds blob capacity; evicting its nonce suffix",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        }
-                        Ok(BlockGasFit::Defer) => {
-                            blob_budget_cut = true;
-                            deferred = abort_rest(
-                                Some((idx, held)),
-                                &mut out_iter,
-                                std::mem::take(&mut inbounds),
-                            );
-                            break;
-                        }
-                        Err(error) => {
-                            transient = Some((
-                                error,
-                                abort_rest(
-                                    Some((idx, held)),
-                                    &mut out_iter,
-                                    std::mem::take(&mut inbounds),
-                                ),
-                            ));
-                            break;
-                        }
-                    }
-                    // Gate before accept: this entry settles inline, so over
-                    // the cap the whole bundle dies silently (invariant 7).
-                    let cost = candidate_budget.tx_cost(
-                        &l1_entries,
-                        &l1_entries,
-                        &held.raw_tx,
-                        target_gas,
-                    );
-                    if !candidate_budget.try_accept(cost) {
-                        rejected_cost = Some(
-                            projected_postbatch_gas(
-                                cost.entries,
-                                cost.calldata_gas,
-                                cost.target_gas,
-                            )
-                            .saturating_add(attestation_gas(self.inner.emission.attesters)),
-                        );
-                        deferred = abort_rest(
-                            Some((idx, held)),
-                            &mut out_iter,
-                            std::mem::take(&mut inbounds),
-                        );
-                        break;
-                    }
-                    // ── ACCEPT ───────────────────────────────────────
-                    // Block first, state second: a pair evicted at append must
-                    // leave the L1 state untouched. `build_outbound_pair` runs
-                    // the shape gate itself, so an entry the Sync-block lowering
-                    // cannot represent comes back as its `Err`.
-                    let pairs_k = match eez_protocol::system_tx::build_outbound_pair(
-                        &l1_entries[0],
-                        &held.raw_tx,
-                        &stf_cfg,
-                        nonce + system_txs_appended,
-                    ) {
-                        Ok(pairs) => pairs,
-                        Err(e) => {
-                            event!(
-                                name: "eez.composer.cc_compose.shape_evicted",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                error = %e,
-                                "outbound entry shape is not representable in a Sync block; evicting (resubmit required)",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        }
-                    };
-                    let pair_txs = eez_protocol::system_tx::interleave_sync_block_txs(&pairs_k);
-                    let pair_logs = match append_and_execute(&mut draft, &pair_txs) {
-                        Ok(logs) => logs,
-                        Err((at, why)) => {
-                            // A backing-store failure says nothing about the tx —
-                            // abort the slot instead of evicting a valid pair.
-                            if matches!(&why, BuildError::Provider(_)) {
-                                transient = Some((
-                                    format!("outbound append tx#{idx} at {at}: {why}"),
-                                    abort_rest(
-                                        Some((idx, held)),
-                                        &mut out_iter,
-                                        std::mem::take(&mut inbounds),
-                                    ),
-                                ));
-                                break;
-                            }
-                            event!(
-                                name: "eez.composer.cc_compose.append_reverted",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                appended_idx = at,
-                                error = %why,
-                                "outbound [load, user] pair does not execute on the Sync block prefix; evicting the tx and rebuilding the prefix",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            // A failed append may be half-applied; the accepted
-                            // list is the only truth to rebuild from.
-                            draft = match reopen(&sync_txs) {
-                                Ok(rebuilt) => rebuilt,
-                                Err(e) => {
-                                    transient = Some((
-                                        format!("Sync block prefix rebuild after tx#{idx}: {e}"),
-                                        abort_rest(
-                                            None,
-                                            &mut out_iter,
-                                            std::mem::take(&mut inbounds),
-                                        ),
-                                    ));
-                                    break;
-                                }
-                            };
-                            continue;
-                        }
-                    };
-                    // The entry was composed from a sim that ran WITHOUT the
-                    // preceding load tx, so re-check it against what the user tx
-                    // actually did here (`docs/issues/outbound-sim-divergence.md`).
-                    let observed = eez_protocol::outbound_gate::observations_from_logs(
-                        &pair_logs,
-                        stf_cfg.eezl2_address,
-                    );
-                    if let Err(e) = eez_protocol::outbound_gate::verify_outbound_authorized(
-                        &l1_entries,
-                        &observed,
-                        rollup_id,
-                    ) {
-                        event!(
-                            name: "eez.composer.cc_compose.outbound_unobserved",
-                            Level::WARN,
-                            rollup_id,
-                            tx_idx = idx,
-                            tx_hash = %held.hash,
-                            error = %e,
-                            "composed outbound entry does not match the call the tx made on the Sync block; evicting",
-                        );
-                        push_poison_root(&mut poison, &mut poison_gaps, held);
-                        draft = match reopen(&sync_txs) {
-                            Ok(rebuilt) => rebuilt,
-                            Err(e) => {
-                                transient = Some((
-                                    format!("Sync block prefix rebuild after tx#{idx}: {e}"),
-                                    abort_rest(None, &mut out_iter, std::mem::take(&mut inbounds)),
-                                ));
-                                break;
-                            }
-                        };
-                        continue;
-                    }
-                    sync_txs.extend(pair_txs);
-                    system_txs_appended += pairs_k.len() as u64;
-                    // Debit at accept, not at the check above: a tx evicted in
-                    // between never draws the escrow down on L1, and a budget
-                    // reduced for it would evict later legitimate withdrawals.
-                    if let Some(avail) = escrow_remaining {
-                        escrow_remaining = Some(avail.saturating_sub(need));
-                    }
-
-                    // The state advances only now, behind the accepted block.
-                    match take_l1_cache(&mut sessions, cc.entry_rollup_id) {
-                        Ok(cache) => l1_state.cache = cache,
-                        Err(e) => {
-                            event!(
-                                name: "eez.composer.cc_compose.l1_session_lost",
-                                Level::ERROR,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                error = %e,
-                                "the L1 execution session did not come back from the composition; the slot's L1 state can no longer chain — degrading",
-                            );
-                            transient = Some((
-                                format!("L1 session hand-off tx#{idx}: {e}"),
-                                abort_rest(
-                                    Some((idx, held)),
-                                    &mut out_iter,
-                                    std::mem::take(&mut inbounds),
-                                ),
-                            ));
-                            break;
-                        }
-                    }
-
-                    budget = candidate_budget;
-                    pending_out.push((l1_entries[0].clone(), held.raw_tx.clone()));
-                    outbound_entries.extend(l1_entries);
-                    outbound_target_gas = outbound_target_gas.saturating_add(target_gas);
-                    // NOT pushed to `survivor_comps`: its `source.batch` is OUR
-                    // L2's entries (a dest=MAINNET call that must not settle on
-                    // L1). The L1 settlement is `outbound_entries`, spliced
-                    // separately with dest=rid.
-                    survivors.push((idx, held));
-                }
-                Err(e) if sim_error_is_insufficient_funds(&e) => {
-                    event!(
-                        name: "eez.composer.cc_compose.outbound_funding_deferred",
-                        Level::INFO,
-                        rollup_id,
-                        tx_idx = idx,
-                        tx_hash = %held.hash,
-                        sender = %held.sender,
-                        nonce = held.nonce,
-                        error = %e,
-                        "outbound target lacks funds; applying bounded funding retry while inbounds continue",
-                    );
-                    let (held, exhausted) = advance_funding_retry(rollup_id, held);
-                    if exhausted {
-                        push_poison_root(&mut poison, &mut poison_gaps, held);
-                    } else {
-                        push_deferred_root(&mut funding_deferred, &mut funding_gaps, idx, held);
-                    }
-                }
-                Err(e) if sim_error_is_poison(&e) => {
-                    event!(
-                        name: "eez.composer.cc_compose.outbound_poison",
-                        Level::WARN,
-                        rollup_id,
-                        tx_idx = idx,
-                        tx_hash = %held.hash,
-                        error = %e,
-                        "outbound tx fails simulation deterministically; evicting",
-                    );
-                    push_poison_root(&mut poison, &mut poison_gaps, held);
-                }
-                Err(e) => {
-                    transient = Some((
-                        format!("compose_crosschain outbound tx#{idx}: {e}"),
-                        abort_rest(
-                            Some((idx, held)),
-                            &mut out_iter,
-                            std::mem::take(&mut inbounds),
-                        ),
-                    ));
-                    break;
-                }
+            DrainEnd::Complete => {
+                drain.compose_inbound(cc, &stf_cfg, inbound_gas_limit_cap, reopen, inbounds);
             }
         }
+        // Boxed: the drain holds two live execution contexts, so its future is
+        // past the inline-size budget.
+        Box::pin(self.finish_cross_chain_batch(cc, rollup, slot, &stf_cfg, stale.len(), drain))
+            .await
+    }
 
-        // ── PHASE 2 — INBOUND (L1→L2) ────────────────────────────────
-        // Source-sim runs the L1 user tx on a fork of the state; the L2 side
-        // probes the canonical delivery on a fork of the block and reads the
-        // claim off the real `EEZL2 → proxy` frame. On accept the delivery
-        // extends the block and the source fork's writes become the state.
-        // A phase-1 abort already collected these txs into the re-queue set.
-        let inbounds = if transient.is_some() {
-            Vec::new()
-        } else {
-            inbounds
-        };
-        let mut in_iter = inbounds.into_iter();
-        while let Some((idx, held)) = in_iter.next() {
-            if let Some(gap_at) = poison_gap_for(&poison_gaps, &held) {
-                event!(
-                    name: "eez.composer.cc_compose.poison_chain_evicted",
-                    Level::WARN,
-                    rollup_id,
-                    tx_idx = idx,
-                    tx_hash = %held.hash,
-                    sender = %held.sender,
-                    nonce = held.nonce,
-                    gap_at,
-                    "same-sender tx above an evicted poison nonce in the same drain; evicted (resubmit in order)",
-                );
-                poison.push(held);
-                continue;
-            }
-
-            // Source simulation is uncapped; enforce the L1 envelope cap first.
-            let user_declared = declared_gas_limit(&held.raw_tx);
-            if let Some((declared, cap)) = gas_limit_violation(user_declared, inbound_gas_limit_cap)
-            {
-                evict_gas_limit_violation(
-                    rollup_id,
-                    idx,
-                    held,
-                    declared,
-                    cap,
-                    &mut poison,
-                    &mut poison_gaps,
-                );
-                continue;
-            }
-
-            let contexts = draft
-                .fork()
-                .map_err(|e| format!("SyncBlockState::fork: {e}"))
-                .map(|fork| {
-                    InboundL2TargetSession::new(fork, stf_cfg.clone(), nonce + system_txs_appended)
-                })
-                .and_then(|probe| {
-                    l1_state
-                        .fork_state(&local.l1_entry)
-                        .map(|source| (probe, source))
-                        .map_err(|e| format!("L1SlotState::fork_state: {e}"))
-                });
-            let (probe, (mut l1_fork, l1_env)) = match contexts {
-                Ok(contexts) => contexts,
-                Err(e) => {
-                    transient = Some((
-                        format!("inbound execution contexts tx#{idx}: {e}"),
-                        abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
-                    ));
-                    break;
-                }
-            };
-            let sessions = seed_session(eez_protocol::RollupId(rollup_id), probe);
-            let sim = compose_crosschain(
-                cc,
-                cc.entry_rollup_id,
-                &local.l1_entry,
-                held.raw_tx.as_ref(),
-                sessions,
-                &mut l1_fork,
-                &l1_env,
-            );
-            match sim {
-                Ok((composition, _sessions, _probe_gas)) => {
-                    let target_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
-                        .targets
-                        .iter()
-                        .flat_map(|t| t.batch.entries.iter().cloned())
-                        .collect();
-                    // Shape gate at accept, both halves: an entry the delivery
-                    // lowering cannot represent, or a nested recording on the
-                    // source side, is this tx's problem, not the slot's.
-                    let shape = target_entries
-                        .iter()
-                        .try_for_each(|entry| {
-                            eez_protocol::system_tx::check_entry_shape(entry, "inbound")
-                        })
-                        .and_then(|()| {
-                            match composition
-                                .source
-                                .batch
-                                .entries
-                                .iter()
-                                .find(|entry| !entry.expectedL1ToL2Calls.is_empty())
-                            {
-                                Some(nested) => Err(format!(
-                                    "inbound source entry records {} nested L1→L2 call(s); nested composition is parked",
-                                    nested.expectedL1ToL2Calls.len(),
-                                )),
-                                None => Ok(()),
-                            }
-                        });
-                    if let Err(e) = shape {
-                        event!(
-                            name: "eez.composer.cc_compose.shape_evicted",
-                            Level::WARN,
-                            rollup_id,
-                            tx_idx = idx,
-                            tx_hash = %held.hash,
-                            error = %e,
-                            "inbound composition uses an unsupported entry shape; evicting (resubmit required)",
-                        );
-                        push_poison_root(&mut poison, &mut poison_gaps, held);
-                        continue;
-                    }
-
-                    // Same gate: one delivery tx per entry, each at the protocol gas budget.
-                    // Foreign entries never ship, so this over-counts at worst.
-                    let declared = eez_primitives::SYSTEM_TX_GAS_LIMIT
-                        .saturating_mul(target_entries.len() as u64);
-                    match block_gas_fit(draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
-                        BlockGasFit::Accept => {}
-                        BlockGasFit::Defer => {
-                            block_gas_cut = Some(BlockGasCut {
-                                gas_used: draft.gas_used(),
-                                declared,
-                            });
-                            deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
-                            break;
-                        }
-                        BlockGasFit::Unfittable => {
-                            event!(
-                                name: "eez.composer.cc_compose.block_gas_unfittable",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                declared,
-                                deliveries = target_entries.len(),
-                                block_gas_limit = BUILDER_GAS_LIMIT,
-                                "inbound deliveries declare more gas than a whole L2 block; no slot can ever take them — evicting (resubmit as separate calls)",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        }
-                    }
-                    // Commit both projections only after the block append succeeds.
-                    let mut candidate_budget = budget;
-                    match candidate_budget.try_accept_da(rollup_id, &target_entries, None) {
-                        Ok(BlockGasFit::Accept) => {}
-                        Ok(BlockGasFit::Unfittable) => {
-                            event!(
-                                name: "eez.composer.cc_compose.blob_unfittable",
-                                Level::WARN,
-                                rollup_id,
-                                tx_hash = %held.hash,
-                                "held transaction alone exceeds blob capacity; evicting its nonce suffix",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        }
-                        Ok(BlockGasFit::Defer) => {
-                            blob_budget_cut = true;
-                            deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
-                            break;
-                        }
-                        Err(error) => {
-                            transient = Some((
-                                error,
-                                abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
-                            ));
-                            break;
-                        }
-                    }
-                    // Same gate, no target gas: a deferred entry only queues
-                    // here, and its L1 half is a separate bundled tx.
-                    let cost = candidate_budget.tx_cost(
-                        &composition.source.batch.entries,
-                        &target_entries,
-                        &[],
-                        0,
-                    );
-                    if !candidate_budget.try_accept(cost) {
-                        rejected_cost = Some(
-                            projected_postbatch_gas(
-                                cost.entries,
-                                cost.calldata_gas,
-                                cost.target_gas,
-                            )
-                            .saturating_add(attestation_gas(self.inner.emission.attesters)),
-                        );
-                        deferred = abort_rest(Some((idx, held)), &mut in_iter, Vec::new());
-                        break;
-                    }
-                    // ── ACCEPT ───────────────────────────────────────
-                    let deliveries = match target_entries
-                        .iter()
-                        .map(eez_protocol::entries::InboundSidecar::try_from)
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|error| error.to_string())
-                        .and_then(|inbound| {
-                            eez_protocol::system_tx::build_inbound_system_txs(
-                                &inbound,
-                                &stf_cfg,
-                                nonce + system_txs_appended,
-                            )
-                        }) {
-                        Ok(deliveries) if deliveries.is_empty() && !target_entries.is_empty() => {
-                            event!(
-                                name: "eez.composer.cc_compose.shape_evicted",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                entries = target_entries.len(),
-                                "every inbound target entry was skipped as foreign, which cannot happen for own-rollup targets; evicting",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        }
-                        Ok(deliveries) => deliveries,
-                        Err(e) => {
-                            event!(
-                                name: "eez.composer.cc_compose.shape_evicted",
-                                Level::WARN,
-                                rollup_id,
-                                tx_idx = idx,
-                                tx_hash = %held.hash,
-                                error = %e,
-                                "build_inbound_system_txs rejected the entries; evicting (resubmit required)",
-                            );
-                            push_poison_root(&mut poison, &mut poison_gaps, held);
-                            continue;
-                        }
-                    };
-                    // The delivery re-runs the on-chain claim compare, so this
-                    // append IS the verifier: a revert means the claims and the
-                    // block disagree and the tx must go.
-                    if let Err((at, why)) = append_and_execute(&mut draft, &deliveries) {
-                        // A backing-store failure says nothing about the tx —
-                        // abort the slot instead of evicting a valid delivery.
-                        if matches!(&why, BuildError::Provider(_)) {
-                            transient = Some((
-                                format!("inbound append tx#{idx} at {at}: {why}"),
-                                abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
-                            ));
-                            break;
-                        }
-                        event!(
-                            name: "eez.composer.cc_compose.append_reverted",
-                            Level::WARN,
-                            rollup_id,
-                            tx_idx = idx,
-                            tx_hash = %held.hash,
-                            appended_idx = at,
-                            error = %why,
-                            "inbound delivery does not execute on the Sync block prefix; evicting the tx and rebuilding the prefix",
-                        );
-                        push_poison_root(&mut poison, &mut poison_gaps, held);
-                        draft = match reopen(&sync_txs) {
-                            Ok(rebuilt) => rebuilt,
-                            Err(e) => {
-                                transient = Some((
-                                    format!("Sync block prefix rebuild after tx#{idx}: {e}"),
-                                    abort_rest(None, &mut in_iter, Vec::new()),
-                                ));
-                                break;
-                            }
-                        };
-                        continue;
-                    }
-                    system_txs_appended += deliveries.len() as u64;
-                    sync_txs.extend(deliveries);
-                    // The source fork carries the L1 user tx's committed writes;
-                    // later inbound sims must observe them (design §4 step 6).
-                    l1_state.cache = l1_fork.into_cache();
-
-                    let target_count = target_entries.len();
-                    pending_in.extend(target_entries);
-                    event!(
-                        name: "eez.composer.cc_compose.tx",
-                        Level::INFO,
-                        rollup_id,
-                        tx_idx = idx,
-                        target_count,
-                        "composition produced {{target_count}} target(s) for held tx #{{tx_idx}}",
-                    );
-                    budget = candidate_budget;
-                    survivor_comps.push((composition, held.hash));
-                    survivors.push((idx, held));
-                }
-                Err(e) if sim_error_is_poison(&e) => {
-                    event!(
-                        name: "eez.composer.cc_compose.poison_evicted",
-                        Level::WARN,
-                        rollup_id,
-                        tx_idx = idx,
-                        tx_hash = %held.hash,
-                        sender = %held.sender,
-                        nonce = held.nonce,
-                        error = %e,
-                        "held tx fails simulation deterministically (e.g. wrong proxy → EmptyCalls, or revert); evicting — it can never compose, resubmit required",
-                    );
-                    push_poison_root(&mut poison, &mut poison_gaps, held);
-                }
-                Err(e) => {
-                    // Transient (provider / transport / unavailable) —
-                    // abort the slot, re-queue this tx + the remainder.
-                    transient = Some((
-                        format!("compose_crosschain inbound tx#{idx}: {e}"),
-                        abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
-                    ));
-                    break;
-                }
-            }
-        }
-
-        // ── Budget cut: settle what fits, keep the rest held. ─────────
-        // Normal under load. Before the poison sweep, so an eviction here rides
-        // the same nonce cascade.
-        let deferred_was_empty = deferred.is_empty();
-        if !deferred.is_empty() {
-            let deferred_count = deferred.len();
-            let accepted_count = survivors.len();
-            // A block-gas cut needs gas on the block, which needs an accepted tx,
-            // so the eviction branch below can only ever be an L1-budget cut.
-            debug_assert!(
-                accepted_count > 0 || block_gas_cut.is_none(),
-                "a block-gas cut cannot happen with nothing accepted"
-            );
-            if accepted_count == 0 && !blob_budget_cut {
-                // It lost against the whole budget, so no slot is roomier and
-                // re-queueing would block the FIFO forever. It sits first.
-                let (_, head) = deferred.remove(0);
-                event!(
-                    name: "eez.composer.sync_slot.gas_budget_cut",
-                    Level::WARN,
-                    rollup_id,
-                    accepted_count,
-                    deferred_count,
-                    projected_gas = budget.projected,
-                    rejected_cost = rejected_cost.unwrap_or(0),
-                    budget = budget.cap,
-                    tx_hash = %head.hash,
-                    "the first held tx alone exceeds the postBatch gas budget; it can never settle — evicting it (resubmit a cheaper call)",
-                );
-                push_poison_root(&mut poison, &mut poison_gaps, head);
-            } else if blob_budget_cut {
-                event!(
-                    name: "eez.composer.sync_slot.blob_budget_cut",
-                    Level::INFO,
-                    rollup_id,
-                    accepted_count,
-                    deferred_count,
-                    blob = ?budget.blob,
-                    "blob byte budget reached; remaining held transactions stay queued",
-                );
-            } else if let Some(BlockGasCut { gas_used, declared }) = block_gas_cut {
-                event!(
-                    name: "eez.composer.sync_slot.block_gas_cut",
-                    Level::INFO,
-                    rollup_id,
-                    accepted_count,
-                    deferred_count,
-                    gas_used,
-                    declared,
-                    block_gas_limit = BUILDER_GAS_LIMIT,
-                    "Sync block gas limit reached; {{deferred_count}} held tx(s) stay queued for a later Sync slot",
-                );
-            } else {
-                event!(
-                    name: "eez.composer.sync_slot.gas_budget_cut",
-                    Level::INFO,
-                    rollup_id,
-                    accepted_count,
-                    deferred_count,
-                    projected_gas = budget.projected,
-                    rejected_cost = rejected_cost.unwrap_or(0),
-                    budget = budget.cap,
-                    "postBatch gas budget reached; {{deferred_count}} held tx(s) stay queued for a later Sync slot",
-                );
-            }
-        }
+    /// Settle the drain: run the budget-cut and poison dispositions, re-queue
+    /// what stays held, then build the Sync block and its postBatch from the
+    /// accepted prefix — or degrade to a minimal postBatch when nothing
+    /// survived or a systemic step failed.
+    async fn finish_cross_chain_batch(
+        &self,
+        cc: &CrossChainWiring,
+        rollup: &RollupState<L2>,
+        slot: SlotTarget<'_>,
+        stf_cfg: &eez_protocol::system_tx::SystemTxContext,
+        evicted_stale: usize,
+        mut drain: CrossChainDrain,
+    ) -> Result<Option<SyncSlotBlock>, String> {
+        let SlotTarget {
+            parent_header,
+            timestamp,
+            fee_recipient: suggested_fee_recipient,
+            bundle_target,
+        } = slot;
+        let ctx = cc.exec_ctx.as_ref();
+        let pool = rollup.held_pool.as_ref();
+        drain.handle_budget_cut();
+        let CrossChainDrain {
+            rollup_id,
+            live_source,
+            l1_state,
+            draft,
+            sync_txs,
+            survivors,
+            survivor_comps,
+            pending_out,
+            pending_in,
+            outbound_entries,
+            outbound_target_gas,
+            poison,
+            poison_gaps,
+            mut funding_deferred,
+            end,
+            ..
+        } = drain;
 
         // Evict the poison txs' gapped higher nonces from the pool — once
         // a sender's nonce N is evicted, N+1.. can never land.
@@ -3345,39 +2625,29 @@ where
             }
         }
 
-        // ── Transient abort: re-queue survivors + remainder, minimal. ──
-        // A cut empties the inbound queue, so phase 2 can't also fail here.
-        // Asserted so a future edit can't double-push the survivors.
-        debug_assert!(
-            transient.is_none() || deferred_was_empty,
-            "budget cut and transient abort are mutually exclusive"
-        );
-        if let Some((err, rest)) = transient {
-            event!(
-                name: "eez.composer.phase2.transient",
-                Level::WARN,
-                rollup_id,
-                error = %err,
-                survivors = survivors.len(),
-                "transient compose failure; re-queueing and degrading to minimal postBatch this slot",
-            );
-            // Both phases contribute; the pool is owed its own FIFO order.
-            let mut requeue = funding_deferred;
-            requeue.extend(survivors);
-            requeue.extend(rest);
-            requeue_unprocessed(pool, rollup_id, &poison_gaps, requeue);
-            return self
-                .dispatch_minimal_postbatch(
-                    ctx,
+        let deferred = match end {
+            DrainEnd::Complete => Vec::new(),
+            DrainEnd::Cut { rest, .. } => rest,
+            // ── Transient abort: re-queue survivors + remainder, minimal. ──
+            DrainEnd::Transient { error, rest } => {
+                event!(
+                    name: "eez.composer.phase2.transient",
+                    Level::WARN,
                     rollup_id,
-                    rollup,
-                    parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                )
-                .await;
-        }
+                    error = %error,
+                    survivors = survivors.len(),
+                    "transient compose failure; re-queueing and degrading to minimal postBatch this slot",
+                );
+                // Both phases contribute; the pool is owed its own FIFO order.
+                let mut requeue = funding_deferred;
+                requeue.extend(survivors);
+                requeue.extend(rest);
+                requeue_unprocessed(pool, rollup_id, &poison_gaps, requeue);
+                return self
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
+                    .await;
+            }
+        };
 
         funding_deferred.extend(deferred);
         if !funding_deferred.is_empty() {
@@ -3387,7 +2657,7 @@ where
         // Nothing composed (all evicted or deferred). Still post a minimal
         // batch so L1 keeps tracking L2's progression.
         if survivors.is_empty() {
-            let evicted = poison.len() + stale.len();
+            let evicted = poison.len() + evicted_stale;
             event!(
                 name: "eez.composer.phase2.all_poison",
                 Level::WARN,
@@ -3396,33 +2666,27 @@ where
                 "no held tx survived the drain (stale, deterministic failure, temporarily underfunded, or over the gas budget); emitting minimal postBatch",
             );
             return self
-                .dispatch_minimal_postbatch(
-                    ctx,
-                    rollup_id,
-                    rollup,
-                    parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                )
+                .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                 .await;
         }
 
         // Past the drain the pool's order is all that matters again.
         let survivors: Vec<HeldTx> = restore_pool_order(survivors);
 
-        // ── Rebuild the Sync block's system txs via THE canonical builder —
-        // deriver-byte-identical two-phase SYSTEM_ADDRESS nonces (outbound loads
-        // N.., then inbound deliveries N+K..) + interleaved order
-        // [load,user,…,deliveries]. Handles inbound / outbound / mixed
-        // uniformly. A failure is systemic (signing / nonce overflow) →
-        // re-queue survivors, degrade to minimal.
-        let pairs = match eez_protocol::system_tx::build_cross_chain_sync_pairs(
+        // Reconstruct canonical plans independently of the accepted byte list,
+        // using the actual preceding gas recorded by the draft. A mismatch
+        // aborts posting and requeues survivors without re-executing the block.
+        let (pairs, canonical) = match eez_protocol::system_tx::build_cross_chain_sync_pairs(
             &pending_out,
             &pending_in,
-            &stf_cfg,
-            nonce,
-        ) {
+            stf_cfg,
+            live_source,
+        )
+        .and_then(|pairs| {
+            let bytes = draft
+                .materialize_prefix(&eez_protocol::system_tx::interleave_sync_block_txs(&pairs))?;
+            Ok((pairs, bytes))
+        }) {
             Ok(p) => p,
             Err(e) => {
                 event!(
@@ -3434,15 +2698,7 @@ where
                 );
                 pool.push_front_batch(survivors);
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
         };
@@ -3453,7 +2709,6 @@ where
         // reconstructs from the same entries. Inequality is a composer bug, not
         // an input condition, so it degrades the slot loudly instead of posting
         // a block nobody else can rebuild.
-        let canonical = eez_protocol::system_tx::interleave_sync_block_txs(&pairs);
         if canonical != sync_txs {
             let first_divergent = canonical
                 .iter()
@@ -3471,15 +2726,7 @@ where
             );
             pool.push_front_batch(survivors);
             return self
-                .dispatch_minimal_postbatch(
-                    ctx,
-                    rollup_id,
-                    rollup,
-                    parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                )
+                .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                 .await;
         }
 
@@ -3505,15 +2752,7 @@ where
                 );
                 pool.push_front_batch(survivors);
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
         };
@@ -3531,15 +2770,7 @@ where
             );
             pool.push_front_batch(survivors);
             return self
-                .dispatch_minimal_postbatch(
-                    ctx,
-                    rollup_id,
-                    rollup,
-                    parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                )
+                .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                 .await;
         }
         // Per-effect intermediate L2 roots: the prover requires each entry's
@@ -3564,15 +2795,7 @@ where
                 );
                 pool.push_front_batch(survivors);
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
         };
@@ -3645,15 +2868,7 @@ where
                         "opaque prover failure recovered with bounded transaction eviction",
                     );
                     return self
-                        .dispatch_minimal_postbatch(
-                            ctx,
-                            rollup_id,
-                            rollup,
-                            parent_header,
-                            timestamp,
-                            suggested_fee_recipient,
-                            bundle_target,
-                        )
+                        .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                         .await;
                 };
 
@@ -3706,16 +2921,8 @@ where
                 // The recursive call owns `retry`; retain this level's exact
                 // set so a pre-classification error can requeue it locally.
                 let retry_after_error = retry.clone();
-                let recomposed = Box::pin(self.compose_cross_chain_batch(
-                    cc,
-                    rollup_id,
-                    retry,
-                    parent_header,
-                    timestamp,
-                    suggested_fee_recipient,
-                    bundle_target,
-                ))
-                .await;
+                let recomposed =
+                    Box::pin(self.compose_cross_chain_batch(cc, rollup_id, retry, slot)).await;
                 return match recomposed {
                     Ok(result) => Ok(result),
                     Err(error) => {
@@ -3733,10 +2940,7 @@ where
                                 ctx,
                                 rollup_id,
                                 rollup,
-                                parent_header,
-                                timestamp,
-                                suggested_fee_recipient,
-                                bundle_target,
+                                slot,
                             )
                             .await
                             .unwrap_or_else(|fallback_error| {
@@ -3786,15 +2990,7 @@ where
                     "prover failure recovered",
                 );
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
             Err(PreparePostBatchError::Build(error)) => {
@@ -3807,15 +3003,7 @@ where
                 );
                 pool.push_front_batch(survivors);
                 return self
-                    .dispatch_minimal_postbatch(
-                        ctx,
-                        rollup_id,
-                        rollup,
-                        parent_header,
-                        timestamp,
-                        suggested_fee_recipient,
-                        bundle_target,
-                    )
+                    .dispatch_minimal_postbatch(ctx, rollup_id, rollup, slot)
                     .await;
             }
         };
@@ -3848,7 +3036,7 @@ where
             tx_count = bundle.len(),
             entry_count = total_entries,
             evicted_poison = poison.len(),
-            evicted_stale = stale.len(),
+            evicted_stale,
             "rich bundle dispatched to background observer; committing Sync block optimistically",
         );
         rollup.optimistic.begin(
@@ -3887,11 +3075,14 @@ where
         ctx: &CrossChainExecCtx,
         rollup_id: u64,
         rollup: &RollupState<L2>,
-        parent_header: &reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
-        timestamp: u64,
-        suggested_fee_recipient: Address,
-        bundle_target: BundleTarget,
+        slot: SlotTarget<'_>,
     ) -> Result<Option<SyncSlotBlock>, String> {
+        let SlotTarget {
+            parent_header,
+            timestamp,
+            fee_recipient: suggested_fee_recipient,
+            bundle_target,
+        } = slot;
         let empty_built = match build_sync_block(
             rollup.l2_provider.as_ref(),
             &self.inner.evm_config,
@@ -4375,201 +3566,32 @@ where
 
         let sync_block_hash = terminal_header.hash();
 
-        // Merge inbound compositions' L1 source batches, or start empty so an
-        // idle Sync slot can carry only the leading immediate entry that
-        // advances L1's stored root.
-        let mut batch = if compositions.is_empty() {
-            eez_protocol::EvmBatch::default()
-        } else {
-            let mut b = compositions[0].source.batch.clone();
-            for c in &compositions[1..] {
-                b.entries.extend(c.source.batch.entries.iter().cloned());
-                b.staticEntries
-                    .extend(c.source.batch.staticEntries.iter().cloned());
-            }
-            b
-        };
-        batch.blockNumber = if l1_context.is_some() { u64::MAX } else { 0 };
-
-        // Prepend one leading immediate entry (`proxyEntryHash == 0`)
-        // covering all L2 effects before the sync block — EEZ.sol drains
-        // it inline during postAndVerifyBatch, applying its state update
-        // against L1's recorded root.
-        //
-        // `currentRoot` = hash(posted), the L1-confirmed cursor block — must
-        // equal L1.config.root at postBatch time so the deriver's
-        // check_claimed_state agrees. `newRoot` = the Sync block sealed over no
-        // transactions, so the anchor already sits at the Sync block's height
-        // and later effect entries chain from it. With no effects that block IS
-        // the Sync block, so it is also the required endpoint.
-        let posted = self
-            .inner
-            .rollups
-            .get(&rollup_id)
-            .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
-            .l1_head
-            .cursor();
+        // The L1-confirmed cursor block anchors the batch: its hash is the
+        // leading immediate entry's `currentRoot` and `posted + 1` starts the
+        // covered range.
+        let rollup =
+            self.inner.rollups.get(&rollup_id).ok_or_else(|| {
+                format!("unknown rollup_id {rollup_id} in prepare_post_batch_raw")
+            })?;
+        let posted = rollup.l1_head.cursor();
         let (pre_block_hash, pre_state_root): (B256, B256) = {
-            let h = self
-                .inner
-                .rollups
-                .get(&rollup_id)
-                .ok_or_else(|| format!("unknown rollup_id {rollup_id}"))?
+            let h = rollup
                 .l2_provider
                 .sealed_header(posted)
                 .map_err(|e| format!("sealed_header({posted}): {e}"))?
                 .ok_or_else(|| format!("local L2 header at {posted} missing"))?;
             (h.hash(), h.state_root())
         };
-        let immediate_entry = eez_protocol::abi::ExecutionEntrySol {
-            rollupUpdates: vec![eez_protocol::abi::RollupUpdateSol {
-                rollupId: rollup_id,
-                currentRoot: pre_block_hash,
-                newRoot: candidates.anchor,
-                etherDelta: alloy_primitives::aliases::I192::ZERO,
-            }],
-            proxyEntryHash: B256::ZERO,
-            l2ToL1Calls: Vec::new(),
-            expectedL1ToL2Calls: Vec::new(),
-            rollingHash: B256::ZERO,
-            destinationRollupId: rollup_id,
-            success: true,
-            returnData: Bytes::new(),
-        };
-        batch.entries.insert(0, immediate_entry);
 
-        // Splice OUTBOUND settlement entries after the leading anchor; its state
-        // update is attached below. The contract drains the contiguous
-        // `proxyEntryHash==0` run inline, so order must be
-        // `[anchor | outbound | inbound]`. `dest=rid` is the settlement's source
-        // rollup (not the call's MAINNET target); `_validateStructure` checks it.
-        for (k, oe) in outbound_entries.iter().enumerate() {
-            let mut entry = oe.clone();
-            entry.destinationRollupId = rollup_id;
-            batch.entries.insert(1 + k, entry);
-        }
-
-        // Deposit value for inbound deferred entries: the lean on-chain entry binds
-        // V only in its `proxyEntryHash` preimage, so read V from the DA sidecar
-        // (`targets[].batch`, same `proxyEntryHash`). Value-free → absent → 0.
-        let inbound_ether: HashMap<B256, alloy_primitives::aliases::I192> = compositions
-            .iter()
-            .flat_map(|c| c.targets.iter())
-            .flat_map(|t| t.batch.entries.iter())
-            .filter_map(|e| {
-                let v = e.l2ToL1Calls.first()?.value;
-                if v.is_zero() {
-                    return None;
-                }
-                eez_protocol::abi::u256_to_i192(v).map(|d| (e.proxyEntryHash, d))
-            })
-            .collect();
-
-        // Cross-chain entries arrive with EMPTY `rollupUpdates`; attach one chained
-        // settlement state update to each (the anchor already has its own) — else
-        // `_applyRollupUpdates` no-ops and the L2 root never settles. Direction by
-        // `proxyEntryHash`: outbound (== 0) → `-V` (via `outbound_ether_out`; None =
-        // multi-call-with-value, unsupported → reject); inbound (!= 0) → `+V` deposit.
-        // Value-free → 0.
-        // `newRoot` = effect `k`'s per-effect root `candidates.per_effect[k]`; entries are
-        // ordered `[outbound… | inbound…]`, matching the Sync block's pair-ends.
-        // The prover requires this exact per-entry value. `currentRoot` is fixed
-        // by the stitch below.
-        let mut effect_k = 0usize;
-        for entry in &mut batch.entries {
-            // Preserve the anchor's existing state update and fill only the
-            // cross-chain effect entries, which arrive empty.
-            if !entry.rollupUpdates.is_empty() {
-                continue;
-            }
-            let ether_delta = if entry.proxyEntryHash == B256::ZERO {
-                let v = eez_protocol::entries::outbound_ether_out(entry).ok_or_else(|| {
-                    format!(
-                        "outbound entry: multi-call value not supported \
-                         (l2ToL1Calls={})",
-                        entry.l2ToL1Calls.len(),
-                    )
-                })?;
-                if v.is_zero() {
-                    alloy_primitives::aliases::I192::ZERO
-                } else {
-                    -eez_protocol::abi::u256_to_i192(v)
-                        .ok_or_else(|| format!("outbound etherOut {v} overflows int192"))?
-                }
-            } else {
-                inbound_ether
-                    .get(&entry.proxyEntryHash)
-                    .copied()
-                    .unwrap_or(alloy_primitives::aliases::I192::ZERO)
-            };
-            let new_root = *candidates.per_effect.get(effect_k).ok_or_else(|| {
-                format!(
-                    "settlement stitch: effect entry {effect_k} has no per-effect root \
-                     (only {} pair-end roots — pair-end/entry misalignment)",
-                    candidates.per_effect.len(),
-                )
-            })?;
-            entry.rollupUpdates = vec![eez_protocol::abi::RollupUpdateSol {
-                rollupId: rollup_id,
-                currentRoot: B256::ZERO,
-                newRoot: new_root,
-                etherDelta: ether_delta,
-            }];
-            effect_k += 1;
-        }
-        if effect_k != candidates.per_effect.len() {
-            return Err(format!(
-                "settlement stitch: {effect_k} effect entries but {} per-effect roots \
-                 (pair-end/entry misalignment)",
-                candidates.per_effect.len(),
-            )
-            .into());
-        }
-
-        // Stitch the per-rollup state-update chain: EEZ.sol `_applyRollupUpdates`
-        // enforces `config.root == update.currentRoot` then sets it to
-        // `newRoot`, so each entry's `currentRoot` must chain to the prior
-        // entry's `newRoot`. This chains `posted → E → R_0 → … → R_last`, with
-        // `E` the empty prefix and `R_last` the terminal, satisfying both EEZ.sol
-        // and the prover's effect-prefix gate.
-        let mut running_roots: HashMap<u64, B256> = HashMap::new();
-        for entry in &mut batch.entries {
-            for update in &mut entry.rollupUpdates {
-                if let Some(prev_new) = running_roots.get(&update.rollupId).copied() {
-                    update.currentRoot = prev_new;
-                }
-                running_roots.insert(update.rollupId, update.newRoot);
-            }
-        }
-
-        // The validating proof path enforces that the chain ends at the Sync
-        // block's final root. Debug builds also check the local stitching
-        // invariant here before the proof signer independently validates it.
-        debug_assert_eq!(
-            batch
-                .entries
-                .last()
-                .and_then(|entry| entry.rollupUpdates.last())
-                .map(|update| update.newRoot),
-            Some(sync_block_hash),
-            "settlement chain must end at the Sync-block state root",
-        );
-
-        // The L1 rolling seed commits the finalized ordered state updates, so
-        // it can only be computed after the stitch above has set every
-        // `currentRoot`.
-        eez_protocol::entries::finalize_l1_rolling_hashes(&mut batch)
-            .map_err(|error| format!("finalize L1 rolling hashes: {error}"))?;
-
-        // The contract drains the leading contiguous `proxyEntryHash == 0` run
-        // inline: one anchor plus the outbound immediate entries.
-        // Inbound deferred entries (proxyEntryHash != 0) queue for
-        // `executeCrossChainCall` consumption. N=0 for inbound-only → 1.
-        batch.immediateEntryCount = U256::from(1 + outbound_entries.len() as u64);
-
-        // Registry-id settlement gate: refuse a batch carrying any non-registry
-        // destinationRollupId (e.g. an un-rewritten MAINNET(0) outbound entry).
-        ensure_batch_registry_native(&batch, rollup_id)?;
+        let mut batch = build_settlement_batch(
+            rollup_id,
+            compositions,
+            outbound_entries,
+            pre_block_hash,
+            candidates,
+            sync_block_hash,
+            l1_context.is_some(),
+        )?;
         // Every configured attester until the quorum answers; the settled
         // batch then names exactly the proof systems whose proofs it carries.
         assign_proof_systems(
@@ -4589,114 +3611,47 @@ where
         // provider index for the newest block. The Sync-block DA carries
         // outbound user transactions; its system transactions are reconstructed
         // by the deriver from the postBatch entries.
-        let rollup =
-            self.inner.rollups.get(&rollup_id).ok_or_else(|| {
-                format!("unknown rollup_id {rollup_id} in prepare_post_batch_raw")
-            })?;
         // Reuse the SAME cursor read that anchored the leading
         // immediate's currentRoot above — a second read could race the
         // Deriver's cursor advance and desync the callData range from
         // the state-update anchor (TOCTOU).
-        let from = posted + 1;
-        let sync_block_number = parent_header.number() + 1;
-        if sync_block_number < from {
-            return Err(format!(
-                "sync block {sync_block_number} <= L1-confirmed cursor {posted}; \
-                 composer is behind its own posted batches"
-            )
-            .into());
-        }
-        // Invariant 7: `compose_sync_slot` bounds every range, so reaching this
-        // is a decision-layer bug, not an operating condition.
-        let span = sync_block_number - from + 1;
-        if span > self.inner.emission.max_blocks {
-            return Err(format!(
-                "batch range {from}..={sync_block_number} spans {span} blocks, over \
-                 MAX_BLOCKS_PER_BATCH ({}) — emission bug",
-                self.inner.emission.max_blocks,
-            )
-            .into());
-        }
-        let mut blocks = self.committed_da_blocks(rollup, parent_header, from)?;
-        // Outbound user txs aren't reconstructible from the entries (only the load
-        // is), so they travel in the Sync-block DA here; the deriver interleaves
-        // them with the rebuilt loads. Inbound-only → empty.
-        blocks.push(eez_payload_codec::SpanBlock {
-            // Read off the terminal header.
-            beneficiary: terminal_header.beneficiary().into(),
-            extra_data: terminal_header.extra_data().to_vec(),
-            transactions: outbound_user_txs.iter().map(|b| b.to_vec()).collect(),
-        });
-        // Outbound entries describe L1 settlement and L2 loads; inbound target
-        // batches carry the delivery inputs. Published as actions in that order
-        // — a lean inbound entry binds its call only via `proxyEntryHash`, so
-        // this is its only published copy.
-        let actions: Vec<eez_payload_codec::Action> = outbound_entries
-            .iter()
-            .chain(
-                compositions
-                    .iter()
-                    .flat_map(|c| c.targets.iter())
-                    .flat_map(|t| t.batch.entries.iter()),
-            )
-            .map(|entry| {
-                eez_protocol::entries::manifest::action_from_entry(
-                    entry,
-                    eez_protocol::RollupId(rollup_id),
-                )
-                .map_err(|e| format!("DA action for entry: {e}"))
-            })
-            .collect::<Result<_, String>>()?;
-        // A failed action is never emitted: an unsuccessful call is rejected
-        // as unsupported long before it becomes an entry.
-        if let Some(at) = actions.iter().position(|a| !a.success) {
-            return Err(format!(
-                "action {at} of {} failed; we do not emit failed actions",
-                actions.len(),
-            )
-            .into());
-        }
-        // Blob settlement carries the stream in blobs sized for the target's fork.
-        let physical_blobs = if let Some(config) = &ctx.blob_posting {
-            let limit = target_blob_limit(
-                &ctx.l1_provider,
-                config,
-                self.inner.emission.timing.l1_block_time(),
-                bundle_target,
-            )
-            .await?;
-            let blobs = eez_payload_codec::encode_blob_container(rollup_id, &blocks, &actions)
-                .map_err(|e| format!("eez_payload_codec::encode_blob_container: {e}"))?;
-            batch.callData = Bytes::new();
-            batch.blobIndices = (0..blobs.len()).map(U256::from).collect();
-            Some((config, blobs, limit))
-        } else {
-            let payload = eez_payload_codec::encode_container(rollup_id, &blocks, &actions)
-                .map_err(|e| format!("eez_payload_codec::encode_container: {e}"))?;
-            batch.callData = alloy_primitives::Bytes::from(payload);
-            None
-        };
+        let (from, sync_block_number, span) = batch_range(
+            posted,
+            parent_header.number(),
+            self.inner.emission.max_blocks,
+        )?;
+        let committed = self.committed_da_blocks(rollup, parent_header, from)?;
+        let (blocks, actions) = build_da_payload(
+            rollup_id,
+            committed,
+            terminal_header,
+            outbound_user_txs,
+            compositions,
+            outbound_entries,
+        )?;
+        let physical_blobs = encode_da(
+            ctx,
+            self.inner.emission.timing.l1_block_time(),
+            bundle_target,
+            rollup_id,
+            &blocks,
+            &actions,
+            &mut batch,
+        )
+        .await?;
 
         // Priced on the encoded candidate before witnesses and proving; `Ok(None)`
         // is over-budget, not an error, and the caller chooses what to do.
         let ceiling = self.inner.emission.max_gas;
-        // Sized for every configured attester: the grace window can collect a
-        // proof from each of them.
-        let mut sized = batch.clone();
-        sized.proofs = vec![Bytes::from(vec![0xffu8; MAX_PROOF_BYTES]); self.inner.quorum.len()];
-        let projected = postAndVerifyBatchCall { batch: sized }.abi_encode();
-        // EIP-7623 charges max(standard, floor). Standard now covers the bytes the
-        // drain could not see; floor is what a fat, entry-light batch hits.
-        let projected_gas = projected_postbatch_gas(
-            batch.entries.len() as u64,
-            calldata_gas(&projected),
+        let (projected_gas, calldata_bytes) = postbatch_gas_with_floor(
+            &batch,
+            self.inner.quorum.len(),
             outbound_target_gas,
-        )
-        .saturating_add(attestation_gas(self.inner.emission.attesters))
-        .max(calldata_floor_gas(&projected));
+            self.inner.emission.attesters,
+        );
         let over_blobs = physical_blobs
             .as_ref()
-            .is_some_and(|(_, blobs, limit)| blobs.len() > limit.max_blobs);
+            .is_some_and(|physical| physical.blobs.len() > physical.limit.max_blobs);
         if projected_gas > ceiling || over_blobs {
             event!(
                 name: "eez.composer.emission.candidate_over_budget",
@@ -4706,28 +3661,14 @@ where
                 to = sync_block_number,
                 projected_gas,
                 ceiling,
-                calldata_bytes = projected.len(),
+                calldata_bytes,
                 blobs = batch.blobIndices.len(),
                 "candidate range exceeds the postBatch gas or blob budget",
             );
             return Ok(None);
         }
 
-        // The fee is re-read since it can rise after the slot's gate. Cell
-        // proofs are CPU-heavy, so the sidecar builds on the blocking pool
-        // while the witnesses build and the attesters prove.
-        let (blobs, carrier) = match physical_blobs {
-            Some((config, blobs, limit)) => {
-                let max_fee_per_blob_gas = blob_fee(&ctx.l1_provider, config).await?;
-                let blobs: Vec<Bytes> = blobs.into_iter().map(Bytes::from).collect();
-                let sidecar_blobs = blobs.clone();
-                let sidecar = tokio::task::spawn_blocking(move || {
-                    eez_blob::prepare_blob_sidecar(&sidecar_blobs, limit.sidecar_encoding)
-                });
-                (blobs, Some((sidecar, max_fee_per_blob_gas)))
-            }
-            None => (Vec::new(), None),
-        };
+        let (blobs, pending_sidecar) = start_blob_sidecar(&ctx.l1_provider, physical_blobs).await?;
         // Prove the assembled window (proofs[] empty — not part of the
         // publicInputsHash). Mock ignores the context; a remote prover re-executes
         // `blocks`. Settlement path, off block production.
@@ -4757,37 +3698,11 @@ where
             blobs,
             verification_key: None,
         };
-        let attestations = match round
+        let attestations = round
             .attest(&proving_ctx, self.inner.emission.timing, bundle_target)
             .await
-        {
-            Ok(attestations) => attestations,
-            Err(error) => {
-                let Some(failure) = error.actionable_failure() else {
-                    return Err(PreparePostBatchError::Prover(error));
-                };
-                if let Err(validation_error) =
-                    validate_actionable_prover_failure(failure, &batch, sync_block)
-                {
-                    event!(
-                        name: "eez.composer.prover.actionable_invalid",
-                        Level::ERROR,
-                        rollup_id,
-                        failure = %failure,
-                        error = %validation_error,
-                        "prover supplied actionable failure details that do not match the current request; treating the rejection as opaque",
-                    );
-                    return Err(PreparePostBatchError::Prover(error));
-                }
-                return Err(PreparePostBatchError::Actionable(failure));
-            }
-        };
-        assign_proof_systems(
-            &mut batch,
-            rollup_id,
-            attestations.iter().map(|a| a.proof_system).collect(),
-        );
-        batch.proofs = attestations.into_iter().map(|a| a.proof).collect();
+            .map_err(|error| attestation_error(rollup_id, error, &batch, sync_block))?;
+        apply_attestations(&mut batch, rollup_id, attestations);
 
         let calldata = postAndVerifyBatchCall {
             batch: batch.clone(),
@@ -4812,16 +3727,7 @@ where
             "postBatch anchors: cursor block hash, claimed final Sync block hash",
         );
 
-        let carrier = match carrier {
-            Some((sidecar, max_fee_per_blob_gas)) => Some(BlobCarrier {
-                sidecar: sidecar
-                    .await
-                    .map_err(|e| format!("blob sidecar task: {e}"))?
-                    .map_err(|e| format!("prepare blob sidecar: {e}"))?,
-                max_fee_per_blob_gas,
-            }),
-            None => None,
-        };
+        let carrier = finish_blob_carrier(pending_sidecar).await?;
         Ok(sign_post_batch_tx(
             &ctx.l1_poster_signer,
             &ctx.l1_provider,
@@ -4930,6 +3836,939 @@ fn ensure_batch_registry_native(
         }
     }
     Ok(())
+}
+
+/// Execution state and transaction disposition shared by the two drain phases
+/// of [`Composer::compose_cross_chain_batch`].
+struct CrossChainDrain {
+    /// The rollup being drained.
+    rollup_id: u64,
+    /// Native group identity anchored to the intended L1 parent.
+    live_source: eez_protocol::native_source::SourceEntry,
+    l1_state: L1SlotState,
+    draft: SyncBlockState,
+    /// The Sync block's txs in canonical order, exactly as accepted: the
+    /// list the prefix is rebuilt from and the keystone assert compares the
+    /// canonical rebuild against.
+    sync_txs: Vec<Bytes>,
+    /// One ordinal per complete native group in the original candidate.
+    system_txs_appended: u64,
+    /// Drain indices ride along so a re-queue can restore pool order across
+    /// the two direction phases.
+    survivors: Vec<(usize, HeldTx)>,
+    /// Inbound survivors' compositions (their `source.batch` = the L1
+    /// deferred entries) feed `prepare_post_batch_raw`'s merge.
+    /// Keep each inbound composition attached to its HeldTx. The same
+    /// compositions feed batch assembly and actionable entry resolution.
+    survivor_comps: Vec<(eez_protocol::Composition, B256)>,
+    /// Staged for the post-drain canonical rebuild, which must reproduce
+    /// `sync_txs` byte-for-byte. `pending_out` pairs an outbound settlement
+    /// entry with its user tx; `pending_in` holds inbound target-side
+    /// derivation entries; and `outbound_entries` holds settlement entries
+    /// spliced into `postBatch`.
+    pending_out: Vec<(eez_protocol::abi::ExecutionEntrySol, Bytes)>,
+    pending_in: Vec<eez_protocol::abi::ExecutionEntrySol>,
+    outbound_entries: Vec<eez_protocol::abi::ExecutionEntrySol>,
+    /// Probed gas of the accepted outbound target calls; they re-execute
+    /// inside postAndVerifyBatch, so its gas limit must cover them.
+    outbound_target_gas: u64,
+    /// Escrow drawn down per outbound withdrawal (read once, lazily) so several
+    /// in one slot can't collectively over-drain. `None` = not yet read.
+    escrow_remaining: Option<U256>,
+    poison: Vec<HeldTx>,
+    poison_gaps: Vec<(Address, Direction, u64)>,
+    /// A temporarily underfunded outbound root and its same-sender nonce
+    /// suffix stay held, while unrelated outbounds and all inbounds may
+    /// still settle and change the balance for the next slot.
+    funding_deferred: Vec<(usize, HeldTx)>,
+    funding_gaps: Vec<(Address, Direction, u64)>,
+    /// Gas and bytes, not the tx cap, bound this bundle; overflow stays
+    /// held for later slots.
+    budget: PostBatchGasBudget,
+    /// Set by the cut or transient abort that ended the drain, if any.
+    end: DrainEnd,
+}
+
+impl CrossChainDrain {
+    /// Log the budget cut that ended the drain, if any, evicting the first
+    /// held transaction when it alone exceeds the postBatch gas budget.
+    fn handle_budget_cut(&mut self) {
+        let rollup_id = self.rollup_id;
+        // ── Budget cut: settle what fits, keep the rest held. ─────────
+        // Normal under load. Before the poison sweep, so an eviction here rides
+        // the same nonce cascade.
+        if let DrainEnd::Cut { cut, rest } = &mut self.end {
+            let deferred_count = rest.len();
+            let accepted_count = self.survivors.len();
+            // A block-gas cut needs gas on the block, which needs an accepted tx,
+            // so the eviction branch below can only ever be an L1-budget cut.
+            debug_assert!(
+                accepted_count > 0 || !matches!(cut, BudgetCut::BlockGas(_)),
+                "a block-gas cut cannot happen with nothing accepted"
+            );
+            let rejected_cost = match cut {
+                BudgetCut::PostBatchGas { rejected_cost } => *rejected_cost,
+                BudgetCut::BlockGas(_) | BudgetCut::Blob => 0,
+            };
+            if accepted_count == 0 && !matches!(cut, BudgetCut::Blob) {
+                // It lost against the whole budget, so no slot is roomier and
+                // re-queueing would block the FIFO forever. It sits first.
+                let (_, head) = rest.remove(0);
+                event!(
+                    name: "eez.composer.sync_slot.gas_budget_cut",
+                    Level::WARN,
+                    rollup_id,
+                    accepted_count,
+                    deferred_count,
+                    projected_gas = self.budget.projected,
+                    rejected_cost,
+                    budget = self.budget.cap,
+                    tx_hash = %head.hash,
+                    "the first held tx alone exceeds the postBatch gas budget; it can never settle — evicting it (resubmit a cheaper call)",
+                );
+                push_poison_root(&mut self.poison, &mut self.poison_gaps, head);
+            } else if matches!(cut, BudgetCut::Blob) {
+                event!(
+                    name: "eez.composer.sync_slot.blob_budget_cut",
+                    Level::INFO,
+                    rollup_id,
+                    accepted_count,
+                    deferred_count,
+                    blob = ?self.budget.blob,
+                    "blob byte budget reached; remaining held transactions stay queued",
+                );
+            } else if let BudgetCut::BlockGas(BlockGasCut { gas_used, declared }) = *cut {
+                event!(
+                    name: "eez.composer.sync_slot.block_gas_cut",
+                    Level::INFO,
+                    rollup_id,
+                    accepted_count,
+                    deferred_count,
+                    gas_used,
+                    declared,
+                    block_gas_limit = BUILDER_GAS_LIMIT,
+                    "Sync block gas limit reached; {{deferred_count}} held tx(s) stay queued for a later Sync slot",
+                );
+            } else {
+                event!(
+                    name: "eez.composer.sync_slot.gas_budget_cut",
+                    Level::INFO,
+                    rollup_id,
+                    accepted_count,
+                    deferred_count,
+                    projected_gas = self.budget.projected,
+                    rejected_cost,
+                    budget = self.budget.cap,
+                    "postBatch gas budget reached; {{deferred_count}} held tx(s) stay queued for a later Sync slot",
+                );
+            }
+        }
+    }
+
+    /// Phase 1: compose the outbound (L2→L1) transactions onto the drain.
+    async fn compose_outbound(
+        &mut self,
+        cc: &CrossChainWiring,
+        stf_cfg: &eez_protocol::system_tx::SystemTxContext,
+        outbound_gas_limit_cap: Option<u64>,
+        reopen: impl Fn(&[Bytes]) -> Result<SyncBlockState, BuildError>,
+        outbounds: Vec<(usize, HeldTx)>,
+    ) {
+        let rollup_id = self.rollup_id;
+        let local = &cc.local;
+        let ctx = cc.exec_ctx.as_ref();
+        // ── PHASE 1 — OUTBOUND (L2→L1) ───────────────────────────────
+        // Source-sim runs on a fork of the Sync block against the L2 ENTRY
+        // client (the L2 follower errors `Unavailable`); the L1 side executes
+        // real `_processL2ToL1Calls` frames on a fork of the state. On accept the
+        // canonical `[load, user]` pair extends the block and the L1 frames
+        // commit to the state.
+        let mut out_iter = outbounds.into_iter();
+        while let Some((idx, held)) = out_iter.next() {
+            if let Some(gap_at) = poison_gap_for(&self.poison_gaps, &held) {
+                event!(
+                    name: "eez.composer.cc_compose.poison_chain_evicted",
+                    Level::WARN,
+                    rollup_id,
+                    tx_idx = idx,
+                    tx_hash = %held.hash,
+                    sender = %held.sender,
+                    nonce = held.nonce,
+                    gap_at,
+                    "same-sender tx above an evicted poison nonce in the same drain; evicted (resubmit in order)",
+                );
+                self.poison.push(held);
+                continue;
+            }
+            if let Some(gap_at) = poison_gap_for(&self.funding_gaps, &held) {
+                event!(
+                    name: "eez.composer.cc_compose.outbound_funding_chain_deferred",
+                    Level::INFO,
+                    rollup_id,
+                    tx_idx = idx,
+                    tx_hash = %held.hash,
+                    sender = %held.sender,
+                    nonce = held.nonce,
+                    gap_at,
+                    "same-sender tx above an underfunded outbound nonce; holding for a later slot",
+                );
+                self.funding_deferred.push((idx, held));
+                continue;
+            }
+
+            // Reject against the draft's cap before simulation can mark it poison.
+            let user_declared = declared_gas_limit(&held.raw_tx);
+            if let Some((declared, cap)) =
+                gas_limit_violation(user_declared, outbound_gas_limit_cap)
+            {
+                evict_gas_limit_violation(
+                    rollup_id,
+                    idx,
+                    held,
+                    declared,
+                    cap,
+                    &mut self.poison,
+                    &mut self.poison_gaps,
+                );
+                continue;
+            }
+
+            let contexts = L1TargetSession::new(&self.l1_state, local.l1_entry.clone())
+                .map_err(|e| format!("L1TargetSession::new: {e}"))
+                .and_then(|exec| {
+                    self.draft
+                        .fork()
+                        .map(|fork| (exec, fork))
+                        .map_err(|e| format!("SyncBlockState::fork: {e}"))
+                });
+            let (l1_exec, mut l2_fork) = match contexts {
+                Ok(contexts) => contexts,
+                Err(e) => {
+                    self.end = DrainEnd::Transient {
+                        error: format!("outbound execution contexts tx#{idx}: {e}"),
+                        rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                    };
+                    break;
+                }
+            };
+            let sessions = seed_session(cc.entry_rollup_id, l1_exec);
+            let (state, env) = l2_fork.state_and_env();
+            let sim = compose_crosschain(
+                cc,
+                eez_protocol::RollupId(rollup_id),
+                &local.l2_entry,
+                held.raw_tx.as_ref(),
+                sessions,
+                state,
+                env,
+            );
+            match sim {
+                Ok((composition, mut sessions, target_gas)) => {
+                    let l1_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
+                        .targets
+                        .iter()
+                        .flat_map(|t| t.batch.entries.iter().cloned())
+                        .collect();
+                    if l1_entries.is_empty() {
+                        event!(
+                            name: "eez.composer.cc_compose.outbound_no_entries",
+                            Level::WARN,
+                            rollup_id,
+                            tx_idx = idx,
+                            tx_hash = %held.hash,
+                            "outbound tx produced no L1 settlement entry; evicting (resubmit required)",
+                        );
+                        push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                        continue;
+                    }
+                    // `check_entry_shape` covers multiple calls within one entry;
+                    // this guard covers one transaction producing multiple
+                    // entries. Each entry would pair with the same nonce-bearing
+                    // raw transaction, causing the Sync block to include it more
+                    // than once and fail replay.
+                    if l1_entries.len() > 1 {
+                        event!(
+                            name: "eez.composer.cc_compose.outbound_multicall_unsupported",
+                            Level::WARN,
+                            event_name = "eez.composer.cc_compose.outbound_multicall_unsupported",
+                            rollup_id,
+                            tx_idx = idx,
+                            tx_hash = %held.hash,
+                            entries = l1_entries.len(),
+                            "outbound tx made multiple cross-chain calls; evicting because one source transaction cannot back multiple entries",
+                        );
+                        push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                        continue;
+                    }
+                    // Defer a withdrawal that currently exceeds the rollup's L1
+                    // escrow; an inbound deposit may make it valid next slot.
+                    // "ether out" is the amount of Ether being withdrawn in this outbound settlement entry.
+                    // If missing, the entry is malformed and must be evicted.
+                    // Review once reentrancy is available
+                    let Some(need) = eez_protocol::entries::outbound_ether_out(&l1_entries[0])
+                    else {
+                        event!(name: "eez.composer.cc_compose.outbound_ether_out_missing", Level::WARN, rollup_id, tx_idx = idx, tx_hash = %held.hash, "outbound tx is missing ether out entry, likely malformed; evicting");
+                        push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                        continue;
+                    };
+                    // Check here (cheap early eviction, before any append work);
+                    // the debit happens at accept below.
+                    if need > U256::ZERO {
+                        if self.escrow_remaining.is_none() {
+                            self.escrow_remaining =
+                                read_rollup_escrow(&ctx.l1_provider, ctx.eez_registry, rollup_id)
+                                    .await;
+                        }
+                        if let Some(avail) = self.escrow_remaining
+                            && need > avail
+                        {
+                            event!(
+                                name: "eez.composer.cc_compose.outbound_over_escrow",
+                                Level::INFO,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                need = %need,
+                                escrow = %avail,
+                                "outbound withdrawal exceeds current L1 rollup escrow; applying bounded funding retry to this sender's nonce chain",
+                            );
+                            let (held, exhausted) = advance_funding_retry(rollup_id, held);
+                            if exhausted {
+                                push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                            } else {
+                                push_deferred_root(
+                                    &mut self.funding_deferred,
+                                    &mut self.funding_gaps,
+                                    idx,
+                                    held,
+                                );
+                            }
+                            continue;
+                        } else if self.escrow_remaining.is_none() {
+                            event!(
+                                name: "eez.composer.cc_compose.escrow_read_failed",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                need = %need,
+                                "escrow read returned None; over-escrow check skipped and withdrawal admitted (the bundle may revert on L1 if the rollup balance is insufficient)",
+                            );
+                        }
+                    }
+                    // `[load, user]` must fit the Sync block or `build_sync_block`
+                    // hard-errors. Before the L1 budget, so a refusal costs nothing.
+                    // Native loads use the remaining budget. The append below
+                    // checks the user's declared limit after actual load gas.
+                    let declared = user_declared;
+                    match block_gas_fit(self.draft.gas_used(), declared, BUILDER_GAS_LIMIT) {
+                        BlockGasFit::Accept => {}
+                        BlockGasFit::Defer => {
+                            self.end = DrainEnd::Cut {
+                                cut: BudgetCut::BlockGas(BlockGasCut {
+                                    gas_used: self.draft.gas_used(),
+                                    declared,
+                                }),
+                                rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                            };
+                            break;
+                        }
+                        BlockGasFit::Unfittable => {
+                            event!(
+                                name: "eez.composer.cc_compose.block_gas_unfittable",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                declared,
+                                block_gas_limit = BUILDER_GAS_LIMIT,
+                                "outbound [load, user] pair declares more gas than a whole L2 block; no slot can ever take it — evicting (resubmit with a lower gas limit)",
+                            );
+                            push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                            continue;
+                        }
+                    }
+                    // Commit both projections only after the block append succeeds.
+                    let mut candidate_budget = self.budget;
+                    match candidate_budget.try_accept_da(rollup_id, &l1_entries, Some(&held.raw_tx))
+                    {
+                        Ok(BlockGasFit::Accept) => {}
+                        Ok(BlockGasFit::Unfittable) => {
+                            event!(
+                                name: "eez.composer.cc_compose.blob_unfittable",
+                                Level::WARN,
+                                rollup_id,
+                                tx_hash = %held.hash,
+                                "held transaction alone exceeds blob capacity; evicting its nonce suffix",
+                            );
+                            push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                            continue;
+                        }
+                        Ok(BlockGasFit::Defer) => {
+                            self.end = DrainEnd::Cut {
+                                cut: BudgetCut::Blob,
+                                rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                            };
+                            break;
+                        }
+                        Err(error) => {
+                            self.end = DrainEnd::Transient {
+                                error,
+                                rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                            };
+                            break;
+                        }
+                    }
+                    // Gate before accept: this entry settles inline, so over
+                    // the cap the whole bundle dies silently (invariant 7).
+                    let cost = candidate_budget.tx_cost(
+                        &l1_entries,
+                        &l1_entries,
+                        &held.raw_tx,
+                        target_gas,
+                    );
+                    if !candidate_budget.try_accept(cost) {
+                        self.end = DrainEnd::Cut {
+                            cut: BudgetCut::PostBatchGas {
+                                rejected_cost: candidate_budget.standalone_cost(cost),
+                            },
+                            rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                        };
+                        break;
+                    }
+                    // ── ACCEPT ───────────────────────────────────────
+                    // Block first, state second: a pair evicted at append must
+                    // leave the L1 state untouched. `build_outbound_pair` runs
+                    // the shape gate itself, so an entry the Sync-block lowering
+                    // cannot represent comes back as its `Err`.
+                    let pairs_k = match eez_protocol::system_tx::build_outbound_pair(
+                        &l1_entries[0],
+                        &held.raw_tx,
+                        stf_cfg,
+                        self.live_source.with_index(self.system_txs_appended),
+                    ) {
+                        Ok(pairs) => pairs,
+                        Err(e) => {
+                            event!(
+                                name: "eez.composer.cc_compose.shape_evicted",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                error = %e,
+                                "outbound entry shape is not representable in a Sync block; evicting (resubmit required)",
+                            );
+                            push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                            continue;
+                        }
+                    };
+                    let plans = eez_protocol::system_tx::interleave_sync_block_txs(&pairs_k);
+                    let mut pair_txs = Vec::new();
+                    let pair_logs = match append_and_execute(&mut self.draft, &plans, &mut pair_txs)
+                    {
+                        Ok(logs) => logs,
+                        Err((at, why)) => {
+                            if matches!(why, BuildError::Capacity) && !self.sync_txs.is_empty() {
+                                self.end = DrainEnd::Cut {
+                                    cut: BudgetCut::BlockGas(BlockGasCut {
+                                        gas_used: self.draft.gas_used(),
+                                        declared: user_declared,
+                                    }),
+                                    rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                                };
+                                break;
+                            }
+                            // A backing-store failure says nothing about the tx —
+                            // abort the slot instead of evicting a valid pair.
+                            if matches!(&why, BuildError::Provider(_)) {
+                                self.end = DrainEnd::Transient {
+                                    error: format!("outbound append tx#{idx} at {at}: {why}"),
+                                    rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                                };
+                                break;
+                            }
+                            event!(
+                                name: "eez.composer.cc_compose.append_reverted",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                appended_idx = at,
+                                error = %why,
+                                "outbound [load, user] pair does not execute on the Sync block prefix; evicting the tx and rebuilding the prefix",
+                            );
+                            push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                            // A failed append may be half-applied; the accepted
+                            // list is the only truth to rebuild from.
+                            self.draft = match reopen(&self.sync_txs) {
+                                Ok(rebuilt) => rebuilt,
+                                Err(e) => {
+                                    self.end = DrainEnd::Transient {
+                                        error: format!(
+                                            "Sync block prefix rebuild after tx#{idx}: {e}"
+                                        ),
+                                        rest: abort_rest(None, &mut out_iter, Vec::new()),
+                                    };
+                                    break;
+                                }
+                            };
+                            continue;
+                        }
+                    };
+                    // The entry was composed from a sim that ran WITHOUT the
+                    // preceding load tx, so re-check it against what the user tx
+                    // actually did here (`docs/issues/outbound-sim-divergence.md`).
+                    let observed = eez_protocol::outbound_gate::observations_from_logs(
+                        &pair_logs,
+                        stf_cfg.eezl2_address,
+                    );
+                    if let Err(e) = eez_protocol::outbound_gate::verify_outbound_authorized(
+                        &l1_entries,
+                        &observed,
+                        rollup_id,
+                    ) {
+                        event!(
+                            name: "eez.composer.cc_compose.outbound_unobserved",
+                            Level::WARN,
+                            rollup_id,
+                            tx_idx = idx,
+                            tx_hash = %held.hash,
+                            error = %e,
+                            "composed outbound entry does not match the call the tx made on the Sync block; evicting",
+                        );
+                        push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                        self.draft = match reopen(&self.sync_txs) {
+                            Ok(rebuilt) => rebuilt,
+                            Err(e) => {
+                                self.end = DrainEnd::Transient {
+                                    error: format!("Sync block prefix rebuild after tx#{idx}: {e}"),
+                                    rest: abort_rest(None, &mut out_iter, Vec::new()),
+                                };
+                                break;
+                            }
+                        };
+                        continue;
+                    }
+                    self.sync_txs.extend(pair_txs);
+                    self.system_txs_appended += pairs_k.len() as u64;
+                    // Debit at accept, not at the check above: a tx evicted in
+                    // between never draws the escrow down on L1, and a budget
+                    // reduced for it would evict later legitimate withdrawals.
+                    if let Some(avail) = self.escrow_remaining {
+                        self.escrow_remaining = Some(avail.saturating_sub(need));
+                    }
+
+                    // The state advances only now, behind the accepted block.
+                    match take_l1_cache(&mut sessions, cc.entry_rollup_id) {
+                        Ok(cache) => self.l1_state.cache = cache,
+                        Err(e) => {
+                            event!(
+                                name: "eez.composer.cc_compose.l1_session_lost",
+                                Level::ERROR,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                error = %e,
+                                "the L1 execution session did not come back from the composition; the slot's L1 state can no longer chain — degrading",
+                            );
+                            self.end = DrainEnd::Transient {
+                                error: format!("L1 session hand-off tx#{idx}: {e}"),
+                                rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                            };
+                            break;
+                        }
+                    }
+
+                    self.budget = candidate_budget;
+                    self.pending_out
+                        .push((l1_entries[0].clone(), held.raw_tx.clone()));
+                    self.outbound_entries.extend(l1_entries);
+                    self.outbound_target_gas = self.outbound_target_gas.saturating_add(target_gas);
+                    // NOT pushed to `survivor_comps`: its `source.batch` is OUR
+                    // L2's entries (a dest=MAINNET call that must not settle on
+                    // L1). The L1 settlement is `outbound_entries`, spliced
+                    // separately with dest=rid.
+                    self.survivors.push((idx, held));
+                }
+                Err(e) if sim_error_is_insufficient_funds(&e) => {
+                    event!(
+                        name: "eez.composer.cc_compose.outbound_funding_deferred",
+                        Level::INFO,
+                        rollup_id,
+                        tx_idx = idx,
+                        tx_hash = %held.hash,
+                        sender = %held.sender,
+                        nonce = held.nonce,
+                        error = %e,
+                        "outbound target lacks funds; applying bounded funding retry while inbounds continue",
+                    );
+                    let (held, exhausted) = advance_funding_retry(rollup_id, held);
+                    if exhausted {
+                        push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                    } else {
+                        push_deferred_root(
+                            &mut self.funding_deferred,
+                            &mut self.funding_gaps,
+                            idx,
+                            held,
+                        );
+                    }
+                }
+                Err(e) if sim_error_is_poison(&e) => {
+                    event!(
+                        name: "eez.composer.cc_compose.outbound_poison",
+                        Level::WARN,
+                        rollup_id,
+                        tx_idx = idx,
+                        tx_hash = %held.hash,
+                        error = %e,
+                        "outbound tx fails simulation deterministically; evicting",
+                    );
+                    push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                }
+                Err(e) => {
+                    self.end = DrainEnd::Transient {
+                        error: format!("compose_crosschain outbound tx#{idx}: {e}"),
+                        rest: abort_rest(Some((idx, held)), &mut out_iter, Vec::new()),
+                    };
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Phase 2: compose the inbound (L1→L2) transactions onto the drain, after
+    /// every outbound pair.
+    fn compose_inbound(
+        &mut self,
+        cc: &CrossChainWiring,
+        stf_cfg: &eez_protocol::system_tx::SystemTxContext,
+        inbound_gas_limit_cap: Option<u64>,
+        reopen: impl Fn(&[Bytes]) -> Result<SyncBlockState, BuildError>,
+        inbounds: Vec<(usize, HeldTx)>,
+    ) {
+        let rollup_id = self.rollup_id;
+        let local = &cc.local;
+        // ── PHASE 2 — INBOUND (L1→L2) ────────────────────────────────
+        // Source-sim runs the L1 user tx on a fork of the state; the L2 side
+        // probes the canonical delivery on a fork of the block and reads the
+        // claim off the real `EEZL2 → proxy` frame. On accept the delivery
+        // extends the block and the source fork's writes become the state.
+        // Skipped after a phase-1 abort or cut; the caller re-queues these txs.
+        let mut in_iter = inbounds.into_iter();
+        while let Some((idx, held)) = in_iter.next() {
+            if let Some(gap_at) = poison_gap_for(&self.poison_gaps, &held) {
+                event!(
+                    name: "eez.composer.cc_compose.poison_chain_evicted",
+                    Level::WARN,
+                    rollup_id,
+                    tx_idx = idx,
+                    tx_hash = %held.hash,
+                    sender = %held.sender,
+                    nonce = held.nonce,
+                    gap_at,
+                    "same-sender tx above an evicted poison nonce in the same drain; evicted (resubmit in order)",
+                );
+                self.poison.push(held);
+                continue;
+            }
+
+            // Source simulation is uncapped; enforce the L1 envelope cap first.
+            let user_declared = declared_gas_limit(&held.raw_tx);
+            if let Some((declared, cap)) = gas_limit_violation(user_declared, inbound_gas_limit_cap)
+            {
+                evict_gas_limit_violation(
+                    rollup_id,
+                    idx,
+                    held,
+                    declared,
+                    cap,
+                    &mut self.poison,
+                    &mut self.poison_gaps,
+                );
+                continue;
+            }
+
+            let contexts = self
+                .draft
+                .fork()
+                .map_err(|e| format!("SyncBlockState::fork: {e}"))
+                .map(|fork| {
+                    InboundL2TargetSession::new(
+                        fork,
+                        stf_cfg.clone(),
+                        self.live_source.with_index(self.system_txs_appended),
+                    )
+                })
+                .and_then(|probe| {
+                    self.l1_state
+                        .fork_state(&local.l1_entry)
+                        .map(|source| (probe, source))
+                        .map_err(|e| format!("L1SlotState::fork_state: {e}"))
+                });
+            let (probe, (mut l1_fork, l1_env)) = match contexts {
+                Ok(contexts) => contexts,
+                Err(e) => {
+                    self.end = DrainEnd::Transient {
+                        error: format!("inbound execution contexts tx#{idx}: {e}"),
+                        rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                    };
+                    break;
+                }
+            };
+            let sessions = seed_session(eez_protocol::RollupId(rollup_id), probe);
+            let sim = compose_crosschain(
+                cc,
+                cc.entry_rollup_id,
+                &local.l1_entry,
+                held.raw_tx.as_ref(),
+                sessions,
+                &mut l1_fork,
+                &l1_env,
+            );
+            match sim {
+                Ok((composition, _sessions, _probe_gas)) => {
+                    let target_entries: Vec<eez_protocol::abi::ExecutionEntrySol> = composition
+                        .targets
+                        .iter()
+                        .flat_map(|t| t.batch.entries.iter().cloned())
+                        .collect();
+                    // Shape gate at accept, both halves: an entry the delivery
+                    // lowering cannot represent, or a nested recording on the
+                    // source side, is this tx's problem, not the slot's.
+                    let shape = target_entries
+                        .iter()
+                        .try_for_each(|entry| {
+                            eez_protocol::system_tx::check_entry_shape(entry, "inbound")
+                        })
+                        .and_then(|()| {
+                            match composition
+                                .source
+                                .batch
+                                .entries
+                                .iter()
+                                .find(|entry| !entry.expectedL1ToL2Calls.is_empty())
+                            {
+                                Some(nested) => Err(format!(
+                                    "inbound source entry records {} nested L1→L2 call(s); nested composition is parked",
+                                    nested.expectedL1ToL2Calls.len(),
+                                )),
+                                None => Ok(()),
+                            }
+                        });
+                    if let Err(e) = shape {
+                        event!(
+                            name: "eez.composer.cc_compose.shape_evicted",
+                            Level::WARN,
+                            rollup_id,
+                            tx_idx = idx,
+                            tx_hash = %held.hash,
+                            error = %e,
+                            "inbound composition uses an unsupported entry shape; evicting (resubmit required)",
+                        );
+                        push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                        continue;
+                    }
+
+                    // Commit both projections only after the block append succeeds.
+                    let mut candidate_budget = self.budget;
+                    match candidate_budget.try_accept_da(rollup_id, &target_entries, None) {
+                        Ok(BlockGasFit::Accept) => {}
+                        Ok(BlockGasFit::Unfittable) => {
+                            event!(
+                                name: "eez.composer.cc_compose.blob_unfittable",
+                                Level::WARN,
+                                rollup_id,
+                                tx_hash = %held.hash,
+                                "held transaction alone exceeds blob capacity; evicting its nonce suffix",
+                            );
+                            push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                            continue;
+                        }
+                        Ok(BlockGasFit::Defer) => {
+                            self.end = DrainEnd::Cut {
+                                cut: BudgetCut::Blob,
+                                rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                            };
+                            break;
+                        }
+                        Err(error) => {
+                            self.end = DrainEnd::Transient {
+                                error,
+                                rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                            };
+                            break;
+                        }
+                    }
+                    // Same gate, no target gas: a deferred entry only queues
+                    // here, and its L1 half is a separate bundled tx.
+                    let cost = candidate_budget.tx_cost(
+                        &composition.source.batch.entries,
+                        &target_entries,
+                        &[],
+                        0,
+                    );
+                    if !candidate_budget.try_accept(cost) {
+                        self.end = DrainEnd::Cut {
+                            cut: BudgetCut::PostBatchGas {
+                                rejected_cost: candidate_budget.standalone_cost(cost),
+                            },
+                            rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                        };
+                        break;
+                    }
+                    // ── ACCEPT ───────────────────────────────────────
+                    let deliveries = match target_entries
+                        .iter()
+                        .map(eez_protocol::entries::InboundSidecar::try_from)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| error.to_string())
+                        .and_then(|inbound| {
+                            eez_protocol::system_tx::build_inbound_system_txs(
+                                &inbound,
+                                stf_cfg,
+                                self.live_source.with_index(self.system_txs_appended),
+                            )
+                        }) {
+                        Ok(deliveries) if deliveries.is_empty() && !target_entries.is_empty() => {
+                            event!(
+                                name: "eez.composer.cc_compose.shape_evicted",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                entries = target_entries.len(),
+                                "every inbound target entry was skipped as foreign, which cannot happen for own-rollup targets; evicting",
+                            );
+                            push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                            continue;
+                        }
+                        Ok(deliveries) => deliveries,
+                        Err(e) => {
+                            event!(
+                                name: "eez.composer.cc_compose.shape_evicted",
+                                Level::WARN,
+                                rollup_id,
+                                tx_idx = idx,
+                                tx_hash = %held.hash,
+                                error = %e,
+                                "build_inbound_system_txs rejected the entries; evicting (resubmit required)",
+                            );
+                            push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                            continue;
+                        }
+                    };
+                    // The delivery re-runs the on-chain claim compare, so this
+                    // append IS the verifier: a revert means the claims and the
+                    // block disagree and the tx must go.
+                    let plans = deliveries
+                        .into_iter()
+                        .map(eez_protocol::system_tx::PlannedTransaction::Native)
+                        .collect::<Vec<_>>();
+                    let mut deliveries = Vec::new();
+                    if let Err((at, why)) =
+                        append_and_execute(&mut self.draft, &plans, &mut deliveries)
+                    {
+                        if matches!(why, BuildError::Capacity) && !self.sync_txs.is_empty() {
+                            self.end = DrainEnd::Cut {
+                                cut: BudgetCut::BlockGas(BlockGasCut {
+                                    gas_used: self.draft.gas_used(),
+                                    declared: eez_primitives::SYSTEM_TX_GAS_CAP,
+                                }),
+                                rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                            };
+                            break;
+                        }
+                        // A backing-store failure says nothing about the tx —
+                        // abort the slot instead of evicting a valid delivery.
+                        if matches!(&why, BuildError::Provider(_)) {
+                            self.end = DrainEnd::Transient {
+                                error: format!("inbound append tx#{idx} at {at}: {why}"),
+                                rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                            };
+                            break;
+                        }
+                        event!(
+                            name: "eez.composer.cc_compose.append_reverted",
+                            Level::WARN,
+                            rollup_id,
+                            tx_idx = idx,
+                            tx_hash = %held.hash,
+                            appended_idx = at,
+                            error = %why,
+                            "inbound delivery does not execute on the Sync block prefix; evicting the tx and rebuilding the prefix",
+                        );
+                        push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                        self.draft = match reopen(&self.sync_txs) {
+                            Ok(rebuilt) => rebuilt,
+                            Err(e) => {
+                                self.end = DrainEnd::Transient {
+                                    error: format!("Sync block prefix rebuild after tx#{idx}: {e}"),
+                                    rest: abort_rest(None, &mut in_iter, Vec::new()),
+                                };
+                                break;
+                            }
+                        };
+                        continue;
+                    }
+                    self.system_txs_appended += deliveries.len() as u64;
+                    self.sync_txs.extend(deliveries);
+                    // The source fork carries the L1 user tx's committed writes;
+                    // later inbound sims must observe them (design §4 step 6).
+                    self.l1_state.cache = l1_fork.into_cache();
+
+                    let target_count = target_entries.len();
+                    self.pending_in.extend(target_entries);
+                    event!(
+                        name: "eez.composer.cc_compose.tx",
+                        Level::INFO,
+                        rollup_id,
+                        tx_idx = idx,
+                        target_count,
+                        "composition produced {{target_count}} target(s) for held tx #{{tx_idx}}",
+                    );
+                    self.budget = candidate_budget;
+                    self.survivor_comps.push((composition, held.hash));
+                    self.survivors.push((idx, held));
+                }
+                Err(eez_protocol::ComposerError::Executor(
+                    eez_protocol::ExecutorError::Capacity,
+                )) if !self.sync_txs.is_empty() => {
+                    self.end = DrainEnd::Cut {
+                        cut: BudgetCut::BlockGas(BlockGasCut {
+                            gas_used: self.draft.gas_used(),
+                            declared: eez_primitives::SYSTEM_TX_GAS_CAP,
+                        }),
+                        rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                    };
+                    break;
+                }
+                Err(e) if sim_error_is_poison(&e) => {
+                    event!(
+                        name: "eez.composer.cc_compose.poison_evicted",
+                        Level::WARN,
+                        rollup_id,
+                        tx_idx = idx,
+                        tx_hash = %held.hash,
+                        sender = %held.sender,
+                        nonce = held.nonce,
+                        error = %e,
+                        "held tx fails simulation deterministically (e.g. wrong proxy → EmptyCalls, or revert); evicting — it can never compose, resubmit required",
+                    );
+                    push_poison_root(&mut self.poison, &mut self.poison_gaps, held);
+                }
+                Err(e) => {
+                    // Transient (provider / transport / unavailable) —
+                    // abort the slot, re-queue this tx + the remainder.
+                    self.end = DrainEnd::Transient {
+                        error: format!("compose_crosschain inbound tx#{idx}: {e}"),
+                        rest: abort_rest(Some((idx, held)), &mut in_iter, Vec::new()),
+                    };
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Background bundle observer — verdict recording ONLY. Marks the ledger
@@ -5189,6 +5028,9 @@ async fn sign_post_batch_tx(
 
 #[cfg(test)]
 mod recovery_tests;
+
+#[cfg(test)]
+mod native_gas_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6298,13 +6140,12 @@ mod tests {
     /// second must be refused before `build_sync_block` hard-errors on it.
     #[test]
     fn block_gas_fit_refuses_the_second_fat_outbound_pair() {
-        // Live shapes: 30M block, 2M `loadExecutionTable`, a user tx declaring
-        // 16.7M and burning 13.3M of it.
-        const LOAD: u64 = 2_000_000;
+        // The early gate checks the signed user's declared gas. The actual
+        // load is metered before the user is admitted by append_and_execute.
         const USER_DECLARED: u64 = 16_700_000;
         const USER_BURNED: u64 = 13_300_000;
         const LOAD_BURNED: u64 = 100_000;
-        let pair = LOAD + USER_DECLARED;
+        let pair = USER_DECLARED;
 
         // Pair 1 fits an empty block.
         assert_eq!(
@@ -6358,9 +6199,8 @@ mod tests {
     fn eip_7825_user_cap_is_independent_of_sync_block_fit() {
         // An invalid user limit can still fit in the aggregate Sync-block budget.
         const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
-        const SYSTEM_TX_GAS_LIMIT: u64 = 2_000_000;
         let invalid_user_limit = EIP_7825_TX_GAS_LIMIT + 1;
-        let pair_limit = SYSTEM_TX_GAS_LIMIT + invalid_user_limit;
+        let pair_limit = invalid_user_limit;
 
         assert_eq!(
             block_gas_fit(0, pair_limit, BUILDER_GAS_LIMIT),

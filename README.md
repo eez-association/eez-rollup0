@@ -28,6 +28,9 @@ rebuild the whole L2 chain from L1 alone. The supported L1 is Gnosis **Chiado**
 
 `eez-proof-signer` statelessly re-executes each proposed batch and validates
 its settlement effects before signing the recomputed public-input hash.
+`eez-prover-stateful` provides the same service using the default evm2 follower
+and a local L2 database. The backends have separate workspaces in the
+[provers repository](docs/provers.md); the follower and shared signing library stay here.
 `ECDSAProofSystem` verifies that hash-bound attestation on L1. This is not yet
 a succinct validity proof, but the deployed verifier no longer accepts an
 unbound mock signature. The
@@ -84,13 +87,14 @@ standalone chiado-reth.
 cp .env.example .env
 #   EEZ_L1_RPC_URL=<tip chiado RPC>   EEZ_L1_POSTER_KEY=<operator key>
 #   EEZ_PROOF_SIGNER_KEY=<operator key>   (its address becomes the proof system's authorizedSigner)
+#   EEZ_L2_RECOVERY_ADDRESS=<L2 EOA or multisig you control, distinct from the system address>
 EEZ_DEPLOY_SKIP_SIMULATION=1 make deploy-protocol
 ```
 
 This deploys EEZ + ECDSAProofSystem + the rollup manager, registers the
 rollup, deploys an initialized L1 reference ETH bridge, and writes **`deployments.env`**
 (registry, proof system, rollup id, deploy block, bridge, and EEZL2 addresses).
-The deploy uses reserved native system address `0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0076`,
+The deploy uses reserved native system address `0xfffffffffffffffffffffffffffffffffffffffe`,
 generates its canonical EEZL2 genesis without allocating the system account, and
 registers that exact state root. System transactions require no private key. It also writes the
 L2 **`datadir/genesis.json`** whose timestamp is pinned to the deploy block. The

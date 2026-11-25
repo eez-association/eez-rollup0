@@ -37,7 +37,7 @@ Startup rules:
   start.
 - On a follower, `EEZ_SEQUENCER_ADDRESS` and `EEZ_P2P_LISTEN` each require the
   other. With neither, the follower follows L1 only.
-- The stateful prover (`EEZ_STATEFUL_PROOF_SIGNER_ADDR`) moves the unsafe head
+- The `eez-prover-stateful` executable (in the provers repo) moves the unsafe head
   itself, so it requires a follower without `EEZ_SEQUENCER_ADDRESS`.
 - `EEZ_SYNC_L1_ONLY` accepts `1`, `true`, `0`, `false` or empty; anything else
   is a startup error.
