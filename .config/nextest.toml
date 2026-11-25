@@ -21,6 +21,7 @@ flaky-result = "fail"
 # Local runs of eez-node-e2e several tests at a time, for a large machine:
 #   cargo nextest run -p eez-node-e2e --profile local --no-fail-fast
 # A test that runs two composer nodes at once takes two slots, any other one.
+# See docs/e2e-parallel.md.
 [profile.local]
 
 [[profile.local.overrides]]
