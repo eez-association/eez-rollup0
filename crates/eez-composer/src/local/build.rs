@@ -209,8 +209,9 @@ where
 
 /// Outcome of one transaction executed on a live prefix state.
 ///
-/// A reverted tx is a successful *execution* with `success == false` — only a
-/// tx the EVM refuses outright (nonce, balance, decode) is a [`BuildError`].
+/// A reverted tx normally returns `success == false`. A clamped native tx whose
+/// full-cap reference fails is rejected with [`BuildError::ExecuteTx`] before
+/// committing either execution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxOutcome {
     /// Receipt-level status: false for a revert or a halt.
@@ -234,6 +235,19 @@ fn exec_outcome(result: TxResult<EezEvmTypes>) -> TxOutcome {
     }
 }
 
+/// Hex of the first 32 bytes of a revert/return payload, for diagnostics.
+pub(crate) fn truncated_hex(data: &Bytes) -> String {
+    const MAX: usize = 32;
+    if data.len() <= MAX {
+        return alloy_primitives::hex::encode_prefixed(data);
+    }
+    format!(
+        "{}… ({} bytes)",
+        alloy_primitives::hex::encode_prefixed(&data[..MAX]),
+        data.len()
+    )
+}
+
 /// Execute one raw tx against `state` under `evm_env` and commit it — the
 /// per-tx half of `BlockBuilder::execute_transaction` (the block executor
 /// transacts and commits the same way; the rest of its work is receipts and
@@ -249,7 +263,6 @@ fn execute_and_commit(
     idx: usize,
     gas_used: u64,
     group: &mut ExecutionGroupState,
-    inspector: Option<&mut dyn Inspector<EezEvmTypes>>,
 ) -> Result<TxOutcome, BuildError> {
     let recovered = recover_tx(raw, idx)?;
     let (next_group, _) = group
@@ -282,21 +295,32 @@ fn execute_and_commit(
         };
         native.gas_limit = eez_primitives::SYSTEM_TX_GAS_CAP;
         let reference = Recovered::new_unchecked(EezEvmTx::System(native), tx.signer());
-        Some(
-            state
-                .transact(evm_config, evm_env, &reference, None)
-                .map_err(|error| match error {
-                    HandlerError::Database(error) => BuildError::Provider(error.to_string()),
-                    other => BuildError::ExecuteTx {
-                        idx,
-                        msg: other.to_string(),
-                    },
-                })?,
-        )
+        let reference = state
+            .transact(evm_config, evm_env, &reference, None)
+            .map_err(|error| match error {
+                HandlerError::Database(error) => BuildError::Provider(error.to_string()),
+                other => BuildError::ExecuteTx {
+                    idx,
+                    msg: other.to_string(),
+                },
+            })?;
+        // A fresh block cannot offer more than this cap. A failing reference
+        // must reach rejection even if the reduced run would fail differently
+        // or succeed; neither execution may commit speculative effects.
+        if !reference.result.is_success() {
+            return Err(BuildError::ExecuteTx {
+                idx,
+                msg: format!(
+                    "native transaction failed at full gas cap: {}",
+                    truncated_hex(&reference.result.output)
+                ),
+            });
+        }
+        Some(reference)
     } else {
         None
     };
-    let executed = match state.transact(evm_config, evm_env, &tx, inspector) {
+    let executed = match state.transact(evm_config, evm_env, &tx, None) {
         Err(HandlerError::Database(error)) => return Err(BuildError::Provider(error.to_string())),
         Err(_) if reference.is_some() => return Err(BuildError::Capacity),
         Err(error) => {
@@ -307,16 +331,7 @@ fn execute_and_commit(
         }
         Ok(executed) => executed,
     };
-    if reference.is_some_and(|mut reference| {
-        // Equivalent failures must reach normal rejection even when a halt
-        // consumes the entire (different) budget in each run. Normalize only
-        // the reference's gas accounting; retain every other result/state check.
-        if !reference.result.is_success() && !executed.result.is_success() {
-            reference.result.total_gas_spent = executed.result.total_gas_spent;
-            reference.result.state_gas_spent = executed.result.state_gas_spent;
-            reference.result.refunded = executed.result.refunded;
-            reference.result.floor_gas = executed.result.floor_gas;
-        }
+    if reference.is_some_and(|reference| {
         reference.result != executed.result || reference.pending_state != executed.pending_state
     }) {
         return Err(BuildError::Capacity);
@@ -500,7 +515,6 @@ impl SyncBlockState {
             self.applied,
             gas_used,
             &mut self.group,
-            None,
         )?;
         self.applied += 1;
         self.cumulative_gas_used
@@ -586,37 +600,44 @@ impl SyncBlockFork {
             self.applied,
             self.gas_used,
             &mut self.group,
-            None,
         )?;
         self.applied += 1;
         self.gas_used = self.gas_used.saturating_add(outcome.gas_used);
         Ok(outcome)
     }
 
-    /// [`Self::execute_tx`] under an inspector — the probe path, where the
-    /// inspector captures the inner frame's outcome as the claim.
+    /// Discover a native delivery's claim at its full gas cap without committing
+    /// state, gas, or group progress. Placeholder claims can intentionally revert
+    /// after the inspected inner frame succeeds. The finalized delivery must
+    /// still pass [`Self::execute_tx`]'s full-cap and remaining-gas checks.
     ///
     /// # Errors
     ///
     /// See [`BuildError`].
-    pub fn execute_tx_inspected(
+    pub(crate) fn probe_native_tx(
         &mut self,
         raw: &Bytes,
         inspector: &mut dyn Inspector<EezEvmTypes>,
     ) -> Result<TxOutcome, BuildError> {
-        let outcome = execute_and_commit(
-            &self.evm_config,
-            &mut self.state,
-            &self.evm_env,
-            raw,
-            self.applied,
-            self.gas_used,
-            &mut self.group,
-            Some(inspector),
-        )?;
-        self.applied += 1;
-        self.gas_used = self.gas_used.saturating_add(outcome.gas_used);
-        Ok(outcome)
+        let recovered = recover_tx(raw, self.applied)?.convert::<EezEvmTx>();
+        let EezEvmTx::System(mut native) = recovered.inner().clone() else {
+            return Err(BuildError::ExecuteTx {
+                idx: self.applied,
+                msg: "inbound probe requires a native transaction".into(),
+            });
+        };
+        native.gas_limit = eez_primitives::SYSTEM_TX_GAS_CAP;
+        let tx = Recovered::new_unchecked(EezEvmTx::System(native), recovered.signer());
+        self.state
+            .transact(&self.evm_config, &self.evm_env, &tx, Some(inspector))
+            .map(|executed| exec_outcome(executed.result))
+            .map_err(|error| match error {
+                HandlerError::Database(error) => BuildError::Provider(error.to_string()),
+                other => BuildError::ExecuteTx {
+                    idx: self.applied,
+                    msg: other.to_string(),
+                },
+            })
     }
 
     /// Restore point for composition rollback.
