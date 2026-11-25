@@ -23,10 +23,19 @@ async fn restart_with_datadir_ahead_of_l1_retreats_before_production() {
     let harness = Harness::fresh().await.unwrap();
     let chain = harness.chain();
     let datadir = tempfile::tempdir().unwrap();
-    // reth persists only past 50 in-memory blocks by default; at 0 the kill leaves the suffix on disk.
+    // reth persists only past 50 in-memory blocks by default; at 0 it saves
+    // every block, and the WebSocket `reth` namespace reports each save.
     let cfg = NodeConfig {
         genesis_path: Some(harness.l2_genesis_path()),
-        extra_args: vec!["--engine.persistence-threshold".into(), "0".into()],
+        extra_args: [
+            "--engine.persistence-threshold",
+            "0",
+            "--ws",
+            "--ws.api",
+            "reth",
+        ]
+        .map(String::from)
+        .to_vec(),
         ..Default::default()
     };
     let env = harness.env_for(STAGING_USER_KEY, true).await.unwrap();
@@ -48,11 +57,10 @@ async fn restart_with_datadir_ahead_of_l1_retreats_before_production() {
         wait_for_latest_height(&node, 4, TIMEOUT)
             .await
             .expect("failed to stage a multi-block unconfirmed suffix");
-        // Persistence trails the head; one L1 block lets it flush.
-        chain
-            .wait_for_l1_blocks(1, Duration::from_secs(20))
+        // reth saves in the background; the kill must find the suffix on disk.
+        node.wait_for_persisted(4, TIMEOUT)
             .await
-            .expect("L1 did not advance while the staged suffix persisted");
+            .expect("reth did not save the staged suffix to disk");
         assert_eq!(
             chain.batches_posted().await.unwrap(),
             0,
