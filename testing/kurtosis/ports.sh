@@ -30,9 +30,10 @@ eez_devnet_ports_main() {
         esac
     }
 
-    local l1_rpc l2_rpc l1_front l2_front proof_signer_grpc
+    local l1_rpc l1_beacon l2_rpc l1_front l2_front proof_signer_grpc
     local l1_explorer l2_explorer l1_explorer_api l2_explorer_api
     l1_rpc="$(eez_devnet_port el-1-reth-lighthouse rpc)" || return 1
+    l1_beacon="$(eez_devnet_port cl-1-lighthouse-reth http)" || return 1
     l2_rpc="$(eez_devnet_port eez-node l2-rpc)" || return 1
     l1_front="$(eez_devnet_port eez-node l1-xchain)" || return 1
     l2_front="$(eez_devnet_port eez-node l2-xchain)" || return 1
@@ -44,6 +45,7 @@ eez_devnet_ports_main() {
     l2_explorer_api="$(eez_devnet_port l2-blockscout http 2>/dev/null || true)"
 
     export EEZ_DEVNET_L1_RPC="$(eez_devnet_http_url "$l1_rpc")"
+    export EEZ_DEVNET_L1_BEACON_URL="$(eez_devnet_http_url "$l1_beacon")"
     export EEZ_DEVNET_L2_RPC="$(eez_devnet_http_url "$l2_rpc")"
     export EEZ_DEVNET_L1_FRONT="$(eez_devnet_http_url "$l1_front")"
     export EEZ_DEVNET_L2_FRONT="$(eez_devnet_http_url "$l2_front")"
@@ -65,6 +67,7 @@ eez_devnet_ports_main() {
 
     printf '\nEEZ Kurtosis devnet endpoints (enclave: %s)\n' "$enclave"
     printf '  %-22s %s\n' 'Canonical L1 RPC:' "$EEZ_DEVNET_L1_RPC"
+    printf '  %-22s %s\n' 'L1 beacon API:' "$EEZ_DEVNET_L1_BEACON_URL"
     printf '  %-22s %s\n' 'L2 RPC:' "$EEZ_DEVNET_L2_RPC"
     printf '  %-22s %s\n' 'L1 cross-chain front:' "$EEZ_DEVNET_L1_FRONT"
     printf '  %-22s %s\n' 'L2 cross-chain front:' "$EEZ_DEVNET_L2_FRONT"
