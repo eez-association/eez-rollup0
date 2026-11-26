@@ -293,9 +293,31 @@ mod tests {
         search(
             &mut HashMap::new(),
             &(10_000..10_001),
-            iter::repeat(10_000),
+            (0..).map(|tried| {
+                assert_eq!(tried, 0, "searched past the range");
+                10_000
+            }),
             2,
             |_| unreachable!("no candidate fits"),
         );
+    }
+
+    /// A port is bound only once it is claimed, so no other test process can
+    /// bind it in between.
+    #[test]
+    fn a_port_is_claimed_before_it_is_bound() {
+        let candidates = iter::repeat_with(next_port);
+        search(&mut HashMap::new(), &LEASE_RANGE, candidates, 1, |port| {
+            assert!(
+                !claim(&mut HashMap::new(), port),
+                "port {port} is not claimed"
+            );
+            Ok(PortLease {
+                port,
+                _tcp: None,
+                _tcp_secondary: None,
+                _udp: None,
+            })
+        });
     }
 }
