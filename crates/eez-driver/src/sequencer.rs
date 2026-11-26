@@ -608,6 +608,7 @@ where
     /// for L1-derived blocks. Holds the reconcile lock so a sync-slot
     /// commit can't race with a deriver-side reconcile. Releases the
     /// block's bundle only after the commit; on any error it is withheld.
+    /// A block reth rejects as invalid is reported as rejected.
     async fn commit_one_prebuilt(
         &mut self,
         kind: SlotKind,
@@ -637,15 +638,19 @@ where
         let block_number = header.number();
         let block_hash = header.hash();
         let block_timestamp = header.timestamp();
-        let _outcome = self
+        let outcome = self
             .committer
             // feed_witness=true: this is a PRODUCED Sync block — emit it to the
             // prover witness-capture feed (the follower/deriver passes false).
             .commit_derived(payload, header, true)
-            .await?;
-        if let Some(release) = release {
-            release.committed(block_hash);
+            .await;
+        match (&outcome, release) {
+            (Ok(imported), Some(release)) => release.committed(imported.block_hash),
+            // Reth rejected the block; any other error drops the release.
+            (Err(DriverError::InvalidPayload(_)), Some(release)) => release.rejected(),
+            _ => {}
         }
+        outcome?;
 
         event!(
             name: "eez.sequencer.block.produced",
@@ -737,7 +742,7 @@ mod tests {
         StaleChild,
     }
 
-    type ReleaseTask = tokio::task::JoinHandle<Result<B256, oneshot::error::RecvError>>;
+    type ReleaseTask = tokio::task::JoinHandle<Result<Option<B256>, oneshot::error::RecvError>>;
 
     /// Records every compose call and returns the [`Prebuild`] block.
     #[derive(Debug)]
@@ -766,7 +771,9 @@ mod tests {
             let engine = self.engine.clone();
             *self.release.lock().unwrap() = Some(tokio::spawn(async move {
                 let hash = released.await?;
-                engine.note_release(hash);
+                if let Some(hash) = hash {
+                    engine.note_release(hash);
+                }
                 Ok(hash)
             }));
             SyncSlotBlock {
@@ -776,7 +783,7 @@ mod tests {
             }
         }
 
-        async fn released(&self) -> Result<B256, oneshot::error::RecvError> {
+        async fn released(&self) -> Result<Option<B256>, oneshot::error::RecvError> {
             let release = self
                 .release
                 .lock()
@@ -1009,7 +1016,7 @@ mod tests {
         *f.composer.prebuild.lock().unwrap() = Prebuild::Child;
         f.sync_slot(SYNC_TS).await;
 
-        let hash = f.composer.released().await.unwrap();
+        let hash = f.composer.released().await.unwrap().unwrap();
         assert_eq!(hash, f.sequencer.committer.last_header().hash());
         let calls = f.engine.calls();
         assert_eq!(
@@ -1056,7 +1063,7 @@ mod tests {
         let err = f.try_sync_slot(SYNC_TS).await.unwrap_err();
 
         assert!(matches!(err, DriverError::InvalidPayload(_)), "{err}");
-        assert!(f.composer.released().await.is_err());
+        assert_eq!(f.composer.released().await, Ok(None));
         assert_eq!(f.head(), 5);
     }
 }

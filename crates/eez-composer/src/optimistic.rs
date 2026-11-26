@@ -35,9 +35,8 @@ use crate::held_pool::HeldTx;
 
 /// A failed entry extracted for slot-context recovery.
 ///
-/// "Failed" here always means the bundle did not land: the postBatch had no
-/// receipt by its target L1 block, or it was never sent because its Sync
-/// block did not commit. Under strict all-or-nothing bundles
+/// "Failed" here means L1 kept nothing of the batch: it was not sent, did not
+/// land, or landed without applying an entry. Under strict all-or-nothing bundles
 /// a reverting tx is excluded → the whole bundle drops, so the outcome
 /// can't distinguish "relay bad luck" from "a tx would revert" — both
 /// look like a drop. Poison is therefore caught earlier, at compose
@@ -62,9 +61,8 @@ pub struct FailedBatch {
     pub block: alloy_primitives::B256,
     /// The user txs whose effects the block carried.
     pub txs: Vec<HeldTx>,
-    /// Drop not attributable to the txs (skipped L1 slot, unanswered relay,
-    /// bundle never sent) — recovery re-queues without counting toward
-    /// poison-eviction.
+    /// The failure is not attributable to the txs — recovery re-queues without
+    /// counting toward poison-eviction.
     pub slot_skipped: bool,
 }
 
@@ -76,7 +74,7 @@ enum Resolution {
     /// L1 settled (observer verdict or Deriver cursor confirmation).
     /// Retained until L1 finality for reorg recovery.
     Settled,
-    /// Observer verdict: the bundle didn't land. Awaiting slot-context
+    /// Observer verdict: L1 kept nothing of the batch. Awaiting slot-context
     /// recovery (reorg + re-push) via
     /// [`OptimisticallyIncluded::take_failed_for_recovery`]. The
     /// Deriver's cursor reaching this height overrides to Settled — the
@@ -102,7 +100,7 @@ struct InFlight {
     /// Settled first, while cursor confirmation owns the held pool's
     /// one-time in-flight cleanup.
     cursor_confirmed: bool,
-    /// Set by `mark_failed` when the drop wasn't the bundled txs' fault.
+    /// Set by `mark_failed` when the failure wasn't the bundled txs' fault.
     slot_skipped: bool,
 }
 
@@ -260,8 +258,8 @@ impl OptimisticallyIncluded {
         }
     }
 
-    /// Observer verdict: the bundle failed (dropped, or landed without
-    /// reaching the claimed final state root). Marks the entry Failed;
+    /// Observer verdict: L1 kept nothing of the batch, or it was never sent.
+    /// Marks the entry Failed;
     /// the actual recovery (L2 reorg + re-push) happens in slot
     /// context via [`Self::take_failed_for_recovery`] — the observer
     /// task never mutates chain state. No-op if the entry is already
@@ -276,6 +274,15 @@ impl OptimisticallyIncluded {
             entry.resolution = Resolution::Failed;
             entry.slot_skipped = slot_skipped;
         }
+    }
+
+    /// Whether the bundle `post_batch_hash` at `sync_height` still awaits a verdict.
+    #[must_use]
+    pub fn is_pending(&self, sync_height: u64, post_batch_hash: TxHash) -> bool {
+        let map = self.by_sync_height.lock().unwrap();
+        map.get(&sync_height).is_some_and(|entry| {
+            entry.post_batch_hash == post_batch_hash && entry.resolution == Resolution::Pending
+        })
     }
 
     /// Extract the Failed entry above `cursor`, if any, for slot-
@@ -746,6 +753,18 @@ mod tests {
         replacement.raw_tx = alloy_primitives::Bytes::from(vec![0xff; 4]);
         assert!(held_pool.push_contiguous(replacement, 1).is_err());
         assert_eq!(optimistic.blocking_height(0), Some(10));
+    }
+
+    /// An entry is pending until a verdict or the cursor resolves it, and only
+    /// for its own bundle.
+    #[test]
+    fn pending_until_resolved() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
+        assert!(pool.is_pending(10, pb_hash(0xa)));
+        assert!(!pool.is_pending(10, pb_hash(0xb)));
+        pool.resolve_below_cursor(10);
+        assert!(!pool.is_pending(10, pb_hash(0xa)));
     }
 
     #[test]

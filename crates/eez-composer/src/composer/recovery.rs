@@ -846,26 +846,27 @@ where
 
 /// What the observer records for one bundle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BundleVerdict {
+pub(super) enum BundleVerdict {
     /// L1 reached the claimed endpoint.
     Settled,
     /// L1 kept part of the batch; the height stays canonical.
     SettledPartial,
     /// L1 ran nothing of the batch. `charge_attempt` counts an attempt toward eviction.
     Failed { charge_attempt: bool },
-    /// The post landed but its settlement is unread; the cursor decides.
-    Unresolved,
+    /// The post landed in `l1_block` but its settlement is unread; the cursor decides.
+    Unresolved { l1_block: u64 },
 }
 
-/// The verdict L1's outcome gives. The relay's answer never decides it: an
-/// unanswered send only waives the charge, as do a skipped pinned slot and
-/// `pin_mismatch` (the target block's timestamp differs from the pin).
-fn bundle_verdict(
+/// The verdict L1's outcome gives. The relay's answer never decides it: only a
+/// bundle the relay accepted is charged, and a skipped pinned slot or
+/// `waive_charge` (the target block's timestamp differs from the pin, or the
+/// node sent the bundle late) waives that.
+pub(super) fn bundle_verdict(
     sent: &SentBundle,
     expected_final_root: B256,
-    pin_mismatch: bool,
+    waive_charge: bool,
 ) -> BundleVerdict {
-    let charge_attempt = !(matches!(sent.reply, RelayReply::Unanswered(_)) || pin_mismatch);
+    let charge_attempt = sent.reply == RelayReply::Accepted && !waive_charge;
     match &sent.outcome {
         SendOutcome::Included { settlement, .. }
             if settlement.final_state == Some(expected_final_root) =>
@@ -886,7 +887,9 @@ fn bundle_verdict(
         SendOutcome::Included { .. } | SendOutcome::Dropped { .. } => {
             BundleVerdict::Failed { charge_attempt }
         }
-        SendOutcome::IncludedUnread { .. } => BundleVerdict::Unresolved,
+        SendOutcome::IncludedUnread { l1_block, .. } => BundleVerdict::Unresolved {
+            l1_block: *l1_block,
+        },
     }
 }
 
@@ -916,7 +919,8 @@ async fn pin_mismatch(submitter: &Submitter, block: u64, pin: u64) -> bool {
 /// "Settled" requires an `L2ExecutionPerformed` in the inclusion block
 /// whose `newRoot` equals `expected_final_root` (the built Sync block's
 /// root) — the leading immediate advancing L1 partway doesn't count.
-/// `on_dispatch` runs when the bundle goes out.
+/// `on_dispatch` runs when the bundle goes out. A bundle `sent_late` by the
+/// node charges nothing.
 pub(super) async fn observe_bundle_outcome(
     rollup_id: u64,
     sync_height: u64,
@@ -929,6 +933,7 @@ pub(super) async fn observe_bundle_outcome(
     submitter: Submitter,
     target: BundleTarget,
     on_dispatch: impl FnOnce(),
+    sent_late: bool,
 ) {
     let sent = match submitter.send_bundle(&bundle, target, on_dispatch).await {
         Ok(sent) => sent,
@@ -946,7 +951,7 @@ pub(super) async fn observe_bundle_outcome(
             return;
         }
     };
-    let mut verdict = bundle_verdict(&sent, expected_final_root, false);
+    let mut verdict = bundle_verdict(&sent, expected_final_root, sent_late);
     // Only a charge can be waived, and only an Exact target carries a pin.
     if let (
         BundleVerdict::Failed {
@@ -971,8 +976,62 @@ pub(super) async fn observe_bundle_outcome(
         BundleVerdict::Failed { charge_attempt } => {
             optimistic.mark_failed(sync_height, post_batch_hash, !charge_attempt)
         }
-        // The post landed, so it is not a failure; the cursor resolves it.
-        BundleVerdict::Unresolved => {}
+        // The post landed, so the cursor resolves it unless it reverted or an L1 reorg drops it.
+        BundleVerdict::Unresolved { l1_block } => {
+            watch_unresolved(
+                rollup_id,
+                sync_height,
+                post_batch_hash,
+                l1_block,
+                &optimistic,
+                &submitter,
+            )
+            .await;
+        }
+    }
+}
+
+/// How often an unresolved post is checked.
+const UNRESOLVED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Wait while the batch is pending. A post L1 applied nothing of before the
+/// cursor covered it fails without a charge: its receipt reverted, or its
+/// receipt is gone and `l1_block`, where it landed, reads without it. A
+/// successful receipt waits for the cursor; anything unread is read again.
+pub(super) async fn watch_unresolved(
+    rollup_id: u64,
+    sync_height: u64,
+    post_batch_hash: alloy_primitives::TxHash,
+    l1_block: u64,
+    optimistic: &OptimisticallyIncluded,
+    submitter: &Submitter,
+) {
+    while optimistic.is_pending(sync_height, post_batch_hash) {
+        let failed = match submitter.receipt_status(post_batch_hash).await {
+            // Back from the mempool after a reorg, it can land again and revert.
+            Ok(Some(false)) => Some("the postBatch reverted on L1"),
+            // A lagging provider answers no receipt too, but it cannot serve the block.
+            Ok(None) => matches!(
+                submitter.block_has_tx(l1_block, post_batch_hash).await,
+                Ok(Some(false))
+            )
+            .then_some("the postBatch is no longer on L1"),
+            Ok(Some(true)) | Err(_) => None,
+        };
+        if let Some(reason) = failed {
+            event!(
+                name: "eez.composer.bundle.unresolved_failed",
+                Level::WARN,
+                rollup_id,
+                sync_height,
+                post_batch_hash = %post_batch_hash,
+                reason,
+                "unresolved postBatch applied nothing on L1; failing the batch without charging an attempt",
+            );
+            optimistic.mark_failed(sync_height, post_batch_hash, true);
+            return;
+        }
+        tokio::time::sleep(UNRESOLVED_POLL_INTERVAL).await;
     }
 }
 
@@ -995,7 +1054,7 @@ fn log_bundle_verdict(rollup_id: u64, sync_height: u64, sent: &SentBundle, verdi
             relay_reply = ?reply,
             "postBatch settled partially; L1 kept part of this batch",
         ),
-        (BundleVerdict::Unresolved, _) => event!(
+        (BundleVerdict::Unresolved { .. }, _) => event!(
             name: "eez.composer.bundle.unresolved",
             Level::ERROR,
             rollup_id,
@@ -1098,19 +1157,14 @@ mod tests {
             RelayReply::Rejected(String::new()),
             RelayReply::Unanswered(String::new()),
         ];
-        // The relay decides: one that did not accept fails the batch before
-        // L1 is read, and so does an unread settlement.
+        // The contrasting table, where the relay decides: one that did not accept
+        // fails the batch uncharged, and an unread settlement fails instead of `Unresolved`.
         let relay_decides = |reply: &RelayReply, outcome: &SendOutcome, pin_mismatch: bool| match (
             reply, outcome,
         ) {
-            (RelayReply::Unanswered(_), _) => BundleVerdict::Failed {
+            (RelayReply::Rejected(_) | RelayReply::Unanswered(_), _) => BundleVerdict::Failed {
                 charge_attempt: false,
             },
-            (RelayReply::Rejected(_), _) | (_, SendOutcome::IncludedUnread { .. }) => {
-                BundleVerdict::Failed {
-                    charge_attempt: !pin_mismatch,
-                }
-            }
             (_, SendOutcome::Included { settlement, .. })
                 if settlement.final_state == Some(root) =>
             {
@@ -1150,7 +1204,7 @@ mod tests {
                             BundleVerdict::SettledPartial
                         }
                         // A landed post is never a failure.
-                        (_, "unread") => BundleVerdict::Unresolved,
+                        (_, "unread") => BundleVerdict::Unresolved { l1_block: 7 },
                         _ => relay_decides(reply, outcome, pin_mismatch),
                     };
                     assert_eq!(got, want, "{reply:?} {case} pin_mismatch={pin_mismatch}");

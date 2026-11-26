@@ -9,16 +9,18 @@ L2, and L1 alone decides what happened to it.
    optimistic ledger and spawns the bundle observer. It logs `eez.composer.bundle.staged`. The
    observer waits.
 2. The Sequencer commits the block (`commit_one_prebuilt`). On success it releases the bundle
-   (`SyncSlotBlock.release`, a `BundleRelease`).
+   (`SyncSlotBlock.release`, a `BundleRelease`); a block reth rejects is released as rejected.
 3. The observer sends the bundle, logs `eez.composer.bundle.dispatched` and watches L1.
 
 A minimal postBatch takes the same steps and logs `eez.composer.phase1.bundle.staged` and
 `eez.composer.phase1.bundle.dispatched`.
 
-If the commit fails, or another block commits at that height, the release is dropped and the
-bundle is never sent: it logs `eez.composer.bundle.withheld`, never `dispatched`. Recovery
-re-queues its txs without charging an attempt. No bundle is in flight for a block that is not in
-the chain.
+If the commit fails, or another block commits at that height, the
+bundle is never sent: it logs `eez.composer.bundle.withheld`, never `dispatched`. So is an `Exact`
+bundle whose block commits after its target L1 slot started (`timestamp·1000`). One that commits after `timestamp·1000 − submission slack`, the node's own margin, is still sent, and its failure charges nothing (`eez.composer.bundle.sent_late`). Recovery
+re-queues its txs without charging an attempt, unless reth rejected the block as invalid
+(`BundleRelease::rejected`), which charges its txs an attempt. No bundle is sent
+before its block commits, though the block can still be replaced after the bundle is sent.
 
 Historical chunks have no block to wait for and send at once. Their one event is
 `eez.composer.emission.historical_chunk`.
@@ -39,12 +41,13 @@ nothing was sent.
 | post landed, final state is the claimed endpoint | settled |
 | post landed, some entries applied | settled partially |
 | post landed, nothing applied | failed |
-| post landed, settlement unread | unresolved: the batch stays pending until the cursor decides |
+| post landed, settlement unread | unresolved: the batch stays pending until the cursor decides; failed without a charge if an L1 reorg drops the post first or it reverts |
 | target passed without the post | failed |
 
-The relay's answer only affects the charge. A failed batch charges its txs an attempt unless the
-relay reply was `Unanswered`, the pinned slot was skipped, or the target block's timestamp
-differs from the pin.
+The relay's answer only affects the charge. A sent bundle's failed batch charges its txs an attempt only if the
+relay reply was `Accepted`, the node did not send it late, the pinned slot was not skipped and the target block's timestamp
+matches the pin. A `Rejected` reply says nothing about the txs.
+When the relay has no `eth_sendBundle`, only the postBatch goes through `eth_sendRawTransaction`, the user txs are never sent, and the reply is `Rejected`, so a failed batch is not charged; a partial settlement still charges its first unconsumed tx.
 
 ## Cost
 

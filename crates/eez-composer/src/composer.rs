@@ -70,8 +70,8 @@ pub struct CrossChainExecCtx {
     /// `compose_sync_slot` hands it `[postBatch, inbound_user_tx_1, …]` via
     /// `Submitter::send_bundle`; outbound user transactions execute in the L2
     /// Sync block instead. The Submitter owns the transport decision (atomic
-    /// `eth_sendBundle` on supporting relays, ordered mempool submission on
-    /// plain execution RPCs).
+    /// `eth_sendBundle` on supporting relays, the postBatch alone through the
+    /// mempool on plain execution RPCs).
     pub submitter: eez_l1::Submitter,
     /// L1 EOA whose key signs the `postAndVerifyBatch` transaction. Different from
     /// the reserved L2 SYSTEM_ADDRESS. For dev

@@ -11,6 +11,7 @@ use eez_driver::{
 };
 use eez_l1::{BundleTarget, Submitter};
 use eez_prover::{ActionableProverFailure, BlockWitness, ProverError, ProvingContext};
+use eez_timing::SharedClock;
 use reth_primitives_traits::{AlloyBlockHeader, Block, BlockBody};
 use reth_storage_api::{BlockReader, BlockSource, StateProviderFactory, TransactionsProvider};
 use tracing::{Level, event};
@@ -737,6 +738,13 @@ where
         target: BundleTarget,
         staged: Option<Staged>,
     ) {
+        let deadlines = match target {
+            BundleTarget::Exact { timestamp, .. } => Some(send_deadlines_ms(
+                timestamp,
+                self.inner.emission.timing.submission_slack(),
+            )),
+            BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => None,
+        };
         tokio::spawn(send_after_commit(
             rollup_id,
             sync_height,
@@ -748,6 +756,8 @@ where
             target,
             staged,
             tokio::time::Instant::now(),
+            deadlines,
+            Arc::clone(&self.inner.clock),
         ));
     }
 
@@ -1165,8 +1175,9 @@ pub(super) fn ensure_batch_registry_native(
 
 /// A bundle waiting for its Sync block to commit.
 pub(super) struct Staged {
-    /// Receives the hash of the block committed at the Sync height.
-    pub(super) released: tokio::sync::oneshot::Receiver<B256>,
+    /// Receives the hash of the block committed at the Sync height, or `None`
+    /// when reth rejected the block.
+    pub(super) released: tokio::sync::oneshot::Receiver<Option<B256>>,
     /// The event the bundle logs when it is sent.
     pub(super) dispatched: Dispatched,
 }
@@ -1184,8 +1195,19 @@ pub(super) enum Dispatched {
     Minimal,
 }
 
+/// When a bundle pinned to L1 timestamp `timestamp` (seconds) is late, in unix
+/// ms: after the first instant it has missed the node's `submission_slack`
+/// margin, after the second its target slot has started.
+fn send_deadlines_ms(timestamp: u64, submission_slack: std::time::Duration) -> (u64, u64) {
+    let slot_start_ms = timestamp.saturating_mul(1_000);
+    let margin_ms = slot_start_ms.saturating_sub(submission_slack.as_millis() as u64);
+    (margin_ms, slot_start_ms)
+}
+
 /// Send the bundle once its Sync block commits, then observe it. A bundle
-/// whose block is not committed is never sent, so nothing is charged.
+/// whose block is not committed is never sent; only a block reth rejected
+/// charges its txs. On `clock`, a staged bundle past the first of its
+/// `deadlines` is sent uncharged, and one past the second is not sent.
 async fn send_after_commit(
     rollup_id: u64,
     sync_height: u64,
@@ -1197,15 +1219,47 @@ async fn send_after_commit(
     target: BundleTarget,
     staged: Option<Staged>,
     staged_at: tokio::time::Instant,
+    deadlines: Option<(u64, u64)>,
+    clock: SharedClock,
 ) {
+    let mut sent_late = false;
     let dispatched = match staged {
         Some(Staged {
             released,
             dispatched,
         }) => {
-            if !await_commit(rollup_id, sync_height, expected_final_root, released).await {
+            if let Err(charge_attempt) =
+                await_commit(rollup_id, sync_height, expected_final_root, released).await
+            {
+                optimistic.mark_failed(sync_height, post_batch_hash, !charge_attempt);
+                return;
+            }
+            let now_ms = clock.now_unix_ms();
+            // A bundle sent after its slot started cannot land in it.
+            if let Some((_, slot_start_ms)) = deadlines
+                && now_ms > slot_start_ms
+            {
+                event!(
+                    name: "eez.composer.bundle.withheld",
+                    Level::WARN,
+                    rollup_id,
+                    sync_height,
+                    slot_start_ms,
+                    "Sync block committed after its target L1 slot started; withholding its bundle",
+                );
                 optimistic.mark_failed(sync_height, post_batch_hash, true);
                 return;
+            }
+            // Past the node's own margin the bundle still goes out; the lateness is the node's.
+            sent_late = deadlines.is_some_and(|(margin_ms, _)| now_ms > margin_ms);
+            if sent_late {
+                event!(
+                    name: "eez.composer.bundle.sent_late",
+                    Level::WARN,
+                    rollup_id,
+                    sync_height,
+                    "Sync block committed after the submission slack; sending its bundle, whose failure charges nothing",
+                );
             }
             Some((dispatched, staged_at.elapsed()))
         }
@@ -1235,6 +1289,7 @@ async fn send_after_commit(
         submitter,
         target,
         on_dispatch,
+        sent_late,
     )
     .await;
 }
@@ -1281,17 +1336,18 @@ fn log_dispatched(
     }
 }
 
-/// Wait until the Sync block `expected` is committed. `false` withholds the
-/// bundle: the block was not committed, or another block was.
+/// Wait until the Sync block `expected` is committed. `Err(charge_attempt)`
+/// withholds the bundle: the block was not committed, or another block was.
+/// Only a block reth rejected as invalid charges its txs an attempt.
 async fn await_commit(
     rollup_id: u64,
     sync_height: u64,
     expected: B256,
-    released: tokio::sync::oneshot::Receiver<B256>,
-) -> bool {
+    released: tokio::sync::oneshot::Receiver<Option<B256>>,
+) -> Result<(), bool> {
     match released.await {
-        Ok(committed) if committed == expected => true,
-        Ok(committed) => {
+        Ok(Some(committed)) if committed == expected => Ok(()),
+        Ok(Some(committed)) => {
             event!(
                 name: "eez.composer.bundle.withheld",
                 Level::ERROR,
@@ -1301,7 +1357,17 @@ async fn await_commit(
                 committed = %committed,
                 "a different block was committed for this bundle; withholding it",
             );
-            false
+            Err(false)
+        }
+        Ok(None) => {
+            event!(
+                name: "eez.composer.bundle.withheld",
+                Level::ERROR,
+                rollup_id,
+                sync_height,
+                "reth rejected the Sync block as invalid; withholding its bundle and charging its txs",
+            );
+            Err(true)
         }
         Err(_) => {
             event!(
@@ -1311,7 +1377,7 @@ async fn await_commit(
                 sync_height,
                 "Sync block was not committed; withholding its bundle",
             );
-            false
+            Err(false)
         }
     }
 }
@@ -1461,8 +1527,10 @@ async fn sign_post_batch_tx(
 mod tests {
     use super::*;
     use crate::attestation_quorum::MAX_ATTESTERS;
+    use crate::composer::recovery::{BundleVerdict, bundle_verdict, watch_unresolved};
     use crate::composer::tests::signed_user_tx;
     use alloy_primitives::TxHash;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn blob_post_is_a_pooled_tx_bound_to_its_sidecar() {
@@ -1512,7 +1580,7 @@ mod tests {
     }
 
     /// A bundle whose Sync block never commits is never sent, and recovery
-    /// re-queues it without a charge.
+    /// re-queues it without a charge unless reth rejected the block.
     #[tokio::test]
     async fn withheld_bundle_is_never_sent() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1527,20 +1595,7 @@ mod tests {
                 std::mem::forget(socket);
             }
         });
-        let reader = eez_l1::L1ReaderConfig {
-            rpc_url: url.parse().unwrap(),
-            trace_rpc_url: url.parse().unwrap(),
-            eez: Address::ZERO,
-            rollup_id: 1,
-            deploy_block: 0,
-            beacon_url: None,
-        };
-        let submitter = Submitter::new(eez_l1::SubmitterConfig {
-            builder_rpc_url: url.parse().unwrap(),
-            reader,
-            target_rpc_url: None,
-            poster: alloy_signer_local::PrivateKeySigner::random(),
-        });
+        let submitter = submitter_at(&url);
         let optimistic = Arc::new(OptimisticallyIncluded::new());
         let block = B256::repeat_byte(7);
         let post_batch = TxHash::repeat_byte(1);
@@ -1567,6 +1622,8 @@ mod tests {
                 dispatched: Dispatched::Minimal,
             }),
             tokio::time::Instant::now(),
+            None,
+            Arc::new(eez_timing::SystemClock),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), observer)
             .await
@@ -1575,6 +1632,248 @@ mod tests {
         assert_eq!(connections.load(Ordering::SeqCst), 0);
         let failed = optimistic.take_failed_for_recovery(0).unwrap();
         assert!(failed.slot_skipped);
+
+        // A block reth rejected charges its txs.
+        let (release, released) = BundleRelease::new();
+        release.rejected();
+        assert_eq!(await_commit(1, 6, block, released).await, Err(true));
+    }
+
+    #[test]
+    fn send_deadlines_are_the_slack_point_then_the_slot_start() {
+        let slack = std::time::Duration::from_millis(1_300);
+        assert_eq!(send_deadlines_ms(1_000, slack), (998_700, 1_000_000));
+    }
+
+    /// A bundle whose Sync block commits after its target L1 slot started is
+    /// never sent, and recovery re-queues it without a charge.
+    #[tokio::test]
+    async fn bundle_after_its_slot_started_is_never_sent() {
+        // Nothing listens here: an L1 read or a send would leave the observer waiting.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        assert!(send_committed(&url, 1_001).await.slot_skipped);
+    }
+
+    /// A bundle whose Sync block commits past the node's margin but before its
+    /// slot is still sent, and its drop charges nothing: the lateness is the node's.
+    #[tokio::test]
+    async fn late_bundle_is_sent_and_its_drop_charges_nothing() {
+        let (url, _l1, sends) = l1_with_block_9().await;
+        assert!(send_committed(&url, 999).await.slot_skipped);
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Run the observer of a committed bundle pinned to L1 block 9 at timestamp
+    /// 1 with a 100 ms slack, on a clock at `now_ms`, and return its failure.
+    async fn send_committed(url: &str, now_ms: u64) -> crate::optimistic::FailedBatch {
+        let optimistic = Arc::new(OptimisticallyIncluded::new());
+        let block = B256::repeat_byte(7);
+        let post_batch = TxHash::repeat_byte(1);
+        let parent =
+            reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
+        optimistic.begin(6, post_batch, parent, block, Vec::new());
+
+        let (release, released) = BundleRelease::new();
+        release.committed(block);
+        let observer = send_after_commit(
+            1,
+            6,
+            vec![signed_user_tx(21_000)],
+            post_batch,
+            block,
+            Arc::clone(&optimistic),
+            submitter_at(url),
+            BundleTarget::Exact {
+                block: 9,
+                timestamp: 1,
+            },
+            Some(Staged {
+                released,
+                dispatched: Dispatched::Minimal,
+            }),
+            tokio::time::Instant::now(),
+            Some(send_deadlines_ms(1, std::time::Duration::from_millis(100))),
+            Arc::new(eez_timing::TokioClock::starting_at(now_ms)),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), observer)
+            .await
+            .unwrap();
+        optimistic.take_failed_for_recovery(0).unwrap()
+    }
+
+    /// A landed post whose settlement was unread and that L1 then applied
+    /// nothing of fails without a charge, so it no longer holds the gate. A
+    /// missing receipt alone may be a lagging provider and fails nothing.
+    #[tokio::test]
+    async fn unresolved_post_dropped_by_a_reorg_fails_uncharged() {
+        let (url, _l1, _) = l1_with_block_9().await;
+        let submitter = submitter_at(&url);
+        // Post 1 has no receipt, post 2 reverted and post 3 succeeded.
+        assert!(!fails_uncharged(&submitter, 1, 10).await, "block 10 unread");
+        assert!(
+            !fails_uncharged(&submitter, 3, 9).await,
+            "the cursor decides"
+        );
+        assert!(fails_uncharged(&submitter, 1, 9).await, "reorged out");
+        assert!(fails_uncharged(&submitter, 2, 10).await, "reverted");
+        // A reverted post still has a receipt: its nonce is spent.
+        assert!(
+            submitter
+                .receipt_exists(TxHash::repeat_byte(2))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Watch the unresolved post `0xtag…` that landed in `l1_block` for a second:
+    /// whether it fails without a charge, rather than staying pending.
+    async fn fails_uncharged(submitter: &Submitter, tag: u8, l1_block: u64) -> bool {
+        let optimistic = OptimisticallyIncluded::new();
+        let post_batch = TxHash::repeat_byte(tag);
+        let parent =
+            reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
+        optimistic.begin(6, post_batch, parent, B256::ZERO, Vec::new());
+        let watch = watch_unresolved(1, 6, post_batch, l1_block, &optimistic, submitter);
+        if tokio::time::timeout(std::time::Duration::from_secs(1), watch)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        optimistic
+            .take_failed_for_recovery(0)
+            .is_some_and(|failed| failed.slot_skipped)
+    }
+
+    /// A relay without `eth_sendBundle` gets only the postBatch, through the
+    /// mempool: a user tx sent there could run before its entry and revert.
+    /// No builder took the bundle, so its failure charges nothing.
+    #[tokio::test]
+    async fn without_send_bundle_only_the_post_batch_is_sent() {
+        // No eth_sendBundle; L1 is past block 9 and holds no receipts.
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<Bytes>::new()));
+        let mut module = jsonrpsee::RpcModule::new(Arc::clone(&sent));
+        module
+            .register_method("eth_sendRawTransaction", |params, sent, _| {
+                sent.lock().unwrap().push(params.one().unwrap());
+                Ok::<_, jsonrpsee::types::ErrorObjectOwned>(B256::ZERO)
+            })
+            .unwrap();
+        module
+            .register_method("eth_getTransactionReceipt", |_, _, _| ())
+            .unwrap();
+        module
+            .register_method("eth_blockNumber", |_, _, _| "0xa")
+            .unwrap();
+        let server = jsonrpsee::server::ServerBuilder::default()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let _server = server.start(module);
+
+        let bundle = [signed_user_tx(21_000), signed_user_tx(30_000)];
+        let outcome = submitter_at(&url)
+            .send_bundle(&bundle, BundleTarget::ExactBlock { block: 9 }, || {})
+            .await
+            .unwrap();
+        assert_eq!(*sent.lock().unwrap(), bundle[..1]);
+        assert_eq!(
+            bundle_verdict(&outcome, B256::ZERO, false),
+            BundleVerdict::Failed {
+                charge_attempt: false
+            }
+        );
+    }
+
+    /// A submitter whose L1 reads and relay both go to `url`.
+    fn submitter_at(url: &str) -> Submitter {
+        Submitter::new(eez_l1::SubmitterConfig {
+            builder_rpc_url: url.parse().unwrap(),
+            reader: eez_l1::L1ReaderConfig {
+                rpc_url: url.parse().unwrap(),
+                trace_rpc_url: url.parse().unwrap(),
+                eez: Address::ZERO,
+                rollup_id: 1,
+                deploy_block: 0,
+                beacon_url: None,
+            },
+            target_rpc_url: None,
+            poster: alloy_signer_local::PrivateKeySigner::random(),
+        })
+    }
+
+    /// An L1 whose only block is an empty block 9 at timestamp 1, where tx
+    /// `0x02…` reverted and tx `0x03…` succeeded, behind a relay that accepts
+    /// every bundle. Returns its URL, server and bundle count.
+    async fn l1_with_block_9() -> (
+        String,
+        jsonrpsee::server::ServerHandle,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut module = jsonrpsee::RpcModule::new(Arc::clone(&sends));
+        let header = alloy_rpc_types_eth::Header::new(alloy_consensus::Header {
+            number: 9,
+            timestamp: 1,
+            ..Default::default()
+        });
+        let block = alloy_rpc_types_eth::Block::<alloy_rpc_types_eth::Transaction>::empty(header);
+        let block = serde_json::to_value(block).unwrap();
+        module
+            .register_method("eth_getBlockByNumber", move |params, _, _| {
+                let (number, _): (alloy_eips::BlockNumberOrTag, bool) = params.parse().unwrap();
+                (number == alloy_eips::BlockNumberOrTag::Number(9)).then(|| block.clone())
+            })
+            .unwrap();
+        let receipt = |tag: u8, status: bool| {
+            let receipt = alloy_rpc_types_eth::TransactionReceipt {
+                inner: alloy_consensus::ReceiptEnvelope::Eip1559(
+                    alloy_consensus::ReceiptWithBloom {
+                        receipt: alloy_consensus::Receipt {
+                            status: status.into(),
+                            cumulative_gas_used: 0,
+                            logs: Vec::<alloy_rpc_types_eth::Log>::new(),
+                        },
+                        logs_bloom: alloy_primitives::Bloom::ZERO,
+                    },
+                ),
+                transaction_hash: TxHash::repeat_byte(tag),
+                transaction_index: Some(0),
+                block_hash: Some(B256::ZERO),
+                block_number: Some(9),
+                gas_used: 0,
+                effective_gas_price: 0,
+                blob_gas_used: None,
+                blob_gas_price: None,
+                from: Address::ZERO,
+                to: None,
+                contract_address: None,
+            };
+            (
+                TxHash::repeat_byte(tag),
+                serde_json::to_value(receipt).unwrap(),
+            )
+        };
+        let receipts = HashMap::from([receipt(2, false), receipt(3, true)]);
+        module
+            .register_method("eth_getTransactionReceipt", move |params, _, _| {
+                receipts.get(&params.one::<TxHash>().unwrap()).cloned()
+            })
+            .unwrap();
+        module
+            .register_method("eth_sendBundle", |_, sends, _| {
+                sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .unwrap();
+        let server = jsonrpsee::server::ServerBuilder::default()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (url, server.start(module), sends)
     }
 
     #[test]
