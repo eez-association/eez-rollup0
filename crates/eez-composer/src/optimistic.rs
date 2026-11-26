@@ -278,6 +278,15 @@ impl OptimisticallyIncluded {
         }
     }
 
+    /// Whether the bundle `post_batch_hash` at `sync_height` still awaits a verdict.
+    #[must_use]
+    pub fn is_pending(&self, sync_height: u64, post_batch_hash: TxHash) -> bool {
+        let map = self.by_sync_height.lock().unwrap();
+        map.get(&sync_height).is_some_and(|entry| {
+            entry.post_batch_hash == post_batch_hash && entry.resolution == Resolution::Pending
+        })
+    }
+
     /// Extract the Failed entry above `cursor`, if any, for slot-
     /// context recovery (at most one can exist — the gate blocks new
     /// emission while any entry is unresolved). The caller performs
@@ -746,6 +755,18 @@ mod tests {
         replacement.raw_tx = alloy_primitives::Bytes::from(vec![0xff; 4]);
         assert!(held_pool.push_contiguous(replacement, 1).is_err());
         assert_eq!(optimistic.blocking_height(0), Some(10));
+    }
+
+    /// An entry is pending until a verdict or the cursor resolves it, and only
+    /// for its own bundle.
+    #[test]
+    fn pending_until_resolved() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
+        assert!(pool.is_pending(10, pb_hash(0xa)));
+        assert!(!pool.is_pending(10, pb_hash(0xb)));
+        pool.resolve_below_cursor(10);
+        assert!(!pool.is_pending(10, pb_hash(0xa)));
     }
 
     #[test]

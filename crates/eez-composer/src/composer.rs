@@ -5113,8 +5113,46 @@ async fn observe_bundle_outcome(
         BundleVerdict::Failed { charge_attempt } => {
             optimistic.mark_failed(sync_height, post_batch_hash, !charge_attempt)
         }
-        // The post landed, so it is not a failure; the cursor resolves it.
-        BundleVerdict::Unresolved => {}
+        // The post landed, so the cursor resolves it unless an L1 reorg drops it first.
+        BundleVerdict::Unresolved => {
+            watch_unresolved(
+                rollup_id,
+                sync_height,
+                post_batch_hash,
+                &optimistic,
+                &submitter,
+            )
+            .await;
+        }
+    }
+}
+
+/// How often an unresolved post is checked.
+const UNRESOLVED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Wait while the batch is pending. A post that left L1 before the cursor
+/// covered it fails without a charge; failed reads are retried.
+async fn watch_unresolved(
+    rollup_id: u64,
+    sync_height: u64,
+    post_batch_hash: alloy_primitives::TxHash,
+    optimistic: &OptimisticallyIncluded,
+    submitter: &Submitter,
+) {
+    while optimistic.is_pending(sync_height, post_batch_hash) {
+        if let Ok(false) = submitter.receipt_exists(post_batch_hash).await {
+            event!(
+                name: "eez.composer.bundle.reorged_out",
+                Level::WARN,
+                rollup_id,
+                sync_height,
+                post_batch_hash = %post_batch_hash,
+                "unresolved postBatch is no longer on L1; failing the batch without charging an attempt",
+            );
+            optimistic.mark_failed(sync_height, post_batch_hash, true);
+            return;
+        }
+        tokio::time::sleep(UNRESOLVED_POLL_INTERVAL).await;
     }
 }
 
@@ -5582,6 +5620,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let failed = optimistic.take_failed_for_recovery(0).unwrap();
+        assert!(failed.slot_skipped);
+    }
+
+    /// A landed post whose settlement was unread and that an L1 reorg then
+    /// dropped fails without a charge, so it no longer holds the gate.
+    #[tokio::test]
+    async fn unresolved_post_dropped_by_a_reorg_fails_uncharged() {
+        let (url, _l1, _) = l1_with_block_9().await;
+        let optimistic = OptimisticallyIncluded::new();
+        let post_batch = TxHash::repeat_byte(1);
+        let parent =
+            reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
+        optimistic.begin(6, post_batch, parent, B256::ZERO, Vec::new());
+
+        let submitter = submitter_at(&url);
+        let watch = watch_unresolved(1, 6, post_batch, &optimistic, &submitter);
+        tokio::time::timeout(std::time::Duration::from_secs(5), watch)
+            .await
+            .unwrap();
+
         let failed = optimistic.take_failed_for_recovery(0).unwrap();
         assert!(failed.slot_skipped);
     }

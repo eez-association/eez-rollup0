@@ -40,7 +40,7 @@ nothing was sent.
 | post landed, final state is the claimed endpoint | settled |
 | post landed, some entries applied | settled partially |
 | post landed, nothing applied | failed |
-| post landed, settlement unread | unresolved: the batch stays pending until the cursor decides |
+| post landed, settlement unread | unresolved: the batch stays pending until the cursor decides; failed without a charge if an L1 reorg drops the post first |
 | target passed without the post | failed |
 
 The relay's answer only affects the charge. A failed batch charges its txs an attempt unless the
