@@ -5662,6 +5662,7 @@ mod tests {
 
     /// A relay without `eth_sendBundle` gets only the postBatch, through the
     /// mempool: a user tx sent there could run before its entry and revert.
+    /// No builder took the bundle, so its failure charges nothing.
     #[tokio::test]
     async fn without_send_bundle_only_the_post_batch_is_sent() {
         // No eth_sendBundle; L1 is past block 9 and holds no receipts.
@@ -5687,11 +5688,17 @@ mod tests {
         let _server = server.start(module);
 
         let bundle = [signed_user_tx(21_000), signed_user_tx(30_000)];
-        submitter_at(&url)
+        let outcome = submitter_at(&url)
             .send_bundle(&bundle, BundleTarget::ExactBlock { block: 9 }, || {})
             .await
             .unwrap();
         assert_eq!(*sent.lock().unwrap(), bundle[..1]);
+        assert_eq!(
+            bundle_verdict(&outcome, B256::ZERO, false),
+            BundleVerdict::Failed {
+                charge_attempt: false
+            }
+        );
     }
 
     /// A submitter whose L1 reads and relay both go to `url`.

@@ -402,7 +402,10 @@ impl Inner {
                         "the relay at EEZ_L1_BUILDER_RPC_URL has no eth_sendBundle; the postBatch goes through the mempool",
                     );
                 }
-                let mut reply = RelayReply::Accepted;
+                // No builder took the bundle, so it is never `Accepted`.
+                let mut reply = RelayReply::Rejected(
+                    "relay has no eth_sendBundle; postBatch sent through the mempool".into(),
+                );
                 if let Err(err) = alloy_provider::Provider::send_raw_transaction(
                     &self.build_target_provider(),
                     raw_txs[0].as_ref(),
