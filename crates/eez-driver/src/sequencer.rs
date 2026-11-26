@@ -646,7 +646,7 @@ where
             .await;
         match (&outcome, release) {
             (Ok(imported), Some(release)) => release.committed(imported.block_hash),
-            // Reth rejected the block's contents; any other error drops the release.
+            // Reth rejected the block; any other error drops the release.
             (Err(DriverError::InvalidPayload(_)), Some(release)) => release.rejected(),
             _ => {}
         }

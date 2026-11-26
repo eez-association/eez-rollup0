@@ -35,9 +35,8 @@ use crate::held_pool::HeldTx;
 
 /// A failed entry extracted for slot-context recovery.
 ///
-/// "Failed" here always means the bundle did not land: the postBatch had no
-/// receipt by its target L1 block, or it was never sent because its Sync
-/// block did not commit. Under strict all-or-nothing bundles
+/// "Failed" here means L1 kept nothing of the batch: it was not sent, did not
+/// land, or landed without applying an entry. Under strict all-or-nothing bundles
 /// a reverting tx is excluded → the whole bundle drops, so the outcome
 /// can't distinguish "relay bad luck" from "a tx would revert" — both
 /// look like a drop. Poison is therefore caught earlier, at compose
@@ -62,9 +61,8 @@ pub struct FailedBatch {
     pub block: alloy_primitives::B256,
     /// The user txs whose effects the block carried.
     pub txs: Vec<HeldTx>,
-    /// Drop not attributable to the txs (skipped L1 slot, unanswered relay,
-    /// bundle never sent) — recovery re-queues without counting toward
-    /// poison-eviction.
+    /// The failure is not attributable to the txs — recovery re-queues without
+    /// counting toward poison-eviction.
     pub slot_skipped: bool,
 }
 
@@ -76,7 +74,7 @@ enum Resolution {
     /// L1 settled (observer verdict or Deriver cursor confirmation).
     /// Retained until L1 finality for reorg recovery.
     Settled,
-    /// Observer verdict: the bundle didn't land. Awaiting slot-context
+    /// Observer verdict: L1 kept nothing of the batch. Awaiting slot-context
     /// recovery (reorg + re-push) via
     /// [`OptimisticallyIncluded::take_failed_for_recovery`]. The
     /// Deriver's cursor reaching this height overrides to Settled — the
@@ -102,7 +100,7 @@ struct InFlight {
     /// Settled first, while cursor confirmation owns the held pool's
     /// one-time in-flight cleanup.
     cursor_confirmed: bool,
-    /// Set by `mark_failed` when the drop wasn't the bundled txs' fault.
+    /// Set by `mark_failed` when the failure wasn't the bundled txs' fault.
     slot_skipped: bool,
 }
 
@@ -260,8 +258,8 @@ impl OptimisticallyIncluded {
         }
     }
 
-    /// Observer verdict: the bundle failed (dropped, or landed without
-    /// reaching the claimed final state root). Marks the entry Failed;
+    /// Observer verdict: L1 kept nothing of the batch, or it was never sent.
+    /// Marks the entry Failed;
     /// the actual recovery (L2 reorg + re-push) happens in slot
     /// context via [`Self::take_failed_for_recovery`] — the observer
     /// task never mutates chain state. No-op if the entry is already

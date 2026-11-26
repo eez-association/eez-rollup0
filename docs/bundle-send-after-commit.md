@@ -15,11 +15,11 @@ L2, and L1 alone decides what happened to it.
 A minimal postBatch takes the same steps and logs `eez.composer.phase1.bundle.staged` and
 `eez.composer.phase1.bundle.dispatched`.
 
-If the commit fails, or another block commits at that height, the release is dropped and the
+If the commit fails, or another block commits at that height, the
 bundle is never sent: it logs `eez.composer.bundle.withheld`, never `dispatched`. So is an `Exact`
 bundle whose block commits after `timestamp·1000 − submission slack`, which the relay would drop. Recovery
 re-queues its txs without charging an attempt, unless reth rejected the block as invalid
-(`BundleRelease::rejected`): its contents caused that, so its txs are charged. No bundle is sent
+(`BundleRelease::rejected`), which charges its txs an attempt. No bundle is sent
 before its block commits, though the block can still be replaced after the bundle is sent.
 
 Historical chunks have no block to wait for and send at once. Their one event is
@@ -47,6 +47,7 @@ nothing was sent.
 The relay's answer only affects the charge. A failed batch charges its txs an attempt only if the
 relay reply was `Accepted`, the pinned slot was not skipped and the target block's timestamp
 matches the pin. A `Rejected` reply says nothing about the txs.
+When the relay has no `eth_sendBundle`, only the postBatch goes through `eth_sendRawTransaction`, the user txs are never sent, and the reply is `Rejected`, so a failed batch is not charged; a partial settlement still charges its first unconsumed tx.
 
 ## Cost
 

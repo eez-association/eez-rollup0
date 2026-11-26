@@ -5505,8 +5505,8 @@ mod tests {
             RelayReply::Rejected(String::new()),
             RelayReply::Unanswered(String::new()),
         ];
-        // The relay decides: one that did not accept fails the batch uncharged
-        // before L1 is read. An unread settlement fails it.
+        // The contrasting table, where the relay decides: one that did not accept
+        // fails the batch uncharged, and an unread settlement fails instead of `Unresolved`.
         let relay_decides = |reply: &RelayReply, outcome: &SendOutcome, pin_mismatch: bool| match (
             reply, outcome,
         ) {
