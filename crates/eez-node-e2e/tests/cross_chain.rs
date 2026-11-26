@@ -1150,14 +1150,28 @@ async fn follower_replays_settled_inbound_safe_block() {
         U256::from(71u64),
         "follower execution must reproduce the inbound destination write",
     );
+    // L1 goes on settling while the follower derives, so the follower's safe
+    // chain must come to hold exactly the block L1 commits to.
     let committed = rollup_commitment(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id)
         .await
         .unwrap();
-    assert_eq!(
-        safe_block_hash(&follower.l2_rpc_url()).await.unwrap(),
-        Some(committed),
-        "follower safe block hash must match the L1 commitment",
-    );
+    let committed_number = ProviderBuilder::new()
+        .connect_http(l2_rpc.parse().unwrap())
+        .get_block_by_hash(committed)
+        .await
+        .unwrap()
+        .expect("the composer has the block L1 commits to")
+        .header
+        .number;
+    if let Err(err) =
+        wait_for_safe_chain_contains(&follower, committed_number, committed, SETTLE_TIMEOUT).await
+    {
+        let safe = block_number_and_hash_at(&follower.l2_rpc_url(), BlockNumberOrTag::Safe).await;
+        panic!(
+            "the follower's safe chain never held the block L1 commits to, \
+             #{committed_number} {committed}; its safe block is {safe:?}: {err:#}"
+        );
+    }
     follower.assert_no_process_death();
     w.node.assert_no_divergence_failure_logs();
 }
