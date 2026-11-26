@@ -256,10 +256,21 @@ where
         // A slow fetch must not queue a burst of catch-up retries.
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut fcu_interval = tokio::time::interval(FCU_REFRESH);
+        let mut feed_open = true;
         loop {
             let advanced = tokio::select! {
                 _ = retry.tick() => self.follow_best().await,
-                Some(head) = self.heads.recv() => {
+                head = self.heads.recv(), if feed_open => {
+                    let Some(head) = head else {
+                        feed_open = false;
+                        event!(
+                            name: "eez.node.follower.head_feed.closed",
+                            Level::ERROR,
+                            event_name = "eez.node.follower.head_feed.closed",
+                            "head feed closed; the unsafe head no longer follows the sequencer",
+                        );
+                        continue;
+                    };
                     // The feed passes only heads newer than their source's latest.
                     self.tracker.observe(head, now_ms());
                     // Take the whole burst first, so one fetch serves the newest head.
