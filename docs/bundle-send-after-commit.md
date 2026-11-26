@@ -19,8 +19,8 @@ If the commit fails, or another block commits at that height, the release is dro
 bundle is never sent: it logs `eez.composer.bundle.withheld`, never `dispatched`. So is a bundle
 whose `Exact` target L1 block was built before the commit, which the relay would drop. Recovery
 re-queues its txs without charging an attempt, unless reth rejected the block as invalid
-(`BundleRelease::rejected`): its contents caused that, so its txs are charged. No bundle is in
-flight for a block that is not in the chain.
+(`BundleRelease::rejected`): its contents caused that, so its txs are charged. No bundle is sent
+before its block commits, though the block can still be replaced after the bundle is sent.
 
 Historical chunks have no block to wait for and send at once. Their one event is
 `eez.composer.emission.historical_chunk`.

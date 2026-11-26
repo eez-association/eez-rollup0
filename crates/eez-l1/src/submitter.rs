@@ -465,8 +465,8 @@ impl Inner {
     /// target produced false `Dropped` verdicts), then attribute the applied
     /// entries from the inclusion block via [`Self::observe_settlement`].
     ///
-    /// `pinned` is the timestamp pin, set only for an [`BundleTarget::Exact`]
-    /// bundle the relay accepted — those get the early verdict below.
+    /// `pin_timestamp` is the pin of an [`BundleTarget::Exact`] bundle sent to
+    /// the relay, whatever it answered; it gets the early verdict below.
     async fn observe(
         &self,
         tx_hash: TxHash,
