@@ -106,8 +106,8 @@ pub struct CrossChainExecCtx {
     /// `compose_sync_slot` hands it `[postBatch, inbound_user_tx_1, …]` via
     /// `Submitter::send_bundle`; outbound user transactions execute in the L2
     /// Sync block instead. The Submitter owns the transport decision (atomic
-    /// `eth_sendBundle` on supporting relays, ordered mempool submission on
-    /// plain execution RPCs).
+    /// `eth_sendBundle` on supporting relays, the postBatch alone through the
+    /// mempool on plain execution RPCs).
     pub submitter: eez_l1::Submitter,
     /// L1 EOA whose key signs the `postAndVerifyBatch` transaction. Different from
     /// the reserved L2 SYSTEM_ADDRESS. For dev
@@ -5658,6 +5658,40 @@ mod tests {
 
         let failed = optimistic.take_failed_for_recovery(0).unwrap();
         assert!(failed.slot_skipped);
+    }
+
+    /// A relay without `eth_sendBundle` gets only the postBatch, through the
+    /// mempool: a user tx sent there could run before its entry and revert.
+    #[tokio::test]
+    async fn without_send_bundle_only_the_post_batch_is_sent() {
+        // No eth_sendBundle; L1 is past block 9 and holds no receipts.
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<Bytes>::new()));
+        let mut module = jsonrpsee::RpcModule::new(Arc::clone(&sent));
+        module
+            .register_method("eth_sendRawTransaction", |params, sent, _| {
+                sent.lock().unwrap().push(params.one().unwrap());
+                Ok::<_, jsonrpsee::types::ErrorObjectOwned>(B256::ZERO)
+            })
+            .unwrap();
+        module
+            .register_method("eth_getTransactionReceipt", |_, _, _| ())
+            .unwrap();
+        module
+            .register_method("eth_blockNumber", |_, _, _| "0xa")
+            .unwrap();
+        let server = jsonrpsee::server::ServerBuilder::default()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let _server = server.start(module);
+
+        let bundle = [signed_user_tx(21_000), signed_user_tx(30_000)];
+        submitter_at(&url)
+            .send_bundle(&bundle, BundleTarget::ExactBlock { block: 9 }, || {})
+            .await
+            .unwrap();
+        assert_eq!(*sent.lock().unwrap(), bundle[..1]);
     }
 
     /// A submitter whose L1 reads and relay both go to `url`.

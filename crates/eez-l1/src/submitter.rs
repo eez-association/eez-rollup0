@@ -218,9 +218,8 @@ impl Submitter {
     ///
     /// # Errors
     ///
-    /// Only when nothing was sent: an empty or undecodable bundle, an
-    /// unreadable `NextBlock` target, or a blob post to a relay without
-    /// `eth_sendBundle`.
+    /// Only when nothing was sent: an empty or undecodable bundle, or an
+    /// unreadable `NextBlock` target.
     pub async fn send_bundle(
         &self,
         raw_txs: &[alloy_primitives::Bytes],
@@ -264,8 +263,8 @@ impl Submitter {
         on_dispatch();
         // One bundle, one target block. Atomic bundle semantics:
         // rbuilder either includes the whole bundle in `target_block`
-        // in the specified order, or drops it. Relays without a bundle
-        // API degrade to ordered mempool submission inside
+        // in the specified order, or drops it. A relay without a bundle API
+        // gets only the postBatch, through the mempool, inside
         // `dispatch_and_observe`.
         self.inner
             .dispatch_and_observe(raw_txs, post_batch_hash, target_block, pin_timestamp)
@@ -338,11 +337,10 @@ impl Inner {
 
     /// Submit `raw_txs` (postBatch first) and observe the outcome. Try
     /// the relay's `eth_sendBundle`; if it's a plain execution RPC
-    /// (JSON-RPC `-32601`), degrade to ordered mempool
-    /// submission — on dev reth / anvil that lands every tx in the next
-    /// block, postBatch first by priority-fee, minus the all-or-nothing
-    /// guarantee (irrelevant without a competing builder).
-    /// This fallback is limited to calldata; blob posts require ordered bundles.
+    /// (JSON-RPC `-32601`), send only the postBatch, calldata or blob,
+    /// through `eth_sendRawTransaction`. The mempool keeps no bundle order, so
+    /// a user tx could run before its entry and revert: the user txs are never
+    /// sent, and their entries stay unconsumed.
     async fn dispatch_and_observe(
         &self,
         raw_txs: &[alloy_primitives::Bytes],
@@ -382,77 +380,53 @@ impl Inner {
                     .await;
                 Ok(SentBundle { reply, outcome })
             }
-            PostReply::Unsupported
-                if raw_txs.first().is_some_and(|raw| raw.first() == Some(&3)) =>
-            {
-                Err(L1Error::Submission(
-                    "blob settlement requires eth_sendBundle; refusing public mempool submission"
-                        .into(),
-                ))
-            }
             PostReply::Unsupported => {
-                // A multi-tx bundle needs its order kept: the deferred entries
-                // chain, so a reordered user tx finds no entry and reverts.
-                if raw_txs.len() > 1 {
+                let unsent = raw_txs.len() - 1;
+                if unsent > 0 {
+                    event!(
+                        name: "eez.submitter.bundle.mempool_fallback",
+                        Level::ERROR,
+                        event_name = "eez.submitter.bundle.mempool_fallback",
+                        target_block,
+                        tx_count = raw_txs.len(),
+                        unsent_user_txs = unsent,
+                        "the relay at EEZ_L1_BUILDER_RPC_URL has no eth_sendBundle; only the postBatch is sent; the bundle's {unsent} user transactions are not sent and their entries stay unconsumed",
+                    );
+                } else {
                     event!(
                         name: "eez.submitter.bundle.mempool_fallback",
                         Level::WARN,
                         event_name = "eez.submitter.bundle.mempool_fallback",
                         target_block,
                         tx_count = raw_txs.len(),
-                        "relay has no eth_sendBundle; the mempool does NOT guarantee bundle order, so bundled user txs may revert",
-                    );
-                } else {
-                    event!(
-                        name: "eez.submitter.bundle.mempool_fallback",
-                        Level::INFO,
-                        event_name = "eez.submitter.bundle.mempool_fallback",
-                        target_block,
-                        tx_count = raw_txs.len(),
-                        "relay has no eth_sendBundle; submitting the lone postBatch via mempool",
+                        "the relay at EEZ_L1_BUILDER_RPC_URL has no eth_sendBundle; the postBatch goes through the mempool",
                     );
                 }
-                let target_provider = self.build_target_provider();
                 let mut reply = RelayReply::Accepted;
-                for (idx, raw) in raw_txs.iter().enumerate() {
-                    if let Err(err) = alloy_provider::Provider::send_raw_transaction(
-                        &target_provider,
-                        raw.as_ref(),
-                    )
-                    .await
-                    {
-                        // A failed postBatch send stops the user_txs, which
-                        // would run without their entries; L1 still decides
-                        // whether the postBatch landed. A rejected user_tx
-                        // (stale nonce after a re-push) is logged and skipped.
-                        if idx == 0 {
-                            let detail = format!("mempool fallback: postBatch send: {err}");
-                            reply = if err.is_error_resp() {
-                                RelayReply::Rejected(detail)
-                            } else {
-                                RelayReply::Unanswered(detail)
-                            };
-                            event!(
-                                name: "eez.submitter.bundle.not_accepted",
-                                Level::WARN,
-                                tx_hash = %post_batch_hash,
-                                target_block,
-                                relay_reply = ?reply,
-                                "mempool did not accept the postBatch; L1 decides its outcome",
-                            );
-                            break;
-                        }
-                        event!(
-                            name: "eez.submitter.mempool.user_tx_rejected",
-                            Level::WARN,
-                            tx_idx = idx,
-                            error = %err,
-                            "mempool fallback: user_tx rejected; continuing without it",
-                        );
-                    }
+                if let Err(err) = alloy_provider::Provider::send_raw_transaction(
+                    &self.build_target_provider(),
+                    raw_txs[0].as_ref(),
+                )
+                .await
+                {
+                    // L1 still decides whether the postBatch landed.
+                    let detail = format!("mempool fallback: postBatch send: {err}");
+                    reply = if err.is_error_resp() {
+                        RelayReply::Rejected(detail)
+                    } else {
+                        RelayReply::Unanswered(detail)
+                    };
+                    event!(
+                        name: "eez.submitter.bundle.not_accepted",
+                        Level::WARN,
+                        tx_hash = %post_batch_hash,
+                        target_block,
+                        relay_reply = ?reply,
+                        "mempool did not accept the postBatch; L1 decides its outcome",
+                    );
                 }
-                // No bundle API, no timestamp pin: these txs can genuinely land
-                // in a later block, so the conservative rule is the only one.
+                // No bundle API, no timestamp pin: the postBatch can genuinely
+                // land in a later block, so the conservative rule is the only one.
                 let outcome = self.observe(post_batch_hash, target_block, None).await;
                 Ok(SentBundle { reply, outcome })
             }
