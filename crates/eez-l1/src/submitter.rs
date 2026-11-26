@@ -208,6 +208,7 @@ impl Submitter {
     /// (`[postBatch, user_tx_1, …]`, signed upstream) into one
     /// `eth_sendBundle` POST. Flashbots ordering: the bundle lands in
     /// `target_block` as one atomic insert or is dropped — no subset.
+    /// A relay without `eth_sendBundle` gets only the postBatch, through the mempool.
     ///
     /// Once sent, the bundle is observed until L1 decides, whatever the
     /// relay answered. Only `raw_txs[0]` (the postBatch) is checked for

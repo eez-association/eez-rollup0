@@ -9,7 +9,7 @@ L2, and L1 alone decides what happened to it.
    optimistic ledger and spawns the bundle observer. It logs `eez.composer.bundle.staged`. The
    observer waits.
 2. The Sequencer commits the block (`commit_one_prebuilt`). On success it releases the bundle
-   (`SyncSlotBlock.release`, a `BundleRelease`).
+   (`SyncSlotBlock.release`, a `BundleRelease`); a block reth rejects is released as rejected.
 3. The observer sends the bundle, logs `eez.composer.bundle.dispatched` and watches L1.
 
 A minimal postBatch takes the same steps and logs `eez.composer.phase1.bundle.staged` and
@@ -41,11 +41,11 @@ nothing was sent.
 | post landed, final state is the claimed endpoint | settled |
 | post landed, some entries applied | settled partially |
 | post landed, nothing applied | failed |
-| post landed, settlement unread | unresolved: the batch stays pending until the cursor decides; failed without a charge if an L1 reorg drops the post first |
+| post landed, settlement unread | unresolved: the batch stays pending until the cursor decides; failed without a charge if an L1 reorg drops the post first or it reverts |
 | target passed without the post | failed |
 
-The relay's answer only affects the charge. A failed batch charges its txs an attempt only if the
-relay reply was `Accepted`, the pinned slot was not skipped and the target block's timestamp
+The relay's answer only affects the charge. A sent bundle's failed batch charges its txs an attempt only if the
+relay reply was `Accepted`, the node did not send it late, the pinned slot was not skipped and the target block's timestamp
 matches the pin. A `Rejected` reply says nothing about the txs.
 When the relay has no `eth_sendBundle`, only the postBatch goes through `eth_sendRawTransaction`, the user txs are never sent, and the reply is `Rejected`, so a failed batch is not charged; a partial settlement still charges its first unconsumed tx.
 
