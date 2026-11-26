@@ -3459,6 +3459,15 @@ where
         target: BundleTarget,
         staged: Option<Staged>,
     ) {
+        // An Exact bundle must reach the relay by `timestamp·1000 − slack`.
+        let send_by_ms = match target {
+            BundleTarget::Exact { timestamp, .. } => {
+                Some(timestamp.saturating_mul(1_000).saturating_sub(
+                    self.inner.emission.timing.submission_slack().as_millis() as u64,
+                ))
+            }
+            BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => None,
+        };
         tokio::spawn(send_after_commit(
             rollup_id,
             sync_height,
@@ -3470,6 +3479,8 @@ where
             target,
             staged,
             tokio::time::Instant::now(),
+            send_by_ms,
+            Arc::clone(&self.inner.clock),
         ));
     }
 
@@ -4906,7 +4917,7 @@ enum Dispatched {
 
 /// Send the bundle once its Sync block commits, then observe it. A bundle
 /// whose block is not committed is never sent; only a block reth rejected
-/// charges its txs.
+/// charges its txs. A staged bundle is not sent after `send_by_ms` on `clock`.
 async fn send_after_commit(
     rollup_id: u64,
     sync_height: u64,
@@ -4918,6 +4929,8 @@ async fn send_after_commit(
     target: BundleTarget,
     staged: Option<Staged>,
     staged_at: tokio::time::Instant,
+    send_by_ms: Option<u64>,
+    clock: SharedClock,
 ) {
     let dispatched = match staged {
         Some(Staged {
@@ -4930,17 +4943,17 @@ async fn send_after_commit(
                 optimistic.mark_failed(sync_height, post_batch_hash, !charge_attempt);
                 return;
             }
-            // The relay drops a bundle for a block already built.
-            if let BundleTarget::Exact { block, .. } = target
-                && let Ok(Some(_)) = submitter.block_timestamp(block).await
+            // The relay drops a bundle that reaches it after the cutoff.
+            if let Some(send_by_ms) = send_by_ms
+                && clock.now_unix_ms() > send_by_ms
             {
                 event!(
                     name: "eez.composer.bundle.withheld",
                     Level::WARN,
                     rollup_id,
                     sync_height,
-                    target_block = block,
-                    "target L1 block was built before the Sync block committed; withholding its bundle",
+                    send_by_ms,
+                    "Sync block committed after the bundle's send deadline; withholding its bundle",
                 );
                 optimistic.mark_failed(sync_height, post_batch_hash, true);
                 return;
@@ -5583,6 +5596,8 @@ mod tests {
                 dispatched: Dispatched::Minimal,
             }),
             tokio::time::Instant::now(),
+            None,
+            Arc::new(eez_timing::SystemClock),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), observer)
             .await
@@ -5598,10 +5613,10 @@ mod tests {
         assert_eq!(await_commit(1, 6, block, released).await, Err(true));
     }
 
-    /// A bundle whose target L1 block was built before its Sync block committed
-    /// is never sent, and recovery re-queues it without a charge.
+    /// A bundle whose Sync block commits after the bundle's send deadline is
+    /// never sent, and recovery re-queues it without a charge.
     #[tokio::test]
-    async fn bundle_for_a_built_target_block_is_never_sent() {
+    async fn bundle_past_its_send_deadline_is_never_sent() {
         let (url, _l1, sends) = l1_with_block_9().await;
         let optimistic = Arc::new(OptimisticallyIncluded::new());
         let block = B256::repeat_byte(7);
@@ -5629,6 +5644,9 @@ mod tests {
                 dispatched: Dispatched::Minimal,
             }),
             tokio::time::Instant::now(),
+            // Pinned to L1 timestamp 1 with a 100 ms slack; the commit ends at 1 s.
+            Some(900),
+            Arc::new(eez_timing::TokioClock::starting_at(1_000)),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), observer)
             .await
