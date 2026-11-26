@@ -1009,6 +1009,7 @@ where
     ///
     /// On a fatal error (`is_fatal`), to stop the node.
     pub async fn run(self, mut rx: broadcast::Receiver<L1Event>) {
+        let mut resync_pending = false;
         // Defensive re-anchor: a cheap no-op in the normal boot order;
         // load-bearing for any caller that subscribed rx late.
         if let Err(err) = self.catch_up().await {
@@ -1018,8 +1019,9 @@ where
                 Level::ERROR,
                 event_name = "eez.deriver.resync.failed",
                 error = %err,
-                "post-subscribe resync failed; deriver may have a gap",
+                "post-subscribe resync failed; will retry at the next L1 event",
             );
+            resync_pending = true;
         }
 
         event!(
@@ -1031,6 +1033,10 @@ where
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    // A pending resync runs before each event; NewHead comes once per L1 block.
+                    if resync_pending && !self.try_recover(&mut resync_pending).await {
+                        return;
+                    }
                     if let Err(err) = self.handle_event(event).await {
                         stop_if_fatal(&err);
                         if matches!(&err, DeriverError::CommitterClosed) {
@@ -1052,7 +1058,7 @@ where
                             error = %err,
                             "deriver failed to handle event; resyncing from L1",
                         );
-                        if !self.try_recover().await {
+                        if !self.try_recover(&mut resync_pending).await {
                             return;
                         }
                     }
@@ -1064,7 +1070,7 @@ where
                         skipped,
                         "L1 event stream lagged; resyncing from L1",
                     );
-                    if !self.try_recover().await {
+                    if !self.try_recover(&mut resync_pending).await {
                         return;
                     }
                 }
@@ -1080,11 +1086,14 @@ where
         }
     }
 
-    /// Post-failure recovery via [`Self::catch_up`]. Returns `false` only
-    /// when the committer is gone and the loop must exit; a failed resync is
-    /// logged and retried at the next L1 event. Panics on an [`is_fatal`] one.
-    async fn try_recover(&self) -> bool {
-        match self.catch_up().await {
+    /// Post-failure recovery via [`Self::catch_up`]. Sets `pending` while it
+    /// fails, so [`Self::run`] retries it at the next L1 event. Returns `false`
+    /// only when the committer is gone and the loop must exit. Panics on an
+    /// [`is_fatal`] error.
+    async fn try_recover(&self, pending: &mut bool) -> bool {
+        let result = self.catch_up().await;
+        *pending = result.is_err();
+        match result {
             Ok(()) => {
                 event!(
                     name: "eez.deriver.resync.recovered",
@@ -1112,7 +1121,7 @@ where
                     Level::ERROR,
                     event_name = "eez.deriver.resync.failed",
                     error = %err,
-                    "resync failed; will retry after the next L1 event",
+                    "resync failed; will retry at the next L1 event",
                 );
                 true
             }
