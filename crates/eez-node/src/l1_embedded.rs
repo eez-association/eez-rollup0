@@ -15,7 +15,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -43,21 +43,18 @@ pub const TESTING_L1_BLOCK_TIME: std::time::Duration = std::time::Duration::from
 
 /// Timestamp of the testing L1's next block, at wall-clock second `now`.
 ///
-/// The first block after launch takes the wall-clock second, as reth's dev
-/// miner does, which starts a grid of [`TESTING_L1_BLOCK_TIME`] slots. Every
-/// later block lands on that grid: one slot after its parent when mined on
-/// time or up to four seconds late, more when a longer pause skipped whole
-/// slots. A postBatch pinned to `parent + slot` then lands in its block even
-/// when the node stalls across a second boundary.
+/// A block lands one [`TESTING_L1_BLOCK_TIME`] slot after its parent, however
+/// late it is mined, so a postBatch pinned to `parent + slot` lands in its
+/// block even when the node stalls. The dev miner replays the ticks it missed
+/// during a pause back to back; each block they mine is one slot closer to
+/// the wall clock.
 ///
-/// A block is never stamped ahead of the wall clock. The dev miner replays the
-/// ticks it missed during a pause back to back; a block the grid would put in
-/// the future takes the wall-clock second instead, which restarts the grid.
-pub(crate) fn next_l1_timestamp(parent: u64, now: u64, first: bool) -> u64 {
-    let slot = TESTING_L1_BLOCK_TIME.as_secs();
-    let slots = (now.saturating_sub(parent) / slot).max(1);
-    let on_grid = parent.saturating_add(slot * slots);
-    if first || on_grid > now {
+/// On `restart`, or when the next slot would be ahead of the wall clock, the
+/// block takes the wall-clock second instead, or the second after its parent
+/// if that is later. That starts a new grid.
+pub(crate) fn next_l1_timestamp(parent: u64, now: u64, restart: bool) -> u64 {
+    let on_grid = parent.saturating_add(TESTING_L1_BLOCK_TIME.as_secs());
+    if restart || on_grid > now {
         return now.max(parent.saturating_add(1));
     }
     on_grid
@@ -68,14 +65,16 @@ pub(crate) fn next_l1_timestamp(parent: u64, now: u64, first: bool) -> u64 {
 #[derive(Debug)]
 pub struct TestingL1Attributes {
     chain_spec: Arc<ChainSpec>,
-    started: AtomicBool,
+    /// The timestamp given last. A parent with another timestamp restarts the
+    /// grid: the first block after launch, or a block that was not mined.
+    last: AtomicU64,
 }
 
 impl TestingL1Attributes {
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
         Self {
             chain_spec,
-            started: AtomicBool::new(false),
+            last: AtomicU64::new(u64::MAX),
         }
     }
 }
@@ -86,8 +85,10 @@ impl PayloadAttributesBuilder<PayloadAttributes, Header> for TestingL1Attributes
             .duration_since(UNIX_EPOCH)
             .expect("system clock after 1970")
             .as_secs();
-        let first = !self.started.swap(true, Ordering::Relaxed);
-        let timestamp = next_l1_timestamp(parent.header().timestamp, now, first);
+        let parent = parent.header().timestamp;
+        let restart = self.last.load(Ordering::Relaxed) != parent;
+        let timestamp = next_l1_timestamp(parent, now, restart);
+        self.last.store(timestamp, Ordering::Relaxed);
         // The fields below follow reth's `LocalPayloadAttributesBuilder`.
         PayloadAttributes {
             timestamp,
@@ -275,55 +276,62 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
 mod tests {
     use super::*;
 
-    /// A block mined on time or up to four seconds late lands one slot after
-    /// its parent; a longer pause skips whole slots; a block the grid would
-    /// put ahead of the wall clock takes the wall-clock second, as the first
-    /// block after launch does.
+    /// A block lands one slot after its parent however late it is mined. When
+    /// that would be ahead of the wall clock, or on a restart, it takes the
+    /// wall-clock second, or the second after its parent if that is later.
     #[test]
     fn testing_l1_timestamps_sit_on_a_five_second_grid() {
         let parent = 1_000;
-        for (now, expected) in [
-            (1_005, 1_005), // on time
-            (1_006, 1_005), // 1 s late
-            (1_009, 1_005), // 4 s late
-            (1_011, 1_010), // 6 s late: one slot skipped
-            (1_023, 1_020), // three slots skipped
-            (1_004, 1_004), // the grid is ahead of the wall clock
-            (990, 1_001),   // wall clock behind the parent
+        for (now, restart, expected) in [
+            (1_005, false, 1_005), // on time
+            (1_006, false, 1_005), // 1 s late
+            (1_023, false, 1_005), // 18 s late
+            (1_004, false, 1_004), // the grid is ahead of the wall clock
+            (990, false, 1_001),   // the parent is ahead of the wall clock
+            (1_002, true, 1_002),
+            (1_023, true, 1_023),
+            (1_000, true, 1_001),
         ] {
-            assert_eq!(next_l1_timestamp(parent, now, false), expected, "now {now}");
+            assert_eq!(
+                next_l1_timestamp(parent, now, restart),
+                expected,
+                "now {now}"
+            );
         }
-        // The first block after launch: the wall-clock second, after the parent.
-        assert_eq!(next_l1_timestamp(0, 1_700_000_003, true), 1_700_000_003);
-        assert_eq!(next_l1_timestamp(parent, 1_002, true), 1_002);
-        assert_eq!(next_l1_timestamp(parent, 1_000, true), 1_001);
     }
 
-    /// After a pause the dev miner replays its missed ticks back to back. The
-    /// timestamps return to the wall clock and to the grid, with no lead left.
+    /// After a pause the dev miner replays its missed ticks back to back, and
+    /// the chain returns to the wall clock without leaving the grid. A grid
+    /// started by a late first block moves back to the wall clock once.
     #[test]
-    fn testing_l1_timestamps_return_to_the_wall_clock_after_a_pause() {
-        // A block at 1000, then (wall-clock second of each tick, timestamp).
-        for ticks in [
+    fn testing_l1_timestamps_return_to_the_wall_clock() {
+        // (timestamp of the block before, [(wall-clock second of a tick, timestamp)]).
+        for (first, ticks) in [
             // 12 s pause: the ticks due at 1005 and 1010 both fire at 1012.
-            [
-                (1_012, 1_010),
-                (1_012, 1_012),
-                (1_015, 1_015),
-                (1_020, 1_020),
-            ],
-            // 10 s pause: both fire at 1010.
-            [
-                (1_010, 1_010),
-                (1_010, 1_011),
-                (1_015, 1_015),
-                (1_020, 1_020),
-            ],
+            (
+                1_000,
+                [
+                    (1_012, 1_005),
+                    (1_012, 1_010),
+                    (1_015, 1_015),
+                    (1_020, 1_020),
+                ],
+            ),
+            // The first block was mined a second late.
+            (
+                1_001,
+                [
+                    (1_005, 1_005),
+                    (1_010, 1_010),
+                    (1_016, 1_015),
+                    (1_020, 1_020),
+                ],
+            ),
         ] {
-            let mut parent = 1_000;
+            let mut parent = first;
             for (now, expected) in ticks {
                 parent = next_l1_timestamp(parent, now, false);
-                assert_eq!(parent, expected, "tick at {now}");
+                assert_eq!(parent, expected, "tick at {now} after {first}");
             }
         }
     }
