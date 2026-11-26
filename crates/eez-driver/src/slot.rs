@@ -52,12 +52,13 @@ pub struct SyncSlotBlock {
 /// Releases a Sync block's bundle once the block is committed. Dropping it
 /// withholds the bundle.
 #[derive(Debug)]
-pub struct BundleRelease(oneshot::Sender<B256>);
+pub struct BundleRelease(oneshot::Sender<Option<B256>>);
 
 impl BundleRelease {
-    /// A release and the receiver the bundle's sender waits on.
+    /// A release and the receiver the bundle's sender waits on. It receives
+    /// the committed block's hash, or `None` when reth rejected the block.
     #[must_use]
-    pub fn new() -> (Self, oneshot::Receiver<B256>) {
+    pub fn new() -> (Self, oneshot::Receiver<Option<B256>>) {
         let (tx, rx) = oneshot::channel();
         (Self(tx), rx)
     }
@@ -65,7 +66,12 @@ impl BundleRelease {
     /// The block `hash` is committed, so its bundle may be sent.
     pub fn committed(self, hash: B256) {
         // A sender that is gone has nothing left to send.
-        let _ = self.0.send(hash);
+        let _ = self.0.send(Some(hash));
+    }
+
+    /// Reth rejected the block as invalid, so its bundle is withheld.
+    pub fn rejected(self) {
+        let _ = self.0.send(None);
     }
 }
 

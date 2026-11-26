@@ -4884,8 +4884,9 @@ async fn pin_mismatch(submitter: &Submitter, block: u64, pin: u64) -> bool {
 
 /// A bundle waiting for its Sync block to commit.
 struct Staged {
-    /// Receives the hash of the block committed at the Sync height.
-    released: tokio::sync::oneshot::Receiver<B256>,
+    /// Receives the hash of the block committed at the Sync height, or `None`
+    /// when reth rejected the block.
+    released: tokio::sync::oneshot::Receiver<Option<B256>>,
     /// The event the bundle logs when it is sent.
     dispatched: Dispatched,
 }
@@ -4904,7 +4905,8 @@ enum Dispatched {
 }
 
 /// Send the bundle once its Sync block commits, then observe it. A bundle
-/// whose block is not committed is never sent, so nothing is charged.
+/// whose block is not committed is never sent; only a block reth rejected
+/// charges its txs.
 async fn send_after_commit(
     rollup_id: u64,
     sync_height: u64,
@@ -4922,8 +4924,10 @@ async fn send_after_commit(
             released,
             dispatched,
         }) => {
-            if !await_commit(rollup_id, sync_height, expected_final_root, released).await {
-                optimistic.mark_failed(sync_height, post_batch_hash, true);
+            if let Err(charge_attempt) =
+                await_commit(rollup_id, sync_height, expected_final_root, released).await
+            {
+                optimistic.mark_failed(sync_height, post_batch_hash, !charge_attempt);
                 return;
             }
             // The relay drops a bundle for a block already built.
@@ -5015,17 +5019,18 @@ fn log_dispatched(
     }
 }
 
-/// Wait until the Sync block `expected` is committed. `false` withholds the
-/// bundle: the block was not committed, or another block was.
+/// Wait until the Sync block `expected` is committed. `Err(charge_attempt)`
+/// withholds the bundle: the block was not committed, or another block was.
+/// Only a block reth rejected as invalid charges its txs an attempt.
 async fn await_commit(
     rollup_id: u64,
     sync_height: u64,
     expected: B256,
-    released: tokio::sync::oneshot::Receiver<B256>,
-) -> bool {
+    released: tokio::sync::oneshot::Receiver<Option<B256>>,
+) -> Result<(), bool> {
     match released.await {
-        Ok(committed) if committed == expected => true,
-        Ok(committed) => {
+        Ok(Some(committed)) if committed == expected => Ok(()),
+        Ok(Some(committed)) => {
             event!(
                 name: "eez.composer.bundle.withheld",
                 Level::ERROR,
@@ -5035,7 +5040,17 @@ async fn await_commit(
                 committed = %committed,
                 "a different block was committed for this bundle; withholding it",
             );
-            false
+            Err(false)
+        }
+        Ok(None) => {
+            event!(
+                name: "eez.composer.bundle.withheld",
+                Level::ERROR,
+                rollup_id,
+                sync_height,
+                "reth rejected the Sync block as invalid; withholding its bundle and charging its txs",
+            );
+            Err(true)
         }
         Err(_) => {
             event!(
@@ -5045,7 +5060,7 @@ async fn await_commit(
                 sync_height,
                 "Sync block was not committed; withholding its bundle",
             );
-            false
+            Err(false)
         }
     }
 }
@@ -5531,7 +5546,7 @@ mod tests {
     }
 
     /// A bundle whose Sync block never commits is never sent, and recovery
-    /// re-queues it without a charge.
+    /// re-queues it without a charge unless reth rejected the block.
     #[tokio::test]
     async fn withheld_bundle_is_never_sent() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5581,6 +5596,11 @@ mod tests {
         assert_eq!(connections.load(Ordering::SeqCst), 0);
         let failed = optimistic.take_failed_for_recovery(0).unwrap();
         assert!(failed.slot_skipped);
+
+        // A block reth rejected charges its txs.
+        let (release, released) = BundleRelease::new();
+        release.rejected();
+        assert_eq!(await_commit(1, 6, block, released).await, Err(true));
     }
 
     /// A bundle whose target L1 block was built before its Sync block committed
