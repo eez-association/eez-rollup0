@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions, TryLockError},
     hash::{BuildHasher, Hasher, RandomState},
+    io, iter,
     net::{TcpListener, UdpSocket},
     ops::Range,
     sync::{
@@ -56,7 +57,8 @@ fn next_port() -> u16 {
 /// A claim locks `<tmp>/eez-testkit-ports/<port>` until this process exits.
 /// nextest runs each test in its own process, so test processes running side
 /// by side never hand out the same port, also while a child that will bind it
-/// is starting or restarting.
+/// is starting or restarting. A lease claims its ports before it binds them,
+/// so no test process binds a port another one has claimed.
 static CLAIMED: LazyLock<Mutex<HashMap<u16, File>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Claims `port` for this process; false when this or another process holds it.
@@ -82,6 +84,66 @@ fn claim(claimed: &mut HashMap<u16, File>, port: u16) -> bool {
     }
 }
 
+/// Claims every port of `ports`, or none of them.
+fn claim_all(claimed: &mut HashMap<u16, File>, ports: Range<u16>) -> bool {
+    for port in ports.clone() {
+        if !claim(claimed, port) {
+            release(claimed, ports.start..port);
+            return false;
+        }
+    }
+    true
+}
+
+/// Drops the claims on `ports`, which closes their lock files.
+fn release(claimed: &mut HashMap<u16, File>, ports: Range<u16>) {
+    for port in ports {
+        claimed.remove(&port);
+    }
+}
+
+/// Leases the first candidate whose ports can be claimed in `claimed` and bound
+/// by `bind`, trying at most as many candidates as `range` holds.
+///
+/// A candidate leases itself and the `width - 1` ports after it, all in
+/// `range`. They are claimed first, then bound; when a port is in use, the
+/// claims are dropped and the next candidate is tried. Any other bind error
+/// panics, and so does running out of candidates.
+fn search(
+    claimed: &mut HashMap<u16, File>,
+    range: &Range<u16>,
+    candidates: impl IntoIterator<Item = u16>,
+    width: u16,
+    bind: impl Fn(u16) -> io::Result<PortLease>,
+) -> PortLease {
+    for port in candidates.into_iter().take(range.len()) {
+        let Some(end) = port.checked_add(width).filter(|&end| end <= range.end) else {
+            continue;
+        };
+        if !claim_all(claimed, port..end) {
+            continue;
+        }
+        match bind(port) {
+            Ok(lease) => return lease,
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => release(claimed, port..end),
+            Err(e) => panic!("lease test port {port}: {e}"),
+        }
+    }
+    panic!("no free test port in {range:?}")
+}
+
+/// A lease of `width` ports from [`LEASE_RANGE`], claimed for this process.
+fn lease(width: u16, bind: impl Fn(u16) -> io::Result<PortLease>) -> PortLease {
+    let mut claimed = CLAIMED.lock().expect("claimed ports lock");
+    search(
+        &mut claimed,
+        &LEASE_RANGE,
+        iter::repeat_with(next_port),
+        width,
+        bind,
+    )
+}
+
 /// Keeps selected sockets bound while a child command is being assembled.
 ///
 /// The lease must be released immediately before spawning the child. Between
@@ -97,99 +159,48 @@ pub(crate) struct PortLease {
 
 impl PortLease {
     pub(crate) fn tcp() -> Self {
-        let mut claimed = CLAIMED.lock().expect("claimed ports lock");
-        loop {
-            let port = next_port();
-            let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) else {
-                continue;
-            };
-            if claim(&mut claimed, port) {
-                return Self {
-                    port,
-                    _tcp: Some(listener),
-                    _tcp_secondary: None,
-                    _udp: None,
-                };
-            }
-        }
+        lease(1, |port| {
+            Ok(Self {
+                port,
+                _tcp: Some(TcpListener::bind(("127.0.0.1", port))?),
+                _tcp_secondary: None,
+                _udp: None,
+            })
+        })
     }
 
     pub(crate) fn udp() -> Self {
-        let mut claimed = CLAIMED.lock().expect("claimed ports lock");
-        loop {
-            let port = next_port();
-            let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) else {
-                continue;
-            };
-            if claim(&mut claimed, port) {
-                return Self {
-                    port,
-                    _tcp: None,
-                    _tcp_secondary: None,
-                    _udp: Some(socket),
-                };
-            }
-        }
+        lease(1, |port| {
+            Ok(Self {
+                port,
+                _tcp: None,
+                _tcp_secondary: None,
+                _udp: Some(UdpSocket::bind(("127.0.0.1", port))?),
+            })
+        })
     }
 
     pub(crate) fn tcp_udp() -> Self {
-        let mut claimed = CLAIMED.lock().expect("claimed ports lock");
-        loop {
-            let port = next_port();
-            if claimed.contains_key(&port) {
-                continue;
-            }
-            let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) else {
-                continue;
-            };
-            let Ok(socket) = UdpSocket::bind(("127.0.0.1", port)) else {
-                continue;
-            };
-            if !claim(&mut claimed, port) {
-                continue;
-            }
-            return Self {
+        lease(1, |port| {
+            Ok(Self {
                 port,
-                _tcp: Some(listener),
+                _tcp: Some(TcpListener::bind(("127.0.0.1", port))?),
                 _tcp_secondary: None,
-                _udp: Some(socket),
-            };
-        }
+                _udp: Some(UdpSocket::bind(("127.0.0.1", port))?),
+            })
+        })
     }
 
     /// Reserve an HTTP port and its implicit `port + 1` WebSocket port.
     pub(crate) fn http_pair() -> Self {
-        let mut claimed = CLAIMED.lock().expect("claimed ports lock");
-        loop {
-            let port = next_port();
-            let ws_port = port + 1;
-            if !LEASE_RANGE.contains(&ws_port)
-                || claimed.contains_key(&port)
-                || claimed.contains_key(&ws_port)
-            {
-                continue;
-            }
-            let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) else {
-                continue;
-            };
-            let Ok(ws_listener) = TcpListener::bind(("127.0.0.1", ws_port)) else {
-                continue;
-            };
-            if !claim(&mut claimed, port) {
-                continue;
-            }
-            if !claim(&mut claimed, ws_port) {
-                // Drops the file, which releases `port` again.
-                claimed.remove(&port);
-                continue;
-            }
-            return Self {
+        lease(2, |port| {
+            Ok(Self {
                 port,
-                _tcp: Some(listener),
-                _tcp_secondary: Some(ws_listener),
+                _tcp: Some(TcpListener::bind(("127.0.0.1", port))?),
+                _tcp_secondary: Some(TcpListener::bind(("127.0.0.1", port + 1))?),
                 _udp: None,
-            };
-        }
+            })
+        })
     }
 
     pub(crate) const fn port(&self) -> u16 {
@@ -232,6 +243,21 @@ mod tests {
         assert_eq!(distinct.len(), ports.len(), "{ports:?}");
     }
 
+    /// A TCP lease from `candidates`, claimed in `claimed` instead of [`CLAIMED`].
+    fn lease_tcp(
+        claimed: &mut HashMap<u16, File>,
+        candidates: impl IntoIterator<Item = u16>,
+    ) -> PortLease {
+        search(claimed, &LEASE_RANGE, candidates, 1, |port| {
+            Ok(PortLease {
+                port,
+                _tcp: Some(TcpListener::bind(("127.0.0.1", port))?),
+                _tcp_secondary: None,
+                _udp: None,
+            })
+        })
+    }
+
     /// A port another process holds is not handed out until it lets go. Two
     /// claim tables stand for two processes: each claim opens its own file,
     /// and the locks of two open files conflict even within one process.
@@ -239,15 +265,37 @@ mod tests {
     fn a_port_claimed_by_another_process_is_not_handed_out() {
         let mut first = HashMap::new();
         let mut second = HashMap::new();
-        let port = loop {
-            let port = next_port();
-            if TcpListener::bind(("127.0.0.1", port)).is_ok() && claim(&mut first, port) {
-                break port;
-            }
-        };
+        let port = lease_tcp(&mut first, iter::repeat_with(next_port)).port();
         assert!(!claim(&mut second, port));
         assert!(!claim(&mut first, port));
         drop(first);
         assert!(claim(&mut second, port));
+    }
+
+    /// A candidate whose port is in use is skipped, and its claim is dropped, so
+    /// another process can lease the port once it is free.
+    #[test]
+    fn a_port_in_use_is_skipped_and_its_claim_released() {
+        let busy = lease_tcp(&mut HashMap::new(), iter::repeat_with(next_port)).port();
+        let free = lease_tcp(&mut HashMap::new(), iter::repeat_with(next_port)).port();
+        let _listener = TcpListener::bind(("127.0.0.1", busy)).unwrap();
+        let mut first = HashMap::new();
+        assert_eq!(lease_tcp(&mut first, [busy, free]).port(), free);
+        let mut second = HashMap::new();
+        assert!(claim(&mut second, busy));
+    }
+
+    /// A range of one port holds no HTTP pair; the search gives up after one
+    /// candidate instead of trying forever.
+    #[test]
+    #[should_panic(expected = "no free test port in 10000..10001")]
+    fn a_search_tries_each_port_of_the_range_once() {
+        search(
+            &mut HashMap::new(),
+            &(10_000..10_001),
+            iter::repeat(10_000),
+            2,
+            |_| unreachable!("no candidate fits"),
+        );
     }
 }
