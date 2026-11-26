@@ -45,17 +45,22 @@ pub const TESTING_L1_BLOCK_TIME: std::time::Duration = std::time::Duration::from
 ///
 /// The first block after launch takes the wall-clock second, as reth's dev
 /// miner does, which starts a grid of [`TESTING_L1_BLOCK_TIME`] slots. Every
-/// later block lands on that grid: one slot after its parent when mined early,
-/// on time or up to four seconds late, more when a longer pause skipped whole
+/// later block lands on that grid: one slot after its parent when mined on
+/// time or up to four seconds late, more when a longer pause skipped whole
 /// slots. A postBatch pinned to `parent + slot` then lands in its block even
 /// when the node stalls across a second boundary.
+///
+/// A block is never stamped ahead of the wall clock. The dev miner replays the
+/// ticks it missed during a pause back to back; a block the grid would put in
+/// the future takes the wall-clock second instead, which restarts the grid.
 pub(crate) fn next_l1_timestamp(parent: u64, now: u64, first: bool) -> u64 {
-    if first {
-        return now.max(parent.saturating_add(1));
-    }
     let slot = TESTING_L1_BLOCK_TIME.as_secs();
     let slots = (now.saturating_sub(parent) / slot).max(1);
-    parent.saturating_add(slot * slots)
+    let on_grid = parent.saturating_add(slot * slots);
+    if first || on_grid > now {
+        return now.max(parent.saturating_add(1));
+    }
+    on_grid
 }
 
 /// Payload attributes for the testing L1's dev miner: reth's defaults, with
@@ -270,20 +275,21 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
 mod tests {
     use super::*;
 
-    /// A block mined early, on time or up to four seconds late lands one
-    /// slot after its parent; a longer pause skips whole slots; the first
-    /// block after launch takes the wall-clock second.
+    /// A block mined on time or up to four seconds late lands one slot after
+    /// its parent; a longer pause skips whole slots; a block the grid would
+    /// put ahead of the wall clock takes the wall-clock second, as the first
+    /// block after launch does.
     #[test]
     fn testing_l1_timestamps_sit_on_a_five_second_grid() {
         let parent = 1_000;
         for (now, expected) in [
-            (1_004, 1_005), // early
             (1_005, 1_005), // on time
             (1_006, 1_005), // 1 s late
             (1_009, 1_005), // 4 s late
             (1_011, 1_010), // 6 s late: one slot skipped
             (1_023, 1_020), // three slots skipped
-            (990, 1_005),   // wall clock behind the parent
+            (1_004, 1_004), // the grid is ahead of the wall clock
+            (990, 1_001),   // wall clock behind the parent
         ] {
             assert_eq!(next_l1_timestamp(parent, now, false), expected, "now {now}");
         }
@@ -291,6 +297,35 @@ mod tests {
         assert_eq!(next_l1_timestamp(0, 1_700_000_003, true), 1_700_000_003);
         assert_eq!(next_l1_timestamp(parent, 1_002, true), 1_002);
         assert_eq!(next_l1_timestamp(parent, 1_000, true), 1_001);
+    }
+
+    /// After a pause the dev miner replays its missed ticks back to back. The
+    /// timestamps return to the wall clock and to the grid, with no lead left.
+    #[test]
+    fn testing_l1_timestamps_return_to_the_wall_clock_after_a_pause() {
+        // A block at 1000, then (wall-clock second of each tick, timestamp).
+        for ticks in [
+            // 12 s pause: the ticks due at 1005 and 1010 both fire at 1012.
+            [
+                (1_012, 1_010),
+                (1_012, 1_012),
+                (1_015, 1_015),
+                (1_020, 1_020),
+            ],
+            // 10 s pause: both fire at 1010.
+            [
+                (1_010, 1_010),
+                (1_010, 1_011),
+                (1_015, 1_015),
+                (1_020, 1_020),
+            ],
+        ] {
+            let mut parent = 1_000;
+            for (now, expected) in ticks {
+                parent = next_l1_timestamp(parent, now, false);
+                assert_eq!(parent, expected, "tick at {now}");
+            }
+        }
     }
 
     /// The batch scan traces contract-posted batches over HTTP, so every
