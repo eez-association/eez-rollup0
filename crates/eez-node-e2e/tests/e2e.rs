@@ -1404,6 +1404,72 @@ async fn happy_case_follower_l1_reorg_recovers() {
     seq.assert_no_process_death();
 }
 
+/// An L1 reorg removes the block holding a settled batch and L1 lands the same
+/// postBatch again. reth saves every block, so a read by number still returns
+/// the blocks the reorg retreated; the composer replays the batch and settles on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relanded_batch_after_l1_reorg_keeps_settling() {
+    let harness = Harness::fresh().await.unwrap();
+    let chain = harness.chain();
+    let cfg = NodeConfig {
+        genesis_path: Some(harness.l2_genesis_path()),
+        extra_args: vec!["--engine.persistence-threshold".into(), "0".into()],
+        ..Default::default()
+    };
+    let seq = NodeHandle::start("seq", &cfg, &harness.env().await.unwrap())
+        .await
+        .unwrap();
+    seq.run_tx_spammer(ANVIL_KEY_1);
+    chain.wait_for_batches(3, DEFAULT_TIMEOUT).await.unwrap();
+    chain.set_interval_mining(0).await.unwrap();
+    // The node settles the newest batch before L1 drops its block.
+    let settled = chain.commitment().await.unwrap();
+    wait_for(DEFAULT_TIMEOUT, || async {
+        Ok((safe_block_hash(&seq.l2_rpc_url()).await? == Some(settled)).then_some(()))
+    })
+    .await
+    .unwrap();
+    let l1 = ProviderBuilder::new().connect_http(chain.rpc_url().parse().unwrap());
+    let (eez, from, rollup) = (chain.eez_address(), chain.deploy_block(), chain.rollup_id());
+    let batches = posted_batches(chain.rpc_url(), eez, from, rollup)
+        .await
+        .unwrap();
+    let tx_hash = batches.iter().rev().find(|b| b.succeeded).unwrap().tx_hash;
+    let receipt = l1.get_transaction_receipt(tx_hash).await.unwrap().unwrap();
+    let block = receipt.block_number.unwrap();
+    let raw = l1
+        .get_raw_transaction_by_hash(tx_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    let depth = l1.get_block_number().await.unwrap() - block + 1;
+    // Same height, parent and timestamp, so the batch's L1 pin still holds.
+    let interval = eez_testkit::Chain::block_time_secs();
+    let rpc = l1.client();
+    let _: serde_json::Value = rpc
+        .request("anvil_setBlockTimestampInterval", (interval,))
+        .await
+        .unwrap();
+    let _: serde_json::Value = rpc
+        .request("anvil_reorg", (depth, vec![(raw, 0u64)]))
+        .await
+        .unwrap();
+    let relanded = l1.get_transaction_receipt(tx_hash).await.unwrap().unwrap();
+    assert!(relanded.status() && relanded.block_number == Some(block));
+    assert_ne!(
+        relanded.block_hash, receipt.block_hash,
+        "the reorg replaced the block"
+    );
+    let states = chain.executed_states().await.unwrap();
+    // Two slots pass, so a bundle composed before the reorg misses its pinned slot.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    chain.set_interval_mining(1).await.unwrap();
+    wait_for_new_attested_safe_block(&seq, &chain, &states, DEFAULT_TIMEOUT)
+        .await
+        .expect("the node stopped settling after the re-landed batch");
+    seq.assert_no_process_death();
+}
+
 /// Followers with different unsafe sources converge on the same safe prefix.
 /// This proves L1 derivation, rather than the unsafe source, controls safe-head selection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

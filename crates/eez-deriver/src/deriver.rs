@@ -2655,26 +2655,11 @@ mod suffix_replay_tests {
 
 #[cfg(test)]
 mod reconcile_decision_tests {
-    use super::{on_local_chain, range_already_derived, resume_replay_txs};
+    use super::{range_already_derived, resume_replay_txs};
     use alloy_primitives::B256;
 
     fn tx(byte: u8) -> Vec<u8> {
         vec![byte]
-    }
-
-    /// After a retreat a read by number still returns the block that was at a
-    /// height above the new head; it is not part of the local chain, so a range
-    /// ending there is not derived yet, even when that block is the one L1
-    /// settled.
-    #[test]
-    fn a_block_above_the_head_is_not_local() {
-        let settled = B256::repeat_byte(0xAA);
-        // The block a read by number returns at 62, left behind by a retreat
-        // to 58, is the one L1 settled.
-        let terminal = on_local_chain(62, 58).then_some(settled);
-        assert_eq!(terminal, None);
-        assert!(!range_already_derived(false, terminal, Some(settled)));
-        assert!(on_local_chain(58, 58), "the head itself is local");
     }
 
     /// The terminal block's hash decides the whole range: a block hash contains
