@@ -2020,8 +2020,9 @@ impl NodeHandle {
 
     /// Waits until this process's reth has saved block `number`, or a later
     /// one, to disk. reth saves canonical blocks in the background, so a block
-    /// its RPC already serves can still be lost to a kill. The node must run
-    /// with `--ws --ws.api reth`.
+    /// its RPC already serves can still be lost to a kill. Only a save made
+    /// after the call is seen, so the node must still be producing blocks. The
+    /// node must run with `--ws --ws.api reth`.
     ///
     /// # Errors
     ///

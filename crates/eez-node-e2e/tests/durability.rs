@@ -54,11 +54,11 @@ async fn restart_with_datadir_ahead_of_l1_retreats_before_production() {
         )
         .await
         .expect("staged transaction did not land");
-        wait_for_latest_height(&node, 4, TIMEOUT)
+        let staged = wait_for_latest_height(&node, 4, TIMEOUT)
             .await
             .expect("failed to stage a multi-block unconfirmed suffix");
         // reth saves in the background; the kill must find the suffix on disk.
-        node.wait_for_persisted(4, TIMEOUT)
+        node.wait_for_persisted(staged.number, TIMEOUT)
             .await
             .expect("reth did not save the staged suffix to disk");
         assert_eq!(
