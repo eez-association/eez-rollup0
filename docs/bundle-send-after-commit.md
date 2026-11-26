@@ -17,7 +17,7 @@ A minimal postBatch takes the same steps and logs `eez.composer.phase1.bundle.st
 
 If the commit fails, or another block commits at that height, the
 bundle is never sent: it logs `eez.composer.bundle.withheld`, never `dispatched`. So is an `Exact`
-bundle whose block commits after `timestamp·1000 − submission slack`, which the relay would drop. Recovery
+bundle whose block commits after its target L1 slot started (`timestamp·1000`). One that commits after `timestamp·1000 − submission slack`, the node's own margin, is still sent, and its failure charges nothing (`eez.composer.bundle.sent_late`). Recovery
 re-queues its txs without charging an attempt, unless reth rejected the block as invalid
 (`BundleRelease::rejected`), which charges its txs an attempt. No bundle is sent
 before its block commits, though the block can still be replaced after the bundle is sent.

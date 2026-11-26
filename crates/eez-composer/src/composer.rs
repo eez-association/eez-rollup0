@@ -3459,13 +3459,11 @@ where
         target: BundleTarget,
         staged: Option<Staged>,
     ) {
-        // An Exact bundle must reach the relay by `timestamp·1000 − slack`.
-        let send_by_ms = match target {
-            BundleTarget::Exact { timestamp, .. } => {
-                Some(timestamp.saturating_mul(1_000).saturating_sub(
-                    self.inner.emission.timing.submission_slack().as_millis() as u64,
-                ))
-            }
+        let deadlines = match target {
+            BundleTarget::Exact { timestamp, .. } => Some(send_deadlines_ms(
+                timestamp,
+                self.inner.emission.timing.submission_slack(),
+            )),
             BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => None,
         };
         tokio::spawn(send_after_commit(
@@ -3479,7 +3477,7 @@ where
             target,
             staged,
             tokio::time::Instant::now(),
-            send_by_ms,
+            deadlines,
             Arc::clone(&self.inner.clock),
         ));
     }
@@ -4844,13 +4842,14 @@ enum BundleVerdict {
 
 /// The verdict L1's outcome gives. The relay's answer never decides it: only a
 /// bundle the relay accepted is charged, and a skipped pinned slot or
-/// `pin_mismatch` (the target block's timestamp differs from the pin) waives that.
+/// `waive_charge` (the target block's timestamp differs from the pin, or the
+/// node sent the bundle late) waives that.
 fn bundle_verdict(
     sent: &SentBundle,
     expected_final_root: B256,
-    pin_mismatch: bool,
+    waive_charge: bool,
 ) -> BundleVerdict {
-    let charge_attempt = sent.reply == RelayReply::Accepted && !pin_mismatch;
+    let charge_attempt = sent.reply == RelayReply::Accepted && !waive_charge;
     match &sent.outcome {
         SendOutcome::Included { settlement, .. }
             if settlement.final_state == Some(expected_final_root) =>
@@ -4917,9 +4916,19 @@ enum Dispatched {
     Minimal,
 }
 
+/// When a bundle pinned to L1 timestamp `timestamp` (seconds) is late, in unix
+/// ms: after the first instant it has missed the node's `submission_slack`
+/// margin, after the second its target slot has started.
+fn send_deadlines_ms(timestamp: u64, submission_slack: std::time::Duration) -> (u64, u64) {
+    let slot_start_ms = timestamp.saturating_mul(1_000);
+    let margin_ms = slot_start_ms.saturating_sub(submission_slack.as_millis() as u64);
+    (margin_ms, slot_start_ms)
+}
+
 /// Send the bundle once its Sync block commits, then observe it. A bundle
 /// whose block is not committed is never sent; only a block reth rejected
-/// charges its txs. A staged bundle is not sent after `send_by_ms` on `clock`.
+/// charges its txs. On `clock`, a staged bundle past the first of its
+/// `deadlines` is sent uncharged, and one past the second is not sent.
 async fn send_after_commit(
     rollup_id: u64,
     sync_height: u64,
@@ -4931,9 +4940,10 @@ async fn send_after_commit(
     target: BundleTarget,
     staged: Option<Staged>,
     staged_at: tokio::time::Instant,
-    send_by_ms: Option<u64>,
+    deadlines: Option<(u64, u64)>,
     clock: SharedClock,
 ) {
+    let mut sent_late = false;
     let dispatched = match staged {
         Some(Staged {
             released,
@@ -4945,20 +4955,32 @@ async fn send_after_commit(
                 optimistic.mark_failed(sync_height, post_batch_hash, !charge_attempt);
                 return;
             }
-            // The relay drops a bundle that reaches it after the cutoff.
-            if let Some(send_by_ms) = send_by_ms
-                && clock.now_unix_ms() > send_by_ms
+            let now_ms = clock.now_unix_ms();
+            // A bundle sent after its slot started cannot land in it.
+            if let Some((_, slot_start_ms)) = deadlines
+                && now_ms > slot_start_ms
             {
                 event!(
                     name: "eez.composer.bundle.withheld",
                     Level::WARN,
                     rollup_id,
                     sync_height,
-                    send_by_ms,
-                    "Sync block committed after the bundle's send deadline; withholding its bundle",
+                    slot_start_ms,
+                    "Sync block committed after its target L1 slot started; withholding its bundle",
                 );
                 optimistic.mark_failed(sync_height, post_batch_hash, true);
                 return;
+            }
+            // Past the node's own margin the bundle still goes out; the lateness is the node's.
+            sent_late = deadlines.is_some_and(|(margin_ms, _)| now_ms > margin_ms);
+            if sent_late {
+                event!(
+                    name: "eez.composer.bundle.sent_late",
+                    Level::WARN,
+                    rollup_id,
+                    sync_height,
+                    "Sync block committed after the submission slack; sending its bundle, whose failure charges nothing",
+                );
             }
             Some((dispatched, staged_at.elapsed()))
         }
@@ -4988,6 +5010,7 @@ async fn send_after_commit(
         submitter,
         target,
         on_dispatch,
+        sent_late,
     )
     .await;
 }
@@ -5088,7 +5111,8 @@ async fn await_commit(
 /// "Settled" requires an `L2ExecutionPerformed` in the inclusion block
 /// whose `newRoot` equals `expected_final_root` (the built Sync block's
 /// root) — the leading immediate advancing L1 partway doesn't count.
-/// `on_dispatch` runs when the bundle goes out.
+/// `on_dispatch` runs when the bundle goes out. A bundle `sent_late` by the
+/// node charges nothing.
 async fn observe_bundle_outcome(
     rollup_id: u64,
     sync_height: u64,
@@ -5101,6 +5125,7 @@ async fn observe_bundle_outcome(
     submitter: Submitter,
     target: BundleTarget,
     on_dispatch: impl FnOnce(),
+    sent_late: bool,
 ) {
     let sent = match submitter.send_bundle(&bundle, target, on_dispatch).await {
         Ok(sent) => sent,
@@ -5118,7 +5143,7 @@ async fn observe_bundle_outcome(
             return;
         }
     };
-    let mut verdict = bundle_verdict(&sent, expected_final_root, false);
+    let mut verdict = bundle_verdict(&sent, expected_final_root, sent_late);
     // Only a charge can be waived, and only an Exact target carries a pin.
     if let (
         BundleVerdict::Failed {
@@ -5621,11 +5646,35 @@ mod tests {
         assert_eq!(await_commit(1, 6, block, released).await, Err(true));
     }
 
-    /// A bundle whose Sync block commits after the bundle's send deadline is
+    #[test]
+    fn send_deadlines_are_the_slack_point_then_the_slot_start() {
+        let slack = std::time::Duration::from_millis(1_300);
+        assert_eq!(send_deadlines_ms(1_000, slack), (998_700, 1_000_000));
+    }
+
+    /// A bundle whose Sync block commits after its target L1 slot started is
     /// never sent, and recovery re-queues it without a charge.
     #[tokio::test]
-    async fn bundle_past_its_send_deadline_is_never_sent() {
+    async fn bundle_after_its_slot_started_is_never_sent() {
+        // Nothing listens here: an L1 read or a send would leave the observer waiting.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        assert!(send_committed(&url, 1_001).await.slot_skipped);
+    }
+
+    /// A bundle whose Sync block commits past the node's margin but before its
+    /// slot is still sent, and its drop charges nothing: the lateness is the node's.
+    #[tokio::test]
+    async fn late_bundle_is_sent_and_its_drop_charges_nothing() {
         let (url, _l1, sends) = l1_with_block_9().await;
+        assert!(send_committed(&url, 1_000).await.slot_skipped);
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Run the observer of a committed bundle pinned to L1 block 9 at timestamp
+    /// 1 with a 100 ms slack, on a clock at `now_ms`, and return its failure.
+    async fn send_committed(url: &str, now_ms: u64) -> crate::optimistic::FailedBatch {
         let optimistic = Arc::new(OptimisticallyIncluded::new());
         let block = B256::repeat_byte(7);
         let post_batch = TxHash::repeat_byte(1);
@@ -5642,7 +5691,7 @@ mod tests {
             post_batch,
             block,
             Arc::clone(&optimistic),
-            submitter_at(&url),
+            submitter_at(url),
             BundleTarget::Exact {
                 block: 9,
                 timestamp: 1,
@@ -5652,17 +5701,13 @@ mod tests {
                 dispatched: Dispatched::Minimal,
             }),
             tokio::time::Instant::now(),
-            // Pinned to L1 timestamp 1 with a 100 ms slack; the commit ends at 1 s.
-            Some(900),
-            Arc::new(eez_timing::TokioClock::starting_at(1_000)),
+            Some(send_deadlines_ms(1, std::time::Duration::from_millis(100))),
+            Arc::new(eez_timing::TokioClock::starting_at(now_ms)),
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), observer)
             .await
             .unwrap();
-
-        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let failed = optimistic.take_failed_for_recovery(0).unwrap();
-        assert!(failed.slot_skipped);
+        optimistic.take_failed_for_recovery(0).unwrap()
     }
 
     /// A landed post whose settlement was unread and that an L1 reorg then
