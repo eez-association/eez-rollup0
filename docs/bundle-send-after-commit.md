@@ -44,9 +44,9 @@ nothing was sent.
 | post landed, settlement unread | unresolved: the batch stays pending until the cursor decides; failed without a charge if an L1 reorg drops the post first |
 | target passed without the post | failed |
 
-The relay's answer only affects the charge. A failed batch charges its txs an attempt unless the
-relay reply was `Unanswered`, the pinned slot was skipped, or the target block's timestamp
-differs from the pin.
+The relay's answer only affects the charge. A failed batch charges its txs an attempt only if the
+relay reply was `Accepted`, the pinned slot was not skipped and the target block's timestamp
+matches the pin. A `Rejected` reply says nothing about the txs.
 
 ## Cost
 

@@ -4831,15 +4831,15 @@ enum BundleVerdict {
     Unresolved,
 }
 
-/// The verdict L1's outcome gives. The relay's answer never decides it: an
-/// unanswered send only waives the charge, as do a skipped pinned slot and
-/// `pin_mismatch` (the target block's timestamp differs from the pin).
+/// The verdict L1's outcome gives. The relay's answer never decides it: only a
+/// bundle the relay accepted is charged, and a skipped pinned slot or
+/// `pin_mismatch` (the target block's timestamp differs from the pin) waives that.
 fn bundle_verdict(
     sent: &SentBundle,
     expected_final_root: B256,
     pin_mismatch: bool,
 ) -> BundleVerdict {
-    let charge_attempt = !(matches!(sent.reply, RelayReply::Unanswered(_)) || pin_mismatch);
+    let charge_attempt = sent.reply == RelayReply::Accepted && !pin_mismatch;
     match &sent.outcome {
         SendOutcome::Included { settlement, .. }
             if settlement.final_state == Some(expected_final_root) =>
@@ -5484,19 +5484,14 @@ mod tests {
             RelayReply::Rejected(String::new()),
             RelayReply::Unanswered(String::new()),
         ];
-        // The relay decides: one that did not accept fails the batch before
-        // L1 is read, and so does an unread settlement.
+        // The relay decides: one that did not accept fails the batch uncharged
+        // before L1 is read. An unread settlement fails it.
         let relay_decides = |reply: &RelayReply, outcome: &SendOutcome, pin_mismatch: bool| match (
             reply, outcome,
         ) {
-            (RelayReply::Unanswered(_), _) => BundleVerdict::Failed {
+            (RelayReply::Rejected(_) | RelayReply::Unanswered(_), _) => BundleVerdict::Failed {
                 charge_attempt: false,
             },
-            (RelayReply::Rejected(_), _) | (_, SendOutcome::IncludedUnread { .. }) => {
-                BundleVerdict::Failed {
-                    charge_attempt: !pin_mismatch,
-                }
-            }
             (_, SendOutcome::Included { settlement, .. })
                 if settlement.final_state == Some(root) =>
             {
