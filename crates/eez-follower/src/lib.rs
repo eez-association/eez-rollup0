@@ -6,7 +6,7 @@
 
 mod unsafe_head;
 
-pub use unsafe_head::{BlockSource, FollowerError, UnsafeHeadFollower};
+pub use unsafe_head::{BlockSource, FollowerError};
 
 use std::{env, str::FromStr, sync::Arc, time::Duration};
 
@@ -25,7 +25,7 @@ use reth_network::{BlockDownloaderProvider as _, NetworkInfo as _, PeersInfo as 
 use tokio::sync::mpsc;
 use tracing::{Level, event};
 
-use unsafe_head::PeerBlocks;
+use unsafe_head::{PeerBlocks, UnsafeHeadFollower};
 
 /// Overlay heads queued while the follower imports; past it the overlay drops
 /// and WARNs instead of waiting.

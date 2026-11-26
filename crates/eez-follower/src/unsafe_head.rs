@@ -209,7 +209,7 @@ pub(crate) struct Missing {
 /// Follows verified signed heads and routes every engine call through the
 /// shared [`BlockCommitterHandle`].
 #[derive(Debug)]
-pub struct UnsafeHeadFollower<P, S> {
+pub(crate) struct UnsafeHeadFollower<P, S> {
     committer: BlockCommitterHandle<EezEngineTypes>,
     /// Heads the feed verified against the sequencer's address and domain.
     heads: mpsc::Receiver<VerifiedHead>,
@@ -231,7 +231,7 @@ where
     P: HeaderProvider<Header = Header> + BlockIdReader,
     S: BlockSource,
 {
-    pub fn new(
+    pub(crate) fn new(
         committer: BlockCommitterHandle<EezEngineTypes>,
         heads: mpsc::Receiver<VerifiedHead>,
         blocks: S,
@@ -251,7 +251,7 @@ where
         }
     }
 
-    pub async fn run(mut self) {
+    pub(crate) async fn run(mut self) {
         let mut retry = tokio::time::interval(self.retry_interval);
         // A slow fetch must not queue a burst of catch-up retries.
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
