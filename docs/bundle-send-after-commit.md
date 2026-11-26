@@ -16,7 +16,8 @@ A minimal postBatch takes the same steps and logs `eez.composer.phase1.bundle.st
 `eez.composer.phase1.bundle.dispatched`.
 
 If the commit fails, or another block commits at that height, the release is dropped and the
-bundle is never sent: it logs `eez.composer.bundle.withheld`, never `dispatched`. Recovery
+bundle is never sent: it logs `eez.composer.bundle.withheld`, never `dispatched`. So is a bundle
+whose `Exact` target L1 block was built before the commit, which the relay would drop. Recovery
 re-queues its txs without charging an attempt. No bundle is in flight for a block that is not in
 the chain.
 

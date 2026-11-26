@@ -4926,6 +4926,21 @@ async fn send_after_commit(
                 optimistic.mark_failed(sync_height, post_batch_hash, true);
                 return;
             }
+            // The relay drops a bundle for a block already built.
+            if let BundleTarget::Exact { block, .. } = target
+                && let Ok(Some(_)) = submitter.block_timestamp(block).await
+            {
+                event!(
+                    name: "eez.composer.bundle.withheld",
+                    Level::WARN,
+                    rollup_id,
+                    sync_height,
+                    target_block = block,
+                    "target L1 block was built before the Sync block committed; withholding its bundle",
+                );
+                optimistic.mark_failed(sync_height, post_batch_hash, true);
+                return;
+            }
             Some((dispatched, staged_at.elapsed()))
         }
         // A historical chunk is sent at once; `emit_historical_chunk` logged its one event.
@@ -5493,20 +5508,7 @@ mod tests {
                 std::mem::forget(socket);
             }
         });
-        let reader = eez_l1::L1ReaderConfig {
-            rpc_url: url.parse().unwrap(),
-            trace_rpc_url: url.parse().unwrap(),
-            eez: Address::ZERO,
-            rollup_id: 1,
-            deploy_block: 0,
-            beacon_url: None,
-        };
-        let submitter = Submitter::new(eez_l1::SubmitterConfig {
-            builder_rpc_url: url.parse().unwrap(),
-            reader,
-            target_rpc_url: None,
-            poster: alloy_signer_local::PrivateKeySigner::random(),
-        });
+        let submitter = submitter_at(&url);
         let optimistic = Arc::new(OptimisticallyIncluded::new());
         let block = B256::repeat_byte(7);
         let post_batch = TxHash::repeat_byte(1);
@@ -5541,6 +5543,99 @@ mod tests {
         assert_eq!(connections.load(Ordering::SeqCst), 0);
         let failed = optimistic.take_failed_for_recovery(0).unwrap();
         assert!(failed.slot_skipped);
+    }
+
+    /// A bundle whose target L1 block was built before its Sync block committed
+    /// is never sent, and recovery re-queues it without a charge.
+    #[tokio::test]
+    async fn bundle_for_a_built_target_block_is_never_sent() {
+        let (url, _l1, sends) = l1_with_block_9().await;
+        let optimistic = Arc::new(OptimisticallyIncluded::new());
+        let block = B256::repeat_byte(7);
+        let post_batch = TxHash::repeat_byte(1);
+        let parent =
+            reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
+        optimistic.begin(6, post_batch, parent, block, Vec::new());
+
+        let (release, released) = BundleRelease::new();
+        release.committed(block);
+        let observer = send_after_commit(
+            1,
+            6,
+            vec![signed_user_tx(21_000)],
+            post_batch,
+            block,
+            Arc::clone(&optimistic),
+            submitter_at(&url),
+            BundleTarget::Exact {
+                block: 9,
+                timestamp: 1,
+            },
+            Some(Staged {
+                released,
+                dispatched: Dispatched::Minimal,
+            }),
+            tokio::time::Instant::now(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), observer)
+            .await
+            .unwrap();
+
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let failed = optimistic.take_failed_for_recovery(0).unwrap();
+        assert!(failed.slot_skipped);
+    }
+
+    /// A submitter whose L1 reads and relay both go to `url`.
+    fn submitter_at(url: &str) -> Submitter {
+        Submitter::new(eez_l1::SubmitterConfig {
+            builder_rpc_url: url.parse().unwrap(),
+            reader: eez_l1::L1ReaderConfig {
+                rpc_url: url.parse().unwrap(),
+                trace_rpc_url: url.parse().unwrap(),
+                eez: Address::ZERO,
+                rollup_id: 1,
+                deploy_block: 0,
+                beacon_url: None,
+            },
+            target_rpc_url: None,
+            poster: alloy_signer_local::PrivateKeySigner::random(),
+        })
+    }
+
+    /// An L1 that built block 9 at timestamp 1 and holds no receipts, behind a
+    /// relay that accepts every bundle. Returns its URL, server and bundle count.
+    async fn l1_with_block_9() -> (
+        String,
+        jsonrpsee::server::ServerHandle,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut module = jsonrpsee::RpcModule::new(Arc::clone(&sends));
+        let header = alloy_rpc_types_eth::Header::new(alloy_consensus::Header {
+            number: 9,
+            timestamp: 1,
+            ..Default::default()
+        });
+        let block = alloy_rpc_types_eth::Block::<alloy_rpc_types_eth::Transaction>::empty(header);
+        let block = serde_json::to_value(block).unwrap();
+        module
+            .register_method("eth_getBlockByNumber", move |_, _, _| block.clone())
+            .unwrap();
+        module
+            .register_method("eth_getTransactionReceipt", |_, _, _| ())
+            .unwrap();
+        module
+            .register_method("eth_sendBundle", |_, sends, _| {
+                sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .unwrap();
+        let server = jsonrpsee::server::ServerBuilder::default()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (url, server.start(module), sends)
     }
 
     #[test]
