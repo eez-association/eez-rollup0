@@ -273,7 +273,7 @@ where
                         name: "eez.node.sync.history_check_skipped",
                         Level::WARN,
                         %error,
-                        "L1's finalized root is unreadable; boot skips checking that the local chain holds it and leaves finalized where reth has it",
+                        "L1's finalized root is unreadable; boot skips checking that the local chain holds it and does not restore finalized",
                     );
                     None
                 }
