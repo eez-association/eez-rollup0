@@ -5168,7 +5168,7 @@ async fn observe_bundle_outcome(
         BundleVerdict::Failed { charge_attempt } => {
             optimistic.mark_failed(sync_height, post_batch_hash, !charge_attempt)
         }
-        // The post landed, so the cursor resolves it unless an L1 reorg drops it first.
+        // The post landed, so the cursor resolves it unless it reverted or an L1 reorg drops it.
         BundleVerdict::Unresolved { l1_block } => {
             watch_unresolved(
                 rollup_id,
@@ -5678,7 +5678,7 @@ mod tests {
     #[tokio::test]
     async fn late_bundle_is_sent_and_its_drop_charges_nothing() {
         let (url, _l1, sends) = l1_with_block_9().await;
-        assert!(send_committed(&url, 1_000).await.slot_skipped);
+        assert!(send_committed(&url, 999).await.slot_skipped);
         assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -5735,6 +5735,13 @@ mod tests {
         );
         assert!(fails_uncharged(&submitter, 1, 9).await, "reorged out");
         assert!(fails_uncharged(&submitter, 2, 10).await, "reverted");
+        // A reverted post still has a receipt: its nonce is spent.
+        assert!(
+            submitter
+                .receipt_exists(TxHash::repeat_byte(2))
+                .await
+                .unwrap()
+        );
     }
 
     /// Watch the unresolved post `0xtag…` that landed in `l1_block` for a second:

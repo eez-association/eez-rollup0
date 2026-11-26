@@ -109,7 +109,8 @@ pub enum SendOutcome {
         reason: DropReason,
     },
     /// The post landed, but reading how it settled failed for good. Not a
-    /// failure: the Deriver's cursor resolves the batch.
+    /// failure by itself: the Deriver's cursor resolves the batch unless the
+    /// post reverted or left L1.
     IncludedUnread {
         tx_hash: TxHash,
         l1_block: u64,
