@@ -6,10 +6,11 @@ time. The `local` profile runs several at once, for a large machine.
 ## The command
 
 ```bash
-# The suites start target/debug/eez-proof-signer and eez-prover-stateful. The harness
-# builds them only when they are missing, so rebuild them after a change:
-scripts/provers-cargo.sh build -p eez-prover-stateless --bin eez-proof-signer --target-dir target
-scripts/provers-cargo.sh --stateful build -p eez-prover-stateful --bin eez-prover-stateful --target-dir target
+# The suites start eez-proof-signer and eez-prover-stateful from Cargo's target directory,
+# which is $CARGO_TARGET_DIR when it is set and target otherwise. The harness builds them
+# only when they are missing, so rebuild them there after a change:
+scripts/provers-cargo.sh build -p eez-prover-stateless --bin eez-proof-signer --target-dir "${CARGO_TARGET_DIR:-target}"
+scripts/provers-cargo.sh --stateful build -p eez-prover-stateful --bin eez-prover-stateful --target-dir "${CARGO_TARGET_DIR:-target}"
 
 cargo nextest run -p eez-node-e2e --profile local --no-fail-fast
 ```
@@ -24,7 +25,8 @@ cargo nextest run -p eez-node-e2e --profile local --no-fail-fast
 - nextest runs each test in its own process. A port the testkit leases stays claimed by a
   lock file under `$TMPDIR/eez-testkit-ports/` until that process exits, so two tests
   never get the same port, also while a node restarts on its old ports
-  (`crates/eez-testkit/src/ports.rs`).
+  (`crates/eez-testkit/src/ports.rs`). Runs at the same time on one machine must use the
+  same `TMPDIR`, because the lock files live under it.
 - Leased ports come from 10000 up to the start of the kernel's ephemeral range
   (`/proc/sys/net/ipv4/ip_local_port_range`), so no outgoing connection can take one
   between the lease and the node's bind.
