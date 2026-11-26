@@ -5186,9 +5186,10 @@ async fn observe_bundle_outcome(
 /// How often an unresolved post is checked.
 const UNRESOLVED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Wait while the batch is pending. A post that left L1 before the cursor
-/// covered it fails without a charge: its receipt is gone and `l1_block`, where
-/// it landed, reads without it. Anything unread is read again.
+/// Wait while the batch is pending. A post L1 applied nothing of before the
+/// cursor covered it fails without a charge: its receipt reverted, or its
+/// receipt is gone and `l1_block`, where it landed, reads without it. A
+/// successful receipt waits for the cursor; anything unread is read again.
 async fn watch_unresolved(
     rollup_id: u64,
     sync_height: u64,
@@ -5198,17 +5199,26 @@ async fn watch_unresolved(
     submitter: &Submitter,
 ) {
     while optimistic.is_pending(sync_height, post_batch_hash) {
-        // A lagging provider answers no receipt too, but it cannot serve the block.
-        if let Ok(false) = submitter.receipt_exists(post_batch_hash).await
-            && let Ok(Some(false)) = submitter.block_has_tx(l1_block, post_batch_hash).await
-        {
+        let failed = match submitter.receipt_status(post_batch_hash).await {
+            // Back from the mempool after a reorg, it can land again and revert.
+            Ok(Some(false)) => Some("the postBatch reverted on L1"),
+            // A lagging provider answers no receipt too, but it cannot serve the block.
+            Ok(None) => matches!(
+                submitter.block_has_tx(l1_block, post_batch_hash).await,
+                Ok(Some(false))
+            )
+            .then_some("the postBatch is no longer on L1"),
+            Ok(Some(true)) | Err(_) => None,
+        };
+        if let Some(reason) = failed {
             event!(
-                name: "eez.composer.bundle.reorged_out",
+                name: "eez.composer.bundle.unresolved_failed",
                 Level::WARN,
                 rollup_id,
                 sync_height,
                 post_batch_hash = %post_batch_hash,
-                "unresolved postBatch is no longer on L1; failing the batch without charging an attempt",
+                reason,
+                "unresolved postBatch applied nothing on L1; failing the batch without charging an attempt",
             );
             optimistic.mark_failed(sync_height, post_batch_hash, true);
             return;
@@ -5710,32 +5720,41 @@ mod tests {
         optimistic.take_failed_for_recovery(0).unwrap()
     }
 
-    /// A landed post whose settlement was unread and that an L1 reorg then
-    /// dropped fails without a charge, so it no longer holds the gate. A
+    /// A landed post whose settlement was unread and that L1 then applied
+    /// nothing of fails without a charge, so it no longer holds the gate. A
     /// missing receipt alone may be a lagging provider and fails nothing.
     #[tokio::test]
     async fn unresolved_post_dropped_by_a_reorg_fails_uncharged() {
         let (url, _l1, _) = l1_with_block_9().await;
+        let submitter = submitter_at(&url);
+        // Post 1 has no receipt, post 2 reverted and post 3 succeeded.
+        assert!(!fails_uncharged(&submitter, 1, 10).await, "block 10 unread");
+        assert!(
+            !fails_uncharged(&submitter, 3, 9).await,
+            "the cursor decides"
+        );
+        assert!(fails_uncharged(&submitter, 1, 9).await, "reorged out");
+        assert!(fails_uncharged(&submitter, 2, 10).await, "reverted");
+    }
+
+    /// Watch the unresolved post `0xtag…` that landed in `l1_block` for a second:
+    /// whether it fails without a charge, rather than staying pending.
+    async fn fails_uncharged(submitter: &Submitter, tag: u8, l1_block: u64) -> bool {
         let optimistic = OptimisticallyIncluded::new();
-        let post_batch = TxHash::repeat_byte(1);
+        let post_batch = TxHash::repeat_byte(tag);
         let parent =
             reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
         optimistic.begin(6, post_batch, parent, B256::ZERO, Vec::new());
-
-        let submitter = submitter_at(&url);
-        // No receipt, and block 10 is not readable: keep waiting.
-        let lagging = watch_unresolved(1, 6, post_batch, 10, &optimistic, &submitter);
-        let waited = tokio::time::timeout(std::time::Duration::from_secs(1), lagging).await;
-        assert!(waited.is_err());
-        assert!(optimistic.is_pending(6, post_batch));
-        // No receipt, and block 9 reads without the post: it was reorged out.
-        let watch = watch_unresolved(1, 6, post_batch, 9, &optimistic, &submitter);
-        tokio::time::timeout(std::time::Duration::from_secs(5), watch)
+        let watch = watch_unresolved(1, 6, post_batch, l1_block, &optimistic, submitter);
+        if tokio::time::timeout(std::time::Duration::from_secs(1), watch)
             .await
-            .unwrap();
-
-        let failed = optimistic.take_failed_for_recovery(0).unwrap();
-        assert!(failed.slot_skipped);
+            .is_err()
+        {
+            return false;
+        }
+        optimistic
+            .take_failed_for_recovery(0)
+            .is_some_and(|failed| failed.slot_skipped)
     }
 
     /// A relay without `eth_sendBundle` gets only the postBatch, through the
@@ -5796,8 +5815,9 @@ mod tests {
         })
     }
 
-    /// An L1 whose only block is an empty block 9 at timestamp 1, behind a
-    /// relay that accepts every bundle. Returns its URL, server and bundle count.
+    /// An L1 whose only block is an empty block 9 at timestamp 1, where tx
+    /// `0x02…` reverted and tx `0x03…` succeeded, behind a relay that accepts
+    /// every bundle. Returns its URL, server and bundle count.
     async fn l1_with_block_9() -> (
         String,
         jsonrpsee::server::ServerHandle,
@@ -5818,8 +5838,40 @@ mod tests {
                 (number == alloy_eips::BlockNumberOrTag::Number(9)).then(|| block.clone())
             })
             .unwrap();
+        let receipt = |tag: u8, status: bool| {
+            let receipt = alloy_rpc_types_eth::TransactionReceipt {
+                inner: alloy_consensus::ReceiptEnvelope::Eip1559(
+                    alloy_consensus::ReceiptWithBloom {
+                        receipt: alloy_consensus::Receipt {
+                            status: status.into(),
+                            cumulative_gas_used: 0,
+                            logs: Vec::<alloy_rpc_types_eth::Log>::new(),
+                        },
+                        logs_bloom: alloy_primitives::Bloom::ZERO,
+                    },
+                ),
+                transaction_hash: TxHash::repeat_byte(tag),
+                transaction_index: Some(0),
+                block_hash: Some(B256::ZERO),
+                block_number: Some(9),
+                gas_used: 0,
+                effective_gas_price: 0,
+                blob_gas_used: None,
+                blob_gas_price: None,
+                from: Address::ZERO,
+                to: None,
+                contract_address: None,
+            };
+            (
+                TxHash::repeat_byte(tag),
+                serde_json::to_value(receipt).unwrap(),
+            )
+        };
+        let receipts = HashMap::from([receipt(2, false), receipt(3, true)]);
         module
-            .register_method("eth_getTransactionReceipt", |_, _, _| ())
+            .register_method("eth_getTransactionReceipt", move |params, _, _| {
+                receipts.get(&params.one::<TxHash>().unwrap()).cloned()
+            })
             .unwrap();
         module
             .register_method("eth_sendBundle", |_, sends, _| {

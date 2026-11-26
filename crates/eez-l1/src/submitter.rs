@@ -280,6 +280,15 @@ impl Submitter {
     ///
     /// [`L1Error::Provider`] on RPC failure.
     pub async fn receipt_exists(&self, tx_hash: TxHash) -> L1Result<bool> {
+        Ok(self.receipt_status(tx_hash).await?.is_some())
+    }
+
+    /// Whether `tx_hash` succeeded on L1, or `None` without a receipt.
+    ///
+    /// # Errors
+    ///
+    /// [`L1Error::Provider`] on RPC failure.
+    pub async fn receipt_status(&self, tx_hash: TxHash) -> L1Result<Option<bool>> {
         // Target-tip RPC, not the embedded L1 — the embedded node can
         // lag the canonical tip by 2-3 blocks, and a missed receipt
         // here re-queues a burned-nonce tx that poisons the next
@@ -289,7 +298,7 @@ impl Submitter {
             .get_transaction_receipt(tx_hash)
             .await
             .map_err(|e| L1Error::Provider(format!("get_transaction_receipt: {e}")))?
-            .is_some())
+            .map(|receipt| receipt.status()))
     }
 
     /// Timestamp of an L1 block on the target chain, or `None` if absent.
