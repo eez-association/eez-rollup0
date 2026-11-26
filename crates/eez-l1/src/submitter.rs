@@ -302,6 +302,18 @@ impl Submitter {
             .map_err(|e| L1Error::Provider(format!("get_block_by_number({number}): {e}")))?
             .map(|b| b.header.timestamp))
     }
+
+    /// Whether L1 block `number` on the target chain holds `tx_hash`, or
+    /// `None` if the block is absent.
+    pub async fn block_has_tx(&self, number: u64, tx_hash: TxHash) -> L1Result<Option<bool>> {
+        let provider = self.inner.build_target_provider();
+        Ok(provider
+            .get_block_by_number(BlockNumberOrTag::Number(number))
+            .hashes()
+            .await
+            .map_err(|e| L1Error::Provider(format!("get_block_by_number({number}): {e}")))?
+            .map(|b| b.transactions.hashes().any(|h| h == tx_hash)))
+    }
 }
 
 impl Inner {

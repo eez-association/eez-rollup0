@@ -4838,8 +4838,8 @@ enum BundleVerdict {
     SettledPartial,
     /// L1 ran nothing of the batch. `charge_attempt` counts an attempt toward eviction.
     Failed { charge_attempt: bool },
-    /// The post landed but its settlement is unread; the cursor decides.
-    Unresolved,
+    /// The post landed in `l1_block` but its settlement is unread; the cursor decides.
+    Unresolved { l1_block: u64 },
 }
 
 /// The verdict L1's outcome gives. The relay's answer never decides it: only a
@@ -4871,7 +4871,9 @@ fn bundle_verdict(
         SendOutcome::Included { .. } | SendOutcome::Dropped { .. } => {
             BundleVerdict::Failed { charge_attempt }
         }
-        SendOutcome::IncludedUnread { .. } => BundleVerdict::Unresolved,
+        SendOutcome::IncludedUnread { l1_block, .. } => BundleVerdict::Unresolved {
+            l1_block: *l1_block,
+        },
     }
 }
 
@@ -5142,11 +5144,12 @@ async fn observe_bundle_outcome(
             optimistic.mark_failed(sync_height, post_batch_hash, !charge_attempt)
         }
         // The post landed, so the cursor resolves it unless an L1 reorg drops it first.
-        BundleVerdict::Unresolved => {
+        BundleVerdict::Unresolved { l1_block } => {
             watch_unresolved(
                 rollup_id,
                 sync_height,
                 post_batch_hash,
+                l1_block,
                 &optimistic,
                 &submitter,
             )
@@ -5159,16 +5162,21 @@ async fn observe_bundle_outcome(
 const UNRESOLVED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Wait while the batch is pending. A post that left L1 before the cursor
-/// covered it fails without a charge; failed reads are retried.
+/// covered it fails without a charge: its receipt is gone and `l1_block`, where
+/// it landed, reads without it. Anything unread is read again.
 async fn watch_unresolved(
     rollup_id: u64,
     sync_height: u64,
     post_batch_hash: alloy_primitives::TxHash,
+    l1_block: u64,
     optimistic: &OptimisticallyIncluded,
     submitter: &Submitter,
 ) {
     while optimistic.is_pending(sync_height, post_batch_hash) {
-        if let Ok(false) = submitter.receipt_exists(post_batch_hash).await {
+        // A lagging provider answers no receipt too, but it cannot serve the block.
+        if let Ok(false) = submitter.receipt_exists(post_batch_hash).await
+            && let Ok(Some(false)) = submitter.block_has_tx(l1_block, post_batch_hash).await
+        {
             event!(
                 name: "eez.composer.bundle.reorged_out",
                 Level::WARN,
@@ -5203,7 +5211,7 @@ fn log_bundle_verdict(rollup_id: u64, sync_height: u64, sent: &SentBundle, verdi
             relay_reply = ?reply,
             "postBatch settled partially; L1 kept part of this batch",
         ),
-        (BundleVerdict::Unresolved, _) => event!(
+        (BundleVerdict::Unresolved { .. }, _) => event!(
             name: "eez.composer.bundle.unresolved",
             Level::ERROR,
             rollup_id,
@@ -5544,7 +5552,7 @@ mod tests {
                             BundleVerdict::SettledPartial
                         }
                         // A landed post is never a failure.
-                        (_, "unread") => BundleVerdict::Unresolved,
+                        (_, "unread") => BundleVerdict::Unresolved { l1_block: 7 },
                         _ => relay_decides(reply, outcome, pin_mismatch),
                     };
                     assert_eq!(got, want, "{reply:?} {case} pin_mismatch={pin_mismatch}");
@@ -5658,7 +5666,8 @@ mod tests {
     }
 
     /// A landed post whose settlement was unread and that an L1 reorg then
-    /// dropped fails without a charge, so it no longer holds the gate.
+    /// dropped fails without a charge, so it no longer holds the gate. A
+    /// missing receipt alone may be a lagging provider and fails nothing.
     #[tokio::test]
     async fn unresolved_post_dropped_by_a_reorg_fails_uncharged() {
         let (url, _l1, _) = l1_with_block_9().await;
@@ -5669,7 +5678,13 @@ mod tests {
         optimistic.begin(6, post_batch, parent, B256::ZERO, Vec::new());
 
         let submitter = submitter_at(&url);
-        let watch = watch_unresolved(1, 6, post_batch, &optimistic, &submitter);
+        // No receipt, and block 10 is not readable: keep waiting.
+        let lagging = watch_unresolved(1, 6, post_batch, 10, &optimistic, &submitter);
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(1), lagging).await;
+        assert!(waited.is_err());
+        assert!(optimistic.is_pending(6, post_batch));
+        // No receipt, and block 9 reads without the post: it was reorged out.
+        let watch = watch_unresolved(1, 6, post_batch, 9, &optimistic, &submitter);
         tokio::time::timeout(std::time::Duration::from_secs(5), watch)
             .await
             .unwrap();
@@ -5736,7 +5751,7 @@ mod tests {
         })
     }
 
-    /// An L1 that built block 9 at timestamp 1 and holds no receipts, behind a
+    /// An L1 whose only block is an empty block 9 at timestamp 1, behind a
     /// relay that accepts every bundle. Returns its URL, server and bundle count.
     async fn l1_with_block_9() -> (
         String,
@@ -5753,7 +5768,10 @@ mod tests {
         let block = alloy_rpc_types_eth::Block::<alloy_rpc_types_eth::Transaction>::empty(header);
         let block = serde_json::to_value(block).unwrap();
         module
-            .register_method("eth_getBlockByNumber", move |_, _, _| block.clone())
+            .register_method("eth_getBlockByNumber", move |params, _, _| {
+                let (number, _): (alloy_eips::BlockNumberOrTag, bool) = params.parse().unwrap();
+                (number == alloy_eips::BlockNumberOrTag::Number(9)).then(|| block.clone())
+            })
             .unwrap();
         module
             .register_method("eth_getTransactionReceipt", |_, _, _| ())
