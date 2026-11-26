@@ -1443,7 +1443,7 @@ async fn relanded_batch_after_l1_reorg_keeps_settling() {
         .unwrap()
         .unwrap();
     let depth = l1.get_block_number().await.unwrap() - block + 1;
-    // Same height, parent and timestamp, so the batch's L1 pin still holds.
+    // The replacement blocks keep the L1 slot spacing.
     let interval = eez_testkit::Chain::block_time_secs();
     let rpc = l1.client();
     let _: serde_json::Value = rpc
@@ -1467,6 +1467,7 @@ async fn relanded_batch_after_l1_reorg_keeps_settling() {
     wait_for_new_attested_safe_block(&seq, &chain, &states, DEFAULT_TIMEOUT)
         .await
         .expect("the node stopped settling after the re-landed batch");
+    seq.wait_for_reorg_seen(DEFAULT_TIMEOUT).await.unwrap();
     seq.assert_no_process_death();
 }
 
