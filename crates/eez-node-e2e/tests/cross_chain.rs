@@ -2175,6 +2175,93 @@ async fn failed_rich_bundle_keeps_live_l2_txs() {
     w.node.assert_no_divergence_failure_logs();
 }
 
+/// The relay queues the bundle but its reply is lost. L1 decides the outcome,
+/// so the batch settles and its block is never rolled back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_reply_lost_bundle_still_settles() {
+    let w = setup_cross_chain_with_builder_stub().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let l2 = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+    w.set_builder_mode(BuilderStubMode::AckLost).await.unwrap();
+
+    let from = w.node.signal_cursor().unwrap();
+    let outbound = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        ISetterWrapper::setViaProxyCall {
+            v: U256::from(84u64),
+        }
+        .abi_encode(),
+        1_200_000,
+    )
+    .await
+    .unwrap();
+    let n = wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(from)?;
+        let dispatched = emitted
+            .iter()
+            .find(|s| s.name == signals::COMPOSER_BUNDLE_DISPATCHED);
+        dispatched.map(|s| s.u64("sync_height")).transpose()
+    })
+    .await
+    .unwrap();
+
+    let at_n = |s: &signals::NodeSignal, name: &str| {
+        s.name == name && s.u64("sync_height").ok() == Some(n)
+    };
+    let observed = wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(from)?;
+        anyhow::ensure!(
+            !emitted
+                .iter()
+                .any(|s| at_n(s, signals::COMPOSER_RECOVERY_SUBSTITUTED)),
+            "the Sync block {n} was rolled back",
+        );
+        let verdict = emitted
+            .iter()
+            .find(|s| at_n(s, signals::COMPOSER_BUNDLE_OBSERVED));
+        Ok(verdict.map(|s| s.fields.get("settled").and_then(serde_json::Value::as_bool)))
+    })
+    .await;
+    match observed {
+        Ok(settled) => assert_eq!(settled, Some(true), "the bundle at {n} did not settle"),
+        Err(err) => panic!(
+            "no verdict for the bundle at {n}: {err:#}{}",
+            w.settlement_diagnostics()
+        ),
+    }
+
+    let value = wait_for(SETTLE_TIMEOUT, || async {
+        let value = l2_value(&l1_rpc, w.outbound_value).await?;
+        Ok((value == U256::from(84u64)).then_some(value))
+    })
+    .await;
+    assert!(value.is_ok(), "the L1 target never read 84");
+
+    let rich = l2.get_block_by_number(n.into()).await.unwrap().unwrap();
+    assert!(
+        rich.transactions.hashes().any(|tx| tx == outbound),
+        "the Sync block {n} does not carry the outbound call",
+    );
+    wait_for_safe_chain_contains(&w.node, n, rich.header.hash, SETTLE_TIMEOUT)
+        .await
+        .unwrap();
+    assert!(
+        !w.node
+            .signals_since(from)
+            .unwrap()
+            .iter()
+            .any(|s| at_n(s, signals::COMPOSER_RECOVERY_SUBSTITUTED)),
+        "the Sync block {n} was rolled back",
+    );
+    w.node.assert_no_divergence_failure_logs();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inbound_capacity_in_empty_sync_block_is_evicted_and_nonce_released() {
     let w = setup_cross_chain().await.unwrap();

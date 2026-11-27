@@ -42,14 +42,6 @@ pub enum L1Error {
     /// postBatch tx didn't land or reverted on-chain.
     #[error("postBatch submission failed: {0}")]
     Submission(String),
-    /// The configured builder relay answered `eth_sendBundle` with
-    /// JSON-RPC `-32601` (method not found) — it is a plain execution
-    /// RPC, not a bundle relay. [`Submitter::send_bundle`] catches this
-    /// and degrades to ordered mempool submission (dev L1, anvil).
-    ///
-    /// [`Submitter::send_bundle`]: crate::Submitter::send_bundle
-    #[error("builder relay does not support eth_sendBundle")]
-    BundleRpcUnsupported,
     /// L1 reorg deeper than the configured tolerance — beyond Ethereum
     /// finality. Operator must intervene (most likely a transient L1
     /// node anomaly; check L1 health and restart).
@@ -71,7 +63,7 @@ impl L1Error {
     }
 
     /// Retrying cannot change the answer, so readers halt instead of looping.
-    /// `Config`, `Submission` and `BundleRpcUnsupported` are handled where they arise.
+    /// `Config` and `Submission` are handled where they arise.
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
         matches!(
@@ -112,7 +104,6 @@ mod tests {
             ),
             (L1Error::TraceUnavailable { block, detail: d() }, TERMINAL),
             (L1Error::Submission(d()), NEITHER),
-            (L1Error::BundleRpcUnsupported, NEITHER),
             (L1Error::ReorgTooDeep { walked: 0, max: 0 }, TERMINAL),
         ];
         for (err, class) in cases {

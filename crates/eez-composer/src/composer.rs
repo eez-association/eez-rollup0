@@ -27,13 +27,15 @@ use alloy_provider::Provider as _;
 use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use eez_driver::{
-    BUILDER_GAS_LIMIT, BlockCommitterHandle, MAX_BLOCKS_PER_BATCH, ParentContext, RollupTiming,
-    SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
+    BUILDER_GAS_LIMIT, BlockCommitterHandle, BundleRelease, MAX_BLOCKS_PER_BATCH, ParentContext,
+    RollupTiming, SyncSlotBlock, SyncSlotComposer, SyncSlotMode,
     witness::{ExecutionWitnessMode, block_witness},
 };
 use eez_engine::EezEngineTypes;
 use eez_evm::EezEvmConfig;
-use eez_l1::{BundleTarget, L1Error, L1Event, SendOutcome, Submitter};
+use eez_l1::{
+    BundleTarget, DropReason, L1Error, L1Event, RelayReply, SendOutcome, SentBundle, Submitter,
+};
 use eez_prover::{
     ActionableProverFailure, BlockWitness, ProverError, ProvingContext, RetryableProverError,
 };
@@ -105,8 +107,8 @@ pub struct CrossChainExecCtx {
     /// `compose_sync_slot` hands it `[postBatch, inbound_user_tx_1, …]` via
     /// `Submitter::send_bundle`; outbound user transactions execute in the L2
     /// Sync block instead. The Submitter owns the transport decision (atomic
-    /// `eth_sendBundle` on supporting relays, ordered mempool submission on
-    /// plain execution RPCs).
+    /// `eth_sendBundle` on supporting relays, the postBatch alone through the
+    /// mempool on plain execution RPCs).
     pub submitter: eez_l1::Submitter,
     /// L1 EOA whose key signs the `postAndVerifyBatch` transaction. Different from
     /// the reserved L2 SYSTEM_ADDRESS. For dev
@@ -3032,9 +3034,9 @@ where
                 .map(|h| h.raw_tx.clone()),
         );
         event!(
-            name: "eez.composer.bundle.dispatched",
+            name: "eez.composer.bundle.staged",
             Level::INFO,
-            event_name = "eez.composer.bundle.dispatched",
+            event_name = "eez.composer.bundle.staged",
             rollup_id,
             sync_height,
             post_batch_hash = %post_batch_hash,
@@ -3042,7 +3044,7 @@ where
             entry_count = total_entries,
             evicted_poison = poison.len(),
             evicted_stale,
-            "rich bundle dispatched to background observer; committing Sync block optimistically",
+            "rich bundle staged; sent when the Sync block commits",
         );
         rollup.optimistic.begin(
             sync_height,
@@ -3051,6 +3053,7 @@ where
             built.header.hash(),
             survivors,
         );
+        let (release, released) = BundleRelease::new();
         self.spawn_bundle_observer(
             ctx,
             rollup_id,
@@ -3060,10 +3063,19 @@ where
             built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
+            Some(Staged {
+                released,
+                dispatched: Dispatched::Rich {
+                    entry_count: total_entries,
+                    evicted_poison: poison.len(),
+                    evicted_stale,
+                },
+            }),
         );
         Ok(Some(SyncSlotBlock {
             payload: built.payload,
             header: built.header,
+            release: Some(release),
         }))
     }
 
@@ -3173,6 +3185,7 @@ where
                 return Ok(Some(SyncSlotBlock {
                     payload: empty_built.payload,
                     header: empty_built.header,
+                    release: None,
                 }));
             }
         };
@@ -3182,13 +3195,13 @@ where
             hash: post_batch_hash,
         } = minimal_postbatch_raw;
         event!(
-            name: "eez.composer.phase1.bundle.dispatched",
+            name: "eez.composer.phase1.bundle.staged",
             Level::INFO,
-            event_name = "eez.composer.phase1.bundle.dispatched",
+            event_name = "eez.composer.phase1.bundle.staged",
             rollup_id,
             sync_height,
             post_batch_hash = %post_batch_hash,
-            "minimal postBatch dispatched to background observer (leading immediate only)",
+            "minimal postBatch staged (leading immediate only); sent when the Sync block commits",
         );
         rollup.optimistic.begin(
             sync_height,
@@ -3197,6 +3210,7 @@ where
             empty_built.header.hash(),
             Vec::new(),
         );
+        let (release, released) = BundleRelease::new();
         self.spawn_bundle_observer(
             ctx,
             rollup_id,
@@ -3206,10 +3220,15 @@ where
             empty_built.header.hash(),
             Arc::clone(&rollup.optimistic),
             bundle_target,
+            Some(Staged {
+                released,
+                dispatched: Dispatched::Minimal,
+            }),
         );
         Ok(Some(SyncSlotBlock {
             payload: empty_built.payload,
             header: empty_built.header,
+            release: Some(release),
         }))
     }
 
@@ -3232,6 +3251,7 @@ where
             Ok(built) => Some(SyncSlotBlock {
                 payload: built.payload,
                 header: built.header,
+                release: None,
             }),
             Err(err) => {
                 event!(
@@ -3340,6 +3360,7 @@ where
             );
             // A past terminal cannot carry a timestamp pin, but the bundle can
             // still target the exact L1 slot that triggered this composition.
+            // Its terminal is committed, so it sends at once.
             self.spawn_bundle_observer(
                 ctx,
                 rollup_id,
@@ -3349,6 +3370,7 @@ where
                 boundary_header.hash(),
                 Arc::clone(&rollup.optimistic),
                 historical_target,
+                None,
             );
             return Ok(());
         }
@@ -3411,7 +3433,8 @@ where
     /// Spawn the background bundle-observer task. It owns the submission inputs
     /// and records only the verdict in the optimistic ledger; it holds neither
     /// the Composer nor the block committer, so chain recovery stays in slot
-    /// context through `recover_failed_batch`.
+    /// context through `recover_failed_batch`. A `staged` bundle is sent only
+    /// once its Sync block commits.
     fn spawn_bundle_observer(
         &self,
         ctx: &CrossChainExecCtx,
@@ -3422,17 +3445,28 @@ where
         expected_final_root: B256,
         optimistic: Arc<OptimisticallyIncluded>,
         target: BundleTarget,
+        staged: Option<Staged>,
     ) {
-        let submitter = ctx.submitter.clone();
-        tokio::spawn(observe_bundle_outcome(
+        let deadlines = match target {
+            BundleTarget::Exact { timestamp, .. } => Some(send_deadlines_ms(
+                timestamp,
+                self.inner.emission.timing.submission_slack(),
+            )),
+            BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => None,
+        };
+        tokio::spawn(send_after_commit(
             rollup_id,
             sync_height,
             bundle,
             post_batch_hash,
             expected_final_root,
             optimistic,
-            submitter,
+            ctx.submitter.clone(),
             target,
+            staged,
+            tokio::time::Instant::now(),
+            deadlines,
+            Arc::clone(&self.inner.clock),
         ));
     }
 
@@ -4781,6 +4815,282 @@ impl CrossChainDrain {
     }
 }
 
+/// What the observer records for one bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BundleVerdict {
+    /// L1 reached the claimed endpoint.
+    Settled,
+    /// L1 kept part of the batch; the height stays canonical.
+    SettledPartial,
+    /// L1 ran nothing of the batch. `charge_attempt` counts an attempt toward eviction.
+    Failed { charge_attempt: bool },
+    /// The post landed in `l1_block` but its settlement is unread; the cursor decides.
+    Unresolved { l1_block: u64 },
+}
+
+/// The verdict L1's outcome gives. The relay's answer never decides it: only a
+/// bundle the relay accepted is charged, and a skipped pinned slot or
+/// `waive_charge` (the target block's timestamp differs from the pin, or the
+/// node sent the bundle late) waives that.
+fn bundle_verdict(
+    sent: &SentBundle,
+    expected_final_root: B256,
+    waive_charge: bool,
+) -> BundleVerdict {
+    let charge_attempt = sent.reply == RelayReply::Accepted && !waive_charge;
+    match &sent.outcome {
+        SendOutcome::Included { settlement, .. }
+            if settlement.final_state == Some(expected_final_root) =>
+        {
+            BundleVerdict::Settled
+        }
+        // The anchor names a candidate at THIS height, so any applied entry keeps
+        // the height canonical; only an empty settlement leaves it unratified.
+        SendOutcome::Included { settlement, .. } if !settlement.is_empty() => {
+            BundleVerdict::SettledPartial
+        }
+        SendOutcome::Dropped {
+            reason: DropReason::PinnedSlotSkipped,
+            ..
+        } => BundleVerdict::Failed {
+            charge_attempt: false,
+        },
+        SendOutcome::Included { .. } | SendOutcome::Dropped { .. } => {
+            BundleVerdict::Failed { charge_attempt }
+        }
+        SendOutcome::IncludedUnread { l1_block, .. } => BundleVerdict::Unresolved {
+            l1_block: *l1_block,
+        },
+    }
+}
+
+/// Reads of the target block's timestamp before its charge is waived.
+const PIN_READ_ATTEMPTS: u32 = 3;
+
+/// Whether L1 block `block` is missing or has a timestamp other than `pin`.
+/// A read that keeps failing counts as a mismatch, which waives the charge.
+async fn pin_mismatch(submitter: &Submitter, block: u64, pin: u64) -> bool {
+    for attempt in 1..=PIN_READ_ATTEMPTS {
+        match submitter.block_timestamp(block).await {
+            Ok(timestamp) => return timestamp != Some(pin),
+            Err(_) if attempt < PIN_READ_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(_) => {}
+        }
+    }
+    true
+}
+
+/// A bundle waiting for its Sync block to commit.
+struct Staged {
+    /// Receives the hash of the block committed at the Sync height, or `None`
+    /// when reth rejected the block.
+    released: tokio::sync::oneshot::Receiver<Option<B256>>,
+    /// The event the bundle logs when it is sent.
+    dispatched: Dispatched,
+}
+
+/// The `dispatched` event of a staged bundle, with the fields known at staging.
+#[derive(Debug, Clone, Copy)]
+enum Dispatched {
+    /// `eez.composer.bundle.dispatched`: a rich Sync block's bundle.
+    Rich {
+        entry_count: usize,
+        evicted_poison: usize,
+        evicted_stale: usize,
+    },
+    /// `eez.composer.phase1.bundle.dispatched`: a minimal postBatch.
+    Minimal,
+}
+
+/// When a bundle pinned to L1 timestamp `timestamp` (seconds) is late, in unix
+/// ms: after the first instant it has missed the node's `submission_slack`
+/// margin, after the second its target slot has started.
+fn send_deadlines_ms(timestamp: u64, submission_slack: std::time::Duration) -> (u64, u64) {
+    let slot_start_ms = timestamp.saturating_mul(1_000);
+    let margin_ms = slot_start_ms.saturating_sub(submission_slack.as_millis() as u64);
+    (margin_ms, slot_start_ms)
+}
+
+/// Send the bundle once its Sync block commits, then observe it. A bundle
+/// whose block is not committed is never sent; only a block reth rejected
+/// charges its txs. On `clock`, a staged bundle past the first of its
+/// `deadlines` is sent uncharged, and one past the second is not sent.
+async fn send_after_commit(
+    rollup_id: u64,
+    sync_height: u64,
+    bundle: Vec<Bytes>,
+    post_batch_hash: alloy_primitives::TxHash,
+    expected_final_root: B256,
+    optimistic: Arc<OptimisticallyIncluded>,
+    submitter: Submitter,
+    target: BundleTarget,
+    staged: Option<Staged>,
+    staged_at: tokio::time::Instant,
+    deadlines: Option<(u64, u64)>,
+    clock: SharedClock,
+) {
+    let mut sent_late = false;
+    let dispatched = match staged {
+        Some(Staged {
+            released,
+            dispatched,
+        }) => {
+            if let Err(charge_attempt) =
+                await_commit(rollup_id, sync_height, expected_final_root, released).await
+            {
+                optimistic.mark_failed(sync_height, post_batch_hash, !charge_attempt);
+                return;
+            }
+            let now_ms = clock.now_unix_ms();
+            // A bundle sent after its slot started cannot land in it.
+            if let Some((_, slot_start_ms)) = deadlines
+                && now_ms > slot_start_ms
+            {
+                event!(
+                    name: "eez.composer.bundle.withheld",
+                    Level::WARN,
+                    rollup_id,
+                    sync_height,
+                    slot_start_ms,
+                    "Sync block committed after its target L1 slot started; withholding its bundle",
+                );
+                optimistic.mark_failed(sync_height, post_batch_hash, true);
+                return;
+            }
+            // Past the node's own margin the bundle still goes out; the lateness is the node's.
+            sent_late = deadlines.is_some_and(|(margin_ms, _)| now_ms > margin_ms);
+            if sent_late {
+                event!(
+                    name: "eez.composer.bundle.sent_late",
+                    Level::WARN,
+                    rollup_id,
+                    sync_height,
+                    "Sync block committed after the submission slack; sending its bundle, whose failure charges nothing",
+                );
+            }
+            Some((dispatched, staged_at.elapsed()))
+        }
+        // A historical chunk is sent at once; `emit_historical_chunk` logged its one event.
+        None => None,
+    };
+    let tx_count = bundle.len();
+    let on_dispatch = move || {
+        if let Some((dispatched, commit_wait)) = dispatched {
+            log_dispatched(
+                rollup_id,
+                sync_height,
+                post_batch_hash,
+                tx_count,
+                dispatched,
+                commit_wait,
+            );
+        }
+    };
+    observe_bundle_outcome(
+        rollup_id,
+        sync_height,
+        bundle,
+        post_batch_hash,
+        expected_final_root,
+        optimistic,
+        submitter,
+        target,
+        on_dispatch,
+        sent_late,
+    )
+    .await;
+}
+
+/// Log that a staged bundle goes out, `commit_wait` after it was staged.
+fn log_dispatched(
+    rollup_id: u64,
+    sync_height: u64,
+    post_batch_hash: alloy_primitives::TxHash,
+    tx_count: usize,
+    dispatched: Dispatched,
+    commit_wait: std::time::Duration,
+) {
+    let commit_wait_ms = u64::try_from(commit_wait.as_millis()).unwrap_or(u64::MAX);
+    match dispatched {
+        Dispatched::Rich {
+            entry_count,
+            evicted_poison,
+            evicted_stale,
+        } => event!(
+            name: "eez.composer.bundle.dispatched",
+            Level::INFO,
+            event_name = "eez.composer.bundle.dispatched",
+            rollup_id,
+            sync_height,
+            post_batch_hash = %post_batch_hash,
+            tx_count,
+            entry_count,
+            evicted_poison,
+            evicted_stale,
+            commit_wait_ms,
+            "Sync block committed; sending its rich bundle",
+        ),
+        Dispatched::Minimal => event!(
+            name: "eez.composer.phase1.bundle.dispatched",
+            Level::INFO,
+            event_name = "eez.composer.phase1.bundle.dispatched",
+            rollup_id,
+            sync_height,
+            post_batch_hash = %post_batch_hash,
+            commit_wait_ms,
+            "Sync block committed; sending its minimal postBatch",
+        ),
+    }
+}
+
+/// Wait until the Sync block `expected` is committed. `Err(charge_attempt)`
+/// withholds the bundle: the block was not committed, or another block was.
+/// Only a block reth rejected as invalid charges its txs an attempt.
+async fn await_commit(
+    rollup_id: u64,
+    sync_height: u64,
+    expected: B256,
+    released: tokio::sync::oneshot::Receiver<Option<B256>>,
+) -> Result<(), bool> {
+    match released.await {
+        Ok(Some(committed)) if committed == expected => Ok(()),
+        Ok(Some(committed)) => {
+            event!(
+                name: "eez.composer.bundle.withheld",
+                Level::ERROR,
+                rollup_id,
+                sync_height,
+                expected = %expected,
+                committed = %committed,
+                "a different block was committed for this bundle; withholding it",
+            );
+            Err(false)
+        }
+        Ok(None) => {
+            event!(
+                name: "eez.composer.bundle.withheld",
+                Level::ERROR,
+                rollup_id,
+                sync_height,
+                "reth rejected the Sync block as invalid; withholding its bundle and charging its txs",
+            );
+            Err(true)
+        }
+        Err(_) => {
+            event!(
+                name: "eez.composer.bundle.withheld",
+                Level::WARN,
+                rollup_id,
+                sync_height,
+                "Sync block was not committed; withholding its bundle",
+            );
+            Err(false)
+        }
+    }
+}
+
 /// Background bundle observer — verdict recording ONLY. Marks the ledger
 /// entry Settled or Failed; never mutates chain state. The destructive
 /// Recovery for failed entries runs at the next Sync slot through
@@ -4789,6 +5099,8 @@ impl CrossChainDrain {
 /// "Settled" requires an `L2ExecutionPerformed` in the inclusion block
 /// whose `newRoot` equals `expected_final_root` (the built Sync block's
 /// root) — the leading immediate advancing L1 partway doesn't count.
+/// `on_dispatch` runs when the bundle goes out. A bundle `sent_late` by the
+/// node charges nothing.
 async fn observe_bundle_outcome(
     rollup_id: u64,
     sync_height: u64,
@@ -4800,98 +5112,170 @@ async fn observe_bundle_outcome(
     optimistic: Arc<OptimisticallyIncluded>,
     submitter: Submitter,
     target: BundleTarget,
+    on_dispatch: impl FnOnce(),
+    sent_late: bool,
 ) {
-    let outcome = submitter.send_bundle(&bundle, target).await;
-    // How far L1 got with this batch, attributed to our own postBatch tx.
-    let settlement = match &outcome {
-        Ok(SendOutcome::Included { settlement, .. }) => Some(settlement),
-        _ => None,
+    let sent = match submitter.send_bundle(&bundle, target, on_dispatch).await {
+        Ok(sent) => sent,
+        Err(err) => {
+            // Nothing reached the relay, so it says nothing about the txs.
+            event!(
+                name: "eez.composer.bundle.not_sent",
+                Level::ERROR,
+                rollup_id,
+                sync_height,
+                error = %err,
+                "bundle was not sent; re-queueing transactions without charging an attempt",
+            );
+            optimistic.mark_failed(sync_height, post_batch_hash, true);
+            return;
+        }
     };
-    // Settled = L1 reached the claimed endpoint. Anything less is partial.
-    let settled = settlement.is_some_and(|s| s.final_state == Some(expected_final_root));
-    // The anchor names a candidate at THIS height, so any applied entry keeps
-    // the height canonical; only an empty settlement leaves it unratified.
-    let applied_any = settlement.is_some_and(|s| !s.is_empty());
-    match &outcome {
+    let mut verdict = bundle_verdict(&sent, expected_final_root, sent_late);
+    // Only a charge can be waived, and only an Exact target carries a pin.
+    if let (
+        BundleVerdict::Failed {
+            charge_attempt: true,
+        },
+        BundleTarget::Exact { block, timestamp },
+    ) = (verdict, target)
+        && pin_mismatch(&submitter, block, timestamp).await
+    {
+        verdict = bundle_verdict(&sent, expected_final_root, true);
+    }
+    log_bundle_verdict(rollup_id, sync_height, &sent, verdict);
+    match verdict {
+        BundleVerdict::Settled => optimistic.mark_settled(sync_height, post_batch_hash),
+        // L1 kept part of the batch, so this height stays canonical and
+        // recovery owes only the tail disposition — no rollback.
+        BundleVerdict::SettledPartial => {
+            optimistic.mark_settled_partial(sync_height, post_batch_hash)
+        }
+        // L1 ran nothing of this batch, so the height is unratified and the
+        // reorg path is correct.
+        BundleVerdict::Failed { charge_attempt } => {
+            optimistic.mark_failed(sync_height, post_batch_hash, !charge_attempt)
+        }
+        // The post landed, so the cursor resolves it unless it reverted or an L1 reorg drops it.
+        BundleVerdict::Unresolved { l1_block } => {
+            watch_unresolved(
+                rollup_id,
+                sync_height,
+                post_batch_hash,
+                l1_block,
+                &optimistic,
+                &submitter,
+            )
+            .await;
+        }
+    }
+}
+
+/// How often an unresolved post is checked.
+const UNRESOLVED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Wait while the batch is pending. A post L1 applied nothing of before the
+/// cursor covered it fails without a charge: its receipt reverted, or its
+/// receipt is gone and `l1_block`, where it landed, reads without it. A
+/// successful receipt waits for the cursor; anything unread is read again.
+async fn watch_unresolved(
+    rollup_id: u64,
+    sync_height: u64,
+    post_batch_hash: alloy_primitives::TxHash,
+    l1_block: u64,
+    optimistic: &OptimisticallyIncluded,
+    submitter: &Submitter,
+) {
+    while optimistic.is_pending(sync_height, post_batch_hash) {
+        let failed = match submitter.receipt_status(post_batch_hash).await {
+            // Back from the mempool after a reorg, it can land again and revert.
+            Ok(Some(false)) => Some("the postBatch reverted on L1"),
+            // A lagging provider answers no receipt too, but it cannot serve the block.
+            Ok(None) => matches!(
+                submitter.block_has_tx(l1_block, post_batch_hash).await,
+                Ok(Some(false))
+            )
+            .then_some("the postBatch is no longer on L1"),
+            Ok(Some(true)) | Err(_) => None,
+        };
+        if let Some(reason) = failed {
+            event!(
+                name: "eez.composer.bundle.unresolved_failed",
+                Level::WARN,
+                rollup_id,
+                sync_height,
+                post_batch_hash = %post_batch_hash,
+                reason,
+                "unresolved postBatch applied nothing on L1; failing the batch without charging an attempt",
+            );
+            optimistic.mark_failed(sync_height, post_batch_hash, true);
+            return;
+        }
+        tokio::time::sleep(UNRESOLVED_POLL_INTERVAL).await;
+    }
+}
+
+fn log_bundle_verdict(rollup_id: u64, sync_height: u64, sent: &SentBundle, verdict: BundleVerdict) {
+    let settled = verdict == BundleVerdict::Settled;
+    let (reply, outcome) = (&sent.reply, &sent.outcome);
+    match (verdict, outcome) {
         // Settled partially: the height stays canonical and the Deriver rebuilds the
         // block L1 named; only the unconsumed tail is owed a disposition.
-        Ok(o @ SendOutcome::Included { .. }) if !settled && applied_any => event!(
+        (BundleVerdict::SettledPartial, SendOutcome::Included { settlement, .. }) => event!(
             name: "eez.composer.bundle.observed",
             Level::WARN,
             event_name = "eez.composer.bundle.observed",
             rollup_id,
             sync_height,
             settled,
-            applied_any,
-            applied = ?settlement.map(eez_l1::Settlement::applied_indices),
-            outcome = ?o,
+            applied_any = true,
+            applied = ?settlement.applied_indices(),
+            outcome = ?outcome,
+            relay_reply = ?reply,
             "postBatch settled partially; L1 kept part of this batch",
         ),
-        Ok(o @ SendOutcome::Included { .. }) if !settled => event!(
+        (BundleVerdict::Unresolved { .. }, _) => event!(
+            name: "eez.composer.bundle.unresolved",
+            Level::ERROR,
+            rollup_id,
+            sync_height,
+            outcome = ?outcome,
+            relay_reply = ?reply,
+            "postBatch landed but its settlement is unreadable; leaving the batch pending for the cursor",
+        ),
+        (BundleVerdict::Failed { .. }, SendOutcome::Included { .. }) => event!(
             name: "eez.composer.bundle.observed",
             Level::ERROR,
             event_name = "eez.composer.bundle.observed",
             rollup_id,
             sync_height,
             settled,
-            outcome = ?o,
+            outcome = ?outcome,
+            relay_reply = ?reply,
             "postBatch was included without the expected state transition; possible Composer/prover/settlement-contract disagreement",
         ),
-        Ok(o @ SendOutcome::Dropped { .. }) => event!(
+        (_, SendOutcome::Dropped { .. }) => event!(
             name: "eez.composer.bundle.observed",
             Level::WARN,
             event_name = "eez.composer.bundle.observed",
             rollup_id,
             sync_height,
             settled,
-            outcome = ?o,
+            outcome = ?outcome,
+            relay_reply = ?reply,
             "bundle was dropped before settlement; re-queueing transactions for recovery",
         ),
-        Ok(o) => event!(
+        _ => event!(
             name: "eez.composer.bundle.observed",
             Level::INFO,
             event_name = "eez.composer.bundle.observed",
             rollup_id,
             sync_height,
             settled,
-            outcome = ?o,
+            outcome = ?outcome,
+            relay_reply = ?reply,
             "bundle outcome observed",
         ),
-        Err(err) => event!(
-            name: "eez.composer.bundle.observe_failed",
-            Level::WARN,
-            rollup_id,
-            sync_height,
-            error = %err,
-            "bundle submission/observation errored; treating as a drop (re-queue; slot recovery re-verifies via cursor)",
-        ),
-    }
-    if settled {
-        optimistic.mark_settled(sync_height, post_batch_hash);
-    } else if applied_any {
-        // Inclusion means any timestamp pin was satisfied, so this was not a
-        // skipped slot. L1 kept part of the batch, so this height stays
-        // canonical and recovery owes only the tail disposition — no rollback.
-        optimistic.mark_settled_partial(sync_height, post_batch_hash);
-    } else {
-        // L1 ran nothing of this batch, so the height is unratified and the
-        // reorg path is correct.
-        //
-        // slot_skipped = the drop was NOT attributable to the bundled txs →
-        // requeue without counting an attempt toward poison-eviction.
-        let slot_skipped = match &outcome {
-            // Never reached the relay, so it says nothing about the txs. A
-            // relay-side REJECTION is L1Error::Submission and still counts.
-            Err(L1Error::Provider(_)) => true,
-            // Pin unsatisfiable (block ts != pin, or unreadable), not the txs.
-            _ => match target {
-                BundleTarget::Exact { block, timestamp } => {
-                    submitter.block_timestamp(block).await.ok().flatten() != Some(timestamp)
-                }
-                BundleTarget::NextBlock | BundleTarget::ExactBlock { .. } => false,
-            },
-        };
-        optimistic.mark_failed(sync_height, post_batch_hash, slot_skipped);
     }
 }
 
@@ -5094,6 +5478,407 @@ mod tests {
             assert_eq!(hash, *pooled.hash());
             assert_eq!(eez_blob::post_batch_tx_hash(&raw).unwrap(), hash);
         }
+    }
+
+    /// Every relay answer, L1 outcome and pin reading. The verdict differs from
+    /// a table where the relay's answer decides only in the rows listed.
+    #[test]
+    fn relay_reply_only_waives_the_charge() {
+        use eez_l1::scan::{AppliedEntry, EntryRole, Settlement};
+        let root = B256::repeat_byte(0xaa);
+        let applied = |final_state| {
+            Settlement::new(
+                vec![AppliedEntry {
+                    entry_index: 0,
+                    role: EntryRole::Anchor,
+                }],
+                Some(final_state),
+                None,
+                false,
+            )
+        };
+        let included = |settlement| SendOutcome::Included {
+            tx_hash: TxHash::ZERO,
+            l1_block: 7,
+            settlement,
+        };
+        let dropped = |reason| SendOutcome::Dropped {
+            tx_hash: TxHash::ZERO,
+            target_block: 7,
+            reason,
+        };
+        let outcomes = [
+            ("settled", included(applied(root))),
+            ("partial", included(applied(B256::repeat_byte(0xbb)))),
+            ("nothing applied", included(Settlement::NONE)),
+            ("slot skipped", dropped(DropReason::PinnedSlotSkipped)),
+            ("slot excluded", dropped(DropReason::PinnedSlotExcluded)),
+            ("target passed", dropped(DropReason::TargetPassed)),
+            (
+                "unread",
+                SendOutcome::IncludedUnread {
+                    tx_hash: TxHash::ZERO,
+                    l1_block: 7,
+                    error: String::new(),
+                },
+            ),
+        ];
+        let replies = [
+            RelayReply::Accepted,
+            RelayReply::Rejected(String::new()),
+            RelayReply::Unanswered(String::new()),
+        ];
+        // The contrasting table, where the relay decides: one that did not accept
+        // fails the batch uncharged, and an unread settlement fails instead of `Unresolved`.
+        let relay_decides = |reply: &RelayReply, outcome: &SendOutcome, pin_mismatch: bool| match (
+            reply, outcome,
+        ) {
+            (RelayReply::Rejected(_) | RelayReply::Unanswered(_), _) => BundleVerdict::Failed {
+                charge_attempt: false,
+            },
+            (_, SendOutcome::Included { settlement, .. })
+                if settlement.final_state == Some(root) =>
+            {
+                BundleVerdict::Settled
+            }
+            (_, SendOutcome::Included { settlement, .. }) if !settlement.is_empty() => {
+                BundleVerdict::SettledPartial
+            }
+            _ => BundleVerdict::Failed {
+                charge_attempt: !pin_mismatch,
+            },
+        };
+        for reply in &replies {
+            for (case, outcome) in &outcomes {
+                for pin_mismatch in [false, true] {
+                    // A skipped slot always mismatches its pin, an excluded one never.
+                    let reason = match outcome {
+                        SendOutcome::Dropped { reason, .. } => Some(*reason),
+                        _ => None,
+                    };
+                    if (reason == Some(DropReason::PinnedSlotSkipped) && !pin_mismatch)
+                        || (reason == Some(DropReason::PinnedSlotExcluded) && pin_mismatch)
+                    {
+                        continue;
+                    }
+                    let sent = SentBundle {
+                        reply: reply.clone(),
+                        outcome: outcome.clone(),
+                    };
+                    let got = bundle_verdict(&sent, root, pin_mismatch);
+                    let want = match (reply, *case) {
+                        // L1 decides, whatever the relay answered.
+                        (RelayReply::Rejected(_) | RelayReply::Unanswered(_), "settled") => {
+                            BundleVerdict::Settled
+                        }
+                        (RelayReply::Rejected(_) | RelayReply::Unanswered(_), "partial") => {
+                            BundleVerdict::SettledPartial
+                        }
+                        // A landed post is never a failure.
+                        (_, "unread") => BundleVerdict::Unresolved { l1_block: 7 },
+                        _ => relay_decides(reply, outcome, pin_mismatch),
+                    };
+                    assert_eq!(got, want, "{reply:?} {case} pin_mismatch={pin_mismatch}");
+                }
+            }
+        }
+    }
+
+    /// A bundle whose Sync block never commits is never sent, and recovery
+    /// re-queues it without a charge unless reth rejected the block.
+    #[tokio::test]
+    async fn withheld_bundle_is_never_sent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Every L1 read and the relay share this listener, which never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&connections);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::mem::forget(socket);
+            }
+        });
+        let submitter = submitter_at(&url);
+        let optimistic = Arc::new(OptimisticallyIncluded::new());
+        let block = B256::repeat_byte(7);
+        let post_batch = TxHash::repeat_byte(1);
+        let parent =
+            reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
+        optimistic.begin(6, post_batch, parent, block, Vec::new());
+
+        let (release, released) = BundleRelease::new();
+        drop(release);
+        let observer = send_after_commit(
+            1,
+            6,
+            vec![signed_user_tx(21_000)],
+            post_batch,
+            block,
+            Arc::clone(&optimistic),
+            submitter,
+            BundleTarget::Exact {
+                block: 9,
+                timestamp: 1,
+            },
+            Some(Staged {
+                released,
+                dispatched: Dispatched::Minimal,
+            }),
+            tokio::time::Instant::now(),
+            None,
+            Arc::new(eez_timing::SystemClock),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), observer)
+            .await
+            .expect("a withheld bundle must not wait on L1");
+
+        assert_eq!(connections.load(Ordering::SeqCst), 0);
+        let failed = optimistic.take_failed_for_recovery(0).unwrap();
+        assert!(failed.slot_skipped);
+
+        // A block reth rejected charges its txs.
+        let (release, released) = BundleRelease::new();
+        release.rejected();
+        assert_eq!(await_commit(1, 6, block, released).await, Err(true));
+    }
+
+    #[test]
+    fn send_deadlines_are_the_slack_point_then_the_slot_start() {
+        let slack = std::time::Duration::from_millis(1_300);
+        assert_eq!(send_deadlines_ms(1_000, slack), (998_700, 1_000_000));
+    }
+
+    /// A bundle whose Sync block commits after its target L1 slot started is
+    /// never sent, and recovery re-queues it without a charge.
+    #[tokio::test]
+    async fn bundle_after_its_slot_started_is_never_sent() {
+        // Nothing listens here: an L1 read or a send would leave the observer waiting.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        assert!(send_committed(&url, 1_001).await.slot_skipped);
+    }
+
+    /// A bundle whose Sync block commits past the node's margin but before its
+    /// slot is still sent, and its drop charges nothing: the lateness is the node's.
+    #[tokio::test]
+    async fn late_bundle_is_sent_and_its_drop_charges_nothing() {
+        let (url, _l1, sends) = l1_with_block_9().await;
+        assert!(send_committed(&url, 999).await.slot_skipped);
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Run the observer of a committed bundle pinned to L1 block 9 at timestamp
+    /// 1 with a 100 ms slack, on a clock at `now_ms`, and return its failure.
+    async fn send_committed(url: &str, now_ms: u64) -> crate::optimistic::FailedBatch {
+        let optimistic = Arc::new(OptimisticallyIncluded::new());
+        let block = B256::repeat_byte(7);
+        let post_batch = TxHash::repeat_byte(1);
+        let parent =
+            reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
+        optimistic.begin(6, post_batch, parent, block, Vec::new());
+
+        let (release, released) = BundleRelease::new();
+        release.committed(block);
+        let observer = send_after_commit(
+            1,
+            6,
+            vec![signed_user_tx(21_000)],
+            post_batch,
+            block,
+            Arc::clone(&optimistic),
+            submitter_at(url),
+            BundleTarget::Exact {
+                block: 9,
+                timestamp: 1,
+            },
+            Some(Staged {
+                released,
+                dispatched: Dispatched::Minimal,
+            }),
+            tokio::time::Instant::now(),
+            Some(send_deadlines_ms(1, std::time::Duration::from_millis(100))),
+            Arc::new(eez_timing::TokioClock::starting_at(now_ms)),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), observer)
+            .await
+            .unwrap();
+        optimistic.take_failed_for_recovery(0).unwrap()
+    }
+
+    /// A landed post whose settlement was unread and that L1 then applied
+    /// nothing of fails without a charge, so it no longer holds the gate. A
+    /// missing receipt alone may be a lagging provider and fails nothing.
+    #[tokio::test]
+    async fn unresolved_post_dropped_by_a_reorg_fails_uncharged() {
+        let (url, _l1, _) = l1_with_block_9().await;
+        let submitter = submitter_at(&url);
+        // Post 1 has no receipt, post 2 reverted and post 3 succeeded.
+        assert!(!fails_uncharged(&submitter, 1, 10).await, "block 10 unread");
+        assert!(
+            !fails_uncharged(&submitter, 3, 9).await,
+            "the cursor decides"
+        );
+        assert!(fails_uncharged(&submitter, 1, 9).await, "reorged out");
+        assert!(fails_uncharged(&submitter, 2, 10).await, "reverted");
+        // A reverted post still has a receipt: its nonce is spent.
+        assert!(
+            submitter
+                .receipt_exists(TxHash::repeat_byte(2))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// Watch the unresolved post `0xtag…` that landed in `l1_block` for a second:
+    /// whether it fails without a charge, rather than staying pending.
+    async fn fails_uncharged(submitter: &Submitter, tag: u8, l1_block: u64) -> bool {
+        let optimistic = OptimisticallyIncluded::new();
+        let post_batch = TxHash::repeat_byte(tag);
+        let parent =
+            reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
+        optimistic.begin(6, post_batch, parent, B256::ZERO, Vec::new());
+        let watch = watch_unresolved(1, 6, post_batch, l1_block, &optimistic, submitter);
+        if tokio::time::timeout(std::time::Duration::from_secs(1), watch)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        optimistic
+            .take_failed_for_recovery(0)
+            .is_some_and(|failed| failed.slot_skipped)
+    }
+
+    /// A relay without `eth_sendBundle` gets only the postBatch, through the
+    /// mempool: a user tx sent there could run before its entry and revert.
+    /// No builder took the bundle, so its failure charges nothing.
+    #[tokio::test]
+    async fn without_send_bundle_only_the_post_batch_is_sent() {
+        // No eth_sendBundle; L1 is past block 9 and holds no receipts.
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<Bytes>::new()));
+        let mut module = jsonrpsee::RpcModule::new(Arc::clone(&sent));
+        module
+            .register_method("eth_sendRawTransaction", |params, sent, _| {
+                sent.lock().unwrap().push(params.one().unwrap());
+                Ok::<_, jsonrpsee::types::ErrorObjectOwned>(B256::ZERO)
+            })
+            .unwrap();
+        module
+            .register_method("eth_getTransactionReceipt", |_, _, _| ())
+            .unwrap();
+        module
+            .register_method("eth_blockNumber", |_, _, _| "0xa")
+            .unwrap();
+        let server = jsonrpsee::server::ServerBuilder::default()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let _server = server.start(module);
+
+        let bundle = [signed_user_tx(21_000), signed_user_tx(30_000)];
+        let outcome = submitter_at(&url)
+            .send_bundle(&bundle, BundleTarget::ExactBlock { block: 9 }, || {})
+            .await
+            .unwrap();
+        assert_eq!(*sent.lock().unwrap(), bundle[..1]);
+        assert_eq!(
+            bundle_verdict(&outcome, B256::ZERO, false),
+            BundleVerdict::Failed {
+                charge_attempt: false
+            }
+        );
+    }
+
+    /// A submitter whose L1 reads and relay both go to `url`.
+    fn submitter_at(url: &str) -> Submitter {
+        Submitter::new(eez_l1::SubmitterConfig {
+            builder_rpc_url: url.parse().unwrap(),
+            reader: eez_l1::L1ReaderConfig {
+                rpc_url: url.parse().unwrap(),
+                trace_rpc_url: url.parse().unwrap(),
+                eez: Address::ZERO,
+                rollup_id: 1,
+                deploy_block: 0,
+                beacon_url: None,
+            },
+            target_rpc_url: None,
+            poster: alloy_signer_local::PrivateKeySigner::random(),
+        })
+    }
+
+    /// An L1 whose only block is an empty block 9 at timestamp 1, where tx
+    /// `0x02…` reverted and tx `0x03…` succeeded, behind a relay that accepts
+    /// every bundle. Returns its URL, server and bundle count.
+    async fn l1_with_block_9() -> (
+        String,
+        jsonrpsee::server::ServerHandle,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut module = jsonrpsee::RpcModule::new(Arc::clone(&sends));
+        let header = alloy_rpc_types_eth::Header::new(alloy_consensus::Header {
+            number: 9,
+            timestamp: 1,
+            ..Default::default()
+        });
+        let block = alloy_rpc_types_eth::Block::<alloy_rpc_types_eth::Transaction>::empty(header);
+        let block = serde_json::to_value(block).unwrap();
+        module
+            .register_method("eth_getBlockByNumber", move |params, _, _| {
+                let (number, _): (alloy_eips::BlockNumberOrTag, bool) = params.parse().unwrap();
+                (number == alloy_eips::BlockNumberOrTag::Number(9)).then(|| block.clone())
+            })
+            .unwrap();
+        let receipt = |tag: u8, status: bool| {
+            let receipt = alloy_rpc_types_eth::TransactionReceipt {
+                inner: alloy_consensus::ReceiptEnvelope::Eip1559(
+                    alloy_consensus::ReceiptWithBloom {
+                        receipt: alloy_consensus::Receipt {
+                            status: status.into(),
+                            cumulative_gas_used: 0,
+                            logs: Vec::<alloy_rpc_types_eth::Log>::new(),
+                        },
+                        logs_bloom: alloy_primitives::Bloom::ZERO,
+                    },
+                ),
+                transaction_hash: TxHash::repeat_byte(tag),
+                transaction_index: Some(0),
+                block_hash: Some(B256::ZERO),
+                block_number: Some(9),
+                gas_used: 0,
+                effective_gas_price: 0,
+                blob_gas_used: None,
+                blob_gas_price: None,
+                from: Address::ZERO,
+                to: None,
+                contract_address: None,
+            };
+            (
+                TxHash::repeat_byte(tag),
+                serde_json::to_value(receipt).unwrap(),
+            )
+        };
+        let receipts = HashMap::from([receipt(2, false), receipt(3, true)]);
+        module
+            .register_method("eth_getTransactionReceipt", move |params, _, _| {
+                receipts.get(&params.one::<TxHash>().unwrap()).cloned()
+            })
+            .unwrap();
+        module
+            .register_method("eth_sendBundle", |_, sends, _| {
+                sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .unwrap();
+        let server = jsonrpsee::server::ServerBuilder::default()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (url, server.start(module), sends)
     }
 
     #[test]

@@ -51,6 +51,6 @@ pub use error::{DriverError, DriverResult};
 pub use sequencer::{DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, Sequencer};
 #[doc(inline)]
 pub use slot::{
-    ParentContext, SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle, SyncSlotMode,
-    spawn_l1_anchored,
+    BundleRelease, ParentContext, SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle,
+    SyncSlotMode, spawn_l1_anchored,
 };

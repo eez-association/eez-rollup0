@@ -104,6 +104,20 @@ class BuilderDispatchTests(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 31, "result": "drop"},
         )
 
+    def test_ack_lost_queues_then_closes(self):
+        """Queue the bundle for its target block, then write no response."""
+        params = {"txs": ["0xaa"], "blockNumber": "0x5"}
+        handler = self.handler(
+            {"jsonrpc": "2.0", "id": 9, "method": "eth_sendBundle", "params": [params]}
+        )
+        with patch.object(stub.Builder, "mode", "ack-lost"), patch.object(
+            stub.Builder, "pending", {}
+        ), patch.object(stub.Builder, "latest", return_value=(4, 0)):
+            handler.do_POST()
+            self.assertEqual(stub.Builder.pending, {5: [params]})
+        handler.send_response.assert_not_called()
+        self.assertEqual(handler.wfile.getvalue(), b"")
+
 
 if __name__ == "__main__":
     unittest.main()

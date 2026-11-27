@@ -745,7 +745,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         // routes `[postBatch, user_tx_1, …]` through the shared
         // Submitter. The Submitter owns the transport decision —
         // `eth_sendBundle` on relays that support it (rbuilder),
-        // ordered mempool submission on plain execution RPCs
+        // the postBatch alone through the mempool on plain execution RPCs
         // (dev reth, anvil) detected via JSON-RPC -32601.
         let exec_ctx = Arc::new(eez_composer::CrossChainExecCtx {
             eezl2_address,

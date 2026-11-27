@@ -2,9 +2,9 @@
 //!
 //! On chiado the composer submits batches to an external Flashbots-style
 //! relay (`EEZ_L1_BUILDER_RPC_URL`) that speaks `eth_sendBundle`. The
-//! local dev L1 has no such relay, so the `Submitter` used to get a
-//! JSON-RPC `-32601` (method not found) and silently degrade to ordered
-//! `eth_sendRawTransaction` mempool submission
+//! local dev L1 has no such relay, so without this module the `Submitter`
+//! gets a JSON-RPC `-32601` (method not found) and sends only the postBatch
+//! through `eth_sendRawTransaction`
 //! (`eez_l1::submitter::post_bundle`). That divergence means the dev
 //! harness never exercises the real bundle path chiado uses.
 //!
