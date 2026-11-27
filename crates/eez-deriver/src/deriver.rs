@@ -1552,11 +1552,10 @@ where
     /// the new finalized block when it moved.
     async fn raise_finalized(&self, target: u64) -> DeriverResult<Option<u64>> {
         let current_safe = self.inner.safe_l2_block.load(Ordering::Acquire);
-        let Some(finalized) =
-            raised_finalized(self.inner.l1_head.finalized_l2(), target, current_safe)
-        else {
+        let finalized = target.min(current_safe);
+        if finalized <= self.inner.l1_head.finalized_l2() {
             return Ok(None);
-        };
+        }
         let safe_header = self.l2_sealed_header_at(current_safe)?;
         let finalized_hash = self.l2_hash_at(finalized)?;
         self.inner
@@ -2290,13 +2289,6 @@ const fn in_settleable_range(found: Option<u64>, low: u64, high: u64) -> Option<
         Some(block) if block >= low && block <= high => Some(block),
         _ => None,
     }
-}
-
-/// Finalized after a raise towards `target`: bounded by `safe`, and `None`
-/// unless that is above `old`.
-fn raised_finalized(old: u64, target: u64, safe: u64) -> Option<u64> {
-    let new = target.min(safe);
-    (new > old).then_some(new)
 }
 
 /// L2 heights a batch's settled part covers. A resumed batch reuses the Sync
@@ -3338,30 +3330,6 @@ mod cursor_guard_tests {
         // No settled endpoint reported: only `entry_state` can clear the guard.
         assert!(!cursor_root_accepted(OTHER, ENTRY, None));
         assert!(!cursor_root_accepted(FINAL, ENTRY, None));
-    }
-}
-
-#[cfg(test)]
-mod finalized_tests {
-    use super::raised_finalized;
-
-    #[test]
-    fn finalized_rises_to_the_target_but_never_past_safe_or_down() {
-        assert_eq!(
-            raised_finalized(0, 20, 54),
-            Some(20),
-            "restores a lost number"
-        );
-        assert_eq!(raised_finalized(12, 20, 54), Some(20));
-        assert_eq!(raised_finalized(0, 60, 54), Some(54), "bounded by safe");
-        assert_eq!(raised_finalized(20, 20, 54), None, "already there");
-        assert_eq!(raised_finalized(30, 20, 54), None, "never lowers");
-        assert_eq!(
-            raised_finalized(20, 60, 20),
-            None,
-            "safe holds it where it is"
-        );
-        assert_eq!(raised_finalized(0, 0, 54), None, "genesis is no raise");
     }
 }
 
