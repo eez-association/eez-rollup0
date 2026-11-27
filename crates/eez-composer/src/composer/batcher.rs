@@ -22,9 +22,11 @@ use super::post_batch::{
     apply_attestations, attestation_error, batch_range, build_da_payload, build_settlement_batch,
     encode_da, postbatch_gas_with_floor,
 };
-use super::recovery::observe_bundle_outcome;
+use super::recovery::{observe_bundle_outcome, whole_batch};
 use super::{Composer, ComposerConfigError, CrossChainExecCtx};
 use crate::attestation_quorum::assign_proof_systems;
+use crate::disposition::{BatchTx, TxDisposition};
+use crate::in_flight::dispose;
 use crate::local::{SyncCandidates, build_sync_block};
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
@@ -307,7 +309,9 @@ where
             post_batch_hash = %post_batch_hash,
             "minimal postBatch staged (leading immediate only); sent when the Sync block commits",
         );
-        rollup.optimistic.begin(
+        self.begin_batch(
+            rollup_id,
+            rollup,
             sync_height,
             post_batch_hash,
             parent_header.clone(),
@@ -422,7 +426,9 @@ where
                 "settlement backlog exceeds the batch cap; settling a bounded historical chunk",
             );
 
-            rollup.optimistic.begin(
+            self.begin_batch(
+                rollup_id,
+                rollup,
                 boundary,
                 post_batch_hash,
                 boundary_parent,
@@ -499,6 +505,48 @@ where
             ));
         }
         Ok(boundaries)
+    }
+
+    /// Record a staged batch in the ledger. A different batch it replaces at
+    /// the same height leaves the ledger, so the composer drops that batch's
+    /// bodies.
+    pub(super) fn begin_batch(
+        &self,
+        rollup_id: u64,
+        rollup: &RollupState<L2>,
+        sync_height: u64,
+        batch_id: B256,
+        parent: reth_primitives_traits::SealedHeader<alloy_consensus::Header>,
+        block: B256,
+        txs: Vec<BatchTx>,
+    ) {
+        let replaced = rollup
+            .optimistic
+            .begin(sync_height, batch_id, parent, block, txs);
+        // The same batch begun again keeps its bodies under the same id.
+        let Some((replaced, replaced_txs)) =
+            replaced.filter(|(replaced, txs)| *replaced != batch_id && !txs.is_empty())
+        else {
+            return;
+        };
+        event!(
+            name: "eez.composer.optimistic.batch_replaced",
+            Level::ERROR,
+            event_name = "eez.composer.optimistic.batch_replaced",
+            rollup_id,
+            sync_height,
+            replaced_batch_id = %replaced,
+            batch_id = %batch_id,
+            txs = replaced_txs.len(),
+            "a batch with txs was replaced at its height, which the one-in-flight gate should prevent; its tx bodies are dropped and their nonce reservations stay held",
+        );
+        let forget = whole_batch(replaced, &replaced_txs, TxDisposition::Forget, false);
+        dispose(
+            rollup_id,
+            &rollup.held_pool,
+            &rollup.in_flight,
+            vec![forget],
+        );
     }
 
     /// Spawn the background bundle-observer task. It owns the submission inputs
@@ -1382,7 +1430,7 @@ mod tests {
         let post_batch = TxHash::repeat_byte(1);
         let parent =
             reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
-        optimistic.begin(6, post_batch, parent, block, Vec::new());
+        let _ = optimistic.begin(6, post_batch, parent, block, Vec::new());
 
         let (release, released) = BundleRelease::new();
         drop(release);
@@ -1454,7 +1502,7 @@ mod tests {
         let post_batch = TxHash::repeat_byte(1);
         let parent =
             reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
-        optimistic.begin(6, post_batch, parent, block, Vec::new());
+        let _ = optimistic.begin(6, post_batch, parent, block, Vec::new());
 
         let (release, released) = BundleRelease::new();
         release.committed(block);
@@ -1515,7 +1563,7 @@ mod tests {
         let post_batch = TxHash::repeat_byte(tag);
         let parent =
             reth_primitives_traits::SealedHeader::seal_slow(alloy_consensus::Header::default());
-        optimistic.begin(6, post_batch, parent, B256::ZERO, Vec::new());
+        let _ = optimistic.begin(6, post_batch, parent, B256::ZERO, Vec::new());
         let watch = watch_unresolved(1, 6, post_batch, l1_block, &optimistic, submitter);
         if tokio::time::timeout(std::time::Duration::from_secs(1), watch)
             .await

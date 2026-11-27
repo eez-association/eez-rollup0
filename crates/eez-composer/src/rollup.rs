@@ -19,6 +19,7 @@ use eez_l1::{L1CanonicalHead, L1Error, L1Result};
 use eez_protocol::abi::{rollupsCall, rollupsReturn};
 
 use crate::held_pool::HeldPool;
+use crate::in_flight::InFlightBatches;
 use crate::optimistic::OptimisticallyIncluded;
 
 /// Immutable per-rollup configuration. Sourced from env at startup.
@@ -165,6 +166,9 @@ pub struct RollupState<L2> {
     /// Per-rollup cross-chain held-tx pool, drained on each Sync-slot
     /// trigger by the umbrella's `compose_sync_slot`.
     pub held_pool: Arc<HeldPool>,
+    /// Bodies of the held txs in each in-flight batch, until recovery
+    /// disposes of them.
+    pub in_flight: Arc<InFlightBatches>,
     /// Ledger of optimistically-committed Sync blocks whose L1 bundle
     /// is in flight or settled-but-unfinalized. Always present (empty
     /// map costs nothing); only the cross-chain compose path writes it.

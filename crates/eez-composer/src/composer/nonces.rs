@@ -8,25 +8,62 @@ use reth_storage_api::StateProvider;
 use tracing::{Level, event};
 
 use super::CrossChainExecCtx;
+use crate::disposition::BatchTx;
 use crate::held_pool::HeldTx;
 use crate::ingress::Direction;
+
+/// A tx's place in its sender's nonce chain: all the nonce reads and the stale
+/// split look at. The drain has bodies, recovery only the ledger's records.
+pub(super) trait SenderNonce {
+    fn sender(&self) -> Address;
+    fn direction(&self) -> Direction;
+    fn nonce(&self) -> u64;
+}
+
+impl SenderNonce for HeldTx {
+    fn sender(&self) -> Address {
+        self.sender
+    }
+
+    fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    fn nonce(&self) -> u64 {
+        self.nonce
+    }
+}
+
+impl SenderNonce for BatchTx {
+    fn sender(&self) -> Address {
+        self.sender
+    }
+
+    fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    fn nonce(&self) -> u64 {
+        self.nonce
+    }
+}
 
 /// Read L1 nonces for inbound senders at `at`.
 pub(super) async fn inbound_source_nonces_for_drain(
     ctx: &CrossChainExecCtx,
     rollup_id: u64,
-    drained: &[HeldTx],
+    drained: &[impl SenderNonce],
     at: alloy_eips::BlockId,
 ) -> HashMap<(Address, Direction), u64> {
     let mut source_nonces = HashMap::new();
     for tx in drained {
-        let key = (tx.sender, tx.direction);
-        if tx.direction != Direction::Inbound || source_nonces.contains_key(&key) {
+        let key = (tx.sender(), tx.direction());
+        if tx.direction() != Direction::Inbound || source_nonces.contains_key(&key) {
             continue;
         }
         match ctx
             .l1_provider
-            .get_transaction_count(tx.sender)
+            .get_transaction_count(tx.sender())
             .block_id(at)
             .await
         {
@@ -37,8 +74,8 @@ pub(super) async fn inbound_source_nonces_for_drain(
                 name: "eez.composer.cc_compose.source_nonce_check_failed",
                 Level::WARN,
                 rollup_id,
-                sender = %tx.sender,
-                direction = ?tx.direction,
+                sender = %tx.sender(),
+                direction = ?tx.direction(),
                 error = %err,
                 "canonical source-chain nonce read failed",
             ),
@@ -51,15 +88,15 @@ pub(super) async fn inbound_source_nonces_for_drain(
 pub(super) fn outbound_source_nonces_for_drain(
     parent_state: &dyn StateProvider,
     rollup_id: u64,
-    drained: &[HeldTx],
+    drained: &[impl SenderNonce],
 ) -> HashMap<(Address, Direction), u64> {
     let mut source_nonces = HashMap::new();
     for tx in drained {
-        let key = (tx.sender, tx.direction);
-        if tx.direction != Direction::Outbound || source_nonces.contains_key(&key) {
+        let key = (tx.sender(), tx.direction());
+        if tx.direction() != Direction::Outbound || source_nonces.contains_key(&key) {
             continue;
         }
-        match parent_state.account_nonce(&tx.sender) {
+        match parent_state.account_nonce(&tx.sender()) {
             Ok(nonce) => {
                 source_nonces.insert(key, nonce.unwrap_or(0));
             }
@@ -67,8 +104,8 @@ pub(super) fn outbound_source_nonces_for_drain(
                 name: "eez.composer.cc_compose.source_nonce_check_failed",
                 Level::WARN,
                 rollup_id,
-                sender = %tx.sender,
-                direction = ?tx.direction,
+                sender = %tx.sender(),
+                direction = ?tx.direction(),
                 error = %err,
                 "L2 source nonce read failed",
             ),
@@ -77,14 +114,14 @@ pub(super) fn outbound_source_nonces_for_drain(
     source_nonces
 }
 
-pub(super) fn partition_stale(
-    drained: Vec<HeldTx>,
+pub(super) fn partition_stale<T: SenderNonce>(
+    drained: Vec<T>,
     source_nonces: &HashMap<(Address, Direction), u64>,
-) -> (Vec<HeldTx>, Vec<HeldTx>) {
+) -> (Vec<T>, Vec<T>) {
     drained.into_iter().partition(|tx| {
         source_nonces
-            .get(&(tx.sender, tx.direction))
-            .is_none_or(|source_nonce| *source_nonce <= tx.nonce)
+            .get(&(tx.sender(), tx.direction()))
+            .is_none_or(|source_nonce| *source_nonce <= tx.nonce())
     })
 }
 
@@ -138,7 +175,7 @@ mod tests {
         assert_eq!(fresh[0].hash, tx.hash);
         assert!(stale.is_empty());
 
-        let (fresh, stale) = partition_stale(Vec::new(), &HashMap::new());
+        let (fresh, stale) = partition_stale(Vec::<HeldTx>::new(), &HashMap::new());
         assert!(fresh.is_empty());
         assert!(stale.is_empty());
     }

@@ -1,10 +1,19 @@
-//! Drained transactions until their fate is decided: the pool work that
-//! re-queues them, or charges them an attempt and evicts them at the bound.
+//! Drained transactions until their fate is decided: the bodies of each
+//! in-flight batch, and the pool work that releases them, re-queues them, or
+//! charges them an attempt and evicts them at the bound.
+//!
+//! The optimistic ledger keeps only a [`BatchTx`](crate::BatchTx) per
+//! transaction. Recovery decides each one's fate and hands it over as a
+//! [`BatchDisposition`]; [`dispose`] carries it out here.
 
-use alloy_primitives::Address;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use alloy_primitives::{Address, B256, TxHash};
 use eez_prover::{ProverError, RetryableProverError};
 use tracing::{Level, event};
 
+use crate::disposition::{BatchDisposition, TxDisposition};
 use crate::held_pool::{HeldPool, HeldTx};
 use crate::ingress::Direction;
 
@@ -138,6 +147,157 @@ pub(crate) fn recover_prover_failure(
         };
     }
     recover_settlement_failure(pool, rollup_id, txs, SettlementFailureSource::Prover)
+}
+
+/// The bodies of each in-flight batch's transactions, keyed by batch id (the
+/// postBatch hash). One per cross-chain rollup, alongside its `HeldPool`.
+#[derive(Debug, Default)]
+pub struct InFlightBatches {
+    by_batch: Mutex<HashMap<B256, Vec<HeldTx>>>,
+}
+
+impl InFlightBatches {
+    /// Empty table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Hold the bodies of `txs` while batch `batch_id` is in flight.
+    pub(crate) fn begin(&self, batch_id: B256, txs: Vec<HeldTx>) {
+        let mut by_batch = self
+            .by_batch
+            .lock()
+            .expect("in-flight batches mutex poisoned");
+        by_batch.insert(batch_id, txs);
+    }
+
+    /// The bodies `disposition` names, in its order, with their fates, and the
+    /// named txs that have no body here. A body leaves the table unless it is
+    /// released under `keep_released`; a batch with no body left leaves too.
+    fn take(
+        &self,
+        disposition: &BatchDisposition,
+    ) -> (Vec<(HeldTx, TxDisposition)>, Vec<(TxHash, TxDisposition)>) {
+        let mut by_batch = self
+            .by_batch
+            .lock()
+            .expect("in-flight batches mutex poisoned");
+        let Some(bodies) = by_batch.get_mut(&disposition.batch_id) else {
+            return (Vec::new(), disposition.txs.clone());
+        };
+        let mut taken = Vec::with_capacity(disposition.txs.len());
+        let mut missing = Vec::new();
+        for &(hash, fate) in &disposition.txs {
+            let Some(at) = bodies.iter().position(|tx| tx.hash == hash) else {
+                missing.push((hash, fate));
+                continue;
+            };
+            let body = if fate == TxDisposition::Release && disposition.keep_released {
+                bodies[at].clone()
+            } else {
+                bodies.remove(at)
+            };
+            taken.push((body, fate));
+        }
+        if bodies.is_empty() {
+            by_batch.remove(&disposition.batch_id);
+        }
+        (taken, missing)
+    }
+}
+
+/// Carry out recovery's decisions on the held pool in one pass: refuse each
+/// batch's txs at its `refuse_at`, release the `Release` txs, re-queue the
+/// `Requeue` txs at the front in one push, then charge the `Charge` txs. A
+/// `Forget` tx only loses its body.
+///
+/// A pass that refuses reports the txs it released (`nonce_burned`) and its
+/// totals (`re_pushed`); recovery hands such a pass one batch. A `Release`
+/// needs only the tx's hash. A `Requeue` or `Charge` tx with no body here (an
+/// unknown or already disposed batch) is left alone.
+pub(crate) fn dispose(
+    rollup_id: u64,
+    pool: &HeldPool,
+    batches: &InFlightBatches,
+    dispositions: Vec<BatchDisposition>,
+) {
+    let mut refused_at = None;
+    let mut dropped = 0usize;
+    let mut release = Vec::new();
+    let mut requeue = Vec::new();
+    let mut charge = Vec::new();
+    for disposition in &dispositions {
+        if let Some(sync_height) = disposition.refuse_at {
+            // Releasing or evicting a tx can come before reth re-adds it from the
+            // dropped block, which would mine it as a plain L2 call.
+            pool.refuse(disposition.txs.iter().map(|(hash, _)| *hash), sync_height);
+            refused_at = Some(sync_height);
+            for (hash, _) in disposition
+                .txs
+                .iter()
+                .filter(|(_, fate)| *fate == TxDisposition::Release)
+            {
+                dropped += 1;
+                event!(
+                    name: "eez.composer.recovery.nonce_burned",
+                    Level::WARN,
+                    event_name = "eez.composer.recovery.nonce_burned",
+                    rollup_id,
+                    tx_hash = %hash,
+                    "user_tx nonce already spent; not re-queueing (a reverted one must be resubmitted)",
+                );
+            }
+        }
+        let (taken, missing) = batches.take(disposition);
+        let mut unknown = 0usize;
+        for (hash, fate) in missing {
+            match fate {
+                TxDisposition::Release => release.push(hash),
+                TxDisposition::Requeue | TxDisposition::Charge => unknown += 1,
+                TxDisposition::Forget => {}
+            }
+        }
+        if unknown > 0 {
+            event!(
+                name: "eez.composer.recovery.unknown_txs",
+                Level::WARN,
+                event_name = "eez.composer.recovery.unknown_txs",
+                rollup_id,
+                batch_id = %disposition.batch_id,
+                unknown,
+                "disposition names txs with no in-flight body; leaving them alone",
+            );
+        }
+        for (tx, fate) in taken {
+            match fate {
+                TxDisposition::Release => release.push(tx.hash),
+                TxDisposition::Requeue => requeue.push(tx),
+                TxDisposition::Charge => charge.push(tx),
+                TxDisposition::Forget => {}
+            }
+        }
+    }
+    pool.release_by_hash(release);
+    let requeued = requeue.len();
+    pool.push_front_batch(requeue);
+    let charged =
+        recover_settlement_failure(pool, rollup_id, charge, SettlementFailureSource::Relay);
+    let re_pushed = requeued + charged.requeued;
+    dropped += charged.evicted;
+    if let Some(sync_height) = refused_at
+        && (re_pushed > 0 || dropped > 0)
+    {
+        event!(
+            name: "eez.composer.recovery.re_pushed",
+            Level::INFO,
+            rollup_id,
+            sync_height,
+            re_pushed,
+            dropped,
+            "batch recovered; user_txs re-queued (front) for the next Sync slot",
+        );
+    }
 }
 
 #[cfg(test)]

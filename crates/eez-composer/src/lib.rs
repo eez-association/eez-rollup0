@@ -38,6 +38,7 @@
 
 pub mod attestation_quorum;
 pub mod composer;
+mod disposition;
 pub mod held_pool;
 mod in_flight;
 pub mod ingress;
@@ -55,7 +56,11 @@ pub use attestation_quorum::{
 #[doc(inline)]
 pub use composer::{BlobPostingConfig, Composer, ComposerConfigError, CrossChainExecCtx};
 #[doc(inline)]
+pub use disposition::BatchTx;
+#[doc(inline)]
 pub use held_pool::{AdmissionError, HeldPool, HeldTx};
+#[doc(inline)]
+pub use in_flight::InFlightBatches;
 #[doc(inline)]
 pub use ingress::Direction;
 #[doc(inline)]

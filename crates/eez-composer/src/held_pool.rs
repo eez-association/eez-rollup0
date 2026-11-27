@@ -25,6 +25,7 @@ use std::sync::Mutex;
 use alloy_primitives::{Address, Bytes, TxHash};
 use tracing::{Level, event};
 
+use crate::disposition::BatchTx;
 use crate::ingress::Direction;
 
 /// A cross-chain transaction held between submission and Sync-slot
@@ -61,6 +62,17 @@ pub struct HeldTx {
     /// Effective priority fee (legacy/2930: `gas_price`, which is both cap
     /// and tip). Replacements must bump it alongside the cap (geth rule).
     pub priority_fee_per_gas: u128,
+}
+
+impl From<&HeldTx> for BatchTx {
+    fn from(tx: &HeldTx) -> Self {
+        Self {
+            hash: tx.hash,
+            sender: tx.sender,
+            direction: tx.direction,
+            nonce: tx.nonce,
+        }
+    }
 }
 
 /// Minimum bump (percent) a queued-nonce replacement must offer on BOTH
@@ -316,6 +328,15 @@ impl HeldPool {
         let mut state = self.state.lock().expect("held_pool mutex poisoned");
         for tx in txs {
             state.release_in_flight(tx);
+        }
+    }
+
+    /// Release the nonce reservations of `hashes`; a reservation is keyed by
+    /// hash, so no body is needed.
+    pub(crate) fn release_by_hash(&self, hashes: impl IntoIterator<Item = TxHash>) {
+        let mut state = self.state.lock().expect("held_pool mutex poisoned");
+        for hash in hashes {
+            state.in_flight.remove(&hash);
         }
     }
 

@@ -22,6 +22,7 @@ use super::nonces::{
     inbound_source_nonces_for_drain, outbound_source_nonces_for_drain, partition_stale,
 };
 use super::{Composer, CrossChainWiring};
+use crate::disposition::BatchTx;
 use crate::held_pool::HeldTx;
 use crate::in_flight::{
     MAX_BUNDLE_ATTEMPTS, SettlementFailureSource, recover_prover_failure,
@@ -1300,12 +1301,17 @@ where
             evicted_stale,
             "rich bundle staged; sent when the Sync block commits",
         );
-        rollup.optimistic.begin(
+        // The composer keeps the bodies; the ledger keeps what recovery decides on.
+        let batch_txs = survivors.iter().map(BatchTx::from).collect();
+        rollup.in_flight.begin(post_batch_hash, survivors);
+        self.begin_batch(
+            rollup_id,
+            rollup,
             sync_height,
             post_batch_hash,
             parent_header.clone(),
             built.header.hash(),
-            survivors,
+            batch_txs,
         );
         let (release, released) = BundleRelease::new();
         self.spawn_bundle_observer(

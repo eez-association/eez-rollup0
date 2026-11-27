@@ -641,6 +641,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             l2_provider: Arc::new(provider.clone()),
             l1_head: Arc::clone(&l1_head),
             held_pool: Arc::clone(&held_pool),
+            in_flight: Arc::new(eez_composer::InFlightBatches::new()),
             optimistic: Arc::new(eez_composer::OptimisticallyIncluded::new()),
         };
         let mut rollups = HashMap::with_capacity(1);

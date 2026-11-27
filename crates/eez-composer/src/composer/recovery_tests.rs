@@ -4,8 +4,8 @@
 use super::*;
 use crate::attestation_quorum::AttestationQuorum;
 use crate::composer::{CrossChainExecCtx, CrossChainWiring};
-use crate::held_pool::HeldPool;
-use crate::in_flight::MAX_BUNDLE_ATTEMPTS;
+use crate::held_pool::{HeldPool, HeldTx};
+use crate::in_flight::{InFlightBatches, MAX_BUNDLE_ATTEMPTS};
 use alloy_consensus::Header;
 use alloy_primitives::U256;
 use alloy_provider::{ProviderBuilder, RootProvider, mock::Asserter};
@@ -144,6 +144,7 @@ impl Fixture {
                     l2_provider: l2,
                     l1_head: Arc::new(L1CanonicalHead::default()),
                     held_pool: Arc::new(HeldPool::new()),
+                    in_flight: Arc::new(InFlightBatches::new()),
                     optimistic: Arc::new(OptimisticallyIncluded::new()),
                 },
             )]),
@@ -203,13 +204,12 @@ impl Fixture {
             rollup.held_pool.push_contiguous(tx.clone(), 0).unwrap();
         }
         // One suffix is in the batch and one remains queued outside it.
-        rollup.optimistic.begin(
-            10,
-            BATCH,
-            header(9),
-            header(10).hash(),
-            rollup.held_pool.pop_n(2),
-        );
+        let drained = rollup.held_pool.pop_n(2);
+        let records = drained.iter().map(BatchTx::from).collect();
+        rollup.in_flight.begin(BATCH, drained);
+        let _ = rollup
+            .optimistic
+            .begin(10, BATCH, header(9), header(10).hash(), records);
         rollup
             .l1_head
             .append(record(100, 9, B256::repeat_byte(0x90)));
@@ -275,6 +275,16 @@ impl Fixture {
     }
 }
 
+/// Whether an L1 reorg finds no tx left in the ledger to re-queue.
+fn no_txs_rolled_out(fixture: &Fixture) -> bool {
+    fixture
+        .rollup()
+        .optimistic
+        .take_rolled_out(9)
+        .iter()
+        .all(|(_, txs)| txs.is_empty())
+}
+
 #[tokio::test]
 async fn deriver_first_retreat_preserves_inbound_at_retry_limit() {
     deriver_first_retreat(Direction::Inbound).await;
@@ -305,7 +315,7 @@ async fn deriver_first_retreat(direction: Direction) {
         recovery.await;
     }
     fixture.notify_composer();
-    assert!(fixture.rollup().optimistic.take_rolled_out(9).is_empty());
+    assert!(no_txs_rolled_out(&fixture));
     fixture.assert_requeued(&txs);
     assert!(
         !completed_during_retreat,
@@ -439,7 +449,7 @@ async fn lost_race(direction: Direction) {
         .await;
     fixture.assert_requeued(&txs);
     // Requeued transactions must not also remain in the recovery ledger.
-    assert!(fixture.rollup().optimistic.take_rolled_out(9).is_empty());
+    assert!(no_txs_rolled_out(&fixture));
 }
 
 #[tokio::test]
@@ -461,7 +471,7 @@ async fn own_partial_batch_still_charges_the_culprit() {
             fixture.rollup().held_pool.is_empty(),
             "an attributable third failure still evicts the nonce suffix"
         );
-        assert!(fixture.rollup().optimistic.take_rolled_out(9).is_empty());
+        assert!(no_txs_rolled_out(&fixture));
         let mut replacement = txs[0].clone();
         replacement.hash = B256::repeat_byte(0xee);
         fixture
