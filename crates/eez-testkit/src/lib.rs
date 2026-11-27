@@ -2579,6 +2579,16 @@ impl<'a> Chain<'a> {
         rollup_commitment(self.rpc_url, self.eez_address, self.rollup_id).await
     }
 
+    /// L1's finalized block and the [`Self::commitment`] its state stores.
+    pub async fn finalized_commitment(&self) -> Result<(u64, B256)> {
+        let (block, _) = block_number_and_hash_at(self.rpc_url, BlockNumberOrTag::Finalized)
+            .await?
+            .context("L1 has no finalized block")?;
+        let root =
+            rollup_root_at(self.rpc_url, self.eez_address, self.rollup_id, Some(block)).await?;
+        Ok((block, root))
+    }
+
     /// Pin related reads to one L1 block so a batch landing between RPC calls
     /// cannot manufacture a lockstep failure.
     pub async fn snapshot(&self) -> Result<ChainSnapshot> {
