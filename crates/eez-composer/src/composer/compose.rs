@@ -26,7 +26,8 @@ use super::{Composer, CrossChainExecCtx, CrossChainWiring};
 use crate::held_pool::HeldTx;
 use crate::ingress::Direction;
 use crate::local::{
-    BuildError, InboundL2TargetSession, L1SlotState, L1TargetSession, build::SyncBlockState,
+    BuildError, InboundL2TargetSession, L1SlotState, L1TargetSession,
+    build::{SyncBlockState, truncated_hex},
     build_sync_block, sync_block_candidates,
 };
 use crate::prover_retry::{actionable_held_tx, partition_retryable};
@@ -548,19 +549,6 @@ fn take_l1_cache(
         .downcast::<evm2::evm::Cache>()
         .map(|cache| *cache)
         .map_err(|_e| "L1 session checkpoint payload is not a Cache".to_owned())
-}
-
-/// Hex of the first 32 bytes of a revert/return payload, for event messages.
-fn truncated_hex(data: &Bytes) -> String {
-    const MAX: usize = 32;
-    if data.len() <= MAX {
-        return alloy_primitives::hex::encode_prefixed(data);
-    }
-    format!(
-        "{}… ({} bytes)",
-        alloy_primitives::hex::encode_prefixed(&data[..MAX]),
-        data.len()
-    )
 }
 
 // Helper impl block for the cross-chain compose path. Lives outside

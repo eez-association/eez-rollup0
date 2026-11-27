@@ -50,7 +50,7 @@ pub(super) const MAX_PROOF_BYTES: usize = 128;
 
 /// Ceiling on a postBatch's gas limit (`EEZ_MAX_POSTBATCH_GAS` overrides): the
 /// EIP-7825 per-tx cap, above which no tx is valid at any block gas limit.
-const DEFAULT_MAX_POSTBATCH_GAS: u64 = 16_777_216;
+pub(super) const DEFAULT_MAX_POSTBATCH_GAS: u64 = 16_777_216;
 
 /// The belt prices bytes the drain cannot see (ABI framing, proof, DA shape), so
 /// the drain must stop earlier or the same set requeues forever. Gap seen: 230k.
