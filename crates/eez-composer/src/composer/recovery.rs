@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy_eips::Encodable2718;
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, TxHash};
 use eez_l1::{
     BundleTarget, DropReason, L1Error, L1Event, RelayReply, SendOutcome, SentBundle, Submitter,
 };
@@ -17,8 +17,8 @@ use super::nonces::{
     inbound_source_nonces_for_drain, outbound_source_nonces_for_drain, partition_stale,
 };
 use super::{Composer, Inner};
-use crate::held_pool::HeldTx;
-use crate::in_flight::{SettlementFailureSource, recover_settlement_failure};
+use crate::disposition::{BatchDisposition, BatchTx, TxDisposition};
+use crate::in_flight::dispose;
 use crate::ingress::Direction;
 use crate::local::build_sync_block;
 use crate::optimistic::OptimisticallyIncluded;
@@ -35,59 +35,52 @@ pub(super) enum RecoveryOutcome {
     HeadUnchanged,
 }
 
-/// Dispose of a recovered batch's txs: a spent nonce (`landed`) releases the
-/// tx, anything else returns it to the pool.
-fn dispose_recovered_txs(
-    rollup_id: u64,
-    pool: &crate::HeldPool,
+/// A recovered batch's disposition: a spent nonce (`landed`) releases the tx,
+/// anything else returns it to the pool, charged an attempt if
+/// `charge_attempt`. The txs are refused at the Sync block they came from.
+fn recovered_disposition(
+    batch_id: B256,
     sync_height: u64,
-    txs: Vec<crate::HeldTx>,
-    landed: &[alloy_primitives::TxHash],
+    txs: &[BatchTx],
+    landed: &[TxHash],
     charge_attempt: bool,
-) {
-    // Releasing or evicting a tx can come before reth re-adds it from the
-    // dropped block, which would mine it as a plain L2 call.
-    pool.refuse(txs.iter().map(|tx| tx.hash), sync_height);
-    let mut keep: Vec<crate::HeldTx> = Vec::with_capacity(txs.len());
-    let mut release: Vec<crate::HeldTx> = Vec::new();
-    let mut dropped = 0usize;
-    for tx in txs {
-        if landed.contains(&tx.hash) {
-            dropped += 1;
-            release.push(tx.clone());
-            event!(
-                name: "eez.composer.recovery.nonce_burned",
-                Level::WARN,
-                event_name = "eez.composer.recovery.nonce_burned",
-                rollup_id,
-                tx_hash = %tx.hash,
-                "user_tx nonce already spent; not re-queueing (a reverted one must be resubmitted)",
-            );
-        } else {
-            keep.push(tx);
-        }
-    }
-    pool.release_in_flight_batch(&release);
-    let (re_pushed, settlement_evicted) = if charge_attempt {
-        let recovery =
-            recover_settlement_failure(pool, rollup_id, keep, SettlementFailureSource::Relay);
-        (recovery.requeued, recovery.evicted)
+    keep_released: bool,
+) -> BatchDisposition {
+    let unspent = if charge_attempt {
+        TxDisposition::Charge
     } else {
-        let re_pushed = keep.len();
-        pool.push_front_batch(keep);
-        (re_pushed, 0)
+        TxDisposition::Requeue
     };
-    dropped += settlement_evicted;
-    if re_pushed > 0 || dropped > 0 {
-        event!(
-            name: "eez.composer.recovery.re_pushed",
-            Level::INFO,
-            rollup_id,
-            sync_height,
-            re_pushed,
-            dropped,
-            "batch recovered; user_txs re-queued (front) for the next Sync slot",
-        );
+    BatchDisposition {
+        batch_id,
+        refuse_at: Some(sync_height),
+        txs: txs
+            .iter()
+            .map(|tx| {
+                let fate = if landed.contains(&tx.hash) {
+                    TxDisposition::Release
+                } else {
+                    unspent
+                };
+                (tx.hash, fate)
+            })
+            .collect(),
+        keep_released,
+    }
+}
+
+/// One fate for every tx of a batch, with nothing refused.
+pub(super) fn whole_batch(
+    batch_id: B256,
+    txs: &[BatchTx],
+    fate: TxDisposition,
+    keep_released: bool,
+) -> BatchDisposition {
+    BatchDisposition {
+        batch_id,
+        refuse_at: None,
+        txs: txs.iter().map(|tx| (tx.hash, fate)).collect(),
+        keep_released,
     }
 }
 
@@ -96,12 +89,9 @@ fn dispose_recovered_txs(
 /// stopped: the first unspent outbound tx, else the first inbound tx if unspent
 /// (a later inbound tx may only be stuck behind one that reverted and burned).
 fn partial_disposition(
-    txs: &[HeldTx],
+    txs: &[BatchTx],
     nonces: &HashMap<(Address, Direction), u64>,
-) -> (
-    Vec<alloy_primitives::TxHash>,
-    Option<alloy_primitives::TxHash>,
-) {
+) -> (Vec<TxHash>, Option<TxHash>) {
     let (unspent, spent) = partition_stale(txs.to_vec(), nonces);
     let culprit = unspent
         .iter()
@@ -188,8 +178,9 @@ where
                         .l1_head
                         .highest_l2_at_or_below_l1(*common_ancestor_number)
                         .unwrap_or(0);
-                    let txs = rollup.optimistic.take_rolled_out(new_cursor);
-                    if txs.is_empty() {
+                    let rolled_out = rollup.optimistic.take_rolled_out(new_cursor);
+                    let tx_count: usize = rolled_out.iter().map(|(_, txs)| txs.len()).sum();
+                    if tx_count == 0 {
                         continue;
                     }
                     event!(
@@ -198,10 +189,17 @@ where
                         rollup_id,
                         common_ancestor = common_ancestor_number,
                         new_cursor,
-                        tx_count = txs.len(),
+                        tx_count,
                         "L1 reorg rolled out optimistic batches; re-queueing their user_txs",
                     );
-                    rollup.held_pool.push_front_batch(txs);
+                    // One pass, so the batches re-queue in height order.
+                    let requeue = rolled_out
+                        .iter()
+                        .map(|(batch_id, txs)| {
+                            whole_batch(*batch_id, txs, TxDisposition::Requeue, false)
+                        })
+                        .collect();
+                    dispose(*rollup_id, &rollup.held_pool, &rollup.in_flight, requeue);
                 }
             }
             Ok(L1Event::Finalized { block_number, .. }) => {
@@ -248,11 +246,19 @@ where
             let rollup_id = *rollup_id;
             let submitter = self.submitter.clone();
             let held_pool = rollup.held_pool.clone();
+            let in_flight = rollup.in_flight.clone();
             tokio::spawn(async move {
                 for (sync_height, post_batch_hash, txs) in finalized {
+                    // The ledger drops the batch here, so its bodies go too.
+                    let all = |fate| vec![whole_batch(post_batch_hash, &txs, fate, false)];
                     match submitter.receipt_exists(post_batch_hash).await {
                         Ok(true) => {
-                            held_pool.release_in_flight_batch(&txs);
+                            dispose(
+                                rollup_id,
+                                &held_pool,
+                                &in_flight,
+                                all(TxDisposition::Release),
+                            );
                             event!(
                                 name: "eez.composer.finality_audit.ok",
                                 Level::DEBUG,
@@ -275,7 +281,12 @@ where
                                 tx_count = txs.len(),
                                 "finalized batch has NO postBatch receipt on L1 — reorg rolled it out unobserved; re-queueing its user_txs (front)",
                             );
-                            held_pool.push_front_batch(txs);
+                            dispose(
+                                rollup_id,
+                                &held_pool,
+                                &in_flight,
+                                all(TxDisposition::Requeue),
+                            );
                         }
                         Err(err) => {
                             // Inconclusive: re-queueing txs that
@@ -292,7 +303,12 @@ where
                                 error = %err,
                                 "finality-audit receipt lookup failed; ledger entry dropped UNAUDITED",
                             );
-                            held_pool.release_in_flight_batch(&txs);
+                            dispose(
+                                rollup_id,
+                                &held_pool,
+                                &in_flight,
+                                all(TxDisposition::Release),
+                            );
                         }
                     }
                 }
@@ -319,10 +335,16 @@ where
         cursor: u64,
     ) -> Option<RecoveryOutcome> {
         let newly_cursor_confirmed = rollup.optimistic.resolve_below_cursor(cursor);
-        if !newly_cursor_confirmed.is_empty() {
-            rollup
-                .held_pool
-                .release_in_flight_batch(&newly_cursor_confirmed);
+        if newly_cursor_confirmed
+            .iter()
+            .any(|(_, txs)| !txs.is_empty())
+        {
+            // The ledger keeps settled batches until L1 finality, so their bodies stay.
+            let release = newly_cursor_confirmed
+                .iter()
+                .map(|(batch_id, txs)| whole_batch(*batch_id, txs, TxDisposition::Release, true))
+                .collect();
+            dispose(rollup_id, &rollup.held_pool, &rollup.in_flight, release);
         }
         self.recover_batches(rollup_id, rollup, cursor).await
     }
@@ -445,11 +467,11 @@ where
         let culprit = culprit.filter(|_| own_post);
         // Only spent txs can be stranded by a reorg; the re-queued ones are the
         // pool's again.
-        let stranded: Vec<crate::HeldTx> = partial
+        let stranded: Vec<BatchTx> = partial
             .txs
             .iter()
             .filter(|tx| spent.contains(&tx.hash))
-            .cloned()
+            .copied()
             .collect();
         // A reorg during the reads may have taken the batch and re-queued its
         // txs. Claim it before touching the pool.
@@ -481,9 +503,13 @@ where
             .txs
             .into_iter()
             .partition(|tx| culprit == Some(tx.hash));
-        let pool = rollup.held_pool.as_ref();
-        dispose_recovered_txs(rollup_id, pool, sync_height, rest, &spent, false);
-        dispose_recovered_txs(rollup_id, pool, sync_height, charged, &[], true);
+        // The ledger keeps the spent txs until L1 finality, so their bodies stay.
+        let batch_id = partial.post_batch_hash;
+        let (pool, in_flight) = (&rollup.held_pool, &rollup.in_flight);
+        let rest = recovered_disposition(batch_id, sync_height, &rest, &spent, false, true);
+        dispose(rollup_id, pool, in_flight, vec![rest]);
+        let charged = recovered_disposition(batch_id, sync_height, &charged, &[], true, true);
+        dispose(rollup_id, pool, in_flight, vec![charged]);
     }
 
     /// Read each sender's source nonce at the supplied L1 and L2 block hashes.
@@ -493,7 +519,7 @@ where
         &self,
         rollup_id: u64,
         rollup: &RollupState<L2>,
-        txs: &[HeldTx],
+        txs: &[BatchTx],
         l1_block: B256,
         head: B256,
     ) -> Option<HashMap<(Address, Direction), u64>> {
@@ -534,7 +560,6 @@ where
         failed: crate::optimistic::FailedBatch,
     ) -> RecoveryOutcome {
         let sync_height = failed.sync_height;
-        let pool = rollup.held_pool.as_ref();
         // Set when the sibling commit moves the head.
         let mut outcome = RecoveryOutcome::HeadUnchanged;
         let committer = &self.inner.committer;
@@ -619,15 +644,22 @@ where
                 return RecoveryOutcome::HeadUnchanged;
             }
         }
-        dispose_recovered_txs(
-            rollup_id,
-            pool,
+        let disposition = recovered_disposition(
+            failed.post_batch_hash,
             sync_height,
-            failed.txs,
+            &failed.txs,
             &landed,
             // A drop the txs caused counts toward poison-eviction; a skipped L1
             // slot or relay transport failure does not.
             !failed.slot_skipped,
+            // The ledger has dropped the batch.
+            false,
+        );
+        dispose(
+            rollup_id,
+            &rollup.held_pool,
+            &rollup.in_flight,
+            vec![disposition],
         );
         outcome
     }
@@ -695,7 +727,7 @@ where
 
     /// Hashes of the failed batch's transactions that landed on L1; the
     /// first receipt lookup error, with its transaction, stops the scan.
-    async fn recovered_tx_receipts(&self, txs: &[HeldTx]) -> Result<Vec<B256>, (B256, L1Error)> {
+    async fn recovered_tx_receipts(&self, txs: &[BatchTx]) -> Result<Vec<B256>, (B256, L1Error)> {
         let mut landed = Vec::new();
         for tx in txs {
             if self
@@ -975,8 +1007,29 @@ mod recovery_tests;
 mod tests {
     use super::*;
     use crate::composer::tests::held;
-    use crate::in_flight::MAX_BUNDLE_ATTEMPTS;
-    use alloy_primitives::TxHash;
+    use crate::held_pool::{HeldPool, HeldTx};
+    use crate::in_flight::{InFlightBatches, MAX_BUNDLE_ATTEMPTS};
+
+    /// The ledger's record of a held tx.
+    fn record(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> BatchTx {
+        BatchTx::from(&held(sender, direction, nonce, hash_byte))
+    }
+
+    /// Recovery's disposition of `drained`, applied to the batch that carried them.
+    fn dispose_recovered(
+        pool: &HeldPool,
+        drained: Vec<HeldTx>,
+        landed: &[TxHash],
+        charge_attempt: bool,
+    ) {
+        let batch_id = B256::repeat_byte(0xba);
+        let records: Vec<BatchTx> = drained.iter().map(BatchTx::from).collect();
+        let batches = InFlightBatches::new();
+        batches.begin(batch_id, drained);
+        let disposition =
+            recovered_disposition(batch_id, 100, &records, landed, charge_attempt, false);
+        dispose(1, pool, &batches, vec![disposition]);
+    }
 
     /// Every relay answer, L1 outcome and pin reading. The verdict differs from
     /// a table where the relay's answer decides only in the rows listed.
@@ -1097,7 +1150,7 @@ mod tests {
 
         // L1 consumed the first two entries; the third never ran.
         let landed = [TxHash::repeat_byte(0xA1), TxHash::repeat_byte(0xA2)];
-        dispose_recovered_txs(1, &pool, 100, drained, &landed, false);
+        dispose_recovered(&pool, drained, &landed, false);
 
         let queued = pool.pop_all();
         assert_eq!(
@@ -1116,17 +1169,12 @@ mod tests {
     #[test]
     fn partial_disposition_splits_by_nonce_and_names_the_first_unspent() {
         let (a, b) = (Address::repeat_byte(0x0A), Address::repeat_byte(0x0B));
-        let kept_out = held(a, Direction::Outbound, 5, 0x01);
-        let cut_out = held(a, Direction::Outbound, 6, 0x02);
-        let included_in = held(b, Direction::Inbound, 3, 0x03);
-        let dropped_in = held(b, Direction::Inbound, 4, 0x04);
+        let kept_out = record(a, Direction::Outbound, 5, 0x01);
+        let cut_out = record(a, Direction::Outbound, 6, 0x02);
+        let included_in = record(b, Direction::Inbound, 3, 0x03);
+        let dropped_in = record(b, Direction::Inbound, 4, 0x04);
         // Pool order puts an inbound tx first; batch order still leads with outbound.
-        let txs = [
-            included_in.clone(),
-            kept_out.clone(),
-            cut_out.clone(),
-            dropped_in,
-        ];
+        let txs = [included_in, kept_out, cut_out, dropped_in];
         let nonces = HashMap::from([((a, Direction::Outbound), 6), ((b, Direction::Inbound), 4)]);
 
         let (spent, culprit) = partial_disposition(&txs, &nonces);
@@ -1139,10 +1187,10 @@ mod tests {
     #[test]
     fn partial_disposition_falls_back_to_the_first_unspent_inbound() {
         let (a, b) = (Address::repeat_byte(0x0A), Address::repeat_byte(0x0B));
-        let kept_out = held(a, Direction::Outbound, 5, 0x01);
-        let dropped_in = held(b, Direction::Inbound, 4, 0x04);
-        let behind_in = held(b, Direction::Inbound, 5, 0x05);
-        let txs = [kept_out, dropped_in.clone(), behind_in];
+        let kept_out = record(a, Direction::Outbound, 5, 0x01);
+        let dropped_in = record(b, Direction::Inbound, 4, 0x04);
+        let behind_in = record(b, Direction::Inbound, 5, 0x05);
+        let txs = [kept_out, dropped_in, behind_in];
         let nonces = HashMap::from([((a, Direction::Outbound), 6), ((b, Direction::Inbound), 4)]);
 
         let (spent, culprit) = partial_disposition(&txs, &nonces);
@@ -1155,9 +1203,9 @@ mod tests {
     #[test]
     fn partial_disposition_spares_an_inbound_tx_stuck_behind_a_burned_one() {
         let b = Address::repeat_byte(0x0B);
-        let reverted_in = held(b, Direction::Inbound, 3, 0x03);
-        let stuck_in = held(b, Direction::Inbound, 4, 0x04);
-        let txs = [reverted_in.clone(), stuck_in];
+        let reverted_in = record(b, Direction::Inbound, 3, 0x03);
+        let stuck_in = record(b, Direction::Inbound, 4, 0x04);
+        let txs = [reverted_in, stuck_in];
         let nonces = HashMap::from([((b, Direction::Inbound), 4)]);
 
         let (spent, culprit) = partial_disposition(&txs, &nonces);
@@ -1174,8 +1222,8 @@ mod tests {
     fn partial_disposition_charges_nobody_when_every_nonce_is_spent() {
         let a = Address::repeat_byte(0x0A);
         let txs = [
-            held(a, Direction::Inbound, 1, 0x01),
-            held(a, Direction::Inbound, 2, 0x02),
+            record(a, Direction::Inbound, 1, 0x01),
+            record(a, Direction::Inbound, 2, 0x02),
         ];
         let nonces = HashMap::from([((a, Direction::Inbound), 3)]);
 
@@ -1200,7 +1248,7 @@ mod tests {
             "an in-flight reservation must block the nonce before disposition",
         );
 
-        dispose_recovered_txs(1, &pool, 100, drained, &[TxHash::repeat_byte(0xB1)], false);
+        dispose_recovered(&pool, drained, &[TxHash::repeat_byte(0xB1)], false);
         pool.push_contiguous(resubmission, 1)
             .expect("the nonce must be free once the burned tx releases its reservation");
         assert_eq!(pool.len(), 1);
@@ -1217,7 +1265,7 @@ mod tests {
         pool.push_contiguous(tx, 1).unwrap();
         let drained = pool.pop_n(1);
 
-        dispose_recovered_txs(1, &pool, 100, drained, &[], true);
+        dispose_recovered(&pool, drained, &[], true);
         assert_eq!(pool.len(), 0, "at MAX_BUNDLE_ATTEMPTS the tx is evicted");
         assert!(
             pool.holds(&TxHash::repeat_byte(0xD1)),
