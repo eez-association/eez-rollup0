@@ -26,6 +26,8 @@ pub const DERIVER_CATCH_UP_START: &str = "eez.deriver.catch_up.start";
 /// A restarted composer rewinds to L1's cursor, dropping the blocks L1 never settled.
 pub const COMPOSER_UNSETTLED_TAIL_DROPPED: &str = "eez.node.composer.unsettled_tail.dropped";
 pub const COMPOSER_BUNDLE_DISPATCHED: &str = "eez.composer.bundle.dispatched";
+/// The observer's verdict on a bundle; `settled` says whether L1 reached its endpoint.
+pub const COMPOSER_BUNDLE_OBSERVED: &str = "eez.composer.bundle.observed";
 pub const COMPOSER_SYNC_SLOT_INVOKED: &str = "eez.composer.sync_slot.invoked";
 pub const COMPOSER_SYNC_SLOT_DRAIN: &str = "eez.composer.sync_slot.drain";
 pub const COMPOSER_PHASE1_BUNDLE_DISPATCHED: &str = "eez.composer.phase1.bundle.dispatched";

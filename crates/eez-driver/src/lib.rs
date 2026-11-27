@@ -12,12 +12,11 @@
 //!
 //! ## Surface (Stage 4)
 //!
-//! - [`slot`] — `SlotKind`, `SlotEvent`, and [`spawn_l1_anchored`]. Defines
-//!   the protocol between Schedulers and Sequencers.
+//! - [`slot`] — [`spawn_l1_anchored`] and the Sync-slot composer hook.
 //! - [`Sequencer`] consumes [`SlotEvent`]s, builds payload attributes,
 //!   drives reth's engine, tracks head.
-//! - [`RollupTiming`] + [`SlotComposition`] — per-rollup wall-clock
-//!   timing config and per-trigger Live/Future/Sync split.
+//! - [`RollupTiming`], [`SlotComposition`], [`SlotKind`], [`SlotEvent`] and
+//!   the injected [`Clock`] live in `eez-timing` and are re-exported here.
 //!
 //! L1-anchored scheduling consumes an [`eez_l1::L1HeadStream`] through
 //! [`spawn_l1_anchored`]; higher-level composition remains in `eez-composer`.
@@ -34,20 +33,24 @@ pub mod block_committer;
 pub mod error;
 pub mod sequencer;
 pub mod slot;
-pub mod timing;
+#[cfg(test)]
+mod test_engine;
 #[cfg(feature = "witness")]
 pub mod witness;
 
 #[doc(inline)]
 pub use block_committer::{BlockCommitterHandle, CommitOutcome, DeriveOutcome, ForkchoiceOutcome};
 #[doc(inline)]
+pub use eez_timing::{
+    Clock, MAX_BLOCKS_PER_BATCH, MAX_BLOCKS_PER_CATCHUP, RollupTiming, SharedClock,
+    SlotComposition, SlotEvent, SlotKind, SystemClock, TokioClock,
+};
+#[doc(inline)]
 pub use error::{DriverError, DriverResult};
 #[doc(inline)]
 pub use sequencer::{DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, Sequencer};
 #[doc(inline)]
 pub use slot::{
-    ParentContext, SlotEvent, SlotKind, SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle,
+    BundleRelease, ParentContext, SyncSlotBlock, SyncSlotComposer, SyncSlotComposerHandle,
     SyncSlotMode, spawn_l1_anchored,
 };
-#[doc(inline)]
-pub use timing::{MAX_BLOCKS_PER_BATCH, MAX_BLOCKS_PER_CATCHUP, RollupTiming, SlotComposition};

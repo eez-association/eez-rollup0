@@ -178,7 +178,7 @@ head     = [rollupId, number, blockHash, parentHash, epochMs, counter]
   `withdrawalsRoot`. Receivers MUST accept both forms. As in Ethereum block
   bodies:
   - a legacy transaction is an RLP list;
-  - a typed transaction, `0x76` included, is an RLP string holding exactly
+  - a typed transaction, `0x45` included, is an RLP string holding exactly
     `type ‖ payload`.
 
   The block MUST be in canonical form. A receiver re-encodes the block it
@@ -203,7 +203,7 @@ head     = [rollupId, number, blockHash, parentHash, epochMs, counter]
   - type `0x01`, `0x02` or `0x04`;
   - type `0x03`, without its sidecar. It decodes here, but block execution
     rejects it;
-  - type `0x76`, with payload `rlp([chainId, nonce, to, value, input])`
+  - type `0x45`, with payload `rlp([chainId, sourceHash, gasLimit, to, value, input])`
     ([`native-system-transactions.md`](native-system-transactions.md)). A
     `to` other than EEZL2 (`0x4200000000000000000000000000000000000007`)
     fails to decode.
@@ -403,7 +403,7 @@ L2 execution clients peer over devp2p (RLPx) with the `eth` protocol.
     they don't disconnect a peer that sends them.
   - A transaction reaches the sequencer only through the sequencer's own RPC.
   - Peers MUST NOT rely on transaction propagation.
-- **Blocks:** executing EEZ blocks requires the native `0x76` system
+- **Blocks:** executing EEZ blocks requires the native `0x45` system
   transaction ([`native-system-transactions.md`](native-system-transactions.md)).
 
 ## 9. Sequencer

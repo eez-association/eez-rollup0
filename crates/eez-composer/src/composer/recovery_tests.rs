@@ -2,9 +2,16 @@
 //! Barriers force consumer orderings; no mining, live reorg, or timing sleeps.
 
 use super::*;
+use crate::attestation_quorum::AttestationQuorum;
+use crate::composer::{CrossChainExecCtx, CrossChainWiring};
 use alloy_consensus::Header;
+use alloy_primitives::U256;
 use alloy_provider::{ProviderBuilder, RootProvider, mock::Asserter};
+use async_trait::async_trait;
+use eez_driver::{BlockCommitterHandle, RollupTiming};
+use eez_evm::EezEvmConfig;
 use eez_l1::{BatchRecord, L1CanonicalHead, L1ReaderConfig, SubmitterConfig, scan::PostId};
+use eez_prover::ProvingContext;
 use reth_chainspec::ChainSpecBuilder;
 use reth_engine_primitives::{BeaconEngineMessage, ConsensusEngineHandle, OnForkChoiceUpdated};
 use reth_payload_builder::PayloadBuilderHandle;
@@ -162,6 +169,7 @@ impl Fixture {
             committer,
             None,
             RollupTiming::new(5000, 1000, 1000, 100),
+            Arc::new(eez_timing::TokioClock::new()),
         )
         .unwrap();
         Self { composer, engine }
@@ -488,11 +496,18 @@ async fn excluded_failure_before_rival_is_indexed_does_not_evict() {
         assert_eq!(rollup.l1_head.cursor(), 9);
 
         // The rival's bundle won the target block, so the relay excluded ours.
-        let charge = failure_charge(&Ok(SendOutcome::Dropped {
-            tx_hash: BATCH,
-            target_block: 101,
-            reason: DropReason::Excluded,
-        }));
+        let sent = SentBundle {
+            reply: RelayReply::Accepted,
+            outcome: SendOutcome::Dropped {
+                tx_hash: BATCH,
+                target_block: 101,
+                reason: DropReason::PinnedSlotExcluded,
+            },
+        };
+        let verdict = bundle_verdict(&sent, B256::ZERO, false);
+        let BundleVerdict::Failed { charge } = verdict else {
+            panic!("expected an excluded bundle, got {verdict:?}");
+        };
         assert_eq!(charge, AttemptCharge::Excluded);
         rollup.optimistic.mark_failed(10, BATCH, charge);
         let failed = rollup.optimistic.take_failed_for_recovery(9).unwrap();

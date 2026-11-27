@@ -9,6 +9,7 @@ use eez_protocol::{
     public_inputs::{public_inputs_hashes, public_inputs_hashes_with_context},
 };
 use eez_prover::ActionableProverFailure;
+use eez_timing::TokioClock;
 
 use super::*;
 
@@ -207,7 +208,12 @@ async fn attest_with(
         quorum,
         registration,
     }
-    .attest(&context(), timing(), BundleTarget::NextBlock)
+    .attest(
+        &context(),
+        timing(),
+        BundleTarget::NextBlock,
+        &TokioClock::new(),
+    )
     .await
 }
 
@@ -823,7 +829,12 @@ async fn a_lone_attester_reads_no_registration() {
         .await
         .unwrap();
     let attestations = round
-        .attest(&context(), timing(), BundleTarget::NextBlock)
+        .attest(
+            &context(),
+            timing(),
+            BundleTarget::NextBlock,
+            &TokioClock::new(),
+        )
         .await
         .unwrap();
 
@@ -876,7 +887,7 @@ async fn each_attester_uses_the_registered_opaque_key_for_its_window() {
             quorum: &quorum,
             registration,
         }
-        .attest(&ctx, timing(), BundleTarget::NextBlock)
+        .attest(&ctx, timing(), BundleTarget::NextBlock, &TokioClock::new())
         .await
         .unwrap();
 

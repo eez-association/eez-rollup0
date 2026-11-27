@@ -42,12 +42,12 @@ impl FollowerSystemConfig {
 
 /// Follower-specific CLI arguments layered on top of reth's CLI.
 #[derive(clap::Args, Debug, Clone)]
-struct FollowerArgs {
+pub struct FollowerArgs {
     /// The only address whose signed heads are followed, over the p2p overlay.
     /// When set, the unsafe head follows them; safe and finalized remain
     /// L1-derived.
     #[arg(long, env = "EEZ_SEQUENCER_ADDRESS")]
-    sequencer_address: Option<Address>,
+    pub sequencer_address: Option<Address>,
 }
 
 /// Launch an L1-derived follower node.
@@ -57,10 +57,45 @@ struct FollowerArgs {
 /// Returns an error when configuration is invalid or either reth or the L1
 /// bootstrap fails.
 pub fn run() -> eyre::Result<()> {
-    node_cli::<FollowerArgs>()?.run(launch)
+    run_with(|_args| {
+        eyre::ensure!(
+            env::var_os("EEZ_STATEFUL_PROOF_SIGNER_ADDR").is_none()
+                && env::var_os("EEZ_STATEFUL_PROOF_SIGNER_KEY").is_none(),
+            "stateful signing moved to the eez-prover-stateful binary in eez-association/provers",
+        );
+        Ok(|_| Ok(()))
+    })
 }
 
-async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
+/// Handles available after historical synchronization and L1 anchoring complete.
+#[derive(Debug)]
+pub struct FollowerContext {
+    pub provider: reth_provider::providers::BlockchainProvider<
+        reth_node_api::NodeTypesWithDBAdapter<EezNode, reth_db::DatabaseEnv>,
+    >,
+    pub chain_spec: Arc<reth_chainspec::ChainSpec>,
+    pub committer: BlockCommitterHandle<eez_engine::EezEngineTypes>,
+    pub task_executor: reth_tasks::TaskExecutor,
+}
+
+/// Run the default follower and attach a service after synchronization.
+/// `init` validates the caller's configuration before any node services start.
+pub fn run_with<Init, OnReady>(init: Init) -> eyre::Result<()>
+where
+    Init: FnOnce(&FollowerArgs) -> eyre::Result<OnReady> + Send + 'static,
+    OnReady: FnOnce(FollowerContext) -> eyre::Result<()> + Send + 'static,
+{
+    node_cli::<FollowerArgs>()?.run(move |builder, args| async move {
+        let on_ready = init(&args)?;
+        launch(builder, args, on_ready).await
+    })
+}
+
+async fn launch(
+    builder: L2NodeBuilder,
+    ext: FollowerArgs,
+    on_ready: impl FnOnce(FollowerContext) -> eyre::Result<()> + Send + 'static,
+) -> eyre::Result<()> {
     event!(
         name: "eez.node.launching",
         Level::INFO,
@@ -70,12 +105,6 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
     warn_on_deprecated_env();
     let sync_mode = sync_mode_from_env()?;
 
-    let stateful_proof_signer = eez_prover_stateful::Config::from_env()?;
-    if stateful_proof_signer.is_some() && ext.sequencer_address.is_some() {
-        return Err(eyre::eyre!(
-            "stateful proof signing requires an L1-derived-only follower; remove EEZ_SEQUENCER_ADDRESS",
-        ));
-    }
     // A production follower must reconstruct the Composer's Sync-block system
     // transactions byte-for-byte. Read every required value before launching
     // reth so a misconfigured follower never appears healthy.
@@ -168,33 +197,12 @@ async fn launch(builder: L2NodeBuilder, ext: FollowerArgs) -> eyre::Result<()> {
         deriver.run(deriver_events).await;
     });
 
-    if let Some(config) = stateful_proof_signer {
-        let signer_provider = provider.clone();
-        let signer_chain_spec = handle.node.chain_spec();
-        let signer_committer = block_committer.clone();
-        event!(
-            name: "eez.node.stateful_proof_signer.spawned",
-            Level::INFO,
-            "spawning stateful proof signer over the L1-derived follower",
-        );
-        task_executor.spawn_critical_with_graceful_shutdown_signal(
-            "eez-stateful-proof-signer",
-            move |shutdown| async move {
-                // Signal tonic while retaining Reth's shutdown guard during drain.
-                let shutdown_signal = shutdown.clone().ignore_guard();
-                let result = eez_prover_stateful::serve(
-                    config,
-                    signer_provider,
-                    signer_chain_spec,
-                    signer_committer,
-                    shutdown_signal,
-                )
-                .await;
-                drop(shutdown);
-                result.unwrap_or_else(|error| panic!("stateful proof signer exited: {error:#}"));
-            },
-        );
-    }
+    on_ready(FollowerContext {
+        provider: provider.clone(),
+        chain_spec: handle.node.chain_spec(),
+        committer: block_committer.clone(),
+        task_executor: task_executor.clone(),
+    })?;
 
     if let Some((sequencer_address, cfg)) = head_follower {
         event!(

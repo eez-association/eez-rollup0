@@ -272,6 +272,8 @@ struct BundleStub {
 pub enum BuilderStubMode {
     Forward,
     Drop,
+    /// Queue the bundle like `Forward`, then close without answering.
+    AckLost,
 }
 
 impl BuilderStubMode {
@@ -279,6 +281,7 @@ impl BuilderStubMode {
         match self {
             Self::Forward => "forward",
             Self::Drop => "drop",
+            Self::AckLost => "ack-lost",
         }
     }
 }
@@ -382,8 +385,8 @@ fn test_log_destination(name: &str) -> Result<(PathBuf, Option<tempfile::TempDir
     Ok((path, Some(dir)))
 }
 
-fn proof_signer_binary() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("EEZ_TEST_PROOF_SIGNER_BIN") {
+fn prover_binary(package: &str, binary: &str, override_env: &str) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os(override_env) {
         return Ok(path.into());
     }
     let current = std::env::current_exe().context("current test executable")?;
@@ -391,7 +394,7 @@ fn proof_signer_binary() -> Result<PathBuf> {
         .parent()
         .and_then(std::path::Path::parent)
         .ok_or_else(|| anyhow!("test executable has no target profile directory"))?;
-    let path = target_profile.join(format!("eez-proof-signer{}", std::env::consts::EXE_SUFFIX));
+    let path = target_profile.join(format!("{binary}{}", std::env::consts::EXE_SUFFIX));
     if path.is_file() {
         return Ok(path);
     }
@@ -414,27 +417,28 @@ fn proof_signer_binary() -> Result<PathBuf> {
         let mut command = Command::new("bash");
         command
             .current_dir(repo_root())
-            .args([
-                "scripts/provers-cargo.sh",
-                "build",
-                "-p",
-                "eez-prover-stateless",
-                "--bin",
-                "eez-proof-signer",
-            ])
+            .arg("scripts/provers-cargo.sh");
+        if package == "eez-prover-stateful" {
+            command.arg("--stateful");
+        }
+        command
+            .args(["build", "-p", package, "--bin", binary])
             .arg("--target-dir")
-            .arg(target_dir);
+            .arg(target_dir)
+            .env("CARGO_INCREMENTAL", "0");
         if profile != "debug" {
             command.args(["--profile", profile]);
         }
-        let status = command.status().context("build eez-proof-signer")?;
+        let status = command
+            .status()
+            .with_context(|| format!("build {binary}"))?;
         if !status.success() {
-            bail!("building eez-proof-signer failed with {status}");
+            bail!("building {binary} failed with {status}");
         }
     }
     path.is_file()
         .then_some(path)
-        .ok_or_else(|| anyhow!("eez-proof-signer build completed without producing the binary"))
+        .ok_or_else(|| anyhow!("{binary} build completed without producing the binary"))
 }
 
 /// The workspace target directory as Cargo resolves it (`CARGO_TARGET_DIR`,
@@ -487,7 +491,11 @@ impl ProofSignerHandle {
         let working_dir = tempfile::tempdir().context("proof signer working directory")?;
         let log = std::fs::File::create(&log_path).context("create proof signer log")?;
         let err_log = log.try_clone().context("clone proof signer log")?;
-        let mut command = Command::new(proof_signer_binary()?);
+        let mut command = Command::new(prover_binary(
+            "eez-prover-stateless",
+            "eez-proof-signer",
+            "EEZ_TEST_PROOF_SIGNER_BIN",
+        )?);
         command
             // The signer also loads dotenv at startup. Keep its explicitly
             // constructed test environment isolated from repository config.
@@ -1691,6 +1699,8 @@ pub struct NodeHandle {
     /// Owned node database. CI retains it only if this test unwinds in failure.
     owned_datadir: Option<FailureDatadir>,
     pub http_port: u16,
+    /// WebSocket RPC port; served only with `--ws`.
+    pub ws_port: u16,
     /// devp2p RLPx TCP port.
     pub p2p_port: u16,
     /// discv5 UDP port; bound only with [`NodeConfig::discovery`].
@@ -1702,6 +1712,7 @@ pub enum NodeBinary {
     #[default]
     Composer,
     Follower,
+    StatefulProver,
 }
 
 impl NodeBinary {
@@ -1709,10 +1720,18 @@ impl NodeBinary {
         match self {
             Self::Composer => "eez-composer",
             Self::Follower => "eez-follower",
+            Self::StatefulProver => "eez-prover-stateful",
         }
     }
 
     fn path(self) -> Result<PathBuf> {
+        if matches!(self, Self::StatefulProver) {
+            return prover_binary(
+                "eez-prover-stateful",
+                "eez-prover-stateful",
+                "EEZ_TEST_STATEFUL_PROVER_BIN",
+            );
+        }
         let name = self.name();
         if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{name}")) {
             return Ok(path.into());
@@ -1967,6 +1986,7 @@ impl NodeHandle {
             _keep_alive: log_tempdir.into_iter().collect(),
             owned_datadir: None,
             http_port,
+            ws_port,
             p2p_port,
             discv5_port,
         })
@@ -1999,6 +2019,47 @@ impl NodeHandle {
 
     pub fn l2_rpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.http_port)
+    }
+
+    /// Waits until this process's reth has saved block `number`, or a later
+    /// one, to disk. reth saves canonical blocks in the background, so a block
+    /// its RPC already serves can still be lost to a kill. Only a save made
+    /// after the call is seen, so the node must still be producing blocks. The
+    /// node must run with `--ws --ws.api reth`.
+    ///
+    /// # Errors
+    ///
+    /// The subscription fails, or no such block is saved within `timeout`.
+    pub async fn wait_for_persisted(&self, number: u64, timeout: Duration) -> Result<()> {
+        use jsonrpsee::core::client::SubscriptionClientT as _;
+
+        let url = format!("ws://127.0.0.1:{}", self.ws_port);
+        let client = jsonrpsee::ws_client::WsClientBuilder::default()
+            .build(&url)
+            .await
+            .with_context(|| format!("{}: connect {url}", self.name))?;
+        let mut saved = client
+            .subscribe::<alloy_eips::BlockNumHash, _>(
+                "reth_subscribePersistedBlock",
+                jsonrpsee::rpc_params![],
+                "reth_unsubscribePersistedBlock",
+            )
+            .await
+            .with_context(|| format!("{}: reth_subscribePersistedBlock", self.name))?;
+        let reached = async {
+            while let Some(block) = saved.next().await {
+                if block.context("persisted block notification")?.number >= number {
+                    return Ok(());
+                }
+            }
+            bail!("{}: the persisted-block subscription ended", self.name)
+        };
+        tokio::time::timeout(timeout, reached).await.map_err(|_| {
+            anyhow!(
+                "{}: block {number} was not saved to disk within {timeout:?}",
+                self.name
+            )
+        })?
     }
 
     /// Waits for RPC readiness while surfacing early process exits and logs.
@@ -3938,7 +3999,7 @@ pub async fn account_code(rpc_url: &str, addr: Address) -> Result<Bytes> {
 
 pub async fn receipt_ok(rpc_url: &str, hash: alloy_primitives::TxHash) -> Result<Option<bool>> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    // Native system receipts carry type 0x76, outside Ethereum's closed enum.
+    // Native system receipts carry type 0x45, outside Ethereum's closed enum.
     let receipt: Option<
         TransactionReceipt<alloy_consensus_any::AnyReceiptEnvelope<alloy_rpc_types_eth::Log>>,
     > = provider

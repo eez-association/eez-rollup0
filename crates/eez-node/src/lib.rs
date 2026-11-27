@@ -23,7 +23,7 @@ use eez_composer::{Composer, HeldPool, RollupConfig, RollupState};
 use eez_deriver::Deriver;
 use eez_driver::{
     BlockCommitterHandle, DEFAULT_MAX_SPECULATIVE_DEPTH, EthAttributesBuilder, RollupTiming,
-    Sequencer, SyncSlotComposerHandle, spawn_l1_anchored,
+    Sequencer, SharedClock, SyncSlotComposerHandle, SystemClock, spawn_l1_anchored,
 };
 use eez_engine::EezEngineTypes;
 use eez_l1::{
@@ -390,12 +390,16 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                     http_port = l1_cfg.http_port,
                     "launching embedded L1 reth (testing)",
                 );
+                // Block timestamps on a 5 s grid, so a stall near a second
+                // boundary does not move a pinned postBatch's block.
+                let attributes = l1_embedded::TestingL1Attributes::new(node_cfg.chain.clone());
                 let l1_handle = reth_node_builder::NodeBuilder::new(node_cfg)
                     .with_database(db)
                     .with_launch_context(build_l1_runtime()?)
                     .node(EthereumNode::default())
                     .extend_rpc_modules(bundle_rpc::install_dev_bundle_rpc)
                     .launch_with_debug_capabilities()
+                    .with_payload_attributes_builder(attributes)
                     .await?;
                 event!(
                     name: "eez.node.l1_embedded.ready",
@@ -501,6 +505,8 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     let l1_head = Arc::new(L1CanonicalHead::default());
 
     let timing = RollupTiming::from_env()?;
+    // The one wall clock behind every slot-time read.
+    let clock: SharedClock = Arc::new(SystemClock);
 
     // Env reads come first so a bad L1 env fails at startup, not after a backfill.
     let submitter_config = SubmitterConfig::from_env()?;
@@ -510,7 +516,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     // (build_sync_block → reth-evm BlockBuilder). Same chain spec
     // the engine uses, so blocks produced here pass validation
     // when reth ingests them via newPayload.
-    let evm_config = eez_evm::EezEvmConfig::new(chain_spec.clone())?;
+    let evm_config = eez_evm::EezEvmConfig::new_l2(chain_spec.clone())?;
 
     use eez_composer::{GnosisL1Adapter, LocalChainClient};
     use eez_protocol::rollup_id::RollupId;
@@ -739,7 +745,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
         // routes `[postBatch, user_tx_1, …]` through the shared
         // Submitter. The Submitter owns the transport decision —
         // `eth_sendBundle` on relays that support it (rbuilder),
-        // ordered mempool submission on plain execution RPCs
+        // the postBatch alone through the mempool on plain execution RPCs
         // (dev reth, anvil) detected via JSON-RPC -32601.
         let exec_ctx = Arc::new(eez_composer::CrossChainExecCtx {
             eezl2_address,
@@ -836,6 +842,7 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             block_committer.clone(),
             witness_source,
             timing,
+            Arc::clone(&clock),
         )?;
         let sync_slot_handle: SyncSlotComposerHandle = Arc::new(composer.clone());
 
@@ -843,12 +850,14 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
             L1HeadStream::from_watcher(&l1_watcher),
             timing,
             l2_genesis_timestamp,
+            Arc::clone(&clock),
         );
         let sequencer = Sequencer::composer(
             attributes,
             block_committer.clone(),
             schedule_rx,
             timing,
+            clock,
             rollup_id,
             sync_slot_handle,
             depth,
@@ -860,11 +869,11 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
     if let Some(cap) = l2_entry_client
         .current_declared_tx_gas_limit_cap()
         .map_err(|error| eyre::eyre!("resolve active L2 declared gas cap: {error}"))?
-        && eez_primitives::SYSTEM_TX_GAS_LIMIT > cap
+        && eez_primitives::SYSTEM_TX_GAS_CAP > cap
     {
         return Err(eyre::eyre!(
             "L2 system transaction gas limit {} exceeds the active transaction gas limit cap {cap}",
-            eez_primitives::SYSTEM_TX_GAS_LIMIT,
+            eez_primitives::SYSTEM_TX_GAS_CAP,
         ));
     }
 

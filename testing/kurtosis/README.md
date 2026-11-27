@@ -66,7 +66,7 @@ after Kurtosis has deployed the contracts and started the network services. It
 leaves the enclave running.
 
 CI may set `EEZ_PREBUILT_BIN_DIR` to a directory containing prebuilt
-`eez-composer`, `eez-follower`, `eez-proof-signer`, and
+`eez-composer`, `eez-follower`, `eez-proof-signer`, `eez-prover-stateful`, and
 `eez-genesis-state-root` and `eez-genesis-block-hash` binaries. In that mode
 `start.sh` builds thin runtime images from those binaries instead of compiling
 Rust inside Docker.
@@ -462,12 +462,30 @@ an `invalid nonce` rejection with no destination mutation and no source-nonce
 consumption, then settles the contiguous pair and checks L1/L2 block-hash
 commitment convergence.
 
+### Reference bridge round-trip
+
+The shared wave suite also runs `scripts/verify-bridge-round-trip.sh` after the
+existing direct-proxy and state-chaining checks. It deposits ETH through the
+reference L1 bridge and waits for safe derivation before withdrawing the same
+amount through the L2 bridge. Receipt fees are accounted for separately from
+principal. The check requires the rollup's L1 escrow to increase by the deposit
+and return to its baseline after withdrawal.
+
+An independent `eez-follower` in the candidate node image derives only from L1,
+with its own datadir and no sequencer RPC. At each leg it must reach the same
+safe block and reproduce the sender's L2 balance. The check writes
+`checks/bridge-round-trip.json` and captures `checks/bridge-follower.log` before
+removing the follower container. It uses Linux Docker host networking and does
+not require an additional Kurtosis service or image build.
+
+
 ### Run all included workloads
 
 The suite requires an output directory:
 
 ```bash
 export EEZ_CI_RESULT_DIR="$PWD/artifacts/kurtosis-dev"
+export EEZ_NODE_IMAGE="${EEZ_NODE_IMAGE:-eez-node:ci}"
 mkdir -p "$EEZ_CI_RESULT_DIR"
 
 bash testing/kurtosis/scripts/verify-cross-chain-waves.sh
@@ -595,6 +613,34 @@ Kurtosis assigns different host ports automatically. Remember that
 - `scripts/verify-state-chaining.sh`: ordered same-Sync-block state-chaining regression.
 - `scripts/verify-fault-recovery.sh`: proof-signer outage, node restart, and exact safe-prefix replay.
 - `scripts/verify-ingress-admission.sh`: live L1 front nonce-gap rejection and contiguous recovery.
+- `scripts/verify-bridge-round-trip.sh`: reference ETH bridge round-trip and independent follower checks.
+
+### Reorging L1
+
+`scripts/l1-reorg.sh` runs an L1-only devnet (`l1-reorg-args.yaml`, enclave
+`eez-l1-reorg`) and injects reorgs into it. Participant 1 (`el-1`/`cl-1`) is
+the observed side, with 1/3 of the validators and the MEV builder. Participants
+2 and 3 are a hidden side holding 2/3. For each reorg, the script uses iptables
+to cut the hidden side off. Each side then builds its own fork. When the network
+is reconnected, the observed side switches to the heavier hidden fork. Point the
+system under test at the observed EL (`el-1`).
+
+`up` removes any existing enclave with the configured name and starts a fresh devnet.
+
+```bash
+bash testing/kurtosis/scripts/l1-reorg.sh up
+REORG_DEPTH_MIN=1 REORG_DEPTH_MAX=3 \
+REORG_INTERVAL_MIN=5 REORG_INTERVAL_MAX=15 \
+  bash testing/kurtosis/scripts/l1-reorg.sh run
+```
+
+Each reorg replaces `R_DEPTH = random(REORG_DEPTH_MIN, REORG_DEPTH_MAX)`
+observed blocks, with both bounds inclusive. A reorg starts every `R` observed
+blocks, where `REORG_INTERVAL_MIN < R < REORG_INTERVAL_MAX`. Set `REORG_COUNT`
+to stop after a fixed number of reorgs. The observed side gets only 1/3 of the
+slots, so a depth-`D` reorg takes about `3D` slots to build. If a run is
+interrupted, clear the partition with `l1-reorg.sh heal`. The partition needs Docker to grant
+`NET_ADMIN`, which works on Linux and in Docker Desktop on macOS.
 
 ### Blob settlement E2E
 

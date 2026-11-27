@@ -112,6 +112,7 @@ pub(super) fn transact_err(e: HandlerError) -> ExecutorError {
 fn fork_err(e: BuildError) -> ExecutorError {
     match e {
         provider @ BuildError::Provider(_) => provider_err(provider),
+        BuildError::Capacity => ExecutorError::Capacity,
         other => evm_err(other),
     }
 }
@@ -503,11 +504,11 @@ impl<I: Inspector<EezEvmTypes>> Inspector<EezEvmTypes> for SkipTopFrame<I> {
 // ── L2 block probe execution ─────────────────────────────────────
 
 /// Snapshot payload for [`InboundL2TargetSession`]: the fork's restore point
-/// plus the delivery nonce cursor, which advances per accepted delivery and
+/// plus the delivery source cursor, which advances per accepted delivery and
 /// must rewind with it.
 struct ProbeSnapshot {
     fork: ForkSnapshot,
-    delivery_nonce: u64,
+    delivery_source: eez_protocol::native_source::SourceEntry,
 }
 
 /// Target-chain session that resolves an inbound call by running the canonical
@@ -521,30 +522,34 @@ struct ProbeSnapshot {
 pub struct InboundL2TargetSession {
     fork: SyncBlockFork,
     cfg: SystemTxContext,
-    /// SYSTEM_ADDRESS nonce for the next delivery this composition appends.
-    delivery_nonce: u64,
+    /// Original full-candidate source of the next delivery.
+    delivery_source: eez_protocol::native_source::SourceEntry,
     this_rollup_id: u64,
 }
 
 impl std::fmt::Debug for InboundL2TargetSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InboundL2TargetSession")
-            .field("delivery_nonce", &self.delivery_nonce)
+            .field("delivery_source", &self.delivery_source)
             .field("this_rollup_id", &self.this_rollup_id)
             .finish_non_exhaustive()
     }
 }
 
 impl InboundL2TargetSession {
-    /// Open over `fork` (a fork of the block prefix) with the phase-2 nonce
+    /// Open over `fork` (a fork of the block prefix) with the phase-2 source
     /// cursor for the first delivery this composition would append.
     #[must_use]
-    pub fn new(fork: SyncBlockFork, cfg: SystemTxContext, delivery_nonce: u64) -> Self {
+    pub fn new(
+        fork: SyncBlockFork,
+        cfg: SystemTxContext,
+        delivery_source: eez_protocol::native_source::SourceEntry,
+    ) -> Self {
         let this_rollup_id = cfg.this_rollup_id;
         Self {
             fork,
             cfg,
-            delivery_nonce,
+            delivery_source,
             this_rollup_id,
         }
     }
@@ -573,15 +578,17 @@ impl InboundL2TargetSession {
     /// Lower one entry to its single delivery system tx at the current cursor.
     fn delivery_tx(&self, entry: &InboundSidecar) -> ExecutorResult<Bytes> {
         let txs =
-            build_inbound_system_txs(std::slice::from_ref(entry), &self.cfg, self.delivery_nonce)
+            build_inbound_system_txs(std::slice::from_ref(entry), &self.cfg, self.delivery_source)
                 .map_err(|e| encoding_err(format!("build_inbound_system_txs: {e}")))?;
-        let [tx] = <[Bytes; 1]>::try_from(txs).map_err(|txs| {
-            encoding_err(format!(
-                "one inbound entry must lower to exactly one delivery tx; got {}",
-                txs.len()
-            ))
-        })?;
-        Ok(tx)
+        let [tx] = <[eez_protocol::system_tx::NativeTransactionPlan; 1]>::try_from(txs).map_err(
+            |txs| {
+                encoding_err(format!(
+                    "one inbound entry must lower to exactly one delivery tx; got {}",
+                    txs.len()
+                ))
+            },
+        )?;
+        self.fork.materialize(&tx).map_err(encoding_err)
     }
 }
 
@@ -606,15 +613,11 @@ impl TargetExecutionSession for InboundL2TargetSession {
         let probe_entry = self.inbound_sidecar_for_call(&req, Bytes::new())?;
         let probe_tx = self.delivery_tx(&probe_entry)?;
 
-        let snapshot = self.fork.snapshot();
         let mut inspector = ProbeInspector::new(self.cfg.eezl2_address);
         let probe = self
             .fork
-            .execute_tx_inspected(&probe_tx, &mut inspector)
+            .probe_native_tx(&probe_tx, &mut inspector)
             .map_err(fork_err)?;
-        // The probe leaves no trace: its state effects are re-applied by the
-        // real run below.
-        self.fork.restore(snapshot);
 
         let captured = match inspector.captures.as_slice() {
             [one] => one.clone(),
@@ -650,17 +653,18 @@ impl TargetExecutionSession for InboundL2TargetSession {
         let final_entry = self.inbound_sidecar_for_call(&req, captured.output.clone())?;
         let final_tx = self.delivery_tx(&final_entry)?;
         let real = self.fork.execute_tx(&final_tx).map_err(fork_err)?;
+
         if !real.success {
             return Err(encoding_err(format!(
                 "canonical delivery for {} reverted on the block prefix at \
-                 SYSTEM nonce {}: {}",
-                req.target_address, self.delivery_nonce, real.output
+                 source group {}: {}",
+                req.target_address,
+                self.delivery_source.index(),
+                real.output
             )));
         }
 
-        self.delivery_nonce = self.delivery_nonce.checked_add(1).ok_or_else(|| {
-            encoding_err("SYSTEM_ADDRESS delivery nonce overflow in InboundL2TargetSession")
-        })?;
+        self.delivery_source = self.delivery_source.offset(1).map_err(encoding_err)?;
 
         tracing::debug!(
             target = %req.target_address,
@@ -679,7 +683,7 @@ impl TargetExecutionSession for InboundL2TargetSession {
     fn checkpoint(&mut self) -> ExecutorResult<SessionSnapshot> {
         Ok(Box::new(ProbeSnapshot {
             fork: self.fork.snapshot(),
-            delivery_nonce: self.delivery_nonce,
+            delivery_source: self.delivery_source,
         }))
     }
 
@@ -688,7 +692,7 @@ impl TargetExecutionSession for InboundL2TargetSession {
             encoding_err("InboundL2TargetSession::rollback: snapshot type mismatch")
         })?;
         self.fork.restore(snap.fork);
-        self.delivery_nonce = snap.delivery_nonce;
+        self.delivery_source = snap.delivery_source;
         Ok(())
     }
 }

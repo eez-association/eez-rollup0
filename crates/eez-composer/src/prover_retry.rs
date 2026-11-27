@@ -9,6 +9,7 @@ use eez_l1::BundleTarget;
 use eez_prover::{
     ActionableProverFailure, Prover, ProverError, ProvingContext, RetryableProverError,
 };
+use eez_timing::{Clock, deadline};
 use reth_primitives_traits::SignedTransaction;
 use tokio::time::{Instant, sleep_until, timeout};
 use tracing::{Level, event};
@@ -115,13 +116,6 @@ pub(crate) fn validate_actionable_prover_failure(
     Ok(())
 }
 
-fn unix_time_millis() -> u64 {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-}
-
 /// Latest wall-clock millisecond at which a full proof attempt may start.
 ///
 /// The Sequencer applies the same budget before entering the Composer. Repeating
@@ -131,14 +125,7 @@ fn proof_start_cutoff_ms(timing: RollupTiming, target: BundleTarget) -> Option<u
     let BundleTarget::Exact { timestamp, .. } = target else {
         return None;
     };
-    let proof_ms = u64::try_from(timing.proof_time().as_millis()).unwrap_or(u64::MAX);
-    let slack_ms = u64::try_from(timing.submission_slack().as_millis()).unwrap_or(u64::MAX);
-    Some(
-        timestamp
-            .saturating_mul(1_000)
-            .saturating_sub(slack_ms)
-            .saturating_sub(proof_ms),
-    )
+    Some(deadline::proof_start_cutoff_ms(timing, timestamp))
 }
 
 /// Exponential backoff with ±20% wall-clock jitter and a fixed cap.
@@ -177,14 +164,15 @@ fn retry_budget(
 
 /// Run one complete proving operation with the Composer profile's closed
 /// retryable-error allowlist. Every attempt is independently bounded by the
-/// configured proof-time budget.
+/// configured proof-time budget. The slot cutoff is checked against `clock`.
 pub(crate) async fn prove_with_retry(
     prover: &dyn Prover,
     ctx: ProvingContext,
     timing: RollupTiming,
     target: BundleTarget,
+    clock: &dyn Clock,
 ) -> Result<Bytes, ProverError> {
-    prove_with_retry_at(prover, ctx, timing, target, unix_time_millis()).await
+    prove_with_retry_at(prover, ctx, timing, target, clock.now_unix_ms()).await
 }
 
 async fn prove_with_retry_at(
@@ -268,6 +256,7 @@ mod tests {
     use alloy_consensus::SignableTransaction as _;
     use alloy_primitives::{Address, TxHash};
     use async_trait::async_trait;
+    use eez_timing::TokioClock;
 
     use super::*;
 
@@ -634,6 +623,46 @@ mod tests {
             Some(RetryableProverError::DeadlineExceeded)
         );
         assert_eq!(prover.calls(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slot_cutoff_reads_the_injected_clock() {
+        // test_timing: proof 500, slack 100, so the cutoff is ts·1000 − 600.
+        let target = BundleTarget::Exact {
+            block: 1,
+            timestamp: 1_700_000_002,
+        };
+        let cutoff_ms = 1_700_000_002_000 - 600;
+
+        let prover = ScriptedProver::new(vec![Ok(Bytes::from_static(b"proof"))]);
+        let clock = TokioClock::starting_at(cutoff_ms);
+        let proof = prove_with_retry(
+            &prover,
+            ProvingContext::default(),
+            test_timing(),
+            target,
+            &clock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(proof, Bytes::from_static(b"proof"));
+
+        let late = ScriptedProver::new(vec![Ok(Bytes::from_static(b"unexpected"))]);
+        let clock = TokioClock::starting_at(cutoff_ms + 1);
+        let error = prove_with_retry(
+            &late,
+            ProvingContext::default(),
+            test_timing(),
+            target,
+            &clock,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.retryable_kind(),
+            Some(RetryableProverError::DeadlineExceeded)
+        );
+        assert_eq!(late.calls(), 0);
     }
 
     #[tokio::test(start_paused = true)]

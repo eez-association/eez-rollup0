@@ -4,14 +4,17 @@
 //! to the Merge: L2 has no beacon chain, so no withdrawals, beacon roots or
 //! consensus-layer requests. EIP-2935 block-hash history runs by hand.
 
+use alloy_consensus::Transaction;
 use alloy_eip7928::{BlockAccessIndex, BlockAccessList};
+use eez_primitives::ExecutionGroupState;
+use evm2::block::BlockTransactionResult;
 use evm2::{
     SpecId,
     evm::{Bal, HISTORY_STORAGE_ADDRESS, SystemTx},
 };
 use reth_evm::{
     BlockExecutionError, BlockExecutionOutput, BlockExecutor, BlockExecutorFactory,
-    BlockValidationError, BundleState, CommitChanges, ExecutorTx, GasOutput, StateUpdate,
+    BlockValidationError, BundleState, ExecutorTx, GasOutput, RecoveredTx, StateUpdate,
 };
 use reth_evm_ethereum::{
     EthBlockExecutionCtx, EthBlockExecutor, EthBlockExecutorFactory, EthEvmEnv,
@@ -58,7 +61,10 @@ where
         let mut ethereum = self.ethereum.create_executor(evm, ctx);
         // Block-level hooks only; transactions still follow the block's own fork.
         ethereum.set_spec_id(SpecId::MERGE);
-        EezBlockExecutor { ethereum }
+        EezBlockExecutor {
+            ethereum,
+            group_state: ExecutionGroupState::default(),
+        }
     }
 
     fn evm_factory(&self) -> &Self::EvmFactory {
@@ -75,6 +81,23 @@ where
 
 pub struct EezBlockExecutor<'a> {
     ethereum: EthBlockExecutor<'a, EezEvmTypes, &'a EezReceiptBuilder>,
+    group_state: ExecutionGroupState,
+}
+
+/// Detached execution and its group cursor are committed together.
+#[derive(Debug)]
+pub struct EezTxResult {
+    inner: reth_evm_ethereum::EthTransactionResultWithState<EezEvmTypes, eez_primitives::EezTxType>,
+    group_state: ExecutionGroupState,
+}
+
+impl BlockTransactionResult<EezEvmTypes> for EezTxResult {
+    fn result(&self) -> &evm2::TxResultWithState<EezEvmTypes> {
+        self.inner.result()
+    }
+    fn into_result(self) -> evm2::TxResultWithState<EezEvmTypes> {
+        self.inner.into_result()
+    }
 }
 
 impl std::fmt::Debug for EezBlockExecutor<'_> {
@@ -94,8 +117,7 @@ impl<'a> BlockExecutor for EezBlockExecutor<'a> {
     type Transaction = EezTxEnvelope;
     type Receipt = Receipt;
     type Evm = evm2::Evm<'a, EezEvmTypes>;
-    type TransactionResultWithState =
-        <EthBlockExecutor<'a, EezEvmTypes, &'a EezReceiptBuilder> as BlockExecutor>::TransactionResultWithState;
+    type TransactionResultWithState = EezTxResult;
     type BlockAccessList = Bal;
 
     fn evm(&self) -> &Self::Evm {
@@ -170,28 +192,40 @@ impl<'a> BlockExecutor for EezBlockExecutor<'a> {
         self.ethereum.validate_transaction_gas_limit(gas_limit)
     }
 
-    fn execute_transaction_with_commit_condition(
-        &mut self,
-        transaction: impl ExecutorTx<Self>,
-        f: impl FnOnce(&evm2::TxResult<EezEvmTypes>, evm2::TxStateChanges<'_>) -> CommitChanges,
-    ) -> Result<Option<GasOutput>, BlockExecutionError> {
-        self.ethereum
-            .execute_transaction_with_commit_condition(transaction, f)
-    }
-
     fn execute_transaction_without_commit(
         &mut self,
         transaction: impl ExecutorTx<Self>,
     ) -> Result<Self::TransactionResultWithState, BlockExecutionError> {
-        self.ethereum
-            .execute_transaction_without_commit(transaction)
+        let (tx_env, recovered) = transaction.into_parts();
+        let (group_state, _) = self
+            .group_state
+            .after(recovered.tx())
+            .map_err(BlockValidationError::msg)?;
+        if let EezTxEnvelope::System(native) = recovered.tx() {
+            let expected = eez_primitives::system_tx_gas_limit(
+                self.ethereum.evm().block().gas_limit.to(),
+                self.ethereum.inner.cumulative_gas_used,
+            );
+            if native.gas_limit != expected || tx_env.gas_limit() != expected {
+                return Err(BlockValidationError::msg(
+                    "native gas does not match execution position",
+                )
+                .into());
+            }
+        }
+        let inner = self
+            .ethereum
+            .execute_transaction_without_commit((tx_env, recovered))?;
+        Ok(EezTxResult { inner, group_state })
     }
 
     fn commit_transaction(
         &mut self,
         output: Self::TransactionResultWithState,
     ) -> Result<GasOutput, BlockExecutionError> {
-        self.ethereum.commit_transaction(output)
+        let gas = self.ethereum.commit_transaction(output.inner)?;
+        self.group_state = output.group_state;
+        Ok(gas)
     }
 
     fn receipts(&self) -> &[Receipt] {
@@ -201,12 +235,18 @@ impl<'a> BlockExecutor for EezBlockExecutor<'a> {
     fn finish_with_block_access_list(
         self,
     ) -> Result<(BlockExecutionOutput<Receipt>, Option<BlockAccessList>), BlockExecutionError> {
+        self.group_state
+            .ensure_complete()
+            .map_err(BlockValidationError::msg)?;
         self.ethereum.finish_with_block_access_list()
     }
 
     fn finish_with_prepared_block_access_list(
         self,
     ) -> Result<(BlockExecutionOutput<Receipt>, Option<Bal>), BlockExecutionError> {
+        self.group_state
+            .ensure_complete()
+            .map_err(BlockValidationError::msg)?;
         self.ethereum.finish_with_prepared_block_access_list()
     }
 }

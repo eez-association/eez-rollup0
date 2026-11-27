@@ -1150,14 +1150,28 @@ async fn follower_replays_settled_inbound_safe_block() {
         U256::from(71u64),
         "follower execution must reproduce the inbound destination write",
     );
+    // L1 goes on settling while the follower derives, so the follower's safe
+    // chain must come to hold exactly the block L1 commits to.
     let committed = rollup_commitment(&l1_rpc, w.cfg.eez_address, w.cfg.rollup_id)
         .await
         .unwrap();
-    assert_eq!(
-        safe_block_hash(&follower.l2_rpc_url()).await.unwrap(),
-        Some(committed),
-        "follower safe block hash must match the L1 commitment",
-    );
+    let committed_number = ProviderBuilder::new()
+        .connect_http(l2_rpc.parse().unwrap())
+        .get_block_by_hash(committed)
+        .await
+        .unwrap()
+        .expect("the composer has the block L1 commits to")
+        .header
+        .number;
+    if let Err(err) =
+        wait_for_safe_chain_contains(&follower, committed_number, committed, SETTLE_TIMEOUT).await
+    {
+        let safe = block_number_and_hash_at(&follower.l2_rpc_url(), BlockNumberOrTag::Safe).await;
+        panic!(
+            "the follower's safe chain never held the block L1 commits to, \
+             #{committed_number} {committed}; its safe block is {safe:?}: {err:#}"
+        );
+    }
     follower.assert_no_process_death();
     w.node.assert_no_divergence_failure_logs();
 }
@@ -2249,4 +2263,204 @@ async fn failed_rich_bundle_keeps_live_l2_txs() {
         "the L2 pool never refused the rolled-back outbound call"
     );
     w.node.assert_no_divergence_failure_logs();
+}
+
+/// The relay queues the bundle but its reply is lost. L1 decides the outcome,
+/// so the batch settles and its block is never rolled back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_reply_lost_bundle_still_settles() {
+    let w = setup_cross_chain_with_builder_stub().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let l2 = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+    w.set_builder_mode(BuilderStubMode::AckLost).await.unwrap();
+
+    let from = w.node.signal_cursor().unwrap();
+    let outbound = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        ISetterWrapper::setViaProxyCall {
+            v: U256::from(84u64),
+        }
+        .abi_encode(),
+        1_200_000,
+    )
+    .await
+    .unwrap();
+    let n = wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(from)?;
+        let dispatched = emitted
+            .iter()
+            .find(|s| s.name == signals::COMPOSER_BUNDLE_DISPATCHED);
+        dispatched.map(|s| s.u64("sync_height")).transpose()
+    })
+    .await
+    .unwrap();
+
+    let at_n = |s: &signals::NodeSignal, name: &str| {
+        s.name == name && s.u64("sync_height").ok() == Some(n)
+    };
+    let observed = wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(from)?;
+        anyhow::ensure!(
+            !emitted
+                .iter()
+                .any(|s| at_n(s, signals::COMPOSER_RECOVERY_SUBSTITUTED)),
+            "the Sync block {n} was rolled back",
+        );
+        let verdict = emitted
+            .iter()
+            .find(|s| at_n(s, signals::COMPOSER_BUNDLE_OBSERVED));
+        Ok(verdict.map(|s| s.fields.get("settled").and_then(serde_json::Value::as_bool)))
+    })
+    .await;
+    match observed {
+        Ok(settled) => assert_eq!(settled, Some(true), "the bundle at {n} did not settle"),
+        Err(err) => panic!(
+            "no verdict for the bundle at {n}: {err:#}{}",
+            w.settlement_diagnostics()
+        ),
+    }
+
+    let value = wait_for(SETTLE_TIMEOUT, || async {
+        let value = l2_value(&l1_rpc, w.outbound_value).await?;
+        Ok((value == U256::from(84u64)).then_some(value))
+    })
+    .await;
+    assert!(value.is_ok(), "the L1 target never read 84");
+
+    let rich = l2.get_block_by_number(n.into()).await.unwrap().unwrap();
+    assert!(
+        rich.transactions.hashes().any(|tx| tx == outbound),
+        "the Sync block {n} does not carry the outbound call",
+    );
+    wait_for_safe_chain_contains(&w.node, n, rich.header.hash, SETTLE_TIMEOUT)
+        .await
+        .unwrap();
+    assert!(
+        !w.node
+            .signals_since(from)
+            .unwrap()
+            .iter()
+            .any(|s| at_n(s, signals::COMPOSER_RECOVERY_SUBSTITUTED)),
+        "the Sync block {n} was rolled back",
+    );
+    w.node.assert_no_divergence_failure_logs();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_capacity_in_empty_sync_block_is_evicted_and_nonce_released() {
+    let w = setup_cross_chain().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let l2 = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+    let artifact: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(eez_testkit::repo_root().join("contracts/out/GasBurner.sol/GasBurner.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    let creation: Bytes = artifact["bytecode"]["object"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let deployment = sign_and_send(
+        &l2_rpc,
+        TARGET_DEPLOYER,
+        w.l2_chain_id,
+        onchain_nonce(&l2_rpc, TARGET_DEPLOYER).await.unwrap(),
+        None,
+        U256::ZERO,
+        creation.to_vec(),
+        2_000_000,
+    )
+    .await
+    .unwrap();
+    let receipt = wait_for(SETTLE_TIMEOUT, || async {
+        Ok(l2.get_transaction_receipt(deployment).await?)
+    })
+    .await
+    .unwrap();
+    assert!(receipt.status());
+    let target = receipt.contract_address.unwrap();
+    let proxy = eez_testkit::create_cross_chain_proxy(
+        &l1_rpc,
+        w.cfg.deployer_key,
+        w.cfg.eez_address,
+        target,
+        w.cfg.rollup_id,
+    )
+    .await
+    .unwrap();
+    let wrapper = eez_testkit::deploy_setter_wrapper(&l1_rpc, TARGET_DEPLOYER, DEV_CHAIN_ID, proxy)
+        .await
+        .unwrap();
+    let nonce = onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap();
+    let cursor = w.node.signal_cursor().unwrap();
+    // Each delivery fits the 2^24 cap; two cannot fit the 30M Sync block.
+    // This is the only held tx, so Capacity occurs with no accepted groups.
+    let rejected = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(wrapper),
+        U256::ZERO,
+        ISetterWrapper::setSameValueTwiceCall {
+            v: U256::from(15_200_000),
+        }
+        .abi_encode(),
+        1_200_000,
+    )
+    .await
+    .unwrap();
+    wait_for_poison_eviction(&w, cursor, rejected, "Inbound", "empty-block capacity").await;
+    let hash = rejected.to_string();
+    let logs = w.node.log_lines_matching(&[hash.as_str()], usize::MAX);
+    assert!(
+        logs.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
+                record["fields"]["error"].as_str()
+                    == Some("executor: insufficient remaining L2 block gas")
+            })
+        }),
+        "must evict for Capacity, not an unrelated multicall or execution error: {logs}"
+    );
+    assert_eq!(onchain_nonce(&l1_rpc, INBOUND_USER).await.unwrap(), nonce);
+    assert_eq!(
+        l2.get_storage_at(target, U256::ZERO).await.unwrap(),
+        U256::ZERO
+    );
+
+    let replacement = sign_and_send(
+        &w.l1_xchain(),
+        INBOUND_USER,
+        DEV_CHAIN_ID,
+        nonce,
+        Some(wrapper),
+        U256::ZERO,
+        ISetterWrapper::setViaProxyCall {
+            v: U256::from(15_200_000),
+        }
+        .abi_encode(),
+        1_200_000,
+    )
+    .await
+    .expect("eviction must release the held nonce reservation");
+    assert_all_transactions_succeeded(&w, &l1_rpc, &[replacement], "capacity replacement").await;
+    wait_for(SETTLE_TIMEOUT, || async {
+        Ok((l2.get_storage_at(target, U256::ZERO).await? == U256::from(1)).then_some(()))
+    })
+    .await
+    .expect("one full-cap delivery must settle after rejecting the pair");
+    assert_eq!(receipt_ok(&l1_rpc, rejected).await.unwrap(), None);
+    assert_eq!(
+        completed_proxy_calls(&l1_rpc, wrapper).await.unwrap(),
+        U256::from(1)
+    );
+    w.node.assert_no_process_death();
 }

@@ -75,7 +75,7 @@ enum Resolution {
     /// L1 settled (observer verdict or Deriver cursor confirmation).
     /// Retained until L1 finality for reorg recovery.
     Settled,
-    /// Observer verdict: the bundle didn't land. Awaiting slot-context
+    /// Observer verdict: L1 kept nothing of the batch. Awaiting slot-context
     /// recovery (reorg + re-push) via
     /// [`OptimisticallyIncluded::take_failed_for_recovery`]. The
     /// Deriver's cursor reaching this height overrides to Settled — the
@@ -258,8 +258,8 @@ impl OptimisticallyIncluded {
         }
     }
 
-    /// Observer verdict: the bundle failed (dropped, or landed without
-    /// reaching the claimed final state root). Marks the entry Failed;
+    /// Observer verdict: L1 kept nothing of the batch, or it was never sent.
+    /// Marks the entry Failed;
     /// the actual recovery (L2 reorg + re-push) happens in slot
     /// context via [`Self::take_failed_for_recovery`] — the observer
     /// task never mutates chain state. No-op if the entry is already
@@ -274,6 +274,15 @@ impl OptimisticallyIncluded {
             entry.resolution = Resolution::Failed;
             entry.charge = charge;
         }
+    }
+
+    /// Whether the bundle `post_batch_hash` at `sync_height` still awaits a verdict.
+    #[must_use]
+    pub fn is_pending(&self, sync_height: u64, post_batch_hash: TxHash) -> bool {
+        let map = self.by_sync_height.lock().unwrap();
+        map.get(&sync_height).is_some_and(|entry| {
+            entry.post_batch_hash == post_batch_hash && entry.resolution == Resolution::Pending
+        })
     }
 
     /// Extract the Failed entry above `cursor`, if any, for slot-
@@ -755,6 +764,30 @@ mod tests {
             optimistic.take_failed_for_recovery(0).unwrap().charge,
             AttemptCharge::Excluded,
         );
+    }
+
+    /// An entry is pending until a verdict or the cursor resolves it, and only
+    /// for its own bundle.
+    #[test]
+    fn pending_until_resolved() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1)]);
+        assert!(pool.is_pending(10, pb_hash(0xa)));
+        assert!(!pool.is_pending(10, pb_hash(0xb)));
+        pool.resolve_below_cursor(10);
+        assert!(!pool.is_pending(10, pb_hash(0xa)));
+    }
+
+    #[test]
+    fn failed_recovery_preserves_uncharged_verdict() {
+        let pool = OptimisticallyIncluded::new();
+        pool.begin(10, pb_hash(0xa), hdr(), B256::ZERO, vec![tx(1), tx(2)]);
+        // A skipped-slot drop isn't the tx's fault; the verdict must reach
+        // recovery so the caller requeues without poison-eviction.
+        pool.mark_failed(10, pb_hash(0xa), AttemptCharge::None);
+        let batch = pool.take_failed_for_recovery(0).expect("failed entry");
+        assert_eq!(batch.charge, AttemptCharge::None);
+        assert_eq!(batch.txs.len(), 2);
     }
 
     #[test]
