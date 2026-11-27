@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::attestation_quorum::AttestationQuorum;
+use crate::composer::tests::held;
 use crate::composer::{CrossChainExecCtx, CrossChainWiring};
 use crate::held_pool::{HeldPool, HeldTx};
 use crate::in_flight::{InFlightBatches, MAX_BUNDLE_ATTEMPTS};
@@ -480,4 +481,85 @@ async fn own_partial_batch_still_charges_the_culprit() {
             .push_contiguous(replacement, 0)
             .unwrap();
     }
+}
+
+/// A batch replaced at its height leaves the ledger, so its bodies go and its
+/// reservation stays; the same batch begun again keeps its bodies.
+#[tokio::test]
+async fn a_batch_replaced_at_its_height_is_forgotten() {
+    let fixture = Fixture::new(ProviderBuilder::default().connect_mocked_client(Asserter::new()));
+    let rollup = fixture.rollup();
+    let (old, new) = (B256::repeat_byte(0xb1), B256::repeat_byte(0xb2));
+    let replaced = held(SENDER, Direction::Inbound, 0, 0x01);
+    let kept = held(Address::repeat_byte(0x22), Direction::Inbound, 0, 0x02);
+    for tx in [&replaced, &kept] {
+        rollup.held_pool.push_contiguous(tx.clone(), 0).unwrap();
+    }
+    let _reserved = rollup.held_pool.pop_all();
+    for (batch_id, tx) in [(old, &replaced), (new, &kept), (new, &kept)] {
+        rollup.in_flight.begin(batch_id, vec![tx.clone()]);
+        let txs = vec![BatchTx::from(tx)];
+        let parent = header(4);
+        fixture
+            .composer
+            .begin_batch(1, rollup, 5, batch_id, parent, B256::ZERO, txs);
+    }
+
+    // Only the batch the ledger still holds has a body to re-queue.
+    let requeue = [(old, &replaced), (new, &kept)]
+        .map(|(batch_id, tx)| whole_batch(batch_id, &[tx.into()], TxDisposition::Requeue, false));
+    dispose(1, &rollup.held_pool, &rollup.in_flight, requeue.to_vec());
+    let queued = rollup.held_pool.pop_all();
+    assert_eq!(
+        queued.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+        vec![kept.hash]
+    );
+    assert!(
+        rollup.held_pool.holds(&replaced.hash),
+        "the replaced batch's reservation stays"
+    );
+}
+
+/// The cursor releases a settled batch and the partial sweep a spent tx, but
+/// the ledger keeps both until L1 finality: a reorg that rolls them out must
+/// still find their bodies and re-queue them.
+#[tokio::test]
+async fn txs_released_before_finality_return_on_an_l1_reorg() {
+    let fixture = Fixture::new(ProviderBuilder::default().connect_mocked_client(Asserter::new()));
+    let rollup = fixture.rollup();
+    let partial_batch = B256::repeat_byte(0xa2);
+    let settled = held(Address::repeat_byte(0x22), Direction::Outbound, 0, 0x01);
+    let spent = held(SENDER, Direction::Outbound, 0, 0x02);
+    for (height, batch_id, tx) in [(10, BATCH, &settled), (12, partial_batch, &spent)] {
+        rollup.held_pool.push_contiguous(tx.clone(), 0).unwrap();
+        rollup.in_flight.begin(batch_id, rollup.held_pool.pop_n(1));
+        let parent = header(height - 1);
+        let block = header(height).hash();
+        let _ = rollup
+            .optimistic
+            .begin(height, batch_id, parent, block, vec![tx.into()]);
+    }
+    rollup.optimistic.mark_settled(10, BATCH);
+    rollup
+        .l1_head
+        .append(record(100, 9, B256::repeat_byte(0x90)));
+    rollup.l1_head.append(record(101, 12, partial_batch));
+    // L2 has used `spent`'s nonce, so the sweep of the partial batch releases it.
+    rollup
+        .l2_provider
+        .add_account(SENDER, ExtendedAccount::new(1, U256::ZERO));
+
+    let outcome = fixture.composer.reconcile_slot_batches(1, rollup, 12).await;
+    assert!(outcome.is_none(), "nothing failed");
+    assert!(
+        !rollup.held_pool.holds(&settled.hash),
+        "the cursor released it"
+    );
+
+    fixture.notify_composer();
+    let queued = rollup.held_pool.pop_all();
+    assert_eq!(
+        queued.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+        vec![settled.hash, spent.hash],
+    );
 }

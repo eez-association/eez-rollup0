@@ -304,6 +304,95 @@ pub(crate) fn dispose(
 mod tests {
     use super::*;
     use crate::composer::tests::held;
+    use TxDisposition::{Charge, Release, Requeue};
+
+    const BATCH: B256 = B256::repeat_byte(0xb1);
+
+    /// Admit `txs` and drain them into batch `batch_id`, as the drain and the
+    /// rich-batch begin do. Nonces start at zero per sender.
+    fn begin(pool: &HeldPool, batches: &InFlightBatches, batch_id: B256, txs: &[&HeldTx]) {
+        for tx in txs {
+            pool.push_contiguous((*tx).clone(), 0).unwrap();
+        }
+        batches.begin(batch_id, pool.pop_n(txs.len()));
+    }
+
+    fn decided(
+        batch_id: B256,
+        refuse_at: Option<u64>,
+        txs: &[(&HeldTx, TxDisposition)],
+        keep_released: bool,
+    ) -> BatchDisposition {
+        BatchDisposition {
+            batch_id,
+            refuse_at,
+            txs: txs.iter().map(|(tx, fate)| (tx.hash, *fate)).collect(),
+            keep_released,
+        }
+    }
+
+    /// The bodies the table holds for `batch_id`, in order.
+    fn bodies(batches: &InFlightBatches, batch_id: B256) -> Option<Vec<TxHash>> {
+        let by_batch = batches.by_batch.lock().unwrap();
+        by_batch
+            .get(&batch_id)
+            .map(|txs| txs.iter().map(|tx| tx.hash).collect())
+    }
+
+    /// The pool keys a reservation by hash, so a release needs no body.
+    #[test]
+    fn a_release_with_no_body_still_frees_the_reservation() {
+        let pool = HeldPool::new();
+        let batches = InFlightBatches::new();
+        let tx = held(Address::repeat_byte(1), Direction::Inbound, 0, 0x01);
+        pool.push_contiguous(tx.clone(), 0).unwrap();
+        let _reserved = pool.pop_all();
+
+        dispose(
+            1,
+            &pool,
+            &batches,
+            vec![decided(BATCH, None, &[(&tx, Release)], false)],
+        );
+
+        assert!(!pool.holds(&tx.hash));
+        pool.push_contiguous(held(tx.sender, Direction::Inbound, 0, 0x02), 0)
+            .expect("the nonce is free again");
+    }
+
+    #[test]
+    fn the_table_gives_up_exactly_the_disposed_bodies() {
+        let pool = HeldPool::new();
+        let batches = InFlightBatches::new();
+        let (a, b, c) = (
+            held(Address::repeat_byte(1), Direction::Inbound, 0, 0x01),
+            held(Address::repeat_byte(2), Direction::Inbound, 0, 0x02),
+            held(Address::repeat_byte(3), Direction::Inbound, 0, 0x03),
+        );
+        begin(&pool, &batches, BATCH, &[&a, &b, &c]);
+        assert_eq!(bodies(&batches, BATCH), Some(vec![a.hash, b.hash, c.hash]));
+
+        dispose(
+            1,
+            &pool,
+            &batches,
+            vec![decided(BATCH, None, &[(&a, Requeue)], false)],
+        );
+        assert_eq!(bodies(&batches, BATCH), Some(vec![b.hash, c.hash]));
+
+        // Released under keep_released: the ledger still holds it for a reorg.
+        dispose(
+            1,
+            &pool,
+            &batches,
+            vec![decided(BATCH, None, &[(&b, Release)], true)],
+        );
+        assert_eq!(bodies(&batches, BATCH), Some(vec![b.hash, c.hash]));
+
+        let last = [(&b, Release), (&c, Charge)];
+        dispose(1, &pool, &batches, vec![decided(BATCH, None, &last, false)]);
+        assert_eq!(bodies(&batches, BATCH), None);
+    }
 
     #[test]
     fn settlement_failures_increment_once_per_episode_and_preserve_fifo() {
