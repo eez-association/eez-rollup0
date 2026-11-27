@@ -555,6 +555,10 @@ async fn txs_released_before_finality_return_on_an_l1_reorg() {
         !rollup.held_pool.holds(&settled.hash),
         "the cursor released it"
     );
+    assert!(
+        rollup.optimistic.partial_to_dispose(12).is_none(),
+        "the partial sweep disposed its batch"
+    );
 
     fixture.notify_composer();
     let queued = rollup.held_pool.pop_all();

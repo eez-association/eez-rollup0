@@ -538,7 +538,7 @@ where
             replaced_batch_id = %replaced,
             batch_id = %batch_id,
             txs = replaced_txs.len(),
-            "a batch with txs was replaced at its height, which the one-in-flight gate should prevent; its tx bodies are dropped and their nonce reservations stay held",
+            "a batch with txs was replaced at its height, which the one-in-flight gate should prevent; its tx bodies are dropped, and a tx of it that still holds a nonce reservation keeps it until restart, which blocks its sender",
         );
         let forget = whole_batch(replaced, &replaced_txs, TxDisposition::Forget, false);
         dispose(

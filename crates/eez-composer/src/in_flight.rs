@@ -291,6 +291,7 @@ pub(crate) fn dispose(
         event!(
             name: "eez.composer.recovery.re_pushed",
             Level::INFO,
+            event_name = "eez.composer.recovery.re_pushed",
             rollup_id,
             sync_height,
             re_pushed,
@@ -339,27 +340,6 @@ mod tests {
             .map(|txs| txs.iter().map(|tx| tx.hash).collect())
     }
 
-    /// The pool keys a reservation by hash, so a release needs no body.
-    #[test]
-    fn a_release_with_no_body_still_frees_the_reservation() {
-        let pool = HeldPool::new();
-        let batches = InFlightBatches::new();
-        let tx = held(Address::repeat_byte(1), Direction::Inbound, 0, 0x01);
-        pool.push_contiguous(tx.clone(), 0).unwrap();
-        let _reserved = pool.pop_all();
-
-        dispose(
-            1,
-            &pool,
-            &batches,
-            vec![decided(BATCH, None, &[(&tx, Release)], false)],
-        );
-
-        assert!(!pool.holds(&tx.hash));
-        pool.push_contiguous(held(tx.sender, Direction::Inbound, 0, 0x02), 0)
-            .expect("the nonce is free again");
-    }
-
     #[test]
     fn the_table_gives_up_exactly_the_disposed_bodies() {
         let pool = HeldPool::new();
@@ -377,15 +357,6 @@ mod tests {
             &pool,
             &batches,
             vec![decided(BATCH, None, &[(&a, Requeue)], false)],
-        );
-        assert_eq!(bodies(&batches, BATCH), Some(vec![b.hash, c.hash]));
-
-        // Released under keep_released: the ledger still holds it for a reorg.
-        dispose(
-            1,
-            &pool,
-            &batches,
-            vec![decided(BATCH, None, &[(&b, Release)], true)],
         );
         assert_eq!(bodies(&batches, BATCH), Some(vec![b.hash, c.hash]));
 

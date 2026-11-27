@@ -123,9 +123,9 @@ impl OptimisticallyIncluded {
     /// Record a freshly-submitted batch: the Sync block at
     /// `sync_height` carries `txs`' cross-chain effects and its bundle
     /// — whose postBatch L1 tx hashes to `post_batch_hash` — is now in
-    /// flight. Replaces any stale entry at the same height (a
-    /// failed-then-reorged slot rebuilds at the same height) and returns it
-    /// as `(post_batch_hash, txs)`.
+    /// flight. Replaces any entry at the same height and returns it as
+    /// `(post_batch_hash, txs)`. The one-in-flight gate keeps a different
+    /// batch from being there; the caller reports one that is.
     #[must_use]
     pub fn begin(
         &self,
