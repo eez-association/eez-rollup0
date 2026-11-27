@@ -4,6 +4,8 @@
 use super::*;
 use crate::attestation_quorum::AttestationQuorum;
 use crate::composer::{CrossChainExecCtx, CrossChainWiring};
+use crate::held_pool::HeldPool;
+use crate::in_flight::MAX_BUNDLE_ATTEMPTS;
 use alloy_consensus::Header;
 use alloy_primitives::U256;
 use alloy_provider::{ProviderBuilder, RootProvider, mock::Asserter};
@@ -11,7 +13,7 @@ use async_trait::async_trait;
 use eez_driver::{BlockCommitterHandle, RollupTiming};
 use eez_evm::EezEvmConfig;
 use eez_l1::{BatchRecord, L1CanonicalHead, L1ReaderConfig, SubmitterConfig, scan::PostId};
-use eez_prover::ProvingContext;
+use eez_prover::{ProverError, ProvingContext};
 use reth_chainspec::ChainSpecBuilder;
 use reth_engine_primitives::{BeaconEngineMessage, ConsensusEngineHandle, OnForkChoiceUpdated};
 use reth_payload_builder::PayloadBuilderHandle;

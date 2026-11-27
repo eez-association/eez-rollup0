@@ -5,25 +5,28 @@ use std::sync::Arc;
 
 use alloy_eips::Encodable2718;
 use alloy_primitives::{Address, B256, Bytes, U256};
-use alloy_provider::Provider as _;
 use eez_driver::{BUILDER_GAS_LIMIT, BundleRelease, SyncSlotBlock};
 use eez_evm::EezEvmConfig;
 use eez_l1::BundleTarget;
 use reth_primitives_traits::AlloyBlockHeader;
-use reth_storage_api::{BlockReader, StateProvider, StateProviderFactory, TransactionsProvider};
+use reth_storage_api::{BlockReader, StateProviderFactory, TransactionsProvider};
 use tracing::{Level, event};
 
-use super::batcher::{
-    BlobBytes, Dispatched, PostBatchGasBudget, PreparePostBatchError, SignedPostBatch, SlotTarget,
-    Staged,
+use super::batcher::{Dispatched, PreparePostBatchError, SignedPostBatch, SlotTarget, Staged};
+use super::blob::target_blob_limit;
+use super::budget::{
+    BlobBytes, BlockGasFit, PostBatchGasBudget, blob_stream_len, block_gas_fit, declared_gas_limit,
+    gas_limit_violation,
 };
-use super::blob::{blob_stream_len, target_blob_limit};
-use super::recovery::{
+use super::nonces::{
+    inbound_source_nonces_for_drain, outbound_source_nonces_for_drain, partition_stale,
+};
+use super::{Composer, CrossChainWiring};
+use crate::held_pool::HeldTx;
+use crate::in_flight::{
     MAX_BUNDLE_ATTEMPTS, SettlementFailureSource, recover_prover_failure,
     recover_settlement_failure,
 };
-use super::{Composer, CrossChainExecCtx, CrossChainWiring};
-use crate::held_pool::HeldTx;
 use crate::ingress::Direction;
 use crate::local::{
     BuildError, InboundL2TargetSession, L1SlotState, L1TargetSession,
@@ -149,47 +152,6 @@ fn compose_crosschain(
     Ok((composition, sessions, target_gas))
 }
 
-/// What the drain can do with a pair wanting `declared` gas on a Sync block
-/// that already holds `gas_used`, or with a tx against the batch's blob bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BlockGasFit {
-    /// Room in this block — accept.
-    Accept,
-    /// No room here, but an emptier block would take it: hold for a later slot.
-    Defer,
-    /// Over the whole block limit, so no slot can ever take it.
-    Unfittable,
-}
-
-/// Whether a pair fits the L2 Sync block. Sums DECLARED limits, which is what
-/// the builder refuses on; over-estimating only defers early, never overflows.
-const fn block_gas_fit(gas_used: u64, declared: u64, block_gas_limit: u64) -> BlockGasFit {
-    if gas_used.saturating_add(declared) <= block_gas_limit {
-        BlockGasFit::Accept
-    } else if declared > block_gas_limit {
-        BlockGasFit::Unfittable
-    } else {
-        BlockGasFit::Defer
-    }
-}
-
-/// Declared gas limit of a raw tx. An undecodable tx counts as the whole block
-/// so it is refused, never read as free space (`invariant 7`).
-fn declared_gas_limit(raw: &Bytes) -> u64 {
-    use alloy_consensus::Transaction as _;
-    use alloy_eips::eip2718::Decodable2718 as _;
-    reth_ethereum_primitives::TransactionSigned::decode_2718(&mut raw.as_ref())
-        .map_or(u64::MAX, |tx| tx.gas_limit())
-}
-
-/// The declared limit and active cap when an envelope can never fit.
-const fn gas_limit_violation(declared: u64, cap: Option<u64>) -> Option<(u64, u64)> {
-    match cap {
-        Some(cap) if declared > cap => Some((declared, cap)),
-        _ => None,
-    }
-}
-
 /// The refused pair's numbers, for the block-gas cut event.
 #[derive(Debug, Clone, Copy)]
 struct BlockGasCut {
@@ -278,83 +240,6 @@ async fn read_rollup_escrow(
         .await
         .ok()
         .map(|rollup| rollup.etherBalance)
-}
-
-/// Read L1 nonces for inbound senders at `at`.
-pub(super) async fn inbound_source_nonces_for_drain(
-    ctx: &CrossChainExecCtx,
-    rollup_id: u64,
-    drained: &[HeldTx],
-    at: alloy_eips::BlockId,
-) -> HashMap<(Address, Direction), u64> {
-    let mut source_nonces = HashMap::new();
-    for tx in drained {
-        let key = (tx.sender, tx.direction);
-        if tx.direction != Direction::Inbound || source_nonces.contains_key(&key) {
-            continue;
-        }
-        match ctx
-            .l1_provider
-            .get_transaction_count(tx.sender)
-            .block_id(at)
-            .await
-        {
-            Ok(nonce) => {
-                source_nonces.insert(key, nonce);
-            }
-            Err(err) => event!(
-                name: "eez.composer.cc_compose.source_nonce_check_failed",
-                Level::WARN,
-                rollup_id,
-                sender = %tx.sender,
-                direction = ?tx.direction,
-                error = %err,
-                "canonical source-chain nonce read failed",
-            ),
-        }
-    }
-    source_nonces
-}
-
-/// Read outbound nonces from the Sync block's parent state.
-pub(super) fn outbound_source_nonces_for_drain(
-    parent_state: &dyn StateProvider,
-    rollup_id: u64,
-    drained: &[HeldTx],
-) -> HashMap<(Address, Direction), u64> {
-    let mut source_nonces = HashMap::new();
-    for tx in drained {
-        let key = (tx.sender, tx.direction);
-        if tx.direction != Direction::Outbound || source_nonces.contains_key(&key) {
-            continue;
-        }
-        match parent_state.account_nonce(&tx.sender) {
-            Ok(nonce) => {
-                source_nonces.insert(key, nonce.unwrap_or(0));
-            }
-            Err(err) => event!(
-                name: "eez.composer.cc_compose.source_nonce_check_failed",
-                Level::WARN,
-                rollup_id,
-                sender = %tx.sender,
-                direction = ?tx.direction,
-                error = %err,
-                "L2 source nonce read failed",
-            ),
-        }
-    }
-    source_nonces
-}
-
-pub(super) fn partition_stale(
-    drained: Vec<HeldTx>,
-    source_nonces: &HashMap<(Address, Direction), u64>,
-) -> (Vec<HeldTx>, Vec<HeldTx>) {
-    drained.into_iter().partition(|tx| {
-        source_nonces
-            .get(&(tx.sender, tx.direction))
-            .is_none_or(|source_nonce| *source_nonce <= tx.nonce)
-    })
 }
 
 fn poison_gap_for(gaps: &[(Address, Direction, u64)], tx: &HeldTx) -> Option<u64> {
@@ -2422,10 +2307,9 @@ mod native_gas_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::composer::tests::{held, signed_user_tx};
+    use crate::composer::tests::held;
     use crate::held_pool::HeldPool;
     use crate::prover_retry::validate_actionable_prover_failure;
-    use alloy_primitives::TxHash;
     use alloy_sol_types::SolValue as _;
     use eez_prover::ActionableProverFailure;
 
@@ -2647,146 +2531,5 @@ mod tests {
                 expected
             );
         }
-    }
-
-    #[test]
-    fn stale_partition_is_canonical_directional_and_ordered() {
-        let sender = Address::repeat_byte(0xd);
-        let other = Address::repeat_byte(0xe);
-        let drained = vec![
-            held(sender, Direction::Inbound, 1, 1),
-            held(sender, Direction::Inbound, 3, 3),
-            held(sender, Direction::Outbound, 2, 2),
-            held(sender, Direction::Outbound, 4, 4),
-            held(other, Direction::Inbound, 0, 5),
-            held(sender, Direction::Inbound, 2, 6),
-        ];
-        let source_nonces = HashMap::from([
-            ((sender, Direction::Inbound), 3),
-            ((sender, Direction::Outbound), 3),
-        ]);
-
-        let (fresh, stale) = partition_stale(drained, &source_nonces);
-
-        assert_eq!(
-            fresh.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
-            vec![
-                TxHash::repeat_byte(3),
-                TxHash::repeat_byte(4),
-                TxHash::repeat_byte(5),
-            ]
-        );
-        assert_eq!(
-            stale.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
-            vec![
-                TxHash::repeat_byte(1),
-                TxHash::repeat_byte(2),
-                TxHash::repeat_byte(6),
-            ]
-        );
-    }
-
-    /// Two outbound pairs near the EIP-7825 cap overflow a 30M block, so the
-    /// second must be refused before `build_sync_block` hard-errors on it.
-    #[test]
-    fn block_gas_fit_refuses_the_second_fat_outbound_pair() {
-        // The early gate checks the signed user's declared gas. The actual
-        // load is metered before the user is admitted by append_and_execute.
-        const USER_DECLARED: u64 = 16_700_000;
-        const USER_BURNED: u64 = 13_300_000;
-        const LOAD_BURNED: u64 = 100_000;
-        let pair = USER_DECLARED;
-
-        // Pair 1 fits an empty block.
-        assert_eq!(
-            block_gas_fit(0, pair, BUILDER_GAS_LIMIT),
-            BlockGasFit::Accept
-        );
-        // Pair 2 sees the burn of pair 1 and does not.
-        let after_one = LOAD_BURNED + USER_BURNED;
-        assert_eq!(
-            block_gas_fit(after_one, pair, BUILDER_GAS_LIMIT),
-            BlockGasFit::Defer,
-            "the second fat pair must be deferred, not built",
-        );
-        // Ground truth for the deferral: the builder itself would refuse pair 2's
-        // user tx, since its declared limit exceeds what the block has left.
-        assert!(USER_DECLARED > BUILDER_GAS_LIMIT - after_one - LOAD_BURNED);
-
-        // Exact boundary: equal fits, one over defers.
-        assert_eq!(
-            block_gas_fit(BUILDER_GAS_LIMIT - pair, pair, BUILDER_GAS_LIMIT),
-            BlockGasFit::Accept,
-        );
-        assert_eq!(
-            block_gas_fit(BUILDER_GAS_LIMIT - pair + 1, pair, BUILDER_GAS_LIMIT),
-            BlockGasFit::Defer,
-        );
-
-        // Head of line: a pair over the whole block is unfittable at any prefix,
-        // so it is evicted rather than deferred forever.
-        assert_eq!(
-            block_gas_fit(0, BUILDER_GAS_LIMIT + 1, BUILDER_GAS_LIMIT),
-            BlockGasFit::Unfittable,
-        );
-        assert_eq!(
-            block_gas_fit(after_one, BUILDER_GAS_LIMIT + 1, BUILDER_GAS_LIMIT),
-            BlockGasFit::Unfittable,
-        );
-        // An undecodable tx counts as the whole block, so it can never be
-        // mistaken for free space.
-        assert_eq!(
-            declared_gas_limit(&Bytes::from_static(b"not a tx")),
-            u64::MAX
-        );
-        assert_eq!(
-            block_gas_fit(0, u64::MAX, BUILDER_GAS_LIMIT),
-            BlockGasFit::Unfittable,
-        );
-    }
-
-    #[test]
-    fn eip_7825_user_cap_is_independent_of_sync_block_fit() {
-        // An invalid user limit can still fit in the aggregate Sync-block budget.
-        const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
-        let invalid_user_limit = EIP_7825_TX_GAS_LIMIT + 1;
-        let pair_limit = invalid_user_limit;
-
-        assert_eq!(
-            block_gas_fit(0, pair_limit, BUILDER_GAS_LIMIT),
-            BlockGasFit::Accept,
-            "block capacity alone must not be treated as user-transaction validity",
-        );
-        assert!(invalid_user_limit > EIP_7825_TX_GAS_LIMIT);
-        assert!(pair_limit < BUILDER_GAS_LIMIT);
-    }
-
-    #[test]
-    fn gas_limit_violation_uses_the_decoded_eip_7825_boundary_only_when_active() {
-        const EIP_7825_TX_GAS_LIMIT: u64 = alloy_eips::eip7825::MAX_TX_GAS_LIMIT_OSAKA;
-        let at_cap = declared_gas_limit(&signed_user_tx(EIP_7825_TX_GAS_LIMIT));
-        let over_cap = declared_gas_limit(&signed_user_tx(EIP_7825_TX_GAS_LIMIT + 1));
-
-        assert_eq!(
-            gas_limit_violation(at_cap, Some(EIP_7825_TX_GAS_LIMIT)),
-            None
-        );
-        assert_eq!(
-            gas_limit_violation(over_cap, Some(EIP_7825_TX_GAS_LIMIT)),
-            Some((EIP_7825_TX_GAS_LIMIT + 1, EIP_7825_TX_GAS_LIMIT)),
-        );
-        assert_eq!(gas_limit_violation(over_cap, None), None);
-    }
-
-    #[test]
-    fn stale_partition_fails_open_without_a_source_nonce() {
-        let tx = held(Address::repeat_byte(0xf), Direction::Outbound, 9, 1);
-        let (fresh, stale) = partition_stale(vec![tx.clone()], &HashMap::new());
-        assert_eq!(fresh[0].hash, tx.hash);
-        assert!(stale.is_empty());
-
-        let (fresh, stale) = partition_stale(Vec::new(), &HashMap::new());
-        assert!(fresh.is_empty());
-        assert!(stale.is_empty());
     }
 }

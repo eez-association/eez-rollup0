@@ -8,35 +8,21 @@ use alloy_primitives::{Address, B256, Bytes};
 use eez_l1::{
     BundleTarget, DropReason, L1Error, L1Event, RelayReply, SendOutcome, SentBundle, Submitter,
 };
-use eez_prover::{ProverError, RetryableProverError};
 use reth_primitives_traits::AlloyBlockHeader;
 use reth_storage_api::{BlockReader, StateProviderFactory, TransactionsProvider};
 use tokio::sync::broadcast;
 use tracing::{Level, event};
 
-use super::compose::{
+use super::nonces::{
     inbound_source_nonces_for_drain, outbound_source_nonces_for_drain, partition_stale,
 };
 use super::{Composer, Inner};
-use crate::held_pool::{HeldPool, HeldTx};
+use crate::held_pool::HeldTx;
+use crate::in_flight::{SettlementFailureSource, recover_settlement_failure};
 use crate::ingress::Direction;
 use crate::local::build_sync_block;
 use crate::optimistic::OptimisticallyIncluded;
 use crate::rollup::RollupState;
-
-/// Failed inclusion attempts before a held user_tx is evicted as probable
-/// poison. This covers funding deferrals, relay drops, and proof requests that
-/// still fail after their retry episode. After this many failures, the
-/// transaction and its nonce-dependent suffix are evicted so they cannot block
-/// the FIFO queue indefinitely.
-///
-/// Drain-time simulations are chained per chain in canonical order
-/// (`compose_crosschain` over the slot's L1 state and the Sync block under
-/// construction — `docs/CHAINED-INTERSTATE-DESIGN.md`), so a co-bundled
-/// prerequisite is already visible when its dependant composes. What this bound
-/// backstops is the residual: L1 state that moves between compose time and the
-/// bundle's inclusion block.
-pub const MAX_BUNDLE_ATTEMPTS: u32 = 3;
 
 /// Whether [`Composer::recover_failed_batch`] moved the head, so the caller knows
 /// whether its slot still owes a block.
@@ -47,18 +33,6 @@ pub(super) enum RecoveryOutcome {
     HeadMoved,
     /// Nothing was committed (bail, stale verdict, or nothing to roll back).
     HeadUnchanged,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(super) enum SettlementFailureSource {
-    Prover,
-    Relay,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SettlementFailureOutcome {
-    pub(super) requeued: usize,
-    pub(super) evicted: usize,
 }
 
 /// Dispose of a recovered batch's txs: a spent nonce (`landed`) releases the
@@ -139,112 +113,6 @@ fn partial_disposition(
         })
         .map(|tx| tx.hash);
     (spent.into_iter().map(|tx| tx.hash).collect(), culprit)
-}
-
-/// Count one failed settlement episode for every candidate, evict transactions
-/// that reach the bound, and cascade each eviction through its sender/direction
-/// nonce suffix. Survivors retain their attempt count and FIFO order.
-pub(super) fn recover_settlement_failure(
-    pool: &HeldPool,
-    rollup_id: u64,
-    txs: Vec<HeldTx>,
-    source: SettlementFailureSource,
-) -> SettlementFailureOutcome {
-    let mut retry = Vec::with_capacity(txs.len());
-    let mut evicted = Vec::new();
-    let mut evicted_chains: Vec<(Address, Direction, u64)> = Vec::new();
-
-    for mut tx in txs {
-        tx.attempts = tx.attempts.saturating_add(1);
-        if tx.attempts >= MAX_BUNDLE_ATTEMPTS {
-            evicted_chains.push((tx.sender, tx.direction, tx.nonce));
-            event!(
-                name: "eez.composer.recovery.poison_evicted",
-                Level::ERROR,
-                event_name = "eez.composer.recovery.poison_evicted",
-                rollup_id,
-                source = ?source,
-                tx_hash = %tx.hash,
-                sender = %tx.sender,
-                direction = ?tx.direction,
-                nonce = tx.nonce,
-                attempts = tx.attempts,
-                "potentially valid user_tx evicted after MAX_BUNDLE_ATTEMPTS failed settlement episodes to preserve chain liveness; repeated component disagreement requires investigation; resubmit required",
-            );
-            evicted.push(tx);
-        } else {
-            retry.push(tx);
-        }
-    }
-
-    // Without the missing nonce, later transactions cannot execute and would
-    // keep invalidating batches that include them.
-    for (sender, direction, nonce) in evicted_chains {
-        retry.retain(|tx| {
-            let cascade =
-                tx.sender == sender && tx.direction == direction && tx.nonce > nonce;
-            if cascade {
-                event!(
-                    name: "eez.composer.recovery.nonce_chain_evicted",
-                    Level::ERROR,
-                    event_name = "eez.composer.recovery.nonce_chain_evicted",
-                    rollup_id,
-                    source = ?source,
-                    tx_hash = %tx.hash,
-                    sender = %tx.sender,
-                    direction = ?tx.direction,
-                    nonce = tx.nonce,
-                    gap_at = nonce,
-                    "potentially valid same-sender tx depends on an evicted nonce; evicting nonce suffix for liveness (resubmit in order)",
-                );
-                evicted.push(tx.clone());
-            }
-            !cascade
-        });
-        for tx in pool.evict_chain_at_or_above(sender, direction, nonce) {
-            event!(
-                name: "eez.composer.recovery.nonce_chain_evicted",
-                Level::ERROR,
-                event_name = "eez.composer.recovery.nonce_chain_evicted",
-                rollup_id,
-                source = ?source,
-                tx_hash = %tx.hash,
-                sender = %tx.sender,
-                direction = ?tx.direction,
-                nonce = tx.nonce,
-                gap_at = nonce,
-                "potentially valid pooled tx depends on an evicted nonce; evicting nonce suffix for liveness (resubmit in order)",
-            );
-            evicted.push(tx);
-        }
-    }
-
-    let outcome = SettlementFailureOutcome {
-        requeued: retry.len(),
-        evicted: evicted.len(),
-    };
-    pool.release_in_flight_batch(&evicted);
-    pool.push_front_batch(retry);
-    outcome
-}
-
-pub(super) fn recover_prover_failure(
-    pool: &HeldPool,
-    rollup_id: u64,
-    txs: Vec<HeldTx>,
-    error: &ProverError,
-) -> SettlementFailureOutcome {
-    if error.retryable_kind() == Some(RetryableProverError::Unavailable) {
-        // An unavailable backend has not rejected these candidates. Preserve
-        // earlier charged attempts so an outage cannot reset the eviction bound.
-        let requeued = txs.len();
-        pool.push_front_batch(txs);
-        return SettlementFailureOutcome {
-            requeued,
-            evicted: 0,
-        };
-    }
-    recover_settlement_failure(pool, rollup_id, txs, SettlementFailureSource::Prover)
 }
 
 impl<L2> Inner<L2>
@@ -1107,6 +975,7 @@ mod recovery_tests;
 mod tests {
     use super::*;
     use crate::composer::tests::held;
+    use crate::in_flight::MAX_BUNDLE_ATTEMPTS;
     use alloy_primitives::TxHash;
 
     /// Every relay answer, L1 outcome and pin reading. The verdict differs from
@@ -1354,173 +1223,5 @@ mod tests {
             pool.holds(&TxHash::repeat_byte(0xD1)),
             "an evicted tx stays refused, so reth cannot re-add it from the dropped block",
         );
-    }
-
-    #[test]
-    fn settlement_failures_increment_once_per_episode_and_preserve_fifo() {
-        let pool = HeldPool::new();
-        let first = held(Address::repeat_byte(0xa), Direction::Inbound, 0, 1);
-        let second = held(Address::repeat_byte(0xb), Direction::Inbound, 0, 2);
-        pool.push_contiguous(first.clone(), 0).unwrap();
-        pool.push_contiguous(second.clone(), 0).unwrap();
-
-        let first_failure =
-            recover_settlement_failure(&pool, 1, pool.pop_all(), SettlementFailureSource::Prover);
-        assert_eq!(
-            first_failure,
-            SettlementFailureOutcome {
-                requeued: 2,
-                evicted: 0,
-            }
-        );
-        let after_first = pool.pop_all();
-        assert_eq!(
-            after_first.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
-            vec![first.hash, second.hash]
-        );
-        assert!(after_first.iter().all(|tx| tx.attempts == 1));
-
-        let second_failure =
-            recover_settlement_failure(&pool, 1, after_first, SettlementFailureSource::Relay);
-        assert_eq!(
-            second_failure,
-            SettlementFailureOutcome {
-                requeued: 2,
-                evicted: 0,
-            }
-        );
-        let after_second = pool.pop_all();
-        assert_eq!(
-            after_second.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
-            vec![first.hash, second.hash]
-        );
-        assert!(after_second.iter().all(|tx| tx.attempts == 2));
-        pool.release_in_flight_batch(&after_second);
-    }
-
-    #[test]
-    fn prover_outage_preserves_candidates_and_prior_attempts_past_the_eviction_limit() {
-        let pool = HeldPool::new();
-        let sender = Address::repeat_byte(0xa);
-        let mut root = held(sender, Direction::Inbound, 0, 1);
-        root.attempts = MAX_BUNDLE_ATTEMPTS - 1;
-        let suffix = held(sender, Direction::Inbound, 1, 2);
-        let independent = held(Address::repeat_byte(0xb), Direction::Outbound, 0, 3);
-        pool.push_contiguous(root.clone(), 0).unwrap();
-        pool.push_contiguous(suffix.clone(), 0).unwrap();
-        pool.push_contiguous(independent.clone(), 0).unwrap();
-        let unavailable = ProverError::Retryable {
-            kind: RetryableProverError::Unavailable,
-            message: "connection refused".to_owned(),
-        };
-
-        for _ in 0..=MAX_BUNDLE_ATTEMPTS {
-            let recovery = recover_prover_failure(&pool, 1, pool.pop_all(), &unavailable);
-            assert_eq!(
-                recovery,
-                SettlementFailureOutcome {
-                    requeued: 3,
-                    evicted: 0,
-                },
-                "an outage must not consume candidate attempts or evict a nonce suffix",
-            );
-        }
-        let remaining = pool.pop_all();
-        assert_eq!(
-            remaining.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
-            vec![root.hash, suffix.hash, independent.hash],
-            "recovery must preserve candidates and FIFO order",
-        );
-        assert_eq!(
-            remaining.iter().map(|tx| tx.attempts).collect::<Vec<_>>(),
-            vec![MAX_BUNDLE_ATTEMPTS - 1, 0, 0],
-            "an outage must neither charge nor reset earlier attempts",
-        );
-        assert!(
-            pool.push_contiguous(held(sender, Direction::Inbound, 0, 4), 0)
-                .is_err(),
-            "the original nonce reservation must remain held through the outage",
-        );
-
-        let recovery = recover_prover_failure(
-            &pool,
-            1,
-            remaining,
-            &ProverError::Backend("invalid proof".to_owned()),
-        );
-        assert_eq!(
-            recovery,
-            SettlementFailureOutcome {
-                requeued: 1,
-                evicted: 2,
-            },
-            "the next charged failure must still evict the root and its nonce suffix",
-        );
-        let remaining = pool.pop_all();
-        assert_eq!(remaining[0].hash, independent.hash);
-        assert_eq!(remaining[0].attempts, 1);
-        pool.release_in_flight_batch(&remaining);
-    }
-
-    #[test]
-    fn other_retryable_prover_errors_still_charge_candidate_attempts() {
-        for kind in [
-            RetryableProverError::DeadlineExceeded,
-            RetryableProverError::Aborted,
-        ] {
-            let pool = HeldPool::new();
-            let mut tx = held(Address::repeat_byte(0xa), Direction::Inbound, 0, 1);
-            tx.attempts = MAX_BUNDLE_ATTEMPTS - 1;
-            pool.push_contiguous(tx, 0).unwrap();
-            let error = ProverError::Retryable {
-                kind,
-                message: "attempt failed".to_owned(),
-            };
-
-            let recovery = recover_prover_failure(&pool, 1, pool.pop_all(), &error);
-            assert_eq!(
-                recovery,
-                SettlementFailureOutcome {
-                    requeued: 0,
-                    evicted: 1,
-                },
-                "{kind} must retain the existing eviction bound",
-            );
-            assert!(pool.is_empty());
-        }
-    }
-
-    #[test]
-    fn settlement_failure_limit_evicts_current_and_queued_nonce_suffix() {
-        let pool = HeldPool::new();
-        let sender = Address::repeat_byte(0xa);
-        let mut root = held(sender, Direction::Inbound, 0, 1);
-        root.attempts = MAX_BUNDLE_ATTEMPTS - 1;
-        let in_flight_suffix = held(sender, Direction::Inbound, 1, 2);
-        let queued_suffix = held(sender, Direction::Inbound, 2, 3);
-        let opposite_direction = held(sender, Direction::Outbound, 0, 4);
-        let independent = held(Address::repeat_byte(0xb), Direction::Inbound, 0, 5);
-        pool.push_contiguous(root, 0).unwrap();
-        pool.push_contiguous(in_flight_suffix, 0).unwrap();
-        pool.push_contiguous(queued_suffix, 0).unwrap();
-        let failed = pool.pop_n(2);
-        pool.push_contiguous(opposite_direction.clone(), 0).unwrap();
-        pool.push_contiguous(independent.clone(), 0).unwrap();
-
-        let recovery =
-            recover_settlement_failure(&pool, 1, failed, SettlementFailureSource::Prover);
-        assert_eq!(
-            recovery,
-            SettlementFailureOutcome {
-                requeued: 0,
-                evicted: 3,
-            }
-        );
-        let remaining = pool.pop_all();
-        assert_eq!(
-            remaining.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
-            vec![opposite_direction.hash, independent.hash]
-        );
-        pool.release_in_flight_batch(&remaining);
     }
 }

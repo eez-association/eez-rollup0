@@ -42,13 +42,15 @@ use crate::rollup::RollupState;
 
 mod batcher;
 mod blob;
+mod budget;
 mod compose;
+mod nonces;
 mod post_batch;
 mod recovery;
+pub use crate::in_flight::MAX_BUNDLE_ATTEMPTS;
 use batcher::{EmissionLimits, SlotTarget, bundle_targets_for_slot, ensure_submission_identity};
 pub use blob::BlobPostingConfig;
 use blob::blob_fee;
-pub use recovery::MAX_BUNDLE_ATTEMPTS;
 use recovery::RecoveryOutcome;
 
 /// Shared contract identities, public L2 parameters, and L1 submission resources
@@ -472,13 +474,13 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::held_pool::HeldTx;
     use crate::ingress::Direction;
     use alloy_primitives::{B256, Bytes, TxHash, U256};
 
-    pub(super) fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {
+    pub(crate) fn held(sender: Address, direction: Direction, nonce: u64, hash_byte: u8) -> HeldTx {
         HeldTx {
             raw_tx: Bytes::from(vec![hash_byte; 4]),
             hash: TxHash::repeat_byte(hash_byte),

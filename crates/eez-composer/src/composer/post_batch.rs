@@ -13,11 +13,11 @@ use reth_primitives_traits::AlloyBlockHeader;
 use tracing::{Level, event};
 
 use super::CrossChainExecCtx;
-use super::batcher::{
-    MAX_PROOF_BYTES, PreparePostBatchError, attestation_gas, calldata_floor_gas, calldata_gas,
-    ensure_batch_registry_native, projected_postbatch_gas,
-};
+use super::batcher::{PreparePostBatchError, ensure_batch_registry_native};
 use super::blob::{PhysicalBlobs, target_blob_limit};
+use super::budget::{
+    MAX_PROOF_BYTES, attestation_gas, calldata_floor_gas, calldata_gas, projected_postbatch_gas,
+};
 use crate::attestation_quorum::{Attestation, assign_proof_systems};
 use crate::local::SyncCandidates;
 use crate::prover_retry::validate_actionable_prover_failure;
