@@ -43,13 +43,16 @@ flowchart LR
 ## First-window timing
 
 The Composer defaults to `EEZ_PROVER_EARLY_WINDOW=true`. When it knows the
-predecessor, it can send the first eight block or finalization frames while the
-signer confirms the anchor or retained checkpoint. Background prevalidation
-requires an exact tip match. A proof that preempts background
-capture can reuse its last completed checkpoint. After an interrupted proof or
-when the selected checkpoint is unknown, ordinary Resume discovers progress. Set the variable to `false`
-to wait for Ready on every new attachment. Both modes use incremental
-prevalidation and the same proof verification.
+predecessor, it can send all available blocks and `Finalize` while the signer
+confirms the anchor or checkpoint. Background prevalidation requires an exact
+tip match. A proof that preempts background capture can reuse its last completed
+checkpoint. After an interrupted proof or when the checkpoint is unknown,
+ordinary `Resume` discovers the retained prefix.
+
+Set `EEZ_PROVER_EARLY_WINDOW=false` to wait for `Ready` on each new attachment.
+In both modes the Composer sends subsequent blocks as transport capacity allows.
+It checks each reply in order and returns the first rejection, including when
+later blocks or `Finalize` are already in flight.
 
 ## Building and testing here
 

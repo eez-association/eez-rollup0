@@ -187,7 +187,7 @@ impl SessionRuntime {
         }
 
         let mut bound_session = None;
-        let mut early_remaining = 0;
+        let mut allow_early_work = false;
         let mut pending: VecDeque<(ClientFrame, usize, usize)> = VecDeque::new();
         let mut pending_bytes = 0usize;
         let mut pending_items = 0usize;
@@ -254,13 +254,12 @@ impl SessionRuntime {
                 {
                     // Resolve early frames at ingress, freezing the actual attachment
                     // before queueing. Workers still check its epoch before publishing.
-                    if early_remaining > 0 && message.session_id.is_empty() && message.epoch == 0 {
+                    if allow_early_work && message.session_id.is_empty() && message.epoch == 0 {
                         let bound: BoundSession = bound_session.expect("accepted window opener");
                         message.session_id = bound.id.to_vec();
                         message.epoch = bound.epoch;
-                        early_remaining -= 1;
                     } else {
-                        early_remaining = 0;
+                        allow_early_work = false;
                     }
                     // Bound decoded requests before they reach per-session admission.
                     // Allow one window plus its Finalize calldata; keep reading controls
@@ -304,11 +303,7 @@ impl SessionRuntime {
                     let is_rewind = matches!(message.kind, Some(client_frame::Kind::Rewind(_)));
                     let response = self.handle_frame(&mut bound_session, message).await;
                     let rewound = is_rewind && response.is_ok();
-                    early_remaining = if opens_window && response.is_ok() {
-                        eez_control_rpc::MAX_EARLY_FRAMES
-                    } else {
-                        0
-                    };
+                    allow_early_work = opens_window && response.is_ok();
                     let should_close = matches!(response, Ok((_, true)));
                     let frame = match response {
                         Ok((frame, _)) => frame,
@@ -2413,6 +2408,112 @@ mod tests {
                 "queued frames never execute"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pipelined_backfill_rejects_a_gap_and_signs_the_corrected_suffix() {
+        let mut limits = limits();
+        limits.max_blocks = 12;
+        let validations = Arc::new(AtomicUsize::new(0));
+        let server =
+            TestServer::with_service(ProveSvc::new(state(validations.clone()), limits)).await;
+        let mut client = server.client().await;
+        let (requests, mut responses) = open_stream(
+            &mut client,
+            ClientFrame {
+                request_id: 1,
+                kind: Some(client_frame::Kind::Begin(begin())),
+                ..Default::default()
+            },
+        )
+        .await;
+        let anchor = B256::repeat_byte(0x11);
+        let mut parent = anchor;
+        let mut blocks = Vec::new();
+        for number in 11..=22 {
+            let block = block_after(number, parent, number as u8);
+            parent = B256::from_slice(&block.data.as_ref().unwrap().hash);
+            blocks.push(block);
+        }
+        let finalize = client_frame::Kind::Finalize(eez_control_rpc::v1::Finalize {
+            from_block: 11,
+            to_block: 22,
+            terminal_hash: parent.to_vec(),
+            settlement: Some(post_batch(anchor, parent, blocks.len())),
+        });
+        let mut submitted = blocks.clone();
+        submitted[8] = block_after(19, B256::repeat_byte(0xee), 19);
+        for (i, kind) in submitted
+            .into_iter()
+            .map(client_frame::Kind::Block)
+            .chain([finalize.clone()])
+            .enumerate()
+        {
+            requests
+                .send(ClientFrame {
+                    request_id: 2 + i as u64,
+                    kind: Some(kind),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let ready = responses.message().await.unwrap().unwrap();
+        assert!(matches!(ready.kind, Some(server_frame::Kind::Ready(_))));
+        let last_valid = blocks[7].data.as_ref().unwrap();
+        for i in 0..=blocks.len() {
+            let response = responses.message().await.unwrap().unwrap();
+            assert_eq!(response.request_id, 2 + i as u64);
+            assert_eq!(
+                (&response.session_id, response.epoch),
+                (&ready.session_id, ready.epoch)
+            );
+            if i < 8 {
+                assert!(
+                    matches!(response.kind, Some(server_frame::Kind::Validated(v)) if v.number == 11 + i as u64)
+                );
+            } else {
+                assert!(
+                    matches!(response.kind, Some(server_frame::Kind::Rejected(r))
+                    if r.validated_through == last_valid.number && r.validated_hash == last_valid.hash)
+                );
+            }
+        }
+        assert_eq!(validations.load(Ordering::SeqCst), 8);
+        // Retry the four dependent blocks and Finalize on the same checked prefix.
+        for (i, kind) in blocks
+            .into_iter()
+            .skip(8)
+            .map(client_frame::Kind::Block)
+            .chain([finalize])
+            .enumerate()
+        {
+            requests
+                .send(ClientFrame {
+                    request_id: 15 + i as u64,
+                    epoch: ready.epoch,
+                    session_id: ready.session_id.clone(),
+                    kind: Some(kind),
+                })
+                .await
+                .unwrap();
+        }
+        drop(requests);
+        for id in 15..=19 {
+            let response = responses.message().await.unwrap().unwrap();
+            assert_eq!(response.request_id, id);
+            if id == 19 {
+                assert!(
+                    matches!(response.kind, Some(server_frame::Kind::Proof(p)) if p.proof.len() == 65)
+                );
+            } else {
+                assert!(
+                    matches!(response.kind, Some(server_frame::Kind::Validated(v)) if v.number == id + 4)
+                );
+            }
+        }
+        assert!(responses.message().await.unwrap().is_none());
+        assert_eq!(validations.load(Ordering::SeqCst), 12);
     }
 
     #[tokio::test]

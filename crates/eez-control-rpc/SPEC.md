@@ -367,11 +367,13 @@ RollupX conformance; those settlement profiles need separate implementations.
 
 ### Sending the first window before Ready
 
-After `Begin` or a `Resume` with a target, the client may send up to eight
-consecutive `Block` or `Finalize` frames before receiving `Ready`. Each uses a
-distinct request ID, an empty session ID and epoch zero. Each block remains a
-separate gRPC message under the usual wire and queue limits. The first bound
-frame or control ends the allowance. A client can always wait for `Ready` and
+After `Begin` or a `Resume` with a target, the client may send every available
+`Block` and the optional `Finalize` before receiving `Ready`. Each frame uses
+a distinct request ID, an empty session ID and epoch zero. Each block remains a
+separate gRPC message. Stream flow control and signer queue, witness and batch
+limits apply throughout. A later frame may already be in flight when an earlier
+frame is rejected. A rejected block leaves the validated prefix unchanged.
+The first bound frame or control ends the allowance. A client can always wait for `Ready` and
 use the issued binding immediately.
 
 `Begin` starts at its anchor. `Resume` takes an optional target:
@@ -461,7 +463,7 @@ the current Rollup0 [conditional-proof rules](#parent-authorization-by-profile);
 stateful fork selection additionally obeys Reth's safe/finalized ancestry.
 
 Rollup0's Composer requires a pipelining-capable server and retains a live stream,
-limiting outstanding requests to eight while draining responses concurrently.
+streaming each available suffix under transport backpressure while checking responses concurrently.
 Unsupported session controls and subrange selection fall back to fresh Begin/backfill without
 changing the requested settlement. An exchange, including reconnect and EOF,
 has a five-second transport deadline; the Composer's proof cutoff can be shorter.

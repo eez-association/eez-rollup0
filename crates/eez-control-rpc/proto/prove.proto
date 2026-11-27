@@ -31,7 +31,7 @@ message ClientFrame {
   }
 }
 
-// Clients may immediately send up to eight Block/Finalize frames after Begin.
+// Clients may immediately stream Block/Finalize frames after Begin.
 message Begin {
   uint64 rollup_id = 1;
   // Execution predecessor and baseline settlement parent. The first expected
@@ -47,7 +47,7 @@ message Begin {
 // Unsupported Resume returns UNIMPLEMENTED; the client can Begin and backfill.
 message Resume {
   // Omit the target to discover the current tip and wait for Ready. With a
-  // target, the same bounded first window as Begin may follow immediately.
+  // target, the same Block/Finalize stream as Begin may follow immediately.
   oneof target {
     // Select a retained ancestor and fence the previous attachment atomically.
     Ready checkpoint = 1;
