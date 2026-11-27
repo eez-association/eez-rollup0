@@ -625,6 +625,8 @@ to cut the hidden side off. Each side then builds its own fork. When the network
 is reconnected, the observed side switches to the heavier hidden fork. Point the
 system under test at the observed EL (`el-1`).
 
+`up` removes any existing enclave with the configured name and starts a fresh devnet.
+
 ```bash
 bash testing/kurtosis/scripts/l1-reorg.sh up
 REORG_DEPTH_MIN=1 REORG_DEPTH_MAX=3 \

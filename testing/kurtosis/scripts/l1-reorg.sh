@@ -23,6 +23,7 @@ REORG_INTERVAL_MAX="${REORG_INTERVAL_MAX:-15}"
 REORG_COUNT="${REORG_COUNT:-0}"               # stop after N reorgs; 0 runs forever
 REORG_PARTITION_TIMEOUT_SECS="${REORG_PARTITION_TIMEOUT_SECS:-1800}" # to build both forks
 REORG_HEAL_TIMEOUT_SECS="${REORG_HEAL_TIMEOUT_SECS:-300}"            # for the reorg to land
+REORG_STALL_TIMEOUT_SECS="${REORG_STALL_TIMEOUT_SECS:-300}"          # for the observed head to advance
 
 SIDECAR_IMAGE=nicolaka/netshoot:v0.13 # provides iptables
 CHAIN=EEZREORG                        # iptables chain holding the partition rules
@@ -68,6 +69,16 @@ rpc() { # <url> <method> <params-json> → .result
 }
 head_number() { local h; h=$(rpc "$1" eth_blockNumber '[]') && echo $((16#${h#0x})); }
 hash_at() { rpc "$1" eth_getBlockByNumber "[\"$(printf '0x%x' "$2")\",false]" | jq -r '.hash // empty'; }
+block_hash() { local h; h=$(hash_at "$@") && [[ -n "$h" ]] && echo "$h"; } # fails on empty
+
+retry() { # <cmd...>: retry a read for 30s, plus any in-flight request
+    local end=$((SECONDS + 30))
+    while (( SECONDS < end )); do
+        "$@" && return 0
+        sleep 1
+    done
+    return 1
+}
 
 common_ancestor() { # <el-a> <el-b> → highest block number both agree on
     local a="$1" b="$2" n ha hb
@@ -122,30 +133,57 @@ partition() { # firewall the hidden EL/CL from every observed-side container
     log "partitioned ${#hidden[@]} hidden containers from ${#blocked[@]} others"
 }
 
-# Idempotent, and the EXIT trap, so an interrupted run never leaves damage.
-restore() { # clear the partition rules and make sure vc-1 is running
-    local svc name
+clear_partition() {
+    local svc name listed state rc=0
+    listed=$(services) || return 1
     while read -r svc name; do
-        [[ "$svc" =~ $HIDDEN_NET_RE ]] && running "$name" || continue
+        [[ "$svc" =~ $HIDDEN_NET_RE ]] || continue
+        if ! state=$(docker inspect -f '{{.State.Running}}' "$name"); then
+            rc=1
+            continue
+        fi
+        [[ "$state" == true ]] || continue
+        # Missing rules are OK; check the remaining rules after deletion.
         # shellcheck disable=SC2016 # expanded by the sidecar's sh
         sidecar "$name" '
             c="$1"
             while iptables -D INPUT -j "$c" 2>/dev/null; do :; done
             while iptables -D OUTPUT -j "$c" 2>/dev/null; do :; done
-            iptables -F "$c" 2>/dev/null; iptables -X "$c" 2>/dev/null; true
-        ' sh "$CHAIN" || log "warning: could not clear rules in $name"
-    done < <(services)
-    svc=$(service_matching '^vc-1-')
-    if [[ -n "$svc" ]] && ! running "$(container_of "$svc")"; then
-        kurtosis service start "$ENCLAVE" "$svc" >/dev/null || log "warning: could not start $svc"
-    fi
+            iptables -F "$c" 2>/dev/null; iptables -X "$c" 2>/dev/null
+            rules=$(iptables -S) || exit 1
+            printf "%s\n" "$rules" | awk -v chain="$c" '\''
+                { for (i = 1; i <= NF; i++) if ($i == chain) found = 1 }
+                END { exit found }
+            '\''
+        ' sh "$CHAIN" || { log "warning: could not clear rules in $name"; rc=1; }
+    done <<< "$listed"
+    return "$rc"
+}
+
+start_vc() {
+    local svc name
+    svc=$(service_matching '^vc-1-') || return 1
+    [[ -n "$svc" ]] || { log "warning: observed validator client not found"; return 1; }
+    name=$(container_of "$svc") && [[ -n "$name" ]] || return 1
+    running "$name" && return 0
+    kurtosis service start "$ENCLAVE" "$svc" >/dev/null || { log "warning: could not start $svc"; return 1; }
+    running "$name" || { log "warning: $svc is not running after start"; return 1; }
+}
+
+# Idempotent cleanup, also used by the EXIT trap.
+restore() { # clear the partition rules and make sure vc-1 is running
+    local rc=0
+    clear_partition || rc=1
+    start_vc || rc=1
+    return "$rc"
 }
 
 # ── One reorg ────────────────────────────────────────────────────────────────
 
 reorg() { # <target-depth> <observed-el> <hidden-el> <observed-cl> <hidden-cl>
     local depth="$1" obs="$2" hid="$3" obs_cl="$4" hid_cl="$5"
-    local vc deadline fork ho hh lo lh ow hw held=0
+    local vc deadline fork ho hh lo lh ow hw obs_hash hid_hash held=0
+    local ancestor orphan=() i h orphaned new_head
     vc=$(service_matching '^vc-1-')
     [[ -n "$vc" ]] || die "observed validator client (vc-1-*) not found"
 
@@ -154,34 +192,50 @@ reorg() { # <target-depth> <observed-el> <hidden-el> <observed-cl> <hidden-cl>
     deadline=$((SECONDS + REORG_PARTITION_TIMEOUT_SECS))
     while :; do
         (( SECONDS < deadline )) || die "forks not built within ${REORG_PARTITION_TIMEOUT_SECS}s"
-        if fork=$(common_ancestor "$obs" "$hid") && ho=$(head_number "$obs") && hh=$(head_number "$hid") \
-            && lo=$((ho - fork)) && lh=$((hh - fork)) && (( lo >= depth )); then
-            # Heal only once the hidden branch outweighs the observed one: block
-            # counts are not enough, since a hidden block without votes loses to
-            # observed blocks with votes. Each beacon node only knows its own
-            # branch's votes; the 2x margin covers votes that do not cross over.
-            if (( lh >= 1 )) \
-                && ow=$(branch_weight "$obs_cl" "$(hash_at "$obs" $((fork + 1)))") \
-                && hw=$(branch_weight "$hid_cl" "$(hash_at "$hid" $((fork + 1)))") \
-                && (( hw > 2 * ow )); then
-                break
-            fi
-            if (( !held )); then # pausing stops the observed fork growing past R_DEPTH
+        if fork=$(common_ancestor "$obs" "$hid") && ho=$(head_number "$obs") && hh=$(head_number "$hid"); then
+            lo=$((ho - fork))
+            lh=$((hh - fork))
+            if (( lo >= depth && !held )); then
                 log "observed fork at $lo blocks; pausing $vc until the hidden branch outweighs it"
-                held=1
                 kurtosis service stop "$ENCLAVE" "$vc" >/dev/null || die "could not stop $vc"
+                held=1 # Re-read the heads next iteration to count in-flight proposals.
+            elif (( lo >= depth )); then
+                # Heal only once the hidden branch outweighs the observed one: block
+                # counts are not enough, since a hidden block without votes loses to
+                # observed blocks with votes. Each beacon node only knows its own
+                # branch's votes; the 1.5x margin sits below the 2x stake ratio.
+                if (( lh >= 1 )) \
+                    && obs_hash=$(block_hash "$obs" $((fork + 1))) \
+                    && hid_hash=$(block_hash "$hid" $((fork + 1))) \
+                    && [[ "$obs_hash" != "$hid_hash" ]] \
+                    && ow=$(branch_weight "$obs_cl" "$obs_hash") \
+                    && hw=$(branch_weight "$hid_cl" "$hid_hash") \
+                    && (( 2 * hw > 3 * ow )); then
+                    # Snapshot the observed fork so its orphaning can be proven after the heal.
+                    ancestor=$(retry block_hash "$obs" "$fork") || die "cannot read observed block $fork"
+                    orphan=()
+                    for ((i = fork + 1; i <= ho; i++)); do
+                        h=$(retry block_hash "$obs" "$i") || die "cannot read observed block $i"
+                        orphan+=("$h")
+                    done
+                    if [[ "${orphan[0]}" == "$obs_hash" ]] \
+                        && h=$(head_number "$obs") && (( h == ho )) \
+                        && h=$(block_hash "$obs" "$ho") && [[ "$h" == "${orphan[lo - 1]}" ]]; then
+                        break
+                    fi
+                fi
+            elif (( held )); then # the fork point moved up, so the observed side must grow again
+                log "observed fork dropped to $lo blocks; resuming $vc"
+                start_vc || die "could not start $vc"
+                held=0
             fi
         fi
         sleep 1
     done
     (( lo == depth )) || log "warning: observed fork overshot to $lo blocks (target $depth)"
 
-    # Snapshot the observed fork so its orphaning can be proven after the heal.
-    local ancestor orphan=() i h orphaned new_head
-    ancestor=$(hash_at "$obs" "$fork")
-    for ((i = fork + 1; i <= ho; i++)); do orphan+=("$(hash_at "$obs" "$i")"); done
     log "fork at $fork: observed +$lo blocks (weight $ow), hidden +$lh blocks (weight $hw); healing"
-    restore # fork choice now moves the observed side onto the hidden fork
+    clear_partition || die "could not clear the partition" # fork choice now moves the observed side onto the hidden fork
 
     deadline=$((SECONDS + REORG_HEAL_TIMEOUT_SECS))
     while :; do
@@ -198,6 +252,7 @@ reorg() { # <target-depth> <observed-el> <hidden-el> <observed-cl> <hidden-cl>
         fi
         sleep 1
     done
+    start_vc || die "could not start $vc"
     log "reorged: depth $lo at block $((fork + 1)) (old head $ho, new head $new_head)"
 }
 
@@ -206,8 +261,10 @@ reorg() { # <target-depth> <observed-el> <hidden-el> <observed-cl> <hidden-cl>
 cmd_run() {
     local v
     for v in REORG_DEPTH_MIN REORG_DEPTH_MAX REORG_INTERVAL_MIN REORG_INTERVAL_MAX REORG_COUNT \
-        REORG_PARTITION_TIMEOUT_SECS REORG_HEAL_TIMEOUT_SECS; do
-        [[ "${!v}" =~ ^[0-9]+$ ]] || die "$v must be a non-negative integer (got '${!v}')"
+        REORG_PARTITION_TIMEOUT_SECS REORG_HEAL_TIMEOUT_SECS REORG_STALL_TIMEOUT_SECS; do
+        # No leading zeros: (( )) would read them as octal.
+        [[ "${!v}" =~ ^(0|[1-9][0-9]*)$ ]] \
+            || die "$v must be a non-negative decimal integer without leading zeros (got '${!v}')"
     done
     (( REORG_DEPTH_MIN >= 1 && REORG_DEPTH_MIN <= REORG_DEPTH_MAX )) \
         || die "need 1 <= REORG_DEPTH_MIN <= REORG_DEPTH_MAX"
@@ -225,17 +282,32 @@ cmd_run() {
 
     trap restore EXIT
     trap 'exit 130' INT TERM
-    restore # undo anything an interrupted run left behind
+    restore || die "could not undo a previous run" # undo anything an interrupted run left behind
     log "observed $obs_svc ($obs), hidden $hid_svc ($hid)"
     log "depth [$REORG_DEPTH_MIN, $REORG_DEPTH_MAX], interval ($REORG_INTERVAL_MIN, $REORG_INTERVAL_MAX), count $REORG_COUNT"
 
-    local n=0 interval depth start head
+    local n=0 interval depth start head last moved
     while (( REORG_COUNT == 0 || n < REORG_COUNT )); do
         interval=$((REORG_INTERVAL_MIN + 1 + RANDOM % (REORG_INTERVAL_MAX - REORG_INTERVAL_MIN - 1)))
         depth=$((REORG_DEPTH_MIN + RANDOM % (REORG_DEPTH_MAX - REORG_DEPTH_MIN + 1)))
-        start=$(head_number "$obs") || die "observed RPC unreachable"
+        start=$(retry head_number "$obs") || die "observed RPC unreachable"
         log "next reorg (depth $depth) after $interval blocks from $start"
-        while head=$(head_number "$obs" || echo "$start"); (( head < start + interval )); do sleep 2; done
+        last=$start
+        moved=$SECONDS
+        while :; do
+            if head=$(head_number "$obs"); then
+                (( head >= start + interval )) && break
+                if (( head > last )); then
+                    last=$head
+                    moved=$SECONDS
+                fi
+            else
+                log "warning: could not read observed head"
+            fi
+            (( SECONDS - moved < REORG_STALL_TIMEOUT_SECS )) \
+                || die "observed head stuck at $last for ${REORG_STALL_TIMEOUT_SECS}s"
+            sleep 2
+        done
         reorg "$depth" "$obs" "$hid" "$obs_cl" "$hid_cl"
         n=$((n + 1))
     done
@@ -243,11 +315,14 @@ cmd_run() {
 
 case "${1:-}" in
 up)
-    require kurtosis
+    require docker kurtosis
+    kurtosis enclave rm -f "$ENCLAVE" 2>/dev/null || true
     kurtosis run "$PACKAGE" --enclave "$ENCLAVE" --args-file "$ARGS" || die "failed to launch enclave $ENCLAVE"
-    log "observed L1 RPC: $(port_url "$(service_matching '^el-1-')" rpc)"
+    svc=$(service_matching '^el-1-') && [[ -n "$svc" ]] || die "observed execution client not found"
+    url=$(port_url "$svc" rpc) || exit 1
+    log "observed L1 RPC: $url"
     ;;
 run) require docker kurtosis jq curl; cmd_run ;;
-heal) require docker kurtosis; restore; log "partition cleared" ;;
+heal) require docker kurtosis; restore || die "could not fully clear the partition"; log "partition cleared" ;;
 *) echo "usage: $0 up|run|heal" >&2; exit 2 ;;
 esac
