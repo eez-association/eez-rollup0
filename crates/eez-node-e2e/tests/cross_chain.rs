@@ -1176,6 +1176,96 @@ async fn follower_replays_settled_inbound_safe_block() {
     w.node.assert_no_divergence_failure_logs();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn valid_cross_chain_tx_survives_repeated_builder_exclusions() {
+    let w = setup_cross_chain_with_builder_stub().await.unwrap();
+    let l1_rpc = w.l1_rpc();
+    let l2_rpc = w.l2_rpc();
+    let value = U256::from(87u64);
+    let l2 = ProviderBuilder::new().connect_http(l2_rpc.parse().unwrap());
+
+    // Drop the first bundle carrying the call as well as its retries.
+    w.set_builder_mode(BuilderStubMode::Drop).await.unwrap();
+    let cursor = w.node.signal_cursor().unwrap();
+    let hash = sign_and_send(
+        &w.l2_xchain(),
+        OUTBOUND_USER,
+        w.l2_chain_id,
+        onchain_nonce(&l2_rpc, OUTBOUND_USER).await.unwrap(),
+        Some(w.outbound_wrapper),
+        U256::ZERO,
+        ISetterWrapper::setViaProxyCall { v: value }.abi_encode(),
+        1_200_000,
+    )
+    .await
+    .expect("valid outbound call must be admitted");
+
+    let assert_no_evictions = |emitted: &[signals::NodeSignal]| {
+        for signal in emitted {
+            assert!(
+                !matches!(
+                    signal.name.as_str(),
+                    signals::TX_POISON_EVICTED
+                        | signals::TX_NONCE_CHAIN_EVICTED
+                        | signals::TX_EXCLUSION_EVICTED
+                ),
+                "transaction {hash} lost during builder drops: {signal:?}",
+            );
+        }
+    };
+
+    wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(cursor)?;
+        assert_no_evictions(&emitted);
+        // Match rich post hashes because the relay also drops minimal bundles.
+        let mut rich_posts = std::collections::HashSet::new();
+        let mut drains = 0;
+        let mut drops = 0;
+        for signal in &emitted {
+            match signal.name.as_str() {
+                signals::COMPOSER_SYNC_SLOT_DRAIN if signal.u64("drained_count")? == 1 => {
+                    drains += 1;
+                }
+                signals::COMPOSER_BUNDLE_DISPATCHED => {
+                    rich_posts.insert(signal.b256("post_batch_hash")?);
+                }
+                signals::BUNDLE_DROPPED if rich_posts.contains(&signal.b256("tx_hash")?) => {
+                    drops += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok((drains >= 4 && drops >= 4).then_some(()))
+    })
+    .await
+    .expect("four rich bundle drops for the outbound call");
+
+    w.set_builder_mode(BuilderStubMode::Forward).await.unwrap();
+    wait_for(SETTLE_TIMEOUT, || async {
+        let emitted = w.node.signals_since(cursor)?;
+        assert_no_evictions(&emitted);
+        if l2_value(&l1_rpc, w.outbound_value).await? != value {
+            return Ok(None);
+        }
+        let Some(receipt) = l2.get_transaction_receipt(hash).await? else {
+            return Ok(None);
+        };
+        let (Some(number), Some(block_hash)) = (receipt.block_number, receipt.block_hash) else {
+            return Ok(None);
+        };
+        let safe = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Safe).await?;
+        let canonical = block_number_and_hash_at(&l2_rpc, BlockNumberOrTag::Number(number)).await?;
+        Ok((receipt.status()
+            && canonical == Some((number, block_hash))
+            && safe.is_some_and(|(height, _)| height >= number))
+        .then_some(()))
+    })
+    .await
+    .expect("the original outbound call must settle after forwarding resumes");
+    assert_no_evictions(&w.node.signals_since(cursor).unwrap());
+    w.node.assert_no_divergence_failure_logs();
+}
+
 /// When a dropped bundle makes the composer replace its rich Sync block, a
 /// follower on the composer's signed heads adopts the replacement before L1
 /// settles that height.

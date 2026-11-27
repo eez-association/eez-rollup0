@@ -382,6 +382,7 @@ fn inbound_drain_rejects_full_cap_failures_but_defers_capacity_under_load() {
                     nonce: 0,
                     direction: Direction::Inbound,
                     attempts: 0,
+                    excluded_slots: 0,
                     max_fee_per_gas: 1,
                     priority_fee_per_gas: 1,
                 }

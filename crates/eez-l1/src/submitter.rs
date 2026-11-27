@@ -56,6 +56,8 @@ pub enum BundleTarget {
 /// What the relay answered to a bundle. It decides nothing about the outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayReply {
+    /// The relay has no bundle API and the post went through the mempool.
+    Unsupported,
     /// The relay accepted the bundle.
     Accepted,
     /// The relay answered with an error.
@@ -426,9 +428,7 @@ impl Inner {
                     );
                 }
                 // No builder took the bundle, so it is never `Accepted`.
-                let mut reply = RelayReply::Rejected(
-                    "relay has no eth_sendBundle; postBatch sent through the mempool".into(),
-                );
+                let mut reply = RelayReply::Unsupported;
                 if let Err(err) = alloy_provider::Provider::send_raw_transaction(
                     &self.build_target_provider(),
                     raw_txs[0].as_ref(),
@@ -473,6 +473,22 @@ impl Inner {
         target_block: u64,
         pin_timestamp: Option<u64>,
     ) -> SendOutcome {
+        self.observe_with_provider(
+            &self.build_target_provider(),
+            tx_hash,
+            target_block,
+            pin_timestamp,
+        )
+        .await
+    }
+
+    async fn observe_with_provider<P: Provider>(
+        &self,
+        target_provider: &P,
+        tx_hash: TxHash,
+        target_block: u64,
+        pin_timestamp: Option<u64>,
+    ) -> SendOutcome {
         // Failure must mean PROVABLY DEAD, not merely slow. A bundle is
         // pinned to `target_block` — included in order there or never —
         // so death = the chain passed the target (head > target) without
@@ -489,7 +505,6 @@ impl Inner {
         // `pinned` buys a slot without weakening that: min == max timestamp
         // leaves one satisfiable height, so the block there decides it.
         let start = tokio::time::Instant::now();
-        let target_provider = self.build_target_provider();
         let mut slow_logged = false;
         let mut settlement_read_warned: Option<tokio::time::Instant> = None;
         loop {
@@ -515,7 +530,7 @@ impl Inner {
                             && log.topic0() == Some(&BatchPosted::SIGNATURE_HASH)
                     });
                     let read = self
-                        .observe_settlement(&target_provider, l1_block, tx_hash, posted)
+                        .observe_settlement(target_provider, l1_block, tx_hash, posted)
                         .await;
                     match included_outcome(tx_hash, l1_block, read) {
                         Ok(outcome) => return outcome,
@@ -540,7 +555,7 @@ impl Inner {
                 Ok(None) => {
                     let verdict = match pin_timestamp {
                         Some(pin_ts) => {
-                            pinned_slot_check(&target_provider, target_block, tx_hash, pin_ts).await
+                            pinned_slot_check(target_provider, target_block, tx_hash, pin_ts).await
                         }
                         None => PinnedVerdict::Pending,
                     };
@@ -837,6 +852,59 @@ mod tests {
 
     const PIN: u64 = 1_700_000_012;
 
+    #[tokio::test]
+    async fn observe_returns_the_reason_for_each_drop_path() {
+        use super::{DropReason, SendOutcome, Submitter, SubmitterConfig};
+        use crate::L1ReaderConfig;
+        use alloy_provider::{ProviderBuilder, mock::Asserter};
+        use alloy_rpc_types_eth::{Block, Transaction};
+        use alloy_signer_local::PrivateKeySigner;
+
+        const TARGET: u64 = 10;
+        let url = "http://127.0.0.1:1".parse::<url::Url>().unwrap();
+        let submitter = Submitter::new(SubmitterConfig {
+            builder_rpc_url: url.clone(),
+            target_rpc_url: None,
+            reader: L1ReaderConfig {
+                rpc_url: url.clone(),
+                trace_rpc_url: url,
+                eez: Address::ZERO,
+                rollup_id: 1,
+                deploy_block: 0,
+                beacon_url: None,
+            },
+            poster: PrivateKeySigner::from_bytes(&B256::repeat_byte(1)).unwrap(),
+        });
+        for (pin, timestamp, expected) in [
+            (Some(PIN), Some(PIN), DropReason::PinnedSlotExcluded),
+            (Some(PIN), Some(PIN + 5), DropReason::PinnedSlotSkipped),
+            (None, None, DropReason::TargetPassed),
+            (Some(PIN), None, DropReason::TargetPassed),
+        ] {
+            let rpc = Asserter::new();
+            rpc.push_success(&serde_json::Value::Null); // receipt
+            if let Some(timestamp) = timestamp {
+                let mut block = Block::<Transaction>::default();
+                block.header.inner.timestamp = timestamp;
+                rpc.push_success(&block);
+            } else {
+                if pin.is_some() {
+                    rpc.push_success(&serde_json::Value::Null); // pinned height unavailable
+                }
+                rpc.push_success(&"0xb"); // head passed TARGET
+            }
+            let provider = ProviderBuilder::default().connect_mocked_client(rpc);
+            let outcome = submitter
+                .inner
+                .observe_with_provider(&provider, TxHash::ZERO, TARGET, pin)
+                .await;
+            assert!(
+                matches!(outcome, SendOutcome::Dropped { tx_hash: TxHash::ZERO, target_block: TARGET, reason } if reason == expected),
+                "{outcome:?}"
+            );
+        }
+    }
+
     /// The postBatch at index 0 is never whitelisted: if it reverts nothing
     /// settled, so letting the user_txs land would deliver calls with no state.
     #[test]
@@ -969,6 +1037,7 @@ mod tests {
         ] {
             let got = match post_bundle(&http, &url, &["0xaa"], 7, None).await {
                 PostReply::Relay(RelayReply::Accepted) => "Accepted",
+                PostReply::Relay(RelayReply::Unsupported) => "Unsupported",
                 PostReply::Relay(RelayReply::Rejected(_)) => "Rejected",
                 PostReply::Relay(RelayReply::Unanswered(_)) => "Unanswered",
                 PostReply::Unsupported => "Unsupported",

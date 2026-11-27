@@ -26,7 +26,7 @@ use super::recovery::observe_bundle_outcome;
 use super::{Composer, ComposerConfigError, CrossChainExecCtx};
 use crate::attestation_quorum::assign_proof_systems;
 use crate::local::{SyncCandidates, build_sync_block};
-use crate::optimistic::OptimisticallyIncluded;
+use crate::optimistic::{AttemptCharge, OptimisticallyIncluded};
 use crate::rollup::RollupState;
 
 pub(super) fn bundle_targets_for_slot(
@@ -1231,7 +1231,12 @@ async fn send_after_commit(
             if let Err(charge_attempt) =
                 await_commit(rollup_id, sync_height, expected_final_root, released).await
             {
-                optimistic.mark_failed(sync_height, post_batch_hash, !charge_attempt);
+                let charge = if charge_attempt {
+                    AttemptCharge::Settlement
+                } else {
+                    AttemptCharge::None
+                };
+                optimistic.mark_failed(sync_height, post_batch_hash, charge);
                 return;
             }
             let now_ms = clock.now_unix_ms();
@@ -1247,7 +1252,7 @@ async fn send_after_commit(
                     slot_start_ms,
                     "Sync block committed after its target L1 slot started; withholding its bundle",
                 );
-                optimistic.mark_failed(sync_height, post_batch_hash, true);
+                optimistic.mark_failed(sync_height, post_batch_hash, AttemptCharge::None);
                 return;
             }
             // Past the node's own margin the bundle still goes out; the lateness is the node's.
@@ -1631,7 +1636,7 @@ mod tests {
 
         assert_eq!(connections.load(Ordering::SeqCst), 0);
         let failed = optimistic.take_failed_for_recovery(0).unwrap();
-        assert!(failed.slot_skipped);
+        assert_eq!(failed.charge, AttemptCharge::None);
 
         // A block reth rejected charges its txs.
         let (release, released) = BundleRelease::new();
@@ -1653,7 +1658,10 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
-        assert!(send_committed(&url, 1_001).await.slot_skipped);
+        assert_eq!(
+            send_committed(&url, 1_001).await.charge,
+            AttemptCharge::None
+        );
     }
 
     /// A bundle whose Sync block commits past the node's margin but before its
@@ -1661,7 +1669,7 @@ mod tests {
     #[tokio::test]
     async fn late_bundle_is_sent_and_its_drop_charges_nothing() {
         let (url, _l1, sends) = l1_with_block_9().await;
-        assert!(send_committed(&url, 999).await.slot_skipped);
+        assert_eq!(send_committed(&url, 999).await.charge, AttemptCharge::None);
         assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -1744,7 +1752,7 @@ mod tests {
         }
         optimistic
             .take_failed_for_recovery(0)
-            .is_some_and(|failed| failed.slot_skipped)
+            .is_some_and(|failed| failed.charge == AttemptCharge::None)
     }
 
     /// A relay without `eth_sendBundle` gets only the postBatch, through the
@@ -1783,7 +1791,7 @@ mod tests {
         assert_eq!(
             bundle_verdict(&outcome, B256::ZERO, false),
             BundleVerdict::Failed {
-                charge_attempt: false
+                charge: AttemptCharge::None
             }
         );
     }

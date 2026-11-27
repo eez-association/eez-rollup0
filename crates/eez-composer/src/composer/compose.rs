@@ -1234,6 +1234,7 @@ where
                         rollup_id,
                         survivors,
                         SettlementFailureSource::Prover,
+                        crate::optimistic::AttemptCharge::Settlement,
                     );
                     event!(
                         name: "eez.composer.prover.failure_recovered",

@@ -48,8 +48,8 @@ mod recovery;
 use batcher::{EmissionLimits, SlotTarget, bundle_targets_for_slot, ensure_submission_identity};
 pub use blob::BlobPostingConfig;
 use blob::blob_fee;
-pub use recovery::MAX_BUNDLE_ATTEMPTS;
 use recovery::RecoveryOutcome;
+pub use recovery::{MAX_BUNDLE_ATTEMPTS, MAX_EXCLUDED_SLOTS};
 
 /// Shared contract identities, public L2 parameters, and L1 submission resources
 /// for cross-chain composition on Sync slots. Owned by `eez-node` at startup
@@ -483,6 +483,7 @@ mod tests {
             raw_tx: Bytes::from(vec![hash_byte; 4]),
             hash: TxHash::repeat_byte(hash_byte),
             attempts: 0,
+            excluded_slots: 0,
             max_fee_per_gas: u128::from(hash_byte),
             priority_fee_per_gas: u128::from(hash_byte),
             sender,
