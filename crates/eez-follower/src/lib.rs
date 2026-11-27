@@ -1,10 +1,16 @@
 //! Launcher for the L1-derived eez follower node.
+//!
+//! Safe and finalized come from L1. The unsafe head follows sequencer-signed
+//! heads from one of two feeds: the p2p overlay ([`run`], [`run_with`]) or a
+//! caller's own ([`launch_with_head_feed`]). Both run the same launch.
 
 mod unsafe_head;
 
-use std::{env, str::FromStr, sync::Arc};
+pub use unsafe_head::{BlockSource, FollowerError};
 
-use alloy_primitives::Address;
+use std::{env, str::FromStr, sync::Arc, time::Duration};
+
+use alloy_primitives::{Address, B256};
 use eez_deriver::Deriver;
 use eez_driver::{BlockCommitterHandle, RollupTiming};
 use eez_l1::{L1CanonicalHead, L1Reader, L1ReaderConfig, L1Watcher, L1WatcherConfig};
@@ -13,7 +19,7 @@ use eez_node_common::{
     L2NodeBuilder, boot, node_cli, sync_mode_from_env, wait_for_idle_engine, wait_for_l1_ready,
     warn_on_deprecated_env,
 };
-use eez_seq_sig::HeadDomain;
+use eez_seq_sig::{HeadDomain, VerifiedHead};
 use reth_chainspec::EthChainSpec as _;
 use reth_network::{BlockDownloaderProvider as _, NetworkInfo as _, PeersInfo as _};
 use tokio::sync::mpsc;
@@ -87,21 +93,116 @@ where
 {
     node_cli::<FollowerArgs>()?.run(move |builder, args| async move {
         let on_ready = init(&args)?;
-        launch(builder, args, on_ready).await
+        event!(
+            name: "eez.node.launching",
+            Level::INFO,
+            mode = "follower",
+            "launching eez follower",
+        );
+        launch(
+            builder,
+            HeadSource::Overlay(args.sequencer_address),
+            on_ready,
+        )
+        .await
     })
+}
+
+/// Signed heads for the unsafe head, and the source of their missing ancestors.
+#[derive(Debug)]
+pub struct HeadFeed<S> {
+    /// Heads verified against the sequencer's address and the head domain.
+    pub heads: mpsc::Receiver<VerifiedHead>,
+    /// Serves the blocks between a head and the local chain.
+    pub blocks: S,
+}
+
+/// What a head feed is built from: the follower's chain config and its task executor.
+#[derive(Debug, Clone)]
+pub struct HeadFeedContext {
+    /// The domain heads are signed in.
+    pub domain: HeadDomain,
+    /// The L2 genesis block hash.
+    pub genesis_hash: B256,
+    /// The `EEZL2` predeploy.
+    pub eezl2_address: Address,
+    /// The L1 and L2 block times.
+    pub timing: RollupTiming,
+    pub task_executor: reth_tasks::TaskExecutor,
+}
+
+/// Launches the follower with its unsafe head fed by `feed` instead of the p2p
+/// overlay. Everything else is the launch [`run`] runs: reth, the L1 watcher,
+/// the Deriver, boot and the unsafe-head follower with its checks. `feed` is
+/// called once boot is done. The caller logs its own `eez.node.launching`.
+///
+/// # Errors
+///
+/// `EEZ_P2P_LISTEN` or `EEZ_P2P_PEERS` is set, configuration is invalid,
+/// reth or the L1 bootstrap fails, or `feed` fails.
+pub async fn launch_with_head_feed<Feed, S>(builder: L2NodeBuilder, feed: Feed) -> eyre::Result<()>
+where
+    Feed: FnOnce(&HeadFeedContext) -> eyre::Result<HeadFeed<S>> + Send + 'static,
+    S: BlockSource + Send + Sync + 'static,
+{
+    let start = move |context: &HeadFeedContext, follower: UnsafeHeadParts| {
+        let HeadFeed { heads, blocks } = feed(context)?;
+        follower.spawn(heads, blocks);
+        Ok(())
+    };
+    Box::pin(launch(builder, HeadSource::Caller(Box::new(start)), |_| {
+        Ok(())
+    }))
+    .await
+}
+
+/// Starts a caller's head feed on the booted follower.
+type StartFeed =
+    Box<dyn FnOnce(&HeadFeedContext, UnsafeHeadParts) -> eyre::Result<()> + Send + 'static>;
+
+/// Where the unsafe head's signed heads come from.
+enum HeadSource {
+    /// The p2p overlay, when `EEZ_P2P_LISTEN` and this address are both set.
+    Overlay(Option<Address>),
+    /// A caller's feed.
+    Caller(StartFeed),
+}
+
+/// What the unsafe-head follower runs on, short of its head feed.
+struct UnsafeHeadParts {
+    committer: BlockCommitterHandle<eez_engine::EezEngineTypes>,
+    provider: reth_provider::providers::BlockchainProvider<
+        reth_node_api::NodeTypesWithDBAdapter<EezNode, reth_db::DatabaseEnv>,
+    >,
+    l1_head: Arc<L1CanonicalHead>,
+    retry_interval: Duration,
+    task_executor: reth_tasks::TaskExecutor,
+}
+
+impl UnsafeHeadParts {
+    /// Spawns the follower on `heads`, fetching missing ancestors from `blocks`.
+    fn spawn<S>(self, heads: mpsc::Receiver<VerifiedHead>, blocks: S)
+    where
+        S: BlockSource + Send + Sync + 'static,
+    {
+        let follower = UnsafeHeadFollower::new(
+            self.committer,
+            heads,
+            blocks,
+            self.provider,
+            self.l1_head,
+            self.retry_interval,
+        );
+        self.task_executor
+            .spawn_critical_task("eez-node-follower-unsafe-head", follower.run());
+    }
 }
 
 async fn launch(
     builder: L2NodeBuilder,
-    ext: FollowerArgs,
+    heads: HeadSource,
     on_ready: impl FnOnce(FollowerContext) -> eyre::Result<()> + Send + 'static,
 ) -> eyre::Result<()> {
-    event!(
-        name: "eez.node.launching",
-        Level::INFO,
-        mode = "follower",
-        "launching eez follower",
-    );
     warn_on_deprecated_env();
     let sync_mode = sync_mode_from_env()?;
 
@@ -113,7 +214,14 @@ async fn launch(
         builder.config().chain.chain().id(),
         system_config.this_rollup_id,
     )?;
-    let head_follower = head_follower(p2p_config, ext.sequencer_address)?;
+    let (head_follower, caller_feed) = match heads {
+        HeadSource::Overlay(address) => (head_follower(p2p_config, address)?, None),
+        HeadSource::Caller(start) => {
+            no_overlay(p2p_config.is_some(), !eez_p2p::peers_from_env()?.is_empty())?;
+            (None, Some(start))
+        }
+    };
+    let eezl2_address = system_config.eezl2_address;
     let system_address = eez_primitives::SYSTEM_ADDRESS;
 
     let handle = builder
@@ -204,7 +312,23 @@ async fn launch(
         task_executor: task_executor.clone(),
     })?;
 
-    if let Some((sequencer_address, cfg)) = head_follower {
+    let unsafe_head = UnsafeHeadParts {
+        committer: block_committer,
+        provider,
+        l1_head,
+        retry_interval: timing.l2_block_time(),
+        task_executor: task_executor.clone(),
+    };
+    if let Some(start) = caller_feed {
+        let context = HeadFeedContext {
+            domain: head_domain,
+            genesis_hash: handle.node.chain_spec().genesis_hash(),
+            eezl2_address,
+            timing,
+            task_executor: task_executor.clone(),
+        };
+        start(&context, unsafe_head)?;
+    } else if let Some((sequencer_address, cfg)) = head_follower {
         event!(
             name: "eez.node.follower.unsafe_head.spawned",
             Level::INFO,
@@ -219,15 +343,7 @@ async fn launch(
             eez_node_common::discover(network.clone()),
         )?;
         task_executor.spawn_critical_task("eez-p2p", overlay.run(None, Some(gossip_tx)));
-        let follower = UnsafeHeadFollower::new(
-            block_committer,
-            gossip_rx,
-            PeerBlocks::new(network.fetch_client().await?),
-            provider,
-            l1_head,
-            timing.l2_block_time(),
-        );
-        task_executor.spawn_critical_task("eez-node-follower-unsafe-head", follower.run());
+        unsafe_head.spawn(gossip_rx, PeerBlocks::new(network.fetch_client().await?));
     } else {
         event!(
             name: "eez.node.follower.l1_derived_only",
@@ -256,6 +372,16 @@ fn head_follower<C>(
         (None, Some(_)) => Err(eyre::eyre!("EEZ_P2P_LISTEN requires EEZ_SEQUENCER_ADDRESS")),
         (None, None) => Ok(None),
     }
+}
+
+/// A node fed heads by its caller runs no p2p overlay, so its settings are an error.
+fn no_overlay(listen: bool, peers: bool) -> eyre::Result<()> {
+    eyre::ensure!(
+        !listen && !peers,
+        "EEZ_P2P_LISTEN or EEZ_P2P_PEERS is set, but this node takes its heads from another \
+         feed and runs no p2p overlay; unset them",
+    );
+    Ok(())
 }
 
 /// Read the mandatory system-transaction identity before follower startup.
@@ -315,5 +441,14 @@ mod tests {
             err(Some(()), None),
             "EEZ_P2P_LISTEN requires EEZ_SEQUENCER_ADDRESS"
         );
+    }
+
+    #[test]
+    fn caller_feed_refuses_overlay_settings() {
+        assert!(no_overlay(false, false).is_ok());
+        for (listen, peers) in [(true, false), (false, true), (true, true)] {
+            let err = no_overlay(listen, peers).unwrap_err().to_string();
+            assert!(err.contains("runs no p2p overlay"), "{err}");
+        }
     }
 }
