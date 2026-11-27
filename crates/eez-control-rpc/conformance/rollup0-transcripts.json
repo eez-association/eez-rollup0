@@ -4000,8 +4000,8 @@
         {
           "action": "send",
           "check": "early-begin",
-          "operation": "OpenWindow",
-          "protobuf_hex": "1001524a0a480801104e1a205f62964e4debc83590b2a717b27ae1b2583bf0ad5d165feee8d3d24d15e8f29c22201d309fa4e2fa74e56fb14aee4105256996ab3ba0fe024dc5d51c6d96a15fc00b",
+          "operation": "Begin",
+          "protobuf_hex": "100122480801104e1a205f62964e4debc83590b2a717b27ae1b2583bf0ad5d165feee8d3d24d15e8f29c22201d309fa4e2fa74e56fb14aee4105256996ab3ba0fe024dc5d51c6d96a15fc00b",
           "stream": "first"
         },
         {
@@ -4030,8 +4030,8 @@
         {
           "action": "send",
           "check": "stale-tip",
-          "operation": "OpenWindow",
-          "protobuf_hex": "0a20e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1100152261a24084e12205f62964e4debc83590b2a717b27ae1b2583bf0ad5d165feee8d3d24d15e8f29c",
+          "operation": "Resume",
+          "protobuf_hex": "0a20e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e110012a261224084e12205f62964e4debc83590b2a717b27ae1b2583bf0ad5d165feee8d3d24d15e8f29c",
           "stream": "stale-tip"
         },
         {
@@ -4045,6 +4045,16 @@
           "action": "receive",
           "kind": "rejected",
           "protobuf_hex": "100142020809",
+          "stream": "stale-tip"
+        },
+        {
+          "action": "receive",
+          "kind": "rejected",
+          "protobuf_hex": "100242020803",
+          "stream": "stale-tip"
+        },
+        {
+          "action": "half_close",
           "stream": "stale-tip"
         },
         {
@@ -4058,8 +4068,8 @@
         {
           "action": "send",
           "check": "bad-height",
-          "operation": "OpenWindow",
-          "protobuf_hex": "0a20e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e110015226122408501220393def756e0a7f87f2a6214c387231534f2cbe876c805645eaf39d169afb68a7",
+          "operation": "Resume",
+          "protobuf_hex": "0a20e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e110012a260a2408501220393def756e0a7f87f2a6214c387231534f2cbe876c805645eaf39d169afb68a7",
           "stream": "bad-height"
         },
         {
@@ -4073,6 +4083,16 @@
           "action": "receive",
           "kind": "rejected",
           "protobuf_hex": "100142020809",
+          "stream": "bad-height"
+        },
+        {
+          "action": "receive",
+          "kind": "rejected",
+          "protobuf_hex": "100242020803",
+          "stream": "bad-height"
+        },
+        {
+          "action": "half_close",
           "stream": "bad-height"
         },
         {
@@ -4099,8 +4119,8 @@
         {
           "action": "send",
           "check": "resume-at-retained-ancestor",
-          "operation": "OpenWindow",
-          "protobuf_hex": "0a20e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1100152261224084f1220393def756e0a7f87f2a6214c387231534f2cbe876c805645eaf39d169afb68a7",
+          "operation": "Resume",
+          "protobuf_hex": "0a20e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e110012a260a24084f1220393def756e0a7f87f2a6214c387231534f2cbe876c805645eaf39d169afb68a7",
           "stream": "select"
         },
         {

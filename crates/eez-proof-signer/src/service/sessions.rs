@@ -299,9 +299,8 @@ impl SessionRuntime {
                 // Handle control frames directly so Rewind and Cancel can fence active work.
                 Event::Input(Ok(Some(message))) => {
                     let request_id = message.request_id;
-                    let opens_window =
-                        matches!(message.kind, Some(client_frame::Kind::OpenWindow(_)));
-                    let fresh_window = opens_window && bound_session.is_none();
+                    let opens_window = matches!(message.kind, Some(client_frame::Kind::Begin(_)))
+                        || matches!(&message.kind, Some(client_frame::Kind::Resume(r)) if r.target.is_some());
                     let is_rewind = matches!(message.kind, Some(client_frame::Kind::Rewind(_)));
                     let response = self.handle_frame(&mut bound_session, message).await;
                     let rewound = is_rewind && response.is_ok();
@@ -310,9 +309,7 @@ impl SessionRuntime {
                     } else {
                         0
                     };
-                    // A rejected opener owns no early frames. Drop its whole speculative window.
-                    let should_close =
-                        matches!(response, Ok((_, true))) || (fresh_window && response.is_err());
+                    let should_close = matches!(response, Ok((_, true)));
                     let frame = match response {
                         Ok((frame, _)) => frame,
                         Err((authorized, status)) => {
@@ -468,44 +465,6 @@ impl SessionRuntime {
         };
 
         match kind {
-            client_frame::Kind::OpenWindow(open) => {
-                use eez_control_rpc::v1::open_window::Start;
-                if bound_session.is_some() || epoch != 0 {
-                    return Err((
-                        None,
-                        Status::invalid_argument(
-                            "OpenWindow requires an unbound stream and epoch zero",
-                        ),
-                    ));
-                }
-                let require_tip = matches!(open.start, Some(Start::ExpectedTip(_)));
-                let (bound, ready) = match open.start {
-                    Some(Start::Begin(begin)) if session_id.is_empty() => self.begin(begin).await,
-                    Some(Start::Checkpoint(cursor) | Start::ExpectedTip(cursor)) => {
-                        let id = parse_session_id(&session_id).map_err(|status| (None, status))?;
-                        let hash = parse_b256("checkpoint hash", &cursor.validated_hash)
-                            .map_err(|status| (None, status))?;
-                        let at = if require_tip {
-                            Attachment::ExpectedTip(cursor.validated_through, hash)
-                        } else {
-                            Attachment::Ancestor {
-                                number: Some(cursor.validated_through),
-                                hash,
-                            }
-                        };
-                        self.attach(id, None, at).await
-                    }
-                    _ => Err(Status::invalid_argument(
-                        "invalid OpenWindow start or session ID",
-                    )),
-                }
-                .map_err(|status| (None, status))?;
-                *bound_session = Some(bound);
-                Ok((
-                    server_frame(bound, request_id, server_frame::Kind::Ready(ready)),
-                    false,
-                ))
-            }
             // Create and bind a new session at the supplied anchor, then report its ready cursor.
             client_frame::Kind::Begin(begin) => {
                 if bound_session.is_some() || !session_id.is_empty() || epoch != 0 {
@@ -524,7 +483,7 @@ impl SessionRuntime {
                 ))
             }
             // Reattach to retained progress with a new epoch that fences the previous attachment.
-            client_frame::Kind::Resume(_) => {
+            client_frame::Kind::Resume(resume) => {
                 if bound_session.is_some() || epoch != 0 {
                     return Err((
                         None,
@@ -532,7 +491,10 @@ impl SessionRuntime {
                     ));
                 }
                 let id = parse_session_id(&session_id).map_err(|status| (None, status))?;
-                let (bound, ready) = self.resume(id).await.map_err(|status| (None, status))?;
+                let (bound, ready) = self
+                    .resume(id, resume.target)
+                    .await
+                    .map_err(|status| (None, status))?;
                 *bound_session = Some(bound);
                 Ok((
                     server_frame(bound, request_id, server_frame::Kind::Ready(ready)),
@@ -698,8 +660,24 @@ impl SessionRuntime {
     }
 
     /// Reattach to retained progress with a new epoch, cancelling work from the previous attachment.
-    async fn resume(&self, id: SessionId) -> Result<(BoundSession, Ready), Status> {
-        self.attach(id, None, Attachment::Current).await
+    async fn resume(
+        &self,
+        id: SessionId,
+        target: Option<eez_control_rpc::v1::resume::Target>,
+    ) -> Result<(BoundSession, Ready), Status> {
+        use eez_control_rpc::v1::resume::Target;
+        let at = match target {
+            None => Attachment::Current,
+            Some(Target::Checkpoint(c)) => Attachment::Ancestor {
+                number: Some(c.validated_through),
+                hash: parse_b256("checkpoint hash", &c.validated_hash)?,
+            },
+            Some(Target::ExpectedTip(c)) => Attachment::ExpectedTip(
+                c.validated_through,
+                parse_b256("expected tip hash", &c.validated_hash)?,
+            ),
+        };
+        self.attach(id, None, at).await
     }
 
     async fn rewind(
@@ -2099,7 +2077,7 @@ mod tests {
         );
 
         // Resuming the remaining candidate must protect it from eviction.
-        let (resumed, _) = runtime.resume(sessions[8].id).await.unwrap();
+        let (resumed, _) = runtime.resume(sessions[8].id, None).await.unwrap();
         assert_ne!(resumed.epoch, sessions[8].epoch);
         assert!(
             runtime
@@ -2149,7 +2127,7 @@ mod tests {
                 session_id: original.session_id.clone(),
                 request_id: 2,
                 epoch: 0,
-                kind: Some(client_frame::Kind::Resume(eez_control_rpc::v1::Resume {})),
+                kind: Some(client_frame::Kind::Resume(Default::default())),
             },
         )
         .await;

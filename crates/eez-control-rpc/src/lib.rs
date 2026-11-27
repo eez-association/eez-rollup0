@@ -8,7 +8,7 @@ pub use generated::v1;
 
 use prost::Message;
 
-/// Maximum number of dependent Block/Finalize frames before an OpenWindow Ready.
+/// Maximum number of dependent Block/Finalize frames before Ready on Begin or a targeted Resume.
 pub const MAX_EARLY_FRAMES: usize = 8;
 
 /// Max size of a single `ProveStream` gRPC message, applied to BOTH the client

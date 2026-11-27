@@ -367,31 +367,25 @@ RollupX conformance; those settlement profiles need separate implementations.
 
 ### Sending the first window before Ready
 
-Rollup0 servers accept both the ordinary exchange and `OpenWindow` as the first
-frame of a new stream. Clients choose per exchange. They may send up to eight
-consecutive `Block` or `Finalize` frames immediately after `OpenWindow`. Each
-uses its own request ID, an empty session ID and epoch zero. Each block remains
-a separate gRPC message under the usual wire and queue limits. The first bound
-frame or control ends this allowance. All later requests use the issued binding.
+After `Begin` or a `Resume` with a target, the client may send up to eight
+consecutive `Block` or `Finalize` frames before receiving `Ready`. Each uses a
+distinct request ID, an empty session ID and epoch zero. Each block remains a
+separate gRPC message under the usual wire and queue limits. The first bound
+frame or control ends the allowance. A client can always wait for `Ready` and
+use the issued binding immediately.
 
-An opener has epoch zero and one of three starts.
+`Begin` starts at its anchor. `Resume` takes an optional target:
 
-- `begin` supplies the ordinary Begin anchor and an empty session ID.
-- `checkpoint` supplies a retained session ID and a validated number and hash.
-  Under the session lock, select that exact ancestor, discard its suffix and
-  fence the previous attachment once.
-- `expected_tip` also requires the checkpoint to be the current tip. A
-  background witness capture can append without risking a rewind.
+- With no target, wait for `Ready` to discover the authoritative tip.
+- `checkpoint` selects a retained ancestor by number and hash, discards its
+  suffix and fences the previous attachment in the same operation.
+- `expected_tip` requires that number and hash to still be the current tip.
+  Background capture uses this to append without rewinding.
 
-A successful opener returns `Ready` at the exact requested cursor before any
-work replies. The server binds early work to that attachment at ingress. It
-applies the usual ordering, quota, execution and stale-epoch checks. A failed
-opener on a new transport returns one correlated rejection, closes that transport
-and discards its speculative work. A missing session returns `NOT_FOUND`.
-A missing ancestor or changed expected tip returns `FAILED_PRECONDITION` and
-preserves the old session, including its epoch. Plain `Resume` discovers the
-authoritative tip after a lost acknowledgement. A client talking to a baseline
-implementation can retry on a new transport after `UNIMPLEMENTED`.
+The signer returns `Ready` at the selected cursor before replying to early
+work. A missing session returns `NOT_FOUND`. An unavailable checkpoint or
+changed tip returns `FAILED_PRECONDITION` and preserves the old attachment.
+A rejected opener leaves the new stream unbound, so its early frames are rejected.
 
 ### Retained sessions
 
