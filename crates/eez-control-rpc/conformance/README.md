@@ -8,10 +8,10 @@ connects to a running prover configured for the fixture and selected test profil
 
 ## Cases and profiles
 
-[`rollup0-transcripts.json`](rollup0-transcripts.json) contains 17 cases.
+[`rollup0-transcripts.json`](rollup0-transcripts.json) contains 18 cases.
 [`rollup0-limits-transcripts.json`](rollup0-limits-transcripts.json) contains four
-more cases requiring explicit server limits. Together they contain 339 requests,
-338 correlated replies, one terminal transport error, and 25 successful proofs.
+more cases requiring explicit server limits. Together they contain 353 requests,
+350 correlated replies, one terminal transport error, and 26 successful proofs.
 
 | Operation | Coverage |
 | --- | --- |
@@ -19,6 +19,7 @@ more cases requiring explicit server limits. Together they contain 339 requests,
 | Block | Execution; duplicate at/before tip; missing data/witness; hash widths; zero/max/gapped numbers; contradictory parent/hash/RLP; invalid witness then valid retry; cache-parent binding. |
 | Finalize | Full range, one block, terminal before tip, optional subrange/last block; empty prefix; invalid range/terminal; malformed/missing ABI; mismatched parent/terminal/rollup/proof system/DA; invalid blob carrier/profile inputs; malformed Rollup0 posting-context fields rejected before range selection; valid retry. |
 | Resume | Progress after half-close and Proof; live takeover; missing/malformed/retired session; nonzero initial epoch; stale transport cannot use the new epoch. |
+| OpenWindow | First blocks and Finalize sent before Ready, exact checkpoint rewind, rejected height and stale append-only tip preserve the original attachment. |
 | Rewind | Tip, intermediate block and anchor; malformed/unknown/pruned ancestors; stale epoch; removed suffix cannot finalize; promoted anchor survives Resume. |
 | Cancel | Acknowledgement and EOF; retired session cannot resume; cross-stream cancellation denied; another Composer can finish. |
 | Framing/pipelining | Unknown operation; unauthorized bindings; zero/max request IDs; interleaved Composers; queued gap; half-close drains work; terminal replies close without client half-close. |
@@ -60,7 +61,7 @@ request/idle timeouts. Start a fresh server for the complete suite or the
 cold-cache witness case. From the repository root:
 
 ```sh
-# All 17 normal cases against a separately configured server:
+# All 18 normal cases against a separately configured server:
 cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0.0.1:50061
 # Minimal sequential profile:
 cargo run --locked -p eez-control-rpc --example replay_streaming -- http://127.0.0.1:50061 baseline-and-rejections

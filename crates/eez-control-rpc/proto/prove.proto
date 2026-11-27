@@ -12,7 +12,7 @@ service Prover {
 }
 
 message ClientFrame {
-  // Empty only on Begin. The server issues this opaque ID; it is never a block
+  // Empty on Begin, a fresh OpenWindow, and its unbound first-window frames. The server issues this opaque ID; it is never a block
   // or proof identity and is not shared between Composers.
   bytes session_id = 1;
   // Chosen by the client, unique among outstanding operations, and echoed on
@@ -28,6 +28,7 @@ message ClientFrame {
     Block block = 7;
     Finalize finalize = 8;
     Cancel cancel = 9;
+    OpenWindow open_window = 10;
   }
 }
 
@@ -45,6 +46,21 @@ message Begin {
 // Optional: first frame on a new stream, with a new epoch on Ready.
 // Unsupported Resume returns UNIMPLEMENTED; the client can Begin and backfill.
 message Resume {}
+
+// Open and pipeline up to eight Block/Finalize frames on this same transport.
+// Early frames use empty session_id and epoch zero. Ready still precedes their
+// correlated replies. All subsequent requests use the regular Ready binding.
+message OpenWindow {
+  oneof start {
+    Begin begin = 1;
+    // The outer session_id names the session. Select this exact retained
+    // ancestor and fence the previous attachment atomically, as one operation.
+    Ready checkpoint = 2;
+    // Append only if this is still the exact tip. A delayed background
+    // prevalidation must never truncate work that advanced since its last ACK.
+    Ready expected_tip = 3;
+  }
+}
 
 message Rewind {
   // Optional. Unsupported Rewind returns UNIMPLEMENTED without changing progress.

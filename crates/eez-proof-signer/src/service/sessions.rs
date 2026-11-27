@@ -133,6 +133,14 @@ struct BoundSession {
     epoch: u64,
 }
 
+/// Plain resume discovers the current tip. Background capture may only append
+/// there, while an authoritative proof can explicitly select a retained ancestor.
+enum Attachment {
+    Current,
+    ExpectedTip(u64, B256),
+    Ancestor { number: Option<u64>, hash: B256 },
+}
+
 type FrameError = (Option<BoundSession>, Status);
 
 /// Shared by every service clone. Session state is private; only immutable,
@@ -179,6 +187,7 @@ impl SessionRuntime {
         }
 
         let mut bound_session = None;
+        let mut early_remaining = 0;
         let mut pending: VecDeque<(ClientFrame, usize, usize)> = VecDeque::new();
         let mut pending_bytes = 0usize;
         let mut pending_items = 0usize;
@@ -237,12 +246,22 @@ impl SessionRuntime {
 
             match event {
                 // Queue dependent work so it cannot overtake earlier blocks or Finalize.
-                Event::Input(Ok(Some(message)))
+                Event::Input(Ok(Some(mut message)))
                     if matches!(
                         message.kind,
                         Some(client_frame::Kind::Block(_) | client_frame::Kind::Finalize(_))
                     ) =>
                 {
+                    // Resolve early frames at ingress, freezing the actual attachment
+                    // before queueing. Workers still check its epoch before publishing.
+                    if early_remaining > 0 && message.session_id.is_empty() && message.epoch == 0 {
+                        let bound: BoundSession = bound_session.expect("accepted window opener");
+                        message.session_id = bound.id.to_vec();
+                        message.epoch = bound.epoch;
+                        early_remaining -= 1;
+                    } else {
+                        early_remaining = 0;
+                    }
                     // Bound decoded requests before they reach per-session admission.
                     // Allow one window plus its Finalize calldata; keep reading controls
                     // while work runs, but close an overflowing stream explicitly.
@@ -280,10 +299,20 @@ impl SessionRuntime {
                 // Handle control frames directly so Rewind and Cancel can fence active work.
                 Event::Input(Ok(Some(message))) => {
                     let request_id = message.request_id;
+                    let opens_window =
+                        matches!(message.kind, Some(client_frame::Kind::OpenWindow(_)));
+                    let fresh_window = opens_window && bound_session.is_none();
                     let is_rewind = matches!(message.kind, Some(client_frame::Kind::Rewind(_)));
                     let response = self.handle_frame(&mut bound_session, message).await;
                     let rewound = is_rewind && response.is_ok();
-                    let should_close = matches!(response, Ok((_, true)));
+                    early_remaining = if opens_window && response.is_ok() {
+                        eez_control_rpc::MAX_EARLY_FRAMES
+                    } else {
+                        0
+                    };
+                    // A rejected opener owns no early frames. Drop its whole speculative window.
+                    let should_close =
+                        matches!(response, Ok((_, true))) || (fresh_window && response.is_err());
                     let frame = match response {
                         Ok((frame, _)) => frame,
                         Err((authorized, status)) => {
@@ -439,6 +468,44 @@ impl SessionRuntime {
         };
 
         match kind {
+            client_frame::Kind::OpenWindow(open) => {
+                use eez_control_rpc::v1::open_window::Start;
+                if bound_session.is_some() || epoch != 0 {
+                    return Err((
+                        None,
+                        Status::invalid_argument(
+                            "OpenWindow requires an unbound stream and epoch zero",
+                        ),
+                    ));
+                }
+                let require_tip = matches!(open.start, Some(Start::ExpectedTip(_)));
+                let (bound, ready) = match open.start {
+                    Some(Start::Begin(begin)) if session_id.is_empty() => self.begin(begin).await,
+                    Some(Start::Checkpoint(cursor) | Start::ExpectedTip(cursor)) => {
+                        let id = parse_session_id(&session_id).map_err(|status| (None, status))?;
+                        let hash = parse_b256("checkpoint hash", &cursor.validated_hash)
+                            .map_err(|status| (None, status))?;
+                        let at = if require_tip {
+                            Attachment::ExpectedTip(cursor.validated_through, hash)
+                        } else {
+                            Attachment::Ancestor {
+                                number: Some(cursor.validated_through),
+                                hash,
+                            }
+                        };
+                        self.attach(id, None, at).await
+                    }
+                    _ => Err(Status::invalid_argument(
+                        "invalid OpenWindow start or session ID",
+                    )),
+                }
+                .map_err(|status| (None, status))?;
+                *bound_session = Some(bound);
+                Ok((
+                    server_frame(bound, request_id, server_frame::Kind::Ready(ready)),
+                    false,
+                ))
+            }
             // Create and bind a new session at the supplied anchor, then report its ready cursor.
             client_frame::Kind::Begin(begin) => {
                 if bound_session.is_some() || !session_id.is_empty() || epoch != 0 {
@@ -632,14 +699,73 @@ impl SessionRuntime {
 
     /// Reattach to retained progress with a new epoch, cancelling work from the previous attachment.
     async fn resume(&self, id: SessionId) -> Result<(BoundSession, Ready), Status> {
-        // Keep the registry locked until attachment so eviction cannot remove
-        // a disconnected session while it is being resumed.
+        self.attach(id, None, Attachment::Current).await
+    }
+
+    async fn rewind(
+        &self,
+        bound: BoundSession,
+        ancestor_hash: B256,
+    ) -> Result<(BoundSession, Ready), Status> {
+        self.attach(
+            bound.id,
+            Some(bound.epoch),
+            Attachment::Ancestor {
+                number: None,
+                hash: ancestor_hash,
+            },
+        )
+        .await
+    }
+
+    /// Validate the requested cursor before changing the prefix or fencing its owner.
+    async fn attach(
+        &self,
+        id: SessionId,
+        current_epoch: Option<u64>,
+        at: Attachment,
+    ) -> Result<(BoundSession, Ready), Status> {
         let registry = self.registry.lock().await;
         let session = registry
             .sessions
             .get(&id)
             .ok_or_else(|| Status::not_found("prover session is not retained"))?;
         let mut session = session.lock().await;
+        if let Some(epoch) = current_epoch {
+            require_epoch(&session, epoch)?;
+        }
+        let tip = session.tip();
+        match at {
+            Attachment::Current => {}
+            Attachment::ExpectedTip(number, hash) => {
+                if (tip.number, tip.hash) != (number, hash) {
+                    return Err(Status::failed_precondition("the retained tip has advanced"));
+                }
+            }
+            Attachment::Ancestor { number, hash } => {
+                let matches = |n, h| hash == h && number.is_none_or(|expected| expected == n);
+                if !matches(tip.number, tip.hash) {
+                    let retained = if matches(session.anchor.number, session.anchor.hash) {
+                        0
+                    } else {
+                        session
+                            .blocks
+                            .iter()
+                            .position(|block| {
+                                matches(block.validated.number(), block.validated.hash())
+                            })
+                            .map(|i| i + 1)
+                            .ok_or_else(|| {
+                                Status::failed_precondition(
+                                    "checkpoint is not in the session's validated active prefix",
+                                )
+                            })?
+                    };
+                    session.blocks.truncate(retained);
+                    session.proved_through = session.proved_through.min(session.tip().number);
+                }
+            }
+        }
         session.cancellation.cancel();
         session.epoch = next_epoch(session.epoch);
         session.connected = true;
@@ -654,46 +780,6 @@ impl SessionRuntime {
                 validated_hash: session.tip().hash.to_vec(),
             },
         ))
-    }
-
-    /// Truncate to a retained ancestor and advance the epoch to invalidate old-prefix work.
-    async fn rewind(
-        &self,
-        bound: BoundSession,
-        ancestor_hash: B256,
-    ) -> Result<(BoundSession, Ready), Status> {
-        let session = self.session(bound.id).await?;
-        let mut session = session.lock().await;
-        require_epoch(&session, bound.epoch)?;
-
-        let retained = if ancestor_hash == session.anchor.hash {
-            0
-        } else {
-            session
-                .blocks
-                .iter()
-                .position(|block| block.validated.hash() == ancestor_hash)
-                .map(|index| index + 1)
-                .ok_or_else(|| {
-                    Status::failed_precondition(
-                        "Rewind ancestor is not in the session's validated active prefix",
-                    )
-                })?
-        };
-        session.blocks.truncate(retained);
-        session.proved_through = session.proved_through.min(session.tip().number);
-        session.cancellation.cancel();
-        session.epoch = next_epoch(session.epoch);
-        session.cancellation = CancellationToken::default();
-        let rewound = BoundSession {
-            id: bound.id,
-            epoch: session.epoch,
-        };
-        let ready = Ready {
-            validated_through: session.tip().number,
-            validated_hash: session.tip().hash.to_vec(),
-        };
-        Ok((rewound, ready))
     }
 
     async fn session(&self, id: SessionId) -> Result<Arc<Mutex<Session>>, Status> {

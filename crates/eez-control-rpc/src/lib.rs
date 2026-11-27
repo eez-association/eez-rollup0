@@ -8,6 +8,9 @@ pub use generated::v1;
 
 use prost::Message;
 
+/// Maximum number of dependent Block/Finalize frames before an OpenWindow Ready.
+pub const MAX_EARLY_FRAMES: usize = 8;
+
 /// Max size of a single `ProveStream` gRPC message, applied to BOTH the client
 /// (encode) and server (decode).
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024 * 1024;

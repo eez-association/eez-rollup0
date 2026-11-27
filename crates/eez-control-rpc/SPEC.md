@@ -73,7 +73,7 @@ A ClientFrame contains exactly one operation and an unambiguous outstanding
 request_id. Every response echoes that ID. Begin is the first frame on an
 unbound stream, with an empty session_id and epoch zero. Its Ready returns a
 new opaque 32-byte session ID, a nonzero epoch and the exact anchor cursor.
-Thereafter frames carry that stream's binding; the baseline simply echoes the
+Ordinary frames then carry that stream's binding. Section 4 defines the early-window exception. The baseline echoes the
 same epoch throughout. A session ID is not a block/proof identity or an
 authentication credential. Shared deployments must authenticate and isolate
 Composers independently of these fields.
@@ -364,6 +364,36 @@ The current Rollup0 implementation does not claim full Rollup0-draft or live
 RollupX conformance; those settlement profiles need separate implementations.
 
 ## 4. Optional advanced session controls
+
+### Sending the first window before Ready
+
+Rollup0 servers accept both the ordinary exchange and `OpenWindow` as the first
+frame of a new stream. Clients choose per exchange. They may send up to eight
+consecutive `Block` or `Finalize` frames immediately after `OpenWindow`. Each
+uses its own request ID, an empty session ID and epoch zero. Each block remains
+a separate gRPC message under the usual wire and queue limits. The first bound
+frame or control ends this allowance. All later requests use the issued binding.
+
+An opener has epoch zero and one of three starts.
+
+- `begin` supplies the ordinary Begin anchor and an empty session ID.
+- `checkpoint` supplies a retained session ID and a validated number and hash.
+  Under the session lock, select that exact ancestor, discard its suffix and
+  fence the previous attachment once.
+- `expected_tip` also requires the checkpoint to be the current tip. A
+  background witness capture can append without risking a rewind.
+
+A successful opener returns `Ready` at the exact requested cursor before any
+work replies. The server binds early work to that attachment at ingress. It
+applies the usual ordering, quota, execution and stale-epoch checks. A failed
+opener on a new transport returns one correlated rejection, closes that transport
+and discards its speculative work. A missing session returns `NOT_FOUND`.
+A missing ancestor or changed expected tip returns `FAILED_PRECONDITION` and
+preserves the old session, including its epoch. Plain `Resume` discovers the
+authoritative tip after a lost acknowledgement. A client talking to a baseline
+implementation can retry on a new transport after `UNIMPLEMENTED`.
+
+### Retained sessions
 
 Resume retains progress subject to published limits. It is the first frame
 on a new stream, with the retained ID and epoch zero. Ready returns the same
