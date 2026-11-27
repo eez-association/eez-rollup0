@@ -50,7 +50,8 @@ use crate::held_pool::{HeldPool, HeldTx};
 use crate::ingress::Direction;
 use crate::local::{
     BuildError, InboundL2TargetSession, L1SlotState, L1TargetSession, SyncCandidates,
-    build::SyncBlockState, build_sync_block, sync_block_candidates,
+    build::{SyncBlockState, truncated_hex},
+    build_sync_block, sync_block_candidates,
 };
 use crate::optimistic::OptimisticallyIncluded;
 use crate::prover_retry::{
@@ -1242,19 +1243,6 @@ fn take_l1_cache(
         .downcast::<evm2::evm::Cache>()
         .map(|cache| *cache)
         .map_err(|_e| "L1 session checkpoint payload is not a Cache".to_owned())
-}
-
-/// Hex of the first 32 bytes of a revert/return payload, for event messages.
-fn truncated_hex(data: &Bytes) -> String {
-    const MAX: usize = 32;
-    if data.len() <= MAX {
-        return alloy_primitives::hex::encode_prefixed(data);
-    }
-    format!(
-        "{}… ({} bytes)",
-        alloy_primitives::hex::encode_prefixed(&data[..MAX]),
-        data.len()
-    )
 }
 
 /// Composer umbrella. Cheaply [`Clone`]able (`Arc<Inner>`).

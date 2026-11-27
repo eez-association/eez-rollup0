@@ -613,15 +613,11 @@ impl TargetExecutionSession for InboundL2TargetSession {
         let probe_entry = self.inbound_sidecar_for_call(&req, Bytes::new())?;
         let probe_tx = self.delivery_tx(&probe_entry)?;
 
-        let snapshot = self.fork.snapshot();
         let mut inspector = ProbeInspector::new(self.cfg.eezl2_address);
         let probe = self
             .fork
-            .execute_tx_inspected(&probe_tx, &mut inspector)
+            .probe_native_tx(&probe_tx, &mut inspector)
             .map_err(fork_err)?;
-        // The probe leaves no trace: its state effects are re-applied by the
-        // real run below.
-        self.fork.restore(snapshot);
 
         let captured = match inspector.captures.as_slice() {
             [one] => one.clone(),

@@ -390,12 +390,16 @@ async fn launch_composer(builder: L2NodeBuilder, _ext: NoRoleArgs) -> eyre::Resu
                     http_port = l1_cfg.http_port,
                     "launching embedded L1 reth (testing)",
                 );
+                // Block timestamps on a 5 s grid, so a stall near a second
+                // boundary does not move a pinned postBatch's block.
+                let attributes = l1_embedded::TestingL1Attributes::new(node_cfg.chain.clone());
                 let l1_handle = reth_node_builder::NodeBuilder::new(node_cfg)
                     .with_database(db)
                     .with_launch_context(build_l1_runtime()?)
                     .node(EthereumNode::default())
                     .extend_rpc_modules(bundle_rpc::install_dev_bundle_rpc)
                     .launch_with_debug_capabilities()
+                    .with_payload_attributes_builder(attributes)
                     .await?;
                 event!(
                     name: "eez.node.l1_embedded.ready",

@@ -17,7 +17,7 @@ ifneq (,$(wildcard deployments.env))
     export
 endif
 
-.PHONY: help check test fmt build deploy-protocol run-node clean-l2 clean-deploy
+.PHONY: help check test fmt build deploy-protocol run-node clean-l2 clean-deploy deploy-bridge-l2
 
 help:
 	@echo "Targets:"
@@ -28,6 +28,7 @@ help:
 	@echo "  make deploy-protocol  - deploy EEZ + ECDSA PS + Rollup manager + register; writes deployments.env"
 	@echo "  make run-node         - run the composer against the configured L2 datadir"
 	@echo "  make clean-l2         - rm EEZ_L2_DATADIR (fresh L2 chain)"
+	@echo "  make deploy-bridge-l2 - deploy the reference ETH bridge after L2 starts"
 	@echo "  make clean-deploy     - rm deployments.env (fresh contract addresses on next deploy)"
 
 # ─── Rust ─────────────────────────────────────────────────────────────────
@@ -56,13 +57,16 @@ fmt:
 #                                   (authorizedSigner derived from EEZ_PROOF_SIGNER_KEY)
 #   3. DeployRollup              → Rollup manager contract
 #   4. RegisterRollup            → EEZ_ROLLUP_ID = 1
-#   5. DeployBridgeL1            → L1 cross-chain bridge contracts
+#   5. DeployBridge              → initialized L1 reference ETH bridge
 #
 # Outputs land in deployments.env (gitignored). eez-node loads it
 # alongside .env at startup, so a successful deploy means `make run-node`
 # Just Works without any paste-the-address-into-.env step.
 deploy-protocol:
 	@./scripts/deploy.sh
+
+deploy-bridge-l2:
+	@./scripts/deploy-bridge-l2.sh
 
 # ─── Node ─────────────────────────────────────────────────────────────────
 run-node:
