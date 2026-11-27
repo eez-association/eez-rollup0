@@ -162,6 +162,7 @@ impl Fixture {
             committer,
             None,
             RollupTiming::new(5000, 1000, 1000, 100),
+            Arc::new(eez_timing::TokioClock::new()),
         )
         .unwrap();
         Self { composer, engine }

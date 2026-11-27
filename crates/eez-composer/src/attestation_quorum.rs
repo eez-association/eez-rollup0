@@ -43,6 +43,7 @@ use eez_protocol::{
 use eez_prover::{
     BlockWitness, Prover, ProverError, ProvingAnchor, ProvingContext, RetryableProverError,
 };
+use eez_timing::Clock;
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use tokio::{
     task::JoinSet,
@@ -429,12 +430,14 @@ impl AttestationRound<'_> {
         ctx: &ProvingContext,
         timing: RollupTiming,
         target: BundleTarget,
+        clock: &dyn Clock,
     ) -> Result<Vec<Attestation>, ProverError> {
         match self {
             Self::Alone(member) => {
                 let request = single_attester_context(ctx, member.proof_system);
                 let proof =
-                    prove_with_retry(member.prover.as_ref(), request, timing, target).await?;
+                    prove_with_retry(member.prover.as_ref(), request, timing, target, clock)
+                        .await?;
                 Ok(vec![Attestation {
                     proof_system: member.proof_system,
                     proof,
@@ -445,7 +448,7 @@ impl AttestationRound<'_> {
                 registration,
             } => {
                 quorum
-                    .collect_proofs(ctx, registration, timing, target)
+                    .collect_proofs(ctx, registration, timing, target, clock)
                     .await
             }
         }
@@ -459,6 +462,7 @@ impl AttestationQuorum {
         registration: &QuorumRegistration,
         timing: RollupTiming,
         target: BundleTarget,
+        clock: &dyn Clock,
     ) -> Result<Vec<Attestation>, ProverError> {
         let threshold = registration.threshold;
         let usable = registration.usable();
@@ -471,12 +475,13 @@ impl AttestationQuorum {
                 let mut request = single_attester_context(ctx, member.proof_system);
                 request.verification_key = Some(vkey);
                 let prover = member.prover.as_ref();
-                let proof = AssertUnwindSafe(prove_with_retry(prover, request, timing, target))
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(ProverError::Backend("the attester panicked".to_owned()))
-                    });
+                let proof =
+                    AssertUnwindSafe(prove_with_retry(prover, request, timing, target, clock))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(ProverError::Backend("the attester panicked".to_owned()))
+                        });
                 (member.proof_system, proof)
             })
             .collect();

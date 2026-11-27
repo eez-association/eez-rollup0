@@ -25,6 +25,7 @@ eez-primitives = { workspace = true, optional = true }
 eez-prover = { workspace = true, optional = true }
 
 eez-l1.workspace = true
+eez-timing.workspace = true
 # reth
 reth-chainspec.workspace                  = true
 reth-engine-primitives.workspace          = true
@@ -53,6 +54,7 @@ tracing.workspace     = true
 
 [dev-dependencies]
 reth-ethereum-primitives.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
