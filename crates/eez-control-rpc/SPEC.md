@@ -73,7 +73,7 @@ A ClientFrame contains exactly one operation and an unambiguous outstanding
 request_id. Every response echoes that ID. Begin is the first frame on an
 unbound stream, with an empty session_id and epoch zero. Its Ready returns a
 new opaque 32-byte session ID, a nonzero epoch and the exact anchor cursor.
-Thereafter frames carry that stream's binding; the baseline simply echoes the
+Ordinary frames then carry that stream's binding. Section 4 defines the early-window exception. The baseline echoes the
 same epoch throughout. A session ID is not a block/proof identity or an
 authentication credential. Shared deployments must authenticate and isolate
 Composers independently of these fields.
@@ -364,6 +364,30 @@ The current Rollup0 implementation does not claim full Rollup0-draft or live
 RollupX conformance; those settlement profiles need separate implementations.
 
 ## 4. Optional advanced session controls
+
+### Sending the first window before Ready
+
+After `Begin` or a `Resume` with a target, the client may send up to eight
+consecutive `Block` or `Finalize` frames before receiving `Ready`. Each uses a
+distinct request ID, an empty session ID and epoch zero. Each block remains a
+separate gRPC message under the usual wire and queue limits. The first bound
+frame or control ends the allowance. A client can always wait for `Ready` and
+use the issued binding immediately.
+
+`Begin` starts at its anchor. `Resume` takes an optional target:
+
+- With no target, wait for `Ready` to discover the authoritative tip.
+- `checkpoint` selects a retained ancestor by number and hash, discards its
+  suffix and fences the previous attachment in the same operation.
+- `expected_tip` requires that number and hash to still be the current tip.
+  Background capture uses this to append without rewinding.
+
+The signer returns `Ready` at the selected cursor before replying to early
+work. A missing session returns `NOT_FOUND`. An unavailable checkpoint or
+changed tip returns `FAILED_PRECONDITION` and preserves the old attachment.
+A rejected opener leaves the new stream unbound, so its early frames are rejected.
+
+### Retained sessions
 
 Resume retains progress subject to published limits. It is the first frame
 on a new stream, with the retained ID and epoch zero. Ready returns the same

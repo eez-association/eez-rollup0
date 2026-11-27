@@ -12,13 +12,13 @@ service Prover {
 }
 
 message ClientFrame {
-  // Empty only on Begin. The server issues this opaque ID; it is never a block
-  // or proof identity and is not shared between Composers.
+  // Empty on Begin and on early Block/Finalize frames. The server issues this
+  // opaque ID per session. Composers do not share it.
   bytes session_id = 1;
   // Chosen by the client, unique among outstanding operations, and echoed on
   // every response to this operation. Superseded work need not receive a reply.
   uint64 request_id = 2;
-  // Zero on Begin and Resume; otherwise echo Ready. Baseline servers may use
+  // Zero on Begin, Resume and early frames. Otherwise echo Ready. Baseline servers may use
   // the constant 1. Only Resume/Rewind require changing epochs and fencing.
   uint64 epoch = 3;
   oneof kind {
@@ -31,6 +31,7 @@ message ClientFrame {
   }
 }
 
+// Clients may immediately send up to eight Block/Finalize frames after Begin.
 message Begin {
   uint64 rollup_id = 1;
   // Execution predecessor and baseline settlement parent. The first expected
@@ -44,7 +45,16 @@ message Begin {
 
 // Optional: first frame on a new stream, with a new epoch on Ready.
 // Unsupported Resume returns UNIMPLEMENTED; the client can Begin and backfill.
-message Resume {}
+message Resume {
+  // Omit the target to discover the current tip and wait for Ready. With a
+  // target, the same bounded first window as Begin may follow immediately.
+  oneof target {
+    // Select a retained ancestor and fence the previous attachment atomically.
+    Ready checkpoint = 1;
+    // Background capture may append only if this is still the exact tip.
+    Ready expected_tip = 2;
+  }
+}
 
 message Rewind {
   // Optional. Unsupported Rewind returns UNIMPLEMENTED without changing progress.

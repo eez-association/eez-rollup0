@@ -74,9 +74,10 @@ fn attestation_quorum_from_env() -> eyre::Result<eez_composer::AttestationQuorum
         .map(|spec| eez_composer::QuorumMember {
             proof_system: spec.proof_system,
             attester: spec.attester,
-            prover: Arc::new(eez_prover_client::RemoteProver::new(
+            prover: Arc::new(eez_prover_client::RemoteProver::with_early_window(
                 spec.url,
                 spec.attester,
+                config.early_window,
             )),
         })
         .collect();
@@ -106,6 +107,7 @@ fn attestation_quorum_from_env() -> eyre::Result<eez_composer::AttestationQuorum
 struct AttesterConfig {
     attesters: Vec<AttesterSpec>,
     grace: Duration,
+    early_window: bool,
 }
 
 /// One configured attester.
@@ -157,7 +159,17 @@ impl AttesterConfig {
             ),
             None => eez_composer::DEFAULT_ATTESTATION_GRACE,
         };
-        Ok(Self { attesters, grace })
+        let early_window = set("EEZ_PROVER_EARLY_WINDOW").map_or(Ok(true), |value| {
+            value
+                .trim()
+                .parse()
+                .map_err(|err| eyre::eyre!("EEZ_PROVER_EARLY_WINDOW `{value}`: {err}"))
+        })?;
+        Ok(Self {
+            attesters,
+            grace,
+            early_window,
+        })
     }
 }
 
@@ -1275,6 +1287,7 @@ mod tests {
 
         assert_eq!(config.attesters, vec![spec("http://signer:50051")]);
         assert_eq!(config.grace, Duration::from_millis(40));
+        assert!(config.early_window);
     }
 
     #[test]
@@ -1297,6 +1310,25 @@ mod tests {
         assert!(
             err.starts_with("EEZ_ECDSA_PROOF_SYSTEM_ADDRESS: `nope` is not an address"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn early_window_is_selectable_for_all_attesters() {
+        let endpoints = format!("http://a:1={ATTESTER}={PROOF_SYSTEM}");
+        let read = |value| {
+            attester_config(&[
+                ("EEZ_PROVERS", &endpoints),
+                ("EEZ_PROVER_EARLY_WINDOW", value),
+            ])
+        };
+        assert!(!read("false").unwrap().early_window);
+        assert!(read("true").unwrap().early_window);
+        assert!(
+            read("sometimes")
+                .unwrap_err()
+                .to_string()
+                .contains("EEZ_PROVER_EARLY_WINDOW")
         );
     }
 

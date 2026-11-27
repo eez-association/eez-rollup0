@@ -7,6 +7,7 @@
 
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,9 +16,9 @@ use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use eez_control_rpc::v1::{
     Begin as StreamBegin, Block as StreamBlock, ClientFrame, Finalize as StreamFinalize,
-    Resume as StreamResume, Rewind as StreamRewind, ServerFrame,
+    Ready as WireCursor, Resume as StreamResume, Rewind as StreamRewind, ServerFrame,
     SettlementInput as StreamSettlement, client_frame,
-    prover_client::ProverClient as StreamingProverClient, server_frame,
+    prover_client::ProverClient as StreamingProverClient, resume, server_frame,
 };
 use eez_control_rpc::v1::{
     BlockWitness as WireBlockWitness, ExecutionWitness as WireWitness, prove_failure,
@@ -31,7 +32,7 @@ use tonic::{Code, Status};
 use tracing::{Level, event};
 
 // Rollup0 clients require bounded pipelining support from the streaming server.
-const MAX_IN_FLIGHT: usize = 8;
+const MAX_IN_FLIGHT: usize = eez_control_rpc::MAX_EARLY_FRAMES;
 // Leave room for rejection diagnostics without allocating witness-sized replies.
 const MAX_STREAMING_RESPONSE_BYTES: usize = 64 * 1024;
 
@@ -51,6 +52,7 @@ struct Inner {
     /// rejected (a wrong/malicious prover cannot forge an attestation).
     attester: Address,
     streaming: Mutex<StreamingState>,
+    early_window: bool,
     // Counts queued/active proofs so best-effort prevalidation yields to all of them.
     proving: watch::Sender<usize>,
     exchange_timeout: Duration,
@@ -75,6 +77,10 @@ struct StreamingState {
         ServerFrame,
     )>,
     next_request_id: u64,
+    // Keep the last completed proof through background capture. Capture can only
+    // append. An interrupted authoritative proof can replace a suffix, so it
+    // consumes these hints and the next reconnect discovers the server cursor.
+    proven: Vec<(u64, B256)>,
 }
 
 #[derive(Debug)]
@@ -90,11 +96,18 @@ impl RemoteProver {
     /// the registered `attester`.
     #[must_use]
     pub fn new(url: impl Into<String>, attester: Address) -> Self {
+        Self::with_early_window(url, attester, true)
+    }
+
+    /// Choose whether this client offers work before Ready on known checkpoints.
+    #[must_use]
+    pub fn with_early_window(url: impl Into<String>, attester: Address, enabled: bool) -> Self {
         Self {
             inner: Arc::new(Inner {
                 url: url.into(),
                 attester,
-                streaming: Mutex::new(StreamingState::default()),
+                streaming: Mutex::default(),
+                early_window: enabled,
                 proving: watch::channel(0).0,
                 // Bound a stalled transport even outside Composer's shorter proof budget.
                 exchange_timeout: Duration::from_secs(5),
@@ -141,6 +154,46 @@ fn wire_block(block: &BlockWitness) -> WireBlockWitness {
                 .map(|bytes| bytes.to_vec())
                 .collect(),
         }),
+    }
+}
+
+// A previous proof is only a hint; the server verifies the selected checkpoint.
+// Background capture may append at a known tip, but only prove() may replace a suffix.
+fn known_checkpoint(
+    proven: &[(u64, B256)],
+    anchor: ProvingAnchor,
+    blocks: &[BlockWitness],
+    proving: bool,
+) -> Option<(usize, u64, B256)> {
+    if !proving {
+        let &(height, hash) = proven.last()?;
+        let block = blocks.first()?;
+        return (height.checked_add(1) == Some(block.number) && hash == block.parent_hash)
+            .then_some((0, height, hash));
+    }
+    blocks
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, b)| (i + 1, b.number, b.hash))
+        .chain(std::iter::once((0, anchor.number, anchor.hash)))
+        .find(|&(_, n, h)| {
+            proven
+                .binary_search_by_key(&n, |&(height, _)| height)
+                .is_ok_and(|i| proven[i].1 == h)
+        })
+}
+
+fn window_frame(
+    blocks: &[BlockWitness],
+    index: usize,
+    finalize: Option<&StreamFinalize>,
+) -> client_frame::Kind {
+    match blocks.get(index) {
+        Some(block) => client_frame::Kind::Block(StreamBlock {
+            data: Some(wire_block(block)),
+        }),
+        None => client_frame::Kind::Finalize(finalize.expect("last request is Finalize").clone()),
     }
 }
 
@@ -296,13 +349,13 @@ impl RemoteProver {
         Ok(Bytes::from(signature))
     }
 
-    /// Reuse the live stream, or open Begin/Resume and correlate its first response.
+    /// Queue the opener and its bounded first window before polling response headers.
     async fn open_stream(
         &self,
         state: &mut StreamingState,
-        begin: Option<StreamBegin>,
-        from_block: u64,
-        to_block: u64,
+        initial: client_frame::Kind,
+        early: Vec<ClientFrame>,
+        range: (u64, u64),
     ) -> Result<
         (
             tokio::sync::mpsc::Sender<ClientFrame>,
@@ -311,11 +364,7 @@ impl RemoteProver {
         ),
         ProverError,
     > {
-        if begin.is_none()
-            && let Some(connection) = state.connection.take()
-        {
-            return Ok(connection);
-        }
+        use tokio_stream::StreamExt;
         let mut client = StreamingProverClient::connect(self.inner.url.clone())
             .await
             .map_err(|error| ProverError::Retryable {
@@ -330,28 +379,24 @@ impl RemoteProver {
             session_id: expected_session.clone().unwrap_or_default(),
             request_id,
             epoch: 0,
-            kind: Some(begin.map_or(
-                client_frame::Kind::Resume(StreamResume {}),
-                client_frame::Kind::Begin,
-            )),
+            kind: Some(initial),
         };
         let (requests, request_stream) = tokio::sync::mpsc::channel(1);
-        requests
-            .send(initial)
-            .await
-            .map_err(|_| ProverError::Backend("unable to open ProveStream".into()))?;
+        let first_window = tokio_stream::iter(std::iter::once(initial).chain(early));
         let mut responses = client
-            .prove_stream(tokio_stream::wrappers::ReceiverStream::new(request_stream))
+            .prove_stream(
+                first_window.chain(tokio_stream::wrappers::ReceiverStream::new(request_stream)),
+            )
             .await
-            .map_err(|status| map_rpc_status(from_block, to_block, status))?
+            .map_err(|status| map_rpc_status(range.0, range.1, status))?
             .into_inner();
         let ready = next_stream_response(
             &mut responses,
             request_id,
             expected_session.as_deref(),
             None,
-            from_block,
-            to_block,
+            range.0,
+            range.1,
         )
         .await?;
         Ok((requests, responses, ready))
@@ -375,6 +420,7 @@ impl RemoteProver {
         {
             state.session = None;
             state.connection = None;
+            state.proven.clear();
         }
         let range = finalize.as_ref().map_or_else(
             || {
@@ -408,27 +454,68 @@ impl RemoteProver {
         let mut retry_at_anchor = state.session.is_some()
             && finalize.as_ref().is_some_and(|f| anchor.number.checked_add(1) == Some(f.from_block));
         'attempt: loop {
-        // Only the server retains the validated prefix. A fresh Ready determines
-        // what to send, including work completed after a previous response was lost.
-        let (requests, mut responses, blocks, mut cursor) = loop {
+        // Ready always confirms the authoritative prefix, including after a lost ACK.
+        let (requests, mut responses, remaining, mut cursor, mut pending) = loop {
             let creating = state.session.is_none();
-            if creating {
-                retry_at_anchor = false; // Already starting at the requested anchor.
+            let mut pending = VecDeque::new();
+            let mut expected_cursor = creating.then_some((anchor.number, anchor.hash));
+            let proven = finalize.is_some().then(|| std::mem::take(&mut state.proven));
+            let (requests, mut responses, response) = if let Some(connection) = state.connection.take() {
+                connection
+            } else {
+                let checkpoint = if !self.inner.early_window {
+                    None
+                } else if creating {
+                    Some((0, anchor.number, anchor.hash))
+                } else {
+                    known_checkpoint(proven.as_deref().unwrap_or(&state.proven), anchor, blocks, finalize.is_some())
+                };
+                let mut target = None;
+                let mut early = Vec::new();
+                if let Some((skip, n, h)) = checkpoint.filter(|&(skip, n, h)| {
+                    blocks.get(skip).is_none_or(|b| n.checked_add(1) == Some(b.number) && b.parent_hash == h)
+                }) {
+                    if !creating {
+                        let cursor = WireCursor { validated_through: n, validated_hash: h.to_vec() };
+                        target = Some(if finalize.is_some() { resume::Target::Checkpoint(cursor) }
+                            else { resume::Target::ExpectedTip(cursor) });
+                        expected_cursor = Some((n, h));
+                    }
+                    let suffix = &blocks[skip..];
+                    let total = suffix.len() + usize::from(finalize.is_some());
+                    for index in 0..total.min(MAX_IN_FLIGHT) {
+                        let kind = window_frame(suffix, index, finalize.as_ref());
+                        let id = state.next_id();
+                        early.push(ClientFrame { request_id: id, kind: Some(kind), ..Default::default() });
+                        pending.push_back((id, index));
+                    }
+                }
+                let initial = if creating {
+                    retry_at_anchor = false;
+                    client_frame::Kind::Begin(StreamBegin {
+                        rollup_id,
+                        anchor_number: anchor.number,
+                        anchor_hash: anchor.hash.to_vec(),
+                        anchor_state_root: anchor.state_root.to_vec(),
+                    })
+                } else {
+                    client_frame::Kind::Resume(StreamResume { target })
+                };
+                self.open_stream(&mut state, initial, early, range).await?
+            };
+            // Rediscover what survived pruning before deciding to backfill.
+            if !creating && expected_cursor.is_some() && matches!(&response.kind, Some(server_frame::Kind::Rejected(r))
+                if Code::from_i32(r.code) == Code::FailedPrecondition) {
+                state.proven.clear();
+                continue;
             }
-            let begin = creating.then(|| StreamBegin {
-                rollup_id,
-                anchor_number: anchor.number,
-                anchor_hash: anchor.hash.to_vec(),
-                anchor_state_root: anchor.state_root.to_vec(),
-            });
-            let (requests, mut responses, response) =
-                self.open_stream(&mut state, begin, range.0, range.1).await?;
             if !creating
                 && matches!(&response.kind,
                     Some(server_frame::Kind::Rejected(rejected)) if matches!(Code::from_i32(rejected.code), Code::NotFound | Code::Unimplemented)
                 )
             {
                 state.session = None;
+                state.proven.clear();
                 continue; // The server evicted the session or restarted; begin at the supplied anchor.
             }
             if let Some(error) = rejection_error(&response, range.0, range.1) {
@@ -446,13 +533,9 @@ impl RemoteProver {
                     "ProveStream returned an invalid Ready binding".into(),
                 ));
             }
-            if creating
-                && (ready.validated_through != anchor.number
-                    || ready.validated_hash != anchor.hash.as_slice())
-            {
-                return Err(ProverError::Backend(
-                    "ProveStream Begin acknowledged another anchor".into(),
-                ));
+            if let Some((n, h)) = expected_cursor
+                && (ready.validated_through != n || ready.validated_hash != h.as_slice()) {
+                return Err(ProverError::Backend("Ready acknowledged another cursor".into()));
             }
             state.session = Some(StreamingSession {
                 rollup_id,
@@ -541,15 +624,13 @@ impl RemoteProver {
                 }
                 state.session.as_mut().expect("ready session exists").epoch = response.epoch;
             }
-            break (requests, responses, remaining, cursor);
+            break (requests, responses, remaining, cursor, pending);
         };
 
         // Poll both directions: a slow reader must not deadlock our request sender.
         // Keep outstanding frames bounded while draining acknowledgements.
-        let total = blocks.len() + usize::from(finalize.is_some());
-        let mut pending_finalize = finalize.clone();
-        let mut next = 0;
-        let mut pending = std::collections::VecDeque::new();
+        let total = remaining.len() + usize::from(finalize.is_some());
+        let mut next = pending.len();
         let mut proof = None;
         while next < total || !pending.is_empty() {
             let request_id = pending.front().map_or(0, |&(id, _)| id);
@@ -559,11 +640,7 @@ impl RemoteProver {
                         kind: RetryableProverError::Unavailable,
                         message: "ProveStream request stream closed".into(),
                     })?;
-                    let kind = if next < blocks.len() {
-                        client_frame::Kind::Block(StreamBlock { data: Some(wire_block(&blocks[next])) })
-                    } else {
-                        client_frame::Kind::Finalize(pending_finalize.take().expect("last request is Finalize"))
-                    };
+                    let kind = window_frame(remaining, next, finalize.as_ref());
                     let id = state.next_id();
                     let session = state.session.as_ref().expect("Ready established a session");
                     permit.send(ClientFrame { session_id: session.id.clone(), epoch: session.epoch, request_id: id, kind: Some(kind) });
@@ -576,7 +653,7 @@ impl RemoteProver {
                     if retry_at_anchor && !response.session_id.is_empty()
                         && matches!(&response.kind, Some(server_frame::Kind::Rejected(rejected))
                             if Code::from_i32(rejected.code) == Code::ResourceExhausted
-                                || (index == blocks.len() && matches!(Code::from_i32(rejected.code),
+                                || (index == remaining.len() && matches!(Code::from_i32(rejected.code),
                                     Code::OutOfRange | Code::Unimplemented))) {
                         state.session = None;
                         continue 'attempt;
@@ -588,7 +665,7 @@ impl RemoteProver {
                         }
                         return Err(error);
                     }
-                    if let Some(block) = blocks.get(index) {
+                    if let Some(block) = remaining.get(index) {
                         if !matches!(&response.kind, Some(server_frame::Kind::Validated(validated))
                             if validated.number == block.number && validated.hash == block.hash.as_slice()
                                 && validated.post_state_root.len() == 32) {
@@ -612,7 +689,13 @@ impl RemoteProver {
         }
         drop(requests);
         return match responses.message().await {
-            Ok(None) => Ok(proof),
+            Ok(None) => {
+                if self.inner.early_window {
+                    state.proven = std::iter::once((anchor.number, anchor.hash))
+                        .chain(blocks.iter().map(|b| (b.number, b.hash))).collect();
+                }
+                Ok(proof)
+            },
             Ok(Some(_)) => Err(ProverError::Backend(
                 "ProveStream returned an unsolicited response".into(),
             )),
@@ -880,14 +963,14 @@ mod tests {
         let result = prover
             .open_stream(
                 &mut StreamingState::default(),
-                Some(StreamBegin {
+                client_frame::Kind::Begin(StreamBegin {
                     rollup_id: 1,
                     anchor_number: anchor.number,
                     anchor_hash: anchor.hash.to_vec(),
                     anchor_state_root: anchor.state_root.to_vec(),
                 }),
-                11,
-                11,
+                Vec::new(),
+                (11, 11),
             )
             .await
             .map(|(_, _, response)| response);
@@ -1056,7 +1139,7 @@ mod tests {
         cross_wire_block_response: bool,
         baseline_only: bool,
         begins: Arc<AtomicUsize>,
-        stall_first_block: Option<Arc<tokio::sync::Notify>>,
+        stall_first_block: Option<(Arc<tokio::sync::Notify>, bool)>,
     }
 
     #[tonic::async_trait]
@@ -1073,16 +1156,13 @@ mod tests {
             let this = self.clone();
             tokio::spawn(async move {
                 let mut anchor_number = None;
+                let mut attached = false;
                 while let Ok(Some(frame)) = input.message().await {
                     let request_id = frame.request_id;
-                    let mut epoch = frame.epoch;
-                    let mut session_id = frame.session_id;
                     let kind = match frame.kind {
                         Some(client_frame::Kind::Begin(begin)) => {
                             anchor_number = Some(begin.anchor_number);
                             this.begins.fetch_add(1, Ordering::SeqCst);
-                            session_id = vec![0x77; 32];
-                            epoch = 1;
                             *this.cursor.lock().await =
                                 (begin.anchor_number, B256::from_slice(&begin.anchor_hash));
                             let cursor = *this.cursor.lock().await;
@@ -1092,19 +1172,25 @@ mod tests {
                             })
                         }
                         Some(client_frame::Kind::Resume(_)) if !this.baseline_only => {
-                            epoch = epoch.saturating_add(1).max(1);
-                            let cursor = *this.cursor.lock().await;
-                            server_frame::Kind::Ready(Ready {
-                                validated_through: cursor.0,
-                                validated_hash: cursor.1.to_vec(),
-                            })
+                            if this.begins.load(Ordering::SeqCst) == 0 {
+                                server_frame::Kind::Rejected(eez_control_rpc::v1::Rejected {
+                                    code: Code::NotFound as i32,
+                                    ..Default::default()
+                                })
+                            } else {
+                                let cursor = *this.cursor.lock().await;
+                                server_frame::Kind::Ready(Ready {
+                                    validated_through: cursor.0,
+                                    validated_hash: cursor.1.to_vec(),
+                                })
+                            }
                         }
-                        Some(client_frame::Kind::Block(block)) => {
+                        Some(client_frame::Kind::Block(block)) if attached => {
                             let block = block.data.unwrap();
                             let first = this.blocks.fetch_add(1, Ordering::SeqCst) == 0;
                             let hash = B256::from_slice(&block.hash);
                             *this.cursor.lock().await = (block.number, hash);
-                            if first && let Some(reached) = &this.stall_first_block {
+                            if first && let Some((reached, _)) = &this.stall_first_block {
                                 reached.notify_one();
                                 sender.closed().await; // Accepted, but its ACK never reaches the client.
                                 return;
@@ -1117,9 +1203,10 @@ mod tests {
                             })
                         }
                         Some(client_frame::Kind::Finalize(finalize))
-                            if !this.baseline_only
-                                || anchor_number.and_then(|n| n.checked_add(1))
-                                    == Some(finalize.from_block) =>
+                            if attached
+                                && (!this.baseline_only
+                                    || anchor_number.and_then(|n| n.checked_add(1))
+                                        == Some(finalize.from_block)) =>
                         {
                             server_frame::Kind::Proof(StreamProof {
                                 public_inputs_hash: this.hash.to_vec(),
@@ -1132,17 +1219,27 @@ mod tests {
                             ..Default::default()
                         }),
                     };
+                    if matches!(kind, server_frame::Kind::Ready(_)) {
+                        attached = true;
+                        if matches!(this.stall_first_block, Some((_, true)))
+                            && this.blocks.load(Ordering::SeqCst) == 0
+                        {
+                            continue; // The server accepted Begin but the client never sees its binding.
+                        }
+                    }
                     if sender
                         .send(Ok(ServerFrame {
                             session_id: if this.cross_wire_block_response
                                 && matches!(&kind, server_frame::Kind::Validated(_))
                             {
                                 vec![0x88; 32]
+                            } else if attached {
+                                vec![0x77; 32]
                             } else {
-                                session_id
+                                Vec::new()
                             },
                             request_id,
-                            epoch,
+                            epoch: u64::from(attached),
                             kind: Some(kind),
                         }))
                         .await
@@ -1160,6 +1257,8 @@ mod tests {
 
     #[derive(Clone)]
     struct PipeliningStub {
+        early: bool,
+        capture_received: Arc<tokio::sync::Notify>,
         signer: PrivateKeySigner,
         hash: B256,
     }
@@ -1180,30 +1279,45 @@ mod tests {
                 let Some(begin) = input.message().await.ok().flatten() else {
                     return;
                 };
-                let Some(client_frame::Kind::Begin(begin_data)) = begin.kind else {
-                    let _ = sender
-                        .send(Err(Status::invalid_argument("expected Begin")))
-                        .await;
-                    return;
+                let (number, hash, epoch) = match begin.kind {
+                    Some(client_frame::Kind::Begin(b)) => (b.anchor_number, b.anchor_hash, 1),
+                    Some(client_frame::Kind::Resume(StreamResume {
+                        target: Some(resume::Target::ExpectedTip(_)),
+                    })) => {
+                        assert!(matches!(
+                            input.message().await.unwrap().unwrap().kind,
+                            Some(client_frame::Kind::Block(_))
+                        ));
+                        this.capture_received.notify_one();
+                        sender.closed().await;
+                        return;
+                    }
+                    Some(client_frame::Kind::Resume(StreamResume {
+                        target: Some(resume::Target::Checkpoint(cursor)),
+                    })) => {
+                        assert_eq!(cursor.validated_through, 12);
+                        (cursor.validated_through, cursor.validated_hash, 2)
+                    }
+                    _ => {
+                        let _ = sender
+                            .send(Err(Status::invalid_argument("unexpected opener")))
+                            .await;
+                        return;
+                    }
                 };
                 let session_id = vec![0x71; 32];
-                let epoch = 1;
-                if sender
-                    .send(Ok(ServerFrame {
-                        session_id: session_id.clone(),
-                        request_id: begin.request_id,
-                        epoch,
-                        kind: Some(server_frame::Kind::Ready(Ready {
-                            validated_through: begin_data.anchor_number,
-                            validated_hash: begin_data.anchor_hash,
-                        })),
-                    }))
-                    .await
-                    .is_err()
-                {
+                let ready = ServerFrame {
+                    session_id: session_id.clone(),
+                    request_id: begin.request_id,
+                    epoch,
+                    kind: Some(server_frame::Kind::Ready(Ready {
+                        validated_through: number,
+                        validated_hash: hash,
+                    })),
+                };
+                if !this.early && sender.send(Ok(ready.clone())).await.is_err() {
                     return;
                 }
-
                 let Some(first) = input.message().await.ok().flatten() else {
                     return;
                 };
@@ -1221,6 +1335,16 @@ mod tests {
                 let Some(finalize) = input.message().await.ok().flatten() else {
                     return;
                 };
+                if this.early && sender.send(Ok(ready)).await.is_err() {
+                    return;
+                }
+                for frame in [&first, &second, &finalize] {
+                    if this.early {
+                        assert!(frame.session_id.is_empty() && frame.epoch == 0);
+                    } else {
+                        assert_eq!((&frame.session_id, frame.epoch), (&session_id, epoch));
+                    }
+                }
                 let blocks = [first, second];
                 for frame in blocks {
                     let Some(client_frame::Kind::Block(block)) = frame.kind else {
@@ -1644,7 +1768,7 @@ mod tests {
 
     #[tokio::test]
     async fn proof_interrupts_stalled_prevalidation_and_recovers_accepted_progress() {
-        for baseline_only in [false, true] {
+        for (baseline_only, lose_ready) in [(false, false), (true, false), (false, true)] {
             let key = test_key();
             let attester = key.address();
             let hash = eez_protocol::public_inputs::public_inputs_hashes(
@@ -1663,10 +1787,10 @@ mod tests {
                 cross_wire_block_response: false,
                 baseline_only,
                 begins: Arc::clone(&begins),
-                stall_first_block: Some(Arc::clone(&reached)),
+                stall_first_block: Some((Arc::clone(&reached), lose_ready)),
             })
             .await;
-            let prover = RemoteProver::new(endpoint, attester);
+            let prover = RemoteProver::with_early_window(endpoint, attester, lose_ready);
             let anchor = test_anchor();
             let block = test_block(11, anchor.hash, 0x22);
             let prevalidation = tokio::spawn({
@@ -1697,15 +1821,10 @@ mod tests {
             assert_eq!(proof.len(), 65);
             prevalidation.await.unwrap().unwrap();
             assert_eq!(*prover.inner.proving.borrow(), 0);
-            // Resume recovers the lost ACK; baseline-only servers receive the complete window.
-            assert_eq!(
-                begins.load(Ordering::SeqCst),
-                if baseline_only { 2 } else { 1 }
-            );
-            assert_eq!(
-                blocks.load(Ordering::SeqCst),
-                if baseline_only { 2 } else { 1 }
-            );
+            // Only a client that received Ready can resume the accepted block.
+            let attempts = if baseline_only || lose_ready { 2 } else { 1 };
+            assert_eq!(begins.load(Ordering::SeqCst), attempts);
+            assert_eq!(blocks.load(Ordering::SeqCst), attempts);
         }
     }
 
@@ -1967,44 +2086,70 @@ mod tests {
 
     #[tokio::test]
     async fn contiguous_blocks_and_finalize_are_pipelined_before_the_first_ack() {
-        let key = test_key();
-        let attester = key.address();
-        let signed_hash =
-            eez_protocol::public_inputs::public_inputs_hashes(&test_batch(), attester.into_word())
-                .unwrap()[0];
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            Server::builder()
-                .add_service(StreamingProverServer::new(PipeliningStub {
-                    signer: key,
-                    hash: signed_hash,
-                }))
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .unwrap();
-        });
-        let anchor = test_anchor();
-        let block_11 = test_block(11, anchor.hash, 0x22);
-        let block_12 = test_block(12, block_11.hash, 0x23);
-        let prover = RemoteProver::new(format!("http://{addr}"), attester);
+        for early in [true, false] {
+            let key = test_key();
+            let attester = key.address();
+            let signed_hash = eez_protocol::public_inputs::public_inputs_hashes(
+                &test_batch(),
+                attester.into_word(),
+            )
+            .unwrap()[0];
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let capture_received = Arc::new(tokio::sync::Notify::new());
+            let signal = Arc::clone(&capture_received);
+            tokio::spawn(async move {
+                Server::builder()
+                    .add_service(StreamingProverServer::new(PipeliningStub {
+                        early,
+                        capture_received: signal,
+                        signer: key,
+                        hash: signed_hash,
+                    }))
+                    .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                    .await
+                    .unwrap();
+            });
+            let anchor = test_anchor();
+            let block_11 = test_block(11, anchor.hash, 0x22);
+            let block_12 = test_block(12, block_11.hash, 0x23);
+            let prover = RemoteProver::with_early_window(format!("http://{addr}"), attester, early);
 
-        let proof = prover
-            .prove(ProvingContext {
+            let mut ctx = ProvingContext {
                 rollup_id: 1,
                 from_block: 11,
                 to_block: 12,
                 anchor,
                 batch: test_batch(),
-                blocks: vec![block_11, block_12],
-                l1_context: None,
-                blobs: Vec::new(),
-                verification_key: None,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(proof.len(), 65);
+                blocks: vec![block_11, block_12.clone()],
+                ..Default::default()
+            };
+            assert_eq!(prover.prove(ctx.clone()).await.unwrap().len(), 65);
+            if early {
+                // The signer receives a background block but withholds its ACK.
+                // The next proof must take over at the last completed proof and
+                // transmit its replacement window before the signer sends Ready.
+                ctx.anchor = ProvingAnchor {
+                    number: 12,
+                    hash: block_12.hash,
+                    state_root: B256::repeat_byte(0x99),
+                };
+                ctx.from_block = 13;
+                ctx.to_block = 14;
+                let block_13 = test_block(13, block_12.hash, 0x24);
+                ctx.blocks = vec![block_13.clone(), test_block(14, block_13.hash, 0x25)];
+                let capture = tokio::spawn({
+                    let p = prover.clone();
+                    let anchor = ctx.anchor;
+                    async move { p.prevalidate(1, anchor, block_13).await }
+                });
+                tokio::time::timeout(Duration::from_secs(1), capture_received.notified())
+                    .await
+                    .unwrap();
+                assert_eq!(prover.prove(ctx).await.unwrap().len(), 65);
+                capture.await.unwrap().unwrap();
+            }
+        }
     }
 
     #[tokio::test]
