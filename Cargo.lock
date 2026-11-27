@@ -3832,6 +3832,7 @@ dependencies = [
  "alloy-sol-types",
  "anyhow",
  "eez-control-rpc",
+ "eez-deriver",
  "eez-follower",
  "eez-node",
  "eez-primitives",
