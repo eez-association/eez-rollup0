@@ -94,38 +94,394 @@ fn delivery() -> PlannedTransaction {
 }
 
 #[test]
-fn permanent_native_revert_is_not_capacity_under_load() {
-    let (provider, config, parent, signer, burner) = fixture(bytes!("63deadbeef6000526004601cfd"));
-    let open = |prefix: &[Bytes]| {
-        SyncBlockState::open(
-            Arc::new(provider.clone()),
-            &config,
-            &parent,
-            1012,
-            Address::ZERO,
-            prefix,
-        )
+fn native_execution_follows_full_cap_without_commit() {
+    use evm2::{evm::DynDatabase as _, interpreter::Word};
+
+    for (name, code, full_success) in [
+        ("revert", bytes!("63deadbeef6000526004601cfd"), false),
+        ("invalid", bytes!("fe"), false),
+        // Write storage before looping forever; rejection must discard the write.
+        ("out of gas", bytes!("60015f555b600456"), false),
+        // Branch on whether GAS exceeds 16M: only the full-cap run stops.
+        (
+            "full success, reduced out of gas",
+            bytes!("62f424005a11600d575b6009565b00"),
+            true,
+        ),
+        // The full-cap run hits INVALID; the reduced run succeeds.
+        (
+            "full invalid, reduced success",
+            bytes!("62f424005a11600a57005bfe"),
+            false,
+        ),
+        // Both halt and consume their budgets, but with different stop reasons.
+        (
+            "full invalid, reduced stack underflow",
+            bytes!("62f424005a11600b5750005bfe"),
+            false,
+        ),
+        // Both revert, but their output contains the starting gas.
+        ("different revert output", bytes!("5a5f5260205ffd"), false),
+    ] {
+        let (provider, config, parent, signer, burner) = fixture(code);
+        let open = |prefix: &[Bytes]| {
+            SyncBlockState::open(
+                Arc::new(provider.clone()),
+                &config,
+                &parent,
+                1012,
+                Address::ZERO,
+                prefix,
+            )
+            .unwrap()
+        };
+        let plan = delivery();
+        let full = open(&[])
+            .execute_tx(&plan.at_position(BUILDER_GAS_LIMIT, 0).unwrap())
+            .unwrap();
+        assert_eq!(full.success, full_success, "{name}");
+        let mut busy = open(&[signed(&signer, 0, burner, 14_500_000)]);
+        let gas_before = busy.gas_used();
+        assert!(BUILDER_GAS_LIMIT - gas_before < 16_000_000);
+        let reduced = busy.execute_tx(&plan.at_position(BUILDER_GAS_LIMIT, gas_before).unwrap());
+        assert!(
+            matches!(
+                &reduced,
+                Err(BuildError::Capacity) if full_success
+            ) || matches!(&reduced, Err(BuildError::ExecuteTx { .. }) if !full_success),
+            "{name}: {reduced:?}"
+        );
+        assert_eq!(busy.gas_used(), gas_before, "{name}");
+        let mut fork = busy.fork().unwrap();
+        assert_eq!(
+            fork.state_and_env()
+                .0
+                .database_mut()
+                .get_storage(&eez_primitives::EEZL2_ADDRESS, &Word::ZERO)
+                .unwrap(),
+            Word::ZERO,
+            "{name}: rejected execution cannot leak storage",
+        );
+    }
+}
+
+#[test]
+fn inbound_drain_rejects_full_cap_failures_but_defers_capacity_under_load() {
+    use crate::composer::batcher::DEFAULT_MAX_POSTBATCH_GAS;
+    use alloy_provider::{ProviderBuilder, mock::Asserter};
+    use eez_l1::{L1ReaderConfig, Submitter, SubmitterConfig};
+    use eez_protocol::{ChainDialect, ProxyLookupConfig, RollupId, TargetConfig};
+    use evm2::{evm::DynDatabase as _, interpreter::Word};
+
+    let genesis: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../genesis.json")).unwrap();
+    let manager_code = genesis["alloc"][eez_primitives::EEZL2_ADDRESS.to_string()]["code"]
+        .as_str()
         .unwrap()
-    };
-    let plan = delivery();
-    let full = append_and_execute(&mut open(&[]), std::slice::from_ref(&plan), &mut Vec::new())
-        .unwrap_err();
-    assert!(matches!(full.1, BuildError::ExecuteTx { .. }));
-    let mut prefix = open(&[signed(&signer, 0, burner, 14_500_000)]);
-    assert!(prefix.gas_used() > 13_222_784);
-    let reduced = append_and_execute(&mut prefix, &[plan], &mut Vec::new()).unwrap_err();
-    assert!(matches!(reduced.1, BuildError::ExecuteTx { .. }));
+        .parse::<Bytes>()
+        .unwrap();
+    for (name, bad_code, full_success, reduced_success) in [
+        ("revert", bytes!("60015f555f5ffd"), false, false),
+        ("invalid", bytes!("60015f55fe"), false, false),
+        ("out of gas", bytes!("60015f555b600456"), false, false),
+        // At full cap the target hits INVALID; at the reduced budget it writes
+        // storage and succeeds. The real EEZL2 must not admit that reduced run.
+        (
+            "full invalid, reduced success",
+            bytes!("62dd40a05a11600e5760015f55005bfe"),
+            false,
+            true,
+        ),
+        (
+            "full success, reduced out of gas",
+            bytes!("62dd40a05a11600d575b6009565b00"),
+            true,
+            false,
+        ),
+    ] {
+        let (provider, config, parent, bad_signer, burner) = fixture(manager_code.clone());
+        let good_signer = PrivateKeySigner::from_bytes(&B256::with_last_byte(8)).unwrap();
+        provider.add_account(
+            good_signer.address(),
+            ExtendedAccount::new(0, U256::from(10u64.pow(18))),
+        );
+        let targets = [Address::repeat_byte(0x23), Address::repeat_byte(0x24)];
+        provider.add_account(
+            targets[0],
+            ExtendedAccount::new(0, U256::ZERO).with_bytecode(bad_code),
+        );
+        // Nonempty return data makes the placeholder probe revert even for
+        // this valid call. Only the finalized delivery may commit the increment.
+        provider.add_account(
+            targets[1],
+            ExtendedAccount::new(0, U256::ZERO)
+                .with_bytecode(bytes!("5f54600101805f555f5260205ff3")),
+        );
+        let registry = Address::repeat_byte(0x40);
+        let proxies = [Address::repeat_byte(0x41), Address::repeat_byte(0x42)];
+        let wrappers = [Address::repeat_byte(0x51), Address::repeat_byte(0x52)];
+        let mut registrations = Vec::new();
+        for ((proxy, target), wrapper) in proxies.into_iter().zip(targets).zip(wrappers) {
+            let mut word = [0u8; 32];
+            word[3..11].copy_from_slice(&1u64.to_be_bytes());
+            word[11..31].copy_from_slice(target.as_ref());
+            word[31] = 1;
+            registrations.push((
+                eez_protocol::proxy_mapping_key(
+                    proxy,
+                    ChainDialect::EvmL1Style.proxy_lookup_slot(),
+                ),
+                U256::from_be_bytes(word),
+            ));
+            // Increment L1 storage before calling the registered proxy, so a
+            // rejected source simulation has observable writes to discard too.
+            let mut code = bytes!("5f546001015f555f5f5f5f5f73").to_vec();
+            code.extend_from_slice(proxy.as_ref());
+            code.extend_from_slice(&bytes!("5af15000"));
+            provider.add_account(
+                wrapper,
+                ExtendedAccount::new(0, U256::ZERO).with_bytecode(code.into()),
+            );
+        }
+        provider.add_account(
+            registry,
+            ExtendedAccount::new(0, U256::ZERO).extend_storage(registrations),
+        );
+        let l1_entry = crate::LocalChainClient::new_entry(
+            provider.clone(),
+            config.clone(),
+            RollupId::MAINNET,
+            registry,
+            ChainDialect::EvmL1Style,
+        );
+        let l2_entry = crate::LocalChainClient::new_entry(
+            provider.clone(),
+            config.clone(),
+            RollupId(1),
+            eez_primitives::EEZL2_ADDRESS,
+            ChainDialect::EvmL2Style,
+        );
+        let reader = L1ReaderConfig {
+            rpc_url: "http://127.0.0.1:1".parse().unwrap(),
+            trace_rpc_url: "http://127.0.0.1:1".parse().unwrap(),
+            eez: registry,
+            rollup_id: 1,
+            deploy_block: 0,
+            beacon_url: None,
+        };
+        let cc = CrossChainWiring {
+            entry_rollup_id: RollupId::MAINNET,
+            rollups: HashMap::from([(
+                RollupId(1),
+                (
+                    l2_entry.clone() as Arc<dyn eez_protocol::ChainClient + Send + Sync>,
+                    TargetConfig {
+                        proxy_lookup: ProxyLookupConfig {
+                            contract_address: eez_primitives::EEZL2_ADDRESS,
+                            authorized_proxies_slot: ChainDialect::EvmL2Style.proxy_lookup_slot(),
+                        },
+                        dialect: ChainDialect::EvmL2Style,
+                    },
+                ),
+            )]),
+            exec_ctx: Arc::new(CrossChainExecCtx {
+                eezl2_address: eez_primitives::EEZL2_ADDRESS,
+                l2_chain_id: 1,
+                l1_provider: ProviderBuilder::default().connect_mocked_client(Asserter::new()),
+                submitter: Submitter::new(SubmitterConfig {
+                    builder_rpc_url: reader.rpc_url.clone(),
+                    reader,
+                    target_rpc_url: None,
+                    poster: bad_signer.clone(),
+                }),
+                l1_poster_signer: bad_signer.clone(),
+                l1_chain_id: 1,
+                l1_post_batch_priority_fee: 0,
+                eez_registry: registry,
+                blob_posting: None,
+            }),
+            local: crate::local::LocalComposeClients { l1_entry, l2_entry },
+        };
+        let reopen = |prefix: &[Bytes]| {
+            SyncBlockState::open(
+                Arc::new(provider.clone()),
+                &config,
+                &parent,
+                1012,
+                Address::ZERO,
+                prefix,
+            )
+        };
+        // Seed the accepted block prefix with load before entering the actual
+        // inbound drain. No source simulation or target execution is mocked.
+        let prefix = vec![signed(&bad_signer, 0, burner, 16_500_000)];
+        let mut draft = reopen(&prefix).unwrap();
+        let remaining = BUILDER_GAS_LIMIT - draft.gas_used();
+        assert!(remaining < 14_500_000);
+        // Bypass the comparison only for this fixture check: prove the actual
+        // EEZL2 delivery reaches the stated outcomes at both budgets.
+        for (gas_limit, success) in [
+            (eez_primitives::SYSTEM_TX_GAS_CAP, full_success),
+            (remaining, reduced_success),
+        ] {
+            let raw = delivery()
+                .at_position(BUILDER_GAS_LIMIT, BUILDER_GAS_LIMIT - gas_limit)
+                .unwrap();
+            let tx = reth_primitives_traits::Recovered::new_unchecked(
+                eez_evm::EezEvmTx::from(
+                    eez_primitives::EezTxEnvelope::decode_2718(&mut raw.as_ref()).unwrap(),
+                ),
+                eez_primitives::SYSTEM_ADDRESS,
+            );
+            let mut fork = draft.fork().unwrap();
+            let (state, env) = fork.state_and_env();
+            assert_eq!(
+                state
+                    .transact(&config, env, &tx, None)
+                    .unwrap()
+                    .result
+                    .is_success(),
+                success,
+                "{name}: gas limit {gas_limit}"
+            );
+        }
+        let mut drain = CrossChainDrain {
+            rollup_id: 1,
+            live_source: eez_protocol::native_source::SourceEntry::new(1, B256::repeat_byte(1), 0)
+                .unwrap(),
+            l1_state: L1SlotState {
+                anchor: parent.clone(),
+                cache: Default::default(),
+            },
+            draft,
+            sync_txs: prefix.clone(),
+            system_txs_appended: 0,
+            survivors: Vec::new(),
+            survivor_comps: Vec::new(),
+            pending_out: Vec::new(),
+            pending_in: Vec::new(),
+            outbound_entries: Vec::new(),
+            outbound_target_gas: 0,
+            escrow_remaining: None,
+            poison: Vec::new(),
+            poison_gaps: Vec::new(),
+            funding_deferred: Vec::new(),
+            funding_gaps: Vec::new(),
+            budget: PostBatchGasBudget::new(DEFAULT_MAX_POSTBATCH_GAS, 1),
+            end: DrainEnd::Complete,
+        };
+        let held: Vec<_> = [&bad_signer, &good_signer]
+            .into_iter()
+            .zip(wrappers)
+            .map(|(signer, wrapper)| {
+                let raw_tx = signed(signer, 0, wrapper, 1_000_000);
+                HeldTx {
+                    hash: alloy_primitives::keccak256(&raw_tx),
+                    raw_tx,
+                    sender: signer.address(),
+                    nonce: 0,
+                    direction: Direction::Inbound,
+                    attempts: 0,
+                    max_fee_per_gas: 1,
+                    priority_fee_per_gas: 1,
+                }
+            })
+            .collect();
+        drain.compose_inbound(
+            &cc,
+            &SystemTxContext {
+                eezl2_address: eez_primitives::EEZL2_ADDRESS,
+                l2_chain_id: 1,
+                this_rollup_id: 1,
+            },
+            None,
+            reopen,
+            held.iter().cloned().enumerate().collect(),
+        );
+        let expected_writes = if full_success {
+            let DrainEnd::Cut {
+                cut: BudgetCut::BlockGas(_),
+                rest,
+            } = &drain.end
+            else {
+                panic!("{name}: a successful full-cap delivery must remain retryable");
+            };
+            assert_eq!(
+                rest.iter().map(|(_, tx)| tx.hash).collect::<Vec<_>>(),
+                held.iter().map(|tx| tx.hash).collect::<Vec<_>>()
+            );
+            assert!(rest.iter().all(|(_, tx)| tx.attempts == 0));
+            assert!(drain.poison.is_empty());
+            assert!(drain.survivors.is_empty());
+            assert!(drain.pending_in.is_empty());
+            assert_eq!(drain.sync_txs, prefix);
+            [0u64, 0]
+        } else {
+            assert!(
+                matches!(drain.end, DrainEnd::Complete),
+                "{name}: drain must not defer the suffix"
+            );
+            assert_eq!(
+                drain.poison.iter().map(|tx| tx.hash).collect::<Vec<_>>(),
+                [held[0].hash],
+                "{name}"
+            );
+            assert_eq!(
+                drain
+                    .survivors
+                    .iter()
+                    .map(|(_, tx)| tx.hash)
+                    .collect::<Vec<_>>(),
+                [held[1].hash],
+                "{name}"
+            );
+            assert_eq!(drain.pending_in.len(), 1, "{name}");
+            assert_eq!(drain.system_txs_appended, 1, "{name}");
+            assert_eq!(drain.sync_txs.len(), prefix.len() + 1, "{name}");
+            [0, 1]
+        };
+        let mut canonical = reopen(&drain.sync_txs).unwrap();
+        assert_eq!(
+            drain.draft.gas_used(),
+            canonical.gas_used(),
+            "{name}: rejected gas cannot leak"
+        );
+        let (mut source, _) = drain.l1_state.fork_state(&cc.local.l1_entry).unwrap();
+        for (index, expected) in expected_writes.into_iter().enumerate() {
+            let expected = Word::from(expected);
+            assert_eq!(
+                source
+                    .database_mut()
+                    .get_storage(&wrappers[index], &Word::ZERO)
+                    .unwrap(),
+                expected,
+                "{name}: L1 source storage"
+            );
+            for state in [&mut drain.draft, &mut canonical] {
+                let mut fork = state.fork().unwrap();
+                assert_eq!(
+                    fork.state_and_env()
+                        .0
+                        .database_mut()
+                        .get_storage(&targets[index], &Word::ZERO)
+                        .unwrap(),
+                    expected,
+                    "{name}: L2 target storage"
+                );
+            }
+        }
+    }
 }
 
 #[test]
 fn native_packing_dependent_success_is_refused_without_commit() {
-    // One program returns GAS; the other stores it while returning identical
-    // output. Both succeed at either budget, so status alone misses the change.
-    for code in [
-        bytes!("5a5f5260205ff3"),
-        bytes!("36156009575a5f55005b5f545f5260205ff3"),
+    // GAS can change output, storage, or only gas spent. All three programs
+    // succeed at either budget, so status alone misses the change.
+    for (code, writes_storage) in [
+        (bytes!("5a5f5260205ff3"), false),
+        (bytes!("36156009575a5f55005b5f545f5260205ff3"), true),
+        (bytes!("5b6207a1205a1160005700"), false),
     ] {
-        let writes_storage = code.len() > 8;
         let (provider, config, parent, signer, burner) = fixture(code);
         let open = |prefix: &[Bytes]| {
             SyncBlockState::open(

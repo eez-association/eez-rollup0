@@ -3491,6 +3491,7 @@ dependencies = [
  "eez-primitives",
  "eez-protocol",
  "eez-prover",
+ "eez-timing",
  "evm2",
  "futures-util",
  "gnosis-primitives",
@@ -3571,6 +3572,7 @@ dependencies = [
  "eez-l1",
  "eez-primitives",
  "eez-prover",
+ "eez-timing",
  "evm2",
  "eyre",
  "reth-chainspec",
@@ -3700,6 +3702,7 @@ dependencies = [
  "alloy-provider",
  "alloy-rlp",
  "alloy-rpc-types-debug",
+ "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
  "alloy-signer-local",
  "alloy-sol-types",
@@ -4037,6 +4040,14 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+]
+
+[[package]]
+name = "eez-timing"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

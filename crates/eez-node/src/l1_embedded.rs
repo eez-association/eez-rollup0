@@ -11,16 +11,28 @@
 //! The `NodeBuilder` launch is inline in [`crate::run_composer`] — the
 //! nested-generic `NodeHandle` AddOns types resist a typed helper.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use alloy_consensus::Header;
+use alloy_primitives::{Address, B256};
+use alloy_rpc_types_engine::PayloadAttributes;
 use eyre::Result;
-use reth_chainspec::ChainSpec;
+use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_gnosis::spec::{chains::CHIADO_GENESIS, gnosis_spec::GnosisChainSpec};
 use reth_network_peers::TrustedPeer;
+use reth_node_api::PayloadAttributesBuilder;
 use reth_node_core::{
     args::{DatadirArgs, NetworkArgs, RpcServerArgs},
     node_config::NodeConfig,
 };
+use reth_primitives_traits::SealedHeader;
 use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection};
 
 /// Block time for the testing embedded L1. 5s gives the composer a wide
@@ -28,6 +40,76 @@ use reth_rpc_server_types::{RethRpcModule, RpcModuleSelection};
 /// 4's atomicity requirement); a 1s window lets dev-reth's auto-mine
 /// split the two `send_raw_transaction` roundtrips across blocks.
 pub const TESTING_L1_BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Timestamp of the testing L1's next block, at wall-clock second `now`.
+///
+/// A block lands one [`TESTING_L1_BLOCK_TIME`] slot after its parent, however
+/// late it is mined, so a postBatch pinned to `parent + slot` lands in its
+/// block even when the node stalls. The dev miner replays the ticks it missed
+/// during a pause back to back; each block they mine is one slot closer to
+/// the wall clock.
+///
+/// On `restart`, or when the next slot would be ahead of the wall clock, the
+/// block takes the wall-clock second instead, or the second after its parent
+/// if that is later. That starts a new grid.
+pub(crate) fn next_l1_timestamp(parent: u64, now: u64, restart: bool) -> u64 {
+    let on_grid = parent.saturating_add(TESTING_L1_BLOCK_TIME.as_secs());
+    if restart || on_grid > now {
+        return now.max(parent.saturating_add(1));
+    }
+    on_grid
+}
+
+/// Payload attributes for the testing L1's dev miner: reth's defaults, with
+/// the timestamp from [`next_l1_timestamp`].
+#[derive(Debug)]
+pub struct TestingL1Attributes {
+    chain_spec: Arc<ChainSpec>,
+    /// The timestamp given last. A parent with another timestamp restarts the
+    /// grid: the first block after launch, or a block that was not mined.
+    last: AtomicU64,
+}
+
+impl TestingL1Attributes {
+    pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
+        Self {
+            chain_spec,
+            last: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
+impl PayloadAttributesBuilder<PayloadAttributes, Header> for TestingL1Attributes {
+    fn build(&self, parent: &SealedHeader<Header>) -> PayloadAttributes {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after 1970")
+            .as_secs();
+        let parent = parent.header().timestamp;
+        let restart = self.last.load(Ordering::Relaxed) != parent;
+        let timestamp = next_l1_timestamp(parent, now, restart);
+        self.last.store(timestamp, Ordering::Relaxed);
+        // The fields below follow reth's `LocalPayloadAttributesBuilder`.
+        PayloadAttributes {
+            timestamp,
+            prev_randao: B256::random(),
+            suggested_fee_recipient: Address::random(),
+            withdrawals: self
+                .chain_spec
+                .is_shanghai_active_at_timestamp(timestamp)
+                .then(Default::default),
+            parent_beacon_block_root: self
+                .chain_spec
+                .is_cancun_active_at_timestamp(timestamp)
+                .then(B256::random),
+            slot_number: self
+                .chain_spec
+                .is_amsterdam_active_at_timestamp(timestamp)
+                .then_some(0),
+            ..Default::default()
+        }
+    }
+}
 
 /// HTTP modules of every embedded L1. `debug` serves the block traces the
 /// batch scan reads for batches a contract posted.
@@ -193,6 +275,66 @@ fn build_network_rpc_args(cfg: &EmbeddedL1Config) -> Result<(NetworkArgs, RpcSer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block lands one slot after its parent however late it is mined. When
+    /// that would be ahead of the wall clock, or on a restart, it takes the
+    /// wall-clock second, or the second after its parent if that is later.
+    #[test]
+    fn testing_l1_timestamps_sit_on_a_five_second_grid() {
+        let parent = 1_000;
+        for (now, restart, expected) in [
+            (1_005, false, 1_005), // on time
+            (1_006, false, 1_005), // 1 s late
+            (1_023, false, 1_005), // 18 s late
+            (1_004, false, 1_004), // the grid is ahead of the wall clock
+            (990, false, 1_001),   // the parent is ahead of the wall clock
+            (1_002, true, 1_002),
+            (1_023, true, 1_023),
+            (1_000, true, 1_001),
+        ] {
+            assert_eq!(
+                next_l1_timestamp(parent, now, restart),
+                expected,
+                "now {now}"
+            );
+        }
+    }
+
+    /// After a pause the dev miner replays its missed ticks back to back, and
+    /// the chain returns to the wall clock without leaving the grid. A grid
+    /// started by a late first block moves back to the wall clock once.
+    #[test]
+    fn testing_l1_timestamps_return_to_the_wall_clock() {
+        // (timestamp of the block before, [(wall-clock second of a tick, timestamp)]).
+        for (first, ticks) in [
+            // 12 s pause: the ticks due at 1005 and 1010 both fire at 1012.
+            (
+                1_000,
+                [
+                    (1_012, 1_005),
+                    (1_012, 1_010),
+                    (1_015, 1_015),
+                    (1_020, 1_020),
+                ],
+            ),
+            // The first block was mined a second late.
+            (
+                1_001,
+                [
+                    (1_005, 1_005),
+                    (1_010, 1_010),
+                    (1_016, 1_015),
+                    (1_020, 1_020),
+                ],
+            ),
+        ] {
+            let mut parent = first;
+            for (now, expected) in ticks {
+                parent = next_l1_timestamp(parent, now, false);
+                assert_eq!(parent, expected, "tick at {now} after {first}");
+            }
+        }
+    }
 
     /// The batch scan traces contract-posted batches over HTTP, so every
     /// embedded L1 serves `debug` beside the standard modules.
