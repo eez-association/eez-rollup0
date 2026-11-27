@@ -88,7 +88,7 @@ echo " Deployment (rollupId ${EEZ_ROLLUP_ID:-1}, deploy block ${EEZ_REGISTRY_DEP
 printf "   %-20s %s\n" "EEZ registry"      "$EEZ_REGISTRY_ADDRESS"
 printf "   %-20s %s\n" "Rollup manager"    "${EEZ_ROLLUP_MANAGER_ADDRESS:-?}"
 printf "   %-20s %s\n" "ECDSA proof system" "${EEZ_ECDSA_PROOF_SYSTEM_ADDRESS:-?}"
-printf "   %-20s %s\n" "L1 bridge sender"  "${EEZ_L1_BRIDGE_SENDER:-?}"
+printf "   %-20s %s\n" "L1 ETH bridge"     "${EEZ_L1_BRIDGE_ADDRESS:-?}"
 if [[ -n "${EEZ_BLOCKSCOUT_URL:-}" ]]; then
     printf "   Blockscout: %s/address/%s\n" "${EEZ_BLOCKSCOUT_URL%/}" "$EEZ_REGISTRY_ADDRESS"
 fi

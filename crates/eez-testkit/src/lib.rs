@@ -1699,6 +1699,8 @@ pub struct NodeHandle {
     /// Owned node database. CI retains it only if this test unwinds in failure.
     owned_datadir: Option<FailureDatadir>,
     pub http_port: u16,
+    /// WebSocket RPC port; served only with `--ws`.
+    pub ws_port: u16,
     /// devp2p RLPx TCP port.
     pub p2p_port: u16,
     /// discv5 UDP port; bound only with [`NodeConfig::discovery`].
@@ -1984,6 +1986,7 @@ impl NodeHandle {
             _keep_alive: log_tempdir.into_iter().collect(),
             owned_datadir: None,
             http_port,
+            ws_port,
             p2p_port,
             discv5_port,
         })
@@ -2016,6 +2019,47 @@ impl NodeHandle {
 
     pub fn l2_rpc_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.http_port)
+    }
+
+    /// Waits until this process's reth has saved block `number`, or a later
+    /// one, to disk. reth saves canonical blocks in the background, so a block
+    /// its RPC already serves can still be lost to a kill. Only a save made
+    /// after the call is seen, so the node must still be producing blocks. The
+    /// node must run with `--ws --ws.api reth`.
+    ///
+    /// # Errors
+    ///
+    /// The subscription fails, or no such block is saved within `timeout`.
+    pub async fn wait_for_persisted(&self, number: u64, timeout: Duration) -> Result<()> {
+        use jsonrpsee::core::client::SubscriptionClientT as _;
+
+        let url = format!("ws://127.0.0.1:{}", self.ws_port);
+        let client = jsonrpsee::ws_client::WsClientBuilder::default()
+            .build(&url)
+            .await
+            .with_context(|| format!("{}: connect {url}", self.name))?;
+        let mut saved = client
+            .subscribe::<alloy_eips::BlockNumHash, _>(
+                "reth_subscribePersistedBlock",
+                jsonrpsee::rpc_params![],
+                "reth_unsubscribePersistedBlock",
+            )
+            .await
+            .with_context(|| format!("{}: reth_subscribePersistedBlock", self.name))?;
+        let reached = async {
+            while let Some(block) = saved.next().await {
+                if block.context("persisted block notification")?.number >= number {
+                    return Ok(());
+                }
+            }
+            bail!("{}: the persisted-block subscription ended", self.name)
+        };
+        tokio::time::timeout(timeout, reached).await.map_err(|_| {
+            anyhow!(
+                "{}: block {number} was not saved to disk within {timeout:?}",
+                self.name
+            )
+        })?
     }
 
     /// Waits for RPC readiness while surfacing early process exits and logs.
