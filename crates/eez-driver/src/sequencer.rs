@@ -40,8 +40,9 @@ use tokio::sync::mpsc;
 
 use crate::block_committer::BlockCommitterHandle;
 use crate::error::{DriverError, DriverResult};
-use crate::slot::{SlotEvent, SlotKind, SyncSlotComposerHandle, SyncSlotMode};
-use crate::timing::{RollupTiming, SlotComposition};
+use crate::slot::{SyncSlotComposerHandle, SyncSlotMode};
+use eez_timing::deadline::misses_l1_slot;
+use eez_timing::{RollupTiming, SharedClock, SlotComposition, SlotEvent, SlotKind};
 
 /// How often the sequencer re-publishes the current forkchoice state.
 ///
@@ -152,6 +153,8 @@ where
     /// compute per-trigger Live/Future/Sync block composition and per-
     /// block timestamps.
     timing: RollupTiming,
+    /// Wall clock for the defer-on-lateness check.
+    clock: SharedClock,
     rollup_id: u64,
     composer: SyncSlotComposerHandle,
     max_speculative_depth: u64,
@@ -201,6 +204,7 @@ where
         committer: BlockCommitterHandle<T>,
         schedule_rx: mpsc::Receiver<SlotEvent>,
         timing: RollupTiming,
+        clock: SharedClock,
         rollup_id: u64,
         composer: SyncSlotComposerHandle,
         max_speculative_depth: u64,
@@ -211,6 +215,7 @@ where
             schedule_rx,
             committer,
             timing,
+            clock,
             rollup_id,
             composer,
             max_speculative_depth,
@@ -322,14 +327,7 @@ where
     /// the immediate next L1 slot. Steady state has headroom; fires only on
     /// a late trigger, where the slot is deferred.
     fn sync_block_misses_l1_slot(&self, sync_slot_timestamp: u64) -> bool {
-        let proof_ms = u64::try_from(self.timing.proof_time().as_millis()).unwrap_or(u64::MAX);
-        let slack_ms =
-            u64::try_from(self.timing.submission_slack().as_millis()).unwrap_or(u64::MAX);
-        let ready_ms = crate::slot::now_unix_millis().saturating_add(proof_ms);
-        let deadline_ms = sync_slot_timestamp
-            .saturating_mul(1_000)
-            .saturating_sub(slack_ms);
-        ready_ms > deadline_ms
+        misses_l1_slot(self.timing, self.clock.now_unix_ms(), sync_slot_timestamp)
     }
 
     /// One skip self-heals next trigger; a run of them means production is
@@ -608,12 +606,19 @@ where
     /// Commit a pre-built Sync block (from the cross-chain composer)
     /// via `commit_derived` — same engine-API tail the Deriver uses
     /// for L1-derived blocks. Holds the reconcile lock so a sync-slot
-    /// commit can't race with a deriver-side reconcile.
+    /// commit can't race with a deriver-side reconcile. Releases the
+    /// block's bundle only after the commit; on any error it is withheld.
+    /// A block reth rejects as invalid is reported as rejected.
     async fn commit_one_prebuilt(
         &mut self,
         kind: SlotKind,
         built: crate::slot::SyncSlotBlock,
     ) -> DriverResult<()> {
+        let crate::slot::SyncSlotBlock {
+            payload,
+            header,
+            release,
+        } = built;
         // `commit_derived` doesn't take the lock itself (only
         // `commit_sequenced` does, and the Deriver already holds it via
         // `begin_reconcile`), so hold it here too.
@@ -623,22 +628,29 @@ where
         // compose and commit, and a prebuilt block on a stale parent
         // would silently reorg that newer work via commit_derived's FCU.
         let current_head = self.committer.last_header().hash();
-        let built_parent = built.header.parent_hash();
+        let built_parent = header.parent_hash();
         if current_head != built_parent {
             return Err(DriverError::StaleParent {
                 expected: built_parent,
                 actual: current_head,
             });
         }
-        let block_number = built.header.number();
-        let block_hash = built.header.hash();
-        let block_timestamp = built.header.timestamp();
-        let _outcome = self
+        let block_number = header.number();
+        let block_hash = header.hash();
+        let block_timestamp = header.timestamp();
+        let outcome = self
             .committer
             // feed_witness=true: this is a PRODUCED Sync block — emit it to the
             // prover witness-capture feed (the follower/deriver passes false).
-            .commit_derived(built.payload, built.header, true)
-            .await?;
+            .commit_derived(payload, header, true)
+            .await;
+        match (&outcome, release) {
+            (Ok(imported), Some(release)) => release.committed(imported.block_hash),
+            // Reth rejected the block; any other error drops the release.
+            (Err(DriverError::InvalidPayload(_)), Some(release)) => release.rejected(),
+            _ => {}
+        }
+        outcome?;
 
         event!(
             name: "eez.sequencer.block.produced",
@@ -678,5 +690,380 @@ where
             "produced block {block_number} hash={block_hash} ts={timestamp} kind={kind}",
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use alloy_consensus::Header;
+    use async_trait::async_trait;
+    use eez_l1::{BatchRecord, L1CanonicalHead, scan::PostId};
+    use eez_timing::TokioClock;
+    use reth_chainspec::{ChainSpec, ChainSpecBuilder};
+    use reth_ethereum_engine_primitives::EthEngineTypes;
+
+    use super::*;
+    use crate::slot::{BundleRelease, ParentContext, SyncSlotBlock, SyncSlotComposer};
+    use crate::test_engine::{EngineCall, MockEngine, MockStatus};
+    use tokio::sync::oneshot;
+
+    /// 12 s L1, 2 s L2, proof 4000, slack 1500: live 3, future 2, K 6.
+    const TIMING: RollupTiming = RollupTiming::new(12_000, 2_000, 4_000, 1_500);
+    const GENESIS_TS: u64 = 1_700_000_000;
+    /// The Sync block of the first slot: height 6, one L1 block after genesis.
+    const SYNC_HEIGHT: u64 = 6;
+    const SYNC_TS: u64 = GENESIS_TS + 12;
+    const L1_HEAD: u64 = 500;
+    /// The trigger instant, `proof_window_open` after the anchor head.
+    const TRIGGER_MS: u64 = (GENESIS_TS + 6) * 1_000;
+    /// The last instant at which the bundle still makes the L1 slot.
+    const CUTOFF_MS: u64 = SYNC_TS * 1_000 - 1_500 - 4_000;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ComposeCall {
+        parent: u64,
+        timestamp: u64,
+        target: Option<u64>,
+        mode: SyncSlotMode,
+        /// Engine calls logged before this compose call.
+        engine_calls: usize,
+    }
+
+    /// What the composer returns for the Sync block.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Prebuild {
+        /// No block: the Sequencer commits the Sync block through the engine.
+        NoBlock,
+        /// A prebuilt child of the parent, with a bundle release.
+        Child,
+        /// A prebuilt child of a sibling of the parent.
+        StaleChild,
+    }
+
+    type ReleaseTask = tokio::task::JoinHandle<Result<Option<B256>, oneshot::error::RecvError>>;
+
+    /// Records every compose call and returns the [`Prebuild`] block.
+    #[derive(Debug)]
+    struct RecordingComposer {
+        engine: MockEngine,
+        calls: Mutex<Vec<ComposeCall>>,
+        prebuild: Mutex<Prebuild>,
+        /// Resolves when the prebuilt block's bundle is released or withheld.
+        release: Mutex<Option<ReleaseTask>>,
+    }
+
+    impl RecordingComposer {
+        /// A prebuilt child of `parent` whose release is logged in engine order.
+        fn prebuilt(&self, parent: &SealedHeader, timestamp: u64) -> SyncSlotBlock {
+            let header = SealedHeader::seal_slow(Header {
+                parent_hash: parent.hash(),
+                number: parent.number + 1,
+                timestamp,
+                gas_limit: parent.gas_limit,
+                ..Default::default()
+            });
+            let block = reth_primitives_traits::SealedBlock::<
+                reth_ethereum_primitives::Block,
+            >::from_sealed_parts(header.clone(), Default::default());
+            let (release, released) = BundleRelease::new();
+            let engine = self.engine.clone();
+            *self.release.lock().unwrap() = Some(tokio::spawn(async move {
+                let hash = released.await?;
+                if let Some(hash) = hash {
+                    engine.note_release(hash);
+                }
+                Ok(hash)
+            }));
+            SyncSlotBlock {
+                payload: <EthEngineTypes as PayloadTypes>::block_to_payload(block, None),
+                header,
+                release: Some(release),
+            }
+        }
+
+        async fn released(&self) -> Result<Option<B256>, oneshot::error::RecvError> {
+            let release = self
+                .release
+                .lock()
+                .unwrap()
+                .take()
+                .expect("no prebuilt block");
+            release.await.unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl SyncSlotComposer for RecordingComposer {
+        async fn compose_sync_slot(
+            &self,
+            _rollup_id: u64,
+            parent: ParentContext,
+            timestamp: u64,
+            target_l1_block: Option<u64>,
+            mode: SyncSlotMode,
+        ) -> Option<SyncSlotBlock> {
+            self.calls.lock().unwrap().push(ComposeCall {
+                parent: parent.header.number(),
+                timestamp,
+                target: target_l1_block,
+                mode,
+                engine_calls: self.engine.calls().len(),
+            });
+            match *self.prebuild.lock().unwrap() {
+                Prebuild::NoBlock => None,
+                Prebuild::Child => Some(self.prebuilt(&parent.header, timestamp)),
+                Prebuild::StaleChild => {
+                    let mut sibling = parent.header.clone_header();
+                    sibling.extra_data = vec![1].into();
+                    Some(self.prebuilt(&SealedHeader::seal_slow(sibling), timestamp))
+                }
+            }
+        }
+    }
+
+    struct Fixture {
+        engine: MockEngine,
+        composer: Arc<RecordingComposer>,
+        sequencer: Sequencer<EthEngineTypes, ChainSpec>,
+    }
+
+    impl Fixture {
+        fn new(now_ms: u64, max_speculative_depth: u64, l1_head: L1CanonicalHead) -> Self {
+            let genesis = SealedHeader::seal_slow(Header {
+                timestamp: GENESIS_TS,
+                gas_limit: 30_000_000,
+                ..Default::default()
+            });
+            let (engine, committer) = MockEngine::committer(&genesis);
+            let composer = Arc::new(RecordingComposer {
+                engine: engine.clone(),
+                calls: Mutex::default(),
+                prebuild: Mutex::new(Prebuild::NoBlock),
+                release: Mutex::default(),
+            });
+            let chain_spec = Arc::new(ChainSpecBuilder::mainnet().build());
+            let (_schedule_tx, schedule_rx) = mpsc::channel(1);
+            let sequencer = Sequencer::composer(
+                EthAttributesBuilder::new(chain_spec),
+                committer,
+                schedule_rx,
+                TIMING,
+                Arc::new(TokioClock::starting_at(now_ms)),
+                1,
+                composer.clone(),
+                max_speculative_depth,
+                Arc::new(l1_head),
+            );
+            Self {
+                engine,
+                composer,
+                sequencer,
+            }
+        }
+
+        async fn sync_slot(&mut self, timestamp: u64) {
+            self.try_sync_slot(timestamp).await.unwrap();
+        }
+
+        async fn try_sync_slot(&mut self, timestamp: u64) -> DriverResult<()> {
+            self.sequencer
+                .advance(SlotEvent::SyncSlot {
+                    block_height: SYNC_HEIGHT,
+                    timestamp,
+                    l1_head: L1_HEAD,
+                })
+                .await
+        }
+
+        fn compose_calls(&self) -> Vec<ComposeCall> {
+            self.composer.calls.lock().unwrap().clone()
+        }
+
+        fn commits(&self) -> usize {
+            self.engine
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, EngineCall::NewPayload { .. }))
+                .count()
+        }
+
+        fn head(&self) -> u64 {
+            self.sequencer.committer.last_header().number()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn steady_trigger_commits_live_and_future_then_composes_steady() {
+        let mut f = Fixture::new(
+            TRIGGER_MS,
+            DEFAULT_MAX_SPECULATIVE_DEPTH,
+            L1CanonicalHead::default(),
+        );
+        f.sync_slot(SYNC_TS).await;
+
+        // Each sequenced commit is FCU+attrs, resolve, newPayload, head FCU.
+        let calls = f.engine.calls();
+        assert_eq!(calls.len(), 6 * 4);
+        for commit in calls.chunks(4) {
+            assert!(matches!(
+                commit,
+                [
+                    EngineCall::Fcu {
+                        with_attrs: true,
+                        ..
+                    },
+                    EngineCall::Resolve { .. },
+                    EngineCall::NewPayload { .. },
+                    EngineCall::Fcu {
+                        with_attrs: false,
+                        ..
+                    },
+                ]
+            ));
+        }
+        // 3 Live + 2 Future, then the steady compose, then the Sync commit.
+        assert_eq!(
+            f.compose_calls(),
+            vec![ComposeCall {
+                parent: 5,
+                timestamp: SYNC_TS,
+                target: Some(L1_HEAD + 1),
+                mode: SyncSlotMode::Steady,
+                engine_calls: 5 * 4,
+            }]
+        );
+        assert_eq!(f.head(), SYNC_HEIGHT);
+        assert_eq!(f.sequencer.committer.last_header().timestamp(), SYNC_TS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_trigger_composes_empty_sync_block() {
+        // On time at the deadline; one millisecond later the slot is deferred.
+        let mut on_time = Fixture::new(
+            CUTOFF_MS,
+            DEFAULT_MAX_SPECULATIVE_DEPTH,
+            L1CanonicalHead::default(),
+        );
+        on_time.sync_slot(SYNC_TS).await;
+        assert_eq!(on_time.compose_calls()[0].mode, SyncSlotMode::Steady);
+
+        let mut late = Fixture::new(
+            CUTOFF_MS + 1,
+            DEFAULT_MAX_SPECULATIVE_DEPTH,
+            L1CanonicalHead::default(),
+        );
+        late.sync_slot(SYNC_TS).await;
+        assert_eq!(
+            late.compose_calls(),
+            vec![ComposeCall {
+                parent: 5,
+                timestamp: SYNC_TS,
+                target: None,
+                mode: SyncSlotMode::Empty,
+                engine_calls: 5 * 4,
+            }]
+        );
+        assert_eq!(late.head(), SYNC_HEIGHT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn off_grid_head_skips_the_sync_block() {
+        let mut f = Fixture::new(
+            TRIGGER_MS,
+            DEFAULT_MAX_SPECULATIVE_DEPTH,
+            L1CanonicalHead::default(),
+        );
+        // One second off the grid: parent + L2 lands on SYNC_TS, not SYNC_TS + 1.
+        f.sync_slot(SYNC_TS + 1).await;
+
+        assert!(f.compose_calls().is_empty());
+        assert_eq!(f.sequencer.off_grid_skips, 1);
+        assert_eq!(f.commits(), 5);
+        assert_eq!(f.head(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn speculative_cap_holds_future_and_sync() {
+        let l1_head = L1CanonicalHead::default();
+        l1_head.seed(BatchRecord {
+            post: PostId {
+                l1_block: 1,
+                l1_block_hash: B256::repeat_byte(1),
+                log_index: 0,
+            },
+            tx_hash: B256::repeat_byte(2),
+            last_l2_block: 1,
+        });
+        let mut f = Fixture::new(TRIGGER_MS, 3, l1_head);
+        f.sync_slot(SYNC_TS).await;
+
+        // Cursor 1, depth 3: 3 Live and 1 Future commit, then the cap holds
+        // the second Future block and the Sync block.
+        assert_eq!(f.commits(), 4);
+        assert_eq!(f.head(), 4);
+        assert!(f.compose_calls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prebuilt_release_follows_the_commit() {
+        let mut f = Fixture::new(
+            TRIGGER_MS,
+            DEFAULT_MAX_SPECULATIVE_DEPTH,
+            L1CanonicalHead::default(),
+        );
+        *f.composer.prebuild.lock().unwrap() = Prebuild::Child;
+        f.sync_slot(SYNC_TS).await;
+
+        let hash = f.composer.released().await.unwrap().unwrap();
+        assert_eq!(hash, f.sequencer.committer.last_header().hash());
+        let calls = f.engine.calls();
+        assert_eq!(
+            calls[5 * 4..],
+            [
+                EngineCall::NewPayload { hash },
+                EngineCall::Fcu {
+                    head: hash,
+                    with_attrs: false
+                },
+                EngineCall::BundleReleased { hash },
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_parent_withholds_the_bundle() {
+        let mut f = Fixture::new(
+            TRIGGER_MS,
+            DEFAULT_MAX_SPECULATIVE_DEPTH,
+            L1CanonicalHead::default(),
+        );
+        *f.composer.prebuild.lock().unwrap() = Prebuild::StaleChild;
+        f.sync_slot(SYNC_TS).await;
+
+        assert!(f.composer.released().await.is_err());
+        assert_eq!(f.commits(), 5);
+        assert_eq!(f.head(), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalid_payload_withholds_the_bundle() {
+        let mut f = Fixture::new(
+            TRIGGER_MS,
+            DEFAULT_MAX_SPECULATIVE_DEPTH,
+            L1CanonicalHead::default(),
+        );
+        *f.composer.prebuild.lock().unwrap() = Prebuild::Child;
+        // Five sequenced blocks pass; the prebuilt Sync block is rejected.
+        for _ in 0..5 {
+            f.engine.queue_new_payload(MockStatus::Valid);
+        }
+        f.engine.queue_new_payload(MockStatus::Invalid);
+        let err = f.try_sync_slot(SYNC_TS).await.unwrap_err();
+
+        assert!(matches!(err, DriverError::InvalidPayload(_)), "{err}");
+        assert_eq!(f.composer.released().await, Ok(None));
+        assert_eq!(f.head(), 5);
     }
 }

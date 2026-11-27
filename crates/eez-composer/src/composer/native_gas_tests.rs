@@ -167,8 +167,9 @@ fn native_execution_follows_full_cap_without_commit() {
 
 #[test]
 fn inbound_drain_rejects_full_cap_failures_but_defers_capacity_under_load() {
+    use crate::composer::batcher::DEFAULT_MAX_POSTBATCH_GAS;
     use alloy_provider::{ProviderBuilder, mock::Asserter};
-    use eez_l1::{L1ReaderConfig, SubmitterConfig};
+    use eez_l1::{L1ReaderConfig, Submitter, SubmitterConfig};
     use eez_protocol::{ChainDialect, ProxyLookupConfig, RollupId, TargetConfig};
     use evm2::{evm::DynDatabase as _, interpreter::Word};
 

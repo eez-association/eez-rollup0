@@ -8,17 +8,19 @@ use alloy_primitives::aliases::I192;
 use alloy_primitives::{B256, Bytes, U256};
 use alloy_sol_types::SolCall;
 use eez_protocol::abi::ExecutionEntrySol;
+use eez_prover::ProverError;
 use reth_primitives_traits::AlloyBlockHeader;
 use tracing::{Level, event};
 
-use super::blob::PhysicalBlobs;
-use super::{
-    CrossChainExecCtx, MAX_PROOF_BYTES, PreparePostBatchError, ProverError, SyncCandidates,
-    assign_proof_systems, attestation_gas, calldata_floor_gas, calldata_gas,
-    ensure_batch_registry_native, projected_postbatch_gas, target_blob_limit,
-    validate_actionable_prover_failure,
+use super::CrossChainExecCtx;
+use super::batcher::{
+    MAX_PROOF_BYTES, PreparePostBatchError, attestation_gas, calldata_floor_gas, calldata_gas,
+    ensure_batch_registry_native, projected_postbatch_gas,
 };
-use crate::attestation_quorum::Attestation;
+use super::blob::{PhysicalBlobs, target_blob_limit};
+use crate::attestation_quorum::{Attestation, assign_proof_systems};
+use crate::local::SyncCandidates;
+use crate::prover_retry::validate_actionable_prover_failure;
 
 /// Assemble the ordered entries and finalize their settlement updates.
 pub(super) fn build_settlement_batch(

@@ -42,6 +42,12 @@ impl L1HeadStream {
         }
     }
 
+    /// Wrap a receiver the caller feeds, e.g. a test's own broadcast channel.
+    #[must_use]
+    pub const fn from_receiver(rx: broadcast::Receiver<L1Event>) -> Self {
+        Self { rx }
+    }
+
     /// `next_head` returns `None` when the source closes (broadcast lagged
     /// past tolerance, `L1Watcher` task died, etc) — the spawner exits
     /// cleanly so the surrounding `spawn_critical_task` notices.

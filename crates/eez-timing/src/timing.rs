@@ -40,8 +40,6 @@ use std::env;
 use std::num::ParseIntError;
 use std::time::Duration;
 
-use crate::error::{DriverError, DriverResult};
-
 /// Cap on Live blocks produced per catchup trigger. Aligned with
 /// [`MAX_BLOCKS_PER_BATCH`] on the Composer side so one trigger's
 /// catchup output maps to exactly one postBatch submission. Drop to
@@ -60,6 +58,11 @@ const ENV_PROOF_TIME_MS: &str = "EEZ_PROOF_TIME_MS";
 const ENV_SUBMISSION_SLACK_MS: &str = "EEZ_SUBMISSION_SLACK_MS";
 
 const DEFAULT_SUBMISSION_SLACK_MS: u32 = 100;
+
+/// `RollupTiming` env loading or validation failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("RollupTiming misconfig: {0}")]
+pub struct TimingError(pub String);
 
 /// Per-rollup timing configuration. Cheap `Copy` value type (four
 /// `u32` fields).
@@ -105,9 +108,9 @@ impl RollupTiming {
     ///
     /// # Errors
     ///
-    /// Returns [`DriverError`] for any missing required variable, malformed
+    /// Returns [`TimingError`] for any missing required variable, malformed
     /// value, or validation failure.
-    pub fn from_env() -> DriverResult<Self> {
+    pub fn from_env() -> Result<Self, TimingError> {
         let t = Self::new(
             parse_env(ENV_L1_BLOCK_TIME_MS)?,
             parse_env(ENV_L2_BLOCK_TIME_MS)?,
@@ -124,7 +127,7 @@ impl RollupTiming {
     ///
     /// # Errors
     ///
-    /// Returns [`DriverError`] for any of:
+    /// Returns [`TimingError`] for any of:
     /// - any zero field
     /// - `L2_block_time % 1000 != 0` — L2 block time must be whole
     ///   seconds. Block timestamps are unix integer-seconds and the
@@ -136,14 +139,14 @@ impl RollupTiming {
     /// - `proof_time + submission_slack >= L1_block_time`
     /// - `proof_time > (K - 1) * L2_block_time` (no room for Future
     ///   blocks before Sync)
-    pub fn validate(&self) -> DriverResult<()> {
+    pub fn validate(&self) -> Result<(), TimingError> {
         if self.l1_block_time_ms == 0 || self.l2_block_time_ms == 0 || self.proof_time_ms == 0 {
-            return Err(DriverError::TimingConfig(
+            return Err(TimingError(
                 "all timing fields (l1_block_time, l2_block_time, proof_time) must be > 0".into(),
             ));
         }
         if !self.l2_block_time_ms.is_multiple_of(1000) {
-            return Err(DriverError::TimingConfig(format!(
+            return Err(TimingError(format!(
                 "L2 block time ({} ms) must be a whole number of seconds; \
                  unix block timestamps are integer-second and the sync-slot \
                  block-height arithmetic relies on it",
@@ -151,26 +154,26 @@ impl RollupTiming {
             )));
         }
         if !self.l1_block_time_ms.is_multiple_of(self.l2_block_time_ms) {
-            return Err(DriverError::TimingConfig(format!(
+            return Err(TimingError(format!(
                 "L1 block time ({} ms) must be an integer multiple of L2 block time ({} ms); K must be integer",
                 self.l1_block_time_ms, self.l2_block_time_ms,
             )));
         }
         let k = self.k();
         if k < 2 {
-            return Err(DriverError::TimingConfig(format!(
+            return Err(TimingError(format!(
                 "K must be >= 2 (got {k}); Sync slot must be distinct from surrounding Live blocks"
             )));
         }
         if self.proof_time_ms.saturating_add(self.submission_slack_ms) >= self.l1_block_time_ms {
-            return Err(DriverError::TimingConfig(format!(
+            return Err(TimingError(format!(
                 "proof_time ({} ms) + submission_slack ({} ms) must be < L1 block time ({} ms)",
                 self.proof_time_ms, self.submission_slack_ms, self.l1_block_time_ms,
             )));
         }
         let max_budget = (k - 1) * self.l2_block_time_ms;
         if self.proof_time_ms.saturating_add(self.submission_slack_ms) > max_budget {
-            return Err(DriverError::TimingConfig(format!(
+            return Err(TimingError(format!(
                 "proof_time ({} ms) + submission_slack ({} ms) must be <= (K-1) * L2 block time ({} * {} = {} ms); else there is no room for Future blocks before Sync",
                 self.proof_time_ms,
                 self.submission_slack_ms,
@@ -336,7 +339,7 @@ pub enum SlotComposition {
     Idle,
     /// Catchup: `live` Live blocks then a terminal Sync block at the
     /// grid-snapped height `head + live + 1`. No Future blocks; the Sync
-    /// block is structural-only (empty) — see [`SyncSlotMode`](crate::SyncSlotMode).
+    /// block is structural-only (empty) — see `eez_driver::SyncSlotMode`.
     Catchup { live: u64 },
     /// Steady-state: produce `live` Live blocks + `future` Future
     /// blocks + 1 Sync block (always implicit when this variant is
@@ -344,22 +347,21 @@ pub enum SlotComposition {
     Slot { live: u64, future: u64 },
 }
 
-fn parse_env(name: &str) -> DriverResult<u32> {
-    let raw =
-        env::var(name).map_err(|_| DriverError::TimingConfig(format!("{name} is required")))?;
+fn parse_env(name: &str) -> Result<u32, TimingError> {
+    let raw = env::var(name).map_err(|_| TimingError(format!("{name} is required")))?;
     raw.parse::<u32>()
-        .map_err(|e: ParseIntError| DriverError::TimingConfig(format!("{name}: {e}")))
+        .map_err(|e: ParseIntError| TimingError(format!("{name}: {e}")))
 }
 
-fn parse_env_or(name: &str, default: u32) -> DriverResult<u32> {
+fn parse_env_or(name: &str, default: u32) -> Result<u32, TimingError> {
     match env::var(name) {
         Ok(v) => v
             .parse::<u32>()
-            .map_err(|e: ParseIntError| DriverError::TimingConfig(format!("{name}: {e}"))),
+            .map_err(|e: ParseIntError| TimingError(format!("{name}: {e}"))),
         Err(env::VarError::NotPresent) => Ok(default),
-        Err(env::VarError::NotUnicode(_)) => Err(DriverError::TimingConfig(format!(
-            "{name} contains non-UTF-8 bytes"
-        ))),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(TimingError(format!("{name} contains non-UTF-8 bytes")))
+        }
     }
 }
 

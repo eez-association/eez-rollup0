@@ -2,9 +2,16 @@
 //! Barriers force consumer orderings; no mining, live reorg, or timing sleeps.
 
 use super::*;
+use crate::attestation_quorum::AttestationQuorum;
+use crate::composer::{CrossChainExecCtx, CrossChainWiring};
 use alloy_consensus::Header;
+use alloy_primitives::U256;
 use alloy_provider::{ProviderBuilder, RootProvider, mock::Asserter};
+use async_trait::async_trait;
+use eez_driver::{BlockCommitterHandle, RollupTiming};
+use eez_evm::EezEvmConfig;
 use eez_l1::{BatchRecord, L1CanonicalHead, L1ReaderConfig, SubmitterConfig, scan::PostId};
+use eez_prover::ProvingContext;
 use reth_chainspec::ChainSpecBuilder;
 use reth_engine_primitives::{BeaconEngineMessage, ConsensusEngineHandle, OnForkChoiceUpdated};
 use reth_payload_builder::PayloadBuilderHandle;
@@ -162,6 +169,7 @@ impl Fixture {
             committer,
             None,
             RollupTiming::new(5000, 1000, 1000, 100),
+            Arc::new(eez_timing::TokioClock::new()),
         )
         .unwrap();
         Self { composer, engine }
