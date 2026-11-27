@@ -1009,6 +1009,7 @@ where
     ///
     /// On a fatal error (`is_fatal`), to stop the node.
     pub async fn run(self, mut rx: broadcast::Receiver<L1Event>) {
+        let mut resync_pending = false;
         // Defensive re-anchor: a cheap no-op in the normal boot order;
         // load-bearing for any caller that subscribed rx late.
         if let Err(err) = self.catch_up().await {
@@ -1018,8 +1019,9 @@ where
                 Level::ERROR,
                 event_name = "eez.deriver.resync.failed",
                 error = %err,
-                "post-subscribe resync failed; deriver may have a gap",
+                "post-subscribe resync failed; will retry at the next L1 event",
             );
+            resync_pending = true;
         }
 
         event!(
@@ -1031,6 +1033,10 @@ where
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    // A pending resync runs before each event; NewHead comes once per L1 block.
+                    if resync_pending && !self.try_recover(&mut resync_pending).await {
+                        return;
+                    }
                     if let Err(err) = self.handle_event(event).await {
                         stop_if_fatal(&err);
                         if matches!(&err, DeriverError::CommitterClosed) {
@@ -1052,7 +1058,7 @@ where
                             error = %err,
                             "deriver failed to handle event; resyncing from L1",
                         );
-                        if !self.try_recover().await {
+                        if !self.try_recover(&mut resync_pending).await {
                             return;
                         }
                     }
@@ -1064,7 +1070,7 @@ where
                         skipped,
                         "L1 event stream lagged; resyncing from L1",
                     );
-                    if !self.try_recover().await {
+                    if !self.try_recover(&mut resync_pending).await {
                         return;
                     }
                 }
@@ -1080,11 +1086,14 @@ where
         }
     }
 
-    /// Post-failure recovery via [`Self::catch_up`]. Returns `false` only
-    /// when the committer is gone and the loop must exit; a failed resync is
-    /// logged and retried at the next L1 event. Panics on an [`is_fatal`] one.
-    async fn try_recover(&self) -> bool {
-        match self.catch_up().await {
+    /// Post-failure recovery via [`Self::catch_up`]. Sets `pending` while it
+    /// fails, so [`Self::run`] retries it at the next L1 event. Returns `false`
+    /// only when the committer is gone and the loop must exit. Panics on an
+    /// [`is_fatal`] error.
+    async fn try_recover(&self, pending: &mut bool) -> bool {
+        let result = self.catch_up().await;
+        *pending = result.is_err();
+        match result {
             Ok(()) => {
                 event!(
                     name: "eez.deriver.resync.recovered",
@@ -1112,7 +1121,7 @@ where
                     Level::ERROR,
                     event_name = "eez.deriver.resync.failed",
                     error = %err,
-                    "resync failed; will retry after the next L1 event",
+                    "resync failed; will retry at the next L1 event",
                 );
                 true
             }
@@ -1559,6 +1568,24 @@ where
         Ok(self.l2_sealed_header_at(l2_block)?.hash())
     }
 
+    /// Whether height `number` is on the local chain, by [`on_local_chain`].
+    fn is_local(&self, number: u64) -> bool {
+        on_local_chain(number, self.inner.committer.last_header().number())
+    }
+
+    /// The hash of the local chain's block `number`; `None` above its head.
+    fn local_hash(&self, number: u64) -> DeriverResult<Option<B256>> {
+        if !self.is_local(number) {
+            return Ok(None);
+        }
+        Ok(self
+            .inner
+            .l2_provider
+            .sealed_header(number)
+            .map_err(|e| DeriverError::L2Provider(e.to_string()))?
+            .map(|header| header.hash()))
+    }
+
     /// Height of the canonical block with hash `commitment`, if we hold one.
     fn block_at(&self, commitment: B256) -> DeriverResult<Option<u64>> {
         let Some(number) = self
@@ -1978,11 +2005,7 @@ where
             }
         } else if range_already_derived(
             stale_boundary,
-            self.inner
-                .l2_provider
-                .sealed_header(from_block + last_index as u64)
-                .map_err(|e| DeriverError::L2Provider(e.to_string()))?
-                .map(|header| header.hash()),
+            self.local_hash(from_block + last_index as u64)?,
             settlement.final_state,
         ) {
             event!(
@@ -2029,13 +2052,13 @@ where
                 // Skip only identical blocks: a needless rewrite wedges reth.
                 // Txs alone do not identify one; the header inputs seal in too.
                 let header_inputs = BlockHeaderInputs::from_span(decoded, i)?;
-                let local_matches =
-                    local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
-                        && local_header_inputs_match(
-                            &self.inner.l2_provider,
-                            l2_block,
-                            &header_inputs,
-                        )?;
+                let local_matches = self.is_local(l2_block)
+                    && local_block_matches(&self.inner.l2_provider, l2_block, &block_txs)?
+                    && local_header_inputs_match(
+                        &self.inner.l2_provider,
+                        l2_block,
+                        &header_inputs,
+                    )?;
                 let should_replay = suffix_replay.required(local_matches);
                 event!(
                     name: "eez.deriver.reconcile.block",
@@ -2338,6 +2361,13 @@ mod header_inputs_tests {
         header.extra_data = Bytes::from_static(b"other");
         assert!(!header_inputs_match(&header, &expected), "extraData");
     }
+}
+
+/// Whether height `number` is on the local chain whose head is at `tip`. A
+/// block above the head is not, even where a read by number still returns
+/// one: a retreat leaves its blocks readable.
+const fn on_local_chain(number: u64, tip: u64) -> bool {
+    number <= tip
 }
 
 fn local_batch_boundary_matches<L2>(l2_provider: &Arc<L2>, from_block: u64) -> DeriverResult<bool>
